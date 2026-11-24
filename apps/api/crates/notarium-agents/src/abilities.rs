@@ -173,6 +173,15 @@ impl<C: ControlCatalogPort + ?Sized> ControlCatalogPort for SystemAbilityCatalog
         self.owned.space(budget, space)
     }
 
+    fn agent_run_has_head(
+        &self,
+        budget: CallBudget,
+        space: SpaceId,
+        run: AgentRunId,
+    ) -> PortFuture<'_, bool> {
+        self.owned.agent_run_has_head(budget, space, run)
+    }
+
     fn projects(
         &self,
         ctx: SpaceContext,

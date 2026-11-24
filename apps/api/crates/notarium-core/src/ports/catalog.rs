@@ -147,6 +147,17 @@ pub trait ControlCatalogPort: Send + Sync {
         })
     }
     fn space(&self, budget: CallBudget, space: SpaceId) -> PortFuture<'_, CatalogSpace>;
+    /// Whether `run` has recorded any canonical document heads in `space`.
+    /// Used to decide whether a non-owner Space Editor may observe a Keeper
+    /// run's liveness during rollback fencing without leaking zero-edit private runs.
+    fn agent_run_has_head(
+        &self,
+        _budget: CallBudget,
+        _space: SpaceId,
+        _run: AgentRunId,
+    ) -> PortFuture<'_, bool> {
+        Box::pin(async { Ok(false) })
+    }
     fn projects(
         &self,
         ctx: SpaceContext,

@@ -234,7 +234,7 @@ pub(in super::super) async fn project_for_folder(
     Ok(item)
 }
 
-fn project_handle(value: &str) -> Result<(&str, &str), PortError> {
+pub(super) fn project_handle(value: &str) -> Result<(&str, &str), PortError> {
     let (space, project) = value
         .split_once('/')
         .ok_or_else(|| invalid(ValidationReason::InvalidQuery))?;
@@ -247,5 +247,6 @@ fn project_handle(value: &str) -> Result<(&str, &str), PortError> {
     {
         return Err(invalid(ValidationReason::InvalidQuery));
     }
+    notarium_syntax::unicode::validate_component(project)?;
     Ok((space, project))
 }

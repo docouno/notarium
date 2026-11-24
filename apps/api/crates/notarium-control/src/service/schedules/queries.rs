@@ -355,28 +355,43 @@ impl ControlService {
                     }
                     let row = rows!(
                         tx.inner_mut(),
-                        (String,),
+                        (String, String),
                         fetch_optional,
-                        "SELECT r.status FROM agent_schedule_runs r JOIN agent_schedules s ON s.schedule_id=r.schedule_id WHERE r.run_id=$1 AND s.space_id=$2",
-                        "SELECT r.status FROM v1_control.agent_schedule_runs r JOIN v1_control.agent_schedules s ON s.schedule_id=r.schedule_id WHERE r.run_id=$1 AND s.space_id=$2";
+                        "SELECT r.status, s.owner_id FROM agent_schedule_runs r JOIN agent_schedules s ON s.schedule_id=r.schedule_id WHERE r.run_id=$1 AND s.space_id=$2",
+                        "SELECT r.status, s.owner_id FROM v1_control.agent_schedule_runs r JOIN v1_control.agent_schedules s ON s.schedule_id=r.schedule_id WHERE r.run_id=$1 AND s.space_id=$2";
                         run.as_str(),
                         space.as_str()
                     )?;
-                    Ok(row
-                        .as_ref()
-                        .is_some_and(|(status,)| matches!(status.as_str(), "claimed" | "running")))
+                    Ok(row.and_then(|(status, owner_id)| {
+                        matches!(status.as_str(), "claimed" | "running")
+                            .then_some(owner_id == auth.principal().as_str())
+                    }))
                 },
                 CommitEffect::NotCommitted,
             )
             .await;
         budget.run(tx.finish(), CommitEffect::NotCommitted).await?;
-        let is_active = result?;
-        let current = AccountContext::new(auth, budget.context(ctx.budget.request));
+        let active_owner_match = result?;
+        let current = AccountContext::new(auth, budget.context(ctx.budget.request.clone()));
         self.catalog_space(&current, &space).await?;
-        if is_active {
-            return Err(invalid(ValidationReason::InvalidState));
+        match active_owner_match {
+            Some(true) => Err(invalid(ValidationReason::InvalidState)),
+            Some(false) => {
+                // Schedule runs are owner-private; only report an active foreign Keeper
+                // when it has already recorded canonical edits in this Space so callers
+                // cannot roll back in-flight edits or probe zero-edit foreign schedules.
+                let has_edits = self
+                    .catalog
+                    .agent_run_has_head(budget.context(ctx.budget.request), space, run)
+                    .await?;
+                if has_edits {
+                    Err(invalid(ValidationReason::InvalidState))
+                } else {
+                    Ok(())
+                }
+            }
+            None => Ok(()),
         }
-        Ok(())
     }
     pub async fn list_schedule_runs(
         &self,

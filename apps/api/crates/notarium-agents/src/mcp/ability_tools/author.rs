@@ -1184,6 +1184,16 @@ pub(super) async fn trash(
             },
         )
         .await?;
+    const TRASH_LABEL: &str = "notarium.mcp.trash-ability-receipt.v1";
+    plan.scope
+        .check(result.receipt.scope())
+        .map_err(|error| super::super::note_tools::post_commit_error(TRASH_LABEL, error.into()))?;
+    if result.value.note != plan.entrypoint.note_id {
+        return Err(super::super::note_tools::post_commit_error(
+            TRASH_LABEL,
+            invalid(ValidationReason::SourceMismatch),
+        ));
+    }
     Ok(
         json!({"ref":reference_token(&plan.reference)?,"noteId":plan.entrypoint.note_id,"versionToken":result.value.revision,"outcome":"trashed"}),
     )

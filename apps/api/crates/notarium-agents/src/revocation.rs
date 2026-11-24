@@ -58,6 +58,7 @@ struct Registered {
     selectors: Selectors,
     cancellation: Cancellation,
     thread: Option<(HistoryScope, ChatThreadId)>,
+    run_owner: Option<(PrincipalId, bool)>,
 }
 
 struct CanonicalRegistration {
@@ -350,12 +351,15 @@ impl RevocationHub {
         if state.fenced(&selectors) || state.runs.contains_key(run) {
             return Err(revocation_unavailable());
         }
+        let shared_group = matches!(auth.kind(), PrincipalKind::AgentRun(_))
+            && auth.chat_audience() == Some(notarium_core::auth::ChatAudience::Shared);
         state.runs.insert(
             run.clone(),
             Registered {
                 selectors,
                 cancellation: cancellation.clone(),
                 thread,
+                run_owner: Some((auth.principal().clone(), shared_group)),
             },
         );
         Ok(RunRevocationLease {
@@ -397,6 +401,7 @@ impl RevocationHub {
                 selectors,
                 cancellation: cancellation.clone(),
                 thread: None,
+                run_owner: None,
             },
         );
         Ok(ViewerRevocationLease {
@@ -620,14 +625,16 @@ impl RevocationHub {
     }
 
     /// Fence, cancel, and wait for any local in-flight chat or Keeper run
-    /// matching `(space, run)` to drop its run lease, provider calls, and
-    /// canonical effects before executing a rollback.
+    /// matching `(space, run)` that `caller` is authorized to stop (either a
+    /// Shared-Space group run or the run's own principal) to drop its run lease,
+    /// provider calls, and canonical effects before executing a rollback.
     pub(crate) async fn stop_and_drain_run(
         &self,
         space: &SpaceId,
         run: &AgentRunId,
+        caller: &PrincipalId,
         budget: &notarium_core::ports::CallBudget,
-    ) -> Result<RollbackRunGuard, PortError> {
+    ) -> Result<Option<RollbackRunGuard>, PortError> {
         if budget.cancellation.is_cancelled() {
             return Err(cancelled());
         }
@@ -644,6 +651,14 @@ impl RevocationHub {
         let (guard, cancellations) = {
             let mut state = self.inner.lock();
             state.ensure_open()?;
+            if let Some(entry) = state.runs.get(run)
+                && entry.selectors.contains(&selector)
+                && let Some((owner, shared_group)) = &entry.run_owner
+                && !*shared_group
+                && owner != caller
+            {
+                return Ok(None);
+            }
             let fence_id = state.allocate()?;
             state
                 .fences
@@ -694,7 +709,7 @@ impl RevocationHub {
                 !run_active && !provider_active && !effect_active
             };
             if drained {
-                return Ok(guard);
+                return Ok(Some(guard));
             }
             if budget.cancellation.is_cancelled() {
                 return Err(cancelled());
@@ -955,6 +970,7 @@ impl SessionRevocationPort for RevocationHub {
                                     selectors,
                                     cancellation: cancellation.clone(),
                                     thread: None,
+                                    run_owner: None,
                                 },
                                 deadline: budget.deadline,
                                 active: 0,
@@ -1005,6 +1021,7 @@ impl SessionRevocationPort for RevocationHub {
                                 selectors,
                                 cancellation: cancellation.clone(),
                                 thread: None,
+                                run_owner: None,
                             },
                         );
                         return Ok(Box::new(RegistryLease {

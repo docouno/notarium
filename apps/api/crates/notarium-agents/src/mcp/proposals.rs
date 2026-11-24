@@ -707,6 +707,16 @@ async fn commit_memory(
     let mutation = input.into_mutation(current.resolved, identity, mode)?;
     let scope = owner.fence_confirmed_effect(scope).await?;
     let committed = owner.registry.engine.append_memory(scope, mutation).await?;
+    const LABEL: &str = "notarium.mcp.confirmed-memory-receipt.v1";
+    plan.scope
+        .check(committed.receipt.scope())
+        .map_err(|error| super::note_tools::post_commit_error(LABEL, error.into()))?;
+    if committed.value.revision.note != plan.note {
+        return Err(super::note_tools::post_commit_error(
+            LABEL,
+            invalid(ValidationReason::SourceMismatch),
+        ));
+    }
     Ok(json!({
         "outcome": "applied",
         "noteId": committed.value.revision.note,

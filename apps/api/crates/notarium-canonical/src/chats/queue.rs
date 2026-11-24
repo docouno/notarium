@@ -260,23 +260,30 @@ pub(super) async fn finish(
                     let thread =
                         load_thread_head_tx(tx, &space.scope.space_id, &request.thread).await?;
                     if closing {
-                        // The existing owner may cancel inputs and clear its own claim
-                        // after archival. No chat entry can be read or appended here.
-                        let project_matches = ctx
-                            .auth()
-                            .spaces()
-                            .get(&space.space.id)
-                            .and_then(|grant| grant.project_root.as_ref())
+                        // Only the current active claim owner with live write authority may
+                        // cancel queued inputs and clear its own claim after archival.
+                        let Some(grant) = ctx.auth().spaces().get(&space.space.id) else {
+                            return Err(DomainError::ResourceNotFound.into());
+                        };
+                        let project_matches = grant
+                            .project_root
+                            .as_ref()
                             .is_none_or(|root| thread.project_folder.as_ref() == Some(root));
                         let audience_ok = !(thread.kind == ChatThreadKind::Personal
                             && ctx.auth().chat_audience()
                                 == Some(notarium_core::auth::ChatAudience::Shared));
-                        if ctx.auth().pinned_write_space() != Some(&space.space.id)
+                        let writable_grant = grant.role != notarium_core::auth::SpaceRole::Viewer
+                            && ctx.auth().bearer_scope()
+                                != Some(notarium_core::ports::BearerScope::Read);
+                        if !writable_grant
+                            || ctx.auth().pinned_write_space() != Some(&space.space.id)
                             || thread.kind == ChatThreadKind::KeeperLog
                             || !project_matches
                             || !audience_ok
                             || (thread.kind != ChatThreadKind::SpaceGroup
                                 && &thread.owner != ctx.auth().principal())
+                            || thread.active_run_id.as_ref() != Some(&request.expected_run)
+                            || !use_current_claim(&thread, &owned, &space)
                         {
                             return Err(DomainError::ResourceNotFound.into());
                         }
@@ -355,6 +362,7 @@ pub(super) async fn list_pending(
                 owned
                     .inner
                     .check_writer_epoch(&scope.space_id, space.active_epoch)?;
+                authorize_chat_write_on_space(ctx.auth(), &space.space)?;
                 let thread = load_thread_head_tx(tx, &scope.space_id, &thread_id).await?;
                 authorize_current_leaf(tx, ctx.auth(), &space, &thread).await?;
                 authorize_run_claim(&owned, &space, &thread, &run)?;

@@ -5,7 +5,7 @@ use notarium_agents::chats::{
 };
 use notarium_control::auth::token::{MintedToken, TokenKind, mint};
 use notarium_core::{
-    auth::{AuthenticatedCredential, ChatAudience},
+    auth::{AuthenticatedCredential, ChatAudience, SpaceKind, SpaceRole},
     classes::DocClass,
     model::HistoryScope,
 };
@@ -522,6 +522,211 @@ async fn revoked_chat_receipt(fixture: &mut RuntimeFixture, personal: &HistorySc
             .admit_chat_write_calls
             .load(Ordering::SeqCst),
         0
+    );
+    // DirectHuman callers lacking write rights in a Space (a Space Viewer on a
+    // Shared Space and a non-member on a Personal Space) must also fail upfront
+    // on `start`, `enqueue_input`, and `redact_chat_entry` before acquiring
+    // thread gates or calling cluster write admission / owner registration.
+    let shared_space = fixture
+        .control
+        .create_space(
+            fixture.human.clone(),
+            AccountMutation {
+                identity: runtime_ability_cases::identity(fixture, &fixture.human, 209).await,
+                input: CreateSpace {
+                    id: SpaceId::from_bytes([209; 16]),
+                    kind: SpaceKind::Shared,
+                    name: "Clustered Auth Gate Shared".into(),
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    let refreshed_owner = AccountContext::new(
+        fixture
+            .control
+            .trusted_none(
+                PerimeterAttestation::attest_checked().with_human_management(),
+                budget(),
+            )
+            .await
+            .unwrap(),
+        budget(),
+    );
+    let viewer_user_id = fixture
+        .control
+        .create_account(
+            refreshed_owner.clone(),
+            AccountMutation {
+                identity: runtime_ability_cases::identity(fixture, &refreshed_owner, 210).await,
+                input: NewAccount {
+                    username: "clustered-viewer".into(),
+                    email: None,
+                    display_name: "Clustered Viewer".into(),
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value
+        .id;
+    let shared_owner_scope = SpaceContext::new(
+        refreshed_owner.auth().clone(),
+        shared_space.history.clone(),
+        budget(),
+    )
+    .unwrap();
+    fixture
+        .control
+        .change_membership(
+            shared_owner_scope,
+            MembershipChange {
+                command: CommandKey::from_bytes([210, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]),
+                member: viewer_user_id.clone(),
+                role: Some(SpaceRole::Viewer),
+                expected: ControlRevision::ZERO,
+            },
+        )
+        .await
+        .unwrap();
+    let viewer_token = mint(TokenKind::Session).unwrap();
+    fixture
+        .storage
+        .observer
+        .seed_session(
+            &viewer_user_id,
+            &AuthSessionId::from_bytes([210; 16]),
+            &viewer_token,
+            fixture.storage.clock.0.load(Ordering::SeqCst),
+        )
+        .await;
+    let viewer_human = AccountContext::new(
+        fixture
+            .control
+            .resolve(support::evidence(
+                AuthEvidenceKind::Session,
+                viewer_token.secret.expose(),
+            ))
+            .await
+            .unwrap(),
+        budget(),
+    );
+    let viewer_thread = ChatThreadId::from_bytes([210; 16]);
+    for (target_scope, expect_read_only, tag) in [
+        (shared_space.history.clone(), true, 211_u8),
+        (personal.clone(), false, 212_u8),
+    ] {
+        let start_res = clustered
+            .start(
+                viewer_human.clone(),
+                StartChatRun {
+                    scope: target_scope.clone(),
+                    thread: viewer_thread.clone(),
+                    expected_leaf: ThreadEntrySeq::ZERO,
+                    options: ChatRunOptions::default(),
+                },
+            )
+            .await;
+        let enqueue_res = clustered
+            .enqueue_input(
+                viewer_human.clone(),
+                SubmitUserChatInput {
+                    identity: CommandIdentity {
+                        scope: target_scope.clone(),
+                        actor: viewer_user_id.clone(),
+                        key: CommandKey::from_bytes([tag; 16]),
+                        hash: ContentDigest::from_bytes([tag; 32]),
+                    },
+                    id: PendingInputId::from_bytes([tag; 16]),
+                    thread: viewer_thread.clone(),
+                    expected_leaf: ThreadEntrySeq::ZERO,
+                    body: "Unauthorized direct human must not touch cluster gate".into(),
+                    mentions_agent: true,
+                },
+                ChatRunOptions::default(),
+            )
+            .await;
+        let redact_res = clustered
+            .redact_chat_entry(
+                viewer_human.clone(),
+                Mutation {
+                    identity: CommandIdentity {
+                        scope: target_scope,
+                        actor: viewer_user_id.clone(),
+                        key: CommandKey::from_bytes([tag.wrapping_add(10); 16]),
+                        hash: ContentDigest::from_bytes([tag.wrapping_add(10); 32]),
+                    },
+                    preconditions: Preconditions::default(),
+                    input: RedactChatEntry {
+                        thread: viewer_thread.clone(),
+                        entry: ThreadEntrySeq::new(1).unwrap(),
+                        expected_thread_revision: RevisionId::from_bytes([tag; 16]),
+                    },
+                },
+            )
+            .await;
+        if expect_read_only {
+            assert!(
+                matches!(
+                    start_res,
+                    Err(PortError::Domain(DomainError::SpaceReadOnly))
+                ),
+                "{start_res:?}"
+            );
+            assert!(
+                matches!(
+                    enqueue_res,
+                    Err(PortError::Domain(DomainError::SpaceReadOnly))
+                ),
+                "{:?}",
+                enqueue_res.err()
+            );
+            assert!(
+                matches!(
+                    redact_res,
+                    Err(PortError::Domain(DomainError::SpaceReadOnly))
+                ),
+                "{redact_res:?}"
+            );
+        } else {
+            assert!(
+                matches!(
+                    start_res,
+                    Err(PortError::Domain(DomainError::ResourceNotFound))
+                ),
+                "{start_res:?}"
+            );
+            assert!(
+                matches!(
+                    enqueue_res,
+                    Err(PortError::Domain(DomainError::ResourceNotFound))
+                ),
+                "{:?}",
+                enqueue_res.err()
+            );
+            assert!(
+                matches!(
+                    redact_res,
+                    Err(PortError::Domain(DomainError::ResourceNotFound))
+                ),
+                "{redact_res:?}"
+            );
+        }
+    }
+    assert_eq!(
+        cluster_authority
+            .register_owner_calls
+            .load(Ordering::SeqCst),
+        0,
+        "Viewer/non-member start/enqueue/redact must not invoke register_owner"
+    );
+    assert_eq!(
+        cluster_authority
+            .admit_chat_write_calls
+            .load(Ordering::SeqCst),
+        0,
+        "Viewer/non-member start/enqueue/redact must not invoke admit_chat_write"
     );
     for (tag, bearer) in [(205_u8, read_pat), (206_u8, read_oauth)] {
         assert!(matches!(

@@ -438,7 +438,8 @@ async fn execute(
         "create_destination",
         None,
     )
-    .await?;
+    .await
+    .map_err(|error| batch_operational_error(LABEL, error, *committed_any))?;
     if created_folder {
         *committed_any = true;
     }
@@ -463,10 +464,7 @@ async fn execute(
         .engine
         .create_note(writer, write)
         .await
-        .map_err(|error| match error {
-            PortError::Domain(domain) => PortError::Domain(domain),
-            operational => batch_operational_error(LABEL, operational, *committed_any),
-        })?;
+        .map_err(|error| batch_operational_error(LABEL, error, *committed_any))?;
     *committed_any = true;
     Ok((committed, parent.folder_id))
 }
@@ -676,6 +674,17 @@ pub(in crate::mcp) fn batch_operational_error(
     error: PortError,
     committed_any: bool,
 ) -> PortError {
+    if committed_any && matches!(error, PortError::Domain(DomainError::RateLimited { .. })) {
+        return PortError::Unavailable(
+            OperationalFailure::new(
+                derive_digest(label, &[error.code().as_bytes()]),
+                CommitEffect::Unknown,
+                RetryAdvice::RetrySameCommand,
+                true,
+            )
+            .expect("same-command retry has durable identity"),
+        );
+    }
     if matches!(error, PortError::Domain(_)) {
         return error;
     }
@@ -740,8 +749,10 @@ pub(super) async fn create_many(
                     .insert(item.prepared.note.clone());
                 created.push(Ok(item));
             }
-            Err(PortError::Domain(error)) => created.push(Err(error)),
-            Err(error) => return Err(batch_operational_error(LABEL, error, committed_any)),
+            Err(error) => match batch_operational_error(LABEL, error, committed_any) {
+                PortError::Domain(domain) => created.push(Err(domain)),
+                operational => return Err(operational),
+            },
         }
     }
     let mut results = Vec::with_capacity(created.len());
@@ -838,6 +849,15 @@ mod tests {
             retry_after_ms: 1000,
             budget: notarium_core::error::BudgetKind::Concurrency,
         });
+        assert_eq!(
+            batch_operational_error(label, rate_limited.clone(), false),
+            rate_limited
+        );
+        assert!(matches!(
+            batch_operational_error(label, rate_limited.clone(), true),
+            PortError::Unavailable(f)
+                if f.effect() == CommitEffect::Unknown && f.retry() == RetryAdvice::RetrySameCommand
+        ));
         assert!(matches!(
             post_commit_error(label, rate_limited),
             PortError::Unavailable(f)

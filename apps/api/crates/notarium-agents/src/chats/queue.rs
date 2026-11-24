@@ -27,6 +27,7 @@ impl AgentRunSupervisor {
         }
         let scope = input.identity.scope.clone();
         let thread = input.thread.clone();
+        self.authorize_chat_space_write(&account, &scope).await?;
         let _admission = self
             .lock_thread_gate(&scope, &thread, &mut account.budget, deadline)
             .await?;
@@ -34,6 +35,7 @@ impl AgentRunSupervisor {
         if account.auth().kind() != &PrincipalKind::DirectHuman {
             return Err(DomainError::AccessDenied.into());
         }
+        self.authorize_chat_space_write(&account, &scope).await?;
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err(gate_deadline());

@@ -315,6 +315,9 @@ impl AgentRunSupervisor {
             if account.auth().kind() != &PrincipalKind::DirectHuman {
                 return Err(DomainError::AccessDenied.into());
             }
+            service
+                .authorize_chat_space_write(&account, &request.scope)
+                .await?;
             let _admission = service
                 .lock_thread_gate(
                     &request.scope,
@@ -512,7 +515,12 @@ impl AgentRunSupervisor {
             let _drain = service
                 .inner
                 .revocations
-                .stop_and_drain_run(&scope.space_id, &run, &remaining_budget())
+                .stop_and_drain_run(
+                    &scope.space_id,
+                    &run,
+                    live_auth.principal(),
+                    &remaining_budget(),
+                )
                 .await?;
             service
                 .inner
@@ -556,6 +564,37 @@ impl AgentRunSupervisor {
         .await
     }
 
+    pub(super) async fn authorize_chat_space_write(
+        &self,
+        account: &AccountContext,
+        scope: &HistoryScope,
+    ) -> Result<(), PortError> {
+        let grant = account
+            .auth()
+            .spaces()
+            .get(&scope.space_id)
+            .ok_or(DomainError::ResourceNotFound)?;
+        if grant.role == notarium_core::auth::SpaceRole::Viewer || grant.project_root.is_some() {
+            return Err(DomainError::SpaceReadOnly.into());
+        }
+        let space_record = self
+            .inner
+            .registry
+            .catalog()
+            .space(account.budget.clone(), scope.space_id.clone())
+            .await?;
+        if space_record.space.lifecycle != notarium_core::auth::SpaceLifecycle::Active {
+            return Err(DomainError::ResourceNotFound.into());
+        }
+        scope.check(&space_record.history)?;
+        if account.auth().taint().is_tainted()
+            && space_record.space.kind == notarium_core::auth::SpaceKind::Shared
+        {
+            return Err(DomainError::CrossSpaceTainted.into());
+        }
+        Ok(())
+    }
+
     /// Redact an entry and stop the local owner of any turn using this branch.
     pub async fn redact_chat_entry(
         &self,
@@ -570,30 +609,7 @@ impl AgentRunSupervisor {
             require_write_bearer(account.auth())?;
             let mut account = service.live_account(account).await?;
             require_write_bearer(account.auth())?;
-            let grant = account
-                .auth()
-                .spaces()
-                .get(&scope.space_id)
-                .ok_or(DomainError::ResourceNotFound)?;
-            if grant.role == notarium_core::auth::SpaceRole::Viewer || grant.project_root.is_some()
-            {
-                return Err(DomainError::SpaceReadOnly.into());
-            }
-            let space_record = service
-                .inner
-                .registry
-                .catalog()
-                .space(account.budget.clone(), scope.space_id.clone())
-                .await?;
-            if space_record.space.lifecycle != notarium_core::auth::SpaceLifecycle::Active {
-                return Err(DomainError::ResourceNotFound.into());
-            }
-            scope.check(&space_record.history)?;
-            if account.auth().taint().is_tainted()
-                && space_record.space.kind == notarium_core::auth::SpaceKind::Shared
-            {
-                return Err(DomainError::CrossSpaceTainted.into());
-            }
+            service.authorize_chat_space_write(&account, &scope).await?;
             let _admission = service
                 .lock_thread_gate(&scope, &thread, &mut account.budget, deadline)
                 .await?;

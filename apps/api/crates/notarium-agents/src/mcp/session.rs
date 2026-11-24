@@ -343,6 +343,9 @@ async fn start(call: &mut ToolCallContext<'_>, args: StartArgs) -> Result<Value,
             args.task.as_deref(),
             requested.clone(),
         )?;
+        if let Some(handle) = args.project.as_deref() {
+            address::project_handle(handle)?;
+        }
         if call.auth.taint().is_tainted() {
             return Err(DomainError::CrossSpaceTainted.into());
         }
@@ -359,6 +362,13 @@ async fn start(call: &mut ToolCallContext<'_>, args: StartArgs) -> Result<Value,
         }
     }
     const SESSION_LABEL: &str = "notarium.mcp.start-session.v1";
+    let map_session_err = |error: PortError| {
+        if committed_any {
+            super::note_tools::post_commit_error(SESSION_LABEL, error)
+        } else {
+            super::note_tools::batch_operational_error(SESSION_LABEL, error, false)
+        }
+    };
     let selector = validated_selector.expect("selector validated when starting session");
     let plan: StartPlan = call
         .journal("start-episode", || async {
@@ -381,13 +391,11 @@ async fn start(call: &mut ToolCallContext<'_>, args: StartArgs) -> Result<Value,
             })
         })
         .await
-        .map_err(|error| {
-            super::note_tools::batch_operational_error(SESSION_LABEL, error, committed_any)
-        })?;
+        .map_err(map_session_err)?;
     if let Some(project) = &plan.project {
-        project_for_folder(call, project).await.map_err(|error| {
-            super::note_tools::batch_operational_error(SESSION_LABEL, error, committed_any)
-        })?;
+        project_for_folder(call, project)
+            .await
+            .map_err(map_session_err)?;
     }
     if let Some(role_selector) = args.role.as_deref() {
         let preview_project = if plan.project.is_some() {
@@ -400,23 +408,11 @@ async fn start(call: &mut ToolCallContext<'_>, args: StartArgs) -> Result<Value,
                         .control
                         .get_episode(call.account(), id.clone())
                         .await
-                        .map_err(|error| {
-                            super::note_tools::batch_operational_error(
-                                SESSION_LABEL,
-                                error,
-                                committed_any,
-                            )
-                        })?;
+                        .map_err(map_session_err)?;
                     Some(
                         selected_project_for_episode(call, None, Some(&episode))
                             .await
-                            .map_err(|error| {
-                                super::note_tools::batch_operational_error(
-                                    SESSION_LABEL,
-                                    error,
-                                    committed_any,
-                                )
-                            })?,
+                            .map_err(map_session_err)?,
                     )
                 }
                 EpisodeSelector::Name(name) => match call
@@ -424,17 +420,12 @@ async fn start(call: &mut ToolCallContext<'_>, args: StartArgs) -> Result<Value,
                     .control
                     .named_episode_project_hint(call.account(), name.clone())
                     .await
-                    .map_err(|error| {
-                        super::note_tools::batch_operational_error(
-                            SESSION_LABEL,
-                            error,
-                            committed_any,
-                        )
-                    })? {
+                    .map_err(map_session_err)?
+                {
                     NamedEpisodePreview::NoMatch => Some(None),
                     NamedEpisodePreview::Unique(project) => Some(project),
                     NamedEpisodePreview::ProjectUnavailable => {
-                        return Err(DomainError::ResourceNotFound.into());
+                        return Err(map_session_err(DomainError::ResourceNotFound.into()));
                     }
                     NamedEpisodePreview::Ambiguous => None,
                 },
@@ -444,9 +435,7 @@ async fn start(call: &mut ToolCallContext<'_>, args: StartArgs) -> Result<Value,
         if let Some(preview_project) = preview_project {
             ability_tools::validate_session_role(call, role_selector, preview_project.as_ref())
                 .await
-                .map_err(|error| {
-                    super::note_tools::batch_operational_error(SESSION_LABEL, error, committed_any)
-                })?;
+                .map_err(map_session_err)?;
         }
     }
     let selector = match selector {
@@ -471,9 +460,7 @@ async fn start(call: &mut ToolCallContext<'_>, args: StartArgs) -> Result<Value,
             },
         )
         .await
-        .map_err(|error| {
-            super::note_tools::batch_operational_error(SESSION_LABEL, error, committed_any)
-        })?;
+        .map_err(map_session_err)?;
     let (episode, state) = match opened.value {
         EpisodeStartResult::New(episode) => (episode, "new"),
         EpisodeStartResult::Resumed(episode) => (episode, "resumed"),

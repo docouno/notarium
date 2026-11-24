@@ -1730,23 +1730,23 @@ async fn chat_candidate_visibility(store: Arc<CanonicalStore>, root: DataRoot) {
         assert!(results.chat_hits.iter().map(|hit| &hit.thread).eq(expected));
         assert!(!results.truncated);
     }
-    let owner_shared_run = notarium_core::ports::SpaceContext::new(
-        owner_ctx
+    let keeper_owner_shared_run = notarium_core::ports::SpaceContext::new(
+        other_ctx
             .auth()
             .for_agent_run(
                 AgentRunId::from_bytes([0x99; 16]),
                 space.scope.space_id.clone(),
                 ChatAudience::Shared,
-                owner_ctx.auth().spaces().clone(),
+                other_ctx.auth().spaces().clone(),
             )
             .unwrap(),
         space.scope.clone(),
-        owner_ctx.budget.clone(),
+        other_ctx.budget.clone(),
     )
     .unwrap();
     let shared_log_hits = engine
         .search(
-            owner_shared_run,
+            keeper_owner_shared_run,
             SearchQuery {
                 text: "logterm".into(),
                 ..req.clone()
@@ -1756,7 +1756,7 @@ async fn chat_candidate_visibility(store: Arc<CanonicalStore>, root: DataRoot) {
         .unwrap();
     assert!(
         shared_log_hits.chat_hits.is_empty(),
-        "Shared-audience AgentRun must not see owner's KeeperLog in chat search"
+        "Shared-audience AgentRun must not see its own principal's KeeperLog in chat search"
     );
     let log_hits = engine
         .search(

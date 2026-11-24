@@ -504,11 +504,22 @@ async fn ensure_destination(
         };
         call.record_journal_with_key(label, &content_command.key, content_command.hash, &plan)
             .await
-            .map_err(|error| batch_operational_error(ERR_LABEL, error, !existed))?
+            .map_err(|error| {
+                if !existed {
+                    post_commit_error(ERR_LABEL, error)
+                } else {
+                    batch_operational_error(ERR_LABEL, error, false)
+                }
+            })?
     };
     let (destination, created) = ensured.into_parts(has_path);
     if destination.space_id != scope.scope().space_id {
-        return Err(invalid(ValidationReason::ScopeMismatch));
+        let mismatch = invalid(ValidationReason::ScopeMismatch);
+        return Err(if created {
+            post_commit_error(ERR_LABEL, mismatch)
+        } else {
+            mismatch
+        });
     }
     let live = call
         .registry
@@ -520,11 +531,24 @@ async fn ensure_destination(
         || live.space.id != destination.space_id
         || live.lifecycle != Lifecycle::Active
     {
-        return Err(DomainError::ResourceNotFound.into());
+        let not_found: PortError = DomainError::ResourceNotFound.into();
+        return Err(if created {
+            post_commit_error(ERR_LABEL, not_found)
+        } else {
+            not_found
+        });
     }
     scope
         .auth()
-        .can_view_folder(&live.space, &destination.folder_id, &live.ancestor_folders)?;
+        .can_view_folder(&live.space, &destination.folder_id, &live.ancestor_folders)
+        .map_err(|error| {
+            let err: PortError = error.into();
+            if created {
+                post_commit_error(ERR_LABEL, err)
+            } else {
+                err
+            }
+        })?;
     if matches!(call.target, EgressTarget::InAppProvider { .. }) {
         let resolved = folder_base(call, scope, &destination.folder_id)
             .await

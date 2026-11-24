@@ -312,6 +312,46 @@ impl ControlCatalogPort for CanonicalStore {
             .await
         })
     }
+    fn agent_run_has_head(
+        &self,
+        budget: CallBudget,
+        space: SpaceId,
+        run: AgentRunId,
+    ) -> PortFuture<'_, bool> {
+        Box::pin(async move {
+            self.with_read_tx_budget(Some(&budget), move |tx| {
+                Box::pin(async move {
+                    let exists: bool = match tx {
+                        BackendConn::Sqlite(conn) => sqlx::query_scalar(
+                            "SELECT EXISTS(SELECT 1 FROM agent_run_heads WHERE space_id = ? AND run_id = ?)",
+                        )
+                        .bind(space.as_str())
+                        .bind(run.as_str())
+                        .fetch_one(&mut **conn)
+                        .await
+                        .map_err(|err| {
+                            crate::codec::internal_not_committed(
+                                "sqlite_catalog_run_head",
+                                err.to_string(),
+                            )
+                        })?,
+                        BackendConn::Postgres(conn) => sqlx::query_scalar(
+                            "SELECT EXISTS(SELECT 1 FROM agent_run_heads WHERE space_id = $1 AND run_id = $2)",
+                        )
+                        .bind(space.as_str())
+                        .bind(run.as_str())
+                        .fetch_one(&mut **conn)
+                        .await
+                        .map_err(|err| {
+                            crate::runtime::pg_read_error("pg_catalog_run_head", err)
+                        })?,
+                    };
+                    Ok(exists)
+                })
+            })
+            .await
+        })
+    }
     fn project(&self, ctx: SpaceContext, reference: FolderRef) -> PortFuture<'_, ProjectInfo> {
         Box::pin(async move {
             let budget = ctx.budget.clone();

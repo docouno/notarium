@@ -459,9 +459,7 @@ impl Destination {
             &folder,
         )
         .await
-        .map_err(|error| {
-            super::batch_operational_error("notarium.confirmed-destination.v1", error, true)
-        })
+        .map_err(|error| super::post_commit_error("notarium.confirmed-destination.v1", error))
     }
 }
 

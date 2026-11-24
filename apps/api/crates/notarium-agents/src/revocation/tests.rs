@@ -446,6 +446,27 @@ async fn stop_and_drain_run_respects_caller_cancellation_and_zero_budget_without
         .register_run(context(1), &run_auth, None, run_cancel.clone())
         .unwrap();
 
+    // Foreign principal must NOT cancel or fence another user's private (non-Shared) run.
+    let foreign = PrincipalId::from_bytes([0x99; 16]);
+    let foreign_budget = CallBudget {
+        request: RequestId::from_bytes([0x46; 16]),
+        cancellation: Cancellation::default(),
+        remaining: Duration::from_secs(5),
+    };
+    let foreign_res = hub
+        .stop_and_drain_run(&space, &run_id, &foreign, &foreign_budget)
+        .await
+        .unwrap();
+    assert!(
+        foreign_res.is_none(),
+        "foreign caller must not fence another user's private run"
+    );
+    assert!(
+        !run_cancel.is_cancelled(),
+        "foreign caller must not cancel another user's private run"
+    );
+    assert!(running.check().is_ok());
+
     // Pre-cancelled caller must fail with Cancelled without touching the active run.
     let cancelled_token = Cancellation::default();
     cancelled_token.cancel();
@@ -455,7 +476,7 @@ async fn stop_and_drain_run_respects_caller_cancellation_and_zero_budget_without
         remaining: Duration::from_secs(5),
     };
     let err = hub
-        .stop_and_drain_run(&space, &run_id, &cancelled_budget)
+        .stop_and_drain_run(&space, &run_id, auth.principal(), &cancelled_budget)
         .await;
     assert!(matches!(err, Err(PortError::Cancelled(_))));
     assert!(
@@ -470,7 +491,9 @@ async fn stop_and_drain_run_respects_caller_cancellation_and_zero_budget_without
         cancellation: Cancellation::default(),
         remaining: Duration::ZERO,
     };
-    let err = hub.stop_and_drain_run(&space, &run_id, &zero_budget).await;
+    let err = hub
+        .stop_and_drain_run(&space, &run_id, auth.principal(), &zero_budget)
+        .await;
     assert!(matches!(err, Err(PortError::DeadlineExceeded(_))));
     assert!(
         !run_cancel.is_cancelled(),
@@ -485,7 +508,9 @@ async fn stop_and_drain_run_respects_caller_cancellation_and_zero_budget_without
         cancellation: Cancellation::default(),
         remaining: Duration::from_millis(15),
     };
-    let err = hub.stop_and_drain_run(&space, &run_id, &short_budget).await;
+    let err = hub
+        .stop_and_drain_run(&space, &run_id, auth.principal(), &short_budget)
+        .await;
     assert!(matches!(err, Err(PortError::DeadlineExceeded(_))));
     assert!(run_cancel.is_cancelled());
     drop(running);

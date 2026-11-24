@@ -443,11 +443,77 @@ impl KeeperScheduler {
         let control = self.inner.registry.control();
         let mut result = control.claim_schedule(ctx.clone(), claim.clone()).await;
         let mut tried = std::collections::BTreeSet::from([claim.next_slot]);
-        let mut cursor = fresh;
-        let mut tried_now_probe = false;
-        let mut tried_slot_probe = false;
-        const MAX_NEXT_SLOT_RETRIES: usize = 16;
-        for _ in 0..MAX_NEXT_SLOT_RETRIES {
+        let mut forward_cursor = fresh.max(now);
+        // Step backward from `forward_cursor` toward `slot` rather than walking
+        // forward from `slot`, so a misfired schedule with slight backward clock
+        // skew reaches Control's expected slot in O(skew) instead of O(misfire).
+        let backward_step_secs = claim
+            .next_slot
+            .and_then(|first| {
+                next(first).ok().flatten().map(|second| {
+                    second
+                        .unix_seconds()
+                        .saturating_sub(first.unix_seconds())
+                        .max(1)
+                })
+            })
+            .unwrap_or(60);
+        let mut backward_anchor: Option<Timestamp> =
+            (slot < forward_cursor).then_some(forward_cursor);
+        let mut tried_short_backward = backward_step_secs <= 60;
+        let mut tried_now_probe = now == fresh;
+        const MAX_NEXT_SLOT_RETRIES: usize = 20;
+        let advance_untried = |cursor: &mut Timestamp,
+                               tried: &std::collections::BTreeSet<Option<Timestamp>>|
+         -> Result<Option<Option<Timestamp>>, PortError> {
+            let mut candidate = next(*cursor)?;
+            loop {
+                if !tried.contains(&candidate) {
+                    if let Some(ts) = candidate {
+                        *cursor = (*cursor).max(ts);
+                    }
+                    return Ok(Some(candidate));
+                }
+                let Some(next_ts) = candidate else {
+                    return Ok(None);
+                };
+                *cursor = (*cursor).max(next_ts);
+                candidate = next(*cursor)?;
+            }
+        };
+        let rewind_untried = |anchor: &mut Option<Timestamp>,
+                              tried_short: &mut bool,
+                              tried: &std::collections::BTreeSet<Option<Timestamp>>|
+         -> Result<Option<Option<Timestamp>>, PortError> {
+            loop {
+                let Some(current) = *anchor else {
+                    return Ok(None);
+                };
+                if current <= slot {
+                    *anchor = None;
+                    return Ok(None);
+                }
+                let step = if !*tried_short {
+                    *tried_short = true;
+                    60
+                } else {
+                    backward_step_secs
+                };
+                let stepped = Timestamp::from_unix_parts(
+                    current
+                        .unix_seconds()
+                        .saturating_sub(step)
+                        .max(slot.unix_seconds()),
+                    0,
+                )?;
+                let candidate = next(stepped)?;
+                *anchor = if stepped <= slot { None } else { Some(stepped) };
+                if !tried.contains(&candidate) {
+                    return Ok(Some(candidate));
+                }
+            }
+        };
+        for step in 0..MAX_NEXT_SLOT_RETRIES {
             if !matches!(&result, Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
                 if diagnostic.reason == ValidationReason::InvalidTimestamp)
             {
@@ -468,57 +534,35 @@ impl KeeperScheduler {
             } else {
                 now
             };
-            let refreshed = {
+            let refreshed = if latest > forward_cursor {
+                forward_cursor = latest;
                 let latest_candidate = next(latest)?;
                 if !tried.contains(&latest_candidate) {
-                    cursor = latest;
-                    latest_candidate
-                } else if !tried_now_probe {
-                    tried_now_probe = true;
-                    let probe = next(now)?;
-                    if !tried.contains(&probe) {
-                        cursor = now.min(latest);
-                        probe
-                    } else {
-                        cursor = cursor.max(latest);
-                        let mut candidate = next(cursor)?;
-                        while tried.contains(&candidate) {
-                            let Some(next_ts) = candidate else {
-                                break;
-                            };
-                            cursor = cursor.max(next_ts);
-                            candidate = next(cursor)?;
-                        }
-                        candidate
+                    if let Some(ts) = latest_candidate {
+                        forward_cursor = forward_cursor.max(ts);
                     }
-                } else if !tried_slot_probe && slot < cursor {
-                    tried_slot_probe = true;
-                    let probe = next(slot)?;
-                    if !tried.contains(&probe) {
-                        cursor = slot;
-                        probe
-                    } else {
-                        let mut candidate = next(cursor)?;
-                        while tried.contains(&candidate) {
-                            let Some(next_ts) = candidate else {
-                                break;
-                            };
-                            cursor = cursor.max(next_ts);
-                            candidate = next(cursor)?;
-                        }
-                        candidate
-                    }
+                    Some(latest_candidate)
                 } else {
-                    let mut candidate = next(cursor)?;
-                    while tried.contains(&candidate) {
-                        let Some(next_ts) = candidate else {
-                            break;
-                        };
-                        cursor = cursor.max(next_ts);
-                        candidate = next(cursor)?;
-                    }
-                    candidate
+                    advance_untried(&mut forward_cursor, &tried)?
                 }
+            } else if !tried_now_probe {
+                tried_now_probe = true;
+                let probe = next(now)?;
+                if !tried.contains(&probe) {
+                    Some(probe)
+                } else {
+                    advance_untried(&mut forward_cursor, &tried)?
+                }
+            } else if step % 2 == 1 && backward_anchor.is_some() {
+                match rewind_untried(&mut backward_anchor, &mut tried_short_backward, &tried)? {
+                    Some(found) => Some(found),
+                    None => advance_untried(&mut forward_cursor, &tried)?,
+                }
+            } else {
+                advance_untried(&mut forward_cursor, &tried)?
+            };
+            let Some(refreshed) = refreshed else {
+                break;
             };
             if !tried.insert(refreshed) {
                 break;
