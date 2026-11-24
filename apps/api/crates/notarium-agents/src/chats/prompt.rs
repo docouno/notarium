@@ -218,8 +218,6 @@ pub(crate) async fn load_history(
     load_history_after(engine, ctx, thread, leaf, selection, None).await
 }
 
-/// A scheduled task retains the same durable audit log while starting its
-/// prompt from the head it inherited at the beginning of this run.
 fn remaining_context(ctx: &SpaceContext, deadline: Instant) -> Result<SpaceContext, PortError> {
     if ctx.budget.cancellation.is_cancelled() {
         return Err(PortError::Cancelled(
@@ -249,6 +247,8 @@ fn remaining_context(ctx: &SpaceContext, deadline: Instant) -> Result<SpaceConte
     Ok(updated)
 }
 
+/// A scheduled task retains the same durable audit log while starting its
+/// prompt from the head it inherited at the beginning of this run.
 pub(crate) async fn load_history_after(
     engine: &dyn ChatPort,
     ctx: &SpaceContext,

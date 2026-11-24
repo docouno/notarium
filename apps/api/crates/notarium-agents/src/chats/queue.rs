@@ -20,7 +20,7 @@ impl AgentRunSupervisor {
         if !options.limits.fits(RunLimits::HARD_CEILING) {
             return Err(invalid(ValidationReason::BudgetExceeded));
         }
-        let deadline = Instant::now() + account.budget.remaining;
+        let deadline = deadline_from(account.budget.remaining);
         let mut account = self.live_account(account).await?;
         if account.auth().kind() != &PrincipalKind::DirectHuman {
             return Err(DomainError::AccessDenied.into());

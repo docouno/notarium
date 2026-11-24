@@ -156,7 +156,9 @@ impl AgentRunSupervisor {
                     .await?;
             let branch = &history.branch;
             if branch.thread.head != leaf || branch.thread.active_run.as_ref() != Some(&run.id) {
-                self.refresh_peer_head(run, ctx, branch.thread.head).await?;
+                let refresh_ctx = run.context(budget.remaining())?;
+                self.refresh_peer_head(run, refresh_ctx, branch.thread.head)
+                    .await?;
                 // The canonical append protects the same precondition again at commit.
                 return Err(invalid(ValidationReason::SourceMismatch));
             }

@@ -310,7 +310,7 @@ impl AgentRunSupervisor {
     ) -> Result<AgentRunId, PortError> {
         let service = self.clone();
         detached(async move {
-            let deadline = Instant::now() + account.budget.remaining;
+            let deadline = deadline_from(account.budget.remaining);
             let mut account = service.live_account(account).await?;
             if account.auth().kind() != &PrincipalKind::DirectHuman {
                 return Err(DomainError::AccessDenied.into());
@@ -515,7 +515,7 @@ impl AgentRunSupervisor {
         detached(async move {
             let scope = request.identity.scope.clone();
             let thread = request.input.thread.clone();
-            let deadline = Instant::now() + account.budget.remaining;
+            let deadline = deadline_from(account.budget.remaining);
             let _admission = service
                 .lock_thread_gate(&scope, &thread, &mut account.budget, deadline)
                 .await?;
@@ -771,35 +771,8 @@ impl AgentRunSupervisor {
         budget: &mut CallBudget,
         deadline: Instant,
     ) -> Result<tokio::sync::OwnedMutexGuard<()>, PortError> {
-        if self.inner.shutdown.is_cancelled() {
-            return Err(owner_unavailable());
-        }
-        if budget.cancellation.is_cancelled() {
-            return Err(gate_cancelled());
-        }
-        if deadline <= Instant::now() {
-            return Err(gate_deadline());
-        }
         let gate = self.thread_gate(scope, thread);
-        let guard = tokio::select! {
-            biased;
-            () = self.inner.shutdown.cancelled() => return Err(owner_unavailable()),
-            () = budget.cancellation.cancelled() => return Err(gate_cancelled()),
-            () = tokio::time::sleep_until(deadline) => return Err(gate_deadline()),
-            guard = gate.lock_owned() => guard,
-        };
-        if self.inner.shutdown.is_cancelled() {
-            return Err(owner_unavailable());
-        }
-        if budget.cancellation.is_cancelled() {
-            return Err(gate_cancelled());
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(gate_deadline());
-        }
-        budget.remaining = remaining;
-        Ok(guard)
+        lock_gate(gate, &self.inner.shutdown, budget, deadline).await
     }
 
     fn active(&self, scope: &HistoryScope, thread: &ChatThreadId) -> Option<Arc<ActiveRun>> {
@@ -1307,6 +1280,48 @@ fn invalid(reason: ValidationReason) -> PortError {
     DomainError::validation(reason).into()
 }
 
+fn deadline_from(remaining: Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_add(remaining)
+        .unwrap_or_else(|| now + Duration::from_secs(86_400))
+}
+
+async fn lock_gate(
+    gate: Arc<AsyncMutex<()>>,
+    shutdown: &Cancellation,
+    budget: &mut CallBudget,
+    deadline: Instant,
+) -> Result<tokio::sync::OwnedMutexGuard<()>, PortError> {
+    if shutdown.is_cancelled() {
+        return Err(owner_unavailable());
+    }
+    if budget.cancellation.is_cancelled() {
+        return Err(gate_cancelled());
+    }
+    if deadline <= Instant::now() {
+        return Err(gate_deadline());
+    }
+    let guard = tokio::select! {
+        biased;
+        () = shutdown.cancelled() => return Err(owner_unavailable()),
+        () = budget.cancellation.cancelled() => return Err(gate_cancelled()),
+        () = tokio::time::sleep_until(deadline) => return Err(gate_deadline()),
+        guard = gate.lock_owned() => guard,
+    };
+    if shutdown.is_cancelled() {
+        return Err(owner_unavailable());
+    }
+    if budget.cancellation.is_cancelled() {
+        return Err(gate_cancelled());
+    }
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(gate_deadline());
+    }
+    budget.remaining = remaining;
+    Ok(guard)
+}
+
 fn owner_unavailable() -> PortError {
     PortError::Unavailable(
         OperationalFailure::new(
@@ -1397,4 +1412,68 @@ fn require_write_bearer(auth: &EngineAuthContext) -> Result<(), PortError> {
         return Err(DomainError::AccessDenied.into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn thread_gate_wait_enforces_deadline_cancellation_and_subtracts_wait_time() {
+        let gate = Arc::new(AsyncMutex::new(()));
+        let shutdown = Cancellation::default();
+        let held = gate.clone().lock_owned().await;
+
+        // 1. Contended gate times out cleanly at deadline instead of waiting forever.
+        let mut short_budget = CallBudget {
+            request: RequestId::from_bytes([1; 16]),
+            cancellation: Cancellation::default(),
+            remaining: Duration::from_millis(40),
+        };
+        let started = Instant::now();
+        let short_deadline = deadline_from(short_budget.remaining);
+        let err = lock_gate(gate.clone(), &shutdown, &mut short_budget, short_deadline)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PortError::DeadlineExceeded(_)), "{err:?}");
+        assert!(started.elapsed() < Duration::from_millis(500));
+
+        // 2. Contended gate respects caller cancellation immediately.
+        let cancel = Cancellation::default();
+        let mut cancel_budget = CallBudget {
+            request: RequestId::from_bytes([2; 16]),
+            cancellation: cancel.clone(),
+            remaining: Duration::from_secs(5),
+        };
+        let cancel_trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            cancel_trigger.cancel();
+        });
+        let cancel_deadline = deadline_from(cancel_budget.remaining);
+        let err = lock_gate(gate.clone(), &shutdown, &mut cancel_budget, cancel_deadline)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PortError::Cancelled(_)), "{err:?}");
+
+        // 3. When the gate releases before deadline, remaining budget is reduced by wait time.
+        let mut wait_budget = CallBudget {
+            request: RequestId::from_bytes([3; 16]),
+            cancellation: Cancellation::default(),
+            remaining: Duration::from_millis(500),
+        };
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            drop(held);
+        });
+        let wait_deadline = deadline_from(wait_budget.remaining);
+        let _guard = lock_gate(gate, &shutdown, &mut wait_budget, wait_deadline)
+            .await
+            .unwrap();
+        assert!(
+            wait_budget.remaining <= Duration::from_millis(460),
+            "remaining budget must subtract mutex wait time: {:?}",
+            wait_budget.remaining
+        );
+    }
 }

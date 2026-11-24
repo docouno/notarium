@@ -254,14 +254,17 @@ pub(crate) async fn complete_step(
     let finish = finish.ok_or_else(protocol)?;
     match finish {
         CompletionFinish::ToolCalls if calls.is_empty() => return Err(protocol()),
-        CompletionFinish::Stop if !calls.is_empty() => return Err(protocol()),
+        CompletionFinish::ToolCalls => {}
+        CompletionFinish::Stop | CompletionFinish::ContentFilter if !calls.is_empty() => {
+            return Err(protocol());
+        }
+        CompletionFinish::Stop | CompletionFinish::ContentFilter => {}
         CompletionFinish::Length => {
             // A truncated completion may include partial or unverified tool
             // calls alongside generated text. Drop tool calls so they are not
             // executed and preserve the partial text with Length interruption.
             calls.clear();
         }
-        _ => {}
     }
     let charge_tokens = charge(&budget, usage.ok_or_else(protocol)?)?;
     run_budget.settle(reservation, charge_tokens);

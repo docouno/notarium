@@ -154,8 +154,31 @@ pub(super) async fn submit(
                     })
                 })
             })
-            .await?;
-        if let Some(outcome) = precheck {
+            .await;
+        // A concurrent retry with the same command key can commit between the
+        // initial receipt check and this admission read. Resolve any completed
+        // receipt before returning Changed, Full, or DuplicateKey.
+        let check_replay = matches!(&precheck, Ok(Some(_)))
+            || matches!(
+                &precheck,
+                Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
+                    if diagnostic.reason == ValidationReason::DuplicateKey
+            );
+        if check_replay
+            && let Some(replayed) = deadline
+                .prepare(&ctx.budget, || {
+                    try_replay_completed_receipt::<StoredUserChatSubmissionV1>(
+                        store,
+                        &space.scope,
+                        &idemp,
+                        Some(&ctx.budget),
+                    )
+                })
+                .await?
+        {
+            return Ok(replayed.into_outcome(ctx.auth()));
+        }
+        if let Some(outcome) = precheck? {
             return Ok(outcome);
         }
         let prepared = PreparedBlobSource::prepare(request.body.as_bytes(), store.blob_codec())?;

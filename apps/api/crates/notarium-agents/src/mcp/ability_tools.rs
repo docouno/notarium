@@ -234,10 +234,9 @@ async fn resolve_selector_for_account(
             )
             .await;
     }
-    if let Ok(id) = AbilityId::parse(selector) {
-        let Some(reference) = raw_reference_for_account(registry, account, id).await? else {
-            return Ok(AbilityResolution::Missing);
-        };
+    if let Ok(id) = AbilityId::parse_v1(selector)
+        && let Some(reference) = raw_reference_for_account(registry, account, id).await?
+    {
         return registry
             .control
             .resolve_ability(
@@ -246,17 +245,32 @@ async fn resolve_selector_for_account(
             )
             .await;
     }
-    registry
+    let by_name = registry
         .control
         .resolve_ability(
             account.clone(),
             AbilitySelection::Name {
                 name: notarium_syntax::unicode::lookup_key(selector),
                 kind,
-                project,
+                project: project.clone(),
             },
         )
-        .await
+        .await?;
+    if !matches!(by_name, AbilityResolution::Missing) {
+        return Ok(by_name);
+    }
+    if let Ok(id) = AbilityId::parse(selector)
+        && let Some(reference) = raw_reference_for_account(registry, account, id).await?
+    {
+        return registry
+            .control
+            .resolve_ability(
+                account.clone(),
+                AbilitySelection::Exact { reference, project },
+            )
+            .await;
+    }
+    Ok(by_name)
 }
 
 async fn raw_reference(

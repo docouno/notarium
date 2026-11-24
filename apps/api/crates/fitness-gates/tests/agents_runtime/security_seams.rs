@@ -2462,36 +2462,36 @@ async fn contract_and_seams_regressions(fixture: &RuntimeFixture, personal: &Spa
         "reusing folder cursor after sibling creation must return CursorStale: {stale_page:?}"
     );
 
-    // 4. Ability names with an `ab_` prefix (e.g. `ab_weekly`) must resolve by name, and
+    // 4. Ability names with an `ab_` prefix (e.g. `ab_weekly`) AND 12-character ASCII names
+    // (which match legacy ID shape, e.g. `ab_weekly_01`) must both resolve by name, and
     // `use_role` in a SpaceGroup/Shared chat must render inline without mutating the episode.
-    call(
-        fixture,
-        &owner,
-        223,
-        "create_ability",
-        json!({
-            "kind": "skill",
-            "name": "ab_weekly",
-            "description": "Weekly digest checklist",
-            "instructions": "# Weekly\n\nCheck progress.",
-            "placement": {"home": "personal"},
-        }),
-    )
-    .await
-    .unwrap();
-    let activated_ab = call(
-        fixture,
-        &owner,
-        224,
-        "use_skill",
-        json!({"name": "ab_weekly"}),
-    )
-    .await
-    .unwrap();
-    assert!(
-        activated_ab.content[0].text.contains("Check progress."),
-        "ab_-prefixed ability name must activate by name"
-    );
+    for (create_tag, use_tag, name, marker) in [
+        (223u8, 224u8, "ab_weekly", "Check progress."),
+        (233u8, 234u8, "ab_weekly_01", "Twelve-char name."),
+    ] {
+        call(
+            fixture,
+            &owner,
+            create_tag,
+            "create_ability",
+            json!({
+                "kind": "skill",
+                "name": name,
+                "description": "Digest checklist",
+                "instructions": format!("# {name}\n\n{marker}"),
+                "placement": {"home": "personal"},
+            }),
+        )
+        .await
+        .unwrap();
+        let activated = call(fixture, &owner, use_tag, "use_skill", json!({"name": name}))
+            .await
+            .unwrap();
+        assert!(
+            activated.content[0].text.contains(marker),
+            "ability name {name} must activate by name"
+        );
+    }
 
     let ep_started = call(
         fixture,
