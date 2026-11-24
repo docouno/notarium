@@ -182,7 +182,7 @@ impl History {
                 && !groups[index + 1].starts_with_tool
             {
                 let mut cap = total.saturating_sub(fixed_tokens).saturating_sub(4) / 2;
-                if index + 1 == latest_message {
+                if !has_tail && index + 1 == latest_message {
                     cap = cap.min(penultimate_summary_cap);
                 }
                 if cap > 0 {
@@ -775,6 +775,131 @@ mod tests {
         assert!(
             fixed_tokens + latest_tokens + planned.budget.max_output_tokens + 4 <= ceiling,
             "next turn after compaction must fit within ceiling"
+        );
+    }
+
+    #[test]
+    fn compaction_with_tail_does_not_starve_summary_with_penultimate_cap() {
+        let provider = ProviderResourceId::from_bytes([19; 16]);
+        let selection = ProviderSelection {
+            provider: provider.clone(),
+            model: ModelProfileId::from_bytes([19; 16]),
+            project: None,
+            project_only: None,
+            completion: Some(CompletionModelLimits {
+                max_input_tokens: 16_384,
+                max_output_tokens: 4096,
+                supports_tools: false,
+            }),
+            revocation_scope: ProviderRevocationScope {
+                owner: PrincipalId::from_bytes([19; 16]),
+                credential: None,
+            },
+            runtime_epochs: ProviderRuntimeEpochs {
+                resource: std::num::NonZeroU64::MIN,
+                credential: None,
+            },
+            policy: ProviderPolicy {
+                provider,
+                allowed_classes: DocClass::all(),
+                audience: ProviderAudience::Personal { consented: true },
+            },
+        };
+        let branch = ChatBranch {
+            thread: ChatThread {
+                id: ChatThreadId::from_bytes([19; 16]),
+                space: SpaceId::from_bytes([19; 16]),
+                kind: ChatThreadKind::Personal,
+                owner: PrincipalId::from_bytes([19; 16]),
+                project_folder: None,
+                title: "Long branch with tail".into(),
+                head: ThreadEntrySeq::new(2).unwrap(),
+                revision: RevisionId::from_bytes([19; 16]),
+                active_run: None,
+                tainted: false,
+            },
+            entries: Vec::new(),
+            next_ancestor: None,
+        };
+        let m1 = CompletionMessage {
+            role: CompletionRole::User,
+            instruction: Some(
+                ProviderInstruction::from_orchestrator("Older ".repeat(400)).unwrap(),
+            ),
+            parts: Vec::new(),
+            tool_calls: Vec::new(),
+            result_for: None,
+        };
+        let m2 = CompletionMessage {
+            role: CompletionRole::Assistant,
+            instruction: Some(
+                ProviderInstruction::from_orchestrator("PageEnd ".repeat(1_500)).unwrap(),
+            ),
+            parts: Vec::new(),
+            tool_calls: Vec::new(),
+            result_for: None,
+        };
+        let mut req_for_fixed = CompletionRequest {
+            intent: notarium_core::ids::CommandKey::from_bytes([19; 16]),
+            selection: selection.clone(),
+            secondary_projects: Vec::new(),
+            messages: vec![system_prompt("System ".repeat(1_200), Vec::new()).unwrap()],
+            tools: Vec::new(),
+            budget: CompletionBudget {
+                max_input_tokens: 32_768,
+                max_output_tokens: 4096,
+                max_tool_calls: 0,
+            },
+        };
+        let normal_fixed = completion_input_estimate(&req_for_fixed).unwrap();
+        req_for_fixed.messages.push(m2.clone());
+        let latest_tokens = completion_input_estimate(&req_for_fixed).unwrap() - normal_fixed;
+        // Choose a ceiling where `normal_fixed + latest_tokens > ceiling` so
+        // `penultimate_summary_cap == 0`, while tool-free summary (`summary_fixed + m1 + m2`)
+        // still fits because `has_tail == true`.
+        let ceiling = normal_fixed + latest_tokens - 50;
+        let history = History {
+            branch,
+            messages: vec![m1, m2],
+            has_tail: true,
+            groups: vec![
+                HistoryGroup {
+                    through: ThreadEntrySeq::new(1).unwrap(),
+                    end: 1,
+                    checkpoint: false,
+                    starts_with_tool: false,
+                },
+                HistoryGroup {
+                    through: ThreadEntrySeq::new(2).unwrap(),
+                    end: 2,
+                    checkpoint: false,
+                    starts_with_tool: false,
+                },
+            ],
+        };
+        let request = CompletionRequest {
+            intent: notarium_core::ids::CommandKey::from_bytes([20; 16]),
+            selection,
+            secondary_projects: Vec::new(),
+            messages: vec![system_prompt("System ".repeat(1_200), Vec::new()).unwrap()],
+            tools: Vec::new(),
+            budget: CompletionBudget {
+                max_input_tokens: ceiling,
+                max_output_tokens: 4096,
+                max_tool_calls: 0,
+            },
+        };
+        let (_branch, planned, proof) = history.plan(request, ceiling).expect(
+            "has_tail compaction must not be starved or rejected by penultimate_summary_cap",
+        );
+        assert_eq!(
+            proof.compacts_through,
+            Some(ThreadEntrySeq::new(1).unwrap())
+        );
+        assert!(
+            planned.budget.max_output_tokens > 100,
+            "has_tail compaction must retain a healthy summary budget (got {})",
+            planned.budget.max_output_tokens
         );
     }
 }

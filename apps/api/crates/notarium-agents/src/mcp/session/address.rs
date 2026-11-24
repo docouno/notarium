@@ -5,7 +5,10 @@ use notarium_core::{
     error::{PortError, ValidationReason},
     ids::SpaceId,
     model::FolderRef,
-    ports::{AccessibleSpace, CatalogSpace, ControlPageRequest, ProjectInfo, SpaceContext},
+    ports::{
+        AccessibleSpace, CatalogSpace, ControlPageRequest, ProjectInfo, ProviderErrorCode,
+        SpaceContext,
+    },
 };
 use notarium_syntax::unicode::lookup_key;
 use std::collections::BTreeMap;
@@ -129,16 +132,57 @@ pub(in super::super) async fn readable_space(
     Ok(space)
 }
 
+async fn admit_in_app_address(
+    call: &ToolCallContext<'_>,
+    scope: &SpaceContext,
+    project: Option<&FolderRef>,
+) -> Result<(), PortError> {
+    if !matches!(
+        call.target,
+        super::super::EgressTarget::InAppProvider { .. }
+    ) {
+        return Ok(());
+    }
+    let selection_project = match &call.target {
+        super::super::EgressTarget::InAppProvider {
+            primary_project, ..
+        } if call.auth.pinned_write_space() == Some(&scope.scope().space_id) => {
+            primary_project.clone()
+        }
+        _ => project.cloned(),
+    };
+    let selection = match call.provider_selection(scope, selection_project).await {
+        Ok(Some(selection)) => selection,
+        Ok(None) => return Ok(()),
+        Err(PortError::Domain(DomainError::Provider {
+            error: ProviderErrorCode::Unavailable,
+        })) => return Err(DomainError::ResourceNotFound.into()),
+        Err(error) if super::super::corpus::hidden(&error) => {
+            return Err(DomainError::ResourceNotFound.into());
+        }
+        Err(error) => return Err(error),
+    };
+    if let Some(required) = &selection.project_only
+        && project != Some(required)
+    {
+        return Err(DomainError::ResourceNotFound.into());
+    }
+    Ok(())
+}
+
 pub(in super::super) async fn resolve_space(
     call: &ToolCallContext<'_>,
     value: &str,
 ) -> Result<SpaceContext, PortError> {
-    if let Ok(id) = SpaceId::parse(value)
+    let scope = if let Ok(id) = SpaceId::parse(value)
         && call.account().auth().spaces().contains_key(&id)
     {
-        return space(call, &id).await;
-    }
-    space_by_slug(call, value).await
+        space(call, &id).await?
+    } else {
+        space_by_slug(call, value).await?
+    };
+    admit_in_app_address(call, &scope, None).await?;
+    Ok(scope)
 }
 
 async fn space_by_slug(call: &ToolCallContext<'_>, slug: &str) -> Result<SpaceContext, PortError> {
@@ -170,6 +214,7 @@ pub(in super::super) async fn resolve_project(
     if project.folder.space_id != scope.scope().space_id {
         return Err(invalid(ValidationReason::InvalidState));
     }
+    admit_in_app_address(call, &scope, Some(&project.folder)).await?;
     Ok(project)
 }
 

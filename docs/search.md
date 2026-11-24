@@ -216,7 +216,9 @@ context, a matching project scope, and a nonempty intersection of search
 classes and provider disclosure; for model-authored queries from chat runs and
 Keepers, the remote embedding provider must additionally cover every
 non-encrypted class disclosed to that run or allowed to its active completion
-provider, degrading to lexical search with `ProviderUnavailable` otherwise. For
+provider, and project-only remote embedders also require prior non-query
+disclosures and the active completion provider to stay confined to that same
+project, degrading to lexical search with `ProviderUnavailable` otherwise. For
 project-scoped queries the canonical egress lease pins the requested folder
 inside that project through dispatch. Provider admission rechecks current access and
 token limits. Dispatch compares both resolved runtime generations and checks

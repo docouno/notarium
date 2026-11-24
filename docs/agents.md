@@ -88,9 +88,11 @@ as external MCP calls, with an additional disclosure ceiling for model-authored
 queries: for in-app chat runs and Keepers, the remote embedding provider must
 also be consented for every non-encrypted `DocClass` previously disclosed to
 that run (recorded on its provider call log) and for every class allowed to its
-active completion provider; otherwise remote query embedding degrades cleanly
-to lexical search with `provider_unavailable` (and direct embedding calls fail
-with `ClassEgressForbidden`). Opening a projection in another Space taints the
+active completion provider, and a project-only remote embedder also requires
+that every prior non-query disclosure in the run (and its active completion
+provider) stayed confined to that same project; otherwise remote query embedding
+degrades cleanly to lexical search with `provider_unavailable` (and direct
+embedding calls fail with `ClassEgressForbidden`). Opening a projection in another Space taints the
 branch before vector search runs. An unavailable remote embedding leaves
 full-text matches available and reports `provider_unavailable`. A scheduled
 Keeper's approved role and skills must still be current at dispatch. The

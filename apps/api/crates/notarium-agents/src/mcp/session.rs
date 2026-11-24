@@ -336,6 +336,20 @@ async fn start(call: &mut ToolCallContext<'_>, args: StartArgs) -> Result<Value,
             "delta": delta::resume(call, continuation, args.delivery_receipt.as_deref(), args.acknowledge).await?
         }));
     }
+    let requested = derive_episode_id(call);
+    let validated_selector = if new_selection || args.delivery_receipt.is_none() {
+        let sel = selector(
+            args.session.as_ref(),
+            args.task.as_deref(),
+            requested.clone(),
+        )?;
+        if call.auth.taint().is_tainted() {
+            return Err(DomainError::CrossSpaceTainted.into());
+        }
+        Some(sel)
+    } else {
+        None
+    };
     let mut committed_any = false;
     if let Some(receipt) = args.delivery_receipt.as_deref() {
         let acknowledged = delta::deliver(call, receipt, args.acknowledge).await?;
@@ -345,15 +359,7 @@ async fn start(call: &mut ToolCallContext<'_>, args: StartArgs) -> Result<Value,
         }
     }
     const SESSION_LABEL: &str = "notarium.mcp.start-session.v1";
-    let requested = derive_episode_id(call);
-    let selector = selector(
-        args.session.as_ref(),
-        args.task.as_deref(),
-        requested.clone(),
-    )?;
-    if call.auth.taint().is_tainted() {
-        return Err(DomainError::CrossSpaceTainted.into());
-    }
+    let selector = validated_selector.expect("selector validated when starting session");
     let plan: StartPlan = call
         .journal("start-episode", || async {
             let project = match args.project.as_deref() {
@@ -596,7 +602,7 @@ async fn start(call: &mut ToolCallContext<'_>, args: StartArgs) -> Result<Value,
         Ok(output)
     }
     .await
-    .map_err(|error| super::note_tools::batch_operational_error(SESSION_LABEL, error, true))
+    .map_err(|error| super::note_tools::post_commit_error(SESSION_LABEL, error))
 }
 
 fn selector(

@@ -798,6 +798,6 @@ fn post_commit_episode_read_error(error: PortError) -> PortError {
         PortError::DeadlineExceeded(_) => PortError::DeadlineExceeded(make()),
         PortError::Unavailable(_) => PortError::Unavailable(make()),
         PortError::Internal(_) => PortError::Internal(make()),
-        PortError::Domain(domain) => PortError::Domain(domain),
+        PortError::Domain(_) => PortError::Unavailable(make()),
     }
 }

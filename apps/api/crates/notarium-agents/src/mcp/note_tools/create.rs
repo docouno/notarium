@@ -656,6 +656,21 @@ async fn resolve_batch_links(
         .map(Some)
 }
 
+pub(in crate::mcp) fn post_commit_error(label: &str, error: PortError) -> PortError {
+    match batch_operational_error(label, error, true) {
+        PortError::Domain(domain) => PortError::Unavailable(
+            OperationalFailure::new(
+                derive_digest(label, &[domain.code().as_bytes()]),
+                CommitEffect::Unknown,
+                RetryAdvice::RetrySameCommand,
+                true,
+            )
+            .expect("same-command retry has durable identity"),
+        ),
+        other => other,
+    }
+}
+
 pub(in crate::mcp) fn batch_operational_error(
     label: &str,
     error: PortError,
@@ -818,5 +833,20 @@ mod tests {
 
         let domain = PortError::Domain(DomainError::ResourceNotFound);
         assert_eq!(batch_operational_error(label, domain.clone(), true), domain);
+
+        let rate_limited = PortError::Domain(DomainError::RateLimited {
+            retry_after_ms: 1000,
+            budget: notarium_core::error::BudgetKind::Concurrency,
+        });
+        assert!(matches!(
+            post_commit_error(label, rate_limited),
+            PortError::Unavailable(f)
+                if f.effect() == CommitEffect::Unknown && f.retry() == RetryAdvice::RetrySameCommand
+        ));
+        assert!(matches!(
+            post_commit_error(label, invalid(ValidationReason::SourceMismatch)),
+            PortError::Unavailable(f)
+                if f.effect() == CommitEffect::Unknown && f.retry() == RetryAdvice::RetrySameCommand
+        ));
     }
 }

@@ -399,14 +399,21 @@ pub(super) async fn handle(
         _ => return Err(invalid(ValidationReason::SourceMismatch)),
     };
     if let Some(committed) = &committed {
-        route.scope.check(committed.receipt.scope())?;
+        const LABEL: &str = "notarium.mcp.folder-receipt.v1";
+        route
+            .scope
+            .check(committed.receipt.scope())
+            .map_err(|error| super::super::note_tools::post_commit_error(LABEL, error.into()))?;
         if committed.value
             != (FolderRef {
                 space_id: route.scope.space_id.clone(),
                 folder_id: folder.clone(),
             })
         {
-            return Err(invalid(ValidationReason::SourceMismatch));
+            return Err(super::super::note_tools::post_commit_error(
+                LABEL,
+                invalid(ValidationReason::SourceMismatch),
+            ));
         }
     }
     let outcome = if committed.is_some() {

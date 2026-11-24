@@ -666,8 +666,10 @@ fn pure_libraries_forbid_unsafe_code_even_if_an_inner_module_tries_to_allow_it()
     for name in [
         "notarium-core",
         "notarium-syntax",
+        "notarium-control",
         "notarium-canonical",
         "notarium-collab",
+        "notarium-agents",
     ] {
         let source =
             fs::read_to_string(root().join("crates").join(name).join("src/lib.rs")).unwrap();

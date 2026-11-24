@@ -347,11 +347,12 @@ pub(super) async fn resume(
     page(call, Instant::now(), ticket.batch, position, acknowledge)
         .await
         .map_err(|error| {
-            super::super::note_tools::batch_operational_error(
-                "notarium.mcp.start-session-delta.v1",
-                error,
-                acked,
-            )
+            const LABEL: &str = "notarium.mcp.start-session-delta.v1";
+            if acked {
+                super::super::note_tools::post_commit_error(LABEL, error)
+            } else {
+                super::super::note_tools::batch_operational_error(LABEL, error, false)
+            }
         })
 }
 

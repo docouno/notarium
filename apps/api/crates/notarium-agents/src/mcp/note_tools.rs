@@ -23,7 +23,7 @@ mod create;
 mod edit;
 mod proposal;
 
-pub(super) use create::batch_operational_error;
+pub(super) use create::{batch_operational_error, post_commit_error};
 pub(super) use proposal::{
     PreparedNoteAction, apply_proposal, describe_proposal, plan_proposal, preview_proposal,
 };
@@ -692,9 +692,16 @@ async fn receipt_result(
     committed: Committed<NoteRevision>,
     outcome: &'static str,
 ) -> Result<Value, PortError> {
-    scope.scope().check(committed.receipt.scope())?;
+    const LABEL: &str = "notarium.mcp.note-receipt.v1";
+    scope
+        .scope()
+        .check(committed.receipt.scope())
+        .map_err(|error| post_commit_error(LABEL, error.into()))?;
     if &committed.value.note != note {
-        return Err(invalid(ValidationReason::SourceMismatch));
+        return Err(post_commit_error(
+            LABEL,
+            invalid(ValidationReason::SourceMismatch),
+        ));
     }
     if matches!(call.target, EgressTarget::InAppProvider { .. }) {
         if outcome == "trashed" {

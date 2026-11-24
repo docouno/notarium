@@ -336,6 +336,26 @@ pub(crate) async fn rollback_agent_run_by_id(
             Err(error) => return Err(error),
         }
     }
+    if !direct_by_id {
+        if let Some(effect) = ctx.canonical_effect() {
+            effect.check()?;
+        }
+        ctx.budget.remaining = rollback_time_left(&ctx.budget, deadline)?;
+        if let Some(replayed) = rollback_wait(
+            &ctx.budget,
+            deadline,
+            try_replay_completed_receipt::<StoredCommittedRollbackV1>(
+                store,
+                ctx.scope(),
+                &idemp,
+                Some(&ctx.budget),
+            ),
+        )
+        .await??
+        {
+            return Ok(replayed.into_committed());
+        }
+    }
     let mut read_ctx = ctx.clone();
     read_ctx.budget.remaining = rollback_time_left(&ctx.budget, deadline)?;
     let (input, prepared_epoch) =
@@ -914,7 +934,7 @@ pub(crate) fn build_rollback_direct_single_tx_exec(
         Box::pin(async move {
             auth.authorize_space_write(&item_ctx.space)?;
             let (run, expected) = target.parts();
-            ensure_chat_run_not_active_tx(tx, &scope_cl.space_id, run).await?;
+            ensure_chat_run_not_active_tx(tx, &item_ctx.space, &auth, run).await?;
             let mut folder_cache = FolderAncestryCache::default();
             type RollbackStateProbe = (bool, bool, Option<bool>, bool, Option<(Vec<u8>, String)>);
             let (has_bmh, has_note_states, known_overlays, read_schema, run_head_opt): RollbackStateProbe =
@@ -2876,39 +2896,105 @@ pub(crate) fn verify_authorized_rollback_revisions<'a>(
 
 async fn ensure_chat_run_not_active_tx(
     tx: &mut BackendConn<'_>,
-    space_id: &SpaceId,
+    space: &notarium_core::auth::Space,
+    auth: &notarium_core::auth::EngineAuthContext,
     run: &AgentRunId,
 ) -> Result<(), PortError> {
-    let active: bool = match tx {
-        BackendConn::Sqlite(conn) => sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM chat_threads WHERE space_id = ? AND active_run_id = ?)",
+    let rows: Vec<(String, String, String, Option<String>)> = match tx {
+        BackendConn::Sqlite(conn) => sqlx::query_as(
+            "SELECT thread_id, kind, owner_id, project_folder_id
+             FROM chat_threads
+             WHERE space_id = ? AND active_run_id = ?",
         )
-        .bind(space_id.as_str())
+        .bind(space.id.as_str())
         .bind(run.as_str())
-        .fetch_one(&mut **conn)
+        .fetch_all(&mut **conn)
         .await
         .map_err(|err| internal_not_committed("sqlite_rollback_active_chat", err.to_string()))?,
-        BackendConn::Postgres(conn) => sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM chat_threads WHERE space_id = $1 AND active_run_id = $2)",
+        BackendConn::Postgres(conn) => sqlx::query_as(
+            "SELECT thread_id, kind, owner_id, project_folder_id
+             FROM chat_threads
+             WHERE space_id = $1 AND active_run_id = $2",
         )
-        .bind(space_id.as_str())
+        .bind(space.id.as_str())
         .bind(run.as_str())
-        .fetch_one(&mut **conn)
+        .fetch_all(&mut **conn)
         .await
         .map_err(|err| crate::runtime::pg_read_error("pg_rollback_active_chat", err))?,
     };
-    if active {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let mut visible = false;
+    for (tid, kind_raw, owner_raw, project_raw) in rows {
+        let thread_id = notarium_core::ids::ChatThreadId::parse(&tid).map_err(|_| {
+            internal_not_committed("corrupt_active_chat_thread", "invalid thread_id")
+        })?;
+        let kind = match kind_raw.as_str() {
+            "personal" => notarium_core::ports::ChatThreadKind::Personal,
+            "space_group" => notarium_core::ports::ChatThreadKind::SpaceGroup,
+            "keeper_log" => notarium_core::ports::ChatThreadKind::KeeperLog,
+            _ => {
+                return Err(internal_not_committed(
+                    "corrupt_active_chat_kind",
+                    "unknown thread kind",
+                ));
+            }
+        };
+        let owner = notarium_core::ids::PrincipalId::parse(&owner_raw)
+            .map_err(|_| internal_not_committed("corrupt_active_chat_owner", "invalid owner_id"))?;
+        let project = project_raw
+            .as_deref()
+            .map(FolderId::parse)
+            .transpose()
+            .map_err(|_| {
+                internal_not_committed("corrupt_active_chat_project", "invalid project_folder_id")
+            })?;
+        if auth
+            .can_view_chat_thread(space, &thread_id, kind, &owner, project.as_ref(), false)
+            .is_ok()
+        {
+            visible = true;
+            break;
+        }
+    }
+    if visible {
         return Err(DomainError::validation(ValidationReason::InvalidState).into());
     }
-    Ok(())
+    let has_run_head: bool = match tx {
+        BackendConn::Sqlite(conn) => sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM agent_run_heads WHERE space_id = ? AND run_id = ?)",
+        )
+        .bind(space.id.as_str())
+        .bind(run.as_str())
+        .fetch_one(&mut **conn)
+        .await
+        .map_err(|err| {
+            internal_not_committed("sqlite_rollback_run_head_exists", err.to_string())
+        })?,
+        BackendConn::Postgres(conn) => sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM agent_run_heads WHERE space_id = $1 AND run_id = $2)",
+        )
+        .bind(space.id.as_str())
+        .bind(run.as_str())
+        .fetch_one(&mut **conn)
+        .await
+        .map_err(|err| crate::runtime::pg_read_error("pg_rollback_run_head_exists", err))?,
+    };
+    if has_run_head {
+        return Err(DomainError::validation(ValidationReason::InvalidState).into());
+    }
+    Err(DomainError::ResourceNotFound.into())
 }
 
 async fn load_run_revision(
     tx: &mut BackendConn<'_>,
     scope: &HistoryScope,
+    space: &notarium_core::auth::Space,
+    auth: &notarium_core::auth::EngineAuthContext,
     run: &AgentRunId,
 ) -> Result<RevisionId, PortError> {
-    ensure_chat_run_not_active_tx(tx, &scope.space_id, run).await?;
+    ensure_chat_run_not_active_tx(tx, space, auth, run).await?;
     let run_row: Option<(Vec<u8>, String)> = match tx {
         BackendConn::Sqlite(conn) => {
             let row = sqlx::query(
@@ -3026,7 +3112,8 @@ pub(super) async fn prepare_agent_run_rollback(
             Box::pin(async move {
                 let record = load_space_record(tx, &scope.space_id).await?;
                 record.scope.check(&scope)?;
-                ensure_chat_run_not_active_tx(tx, &scope.space_id, &run).await?;
+                auth.authorize_space_write(&record.space)?;
+                ensure_chat_run_not_active_tx(tx, &record.space, &auth, &run).await?;
                 let input = prepare_rollback_sources_tx(tx, &record, &auth, run, false).await?;
                 Ok((input, record.active_epoch))
             })
@@ -3149,7 +3236,7 @@ async fn verify_run_and_entity_preconditions_tx(
     {
         super::board::authorized_view_head(tx, space, auth, view).await?;
     }
-    let actual_run_rev = load_run_revision(tx, scope, &input.run).await?;
+    let actual_run_rev = load_run_revision(tx, scope, space, auth, &input.run).await?;
 
     // Discover full touched set of notes in `revisions` UNION `board_move_history`.
     let mut touched_set: BTreeSet<NoteId> = BTreeSet::new();

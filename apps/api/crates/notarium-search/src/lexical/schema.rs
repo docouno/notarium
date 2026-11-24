@@ -105,7 +105,7 @@ impl Fields {
             folder.map_or(0, |folder| u64::from(folder.get())),
         );
         indexed.add_bytes(self.chat_locator, &chat_locator(hit));
-        if hit.kind == ChatThreadKind::Personal {
+        if hit.kind != ChatThreadKind::SpaceGroup {
             indexed.add_bytes(self.chat_owner, hit.owner.as_str().as_bytes());
         }
         self.add_text(&mut indexed, self.bodies[2], &hit.text);

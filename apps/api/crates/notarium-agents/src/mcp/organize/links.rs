@@ -491,9 +491,16 @@ async fn render(
     plan: &LinkPlan,
     committed: Committed<Link>,
 ) -> Result<Value, PortError> {
-    scope.scope().check(committed.receipt.scope())?;
+    const LABEL: &str = "notarium.mcp.link-receipt.v1";
+    scope
+        .scope()
+        .check(committed.receipt.scope())
+        .map_err(|error| super::super::note_tools::post_commit_error(LABEL, error.into()))?;
     if committed.value.source != plan.source {
-        return Err(invalid(ValidationReason::SourceMismatch));
+        return Err(super::super::note_tools::post_commit_error(
+            LABEL,
+            invalid(ValidationReason::SourceMismatch),
+        ));
     }
     let info: Result<Value, PortError> = async {
         // Resolve the exact revision produced by this link command rather than
@@ -629,16 +636,19 @@ async fn many(call: &mut ToolCallContext<'_>, inputs: Vec<LinkInput>) -> Result<
             committed_any = true;
         }
         if response.items.len() != batch.len() {
-            return Err(invalid(ValidationReason::SourceMismatch));
+            let err = invalid(ValidationReason::SourceMismatch);
+            return Err(if committed_any {
+                super::super::note_tools::post_commit_error(LABEL, err)
+            } else {
+                err
+            });
         }
         for (prepared, outcome) in batch.into_iter().zip(response.items) {
             let index = usize::from(prepared.ordinal);
             let mut value = match outcome {
                 Ok(committed) => render(call, &scope, &prepared.plan, committed)
                     .await
-                    .map_err(|error| {
-                        super::super::note_tools::batch_operational_error(LABEL, error, true)
-                    })?,
+                    .map_err(|error| super::super::note_tools::post_commit_error(LABEL, error))?,
                 Err(error) => json!({"ok": false, "error": error.code()}),
             };
             value["index"] = json!(index);

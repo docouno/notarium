@@ -253,20 +253,34 @@ pub(super) async fn finish(
                 Box::pin(async move {
                     let space = lock_space(&owned, tx, &ctx).await?;
                     effect.begin().await?;
+                    let closing = !recover && space.space.lifecycle != SpaceLifecycle::Active;
+                    if !closing {
+                        authorize_chat_write_on_space(ctx.auth(), &space.space)?;
+                    }
                     let thread =
                         load_thread_head_tx(tx, &space.scope.space_id, &request.thread).await?;
-                    let closing = !recover && space.space.lifecycle != SpaceLifecycle::Active;
                     if closing {
                         // The existing owner may cancel inputs and clear its own claim
                         // after archival. No chat entry can be read or appended here.
+                        let project_matches = ctx
+                            .auth()
+                            .spaces()
+                            .get(&space.space.id)
+                            .and_then(|grant| grant.project_root.as_ref())
+                            .is_none_or(|root| thread.project_folder.as_ref() == Some(root));
+                        let audience_ok = !(thread.kind == ChatThreadKind::Personal
+                            && ctx.auth().chat_audience()
+                                == Some(notarium_core::auth::ChatAudience::Shared));
                         if ctx.auth().pinned_write_space() != Some(&space.space.id)
+                            || thread.kind == ChatThreadKind::KeeperLog
+                            || !project_matches
+                            || !audience_ok
                             || (thread.kind != ChatThreadKind::SpaceGroup
                                 && &thread.owner != ctx.auth().principal())
                         {
                             return Err(DomainError::ResourceNotFound.into());
                         }
                     } else {
-                        authorize_chat_write_on_space(ctx.auth(), &space.space)?;
                         authorize_current_leaf(tx, ctx.auth(), &space, &thread).await?;
                     }
                     if thread.active_run_id.is_none() {
@@ -342,8 +356,8 @@ pub(super) async fn list_pending(
                     .inner
                     .check_writer_epoch(&scope.space_id, space.active_epoch)?;
                 let thread = load_thread_head_tx(tx, &scope.space_id, &thread_id).await?;
-                authorize_run_claim(&owned, &space, &thread, &run)?;
                 authorize_current_leaf(tx, ctx.auth(), &space, &thread).await?;
+                authorize_run_claim(&owned, &space, &thread, &run)?;
                 pending_rows(tx, &scope.space_id, &thread_id).await
             })
         })

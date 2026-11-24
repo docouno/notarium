@@ -570,6 +570,30 @@ impl AgentRunSupervisor {
             require_write_bearer(account.auth())?;
             let mut account = service.live_account(account).await?;
             require_write_bearer(account.auth())?;
+            let grant = account
+                .auth()
+                .spaces()
+                .get(&scope.space_id)
+                .ok_or(DomainError::ResourceNotFound)?;
+            if grant.role == notarium_core::auth::SpaceRole::Viewer || grant.project_root.is_some()
+            {
+                return Err(DomainError::SpaceReadOnly.into());
+            }
+            let space_record = service
+                .inner
+                .registry
+                .catalog()
+                .space(account.budget.clone(), scope.space_id.clone())
+                .await?;
+            if space_record.space.lifecycle != notarium_core::auth::SpaceLifecycle::Active {
+                return Err(DomainError::ResourceNotFound.into());
+            }
+            scope.check(&space_record.history)?;
+            if account.auth().taint().is_tainted()
+                && space_record.space.kind == notarium_core::auth::SpaceKind::Shared
+            {
+                return Err(DomainError::CrossSpaceTainted.into());
+            }
             let _admission = service
                 .lock_thread_gate(&scope, &thread, &mut account.budget, deadline)
                 .await?;

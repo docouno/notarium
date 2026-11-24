@@ -757,7 +757,7 @@ async fn project_scoped_chat_starts_ai_and_blocks_foreign_project(
                 identity: cmd(17),
                 preconditions: Preconditions::default(),
                 input: AppendChat {
-                    thread: keeper_log_id,
+                    thread: keeper_log_id.clone(),
                     parent: ThreadEntrySeq::ZERO,
                     kind: ChatEntryKind::Model,
                     body: ChatInputBody::Text("other keeper probe".into()),
@@ -779,6 +779,126 @@ async fn project_scoped_chat_starts_ai_and_blocks_foreign_project(
         ),
         "unrelated Keeper must see ResourceNotFound on another KeeperLog, got {other_keeper_append:?}"
     );
+
+    // A ChatAudience::Shared AgentRun on Alice's Space must NOT read or observe Alice's
+    // private KeeperLog (both read_chat and append_chat must return ResourceNotFound).
+    let shared_audience_auth = owner
+        .auth()
+        .for_agent_run(
+            AgentRunId::from_bytes([0x6E; 16]),
+            scope.space_id.clone(),
+            ChatAudience::Shared,
+            owner.auth().spaces().clone(),
+        )
+        .unwrap();
+    let shared_audience_ctx =
+        SpaceContext::new(shared_audience_auth, scope.clone(), budget()).unwrap();
+    let shared_read_log = fixture
+        .canonical
+        .read_chat(
+            shared_audience_ctx.clone(),
+            ChatRead {
+                thread: keeper_log_id.clone(),
+                leaf: ThreadEntrySeq::ZERO,
+                before: None,
+                max_entries: PageLimit::new(10).unwrap(),
+            },
+        )
+        .await;
+    assert!(
+        matches!(
+            shared_read_log,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ),
+        "Shared-audience AgentRun must NOT read owner's private KeeperLog, got {shared_read_log:?}"
+    );
+    let shared_append_log = fixture
+        .canonical
+        .append_chat(
+            shared_audience_ctx,
+            Mutation {
+                identity: cmd(18),
+                preconditions: Preconditions::default(),
+                input: AppendChat {
+                    thread: keeper_log_id.clone(),
+                    parent: ThreadEntrySeq::ZERO,
+                    kind: ChatEntryKind::Model,
+                    body: ChatInputBody::Text("shared audience probe".into()),
+                    tool_calls: vec![],
+                    provenance: None,
+                    interruption: None,
+                    proposed_diff: None,
+                    proposed_effect: None,
+                    referenced_notes: vec![],
+                    tainted: false,
+                },
+            },
+        )
+        .await;
+    assert!(
+        matches!(
+            shared_append_log,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ),
+        "Shared-audience AgentRun must see ResourceNotFound on KeeperLog write, got {shared_append_log:?}"
+    );
+
+    // Thread-existence oracles on queue methods:
+    // 1. Project-A AgentRun calling list_pending_chat_inputs on out-of-project thread_b
+    //    or KeeperLog must receive ResourceNotFound (not InvalidAuthority).
+    let run_a_probe_ctx = SpaceContext::new(
+        owner
+            .auth()
+            .for_agent_run(
+                AgentRunId::from_bytes([0x64; 16]),
+                scope.space_id.clone(),
+                ChatAudience::Personal,
+                {
+                    let mut g = owner.auth().spaces().clone();
+                    g.get_mut(&scope.space_id).unwrap().project_root =
+                        Some(project_a.folder_id.clone());
+                    g
+                },
+            )
+            .unwrap(),
+        scope.clone(),
+        budget(),
+    )
+    .unwrap();
+    for probe_tid in [
+        thread_b.clone(),
+        keeper_log_id.clone(),
+        ChatThreadId::from_bytes([0x68; 16]),
+    ] {
+        let res = fixture
+            .canonical
+            .list_pending_chat_inputs(run_a_probe_ctx.clone(), probe_tid)
+            .await;
+        assert!(
+            matches!(res, Err(PortError::Domain(DomainError::ResourceNotFound))),
+            "list_pending_chat_inputs must hide invisible/absent threads as ResourceNotFound, got {res:?}"
+        );
+    }
+    // 2. Project-scoped DirectHuman calling recover_active_run must fail with
+    //    SpaceReadOnly before loading the thread (identical for existing and absent threads).
+    let scoped_human = owner.auth().restrict_to_project(&project_a).unwrap();
+    let scoped_human_space = SpaceContext::new(scoped_human, scope, budget()).unwrap();
+    for probe_tid in [thread_b, ChatThreadId::from_bytes([0x67; 16])] {
+        let res = fixture
+            .canonical
+            .recover_active_run(
+                scoped_human_space.clone(),
+                ChatRunRequest {
+                    thread: probe_tid,
+                    expected_run: AgentRunId::from_bytes([0x64; 16]),
+                },
+            )
+            .await;
+        assert!(
+            matches!(res, Err(PortError::Domain(DomainError::SpaceReadOnly))),
+            "project-scoped DirectHuman recover_active_run must fail with SpaceReadOnly before thread lookup, got {res:?}"
+        );
+    }
 }
 
 /// An AgentRun whose completion provider is consented to AgentMemory must
@@ -2163,6 +2283,78 @@ async fn remote_embedding_query_blocks_unconsented_model_sources(
             narrow_tool_res.structured_content
         );
 
+        // (d) Unconsented Space/Project slug existence oracle: an InAppProvider AgentRun
+        //     whose auth includes an unconsented Shared Space (`emb_shared`) must see
+        //     ResourceNotFound (matching a bogus handle) on list_abilities, use_role,
+        //     and list_notes when passing that project handle, without tainting auth.
+        let probe_agent_auth = owner
+            .auth()
+            .for_agent_run(
+                AgentRunId::from_bytes([0x7A, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]),
+                scope.space_id.clone(),
+                ChatAudience::Personal,
+                owner.auth().spaces().clone(),
+            )
+            .unwrap();
+        let probe_agent_account = AccountContext::new(probe_agent_auth, budget());
+        let unconsented_handle = format!("{}/emb-proj-a", emb_shared.slug);
+        for (idx, (tool, args)) in [
+            (
+                "list_abilities",
+                json!({ "view": "runtime", "project": unconsented_handle }),
+            ),
+            (
+                "use_role",
+                json!({ "role": "research", "project": unconsented_handle }),
+            ),
+            ("list_notes", json!({ "project": unconsented_handle })),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let res = emb_registry
+                .call_tool(
+                    McpInvocationContext {
+                        account: probe_agent_account.clone(),
+                        target: EgressTarget::InAppProvider {
+                            provider: chat_narrow_res.clone(),
+                            model: chat_narrow_model.clone(),
+                            primary_project: None,
+                        },
+                        request_key: CommandKey::from_bytes([
+                            0x7B,
+                            idx as u8 + 1,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            1,
+                        ]),
+                    },
+                    tool,
+                    args,
+                )
+                .await;
+            assert!(
+                matches!(res, Err(PortError::Domain(DomainError::ResourceNotFound))),
+                "InAppProvider {tool} on unconsented Shared project must return ResourceNotFound, got {:?}",
+                res.err()
+            );
+        }
+        assert!(
+            !probe_agent_account.auth().taint().is_tainted(),
+            "rejected unconsented project probes must not taint caller"
+        );
+
         search.shutdown().await;
         projector.shutdown().await.unwrap();
     }
@@ -3353,6 +3545,36 @@ async fn rollback_run_stops_active_keeper_and_rejects_unsettled_runs(
         .await
         .unwrap();
     let viewer_account = AccountContext::new(viewer_auth, budget());
+    // Space Viewer calling supervisor.redact_chat_entry must fail upfront with SpaceReadOnly
+    // before acquiring thread gates or invoking cluster write admission.
+    let viewer_redact = supervisor
+        .redact_chat_entry(
+            viewer_account.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: shared.history.clone(),
+                    actor: viewer_account.auth().principal().clone(),
+                    key: CommandKey::from_bytes([
+                        0xC0, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xC0; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: RedactChatEntry {
+                    thread: ChatThreadId::from_bytes([0xC0; 16]),
+                    entry: ThreadEntrySeq::new(1).unwrap(),
+                    expected_thread_revision: RevisionId::from_bytes([0xC0; 16]),
+                },
+            },
+        )
+        .await;
+    assert!(
+        matches!(
+            viewer_redact,
+            Err(PortError::Domain(DomainError::SpaceReadOnly))
+        ),
+        "Viewer redact_chat_entry must fail upfront with SpaceReadOnly, got {viewer_redact:?}"
+    );
     let pat_account = fixture.pat(BearerScope::Write, false).await;
     let project_scoped_owner = AccountContext::new(
         owner.auth().restrict_to_project(&project).unwrap(),
@@ -3718,15 +3940,15 @@ async fn rollback_run_stops_active_keeper_and_rejects_unsettled_runs(
             fenced_empty,
             Mutation {
                 identity: CommandIdentity {
-                    scope: pscope,
-                    actor,
+                    scope: pscope.clone(),
+                    actor: actor.clone(),
                     key: CommandKey::from_bytes([
                         0xCE, 0xCF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
                     ]),
                     hash: ContentDigest::from_bytes([0xCF; 32]),
                 },
                 preconditions: Preconditions::default(),
-                input: empty_run,
+                input: empty_run.clone(),
             },
         )
         .await;
@@ -3738,6 +3960,93 @@ async fn rollback_run_stops_active_keeper_and_rejects_unsettled_runs(
         ),
         "canonical rollback must reject an active zero-edit chat run with InvalidState, got {active_empty_rb:?}"
     );
+
+    // 4b. Unfenced rollback_agent_run_by_id (`direct_by_id == false`, exercising
+    //     `prepare_agent_run_rollback`) must ALSO reject the active zero-edit chat run
+    //     with InvalidState, while an unauthorized read-only caller receives SpaceReadOnly
+    //     on BOTH fenced (`direct_by_id == true`) and unfenced (`direct_by_id == false`) paths.
+    let unfenced_active_empty = fixture
+        .canonical
+        .rollback_agent_run_by_id(
+            personal.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: pscope.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([
+                        0xCE, 0xCF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xCF; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: empty_run.clone(),
+            },
+        )
+        .await;
+    assert!(
+        matches!(
+            unfenced_active_empty,
+            Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
+                if diagnostic.reason == ValidationReason::InvalidState
+        ),
+        "prepare_agent_run_rollback must reject an active zero-edit chat run with InvalidState, got {unfenced_active_empty:?}"
+    );
+    let ro_rb_pat = fixture.pat(BearerScope::Read, false).await;
+    let ro_rb_ctx = SpaceContext::new(ro_rb_pat.auth().clone(), pscope.clone(), budget()).unwrap();
+    let ro_rb_unfenced = fixture
+        .canonical
+        .rollback_agent_run_by_id(
+            ro_rb_ctx,
+            Mutation {
+                identity: CommandIdentity {
+                    scope: pscope.clone(),
+                    actor: ro_rb_pat.auth().principal().clone(),
+                    key: CommandKey::from_bytes([
+                        0xCE, 0xCF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xCF; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: empty_run,
+            },
+        )
+        .await;
+    assert!(
+        matches!(
+            ro_rb_unfenced,
+            Err(PortError::Domain(DomainError::SpaceReadOnly))
+        ),
+        "unauthorized read-only bearer rollback must return SpaceReadOnly before active-run check, got {ro_rb_unfenced:?}"
+    );
+
+    // 4c. On the `!direct_by_id` path, reusing an already-committed rollback CommandKey
+    //     with a different command hash for an authorized run must report IdempotencyKeyReused.
+    let shared_owner_unfenced =
+        SpaceContext::new(owner.auth().clone(), shared.history.clone(), budget()).unwrap();
+    let reused_key_rb = fixture
+        .canonical
+        .rollback_agent_run_by_id(
+            shared_owner_unfenced,
+            Mutation {
+                identity: CommandIdentity {
+                    scope: shared.history,
+                    actor,
+                    key: CommandKey::from_bytes([0xCA; 16]),
+                    hash: ContentDigest::from_bytes([0xCA; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: active_keeper_run,
+            },
+        )
+        .await;
+    assert!(
+        matches!(
+            reused_key_rb,
+            Err(PortError::Domain(DomainError::IdempotencyKeyReused))
+        ),
+        "reusing committed rollback CommandKey on !direct_by_id path must return IdempotencyKeyReused, got {reused_key_rb:?}"
+    );
+    drop(pscope);
 }
 
 /// `remember_about_project` and `remember_about_user` proposal previews
@@ -4938,6 +5247,26 @@ async fn bootstrap_continuation_sliding_ttl_survives_multi_page_resync(fixture: 
         .as_str()
         .expect("page 1 must emit a deliveryReceipt")
         .to_owned();
+
+    // Invalid session locator alongside deliveryReceipt must fail upfront with
+    // InvalidQuery WITHOUT advancing the delta acknowledgement cursor.
+    let bad_session_with_receipt = call_mcp(
+        &fixture.registry,
+        &fresh_owner(fixture).await,
+        [0x43, 0xBB, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "start_session",
+        json!({ "deliveryReceipt": receipt1, "session": {} }),
+    )
+    .await;
+    assert!(
+        matches!(
+            bad_session_with_receipt,
+            Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
+                if diagnostic.reason == ValidationReason::InvalidQuery
+        ),
+        "start_session with invalid session locator and deliveryReceipt must fail with InvalidQuery, got {:?}",
+        bad_session_with_receipt.err()
+    );
 
     // Sleep 850ms (< 1500ms TTL, generous margin against CI jitter) and advance to Page 2.
     tokio::time::sleep(Duration::from_millis(850)).await;

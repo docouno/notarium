@@ -358,6 +358,31 @@ async fn ability_folder(
         .folder_id)
 }
 
+fn post_commit_step_error(label: &str, error: PortError, committed: bool) -> PortError {
+    if committed && matches!(error, PortError::Domain(DomainError::RateLimited { .. })) {
+        return super::super::note_tools::post_commit_error(label, error);
+    }
+    super::super::note_tools::batch_operational_error(label, error, committed)
+}
+
+fn post_commit_ability_read_error(label: &str, error: PortError, committed: bool) -> PortError {
+    if !committed {
+        return super::super::note_tools::batch_operational_error(label, error, false);
+    }
+    if matches!(
+        error,
+        PortError::Domain(
+            DomainError::RevisionConflict { .. }
+                | DomainError::ResourceNotFound
+                | DomainError::AuthenticationFailed
+                | DomainError::AccessDenied
+        )
+    ) {
+        return error;
+    }
+    super::super::note_tools::post_commit_error(label, error)
+}
+
 async fn bound_ability(
     call: &ToolCallContext<'_>,
     reference: &AbilityRef,
@@ -521,10 +546,21 @@ pub(super) async fn create(
         .map_err(|error| {
             super::super::note_tools::batch_operational_error(CREATE_LABEL, error, true)
         })?;
-    let descriptor = bound_ability(call, &reference).await.map_err(|error| {
-        super::super::note_tools::batch_operational_error(CREATE_LABEL, error, true)
-    })?;
-    write_response(&descriptor, "created")
+    match bound_ability(call, &reference).await {
+        Ok(descriptor) => write_response(&descriptor, "created"),
+        Err(PortError::Domain(
+            DomainError::RevisionConflict { .. } | DomainError::ResourceNotFound,
+        )) => Ok(json!({
+            "ref": reference_token(&reference)?,
+            "name": args.name,
+            "kind": kind_name(kind),
+            "outcome": "created",
+        })),
+        Err(error) => Err(super::super::note_tools::post_commit_error(
+            CREATE_LABEL,
+            error,
+        )),
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -887,7 +923,6 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
                 placement: AbilityPlacement::OwnedSpace(plan.scope.space_id.clone()),
                 ..reference.clone()
             };
-            reference = destination.clone();
             let result = call
                 .registry
                 .control
@@ -901,7 +936,7 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
                         ),
                         input: AbilityTrailMutation::AdoptPromotion(AdoptAbilityPromotion {
                             source: plan.original.clone(),
-                            destination,
+                            destination: destination.clone(),
                         }),
                     },
                 )
@@ -909,6 +944,7 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
             let AbilityTrailResult::Promoted(promoted) = result.value else {
                 return Err(invalid(ValidationReason::InvalidState));
             };
+            reference = destination;
             promotion = Some(promoted);
         }
         Ok(())
@@ -918,22 +954,33 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
     if let Err(error) = package_result {
         let partial_package = carrier_edited || carrier_moved || published;
         if !partial_package || !is_partial_step_error(&error) {
-            return Err(super::super::note_tools::batch_operational_error(
+            return Err(post_commit_step_error(
                 EDIT_LABEL,
                 error,
                 partial_package || folder_ensured,
             ));
         }
+        let uncommitted_promotion = plan.promote && promotion.is_none();
+        let report_ref = if uncommitted_promotion {
+            &plan.original
+        } else {
+            &reference
+        };
         for step in ["authored", "home", "availability", "enabled"] {
-            steps.push(if step == "authored" && authored_changed && published {
-                change_step(step, "applied", None)
-            } else if step == phase || step == "authored" && carrier_edited {
-                change_step(step, "failed", Some(&error))
-            } else {
-                change_step(step, "skipped", None)
-            });
+            steps.push(
+                if step == "authored" && authored_changed && published && !uncommitted_promotion {
+                    change_step(step, "applied", None)
+                } else if step == phase
+                    || (step == "authored"
+                        && (carrier_edited || (authored_changed && uncommitted_promotion)))
+                {
+                    change_step(step, "failed", Some(&error))
+                } else {
+                    change_step(step, "skipped", None)
+                },
+            );
         }
-        return edit_result(call, &reference, steps, Some(&error)).await;
+        return edit_result(call, report_ref, steps, Some(&error)).await;
     }
     let mut applied_any = authored_changed || promotion.is_some();
     steps.push(change_step(
@@ -997,11 +1044,7 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
             }
             Err(error) => {
                 if !applied_any || !is_partial_step_error(&error) {
-                    return Err(super::super::note_tools::batch_operational_error(
-                        EDIT_LABEL,
-                        error,
-                        applied_any,
-                    ));
+                    return Err(post_commit_step_error(EDIT_LABEL, error, applied_any));
                 }
                 steps.push(change_step("availability", "failed", Some(&error)));
                 steps.push(change_step("enabled", "skipped", None));
@@ -1059,11 +1102,7 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
             }
             Err(error) => {
                 if !applied_any || !is_partial_step_error(&error) {
-                    return Err(super::super::note_tools::batch_operational_error(
-                        EDIT_LABEL,
-                        error,
-                        applied_any,
-                    ));
+                    return Err(post_commit_step_error(EDIT_LABEL, error, applied_any));
                 }
                 steps.push(change_step("enabled", "failed", Some(&error)));
                 return edit_result(call, &reference, steps, Some(&error)).await;
@@ -1072,9 +1111,9 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
     } else {
         steps.push(change_step("enabled", "skipped", None));
     }
-    let descriptor = bound_ability(call, &reference).await.map_err(|error| {
-        super::super::note_tools::batch_operational_error(EDIT_LABEL, error, applied_any)
-    })?;
+    let descriptor = bound_ability(call, &reference)
+        .await
+        .map_err(|error| post_commit_ability_read_error(EDIT_LABEL, error, applied_any))?;
     let mut result = write_response(&descriptor, "updated")?;
     result["steps"] = json!(steps);
     Ok(result)

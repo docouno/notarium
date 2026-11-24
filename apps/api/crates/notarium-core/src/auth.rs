@@ -939,6 +939,9 @@ impl EngineAuthContext {
         if kind == ChatThreadKind::Personal {
             return self.can_view_own_personal_chat(space, project, tainted);
         }
+        if kind == ChatThreadKind::KeeperLog && self.chat_audience == Some(ChatAudience::Shared) {
+            return Err(DomainError::ResourceNotFound);
+        }
         if (matches!(self.kind, PrincipalKind::Keeper(_)) || self.keeper_log.is_some())
             && (kind != ChatThreadKind::KeeperLog
                 || self.keeper_log.as_ref() != Some(thread)

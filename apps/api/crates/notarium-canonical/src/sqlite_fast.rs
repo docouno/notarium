@@ -6105,29 +6105,122 @@ impl SqliteSyncItemPlan for RollbackDirectSqliteFastPlan {
         let (run, _) = self.target.parts();
 
         // --- 1. Read-only preconditions & pure validation (zero SQL mutations) ---
-        let run_active_on_chat: bool = conn
-            .prepare_cached(
-                "SELECT EXISTS(SELECT 1 FROM chat_threads WHERE space_id = ?1 AND active_run_id = ?2)",
-            )
-            .map_err(|err| {
-                FastItemExecError::PreWrite(internal_not_committed(
-                    "sqlite_rollback_active_chat",
-                    err.to_string(),
-                ))
-            })?
-            .query_row(params![scope_cl.space_id.as_str(), run.as_str()], |row| {
-                row.get(0)
-            })
-            .map_err(|err| {
-                FastItemExecError::PreWrite(map_interrupt_or_internal(
-                    err,
-                    "sqlite_rollback_active_chat",
-                ))
-            })?;
-        if run_active_on_chat {
-            return Err(FastItemExecError::PreWrite(
-                DomainError::validation(ValidationReason::InvalidState).into(),
-            ));
+        auth.authorize_space_write(&item_ctx.space)
+            .map_err(|err| FastItemExecError::PreWrite(err.into()))?;
+        let active_chat_rows: Vec<(String, String, String, Option<String>)> = {
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT thread_id, kind, owner_id, project_folder_id
+                     FROM chat_threads
+                     WHERE space_id = ?1 AND active_run_id = ?2",
+                )
+                .map_err(|err| {
+                    FastItemExecError::PreWrite(internal_not_committed(
+                        "sqlite_rollback_active_chat",
+                        err.to_string(),
+                    ))
+                })?;
+            let mapped = stmt
+                .query_map(params![scope_cl.space_id.as_str(), run.as_str()], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })
+                .map_err(|err| {
+                    FastItemExecError::PreWrite(map_interrupt_or_internal(
+                        err,
+                        "sqlite_rollback_active_chat",
+                    ))
+                })?;
+            let mut out = Vec::new();
+            for row in mapped {
+                out.push(row.map_err(|err| {
+                    FastItemExecError::PreWrite(map_interrupt_or_internal(
+                        err,
+                        "sqlite_rollback_active_chat",
+                    ))
+                })?);
+            }
+            out
+        };
+        if !active_chat_rows.is_empty() {
+            let mut visible = false;
+            for (tid, kind_raw, owner_raw, project_raw) in active_chat_rows {
+                let thread_id = notarium_core::ids::ChatThreadId::parse(&tid).map_err(|_| {
+                    FastItemExecError::PreWrite(internal_not_committed(
+                        "corrupt_active_chat_thread",
+                        "invalid thread_id",
+                    ))
+                })?;
+                let kind = match kind_raw.as_str() {
+                    "personal" => notarium_core::ports::ChatThreadKind::Personal,
+                    "space_group" => notarium_core::ports::ChatThreadKind::SpaceGroup,
+                    "keeper_log" => notarium_core::ports::ChatThreadKind::KeeperLog,
+                    _ => {
+                        return Err(FastItemExecError::PreWrite(internal_not_committed(
+                            "corrupt_active_chat_kind",
+                            "unknown thread kind",
+                        )));
+                    }
+                };
+                let owner = PrincipalId::parse(&owner_raw).map_err(|_| {
+                    FastItemExecError::PreWrite(internal_not_committed(
+                        "corrupt_active_chat_owner",
+                        "invalid owner_id",
+                    ))
+                })?;
+                let project = project_raw
+                    .as_deref()
+                    .map(FolderId::parse)
+                    .transpose()
+                    .map_err(|_| {
+                        FastItemExecError::PreWrite(internal_not_committed(
+                            "corrupt_active_chat_project",
+                            "invalid project_folder_id",
+                        ))
+                    })?;
+                if auth
+                    .can_view_chat_thread(
+                        &item_ctx.space,
+                        &thread_id,
+                        kind,
+                        &owner,
+                        project.as_ref(),
+                        false,
+                    )
+                    .is_ok()
+                {
+                    visible = true;
+                    break;
+                }
+            }
+            if visible {
+                return Err(FastItemExecError::PreWrite(
+                    DomainError::validation(ValidationReason::InvalidState).into(),
+                ));
+            }
+            let has_run_head: bool = conn
+                .prepare_cached(
+                    "SELECT EXISTS(SELECT 1 FROM agent_run_heads WHERE space_id = ?1 AND run_id = ?2)",
+                )
+                .map_err(|err| {
+                    FastItemExecError::PreWrite(internal_not_committed(
+                        "sqlite_rollback_run_head_exists",
+                        err.to_string(),
+                    ))
+                })?
+                .query_row(params![scope_cl.space_id.as_str(), run.as_str()], |row| {
+                    row.get(0)
+                })
+                .map_err(|err| {
+                    FastItemExecError::PreWrite(map_interrupt_or_internal(
+                        err,
+                        "sqlite_rollback_run_head_exists",
+                    ))
+                })?;
+            return Err(FastItemExecError::PreWrite(if has_run_head {
+                DomainError::validation(ValidationReason::InvalidState).into()
+            } else {
+                DomainError::ResourceNotFound.into()
+            }));
         }
         if has_rollback_board_history_rusqlite(conn, &scope_cl.space_id, run)
             .map_err(FastItemExecError::PreWrite)?

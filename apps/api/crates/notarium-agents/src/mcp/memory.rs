@@ -219,9 +219,16 @@ pub(super) async fn handle(
         .engine
         .append_memory(call.corpus_writer(scope).await?, mutation)
         .await?;
-    route.scope.check(committed.receipt.scope())?;
+    const LABEL: &str = "notarium.mcp.memory-receipt.v1";
+    route
+        .scope
+        .check(committed.receipt.scope())
+        .map_err(|error| super::note_tools::post_commit_error(LABEL, error.into()))?;
     if committed.value.revision.note != note.note_id {
-        return Err(invalid(ValidationReason::SourceMismatch));
+        return Err(super::note_tools::post_commit_error(
+            LABEL,
+            invalid(ValidationReason::SourceMismatch),
+        ));
     }
     if let EgressTarget::InAppProvider { .. } = &call.target {
         let scope = call.space(route.scope)?;

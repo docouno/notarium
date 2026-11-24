@@ -1004,6 +1004,7 @@ impl Eligible {
                     ctx.auth()
                         .can_view_own_personal_chat(space, root, false)
                         .is_ok()
+                        || ctx.auth().keeper_log().is_some()
                 })
                 .map(|_| ctx.auth().principal().clone()),
             nodes,
