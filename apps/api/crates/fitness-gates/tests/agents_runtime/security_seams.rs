@@ -66,7 +66,8 @@ async fn exercise(pg: bool) {
     ))
     .await;
     Box::pin(role_cursor_and_schema_regressions(&fixture, &personal)).await;
-    let fixture = Box::pin(orphan_active_run_recovered_on_enqueue(fixture, &personal)).await;
+    let mut fixture = Box::pin(orphan_active_run_recovered_on_enqueue(fixture, &personal)).await;
+    Box::pin(mass_revocation_chunks_above_hub_limit(&mut fixture)).await;
     Box::pin(fixture.close()).await;
 }
 
@@ -3300,6 +3301,78 @@ async fn episode_project_and_folder_journal_regressions(
             .contains(&EpisodeDiagnostic::ProjectUnavailable),
         "replayed explicit BindRole projection after project trash must report ProjectUnavailable"
     );
+
+    // start_session on an episode with ProjectUnavailable and >20 abilities must surface
+    // `project_unavailable` in session.diagnostics and emit a working list_abilities
+    // nextAction without the broken session parameter.
+    for idx in 0..21u8 {
+        call_tool(
+            &owner,
+            40 + idx,
+            "create_ability",
+            json!({
+                "kind": "skill",
+                "name": format!("bootstrap-page-skill-{idx:02}"),
+                "description": format!("Pagination test skill {idx}"),
+                "instructions": format!("# Page Skill {idx}\n"),
+                "placement": {"home": "personal"},
+            }),
+        )
+        .await
+        .unwrap();
+    }
+    let started_unavailable = call_tool(
+        &owner,
+        80,
+        "start_session",
+        json!({"session": {"id": ep_live_proj}}),
+    )
+    .await
+    .expect("start_session on ProjectUnavailable episode must succeed with diagnostics");
+    let session_diag = started_unavailable.structured_content["session"]["diagnostics"]
+        .as_array()
+        .expect("start_session must surface episode diagnostics when project is unavailable");
+    assert!(
+        session_diag
+            .iter()
+            .any(|v| v.as_str() == Some("project_unavailable")),
+        "expected project_unavailable diagnostic in start_session: {session_diag:?}"
+    );
+    let next_action = &started_unavailable.structured_content["nextAction"];
+    assert_eq!(next_action["tool"], "list_abilities");
+    assert!(
+        next_action["arguments"].get("session").is_none(),
+        "nextAction for ProjectUnavailable session must omit session so pagination works: {next_action:?}"
+    );
+    let next_page = call_tool(
+        &owner,
+        81,
+        "list_abilities",
+        next_action["arguments"].clone(),
+    )
+    .await
+    .expect("executing start_session nextAction must succeed");
+    assert!(
+        !next_page.structured_content["items"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "nextAction follow-up page must return remaining abilities"
+    );
+    let direct_with_broken_session = call_tool(
+        &owner,
+        82,
+        "list_abilities",
+        json!({"view": "runtime", "session": ep_live_proj}),
+    )
+    .await;
+    assert!(
+        matches!(
+            direct_with_broken_session,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ),
+        "explicit list_abilities with ProjectUnavailable session and no project must still fail closed"
+    );
 }
 
 async fn role_cursor_and_schema_regressions(fixture: &RuntimeFixture, personal: &SpaceContext) {
@@ -3759,5 +3832,196 @@ async fn role_cursor_and_schema_regressions(fixture: &RuntimeFixture, personal: 
             Some(ProviderToolSchema::ConstBool(true))
         ),
         "create_note.folderPage must publish const true"
+    );
+}
+
+async fn mass_revocation_chunks_above_hub_limit(fixture: &mut RuntimeFixture) {
+    let admin = AccountContext::new(
+        fixture
+            .control
+            .trusted_none(
+                PerimeterAttestation::attest_checked().with_human_management(),
+                budget(),
+            )
+            .await
+            .unwrap(),
+        budget(),
+    );
+    let admin_id = admin.auth().principal().clone();
+    let created = fixture
+        .control
+        .create_account(
+            admin.clone(),
+            AccountMutation {
+                identity: identity(fixture, &admin, 231).await,
+                input: NewAccount {
+                    username: "mass-rev-owner".into(),
+                    email: None,
+                    display_name: "Mass Revocation Owner".into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let target_id = created.value.id.clone();
+    let disabled = fixture
+        .control
+        .set_disabled(
+            admin.clone(),
+            AccountMutation {
+                identity: notarium_core::receipt::AccountCommandIdentity {
+                    owner: target_id.clone(),
+                    actor: admin_id.clone(),
+                    expected: created.value.revision,
+                    key: CommandKey::from_bytes([232; 16]),
+                    hash: ContentDigest::from_bytes([232; 32]),
+                },
+                input: SetAccountDisabled {
+                    account: target_id.clone(),
+                    disabled: true,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    assert!(disabled.value.disabled);
+
+    let enabled_prv = ProviderResourceId::from_bytes([0xC1; 16]).to_string();
+    let disabled_prv = ProviderResourceId::from_bytes([0xC2; 16]).to_string();
+    let emb_model = ModelProfileId::from_bytes([0xC3; 16]).to_string();
+    let disclosure = serde_json::to_string(&ProviderDisclosure {
+        classes: [DocClass::UserDoc].into(),
+    })
+    .unwrap();
+    let timeouts = r#"{"version":1,"total_ms":10000}"#;
+    let caps = r#"{"version":1,"tools":false}"#;
+    let proj_enabled = FolderId::from_bytes([0xD1; 16]).to_string();
+    let proj_disabled = FolderId::from_bytes([0xD2; 16]).to_string();
+
+    macro_rules! seed_512 {
+        ($conn:expr) => {{
+            sqlx::query("BEGIN").execute(&mut *$conn).await.unwrap();
+            for (prv_id, owner_id, name) in [
+                (&enabled_prv, admin_id.as_str(), "mass-rev-enabled"),
+                (&disabled_prv, target_id.as_str(), "mass-rev-disabled"),
+            ] {
+                sqlx::query(
+                    "INSERT INTO provider_resources \
+                     (id, owner_id, name, wire, base_url, headers, credential_id, \
+                      consent_epoch, runtime_epoch, default_model, timeouts, rpm, tpm, disabled_at, revision) \
+                     VALUES ($1, $2, $3, 'ollama', 'http://127.0.0.1:1', '[]', NULL, 1, 1, $4, $5, NULL, NULL, NULL, 1)",
+                )
+                .bind(prv_id)
+                .bind(owner_id)
+                .bind(name)
+                .bind(&emb_model)
+                .bind(timeouts)
+                .execute(&mut *$conn)
+                .await
+                .unwrap();
+                sqlx::query(
+                    "INSERT INTO provider_models \
+                     (resource_id, model_id, wire_model_name, kind, tokenizer_profile, \
+                      max_input, max_output, dimension, capabilities, revision) \
+                     VALUES ($1, $2, 'emb', 'embedding', 'conservative-model-cap-v1', 8192, 0, 384, $3, 1)",
+                )
+                .bind(prv_id)
+                .bind(&emb_model)
+                .bind(caps)
+                .execute(&mut *$conn)
+                .await
+                .unwrap();
+            }
+            for i in 0..512u16 {
+                let mut sp_bytes = [0x90u8; 16];
+                sp_bytes[14..16].copy_from_slice(&i.to_be_bytes());
+                let space_id = SpaceId::from_bytes(sp_bytes).to_string();
+                sqlx::query(
+                    "INSERT INTO space_admission (space_id, state, admission_epoch, revision) \
+                     VALUES ($1, 'active', 1, 1)",
+                )
+                .bind(&space_id)
+                .execute(&mut *$conn)
+                .await
+                .unwrap();
+                for (att_tag, prv_id, owner_id, proj) in [
+                    ("en", &enabled_prv, admin_id.as_str(), &proj_enabled),
+                    ("dis", &disabled_prv, target_id.as_str(), &proj_disabled),
+                ] {
+                    let att_id = format!("att-{att_tag}-{i:04}");
+                    let scope_id = format!("{space_id}:{proj}");
+                    sqlx::query(
+                        "INSERT INTO provider_attachments \
+                         (id, resource_id, target_kind, target_owner, target_space, target_project, \
+                          resource_epoch, credential_epoch, state, disclosure, expires_at, revision) \
+                         VALUES ($1, $2, 'space', NULL, $3, NULL, 1, NULL, 'approved', $4, NULL, 1)",
+                    )
+                    .bind(&att_id)
+                    .bind(prv_id)
+                    .bind(&space_id)
+                    .bind(&disclosure)
+                    .execute(&mut *$conn)
+                    .await
+                    .unwrap();
+                    sqlx::query(
+                        "INSERT INTO provider_preferences \
+                         (owner_id, scope_kind, scope_id, model_kind, resource_id, model_id, revision) \
+                         VALUES ($1, 'project', $2, 'embedding', $3, $4, 1)",
+                    )
+                    .bind(owner_id)
+                    .bind(&scope_id)
+                    .bind(prv_id)
+                    .bind(&emb_model)
+                    .execute(&mut *$conn)
+                    .await
+                    .unwrap();
+                }
+            }
+            sqlx::query("COMMIT").execute(&mut *$conn).await.unwrap();
+        }};
+    }
+
+    match &mut fixture.storage.observer {
+        support::Observer::Sqlite(conn) => seed_512!(conn),
+        support::Observer::Postgres(conn) => seed_512!(conn),
+    }
+
+    let before_delivered = fixture
+        .storage
+        .observer
+        .count("SELECT COUNT(*) FROM revocation_events WHERE delivered_at IS NOT NULL")
+        .await;
+    let reenabled = fixture
+        .control
+        .set_disabled(
+            admin,
+            AccountMutation {
+                identity: notarium_core::receipt::AccountCommandIdentity {
+                    owner: target_id.clone(),
+                    actor: admin_id,
+                    expected: disabled.revision,
+                    key: CommandKey::from_bytes([233; 16]),
+                    hash: ContentDigest::from_bytes([233; 32]),
+                },
+                input: SetAccountDisabled {
+                    account: target_id,
+                    disabled: false,
+                },
+            },
+        )
+        .await
+        .expect(
+            "re-enabling owner affecting 512 Spaces (513 selectors) must chunk fences and succeed",
+        );
+    assert!(!reenabled.value.disabled);
+    let after_delivered = fixture
+        .storage
+        .observer
+        .count("SELECT COUNT(*) FROM revocation_events WHERE delivered_at IS NOT NULL")
+        .await;
+    assert!(
+        after_delivered - before_delivered >= 513,
+        "expected >= 513 delivered revocation events (1 principal + 512 spaces), got {}",
+        after_delivered - before_delivered
     );
 }

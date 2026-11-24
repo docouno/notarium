@@ -135,7 +135,7 @@ impl ControlService {
             if let Some(pin) = schedule_pin.take() {
                 tx.hold_schedule_pin(pin);
             }
-            let (result, events) = budget.run(async {
+            let (mut result, events, claimed_at) = budget.run(async {
                 let owner = user(tx.inner_mut(), &observed.owner_id).await?;
                 let run = AgentRunId::from_bytes(crate::auth::token::random()?);
                 let lease = LeaseEpoch::new(1)?;
@@ -153,7 +153,7 @@ impl ControlService {
                 let previous = slot_receipt(tx.inner_mut(), &request.schedule, slot).await?;
                 if let Some(previous) = &previous {
                     if previous.claim_request_hash == fingerprint {
-                        return Ok((ScheduleClaim::AlreadyClaimed(receipt(previous)?), Vec::new()));
+                        return Ok((ScheduleClaim::AlreadyClaimed(receipt(previous)?), Vec::new(), None));
                     }
                     // Older configurations could rewind the current due to an already
                     // issued slot. Only its live revision may advance past that receipt.
@@ -170,7 +170,7 @@ impl ControlService {
                 }
                 let mut info = schedule_info(&row)?;
                 if let Some(reason) = info.paused_reason {
-                    return Ok((ScheduleClaim::Paused(reason), Vec::new()));
+                    return Ok((ScheduleClaim::Paused(reason), Vec::new(), None));
                 }
                 if request.current_role != info.definition.approved_role {
                     return Err(invalid(ValidationReason::ScopeMismatch));
@@ -196,7 +196,7 @@ impl ControlService {
                     && info.revision.get().checked_sub(1) == Some(request.expected.get())
                     && let Some(outcome) = skipped
                 {
-                    return Ok((outcome, Vec::new()));
+                    return Ok((outcome, Vec::new(), None));
                 }
                 expect(&row, request.expected)?;
                 if row.next_slot_utc_ms != Some(slot) {
@@ -208,7 +208,7 @@ impl ControlService {
                 }
                 if let Some(outcome) = skipped {
                     advance(tx.inner_mut(), &request.schedule, next_slot, &row, self.clock.now_ms()?).await?;
-                    return Ok((outcome, Vec::new()));
+                    return Ok((outcome, Vec::new(), None));
                 }
                 validate(&info.definition, request.next_slot, RunLimits::HARD_CEILING, false)?;
 
@@ -251,6 +251,7 @@ impl ControlService {
                     (Some(reason), None)
                 };
                 let now = self.clock.now_ms()?;
+                let claimed_at = std::time::Instant::now();
                 if let Some(reason) = reason {
                     let label: String = parse(&json(&reason)?)?;
                     let revision = next(row.revision)?;
@@ -263,7 +264,7 @@ impl ControlService {
                         tx.inner_mut(), RevocationSelector::Schedule(request.schedule.clone()),
                         RevocationReason::PermissionChanged, revision, now,
                     ).await?;
-                    return Ok((ScheduleClaim::Paused(reason), vec![event]));
+                    return Ok((ScheduleClaim::Paused(reason), vec![event], None));
                 }
                 let (keeper, admission, history) = admitted.ok_or_else(|| invalid(ValidationReason::InvalidState))?;
                 let expires_at = now.checked_add(info.definition.limits.timeout_ms as i64)
@@ -300,11 +301,19 @@ impl ControlService {
                 })?;
                 Ok((ScheduleClaim::Claimed {
                     run, lease, schedule: Box::new(info), context: Box::new(context),
-                }, Vec::new()))
+                }, Vec::new(), Some(claimed_at)))
             }, CommitEffect::NotCommitted).await?;
             self.commit_revocations(tx, &budget, &events).await?;
             for event in &events {
                 self.flush_event(&budget, event).await?;
+            }
+            if let (ScheduleClaim::Claimed { context, .. }, Some(claimed_at)) =
+                (&mut result, claimed_at)
+            {
+                context.budget.remaining = context
+                    .budget
+                    .remaining
+                    .saturating_sub(claimed_at.elapsed());
             }
             Ok(result)
         }).await

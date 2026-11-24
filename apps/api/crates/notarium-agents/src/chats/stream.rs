@@ -353,6 +353,47 @@ impl StepStreamBuffer {
             None if superseded => return Ok(false),
             None => None,
         };
+        self.record_committed(&mut state, entry, step, boundary, superseded)
+    }
+
+    pub fn reconcile_committed(&self, entry: &ChatEntry) -> DomainResult<bool> {
+        if entry.thread != self.thread || !entry.is_chain_node {
+            return Err(invalid_state());
+        }
+        let mut state = lock(&self.state);
+        if state.visibility_floor != 0 {
+            if entry.seq > state.committed_leaf {
+                state.committed_leaf = entry.seq;
+                state.reset_visibility();
+                self.changed.send_replace(state.end);
+            }
+            return Ok(false);
+        }
+        if state.terminal.is_some() {
+            return Ok(false);
+        }
+        let superseded = entry.seq <= state.committed_leaf;
+        if superseded {
+            return Ok(false);
+        }
+        let boundary =
+            if entry.kind == ChatEntryKind::Model && entry.run.as_ref() == Some(&self.run) {
+                state.transient
+            } else {
+                None
+            };
+        let step = boundary.map(|transient| transient.step);
+        self.record_committed(&mut state, entry, step, boundary, false)
+    }
+
+    fn record_committed(
+        &self,
+        state: &mut State,
+        entry: &ChatEntry,
+        step: Option<u32>,
+        boundary: Option<TransientStep>,
+        superseded: bool,
+    ) -> DomainResult<bool> {
         let frame = state.frame(self.encode(AgentRunEvent::Committed {
             entry_seq: entry.seq,
             step,
@@ -373,7 +414,7 @@ impl StepStreamBuffer {
             state.end = frame.end_offset;
             self.changed.send_replace(state.end);
         } else {
-            self.insert(&mut state, frame);
+            self.insert(state, frame);
         }
         Ok(true)
     }

@@ -459,8 +459,26 @@ async fn start(call: &mut ToolCallContext<'_>, args: StartArgs) -> Result<Value,
             }));
         }
     }
+    let diagnostics: Vec<&str> = context
+        .episode
+        .diagnostics
+        .iter()
+        .map(|diag| match diag {
+            EpisodeDiagnostic::ProjectUnavailable => "project_unavailable",
+            EpisodeDiagnostic::RoleUnavailable => "role_unavailable",
+        })
+        .collect();
+    let mut session = json!({
+        "id": episode.id,
+        "name": episode.name,
+        "state": state,
+        "parentId": episode.parent,
+    });
+    if !diagnostics.is_empty() {
+        session["diagnostics"] = json!(diagnostics);
+    }
     let mut output = json!({
-        "session": { "id": episode.id, "name": episode.name, "state": state, "parentId": episode.parent },
+        "session": session,
         "profile": { "alwaysLoad": selection, "favorites": favorites, "truncated": context.continuation.is_some() },
         "abilities": abilities["items"],
     });

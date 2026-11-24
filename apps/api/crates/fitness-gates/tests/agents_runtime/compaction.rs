@@ -189,7 +189,7 @@ async fn long_branch_compaction_prefix_stays_within_snapshot_budget(
         .read_chat_compaction_prefix(
             personal.clone(),
             ChatRead {
-                thread,
+                thread: thread.clone(),
                 leaf: ThreadEntrySeq::new(TOTAL).unwrap(),
                 before: None,
                 max_entries: PageLimit::new(200).unwrap(),
@@ -211,6 +211,199 @@ async fn long_branch_compaction_prefix_stays_within_snapshot_budget(
     assert_eq!(
         after_cp.branch.entries[199].seq,
         ThreadEntrySeq::new(399).unwrap()
+    );
+
+    // 65+ live compaction checkpoints on the same branch must keep using the
+    // keyset-paged skip-list path instead of falling back to a full-branch scan.
+    let cp_prov_65 = r#"{"origins":[],"projects":[],"compacts_through":400}"#;
+    let marked_65 = fixture
+        .canonical
+        .execute_diagnostic_write_sql_for_test(&format!(
+            "UPDATE chat_entries SET kind='compaction', provenance_json='{cp_prov_65}' \
+             WHERE space_id='{}' AND thread_id='{}' \
+               AND entry_seq BETWEEN 24800 AND 25440 AND (entry_seq % 10) = 0",
+            scope.space_id.as_str(),
+            thread.as_str(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(marked_65, 65);
+    let updated_latest = fixture
+        .canonical
+        .execute_diagnostic_write_sql_for_test(&format!(
+            "UPDATE chat_entries SET provenance_json='{cp_prov_65}' \
+             WHERE space_id='{}' AND thread_id='{}' AND entry_seq=25500",
+            scope.space_id.as_str(),
+            thread.as_str(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(updated_latest, 1);
+
+    let after_66_cps = fixture
+        .canonical
+        .read_chat_compaction_prefix(
+            personal.clone(),
+            ChatRead {
+                thread: thread.clone(),
+                leaf: ThreadEntrySeq::new(TOTAL).unwrap(),
+                before: None,
+                max_entries: PageLimit::new(200).unwrap(),
+            },
+        )
+        .await
+        .expect("66 live compaction checkpoints must stay on the fast skip-list path");
+    assert!(after_66_cps.has_tail);
+    assert_eq!(after_66_cps.branch.entries.len(), 200);
+    assert_eq!(
+        after_66_cps.branch.entries[0].seq,
+        ThreadEntrySeq::new(25_500).unwrap()
+    );
+    assert_eq!(
+        after_66_cps.branch.entries[0].kind,
+        ChatEntryKind::Compaction
+    );
+    assert_eq!(
+        after_66_cps.branch.entries[1].seq,
+        ThreadEntrySeq::new(401).unwrap()
+    );
+    assert_eq!(
+        after_66_cps.branch.entries[199].seq,
+        ThreadEntrySeq::new(599).unwrap()
+    );
+
+    // 65 newer live compaction checkpoints on a sibling branch must force keyset
+    // pagination past page 1 (`cursor_max = last_seq - 1`) and still match ancestor 25,500.
+    let sibling_sql = if pg {
+        format!(
+            "INSERT INTO chat_entries(
+                space_id, thread_id, entry_seq, parent_seq, revision_id, kind,
+                tool_call_id, author_id, agent_run_id, inline_text, payload_blake3,
+                referenced_notes_json, ext_space_tainted, is_chain_node, branch_depth,
+                anc_16_seq, anc_256_seq, created_space_seq, redacted_at_seq,
+                checkpoint_stale, human_origin, body_format, provenance_json
+            )
+            SELECT '{space}', '{thread}', g, 1, 'rev_' || lpad(to_hex(g), 32, '0'), 'compaction',
+                   NULL, '{actor}', NULL, 'sibling cp', NULL,
+                   '[]', 0, 1, 1,
+                   NULL, NULL, 1, NULL, 0, 0, 0, '{prov}'
+            FROM generate_series(25601, 25665) AS g",
+            space = scope.space_id.as_str(),
+            thread = thread.as_str(),
+            actor = actor.as_str(),
+            prov = cp_prov_65,
+        )
+    } else {
+        format!(
+            "WITH RECURSIVE seq(g) AS (
+                SELECT 25601
+                UNION ALL
+                SELECT g + 1 FROM seq WHERE g < 25665
+            )
+            INSERT INTO chat_entries(
+                space_id, thread_id, entry_seq, parent_seq, revision_id, kind,
+                tool_call_id, author_id, agent_run_id, inline_text, payload_blake3,
+                referenced_notes_json, ext_space_tainted, is_chain_node, branch_depth,
+                anc_16_seq, anc_256_seq, created_space_seq, redacted_at_seq,
+                checkpoint_stale, human_origin, body_format, provenance_json
+            )
+            SELECT '{space}', '{thread}', g, 1, 'rev_' || printf('%032x', g), 'compaction',
+                   NULL, '{actor}', NULL, 'sibling cp', NULL,
+                   '[]', 0, 1, 1,
+                   NULL, NULL, 1, NULL, 0, 0, 0, '{prov}'
+            FROM seq",
+            space = scope.space_id.as_str(),
+            thread = thread.as_str(),
+            actor = actor.as_str(),
+            prov = cp_prov_65,
+        )
+    };
+    assert_eq!(
+        fixture
+            .canonical
+            .execute_diagnostic_write_sql_for_test(&sibling_sql)
+            .await
+            .unwrap(),
+        65
+    );
+    let new_leaf_sql = if pg {
+        format!(
+            "INSERT INTO chat_entries(
+                space_id, thread_id, entry_seq, parent_seq, revision_id, kind,
+                tool_call_id, author_id, agent_run_id, inline_text, payload_blake3,
+                referenced_notes_json, ext_space_tainted, is_chain_node, branch_depth,
+                anc_16_seq, anc_256_seq, created_space_seq, redacted_at_seq,
+                checkpoint_stale, human_origin, body_format, provenance_json
+            )
+            VALUES ('{space}', '{thread}', 25666, 25600, 'rev_' || lpad(to_hex(25666), 32, '0'), 'human',
+                    NULL, '{actor}', NULL, 'main leaf after siblings', NULL,
+                    '[]', 0, 1, 25600, 25585, 25345, 1, NULL, 0, 1, 0, NULL)",
+            space = scope.space_id.as_str(),
+            thread = thread.as_str(),
+            actor = actor.as_str(),
+        )
+    } else {
+        format!(
+            "INSERT INTO chat_entries(
+                space_id, thread_id, entry_seq, parent_seq, revision_id, kind,
+                tool_call_id, author_id, agent_run_id, inline_text, payload_blake3,
+                referenced_notes_json, ext_space_tainted, is_chain_node, branch_depth,
+                anc_16_seq, anc_256_seq, created_space_seq, redacted_at_seq,
+                checkpoint_stale, human_origin, body_format, provenance_json
+            )
+            VALUES ('{space}', '{thread}', 25666, 25600, 'rev_' || printf('%032x', 25666), 'human',
+                    NULL, '{actor}', NULL, 'main leaf after siblings', NULL,
+                    '[]', 0, 1, 25600, 25585, 25345, 1, NULL, 0, 1, 0, NULL)",
+            space = scope.space_id.as_str(),
+            thread = thread.as_str(),
+            actor = actor.as_str(),
+        )
+    };
+    assert_eq!(
+        fixture
+            .canonical
+            .execute_diagnostic_write_sql_for_test(&new_leaf_sql)
+            .await
+            .unwrap(),
+        1
+    );
+    fixture
+        .canonical
+        .execute_diagnostic_write_sql_for_test(&format!(
+            "UPDATE chat_threads SET head_leaf_seq=25666 WHERE space_id='{}' AND thread_id='{}'",
+            scope.space_id.as_str(),
+            thread.as_str(),
+        ))
+        .await
+        .unwrap();
+    let after_sibling_page = fixture
+        .canonical
+        .read_chat_compaction_prefix(
+            personal.clone(),
+            ChatRead {
+                thread,
+                leaf: ThreadEntrySeq::new(25_666).unwrap(),
+                before: None,
+                max_entries: PageLimit::new(200).unwrap(),
+            },
+        )
+        .await
+        .expect(
+            "keyset pagination must cross page 1 of 65 sibling checkpoints to find ancestor 25,500",
+        );
+    assert!(after_sibling_page.has_tail);
+    assert_eq!(after_sibling_page.branch.entries.len(), 200);
+    assert_eq!(
+        after_sibling_page.branch.entries[0].seq,
+        ThreadEntrySeq::new(25_500).unwrap()
+    );
+    assert_eq!(
+        after_sibling_page.branch.entries[1].seq,
+        ThreadEntrySeq::new(401).unwrap()
+    );
+    assert_eq!(
+        after_sibling_page.branch.entries[199].seq,
+        ThreadEntrySeq::new(599).unwrap()
     );
 }
 

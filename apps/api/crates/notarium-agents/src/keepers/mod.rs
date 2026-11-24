@@ -444,7 +444,6 @@ impl KeeperScheduler {
         };
         owner.check()?;
         let control = self.inner.registry.control();
-        let mut started = Instant::now();
         let mut result = control.claim_schedule(ctx.clone(), claim.clone()).await;
         for _ in 0..2 {
             if !matches!(&result, Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
@@ -479,7 +478,6 @@ impl KeeperScheduler {
             }
             owner.check()?;
             claim.next_slot = refreshed;
-            started = Instant::now();
             result = control.claim_schedule(ctx.clone(), claim.clone()).await;
         }
         match result {
@@ -490,8 +488,6 @@ impl KeeperScheduler {
                 schedule,
             }) => {
                 let mut context = *context;
-                context.budget.remaining =
-                    context.budget.remaining.saturating_sub(started.elapsed());
                 context.budget.cancellation = cancellation.clone();
                 let outcome = self
                     .run_claimed(&schedule, &run, lease, context, owner.as_mut())

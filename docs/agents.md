@@ -257,7 +257,7 @@ the observed distribution. All values are milliseconds.
 | --- | --- | ---: | ---: | ---: | ---: |
 | High | SQLite | 2.685 | 3.295 | <6 | <25 |
 | High | PostgreSQL | 4.716 | 5.650 | <10 | <35 |
-| Medium | SQLite | 5.817 | 8.398 | <13 | <20 |
+| Medium | SQLite | 5.817 | 8.398 | <13 | <19 |
 | Medium | PostgreSQL | 11.054 | 15.379 | <24 | <50 |
 
 The observed medians and p95 values come from three quiet 20-call series per

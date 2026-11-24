@@ -4,7 +4,7 @@ use notarium_core::{
     DomainError,
     auth::ResourceFacts,
     classes::DocClass,
-    error::{PortError, ValidationReason},
+    error::{CommitEffect, OperationalFailure, PortError, RetryAdvice, ValidationReason},
     ids::{CommandKey, ContentDigest, FolderId, NoteId},
     model::{FolderRef, HistoryScope, Lifecycle},
     patch::CarrierEditOrigin,
@@ -521,9 +521,16 @@ async fn create_draft(
     placement
         .write_scope
         .scope()
-        .check(committed.receipt.scope())?;
+        .check(committed.receipt.scope())
+        .map_err(|error| {
+            batch_operational_error("notarium.mcp.create-notes-batch.v1", error.into(), true)
+        })?;
     if committed.value.note != prepared.note {
-        return Err(invalid(ValidationReason::SourceMismatch));
+        return Err(batch_operational_error(
+            "notarium.mcp.create-notes-batch.v1",
+            invalid(ValidationReason::SourceMismatch),
+            true,
+        ));
     }
     Ok(CreatedDraft {
         prepared,
@@ -624,51 +631,162 @@ async fn resolve_batch_links(
         .map(Some)
 }
 
+pub(super) fn batch_operational_error(
+    label: &str,
+    error: PortError,
+    committed_any: bool,
+) -> PortError {
+    let unknown_retryable = matches!(
+        &error,
+        PortError::Cancelled(failure)
+            | PortError::DeadlineExceeded(failure)
+            | PortError::Unavailable(failure)
+            | PortError::Internal(failure)
+            if failure.effect() == CommitEffect::Unknown
+                && failure.retry() == RetryAdvice::RetrySameCommand
+    );
+    if unknown_retryable {
+        return error;
+    }
+    let unknown_any = matches!(
+        &error,
+        PortError::Cancelled(failure)
+            | PortError::DeadlineExceeded(failure)
+            | PortError::Unavailable(failure)
+            | PortError::Internal(failure)
+            if failure.effect() == CommitEffect::Unknown
+    );
+    if unknown_any || committed_any {
+        let diagnostic = derive_digest(label, &[error.code().as_bytes()]);
+        let failure = OperationalFailure::new(
+            diagnostic,
+            CommitEffect::Unknown,
+            RetryAdvice::RetrySameCommand,
+            true,
+        )
+        .expect("same-command retry has durable identity");
+        match error {
+            PortError::Cancelled(_) => PortError::Cancelled(failure),
+            PortError::DeadlineExceeded(_) => PortError::DeadlineExceeded(failure),
+            PortError::Unavailable(_) | PortError::Internal(_) | PortError::Domain(_) => {
+                PortError::Unavailable(failure)
+            }
+        }
+    } else {
+        error
+    }
+}
+
 pub(super) async fn create_many(
     call: &mut ToolCallContext<'_>,
     raw: Value,
 ) -> Result<Value, PortError> {
+    const LABEL: &str = "notarium.mcp.create-notes-batch.v1";
     let input: BatchInput = decode(raw)?;
     let placement = placement(call, &input.project).await?;
     let mut titles: BTreeMap<String, BTreeSet<NoteId>> = BTreeMap::new();
     let mut created = Vec::with_capacity(input.notes.len());
+    let mut committed_any = false;
     // Commit independently before treating any generated ID as a valid target.
     for (index, raw) in input.notes.into_iter().enumerate() {
-        let row = create_draft(call, &placement, index as u16, raw).await;
-        if let Ok(item) = &row {
-            titles
-                .entry(lookup_key(&item.prepared.title))
-                .or_default()
-                .insert(item.prepared.note.clone());
+        match create_draft(call, &placement, index as u16, raw).await {
+            Ok(item) => {
+                committed_any = true;
+                titles
+                    .entry(lookup_key(&item.prepared.title))
+                    .or_default()
+                    .insert(item.prepared.note.clone());
+                created.push(Ok(item));
+            }
+            Err(PortError::Domain(error)) => created.push(Err(error)),
+            Err(error) => return Err(batch_operational_error(LABEL, error, committed_any)),
         }
-        created.push(row);
     }
     let mut results = Vec::with_capacity(created.len());
     for (index, row) in created.into_iter().enumerate() {
-        let outcome = async {
-            let draft = row?;
-            let (committed, link_error) =
-                match resolve_batch_links(call, &placement, &draft, &titles).await {
-                    Ok(Some(committed)) => (committed, None),
-                    Ok(None) => (draft.committed, None),
-                    Err(error) => (draft.committed, Some(error.code())),
-                };
-            let mut value =
-                result(call, &placement, &draft.prepared, committed, draft.parent).await?;
-            if let Some(error) = link_error {
-                value["linkError"] = json!(error);
+        let draft = match row {
+            Ok(draft) => draft,
+            Err(error) => {
+                results.push(json!({ "index": index, "ok": false, "error": error.code() }));
+                continue;
             }
-            Ok::<_, PortError>(value)
+        };
+        let (committed, link_error) =
+            match resolve_batch_links(call, &placement, &draft, &titles).await {
+                Ok(Some(committed)) => (committed, None),
+                Ok(None) => (draft.committed, None),
+                Err(error) => (draft.committed, Some(error.code())),
+            };
+        let mut value = result(call, &placement, &draft.prepared, committed, draft.parent)
+            .await
+            .map_err(|error| batch_operational_error(LABEL, error, true))?;
+        if let Some(error) = link_error {
+            value["linkError"] = json!(error);
         }
-        .await;
-        results.push(match outcome {
-            Ok(mut value) => {
-                value["index"] = json!(index);
-                value["ok"] = json!(true);
-                value
-            }
-            Err(error) => json!({ "index": index, "ok": false, "error": error.code() }),
-        });
+        value["index"] = json!(index);
+        value["ok"] = json!(true);
+        results.push(value);
     }
     Ok(json!({ "results": results }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn op(effect: CommitEffect, retry: RetryAdvice, idempotent: bool) -> OperationalFailure {
+        OperationalFailure::new(
+            ContentDigest::from_bytes([1; 32]),
+            effect,
+            retry,
+            idempotent,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn batch_operational_error_preserves_variants_and_unknown_retry_advice() {
+        let label = "notarium.test.batch-op.v1";
+
+        let uncomm =
+            PortError::Unavailable(op(CommitEffect::NotCommitted, RetryAdvice::Never, false));
+        assert_eq!(
+            batch_operational_error(label, uncomm.clone(), false),
+            uncomm
+        );
+
+        let upgraded_unavail = batch_operational_error(label, uncomm, true);
+        assert!(matches!(
+            upgraded_unavail,
+            PortError::Unavailable(f)
+                if f.effect() == CommitEffect::Unknown && f.retry() == RetryAdvice::RetrySameCommand
+        ));
+
+        let cancelled =
+            PortError::Cancelled(op(CommitEffect::NotCommitted, RetryAdvice::Never, false));
+        let upgraded_cancel = batch_operational_error(label, cancelled, true);
+        assert!(matches!(
+            upgraded_cancel,
+            PortError::Cancelled(f)
+                if f.effect() == CommitEffect::Unknown && f.retry() == RetryAdvice::RetrySameCommand
+        ));
+
+        let deadline =
+            PortError::DeadlineExceeded(op(CommitEffect::NotCommitted, RetryAdvice::Never, false));
+        let upgraded_deadline = batch_operational_error(label, deadline, true);
+        assert!(matches!(
+            upgraded_deadline,
+            PortError::DeadlineExceeded(f)
+                if f.effect() == CommitEffect::Unknown && f.retry() == RetryAdvice::RetrySameCommand
+        ));
+
+        let unknown_never =
+            PortError::DeadlineExceeded(op(CommitEffect::Unknown, RetryAdvice::Never, false));
+        let upgraded_unknown = batch_operational_error(label, unknown_never, false);
+        assert!(matches!(
+            upgraded_unknown,
+            PortError::DeadlineExceeded(f)
+                if f.effect() == CommitEffect::Unknown && f.retry() == RetryAdvice::RetrySameCommand
+        ));
+    }
 }

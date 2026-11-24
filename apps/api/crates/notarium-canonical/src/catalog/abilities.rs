@@ -582,7 +582,9 @@ pub(super) async fn page(
                                  FROM ability_packages ap \
                                  JOIN note_heads nh ON nh.space_id = ap.space_id AND nh.note_id = ap.entrypoint_note_id \
                                  WHERE ap.space_id = $1), \
-                                (SELECT COALESCE(MAX(updated_seq), 0) FROM folder_heads WHERE space_id = $1)"
+                                CASE WHEN EXISTS (SELECT 1 FROM ability_packages WHERE space_id = $1) \
+                                     THEN (SELECT COALESCE(MAX(updated_seq), 0) FROM folder_heads WHERE space_id = $1) \
+                                     ELSE 0 END"
                         ),
                         fetch_one,
                         space.space.id.as_str()

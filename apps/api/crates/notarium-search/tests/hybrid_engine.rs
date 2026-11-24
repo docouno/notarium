@@ -3071,3 +3071,173 @@ async fn lexical_evidence_and_live_chat_pagination() {
     engine.shutdown().await;
     runtime.shutdown().await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recall_widening_preserves_authorized_graph_neighbors() {
+    use notarium_core::ports::{PortFuture, SearchRecipient};
+    struct DenySet {
+        denied: BTreeSet<NoteId>,
+    }
+    impl SearchRecipient for DenySet {
+        fn admit<'a>(
+            &'a self,
+            card: &'a notarium_core::classes::ClassifiedMetadata,
+        ) -> PortFuture<'a, bool> {
+            Box::pin(async move { Ok(!self.denied.contains(&card.reference().note_id)) })
+        }
+    }
+
+    let _guard = INTEGRATION_LOCK.lock().await;
+    let data = TempDataRoot::new("recall-widening-neighbors");
+    let (store, runtime) = CanonicalRuntime::open(CanonicalConfig::local_default(
+        sample_installation_id(94),
+        data.data_root(),
+    ))
+    .await
+    .unwrap();
+    let store = Arc::new(store);
+    let owner = sample_principal_id(94);
+    let folder = sample_folder_id(94);
+    let epoch = LeaseEpoch::new(1).unwrap();
+    let scope = store
+        .create_space(CreateSpaceSpec {
+            space_id: sample_space_id(94),
+            incarnation: sample_incarnation(94),
+            root_folder_id: folder.clone(),
+            slug: "recall-widening".into(),
+            kind: SpaceKind::Personal,
+            owner: owner.clone(),
+            active_epoch: epoch,
+            initial_last_seq: SpaceSeq::ZERO,
+            created_at: None,
+        })
+        .await
+        .unwrap()
+        .scope;
+    let id = |index: u32| NoteId::from_bytes(u128::from(index + 1).to_be_bytes());
+    let mut view = View::new(scope.clone(), folder.clone());
+    let mut live = BTreeSet::new();
+    let mut denied = BTreeSet::new();
+    let mut batch = Vec::new();
+    let mut cutoff = SpaceSeq::ZERO;
+
+    // 16 authorized seeds (0..16) with higher TF so they rank in pass 1,
+    // 16 * 61 = 976 denied neighbors (16..992) with lower node indices than the
+    // 16 * 4 = 64 authorized neighbors (992..1056) so expanding all 16 seeds
+    // consumes exactly 16 * 65 = 1,040 == MAX_GRAPH_PAGES visits, plus 385
+    // lower-ranked denied lexical matches (1056..1441) that overflow pass 1
+    // (16 + 385 = 401 > 400) and trigger recipient widening with top_k = 100.
+    const SEEDS: u32 = 16;
+    const DENIED_PER_SEED: u32 = 61;
+    const ALLOWED_PER_SEED: u32 = 4;
+    const DENIED_NEIGHBORS_START: u32 = SEEDS;
+    const ALLOWED_NEIGHBORS_START: u32 = DENIED_NEIGHBORS_START + SEEDS * DENIED_PER_SEED;
+    const DENIED_LEXICAL_START: u32 = ALLOWED_NEIGHBORS_START + SEEDS * ALLOWED_PER_SEED;
+    const DENIED_LEXICAL_COUNT: u32 = 385;
+    let total = DENIED_LEXICAL_START + DENIED_LEXICAL_COUNT;
+    for i in 0..total {
+        let note_id = id(i);
+        view.index(note_id.clone(), folder.clone());
+        live.insert(note_id.clone());
+        let (title, body) = if i < SEEDS {
+            (
+                format!("Authorized Seed {i}"),
+                "widenmarker widenmarker widenmarker shared anchor".to_owned(),
+            )
+        } else if i < ALLOWED_NEIGHBORS_START {
+            denied.insert(note_id.clone());
+            (
+                format!("Denied Neighbor {i}"),
+                "blocked linked note without lexical match".to_owned(),
+            )
+        } else if i < DENIED_LEXICAL_START {
+            (
+                format!("Authorized Neighbor {i}"),
+                "linked evidence note without lexical match".to_owned(),
+            )
+        } else {
+            denied.insert(note_id.clone());
+            (
+                format!("Denied Match {i}"),
+                "widenmarker blocked lexical match padding tail".to_owned(),
+            )
+        };
+        batch.push(note(&note_id, &folder, &title, &body));
+        if batch.len() == 64 || i + 1 == total {
+            let (written, _) = store
+                .commit_synthetic_note_batch_for_test(
+                    &scope,
+                    epoch,
+                    &owner,
+                    std::mem::take(&mut batch),
+                )
+                .await
+                .unwrap();
+            cutoff = written.last_seq;
+            view.advance(cutoff);
+        }
+    }
+    for seed in 0..SEEDS {
+        for offset in 0..DENIED_PER_SEED {
+            view.link(
+                seed,
+                DENIED_NEIGHBORS_START + seed * DENIED_PER_SEED + offset,
+            );
+        }
+        for offset in 0..ALLOWED_PER_SEED {
+            // Link incoming so neighbor_page returns all 61 outgoing denied + 4 incoming
+            // authorized neighbors (65 per seed = 1,040 == MAX_GRAPH_PAGES).
+            view.link(
+                ALLOWED_NEIGHBORS_START + seed * ALLOWED_PER_SEED + offset,
+                seed,
+            );
+        }
+    }
+    let projection = Arc::new(Projection {
+        store: store.clone(),
+        snapshot: RwLock::new(view),
+        live: RwLock::new(live),
+    });
+    let engine = SearchEngine::start(
+        SearchConfig::new(data.data_root(), VectorMode::Disabled),
+        SearchDependencies::new(store.clone(), projection),
+    );
+    let ctx = context(&scope, &owner);
+    let req = RecallQuery {
+        query: SearchQuery {
+            top_k: PageLimit::new(100).unwrap(),
+            causal: CausalBasis::Await(AwaitWatermarks::at(scope.clone(), cutoff)),
+            ..query("widenmarker")
+        },
+        graph_depth: 1,
+        token_budget: 131_072,
+        max_per_source: None,
+    };
+    let recipient = DenySet { denied };
+    let recalled = engine
+        .recall_for(ctx, req, Some(&recipient))
+        .await
+        .expect("recall_for widening must succeed");
+    assert!(
+        !recalled.truncated,
+        "single post-widening graph expansion must fit within MAX_GRAPH_PAGES without truncation"
+    );
+    let hit_ids: BTreeSet<_> = recalled
+        .hits
+        .iter()
+        .map(|hit| hit.card.document.provenance().reference().note_id.clone())
+        .collect();
+    assert_eq!(
+        hit_ids.len(),
+        80,
+        "recipient widening must preserve all 16 seeds and 64 authorized graph neighbors"
+    );
+    for i in 0..SEEDS {
+        assert!(hit_ids.contains(&id(i)), "missing authorized seed {i}");
+    }
+    for i in ALLOWED_NEIGHBORS_START..DENIED_LEXICAL_START {
+        assert!(hit_ids.contains(&id(i)), "missing authorized neighbor {i}");
+    }
+    engine.shutdown().await;
+    runtime.shutdown().await.unwrap();
+}

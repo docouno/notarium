@@ -817,6 +817,9 @@ pub(super) async fn session_ability_summaries(
     call: &mut ToolCallContext<'_>,
     episode: &AgentEpisode,
 ) -> Result<Value, PortError> {
+    let project_unavailable = episode
+        .diagnostics
+        .contains(&EpisodeDiagnostic::ProjectUnavailable);
     list(
         call,
         ListArgs {
@@ -827,7 +830,7 @@ pub(super) async fn session_ability_summaries(
             q: None,
             cursor: None,
             limit: None,
-            session: Some(episode.id.clone()),
+            session: (!project_unavailable).then(|| episode.id.clone()),
         },
         episode.project_hint.clone(),
     )

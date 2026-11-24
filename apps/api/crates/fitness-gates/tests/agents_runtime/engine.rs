@@ -123,6 +123,8 @@ pub struct ProjectionFixtures {
     after_ability_publication: Mutex<Option<MutationPause>>,
     before_memory_append: Mutex<Option<MutationPause>>,
     lose_note_edit_ack: Mutex<bool>,
+    lose_note_create_acks: Mutex<usize>,
+    lose_chat_append_acks: Mutex<usize>,
     before_chat_consume: Mutex<Option<MutationPause>>,
     before_chat_hydration: Mutex<Option<MutationPause>>,
     chat_consume: Mutex<ChatConsumeFixture>,
@@ -232,6 +234,14 @@ impl ProjectionFixtures {
         *self.lose_note_edit_ack.lock().unwrap() = true;
     }
 
+    pub fn lose_note_create_acks(&self, count: usize) {
+        *self.lose_note_create_acks.lock().unwrap() = count;
+    }
+
+    pub fn lose_chat_append_acks(&self, count: usize) {
+        *self.lose_chat_append_acks.lock().unwrap() = count;
+    }
+
     pub fn pause_chat_consume(&self) -> (oneshot::Receiver<Cancellation>, oneshot::Sender<()>) {
         MutationPause::install(&self.before_chat_consume)
     }
@@ -311,7 +321,6 @@ macro_rules! canonical_port {
 
 canonical_port!(NoteWritePort;
     ensure_folder_path(Mutation<EnsureFolderPath>) -> FolderRef,
-    create_note(Mutation<CreateNote>) -> Committed<NoteRevision>,
     delete_note(Mutation<DeleteNote>) -> Committed<NoteRevision>,
     mint_and_purge(Mutation<MintAndPurge>) -> Committed<MintAndPurgeResult>,
     rename_note(Mutation<RenameNote>) -> Committed<NoteRevision>,
@@ -323,6 +332,28 @@ canonical_port!(NoteWritePort;
     link_many(LinkBatch) -> BatchResult<Link>,
     rollback_agent_run(Mutation<RollbackAgentRun>) -> Committed<RollbackResult>,
     accept_external_observation(Mutation<ExternalObservation>) -> ExternalObservationResult;
+
+    fn create_note(
+        &self,
+        ctx: SpaceContext,
+        request: Mutation<CreateNote>,
+    ) -> PortFuture<'_, Committed<NoteRevision>> {
+        Box::pin(async move {
+            let committed = NoteWritePort::create_note(&self.0, ctx, request).await?;
+            if lose_ack(&self.1.lose_note_create_acks) {
+                return Err(PortError::Unavailable(
+                    OperationalFailure::new(
+                        ContentDigest::from_bytes([171; 32]),
+                        CommitEffect::Unknown,
+                        RetryAdvice::RetrySameCommand,
+                        true,
+                    )
+                    .unwrap(),
+                ));
+            }
+            Ok(committed)
+        })
+    }
 
     fn move_note(
         &self,
@@ -398,11 +429,31 @@ canonical_port!(ChatPort;
     discard_staged_chat_blob(StagedChatBlob) -> (),
     create_chat(Mutation<CreateChat>) -> Committed<ChatThread>,
     fork_chat(Mutation<ForkChat>) -> Committed<ChatThread>,
-    append_chat(Mutation<AppendChat>) -> Committed<ChatEntry>,
     queue_chat_input(Mutation<PendingChatInput>) -> QueueInputOutcome,
     list_pending_chat_inputs(ChatThreadId) -> Vec<QueuedChatInput>,
     dismiss_chat_input(DismissPending) -> bool,
     recover_active_run(ChatRunRequest) -> FinishChatRunOutcome;
+    fn append_chat(
+        &self,
+        ctx: SpaceContext,
+        request: Mutation<AppendChat>,
+    ) -> PortFuture<'_, Committed<ChatEntry>> {
+        Box::pin(async move {
+            let committed = ChatPort::append_chat(&self.0, ctx, request).await?;
+            if lose_ack(&self.1.lose_chat_append_acks) {
+                return Err(PortError::Unavailable(
+                    OperationalFailure::new(
+                        ContentDigest::from_bytes([172; 32]),
+                        CommitEffect::Unknown,
+                        RetryAdvice::RetrySameCommand,
+                        true,
+                    )
+                    .unwrap(),
+                ));
+            }
+            Ok(committed)
+        })
+    }
     fn read_chat_contents(&self, ctx: SpaceContext, request: ChatContentRead) -> PortFuture<'_, Vec<HydratedChatEntry>> {
         Box::pin(async move {
             MutationPause::enter(&self.1.before_chat_hydration, ctx.budget.cancellation.clone()).await;

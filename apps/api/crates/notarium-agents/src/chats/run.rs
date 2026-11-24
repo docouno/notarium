@@ -20,12 +20,11 @@ impl AgentRunSupervisor {
                 RunTaskStart::Admitted(leaf) => self.run_turn(&run, leaf).await,
                 RunTaskStart::DrainOnly(error) => Err(error),
             };
-            if matches!(
-                &result,
-                Err(PortError::Domain(DomainError::RevisionConflict { .. }))
-            ) {
-                let _ = self.refresh_current_peer_head(&run).await;
-            }
+            let own_reconciled = if result.is_err() {
+                self.refresh_current_head(&run, true).await.is_ok()
+            } else {
+                true
+            };
             let mut delay = Duration::from_millis(25);
             let mut unsettled = None;
             let mut pending_stalls = 0u8;
@@ -55,14 +54,14 @@ impl AgentRunSupervisor {
                             drop(admission);
                         }
                         _ => {
-                            let _ = self.refresh_current_peer_head(&run).await;
+                            let _ = self.refresh_current_head(&run, !own_reconciled).await;
                             self.finish_and_remove_run(&run, result.err().or(Some(error)));
                             drop(admission);
                             return;
                         }
                     },
                     Ok(()) => {
-                        let _ = self.refresh_current_peer_head(&run).await;
+                        let _ = self.refresh_current_head(&run, !own_reconciled).await;
                         self.finish_and_remove_run(&run, result.err());
                         drop(admission);
                         return;

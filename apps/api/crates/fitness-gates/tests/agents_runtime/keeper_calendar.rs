@@ -659,6 +659,81 @@ pub(super) async fn calendar_scope_and_orphan(fixture: &mut RuntimeFixture, spac
         .await
         .unwrap();
 
+    // Waiting behind a Control DB write lock longer than the schedule's timeout_ms
+    // must not exhaust the run's execution budget before step 0, because Control
+    // stamps started_at/expires_at after acquiring the lock.
+    let lock_slot = parse("2026-12-02T12:20:00Z");
+    set_clock(lock_slot);
+    let mut short_budget_def = new_schedule(
+        186,
+        "Lock wait budget keeper",
+        "0 20 * * * * *",
+        "UTC",
+        lock_slot,
+    );
+    short_budget_def.definition.limits.timeout_ms = 1_000;
+    let lock_schedule = create(fixture, 186, short_budget_def).await;
+    if fixture.storage.root.is_some() {
+        fixture.storage.observer.execute("BEGIN IMMEDIATE").await;
+    } else {
+        fixture.storage.observer.execute("BEGIN").await;
+        fixture
+            .storage
+            .observer
+            .execute("LOCK TABLE agent_schedules IN EXCLUSIVE MODE")
+            .await;
+    }
+    let release_lock = async {
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        fixture.storage.observer.execute("COMMIT").await;
+    };
+    let lock_provider = async {
+        let (mut socket, _) = timeout(Duration::from_secs(10), read_request(&listener))
+            .await
+            .expect("keeper must reach provider after lock wait longer than timeout_ms");
+        send_ollama(
+            &mut socket,
+            json!({"role": "assistant", "content": "Completed after lock wait"}),
+            "stop",
+        )
+        .await;
+    };
+    let (lock_summary, (), ()) = tokio::join!(
+        rollover_scheduler.tick(lock_slot),
+        release_lock,
+        lock_provider
+    );
+    let lock_summary = lock_summary.unwrap();
+    assert_eq!(
+        (
+            lock_summary.claimed,
+            lock_summary.succeeded,
+            lock_summary.failed,
+            lock_summary.errors
+        ),
+        (1, 1, 0, 0),
+        "claim lock wait longer than timeout_ms must not fail the newly claimed run: {lock_summary:?}"
+    );
+    let lock_current = fixture
+        .control
+        .get_schedule(space.clone(), lock_schedule.id.clone())
+        .await
+        .unwrap();
+    fixture
+        .control
+        .delete_schedule(
+            fixture.human.clone(),
+            AccountMutation {
+                identity: identity(fixture, &fixture.human, 187).await,
+                input: DeleteSchedule {
+                    schedule: lock_schedule.id,
+                    expected: lock_current.revision,
+                },
+            },
+        )
+        .await
+        .unwrap();
+
     // Personal defaults take precedence over project settings. Retire this
     // fixture's preference before the next provider scenario.
     fixture.storage.observer.execute(

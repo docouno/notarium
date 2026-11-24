@@ -193,7 +193,8 @@ async fn latest_compaction_candidates_tx(
     tx: &mut BackendConn<'_>,
     space_id: &SpaceId,
     thread_id: &ChatThreadId,
-    max_seq: ThreadEntrySeq,
+    max_seq: i64,
+    limit: i64,
 ) -> Result<Vec<(i64, i32)>, PortError> {
     const SQL: &str = "SELECT entry_seq, CAST(branch_depth AS INTEGER)
                        FROM chat_entries
@@ -201,13 +202,14 @@ async fn latest_compaction_candidates_tx(
                          AND kind = 'compaction' AND checkpoint_stale = 0
                          AND entry_seq <= $3
                        ORDER BY entry_seq DESC
-                       LIMIT 65";
+                       LIMIT $4";
     match tx {
         BackendConn::Sqlite(conn) => {
             sqlx::query_as(SQL)
                 .bind(space_id.as_str())
                 .bind(thread_id.as_str())
-                .bind(max_seq.get() as i64)
+                .bind(max_seq)
+                .bind(limit)
                 .fetch_all(&mut **conn)
                 .await
         }
@@ -215,7 +217,8 @@ async fn latest_compaction_candidates_tx(
             sqlx::query_as(SQL)
                 .bind(space_id.as_str())
                 .bind(thread_id.as_str())
-                .bind(max_seq.get() as i64)
+                .bind(max_seq)
+                .bind(limit)
                 .fetch_all(&mut **conn)
                 .await
         }
@@ -606,16 +609,24 @@ async fn oldest_prefix(
                 let fast_plan = if let Some(leaf_depth) = leaf_depth
                     && leaf_depth > (limit as i32) + 64
                 {
-                    let candidates = latest_compaction_candidates_tx(
-                        tx,
-                        &scope.space_id,
-                        &request.thread,
-                        request.leaf,
-                    )
-                    .await?;
-                    if candidates.len() <= 64 {
-                        let mut matched_cp: Option<(i64, i32)> = None;
+                    const CANDIDATE_PAGE: i64 = 64;
+                    let mut matched_cp: Option<(i64, i32)> = None;
+                    let mut cursor_max = request.leaf.get() as i64;
+                    loop {
+                        deadline.remaining(&budget)?;
+                        let candidates = latest_compaction_candidates_tx(
+                            tx,
+                            &scope.space_id,
+                            &request.thread,
+                            cursor_max,
+                            CANDIDATE_PAGE,
+                        )
+                        .await?;
+                        let page_len = candidates.len();
+                        let mut last_seq = cursor_max;
                         for (cand_seq, cand_depth) in candidates {
+                            deadline.remaining(&budget)?;
+                            last_seq = cand_seq;
                             if cand_depth <= leaf_depth
                                 && jump_to_depth_tx(
                                     tx,
@@ -631,106 +642,108 @@ async fn oldest_prefix(
                                 break;
                             }
                         }
-                        let (through, through_depth) = if let Some((cp_seq, cp_depth)) = matched_cp
+                        if matched_cp.is_some()
+                            || page_len < CANDIDATE_PAGE as usize
+                            || last_seq <= 1
                         {
+                            break;
+                        }
+                        cursor_max = last_seq - 1;
+                    }
+                    let (through, through_depth) = if let Some((cp_seq, cp_depth)) = matched_cp {
+                        deadline.remaining(&budget)?;
+                        let mut cp_map = load_prefix_rows_by_seq_tx(
+                            tx,
+                            &scope.space_id,
+                            &request.thread,
+                            &[cp_seq],
+                        )
+                        .await?;
+                        let cp_raw = cp_map.remove(&cp_seq).ok_or_else(|| {
+                            internal_not_committed(
+                                "missing_compaction_checkpoint",
+                                "compaction checkpoint disappeared inside read snapshot",
+                            )
+                        })?;
+                        let (cp_entry, cp_payload) = decode_prefix_row(&request.thread, cp_raw)?;
+                        if cp_entry.tainted {
+                            any_tainted = true;
+                        }
+                        let through = content::decode_proof(
+                            cp_payload.provenance_json.as_deref(),
+                            th.redaction_epoch,
+                        )?
+                        .and_then(|proof| proof.compacts_through)
+                        .unwrap_or(cp_entry.seq);
+                        let through_depth = if through == cp_entry.seq {
+                            cp_depth
+                        } else {
+                            entry_depth_tx(tx, &scope.space_id, &request.thread, through)
+                                .await?
+                                .unwrap_or(-1)
+                        };
+                        checkpoint = Some((cp_entry, cp_payload));
+                        (through, through_depth)
+                    } else {
+                        (ThreadEntrySeq::ZERO, -1)
+                    };
+                    let need_full_taint_scan = !any_tainted
+                        && thread_has_tainted_in_range_tx(
+                            tx,
+                            &scope.space_id,
+                            &request.thread,
+                            through,
+                            request.leaf,
+                        )
+                        .await?;
+                    if need_full_taint_scan {
+                        checkpoint = None;
+                        None
+                    } else {
+                        let mut window: i32 = (limit as i32) + 64;
+                        loop {
                             deadline.remaining(&budget)?;
-                            let mut cp_map = load_prefix_rows_by_seq_tx(
+                            let target_depth = through_depth.saturating_add(window).min(leaf_depth);
+                            let anchor = if target_depth >= leaf_depth {
+                                request.leaf
+                            } else {
+                                let Some(seq) = jump_to_depth_tx(
+                                    tx,
+                                    &scope.space_id,
+                                    &request.thread,
+                                    request.leaf,
+                                    target_depth,
+                                )
+                                .await?
+                                else {
+                                    checkpoint = None;
+                                    break None;
+                                };
+                                queue::seq_from_db(seq)?
+                            };
+                            let scan = scan_prefix_chain_tx(
                                 tx,
-                                &scope.space_id,
-                                &request.thread,
-                                &[cp_seq],
+                                PrefixScanQuery {
+                                    space_id: &scope.space_id,
+                                    thread_id: &request.thread,
+                                    leaf: anchor,
+                                    min_exclusive: through,
+                                    keeper: None,
+                                    stop_at_compaction: false,
+                                    limit,
+                                },
                             )
                             .await?;
-                            let cp_raw = cp_map.remove(&cp_seq).ok_or_else(|| {
-                                internal_not_committed(
-                                    "missing_compaction_checkpoint",
-                                    "compaction checkpoint disappeared inside read snapshot",
-                                )
-                            })?;
-                            let (cp_entry, cp_payload) =
-                                decode_prefix_row(&request.thread, cp_raw)?;
-                            if cp_entry.tainted {
+                            if scan.any_tainted {
                                 any_tainted = true;
                             }
-                            let through = content::decode_proof(
-                                cp_payload.provenance_json.as_deref(),
-                                th.redaction_epoch,
-                            )?
-                            .and_then(|proof| proof.compacts_through)
-                            .unwrap_or(cp_entry.seq);
-                            let through_depth = if through == cp_entry.seq {
-                                cp_depth
-                            } else {
-                                entry_depth_tx(tx, &scope.space_id, &request.thread, through)
-                                    .await?
-                                    .unwrap_or(-1)
-                            };
-                            checkpoint = Some((cp_entry, cp_payload));
-                            (through, through_depth)
-                        } else {
-                            (ThreadEntrySeq::ZERO, -1)
-                        };
-                        let need_full_taint_scan = !any_tainted
-                            && thread_has_tainted_in_range_tx(
-                                tx,
-                                &scope.space_id,
-                                &request.thread,
-                                through,
-                                request.leaf,
-                            )
-                            .await?;
-                        if need_full_taint_scan {
-                            checkpoint = None;
-                            None
-                        } else {
-                            let mut window: i32 = (limit as i32) + 64;
-                            loop {
-                                deadline.remaining(&budget)?;
-                                let target_depth =
-                                    through_depth.saturating_add(window).min(leaf_depth);
-                                let anchor = if target_depth >= leaf_depth {
-                                    request.leaf
-                                } else {
-                                    let Some(seq) = jump_to_depth_tx(
-                                        tx,
-                                        &scope.space_id,
-                                        &request.thread,
-                                        request.leaf,
-                                        target_depth,
-                                    )
-                                    .await?
-                                    else {
-                                        checkpoint = None;
-                                        break None;
-                                    };
-                                    queue::seq_from_db(seq)?
-                                };
-                                let scan = scan_prefix_chain_tx(
-                                    tx,
-                                    PrefixScanQuery {
-                                        space_id: &scope.space_id,
-                                        thread_id: &request.thread,
-                                        leaf: anchor,
-                                        min_exclusive: through,
-                                        keeper: None,
-                                        stop_at_compaction: false,
-                                        limit,
-                                    },
-                                )
-                                .await?;
-                                if scan.any_tainted {
-                                    any_tainted = true;
-                                }
-                                if (scan.oldest_seqs.len() >= limit && scan.has_tail)
-                                    || target_depth >= leaf_depth
-                                {
-                                    break Some((scan.oldest_seqs, scan.has_tail));
-                                }
-                                window = window.saturating_mul(2);
+                            if (scan.oldest_seqs.len() >= limit && scan.has_tail)
+                                || target_depth >= leaf_depth
+                            {
+                                break Some((scan.oldest_seqs, scan.has_tail));
                             }
+                            window = window.saturating_mul(2);
                         }
-                    } else {
-                        None
                     }
                 } else {
                     None

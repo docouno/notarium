@@ -677,6 +677,47 @@ async fn supervised_turn_survives_disconnect_and_stops_cleanly(
     assert!(matches!(woken.value, EpisodeStartResult::Resumed(_)));
     let partial_head = idle_leaf(fixture, personal, &thread).await;
 
+    // When a Personal chat Model append commits in canonical, loses its ack, and the
+    // retry also fails, final reconciliation must still advance committed_leaf before RunFailed.
+    fixture.projections.lose_chat_append_acks(2);
+    let lost_ack_turn = supervisor
+        .enqueue_input(
+            owner.clone(),
+            input(165, partial_head, "Commit model reply with lost acks."),
+            options.clone(),
+        )
+        .await
+        .unwrap();
+    let (mut lost_ack_conn, _) = timeout(Duration::from_secs(10), read_request(&listener))
+        .await
+        .unwrap();
+    let lost_ack_stream = supervisor
+        .subscribe(owner.clone(), scope.clone(), thread.clone(), None)
+        .await
+        .unwrap()
+        .unwrap();
+    send_ollama(
+        &mut lost_ack_conn,
+        json!({"role": "assistant", "content": "Committed despite lost acks"}),
+        "stop",
+    )
+    .await;
+    let lost_events = stream_events(lost_ack_stream).await;
+    let actual_head = idle_leaf(fixture, personal, &thread).await;
+    assert!(lost_ack_turn.run.is_some());
+    assert!(
+        actual_head > partial_head,
+        "canonical must hold the committed Model entry after lost acks"
+    );
+    assert_eq!(lost_events.last().unwrap()["type"], "run_failed");
+    assert!(
+        lost_events
+            .iter()
+            .any(|event| event["type"] == "committed" && event["entrySeq"] == json!(actual_head)),
+        "stream must reconcile committed_leaf to canonical head before run_failed: {lost_events:?}"
+    );
+    let partial_head = actual_head;
+
     let second = supervisor
         .enqueue_input(
             owner.clone(),

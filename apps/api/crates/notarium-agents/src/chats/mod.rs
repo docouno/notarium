@@ -726,8 +726,12 @@ impl AgentRunSupervisor {
         Ok(())
     }
 
-    async fn refresh_current_peer_head(&self, run: &ActiveRun) -> Result<(), PortError> {
-        if run.kind != ChatThreadKind::SpaceGroup {
+    async fn refresh_current_head(
+        &self,
+        run: &ActiveRun,
+        include_own: bool,
+    ) -> Result<(), PortError> {
+        if run.kind != ChatThreadKind::SpaceGroup && !include_own {
             return Ok(());
         }
         run.owner.check()?;
@@ -741,7 +745,30 @@ impl AgentRunSupervisor {
         let branch = self
             .thread_at(ctx.clone(), &run.thread, ThreadEntrySeq::ZERO)
             .await?;
-        self.refresh_peer_head(run, ctx, branch.thread.head).await
+        if branch.thread.head == ThreadEntrySeq::ZERO {
+            return Ok(());
+        }
+        let head = branch.thread.head;
+        let tail = self.thread_at(ctx, &run.thread, head).await?;
+        if tail.thread.head == head
+            && let Some(entry) = tail.entries.iter().find(|entry| {
+                entry.seq == head
+                    && ((run.kind == ChatThreadKind::SpaceGroup
+                        && matches!(entry.kind, ChatEntryKind::Human | ChatEntryKind::Redacted))
+                        || (include_own
+                            && entry.run.as_ref() == Some(&run.id)
+                            && matches!(
+                                entry.kind,
+                                ChatEntryKind::Model
+                                    | ChatEntryKind::Tool { .. }
+                                    | ChatEntryKind::Compaction
+                                    | ChatEntryKind::Redacted
+                            )))
+            })
+        {
+            run.stream.reconcile_committed(entry)?;
+        }
+        Ok(())
     }
 
     fn thread_gate(&self, scope: &HistoryScope, thread: &ChatThreadId) -> Arc<AsyncMutex<()>> {

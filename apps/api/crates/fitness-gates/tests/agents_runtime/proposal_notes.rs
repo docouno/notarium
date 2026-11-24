@@ -365,6 +365,112 @@ async fn confirmed_notes_use_fixed_destinations_and_revisions(
     let carrier = snapshot.document.explicit_read(owner.auth()).unwrap();
     assert!(carrier.contains("An independent edit."));
     assert!(!carrier.contains("Only if the approved revision is current."));
+
+    // Direct create_notes must propagate CommitEffect::Unknown + RetrySameCommand
+    // when a commit acknowledgement is lost (rather than reporting ok:false inside Ok),
+    // and replaying with the same key must return ok:true with the committed noteId.
+    let batch_args = json!({
+        "project": project,
+        "notes": [
+            {"title": "Lost ack direct note", "body": "Persisted before ack dropped."}
+        ],
+    });
+    fixture.projections.lose_note_create_acks(1);
+    let unknown_direct = call(fixture, owner, 71, "create_notes", batch_args.clone())
+        .await
+        .map(|_| ());
+    assert!(
+        matches!(
+            &unknown_direct,
+            Err(PortError::Unavailable(failure))
+                if failure.effect() == notarium_core::error::CommitEffect::Unknown
+                    && failure.retry() == notarium_core::error::RetryAdvice::RetrySameCommand
+        ),
+        "create_notes must surface CommitEffect::Unknown + RetrySameCommand on lost ack: {unknown_direct:?}"
+    );
+    let replayed_direct = call(fixture, owner, 71, "create_notes", batch_args)
+        .await
+        .expect("replaying create_notes with the same key must recover the committed note");
+    let direct_item = &replayed_direct.structured_content["results"][0];
+    assert_eq!(direct_item["ok"], true);
+    let direct_note_id = NoteId::parse(direct_item["noteId"].as_str().unwrap()).unwrap();
+    let direct_snapshot = fixture
+        .canonical
+        .get_note(
+            personal.clone(),
+            GetNote {
+                note: direct_note_id,
+                revision: None,
+                causal: CausalBasis::Await(Default::default()),
+            },
+        )
+        .await
+        .expect("committed create_notes item must be readable in canonical");
+    assert!(
+        direct_snapshot
+            .document
+            .explicit_read(owner.auth())
+            .unwrap()
+            .contains("Persisted before ack dropped.")
+    );
+
+    // Confirmed batch ProposedDiff for create_notes must likewise surface
+    // CommitEffect::Unknown + RetrySameCommand on lost commit ack and replay cleanly.
+    let (batch_confirm, _) = pending_note_action(
+        fixture,
+        personal,
+        provider_id,
+        model_id,
+        72,
+        "create_notes",
+        json!({
+            "project": project,
+            "notes": [
+                {"title": "Proposed batch first", "body": "First confirmed batch note."},
+                {"title": "Proposed batch second", "body": "Second confirmed batch note."},
+            ],
+        }),
+    )
+    .await;
+    fixture.projections.lose_note_create_acks(1);
+    let unknown_batch = fixture
+        .registry
+        .apply_proposed_diff(owner.clone(), batch_confirm.clone())
+        .await
+        .map(|_| ());
+    assert!(
+        matches!(
+            &unknown_batch,
+            Err(PortError::Unavailable(failure))
+                if failure.effect() == notarium_core::error::CommitEffect::Unknown
+                    && failure.retry() == notarium_core::error::RetryAdvice::RetrySameCommand
+        ),
+        "confirmed batch create_notes must surface CommitEffect::Unknown + RetrySameCommand: {unknown_batch:?}"
+    );
+    let replayed_batch = fixture
+        .registry
+        .apply_proposed_diff(owner.clone(), batch_confirm)
+        .await
+        .expect("replaying confirmed batch create_notes must succeed");
+    let batch_results = replayed_batch.result["results"].as_array().unwrap();
+    assert_eq!(batch_results.len(), 2);
+    assert_eq!(batch_results[0]["ok"], true);
+    assert_eq!(batch_results[1]["ok"], true);
+    for item in batch_results {
+        let note_id = NoteId::parse(item["noteId"].as_str().unwrap()).unwrap();
+        fixture
+            .canonical
+            .get_note(
+                personal.clone(),
+                GetNote {
+                    note: note_id,
+                    revision: None,
+                    causal: CausalBasis::Await(Default::default()),
+                },
+            )
+            .await
+            .expect("confirmed batch note must be readable in canonical");
+    }
 }
 
 async fn pending_note_action(

@@ -9,8 +9,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::{
-    BatchInput, CreateInput, CreateProject, PreparedDraft, ToolCallContext, decode, invalid,
-    observe_project, prepare_carrier, project_placement, receipt_result,
+    BatchInput, CreateInput, CreateProject, PreparedDraft, ToolCallContext,
+    batch_operational_error, decode, invalid, observe_project, prepare_carrier, project_placement,
+    receipt_result,
 };
 use crate::mcp::{
     ToolName,
@@ -153,7 +154,7 @@ pub(in crate::mcp::note_tools) async fn prepare(
         .await;
         steps.push(match proposed {
             Ok(draft) => CreateStep::Ready(Box::new(draft)),
-            Err(error) if batch => CreateStep::Invalid {
+            Err(PortError::Domain(error)) if batch => CreateStep::Invalid {
                 code: error.code().to_owned(),
             },
             Err(error) => return Err(error),
@@ -209,7 +210,11 @@ async fn apply_one(
             },
         )
         .await?;
-    let mut result = receipt_result(owner, scope, &draft.note, committed, "created").await?;
+    let mut result = receipt_result(owner, scope, &draft.note, committed, "created")
+        .await
+        .map_err(|error| {
+            batch_operational_error("notarium.mcp.confirmed-create-notes-batch.v1", error, true)
+        })?;
     if result.get("noteId").is_some() {
         result["bodyBytes"] = json!(draft.body_bytes);
         result["bodyHash"] = json!(draft.body_hash);
@@ -236,7 +241,9 @@ pub(in crate::mcp::note_tools) async fn apply(
         };
         return apply_one(owner, &plan.project, *draft, step, 0).await;
     }
+    const LABEL: &str = "notarium.mcp.confirmed-create-notes-batch.v1";
     let mut results = Vec::with_capacity(plan.steps.len());
+    let mut committed_any = false;
     for (index, row) in plan.steps.into_iter().enumerate() {
         let result = match row {
             CreateStep::Ready(draft) => {
@@ -247,14 +254,18 @@ pub(in crate::mcp::note_tools) async fn apply(
                 continue;
             }
         };
-        results.push(match result {
+        match result {
             Ok(mut value) => {
+                committed_any = true;
                 value["index"] = json!(index);
                 value["ok"] = json!(true);
-                value
+                results.push(value);
             }
-            Err(error) => json!({"index": index, "ok": false, "error":error.code()}),
-        });
+            Err(PortError::Domain(error)) => {
+                results.push(json!({"index": index, "ok": false, "error":error.code()}));
+            }
+            Err(error) => return Err(batch_operational_error(LABEL, error, committed_any)),
+        }
     }
     Ok(json!({"results":results}))
 }

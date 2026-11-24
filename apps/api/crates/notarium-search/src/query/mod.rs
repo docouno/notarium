@@ -263,39 +263,46 @@ impl SearchEngine {
             false
         };
         let pass1_overflow = strict_overflow || vector_overflow || (weak_overflow && !floor_filled);
-        let mut graph_budget = ranking::GraphBudget::new(
-            admission.recipient.is_some(),
-            recall.map_or(0, |recall| recall.graph_depth),
-        );
+        let graph_depth = recall.map_or(0, |recall| recall.graph_depth);
         let mut candidates = ranking::fuse(notes.hits, vectors.hits, browse);
-        let mut graph_truncated = if recall.is_some_and(|recall| recall.graph_depth != 0) {
-            ranking::expand(
-                &mut candidates,
-                snapshot.as_ref(),
-                self,
-                &mut admission,
-                &filter,
-                &request.filter.predicate,
-                &mut graph_budget,
+        let mut selected = if graph_depth == 0 {
+            Some(
+                admission
+                    .select(
+                        self,
+                        std::mem::take(&mut candidates).into_iter(),
+                        |candidate| &candidate.note,
+                        top_k + 1,
+                        can_widen,
+                    )
+                    .await?,
             )
-            .await?
         } else {
-            false
+            None
         };
-        let mut selected = admission
-            .select(
-                self,
-                candidates.into_iter(),
-                |candidate| &candidate.note,
-                top_k + 1,
-                can_widen,
-            )
-            .await?;
         let mut window_truncated = if can_widen { false } else { pass1_overflow };
         let mut embedder = vectors.embedder;
         let mut degraded = vectors.degraded;
 
-        if can_widen && selected.len() <= top_k && pass1_overflow {
+        let need_widen = if !can_widen || !pass1_overflow {
+            false
+        } else if let Some(direct) = &selected {
+            direct.len() <= top_k
+        } else {
+            admission
+                .select(
+                    self,
+                    candidates.iter(),
+                    |candidate| &candidate.note,
+                    top_k + 1,
+                    true,
+                )
+                .await?
+                .len()
+                <= top_k
+        };
+
+        if need_widen {
             let wide_lexical = lexical_candidates(
                 clock,
                 snapshot.clone(),
@@ -348,31 +355,40 @@ impl SearchEngine {
             if wide_vec.degraded.is_some() {
                 degraded = wide_vec.degraded;
             }
-            let mut candidates = ranking::fuse(notes.hits, wide_vec.hits, browse);
-            graph_truncated = if recall.is_some_and(|recall| recall.graph_depth != 0) {
-                ranking::expand(
-                    &mut candidates,
-                    snapshot.as_ref(),
-                    self,
-                    &mut admission,
-                    &filter,
-                    &request.filter.predicate,
-                    &mut graph_budget,
-                )
-                .await?
-            } else {
-                false
-            };
-            selected = admission
-                .select(
-                    self,
-                    candidates.into_iter(),
-                    |candidate| &candidate.note,
-                    top_k + 1,
-                    false,
-                )
-                .await?;
+            candidates = ranking::fuse(notes.hits, wide_vec.hits, browse);
+            selected = None;
         }
+
+        let graph_truncated = if graph_depth != 0 {
+            let mut graph_budget =
+                ranking::GraphBudget::new(admission.recipient.is_some(), graph_depth);
+            ranking::expand(
+                &mut candidates,
+                snapshot.as_ref(),
+                self,
+                &mut admission,
+                &filter,
+                &request.filter.predicate,
+                &mut graph_budget,
+            )
+            .await?
+        } else {
+            false
+        };
+        let selected = match selected {
+            Some(selected) => selected,
+            None => {
+                admission
+                    .select(
+                        self,
+                        candidates.into_iter(),
+                        |candidate| &candidate.note,
+                        top_k + 1,
+                        false,
+                    )
+                    .await?
+            }
+        };
 
         let fallback = RemoteConservativeTokenizerBudget::lexical_fallback();
         let tokenizer = embedder

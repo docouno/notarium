@@ -94,7 +94,8 @@ impl ControlService {
         budget: &OperationBudget,
         events: &[RequestId],
     ) -> Result<(), PortError> {
-        let mut selectors = Vec::new();
+        const MAX_FENCE_SELECTORS: usize = 512;
+        let mut unique = std::collections::BTreeSet::new();
         for id in events {
             let event = budget
                 .run(
@@ -112,10 +113,11 @@ impl ControlService {
                 if envelope.version != 1 {
                     return Err(invalid(ValidationReason::InvalidState));
                 }
-                selectors.push(envelope.selector);
+                unique.insert(envelope.selector);
             }
         }
-        if !selectors.is_empty() {
+        let selectors: Vec<_> = unique.into_iter().collect();
+        for chunk in selectors.chunks(MAX_FENCE_SELECTORS) {
             let fence = budget
                 .run(
                     self.revoker.fence_provider(
@@ -123,7 +125,7 @@ impl ControlService {
                             authority: ServiceAuthority::admit(ServicePurpose::Revocation),
                             budget: budget.context(events[0].clone()),
                         },
-                        selectors,
+                        chunk.to_vec(),
                     ),
                     CommitEffect::NotCommitted,
                 )
