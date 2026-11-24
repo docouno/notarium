@@ -160,17 +160,17 @@ async fn postgres_keeper_single_connection_pool_no_deadlock() {
 }
 
 #[inline(never)]
-fn box_step<'a, Fut>(
+fn box_step<'a, T, Fut>(
     make: impl FnOnce() -> Fut,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>
 where
-    Fut: std::future::Future<Output = ()> + Send + 'a,
+    Fut: std::future::Future<Output = T> + Send + 'a,
 {
     Box::pin(make())
 }
 
 async fn exercise_seams(pg: bool) {
-    let mut fixture = Box::pin(RuntimeFixture::open_named(pg, "seam_hardening")).await;
+    let mut fixture = box_step(|| RuntimeFixture::open_named(pg, "seam_hardening")).await;
     let personal = fixture.personal_scope().await;
 
     box_step(|| project_scoped_chat_starts_ai_and_blocks_foreign_project(&fixture, &personal))
@@ -1997,90 +1997,362 @@ async fn remote_embedding_query_blocks_unconsented_model_sources(
     //    (c) an unlogged AgentRun using `InAppProvider(chat_narrow_res)` DOES invoke the
     //        remote embedder (+1 query call).
     if !pg {
-        let resolved_model = provider_svc
-            .resolve_search_embedding_model(
-                &ServiceAuthority::admit(ServicePurpose::Search),
-                scope.clone(),
-                None,
-                budget(),
+        box_step(|| {
+            remote_embedding_sqlite_search_and_probes(
+                fixture,
+                personal,
+                &owner,
+                &actor,
+                &scope,
+                provider_svc,
+                catalog,
+                &emb_res,
+                &emb_hits,
+                wide_run_ctx,
+                &chat_wide_res,
+                &chat_wide_model,
+                &chat_narrow_res,
+                &chat_narrow_model,
+                &emb_shared,
             )
-            .await
-            .unwrap()
-            .expect("resolve_search_embedding_model must resolve personal embedding provider");
-        assert_eq!(resolved_model.provider, emb_res);
-        let root = DataRoot::new(fixture.storage.root.as_ref().unwrap());
-        let projector = ProjectorRuntime::start_sqlite(
-            fixture.canonical.clone(),
-            MaintenanceContext {
-                authority: ServiceAuthority::admit(ServicePurpose::Projection),
-                budget: budget(),
+        })
+        .await;
+    }
+
+    emb_server.abort();
+}
+
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+async fn remote_embedding_sqlite_search_and_probes(
+    fixture: &RuntimeFixture,
+    personal: &SpaceContext,
+    owner: &AccountContext,
+    actor: &PrincipalId,
+    scope: &HistoryScope,
+    provider_svc: Arc<ProviderService>,
+    catalog: Arc<dyn ControlCatalogPort>,
+    emb_res: &ProviderResourceId,
+    emb_hits: &AtomicUsize,
+    wide_run_ctx: SpaceContext,
+    chat_wide_res: &ProviderResourceId,
+    chat_wide_model: &ModelProfileId,
+    chat_narrow_res: &ProviderResourceId,
+    chat_narrow_model: &ModelProfileId,
+    emb_shared: &AccessibleSpace,
+) {
+    let resolved_model = provider_svc
+        .resolve_search_embedding_model(
+            &ServiceAuthority::admit(ServicePurpose::Search),
+            scope.clone(),
+            None,
+            budget(),
+        )
+        .await
+        .unwrap()
+        .expect("resolve_search_embedding_model must resolve personal embedding provider");
+    assert_eq!(resolved_model.provider, *emb_res);
+    let root = DataRoot::new(fixture.storage.root.as_ref().unwrap());
+    let projector = ProjectorRuntime::start_sqlite(
+        fixture.canonical.clone(),
+        MaintenanceContext {
+            authority: ServiceAuthority::admit(ServicePurpose::Projection),
+            budget: budget(),
+        },
+        root.clone(),
+        ProjectionGeneration::new(1).unwrap(),
+        ProjectionConfig::default(),
+    )
+    .await
+    .unwrap();
+    let proj = projector.engine();
+    let mut deps = SearchDependencies::new(Arc::new(fixture.canonical.clone()), proj.clone());
+    deps.model_resolver = Some(Arc::new(SeamSearchModelResolver(provider_svc.clone())));
+    deps.providers = Some(provider_svc.clone());
+    let search = Arc::new(SearchEngine::start(
+        SearchConfig::new(root.clone(), VectorMode::RemoteOnly),
+        deps,
+    ));
+    search.start_space(scope.clone()).unwrap();
+    let _ = fixture.projections.real.set(DerivedReads {
+        projection_calls: Default::default(),
+        notes: proj.note_reads(),
+        projection: proj.clone(),
+        search: search.clone(),
+    });
+    let doc_id = NoteId::from_bytes([0x7F; 16]);
+    let root_folder = fixture
+        .canonical
+        .read_space(&scope.space_id)
+        .await
+        .unwrap()
+        .root_folder_id;
+    let created_note = fixture
+        .canonical
+        .create_note(
+            personal.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: scope.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([0x7F; 16]),
+                    hash: ContentDigest::from_bytes([0x7F; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: CreateNote {
+                    note: doc_id.clone(),
+                    parent: Some(root_folder),
+                    slug: "lexical-fallback-note".into(),
+                    class: DocClass::UserDoc,
+                    carrier: "# Lexical\n\nquasar telemetry beacon\n".into(),
+                    folder_page: false,
+                },
             },
-            root.clone(),
-            ProjectionGeneration::new(1).unwrap(),
-            ProjectionConfig::default(),
         )
         .await
         .unwrap();
-        let proj = projector.engine();
-        let mut deps = SearchDependencies::new(Arc::new(fixture.canonical.clone()), proj.clone());
-        deps.model_resolver = Some(Arc::new(SeamSearchModelResolver(provider_svc.clone())));
-        deps.providers = Some(provider_svc.clone());
-        let search = Arc::new(SearchEngine::start(
-            SearchConfig::new(root.clone(), VectorMode::RemoteOnly),
-            deps,
-        ));
-        search.start_space(scope.clone()).unwrap();
-        let _ = fixture.projections.real.set(DerivedReads {
-            projection_calls: Default::default(),
-            notes: proj.note_reads(),
-            projection: proj.clone(),
-            search: search.clone(),
-        });
-        let doc_id = NoteId::from_bytes([0x7F; 16]);
-        let root_folder = fixture
-            .canonical
-            .read_space(&scope.space_id)
-            .await
-            .unwrap()
-            .root_folder_id;
-        let created_note = fixture
-            .canonical
-            .create_note(
-                personal.clone(),
-                Mutation {
-                    identity: CommandIdentity {
-                        scope: scope.clone(),
-                        actor: actor.clone(),
-                        key: CommandKey::from_bytes([0x7F; 16]),
-                        hash: ContentDigest::from_bytes([0x7F; 32]),
-                    },
-                    preconditions: Preconditions::default(),
-                    input: CreateNote {
-                        note: doc_id.clone(),
-                        parent: Some(root_folder),
-                        slug: "lexical-fallback-note".into(),
-                        class: DocClass::UserDoc,
-                        carrier: "# Lexical\n\nquasar telemetry beacon\n".into(),
-                        folder_page: false,
-                    },
-                },
-            )
-            .await
-            .unwrap();
-        let layout = SearchLayout::open(&root, scope.clone()).unwrap();
-        let mut probe_attempt = 0_u8;
-        timeout(Duration::from_secs(15), async {
-            loop {
-                if let Ok(Some(manifest)) = layout.search_manifest()
-                    && manifest.tantivy_seq >= created_note.receipt.seq()
-                    && manifest.vector_seq.is_some()
-                    && !manifest.embeddings_pending
+    let layout = SearchLayout::open(&root, scope.clone()).unwrap();
+    let mut probe_attempt = 0_u8;
+    timeout(Duration::from_secs(15), async {
+        loop {
+            if let Ok(Some(manifest)) = layout.search_manifest()
+                && manifest.tantivy_seq >= created_note.receipt.seq()
+                && manifest.vector_seq.is_some()
+                && !manifest.embeddings_pending
+            {
+                probe_attempt = probe_attempt.wrapping_add(1);
+                let mut probe_ctx = personal.clone();
+                probe_ctx.budget.request = RequestId::from_bytes([
+                    0x79,
+                    probe_attempt,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    1,
+                ]);
+                if let Ok(probe) = search
+                    .search(
+                        probe_ctx,
+                        SearchQuery {
+                            text: "quasar telemetry beacon".into(),
+                            filter: notarium_core::query::FieldFilterAstV1 {
+                                version: 1,
+                                predicate: notarium_core::query::Predicate::All(vec![]),
+                            },
+                            classes: [DocClass::UserDoc].into(),
+                            folder: None,
+                            causal: CausalBasis::Await(Default::default()),
+                            include_chats: false,
+                            top_k: PageLimit::new(5).unwrap(),
+                            model: None,
+                        },
+                    )
+                    .await
+                    && probe.degraded.is_none()
+                    && probe
+                        .hits
+                        .iter()
+                        .any(|h| h.card.document.provenance().reference().note_id == doc_id)
                 {
-                    probe_attempt = probe_attempt.wrapping_add(1);
-                    let mut probe_ctx = personal.clone();
-                    probe_ctx.budget.request = RequestId::from_bytes([
-                        0x79,
-                        probe_attempt,
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("remote vector indexing must publish in memory before query disclosure check");
+
+    let hits_after_index = emb_hits.load(Ordering::SeqCst);
+    assert!(
+        hits_after_index >= 2,
+        "expected remote indexing to hit embedder, got {hits_after_index}"
+    );
+
+    // (a) Direct SearchEngine query for `wide_run_ctx`: degrades cleanly to lexical, 0 wire calls.
+    let res = search
+        .search(
+            wide_run_ctx,
+            SearchQuery {
+                text: "quasar telemetry beacon".into(),
+                filter: notarium_core::query::FieldFilterAstV1 {
+                    version: 1,
+                    predicate: notarium_core::query::Predicate::All(vec![]),
+                },
+                classes: [DocClass::UserDoc].into(),
+                folder: None,
+                causal: CausalBasis::Await(Default::default()),
+                include_chats: false,
+                top_k: PageLimit::new(10).unwrap(),
+                model: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        res.hits
+            .iter()
+            .any(|h| h.card.document.provenance().reference().note_id == doc_id),
+        "lexical fallback must still return matching UserDoc hits"
+    );
+    assert!(
+        matches!(res.degraded, Some(SearchDegradation::ProviderUnavailable)),
+        "wide_run_ctx must degrade vector search instead of disclosing query text, got {:?}",
+        res.degraded
+    );
+    assert_eq!(
+        emb_hits.load(Ordering::SeqCst),
+        hits_after_index,
+        "zero HTTP calls may reach UserDoc-only embedder for wide_run_ctx"
+    );
+
+    // (b) Unlogged AgentRun calling MCP `search` through InAppProvider(chat_wide_res)
+    //     must STILL be blocked by SearchRecipient::query_source_classes().
+    let emb_registry = ToolRegistry::new(
+        Arc::new(ControlPlane::new(provider_svc.as_ref().clone())),
+        catalog,
+        Arc::new(TestEngine(
+            fixture.canonical.clone(),
+            fixture.projections.clone(),
+        )),
+        fixture.control.clone(),
+    )
+    .with_vector_search(true);
+    let personal_only_grants = std::collections::BTreeMap::from([(
+        scope.space_id.clone(),
+        owner.auth().spaces()[&scope.space_id].clone(),
+    )]);
+    let fresh_agent_auth = owner
+        .auth()
+        .for_agent_run(
+            AgentRunId::from_bytes([0x7D; 16]),
+            scope.space_id.clone(),
+            ChatAudience::Personal,
+            personal_only_grants,
+        )
+        .unwrap();
+    let fresh_agent_account = AccountContext::new(fresh_agent_auth, budget());
+    let wide_tool_res = emb_registry
+        .call_tool(
+            McpInvocationContext {
+                account: fresh_agent_account.clone(),
+                target: EgressTarget::InAppProvider {
+                    provider: chat_wide_res.clone(),
+                    model: chat_wide_model.clone(),
+                    primary_project: None,
+                },
+                request_key: CommandKey::from_bytes([0x7D; 16]),
+            },
+            "search",
+            json!({ "query": "quasar telemetry beacon" }),
+        )
+        .await
+        .unwrap();
+    assert!(
+        serde_json::to_string(&wide_tool_res.structured_content)
+            .unwrap()
+            .contains(doc_id.as_str()),
+        "unlogged wide InAppProvider search must still return lexical hits"
+    );
+    assert_eq!(
+        wide_tool_res.structured_content["degraded"],
+        json!(["provider_unavailable"]),
+        "unlogged wide InAppProvider search must surface provider_unavailable degradation: {}",
+        wide_tool_res.structured_content
+    );
+    assert_eq!(
+        emb_hits.load(Ordering::SeqCst),
+        hits_after_index,
+        "unlogged wide InAppProvider search must NOT send query text to UserDoc-only embedder"
+    );
+
+    // (c) Positive control: same unlogged AgentRun with narrow UserDoc-only completion
+    //     provider IS allowed to execute semantic query (+1 embedder HTTP call).
+    let narrow_tool_res = emb_registry
+        .call_tool(
+            McpInvocationContext {
+                account: fresh_agent_account,
+                target: EgressTarget::InAppProvider {
+                    provider: chat_narrow_res.clone(),
+                    model: chat_narrow_model.clone(),
+                    primary_project: None,
+                },
+                request_key: CommandKey::from_bytes([0x7E; 16]),
+            },
+            "search",
+            json!({ "query": "quasar telemetry beacon" }),
+        )
+        .await
+        .unwrap();
+    assert!(
+        serde_json::to_string(&narrow_tool_res.structured_content)
+            .unwrap()
+            .contains(doc_id.as_str())
+    );
+    assert_eq!(
+        narrow_tool_res.structured_content["degraded"],
+        json!([]),
+        "narrow UserDoc-only InAppProvider search must not degrade: {}",
+        narrow_tool_res.structured_content
+    );
+    assert_eq!(
+        emb_hits.load(Ordering::SeqCst),
+        hits_after_index + 1,
+        "narrow UserDoc-only InAppProvider search must reach the UserDoc-only embedder (content={})",
+        narrow_tool_res.structured_content
+    );
+
+    // (d) Unconsented Space/Project slug existence oracle: an InAppProvider AgentRun
+    //     whose auth includes an unconsented Shared Space (`emb_shared`) must see
+    //     ResourceNotFound (matching a bogus handle) on list_abilities, use_role,
+    //     and list_notes when passing that project handle, without tainting auth.
+    let probe_agent_auth = owner
+        .auth()
+        .for_agent_run(
+            AgentRunId::from_bytes([0x7A, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]),
+            scope.space_id.clone(),
+            ChatAudience::Personal,
+            owner.auth().spaces().clone(),
+        )
+        .unwrap();
+    let probe_agent_account = AccountContext::new(probe_agent_auth, budget());
+    let unconsented_handle = format!("{}/emb-proj-a", emb_shared.slug);
+    for (idx, (tool, args)) in [
+        (
+            "list_abilities",
+            json!({ "view": "runtime", "project": unconsented_handle }),
+        ),
+        (
+            "use_role",
+            json!({ "role": "research", "project": unconsented_handle }),
+        ),
+        ("list_notes", json!({ "project": unconsented_handle })),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let res = emb_registry
+            .call_tool(
+                McpInvocationContext {
+                    account: probe_agent_account.clone(),
+                    target: EgressTarget::InAppProvider {
+                        provider: chat_narrow_res.clone(),
+                        model: chat_narrow_model.clone(),
+                        primary_project: None,
+                    },
+                    request_key: CommandKey::from_bytes([
+                        0x7B,
+                        idx as u8 + 1,
                         0,
                         0,
                         0,
@@ -2095,204 +2367,39 @@ async fn remote_embedding_query_blocks_unconsented_model_sources(
                         0,
                         0,
                         1,
-                    ]);
-                    if let Ok(probe) = search
-                        .search(
-                            probe_ctx,
-                            SearchQuery {
-                                text: "quasar telemetry beacon".into(),
-                                filter: notarium_core::query::FieldFilterAstV1 {
-                                    version: 1,
-                                    predicate: notarium_core::query::Predicate::All(vec![]),
-                                },
-                                classes: [DocClass::UserDoc].into(),
-                                folder: None,
-                                causal: CausalBasis::Await(Default::default()),
-                                include_chats: false,
-                                top_k: PageLimit::new(5).unwrap(),
-                                model: None,
-                            },
-                        )
-                        .await
-                        && probe.degraded.is_none()
-                        && probe
-                            .hits
-                            .iter()
-                            .any(|h| h.card.document.provenance().reference().note_id == doc_id)
-                    {
-                        break;
-                    }
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("remote vector indexing must publish in memory before query disclosure check");
-
-        let hits_after_index = emb_hits.load(Ordering::SeqCst);
-        assert!(
-            hits_after_index >= 2,
-            "expected remote indexing to hit embedder, got {hits_after_index}"
-        );
-
-        // (a) Direct SearchEngine query for `wide_run_ctx`: degrades cleanly to lexical, 0 wire calls.
-        let res = search
-            .search(
-                wide_run_ctx,
-                SearchQuery {
-                    text: "quasar telemetry beacon".into(),
-                    filter: notarium_core::query::FieldFilterAstV1 {
-                        version: 1,
-                        predicate: notarium_core::query::Predicate::All(vec![]),
-                    },
-                    classes: [DocClass::UserDoc].into(),
-                    folder: None,
-                    causal: CausalBasis::Await(Default::default()),
-                    include_chats: false,
-                    top_k: PageLimit::new(10).unwrap(),
-                    model: None,
+                    ]),
                 },
+                tool,
+                args,
             )
-            .await
-            .unwrap();
+            .await;
         assert!(
-            res.hits
-                .iter()
-                .any(|h| h.card.document.provenance().reference().note_id == doc_id),
-            "lexical fallback must still return matching UserDoc hits"
+            matches!(res, Err(PortError::Domain(DomainError::ResourceNotFound))),
+            "InAppProvider {tool} on unconsented Shared project must return ResourceNotFound, got {:?}",
+            res.err()
         );
-        assert!(
-            matches!(res.degraded, Some(SearchDegradation::ProviderUnavailable)),
-            "wide_run_ctx must degrade vector search instead of disclosing query text, got {:?}",
-            res.degraded
-        );
-        assert_eq!(
-            emb_hits.load(Ordering::SeqCst),
-            hits_after_index,
-            "zero HTTP calls may reach UserDoc-only embedder for wide_run_ctx"
-        );
-
-        // (b) Unlogged AgentRun calling MCP `search` through InAppProvider(chat_wide_res)
-        //     must STILL be blocked by SearchRecipient::query_source_classes().
-        let emb_registry = ToolRegistry::new(
-            Arc::new(ControlPlane::new(provider_svc.as_ref().clone())),
-            catalog,
-            Arc::new(TestEngine(
-                fixture.canonical.clone(),
-                fixture.projections.clone(),
-            )),
-            fixture.control.clone(),
-        )
-        .with_vector_search(true);
-        let personal_only_grants = std::collections::BTreeMap::from([(
-            scope.space_id.clone(),
-            owner.auth().spaces()[&scope.space_id].clone(),
-        )]);
-        let fresh_agent_auth = owner
-            .auth()
-            .for_agent_run(
-                AgentRunId::from_bytes([0x7D; 16]),
-                scope.space_id.clone(),
-                ChatAudience::Personal,
-                personal_only_grants,
-            )
-            .unwrap();
-        let fresh_agent_account = AccountContext::new(fresh_agent_auth, budget());
-        let wide_tool_res = emb_registry
-            .call_tool(
-                McpInvocationContext {
-                    account: fresh_agent_account.clone(),
-                    target: EgressTarget::InAppProvider {
-                        provider: chat_wide_res.clone(),
-                        model: chat_wide_model.clone(),
-                        primary_project: None,
-                    },
-                    request_key: CommandKey::from_bytes([0x7D; 16]),
-                },
-                "search",
-                json!({ "query": "quasar telemetry beacon" }),
-            )
-            .await
-            .unwrap();
-        assert!(
-            serde_json::to_string(&wide_tool_res.structured_content)
-                .unwrap()
-                .contains(doc_id.as_str()),
-            "unlogged wide InAppProvider search must still return lexical hits"
-        );
-        assert_eq!(
-            wide_tool_res.structured_content["degraded"],
-            json!(["provider_unavailable"]),
-            "unlogged wide InAppProvider search must surface provider_unavailable degradation: {}",
-            wide_tool_res.structured_content
-        );
-        assert_eq!(
-            emb_hits.load(Ordering::SeqCst),
-            hits_after_index,
-            "unlogged wide InAppProvider search must NOT send query text to UserDoc-only embedder"
-        );
-
-        // (c) Positive control: same unlogged AgentRun with narrow UserDoc-only completion
-        //     provider IS allowed to execute semantic query (+1 embedder HTTP call).
-        let narrow_tool_res = emb_registry
-            .call_tool(
-                McpInvocationContext {
-                    account: fresh_agent_account,
-                    target: EgressTarget::InAppProvider {
-                        provider: chat_narrow_res.clone(),
-                        model: chat_narrow_model.clone(),
-                        primary_project: None,
-                    },
-                    request_key: CommandKey::from_bytes([0x7E; 16]),
-                },
-                "search",
-                json!({ "query": "quasar telemetry beacon" }),
-            )
-            .await
-            .unwrap();
-        assert!(
-            serde_json::to_string(&narrow_tool_res.structured_content)
-                .unwrap()
-                .contains(doc_id.as_str())
-        );
-        assert_eq!(
-            narrow_tool_res.structured_content["degraded"],
-            json!([]),
-            "narrow UserDoc-only InAppProvider search must not degrade: {}",
-            narrow_tool_res.structured_content
-        );
-        assert_eq!(
-            emb_hits.load(Ordering::SeqCst),
-            hits_after_index + 1,
-            "narrow UserDoc-only InAppProvider search must reach the UserDoc-only embedder (content={})",
-            narrow_tool_res.structured_content
-        );
-
-        // (d) Unconsented Space/Project slug existence oracle: an InAppProvider AgentRun
-        //     whose auth includes an unconsented Shared Space (`emb_shared`) must see
-        //     ResourceNotFound (matching a bogus handle) on list_abilities, use_role,
-        //     and list_notes when passing that project handle, without tainting auth.
-        let probe_agent_auth = owner
-            .auth()
-            .for_agent_run(
-                AgentRunId::from_bytes([0x7A, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]),
-                scope.space_id.clone(),
-                ChatAudience::Personal,
-                owner.auth().spaces().clone(),
-            )
-            .unwrap();
-        let probe_agent_account = AccountContext::new(probe_agent_auth, budget());
-        let unconsented_handle = format!("{}/emb-proj-a", emb_shared.slug);
-        for (idx, (tool, args)) in [
+    }
+    assert!(
+        !probe_agent_account.auth().taint().is_tainted(),
+        "rejected unconsented project probes must not taint caller"
+    );
+    // Invalid project component (`<space>/..`) must fail syntactically before
+    // Space slug lookup so an existing unconsented Space slug and a missing
+    // Space slug produce the exact same ValidationFailed error.
+    for (idx, handle) in [
+        format!("{}/..", emb_shared.slug),
+        "missing-space/..".to_owned(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for (tool_idx, (tool, args)) in [
             (
                 "list_abilities",
-                json!({ "view": "runtime", "project": unconsented_handle }),
+                json!({ "view": "runtime", "project": handle }),
             ),
-            (
-                "use_role",
-                json!({ "role": "research", "project": unconsented_handle }),
-            ),
-            ("list_notes", json!({ "project": unconsented_handle })),
+            ("use_role", json!({ "role": "research", "project": handle })),
+            ("list_notes", json!({ "project": handle })),
         ]
         .into_iter()
         .enumerate()
@@ -2307,9 +2414,9 @@ async fn remote_embedding_query_blocks_unconsented_model_sources(
                             primary_project: None,
                         },
                         request_key: CommandKey::from_bytes([
-                            0x7B,
+                            0x7C,
                             idx as u8 + 1,
-                            0,
+                            tool_idx as u8 + 1,
                             0,
                             0,
                             0,
@@ -2330,85 +2437,165 @@ async fn remote_embedding_query_blocks_unconsented_model_sources(
                 )
                 .await;
             assert!(
-                matches!(res, Err(PortError::Domain(DomainError::ResourceNotFound))),
-                "InAppProvider {tool} on unconsented Shared project must return ResourceNotFound, got {:?}",
+                matches!(
+                    res,
+                    Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
+                        if diagnostic.reason == ValidationReason::InvalidPathComponent
+                ),
+                "invalid project component `{handle}` on {tool} must fail with InvalidPathComponent before space lookup, got {:?}",
                 res.err()
             );
         }
-        assert!(
-            !probe_agent_account.auth().taint().is_tainted(),
-            "rejected unconsented project probes must not taint caller"
-        );
-        // Invalid project component (`<space>/..`) must fail syntactically before
-        // Space slug lookup so an existing unconsented Space slug and a missing
-        // Space slug produce the exact same ValidationFailed error.
-        for (idx, handle) in [
-            format!("{}/..", emb_shared.slug),
-            "missing-space/..".to_owned(),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            for (tool_idx, (tool, args)) in [
-                (
-                    "list_abilities",
-                    json!({ "view": "runtime", "project": handle }),
-                ),
-                ("use_role", json!({ "role": "research", "project": handle })),
-                ("list_notes", json!({ "project": handle })),
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                let res = emb_registry
-                    .call_tool(
-                        McpInvocationContext {
-                            account: probe_agent_account.clone(),
-                            target: EgressTarget::InAppProvider {
-                                provider: chat_narrow_res.clone(),
-                                model: chat_narrow_model.clone(),
-                                primary_project: None,
-                            },
-                            request_key: CommandKey::from_bytes([
-                                0x7C,
-                                idx as u8 + 1,
-                                tool_idx as u8 + 1,
-                                0,
-                                0,
-                                0,
-                                0,
-                                0,
-                                0,
-                                0,
-                                0,
-                                0,
-                                0,
-                                0,
-                                0,
-                                1,
-                            ]),
-                        },
-                        tool,
-                        args,
-                    )
-                    .await;
-                assert!(
-                    matches!(
-                        res,
-                        Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
-                            if diagnostic.reason == ValidationReason::InvalidPathComponent
-                    ),
-                    "invalid project component `{handle}` on {tool} must fail with InvalidPathComponent before space lookup, got {:?}",
-                    res.err()
-                );
-            }
-        }
-
-        search.shutdown().await;
-        projector.shutdown().await.unwrap();
     }
 
-    emb_server.abort();
+    // (e) Cross-space BranchTaint and degradation isolation (boxed helper to keep debug frame compact).
+    box_step(|| {
+        unconsented_space_taint_isolation_probes(
+            fixture,
+            owner,
+            actor,
+            &emb_shared.history,
+            &emb_registry,
+            &probe_agent_account,
+            chat_narrow_res,
+            chat_narrow_model,
+        )
+    })
+    .await;
+
+    search.shutdown().await;
+    projector.shutdown().await.unwrap();
+}
+
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+async fn unconsented_space_taint_isolation_probes(
+    fixture: &RuntimeFixture,
+    owner: &AccountContext,
+    actor: &PrincipalId,
+    emb_shared_history: &HistoryScope,
+    emb_registry: &ToolRegistry,
+    probe_agent_account: &AccountContext,
+    chat_narrow_res: &ProviderResourceId,
+    chat_narrow_model: &ModelProfileId,
+) {
+    let emb_shared_ctx =
+        SpaceContext::new(owner.auth().clone(), emb_shared_history.clone(), budget()).unwrap();
+    let emb_shared_root = fixture
+        .canonical
+        .read_space(&emb_shared_history.space_id)
+        .await
+        .unwrap()
+        .root_folder_id;
+    let secret_shared_note = NoteId::from_bytes([0x7D; 16]);
+    fixture
+        .canonical
+        .create_note(
+            emb_shared_ctx,
+            Mutation {
+                identity: CommandIdentity {
+                    scope: emb_shared_history.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([0x7D; 16]),
+                    hash: ContentDigest::from_bytes([0x7D; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: CreateNote {
+                    note: secret_shared_note.clone(),
+                    parent: Some(emb_shared_root),
+                    slug: "unconsented-secret-note".into(),
+                    class: DocClass::UserDoc,
+                    carrier: "# Unconsented Secret\n\nunconsented-zephyr-token payload.\n".into(),
+                    folder_page: false,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let make_probe_ctx = |sub: u8| McpInvocationContext {
+        account: probe_agent_account.clone(),
+        target: EgressTarget::InAppProvider {
+            provider: chat_narrow_res.clone(),
+            model: chat_narrow_model.clone(),
+            primary_project: None,
+        },
+        request_key: CommandKey::from_bytes([
+            0x7D, sub, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, sub,
+        ]),
+    };
+    let search_probe = emb_registry
+        .call_tool(
+            make_probe_ctx(1),
+            "search",
+            json!({ "query": "unconsented-zephyr-token" }),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !serde_json::to_string(&search_probe.structured_content)
+            .unwrap()
+            .contains(secret_shared_note.as_str()),
+        "search must not return notes from unconsented Shared Space: {}",
+        search_probe.structured_content
+    );
+    assert_eq!(search_probe.structured_content["degraded"], json!([]));
+    assert!(
+        !probe_agent_account.auth().taint().is_tainted(),
+        "search over unconsented Shared Space must not flip BranchTaint"
+    );
+    let recall_probe = emb_registry
+        .call_tool(
+            make_probe_ctx(2),
+            "recall",
+            json!({ "query": "unconsented-zephyr-token" }),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !serde_json::to_string(&recall_probe.structured_content)
+            .unwrap()
+            .contains(secret_shared_note.as_str()),
+        "recall must not return sources from unconsented Shared Space: {}",
+        recall_probe.structured_content
+    );
+    assert_eq!(recall_probe.structured_content["degraded"], json!([]));
+    assert!(
+        !probe_agent_account.auth().taint().is_tainted(),
+        "recall over unconsented Shared Space must not flip BranchTaint"
+    );
+    let get_probe = emb_registry
+        .call_tool(
+            make_probe_ctx(3),
+            "get_note",
+            json!({ "ref": secret_shared_note }),
+        )
+        .await;
+    assert!(
+        matches!(
+            get_probe,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ),
+        "get_note on unconsented Shared Space must return ResourceNotFound, got {:?}",
+        get_probe.err()
+    );
+    assert!(
+        !probe_agent_account.auth().taint().is_tainted(),
+        "get_note on unconsented Shared Space must not flip BranchTaint"
+    );
+    let recent_probe = emb_registry
+        .call_tool(make_probe_ctx(4), "recent_activity", json!({}))
+        .await
+        .unwrap();
+    assert!(
+        !serde_json::to_string(&recent_probe.structured_content)
+            .unwrap()
+            .contains(secret_shared_note.as_str()),
+        "recent_activity must not include notes from unconsented Shared Space"
+    );
+    assert!(
+        !probe_agent_account.auth().taint().is_tainted(),
+        "recent_activity must not flip BranchTaint from unconsented Shared Space"
+    );
 }
 
 /// Two same-named roles in two different Shared Spaces must NOT break
@@ -3724,6 +3911,24 @@ async fn rollback_run_stops_active_keeper_and_rejects_unsettled_runs(
         still_active.status
     );
 
+    // Create a second Shared-Space Editor (`bob`) and verify that WHILE Alice's
+    // active Keeper HAS already committed step-1 memory edits (`has_edits == true`
+    // in `agent_run_heads`), Bob receives InvalidState from BOTH
+    // `ensure_run_inactive` and `supervisor.rollback_run`, leaving Alice's Keeper
+    // active and step-1 memory intact (non-vacuous coverage of `agent_run_has_head`).
+    let bob_account = box_step(|| {
+        create_shared_editor_bob_and_verify_edited_keeper(
+            fixture,
+            &owner,
+            &shared.history,
+            &project,
+            &schedule.id,
+            &active_keeper_run,
+            &supervisor,
+        )
+    })
+    .await;
+
     // Now invoke `rollback_run` while Keeper is mid-run! It must cancel & drain Keeper,
     // settle `agent_schedule_runs`, and roll back step 1's memory cleanly.
     let rolled = timeout(
@@ -3832,17 +4037,21 @@ async fn rollback_run_stops_active_keeper_and_rejects_unsettled_runs(
         "rollback_run must reject unsettled remote active schedule run with InvalidState, got {remote_rb:?}"
     );
 
-    // 2b. Foreign Shared-Space Editor isolation (zero-edit Keeper + active local Personal chat).
-    let (bob_account, alice_shared_ctx) = Box::pin(rollback_foreign_editor_isolation(
-        fixture,
-        &owner,
-        &actor,
-        &shared.history,
-        &project,
-        &supervisor,
-        &listener,
-        remote_run,
-    ))
+    // 2b. Foreign Shared-Space Editor isolation (zero-edit Keeper + active & completed zero-edit Personal chat).
+    // Refresh Bob's session after advancing the fixture clock by 7 days to `next_due`.
+    let (bob_account, alice_shared_ctx) = box_step(|| {
+        rollback_foreign_editor_isolation(
+            fixture,
+            &owner,
+            &actor,
+            &shared.history,
+            &project,
+            &supervisor,
+            &listener,
+            bob_account.auth().principal().clone(),
+            remote_run,
+        )
+    })
     .await;
 
     // 3. Direct canonical rollback while `chat_threads.active_run_id = run` must reject with InvalidState.
@@ -4047,34 +4256,35 @@ async fn rollback_run_stops_active_keeper_and_rejects_unsettled_runs(
         "canonical rollback must reject an active zero-edit chat run with InvalidState, got {active_empty_rb:?}"
     );
 
-    Box::pin(rollback_canonical_replay_and_archived_finish(
-        fixture,
-        personal,
-        &owner,
-        &actor,
-        &shared.history,
-        alice_shared_ctx,
-        &bob_account,
-        &viewer_account,
-        chat_run,
-        empty_run,
-    ))
+    box_step(|| {
+        rollback_canonical_replay_and_archived_finish(
+            fixture,
+            personal,
+            &owner,
+            &actor,
+            &shared.history,
+            alice_shared_ctx,
+            &bob_account,
+            &viewer_account,
+            chat_run,
+            empty_run,
+        )
+    })
     .await;
     drop(pscope);
 }
 
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
-async fn rollback_foreign_editor_isolation(
+async fn create_shared_editor_bob_and_verify_edited_keeper(
     fixture: &mut RuntimeFixture,
     owner: &AccountContext,
-    actor: &PrincipalId,
     shared_history: &HistoryScope,
     project: &FolderRef,
+    schedule_id: &ScheduleId,
+    active_keeper_run: &AgentRunId,
     supervisor: &AgentRunSupervisor,
-    listener: &TcpListener,
-    remote_run: AgentRunId,
-) -> (AccountContext, SpaceContext) {
+) -> AccountContext {
     let bob_id = fixture
         .control
         .create_account(
@@ -4106,7 +4316,7 @@ async fn rollback_foreign_editor_isolation(
     fixture
         .control
         .change_membership(
-            shared_owner_ctx.clone(),
+            shared_owner_ctx,
             MembershipChange {
                 command: CommandKey::from_bytes([
                     0x1C, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
@@ -4140,6 +4350,106 @@ async fn rollback_foreign_editor_isolation(
             .unwrap(),
         budget(),
     );
+    let bob_active_check = fixture
+        .control
+        .ensure_run_inactive(
+            bob_account.clone(),
+            shared_history.space_id.clone(),
+            active_keeper_run.clone(),
+        )
+        .await;
+    assert!(
+        matches!(
+            bob_active_check,
+            Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
+                if diagnostic.reason == ValidationReason::InvalidState
+        ),
+        "foreign Editor ensure_run_inactive on edited active Keeper must return InvalidState, got {bob_active_check:?}"
+    );
+    let bob_active_rb = supervisor
+        .rollback_run(
+            bob_account.clone(),
+            shared_history.clone(),
+            active_keeper_run.clone(),
+            CommandKey::from_bytes([0x1C, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9]),
+        )
+        .await;
+    assert!(
+        matches!(
+            bob_active_rb,
+            Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
+                if diagnostic.reason == ValidationReason::InvalidState
+        ),
+        "foreign Editor rollback_run on edited active Keeper must return InvalidState, got {bob_active_rb:?}"
+    );
+    let still_active_after_bob = fixture
+        .control
+        .get_schedule_run(
+            ScheduleRunContext::Owner(Box::new(owner.clone())),
+            schedule_id.clone(),
+            active_keeper_run.clone(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        still_active_after_bob.status,
+        ScheduleRunStatus::Claimed | ScheduleRunStatus::Running
+    ));
+    let mem_before_owner_rb = fixture
+        .control
+        .inspect_memory_target(
+            owner.clone(),
+            MemoryTarget::Project {
+                folder: project.clone(),
+            },
+            "decisions".into(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        mem_before_owner_rb.revision.is_some(),
+        "foreign Editor rollback_run must leave step-1 memory note intact"
+    );
+    bob_account
+}
+
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+async fn rollback_foreign_editor_isolation(
+    fixture: &mut RuntimeFixture,
+    owner: &AccountContext,
+    actor: &PrincipalId,
+    shared_history: &HistoryScope,
+    project: &FolderRef,
+    supervisor: &AgentRunSupervisor,
+    listener: &TcpListener,
+    bob_id: PrincipalId,
+    remote_run: AgentRunId,
+) -> (AccountContext, SpaceContext) {
+    let bob_token = mint(TokenKind::Session).unwrap();
+    fixture
+        .storage
+        .observer
+        .seed_session(
+            &bob_id,
+            &AuthSessionId::from_bytes([0x1C, 0x22, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]),
+            &bob_token,
+            fixture.storage.clock.0.load(Ordering::SeqCst),
+        )
+        .await;
+    let bob_account = AccountContext::new(
+        fixture
+            .control
+            .resolve(support::evidence(
+                AuthEvidenceKind::Session,
+                bob_token.secret.expose(),
+            ))
+            .await
+            .unwrap(),
+        budget(),
+    );
+    let shared_owner_ctx =
+        SpaceContext::new(owner.auth().clone(), shared_history.clone(), budget()).unwrap();
     fixture
         .control
         .ensure_run_inactive(
@@ -4212,7 +4522,7 @@ async fn rollback_foreign_editor_isolation(
         .rollback_run(
             bob_account.clone(),
             shared_history.clone(),
-            alice_priv_run,
+            alice_priv_run.clone(),
             CommandKey::from_bytes([0xC6, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4]),
         )
         .await;
@@ -4234,6 +4544,25 @@ async fn rollback_foreign_editor_isolation(
         alice_priv_leaf.get(),
         1,
         "Alice's active Personal chat turn must survive Bob's unauthorized rollback_run"
+    );
+    // Even AFTER Alice's read-only Personal chat turn has committed its reply via
+    // `append_chat` (zero note edits), `append_chat_tx` must NOT have populated
+    // `agent_run_heads`, so Bob's `rollback_run` must still see ResourceNotFound
+    // (NOT a no-op Committed rollback existence oracle).
+    let bob_post_append_rb = supervisor
+        .rollback_run(
+            bob_account.clone(),
+            shared_history.clone(),
+            alice_priv_run,
+            CommandKey::from_bytes([0xC6, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5]),
+        )
+        .await;
+    assert!(
+        matches!(
+            bob_post_append_rb,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ),
+        "chat-only Personal run must not expose an agent_run_heads existence oracle to foreign Editors, got {bob_post_append_rb:?}"
     );
     (bob_account, shared_owner_ctx)
 }
@@ -4441,11 +4770,46 @@ async fn rollback_canonical_replay_and_archived_finish(
         "reusing committed rollback CommandKey against active chat_run on !direct_by_id path must return IdempotencyKeyReused, got {reused_key_rb:?}"
     );
 
+    box_step(|| {
+        archived_space_finish_run_isolation(
+            fixture,
+            owner,
+            actor,
+            shared_history,
+            alice_shared_ctx,
+            bob_account,
+            viewer_account,
+            &ro_rb_pat,
+        )
+    })
+    .await;
+}
+
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+async fn archived_space_finish_run_isolation(
+    fixture: &RuntimeFixture,
+    owner: &AccountContext,
+    actor: &PrincipalId,
+    shared_history: &HistoryScope,
+    alice_shared_ctx: SpaceContext,
+    bob_account: &AccountContext,
+    viewer_account: &AccountContext,
+    ro_rb_pat: &AccountContext,
+) {
     // 5. Closing/Archived Space `finish_run_if_queue_empty` must ONLY allow the
-    //    active claim owner's live writable AgentRun; non-owner and Viewer AgentRuns
-    //    must receive ResourceNotFound without clearing the claim.
+    //    active claim owner's live writable AgentRun matching `active_run_id`:
+    //    - Viewer AgentRun on an archived `SpaceGroup` thread (bypasses owner &
+    //      audience checks -> genuinely exercises `!writable_grant`) -> ResourceNotFound
+    //    - Read-only bearer AgentRun on archived `SpaceGroup` -> ResourceNotFound
+    //    - Different AgentRun (`wrong_run`) by the thread owner -> ResourceNotFound (not Ok(Changed))
+    //    - Repeated call after `Cleared` (`active_run_id == None`) -> ResourceNotFound
+    //    - Non-owner Editor on archived `Personal` thread -> ResourceNotFound
     let arch_thread = ChatThreadId::from_bytes([0xC7; 16]);
     let arch_run = AgentRunId::from_bytes([0xC7; 16]);
+    let arch_group_thread = ChatThreadId::from_bytes([0xC8; 16]);
+    let arch_group_run = AgentRunId::from_bytes([0xC8; 16]);
+    let wrong_run = AgentRunId::from_bytes([0xC9; 16]);
     fixture
         .canonical
         .create_chat(
@@ -4469,6 +4833,29 @@ async fn rollback_canonical_replay_and_archived_finish(
         )
         .await
         .unwrap();
+    fixture
+        .canonical
+        .create_chat(
+            alice_shared_ctx.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: shared_history.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([0xC8; 16]),
+                    hash: ContentDigest::from_bytes([0xC8; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: CreateChat {
+                    thread: arch_group_thread.clone(),
+                    kind: ChatThreadKind::SpaceGroup,
+                    owner: actor.clone(),
+                    project_folder: None,
+                    title: "Archived space group finish auth".into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
     let arch_owner_auth = owner
         .auth()
         .for_agent_run(
@@ -4480,6 +4867,17 @@ async fn rollback_canonical_replay_and_archived_finish(
         .unwrap();
     let arch_owner_ctx =
         SpaceContext::new(arch_owner_auth, shared_history.clone(), budget()).unwrap();
+    let wrong_run_auth = owner
+        .auth()
+        .for_agent_run(
+            wrong_run.clone(),
+            shared_history.space_id.clone(),
+            ChatAudience::Personal,
+            owner.auth().spaces().clone(),
+        )
+        .unwrap();
+    let wrong_run_ctx =
+        SpaceContext::new(wrong_run_auth, shared_history.clone(), budget()).unwrap();
     assert!(matches!(
         fixture
             .canonical
@@ -4488,6 +4886,33 @@ async fn rollback_canonical_replay_and_archived_finish(
                 ClaimChatRun {
                     thread: arch_thread.clone(),
                     run: arch_run.clone(),
+                    expected_leaf: ThreadEntrySeq::ZERO,
+                    previous_run: None,
+                },
+            )
+            .await
+            .unwrap(),
+        ClaimChatRunOutcome::Claimed
+    ));
+    let arch_group_owner_auth = owner
+        .auth()
+        .for_agent_run(
+            arch_group_run.clone(),
+            shared_history.space_id.clone(),
+            ChatAudience::Shared,
+            owner.auth().spaces().clone(),
+        )
+        .unwrap();
+    let arch_group_owner_ctx =
+        SpaceContext::new(arch_group_owner_auth, shared_history.clone(), budget()).unwrap();
+    assert!(matches!(
+        fixture
+            .canonical
+            .claim_active_run(
+                arch_group_owner_ctx.clone(),
+                ClaimChatRun {
+                    thread: arch_group_thread.clone(),
+                    run: arch_group_run.clone(),
                     expected_leaf: ThreadEntrySeq::ZERO,
                     previous_run: None,
                 },
@@ -4507,17 +4932,28 @@ async fn rollback_canonical_replay_and_archived_finish(
         .unwrap();
     let bob_agent_ctx =
         SpaceContext::new(bob_agent_auth, shared_history.clone(), budget()).unwrap();
-    let viewer_arch_auth = viewer_account
+    let viewer_arch_group_auth = viewer_account
         .auth()
         .for_agent_run(
-            arch_run.clone(),
+            arch_group_run.clone(),
             shared_history.space_id.clone(),
             ChatAudience::Shared,
             viewer_account.auth().spaces().clone(),
         )
         .unwrap();
-    let viewer_arch_ctx =
-        SpaceContext::new(viewer_arch_auth, shared_history.clone(), budget()).unwrap();
+    let viewer_arch_group_ctx =
+        SpaceContext::new(viewer_arch_group_auth, shared_history.clone(), budget()).unwrap();
+    let ro_arch_group_auth = ro_rb_pat
+        .auth()
+        .for_agent_run(
+            arch_group_run.clone(),
+            shared_history.space_id.clone(),
+            ChatAudience::Shared,
+            ro_rb_pat.auth().spaces().clone(),
+        )
+        .unwrap();
+    let ro_arch_group_ctx =
+        SpaceContext::new(ro_arch_group_auth, shared_history.clone(), budget()).unwrap();
     let space_rev = fixture
         .control
         .context_scope(
@@ -4541,17 +4977,39 @@ async fn rollback_canonical_replay_and_archived_finish(
         )
         .await
         .unwrap();
-    for (label, ctx) in [
-        ("bob_non_owner", bob_agent_ctx),
-        ("viewer", viewer_arch_ctx),
+    for (label, ctx, thread, expected_run) in [
+        (
+            "bob_non_owner_personal",
+            bob_agent_ctx,
+            arch_thread.clone(),
+            arch_run.clone(),
+        ),
+        (
+            "viewer_space_group",
+            viewer_arch_group_ctx,
+            arch_group_thread.clone(),
+            arch_group_run.clone(),
+        ),
+        (
+            "ro_bearer_space_group",
+            ro_arch_group_ctx,
+            arch_group_thread.clone(),
+            arch_group_run.clone(),
+        ),
+        (
+            "owner_wrong_expected_run",
+            wrong_run_ctx,
+            arch_thread.clone(),
+            wrong_run,
+        ),
     ] {
         let denied_finish = fixture
             .canonical
             .finish_run_if_queue_empty(
                 ctx,
                 ChatRunRequest {
-                    thread: arch_thread.clone(),
-                    expected_run: arch_run.clone(),
+                    thread,
+                    expected_run,
                 },
             )
             .await;
@@ -4566,15 +5024,47 @@ async fn rollback_canonical_replay_and_archived_finish(
     let owner_finish = fixture
         .canonical
         .finish_run_if_queue_empty(
+            arch_owner_ctx.clone(),
+            ChatRunRequest {
+                thread: arch_thread.clone(),
+                expected_run: arch_run.clone(),
+            },
+        )
+        .await
+        .expect("active claim owner must still clear its own run while Space is archived");
+    assert!(matches!(owner_finish, FinishChatRunOutcome::Cleared));
+    // Post-clear call (`active_run_id == None`) on an archived Space must also return ResourceNotFound.
+    let post_clear = fixture
+        .canonical
+        .finish_run_if_queue_empty(
             arch_owner_ctx,
             ChatRunRequest {
                 thread: arch_thread,
                 expected_run: arch_run,
             },
         )
+        .await;
+    assert!(
+        matches!(
+            post_clear,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ),
+        "post-clear finish_run_if_queue_empty on archived Space must return ResourceNotFound, got {post_clear:?}"
+    );
+    let group_owner_finish = fixture
+        .canonical
+        .finish_run_if_queue_empty(
+            arch_group_owner_ctx,
+            ChatRunRequest {
+                thread: arch_group_thread,
+                expected_run: arch_group_run,
+            },
+        )
         .await
-        .expect("active claim owner must still clear its own run while Space is archived");
-    assert!(matches!(owner_finish, FinishChatRunOutcome::Cleared));
+        .expect(
+            "active SpaceGroup claim owner must still clear its own run while Space is archived",
+        );
+    assert!(matches!(group_owner_finish, FinishChatRunOutcome::Cleared));
 }
 
 /// `remember_about_project` and `remember_about_user` proposal previews

@@ -2680,6 +2680,51 @@ impl StructuralSnapshot for Snapshot {
     }
 }
 
+impl ProjectionEngine {
+    fn filter_live_visible_inner<'a>(
+        &'a self,
+        ctx: &'a SpaceContext,
+        notes: &'a [NoteId],
+        mark_taint: bool,
+    ) -> PortFuture<'a, Vec<bool>> {
+        Box::pin(async move {
+            within_budget(ctx, async {
+                drop(self.current_admission(self.active_generation())?);
+                let handle = self.live_handle_async(ctx.scope(), &ctx.budget).await?;
+                let mut results = Vec::with_capacity(notes.len());
+                let mut checked_head = None;
+                loop {
+                    {
+                        let permit = handle.read(&ctx.budget).await?;
+                        let _admission = self.current_admission(self.active_generation())?;
+                        can_view_query_entry(&permit, ctx, permit.root_folder_id(), None, true)?;
+                        if checked_head != Some(permit.head()) {
+                            results.clear();
+                            checked_head = Some(permit.head());
+                        }
+                        for note in notes[results.len()..].iter().take(VISIBILITY_BATCH) {
+                            match permit.classify(ctx, note, true)? {
+                                LiveNoteStatus::ActiveVisible(facts) => {
+                                    if mark_taint {
+                                        ctx.auth().authorize_read(&facts)?;
+                                    }
+                                    results.push(true);
+                                }
+                                _ => results.push(false),
+                            }
+                        }
+                        if results.len() == notes.len() {
+                            return Ok(results);
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+        })
+    }
+}
+
 impl StructuralReadPort for ProjectionEngine {
     fn acquire_snapshot(
         &self,
@@ -2759,39 +2804,15 @@ impl StructuralReadPort for ProjectionEngine {
         ctx: &'a SpaceContext,
         notes: &'a [NoteId],
     ) -> PortFuture<'a, Vec<bool>> {
-        Box::pin(async move {
-            within_budget(ctx, async {
-                drop(self.current_admission(self.active_generation())?);
-                let handle = self.live_handle_async(ctx.scope(), &ctx.budget).await?;
-                let mut results = Vec::with_capacity(notes.len());
-                let mut checked_head = None;
-                loop {
-                    {
-                        let permit = handle.read(&ctx.budget).await?;
-                        let _admission = self.current_admission(self.active_generation())?;
-                        can_view_query_entry(&permit, ctx, permit.root_folder_id(), None, true)?;
-                        if checked_head != Some(permit.head()) {
-                            results.clear();
-                            checked_head = Some(permit.head());
-                        }
-                        for note in notes[results.len()..].iter().take(VISIBILITY_BATCH) {
-                            match permit.classify(ctx, note, true)? {
-                                LiveNoteStatus::ActiveVisible(facts) => {
-                                    ctx.auth().authorize_read(&facts)?;
-                                    results.push(true);
-                                }
-                                _ => results.push(false),
-                            }
-                        }
-                        if results.len() == notes.len() {
-                            return Ok(results);
-                        }
-                    }
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-        })
+        self.filter_live_visible_inner(ctx, notes, true)
+    }
+
+    fn filter_live_visible_preflight<'a>(
+        &'a self,
+        ctx: &'a SpaceContext,
+        notes: &'a [NoteId],
+    ) -> PortFuture<'a, Vec<bool>> {
+        self.filter_live_visible_inner(ctx, notes, false)
     }
 
     fn hydrate(

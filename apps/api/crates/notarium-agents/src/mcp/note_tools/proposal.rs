@@ -733,12 +733,7 @@ pub(in crate::mcp) async fn apply_proposal(
                     },
                 )
                 .await
-                .map_err(|error| match error {
-                    PortError::Domain(domain) => PortError::Domain(domain),
-                    operational => {
-                        super::batch_operational_error(LABEL, operational, creates_folder)
-                    }
-                })?;
+                .map_err(|error| super::batch_operational_error(LABEL, error, creates_folder))?;
             receipt_result(owner, scope, &route.note, result, "moved")
                 .await
                 .map_err(|error| super::batch_operational_error(LABEL, error, true))

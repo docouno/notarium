@@ -169,6 +169,9 @@ impl ControlCatalogPort for Catalog {
             Ok(result)
         })
     }
+    fn agent_run_has_head(&self, _: CallBudget, _: SpaceId, _: AgentRunId) -> PortFuture<'_, bool> {
+        Box::pin(async { Ok(false) })
+    }
     fn ensure_space(
         &self,
         _: CallBudget,

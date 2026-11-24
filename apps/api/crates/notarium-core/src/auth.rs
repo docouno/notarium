@@ -524,6 +524,25 @@ impl EngineAuthContext {
             ..self.clone()
         })
     }
+    /// Monotonically narrow one Space grant's readable document classes (never widens).
+    pub fn restrict_read_classes(
+        &self,
+        space: &SpaceId,
+        allowed: &BTreeSet<DocClass>,
+    ) -> DomainResult<Self> {
+        let mut grant = self
+            .spaces
+            .get(space)
+            .ok_or(DomainError::ResourceNotFound)?
+            .clone();
+        grant.read_classes.retain(|class| allowed.contains(class));
+        let mut spaces = self.spaces.clone();
+        spaces.insert(space.clone(), grant);
+        Ok(Self {
+            spaces,
+            ..self.clone()
+        })
+    }
 
     fn narrow(&self, requested: BTreeMap<SpaceId, SpaceGrant>) -> DomainResult<Self> {
         if self.proposal_read {

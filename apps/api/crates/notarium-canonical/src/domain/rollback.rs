@@ -336,26 +336,29 @@ pub(crate) async fn rollback_agent_run_by_id(
             Err(error) => return Err(error),
         }
     }
-    if !direct_by_id {
-        if let Some(effect) = ctx.canonical_effect() {
-            effect.check()?;
+    let active_effect = match ctx.canonical_effect() {
+        Some(effect) => Some(effect.begin().await?),
+        None => None,
+    };
+    ctx.budget.remaining = rollback_time_left(&ctx.budget, deadline)?;
+    if let Some(replayed) = rollback_wait(
+        &ctx.budget,
+        deadline,
+        try_replay_completed_receipt::<StoredCommittedRollbackV1>(
+            store,
+            ctx.scope(),
+            &idemp,
+            Some(&ctx.budget),
+        ),
+    )
+    .await??
+    {
+        if let Some(lease) = &active_effect {
+            lease.check()?;
         }
-        ctx.budget.remaining = rollback_time_left(&ctx.budget, deadline)?;
-        if let Some(replayed) = rollback_wait(
-            &ctx.budget,
-            deadline,
-            try_replay_completed_receipt::<StoredCommittedRollbackV1>(
-                store,
-                ctx.scope(),
-                &idemp,
-                Some(&ctx.budget),
-            ),
-        )
-        .await??
-        {
-            return Ok(replayed.into_committed());
-        }
+        return Ok(replayed.into_committed());
     }
+    drop(active_effect);
     let mut read_ctx = ctx.clone();
     read_ctx.budget.remaining = rollback_time_left(&ctx.budget, deadline)?;
     let (input, prepared_epoch) =

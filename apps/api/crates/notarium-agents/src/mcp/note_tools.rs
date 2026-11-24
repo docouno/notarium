@@ -526,7 +526,13 @@ async fn ensure_destination(
         .catalog
         .folder(call.account(), destination.clone())
         .await
-        .map_err(|error| batch_operational_error(ERR_LABEL, error, created))?;
+        .map_err(|error| {
+            if created {
+                post_commit_error(ERR_LABEL, error)
+            } else {
+                batch_operational_error(ERR_LABEL, error, false)
+            }
+        })?;
     if live.reference != destination
         || live.space.id != destination.space_id
         || live.lifecycle != Lifecycle::Active
@@ -552,7 +558,13 @@ async fn ensure_destination(
     if matches!(call.target, EgressTarget::InAppProvider { .. }) {
         let resolved = folder_base(call, scope, &destination.folder_id)
             .await
-            .map_err(|error| batch_operational_error(ERR_LABEL, error, created))?;
+            .map_err(|error| {
+                if created {
+                    post_commit_error(ERR_LABEL, error)
+                } else {
+                    batch_operational_error(ERR_LABEL, error, false)
+                }
+            })?;
         let project = resolved.project.map(|folder_id| FolderRef {
             space_id: destination.space_id.clone(),
             folder_id,
@@ -566,7 +578,13 @@ async fn ensure_destination(
             class,
         )
         .await
-        .map_err(|error| batch_operational_error(ERR_LABEL, error, created))?;
+        .map_err(|error| {
+            if created {
+                post_commit_error(ERR_LABEL, error)
+            } else {
+                batch_operational_error(ERR_LABEL, error, false)
+            }
+        })?;
     }
     Ok((destination, created))
 }

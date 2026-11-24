@@ -444,23 +444,12 @@ impl KeeperScheduler {
         let mut result = control.claim_schedule(ctx.clone(), claim.clone()).await;
         let mut tried = std::collections::BTreeSet::from([claim.next_slot]);
         let mut forward_cursor = fresh.max(now);
-        // Step backward from `forward_cursor` toward `slot` rather than walking
-        // forward from `slot`, so a misfired schedule with slight backward clock
-        // skew reaches Control's expected slot in O(skew) instead of O(misfire).
-        let backward_step_secs = claim
-            .next_slot
-            .and_then(|first| {
-                next(first).ok().flatten().map(|second| {
-                    second
-                        .unix_seconds()
-                        .saturating_sub(first.unix_seconds())
-                        .max(1)
-                })
-            })
-            .unwrap_or(60);
-        let mut backward_anchor: Option<Timestamp> =
-            (slot < forward_cursor).then_some(forward_cursor);
-        let mut tried_short_backward = backward_step_secs <= 60;
+        // Track exact backward frontier `(anchor, upper)` where `next(anchor) == upper`.
+        // Rewinding uses bounded O(log(gap)) exponential backoff + binary search to
+        // locate the exact immediately preceding occurrence without skipping irregular
+        // slots or spinning across long misfire gaps.
+        let mut backward_state: Option<(Timestamp, Option<Timestamp>)> =
+            (slot < forward_cursor).then_some((forward_cursor, claim.next_slot));
         let mut tried_now_probe = now == fresh;
         const MAX_NEXT_SLOT_RETRIES: usize = 20;
         let advance_untried = |cursor: &mut Timestamp,
@@ -481,37 +470,22 @@ impl KeeperScheduler {
                 candidate = next(*cursor)?;
             }
         };
-        let rewind_untried = |anchor: &mut Option<Timestamp>,
-                              tried_short: &mut bool,
+        let rewind_untried = |state: &mut Option<(Timestamp, Option<Timestamp>)>,
                               tried: &std::collections::BTreeSet<Option<Timestamp>>|
          -> Result<Option<Option<Timestamp>>, PortError> {
-            loop {
-                let Some(current) = *anchor else {
+            while let Some((anchor, upper)) = *state {
+                let Some((prev, next_anchor)) = find_previous_slot(slot, anchor, upper, &next)?
+                else {
+                    *state = None;
                     return Ok(None);
                 };
-                if current <= slot {
-                    *anchor = None;
-                    return Ok(None);
-                }
-                let step = if !*tried_short {
-                    *tried_short = true;
-                    60
-                } else {
-                    backward_step_secs
-                };
-                let stepped = Timestamp::from_unix_parts(
-                    current
-                        .unix_seconds()
-                        .saturating_sub(step)
-                        .max(slot.unix_seconds()),
-                    0,
-                )?;
-                let candidate = next(stepped)?;
-                *anchor = if stepped <= slot { None } else { Some(stepped) };
+                *state = next_anchor.map(|ts| (ts, Some(prev)));
+                let candidate = Some(prev);
                 if !tried.contains(&candidate) {
                     return Ok(Some(candidate));
                 }
             }
+            Ok(None)
         };
         for step in 0..MAX_NEXT_SLOT_RETRIES {
             if !matches!(&result, Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
@@ -543,7 +517,10 @@ impl KeeperScheduler {
                     }
                     Some(latest_candidate)
                 } else {
-                    advance_untried(&mut forward_cursor, &tried)?
+                    match advance_untried(&mut forward_cursor, &tried)? {
+                        Some(found) => Some(found),
+                        None => rewind_untried(&mut backward_state, &tried)?,
+                    }
                 }
             } else if !tried_now_probe {
                 tried_now_probe = true;
@@ -551,15 +528,21 @@ impl KeeperScheduler {
                 if !tried.contains(&probe) {
                     Some(probe)
                 } else {
-                    advance_untried(&mut forward_cursor, &tried)?
+                    match advance_untried(&mut forward_cursor, &tried)? {
+                        Some(found) => Some(found),
+                        None => rewind_untried(&mut backward_state, &tried)?,
+                    }
                 }
-            } else if step % 2 == 1 && backward_anchor.is_some() {
-                match rewind_untried(&mut backward_anchor, &mut tried_short_backward, &tried)? {
+            } else if step % 2 == 1 && backward_state.is_some() {
+                match rewind_untried(&mut backward_state, &tried)? {
                     Some(found) => Some(found),
                     None => advance_untried(&mut forward_cursor, &tried)?,
                 }
             } else {
-                advance_untried(&mut forward_cursor, &tried)?
+                match advance_untried(&mut forward_cursor, &tried)? {
+                    Some(found) => Some(found),
+                    None => rewind_untried(&mut backward_state, &tried)?,
+                }
             };
             let Some(refreshed) = refreshed else {
                 break;
@@ -978,4 +961,196 @@ fn unavailable() -> PortError {
         )
         .expect("valid owner failure"),
     )
+}
+
+/// Locate the exact latest schedule occurrence strictly before `upper` (or the
+/// latest occurrence at or after `next(slot)` when `upper` is `None`) in
+/// bounded `O(log(gap))` `next()` evaluations.
+///
+/// Returns `Ok(Some((prev, next_anchor)))` where `next_anchor` is the upper
+/// search bound for a subsequent rewind step (`None` once `prev` reaches `next(slot)`).
+fn find_previous_slot(
+    slot: Timestamp,
+    anchor: Timestamp,
+    upper: Option<Timestamp>,
+    next: &impl Fn(Timestamp) -> Result<Option<Timestamp>, DomainError>,
+) -> Result<Option<(Timestamp, Option<Timestamp>)>, DomainError> {
+    const MAX_PROBES: usize = 64;
+    if anchor <= slot {
+        return Ok(None);
+    }
+    let min_cand = next(slot)?;
+    if min_cand == upper {
+        return Ok(None);
+    }
+    let slot_sec = slot.unix_seconds();
+    let mut hi_sec = anchor.unix_seconds();
+    let mut delta: i64 = 60;
+    let mut probes: usize = 1;
+    let mut lo_sec = slot_sec;
+    let mut lo_cand = min_cand;
+
+    // 1. Exponentially step backward from `anchor` until `next(probe) != upper`.
+    while probes < MAX_PROBES && hi_sec > slot_sec {
+        let probe_sec = hi_sec.saturating_sub(delta).max(slot_sec);
+        if probe_sec == slot_sec {
+            lo_sec = slot_sec;
+            lo_cand = min_cand;
+            break;
+        }
+        probes += 1;
+        let cand = next(Timestamp::from_unix_parts(probe_sec, 0)?)?;
+        if cand != upper {
+            lo_sec = probe_sec;
+            lo_cand = cand;
+            break;
+        }
+        hi_sec = probe_sec;
+        delta = delta.saturating_mul(2);
+    }
+
+    let Some(mut best) = lo_cand else {
+        return Ok(None);
+    };
+    if upper.is_some_and(|u| best >= u) {
+        return Ok(None);
+    }
+
+    // 2. Fast path: if `next(best) == upper`, `best` is already the exact predecessor.
+    if probes < MAX_PROBES {
+        probes += 1;
+        if next(best)? == upper {
+            let next_anchor = (best.unix_seconds() > slot_sec)
+                .then(|| Timestamp::from_unix_parts(best.unix_seconds() - 1, 0))
+                .transpose()?;
+            let next_anchor = next_anchor.filter(|ts| *ts > slot && Some(best) != min_cand);
+            return Ok(Some((best, next_anchor)));
+        }
+    }
+
+    // 3. Binary search `[lo_sec, hi_sec]` where `next(lo_sec) != upper` and
+    //    `next(hi_sec) == upper` to converge onto the exact immediate predecessor.
+    while probes < MAX_PROBES && hi_sec - lo_sec > 1 {
+        let mid_sec = lo_sec + (hi_sec - lo_sec) / 2;
+        probes += 1;
+        let cand = next(Timestamp::from_unix_parts(mid_sec, 0)?)?;
+        if cand == upper {
+            hi_sec = mid_sec;
+        } else {
+            lo_sec = mid_sec;
+            if let Some(ts) = cand {
+                best = ts;
+            }
+        }
+    }
+    let next_anchor = (best.unix_seconds() > slot_sec)
+        .then(|| Timestamp::from_unix_parts(best.unix_seconds() - 1, 0))
+        .transpose()?;
+    let next_anchor = next_anchor.filter(|ts| *ts > slot && Some(best) != min_cand);
+    Ok(Some((best, next_anchor)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn find_previous_slot_handles_irregular_weekday_and_multi_slot_crons_in_log_probes() {
+        // Trace 1: Mon-Fri 09:00 UTC, misfired Mon -> Thu 09:02 (2.5m backward skew).
+        let cron_wk = "0 0 9 * * Mon-Fri *";
+        let slot = Timestamp::parse("2026-03-02T09:00:00Z").unwrap(); // Monday
+        let anchor = Timestamp::parse("2026-03-05T09:02:00Z").unwrap(); // Thursday
+        let upper = compute_next_slot(cron_wk, "UTC", slot, anchor).unwrap(); // Friday 09:00
+        assert_eq!(
+            upper,
+            Some(Timestamp::parse("2026-03-06T09:00:00Z").unwrap())
+        );
+        let calls = Cell::new(0usize);
+        let next = |ts: Timestamp| {
+            calls.set(calls.get() + 1);
+            compute_next_slot(cron_wk, "UTC", slot, ts)
+        };
+        let (prev1, next_anchor1) = find_previous_slot(slot, anchor, upper, &next)
+            .unwrap()
+            .expect("must find Thu 09:00");
+        assert_eq!(prev1, Timestamp::parse("2026-03-05T09:00:00Z").unwrap());
+        assert!(calls.get() <= 16, "too many probes: {}", calls.get());
+        let (prev2, _) = find_previous_slot(slot, next_anchor1.unwrap(), Some(prev1), &next)
+            .unwrap()
+            .expect("must find Wed 09:00");
+        assert_eq!(prev2, Timestamp::parse("2026-03-04T09:00:00Z").unwrap());
+
+        // Trace 2: irregular `0 0,5,10 * * * * *`, 2m backward skew from 10:06:30.
+        let cron_irr = "0 0,5,10 * * * * *";
+        let slot_irr = Timestamp::parse("2026-03-05T08:00:00Z").unwrap();
+        let anchor_irr = Timestamp::parse("2026-03-05T10:06:30Z").unwrap();
+        let upper_irr = compute_next_slot(cron_irr, "UTC", slot_irr, anchor_irr).unwrap(); // 10:10:00
+        assert_eq!(
+            upper_irr,
+            Some(Timestamp::parse("2026-03-05T10:10:00Z").unwrap())
+        );
+        let calls_irr = Cell::new(0usize);
+        let next_irr = |ts: Timestamp| {
+            calls_irr.set(calls_irr.get() + 1);
+            compute_next_slot(cron_irr, "UTC", slot_irr, ts)
+        };
+        let (prev_irr, _) = find_previous_slot(slot_irr, anchor_irr, upper_irr, &next_irr)
+            .unwrap()
+            .expect("must find 10:05:00");
+        assert_eq!(prev_irr, Timestamp::parse("2026-03-05T10:05:00Z").unwrap());
+        assert!(
+            calls_irr.get() <= 16,
+            "too many probes: {}",
+            calls_irr.get()
+        );
+    }
+
+    #[test]
+    fn find_previous_slot_bounds_annual_misfire_and_finite_exhaustion() {
+        // Annual `0 0,1 12 1 1 * *`: 11-month misfire must terminate in <= 64 probes (NOT 480k!).
+        let cron_ann = "0 0,1 12 1 1 * *";
+        let slot = Timestamp::parse("2026-01-01T12:00:00Z").unwrap();
+        let anchor = Timestamp::parse("2026-12-01T12:00:00Z").unwrap();
+        let upper = compute_next_slot(cron_ann, "UTC", slot, anchor).unwrap(); // 2027-01-01T12:00:00Z
+        let calls = Cell::new(0usize);
+        let next = |ts: Timestamp| {
+            calls.set(calls.get() + 1);
+            compute_next_slot(cron_ann, "UTC", slot, ts)
+        };
+        let (prev, next_anchor) = find_previous_slot(slot, anchor, upper, &next)
+            .unwrap()
+            .expect("must find 2026-01-01T12:01:00Z");
+        assert_eq!(prev, Timestamp::parse("2026-01-01T12:01:00Z").unwrap());
+        assert!(next_anchor.is_none());
+        assert!(
+            calls.get() <= 64,
+            "annual gap exceeded probe cap: {}",
+            calls.get()
+        );
+
+        // Finite schedule exhausted forward (`upper == None`): must find last occurrence 23:59:00.
+        let cron_fin = "0 * * * * * 2026";
+        let fin_slot = Timestamp::parse("2026-12-31T23:58:00Z").unwrap();
+        let fin_anchor = Timestamp::parse("2026-12-31T23:59:05Z").unwrap();
+        assert_eq!(
+            compute_next_slot(cron_fin, "UTC", fin_slot, fin_anchor).unwrap(),
+            None
+        );
+        let fin_calls = Cell::new(0usize);
+        let next_fin = |ts: Timestamp| {
+            fin_calls.set(fin_calls.get() + 1);
+            compute_next_slot(cron_fin, "UTC", fin_slot, ts)
+        };
+        let (fin_prev, fin_next) = find_previous_slot(fin_slot, fin_anchor, None, &next_fin)
+            .unwrap()
+            .expect("must find final occurrence 23:59:00");
+        assert_eq!(fin_prev, Timestamp::parse("2026-12-31T23:59:00Z").unwrap());
+        assert!(fin_next.is_none());
+        assert!(
+            fin_calls.get() <= 16,
+            "too many probes: {}",
+            fin_calls.get()
+        );
+    }
 }

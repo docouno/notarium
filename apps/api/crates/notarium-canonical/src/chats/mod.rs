@@ -76,8 +76,7 @@ use crate::{
     domain::{
         common::{
             CommandDeadline, FolderAncestryCache, derive_command_identity_spec,
-            extract_agent_run_from_auth, load_note_head_row_tx, upsert_agent_run_head_tx,
-            validate_mutation_identity,
+            extract_agent_run_from_auth, load_note_head_row_tx, validate_mutation_identity,
         },
         notes::{read_space_and_receipt, try_replay_completed_receipt},
     },
@@ -3427,6 +3426,7 @@ async fn append_chat_impl(
 
     let large_text = match &request.input.body {
         ChatInputBody::Text(text) if text.len() as u64 > StagedChatBlob::INLINE_MAX_BYTES => {
+            authorize_chat_write_on_space(ctx.auth(), &space_rec.space)?;
             let prepared = PreparedBlobSource::prepare(text.as_bytes(), store.blob_codec())?;
             let ticket = deadline
                 .prepare(&ctx.budget, || {
@@ -3437,6 +3437,7 @@ async fn append_chat_impl(
         }
         _ => None,
     };
+    let discard = large_text.as_ref().and_then(StagedBlobTicket::discard);
     let scope = space_rec.scope.clone();
     let active_epoch = space_rec.active_epoch;
     let auth = ctx.auth().clone();
@@ -3474,8 +3475,10 @@ async fn append_chat_impl(
         }),
     };
 
-    let mut stored: StoredCommittedChatEntryV1 =
-        deadline.submit(store, &ctx.budget, intent).await?;
+    let result: Result<StoredCommittedChatEntryV1, PortError> =
+        deadline.submit(store, &ctx.budget, intent).await;
+    settle_queue_upload(deadline, &ctx.budget, discard, &result).await?;
+    let mut stored = result?;
     stored.value.tainted |= legacy_staged;
     Ok(stored.into_committed())
 }
@@ -3737,9 +3740,9 @@ async fn append_chat_tx(
     )
     .await?;
 
-    if let Some(run_id) = &run_opt {
-        upsert_agent_run_head_tx(tx, &scope, run_id, auth.principal(), seq, seq, now_ts).await?;
-    }
+    // Chat entries are not rollbackable corpus mutations; do not record a
+    // synthetic `agent_run_heads` row for chat-only appends so zero-edit
+    // private/Keeper runs remain invisible to foreign rollback probes.
 
     let entry_val = ChatEntry {
         thread: input.thread.clone(),

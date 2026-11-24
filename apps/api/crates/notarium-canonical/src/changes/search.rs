@@ -238,7 +238,7 @@ impl CanonicalStore {
                         row.digest,
                     )?;
                     card.bind_current(current, Lifecycle::Active)?;
-                    if let Ok(card) = ClassEgressFence::search_metadata(card, &auth) {
+                    if let Ok(card) = ClassEgressFence::search_preflight(card, &auth) {
                         metadata.insert(id, card);
                     }
                 }

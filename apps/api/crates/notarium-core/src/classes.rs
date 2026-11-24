@@ -112,6 +112,13 @@ impl DocumentFacts {
         auth.authorize_read(&self.recorded)
     }
 
+    fn can_view(&self, auth: &EngineAuthContext) -> DomainResult<()> {
+        if let Some((current, _)) = self.current.as_deref() {
+            auth.can_view_resource(current)?;
+        }
+        auth.can_view_resource(&self.recorded)
+    }
+
     fn check_egress(&self, lifecycle: Lifecycle) -> DomainResult<()> {
         if self
             .iter()
@@ -1462,6 +1469,18 @@ impl ClassEgressFence {
         auth: &EngineAuthContext,
     ) -> DomainResult<SearchMetadata> {
         document.facts.allow_egress(document.lifecycle, auth)?;
+        Ok(SearchMetadata(document))
+    }
+    /// Untainted candidate metadata check used exclusively for recipient
+    /// preflight before hydration so rejected hits in unconsented Spaces or
+    /// Projects do not flip cross-space `BranchTaint`. Final hydration still
+    /// runs taint-marking `authorize_read` on every admitted hit.
+    pub fn search_preflight(
+        document: ClassifiedMetadata,
+        auth: &EngineAuthContext,
+    ) -> DomainResult<SearchMetadata> {
+        document.facts.check_egress(document.lifecycle)?;
+        document.facts.can_view(auth)?;
         Ok(SearchMetadata(document))
     }
     pub fn projection(

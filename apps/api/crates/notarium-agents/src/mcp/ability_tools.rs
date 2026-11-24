@@ -537,9 +537,20 @@ async fn read_owned_resource(
         .ok_or(DomainError::ResourceNotFound)?;
     let scope = session::space(call, &entry.space_id).await?;
     let project = requested_project(call, reference, &entry.space_id, hint);
+    let selection = call.provider_selection(&scope, project.clone()).await?;
+    if let Some(sel) = &selection {
+        if !sel.policy.allowed_classes.contains(&DocClass::Skill) {
+            return Err(DomainError::validation(ValidationReason::ClassEgressForbidden).into());
+        }
+        if let Some(required) = &sel.project_only
+            && !matches!(&reference.placement, AbilityPlacement::OwnedProject(p) if p == required)
+        {
+            return Err(DomainError::AccessDenied.into());
+        }
+    }
     let body = read_exact_resource(call.registry, &scope, descriptor, resource).await?;
     let origin = body.origin();
-    let text = match call.provider_selection(&scope, project.clone()).await? {
+    let text = match selection {
         Some(selection) => {
             if selection
                 .project_only

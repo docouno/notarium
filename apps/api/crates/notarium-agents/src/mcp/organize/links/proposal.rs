@@ -310,11 +310,18 @@ pub(in crate::mcp) async fn apply_links(
                 output.push(result);
                 applied.insert(source, revision);
             }
-            Err(PortError::Domain(error)) if !single => {
-                output.push(json!({"index": index, "ok": false, "error": error.code()}));
+            Err(error) => {
+                match super::super::super::note_tools::batch_operational_error(
+                    "notarium.confirmed-link-receipt.v1",
+                    error,
+                    !applied.is_empty(),
+                ) {
+                    PortError::Domain(domain) if !single => {
+                        output.push(json!({"index": index, "ok": false, "error": domain.code()}));
+                    }
+                    other => return Err(other),
+                }
             }
-            Err(error) if !applied.is_empty() => return Err(unknown(error)),
-            Err(error) => return Err(error),
         }
     }
     Ok(json!({"results": output}))

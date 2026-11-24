@@ -582,12 +582,16 @@ async fn unconsented_proposal_fails_closed_with_taint(
         .await
         .unwrap();
 
-    // Matching and non-matching FindReplace probes must return identical ResourceNotFound
-    // and mark external-read taint BEFORE touching detached human authority.
+    // Matching, non-matching, and absent-note FindReplace probes must return
+    // identical ResourceNotFound BEFORE touching detached human authority and
+    // must preserve caller taint (neither leaking content nor flipping taint as
+    // a cross-Space NoteId existence oracle).
+    let absent_note = NoteId::from_bytes([0x9F; 16]);
     let mut leaf = ThreadEntrySeq::ZERO;
     for (tag, target_note, needle, pre_taint) in [
         (50, &foreign_secret, "Foreign canary secret.", false),
         (51, &foreign_secret, "Does not exist.", false),
+        (54, &absent_note, "Does not exist.", false),
         (52, &secret_note, "Canary plaintext secret.", true),
         (53, &secret_note, "Absent personal needle.", true),
     ] {
@@ -669,9 +673,10 @@ async fn unconsented_proposal_fails_closed_with_taint(
             matches!(err, PortError::Domain(DomainError::ResourceNotFound)),
             "{needle}: expected ResourceNotFound, got {err:?}"
         );
-        assert!(
+        assert_eq!(
             probe_auth.taint().is_tainted(),
-            "failed cross-Space/proposal probe must mark external-read taint"
+            pre_taint,
+            "rejected unconsented cross-Space probe must preserve taint without leaking NoteId existence"
         );
     }
 }

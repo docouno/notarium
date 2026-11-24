@@ -484,8 +484,13 @@ impl AgentRunSupervisor {
                                     _ => (),
                                 }
                             }
-                            Err(error) if no_authority(&error) => (),
-                            Err(error) => return Err(error),
+                            Err(error)
+                                if !self.inner.shutdown.is_cancelled()
+                                    && retry_handoff(&error).is_some() =>
+                            {
+                                return Err(error);
+                            }
+                            Err(_) => (),
                         }
                     }
                     self.inner.revocations.finish_pending(&attempt.key);
@@ -497,7 +502,11 @@ impl AgentRunSupervisor {
         Err(owner_unavailable())
     }
 
-    async fn dismiss(&self, run: &ActiveRun, key: &PendingCredentialKey) -> Result<(), PortError> {
+    pub(super) async fn dismiss(
+        &self,
+        run: &ActiveRun,
+        key: &PendingCredentialKey,
+    ) -> Result<(), PortError> {
         self.inner
             .registry
             .engine()

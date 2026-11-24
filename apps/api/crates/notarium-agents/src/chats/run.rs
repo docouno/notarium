@@ -13,7 +13,6 @@ impl AgentRunSupervisor {
         start: RunTaskStart,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
-            let drain_only = matches!(&start, RunTaskStart::DrainOnly(_));
             let result = match start {
                 RunTaskStart::Admitted(leaf) => self.run_turn(&run, leaf).await,
                 RunTaskStart::DrainOnly(error) => Err(error),
@@ -38,8 +37,7 @@ impl AgentRunSupervisor {
                     Err(error)
                         if (advised.is_some() || queue::retry_cleanup(&error))
                             && run.owner.check().is_ok()
-                            && !self.inner.shutdown.is_cancelled()
-                            && (!drain_only || unsettled.is_some()) =>
+                            && !self.inner.shutdown.is_cancelled() =>
                     {
                         pending_stalls = 0;
                         drop(admission);
@@ -50,6 +48,35 @@ impl AgentRunSupervisor {
                         ClaimSettlement::Pending if pending_stalls < 3 => {
                             pending_stalls += 1;
                             drop(admission);
+                        }
+                        ClaimSettlement::Pending
+                            if run.owner.check().is_ok() && !self.inner.shutdown.is_cancelled() =>
+                        {
+                            // Clear blocking pending rows so finish_run_if_queue_empty
+                            // releases this live-generation claim cleanly instead of
+                            // abandoning active_run_id in storage.
+                            if let Ok(ctx) = run.cleanup_context()
+                                && let Ok(items) = self
+                                    .inner
+                                    .registry
+                                    .engine()
+                                    .list_pending_chat_inputs(ctx, run.thread.clone())
+                                    .await
+                            {
+                                for item in items {
+                                    let key = PendingCredentialKey {
+                                        scope: run.scope.clone(),
+                                        thread: run.thread.clone(),
+                                        input: item.id,
+                                    };
+                                    let _ = self.dismiss(&run, &key).await;
+                                }
+                            }
+                            let _ = self.settle_unpublished_claim(&run).await;
+                            let _ = self.refresh_current_head(&run, !own_reconciled).await;
+                            self.finish_and_remove_run(&run, result.err().or(Some(error)));
+                            drop(admission);
+                            return;
                         }
                         _ => {
                             let _ = self.refresh_current_head(&run, !own_reconciled).await;

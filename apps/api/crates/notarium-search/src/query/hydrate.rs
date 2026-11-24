@@ -105,7 +105,13 @@ impl NoteAdmission<'_> {
             let ids: Vec<_> = batch.iter().map(&note).cloned().collect();
             let mut check_ctx = self.context.clone();
             check_ctx.budget = self.clock.remaining()?;
-            let flags = structural.filter_live_visible(&check_ctx, &ids).await?;
+            let flags = if self.recipient.is_some() {
+                structural
+                    .filter_live_visible_preflight(&check_ctx, &ids)
+                    .await?
+            } else {
+                structural.filter_live_visible(&check_ctx, &ids).await?
+            };
             if flags.len() != ids.len() {
                 return Err(internal("projection_live_batch"));
             }
@@ -143,7 +149,7 @@ impl NoteAdmission<'_> {
                         *allowed
                     } else {
                         let card = match self.overlay.get(id) {
-                            Some(Some(row)) => ClassEgressFence::search_metadata(
+                            Some(Some(row)) => ClassEgressFence::search_preflight(
                                 row.document.metadata(),
                                 self.context.auth(),
                             )

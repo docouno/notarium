@@ -613,23 +613,22 @@ async fn many(call: &mut ToolCallContext<'_>, inputs: Vec<LinkInput>) -> Result<
         .await;
         let (scope, response) = match prepared_batch {
             Ok(pair) => pair,
-            Err(PortError::Domain(error)) => {
-                for prepared in batch {
-                    let index = usize::from(prepared.ordinal);
-                    results[index] = Some(json!({
-                        "index": index,
-                        "ok": false,
-                        "error": error.code(),
-                    }));
-                }
-                continue;
-            }
             Err(error) => {
-                return Err(super::super::note_tools::batch_operational_error(
-                    LABEL,
-                    error,
-                    committed_any,
-                ));
+                match super::super::note_tools::batch_operational_error(LABEL, error, committed_any)
+                {
+                    PortError::Domain(error) => {
+                        for prepared in batch {
+                            let index = usize::from(prepared.ordinal);
+                            results[index] = Some(json!({
+                                "index": index,
+                                "ok": false,
+                                "error": error.code(),
+                            }));
+                        }
+                        continue;
+                    }
+                    operational => return Err(operational),
+                }
             }
         };
         if response.items.iter().any(Result::is_ok) {

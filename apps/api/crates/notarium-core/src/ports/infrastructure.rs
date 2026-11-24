@@ -83,6 +83,16 @@ pub trait StructuralReadPort: Send + Sync {
             Ok(results)
         })
     }
+    /// Untainted visibility prefilter used when a `SearchRecipient` filters
+    /// candidates prior to hydration so rejected hits do not flip cross-space
+    /// `BranchTaint`. Every admitted hit is still tainted during `hydrate`.
+    fn filter_live_visible_preflight<'a>(
+        &'a self,
+        ctx: &'a SpaceContext,
+        notes: &'a [NoteId],
+    ) -> PortFuture<'a, Vec<bool>> {
+        self.filter_live_visible(ctx, notes)
+    }
     /// Preserve request ordering, including absent/hidden rows.
     fn hydrate(
         &self,

@@ -39,6 +39,26 @@ pub(super) async fn recent(
         if target.last_seq == SpaceSeq::ZERO {
             continue;
         }
+        let mut read_scope = call.space(target.scope.clone())?;
+        if !external {
+            let selection = match call
+                .provider_selection(&read_scope, target.project.clone())
+                .await
+            {
+                Ok(selection) => selection,
+                Err(error) if corpus::hidden(&error) => continue,
+                Err(error) => return Err(error),
+            };
+            if let Some(sel) = selection {
+                read_scope = read_scope.restrict_read_classes(&sel.policy.allowed_classes)?;
+                if let Some(required) = sel.project_only {
+                    read_scope = read_scope.restrict_to_project(&required)?;
+                }
+            }
+        }
+        if let Some(project) = &target.project {
+            read_scope = read_scope.restrict_to_project(project)?;
+        }
         let after = SpaceSeq::new(
             target
                 .last_seq
@@ -49,7 +69,7 @@ pub(super) async fn recent(
             .registry
             .engine
             .recent_activity(
-                call.space(target.scope.clone())?,
+                read_scope,
                 ChangeRead::Log {
                     after: ChangeCursor {
                         scope: target.scope.clone(),
@@ -109,7 +129,32 @@ pub(super) async fn recent(
         };
         let target = &targets[index];
         let facts = {
-            let scope = call.space(target.scope.clone())?;
+            let mut scope = call.space(target.scope.clone())?;
+            if !external {
+                let selection = match call
+                    .provider_selection(&scope, target.project.clone())
+                    .await
+                {
+                    Ok(selection) => selection,
+                    Err(error) if corpus::hidden(&error) => continue,
+                    Err(error) => return Err(error),
+                };
+                if let Some(sel) = selection {
+                    if change
+                        .class
+                        .is_some_and(|class| !sel.policy.allowed_classes.contains(&class))
+                    {
+                        continue;
+                    }
+                    scope = scope.restrict_read_classes(&sel.policy.allowed_classes)?;
+                    if let Some(required) = sel.project_only {
+                        scope = scope.restrict_to_project(&required)?;
+                    }
+                }
+            }
+            if let Some(project) = &target.project {
+                scope = scope.restrict_to_project(project)?;
+            }
             let snapshot = match call
                 .registry
                 .engine

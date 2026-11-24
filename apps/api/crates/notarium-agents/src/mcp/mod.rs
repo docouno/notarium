@@ -425,11 +425,23 @@ impl ToolRegistry {
             )
             .await?;
 
+        #[inline(never)]
+        fn box_tool<'a, T, Fut>(
+            make: impl FnOnce() -> Fut,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>
+        where
+            Fut: std::future::Future<Output = T> + Send + 'a,
+        {
+            Box::pin(make())
+        }
+
         let result = async {
             if let Some(binding) = &personal
                 && proposals::needs_proposal(&call, &args).await?
             {
-                let draft = proposals::prepare(&mut call, binding, &ctx.request_key, args).await?;
+                let draft =
+                    box_tool(|| proposals::prepare(&mut call, binding, &ctx.request_key, args))
+                        .await?;
                 return McpToolResult::proposed(tool, draft, std::mem::take(&mut call.provenance));
             }
             if tool.writes() {
@@ -443,7 +455,7 @@ impl ToolRegistry {
             let mut display = None;
             let payload = match tool {
                 ToolName::Whoami | ToolName::GetMyProjects | ToolName::StartSession => {
-                    session::handle(&mut call, tool, args).await?
+                    box_tool(|| session::handle(&mut call, tool, args)).await?
                 }
                 ToolName::ListAbilities
                 | ToolName::GetAbility
@@ -451,30 +463,38 @@ impl ToolRegistry {
                 | ToolName::UseSkill
                 | ToolName::CreateAbility
                 | ToolName::EditAbility
-                | ToolName::DeleteAbility => ability_tools::handle(&mut call, tool, args).await?,
+                | ToolName::DeleteAbility => {
+                    box_tool(|| ability_tools::handle(&mut call, tool, args)).await?
+                }
                 ToolName::RememberAboutUser | ToolName::RememberAboutProject => {
-                    memory::handle(&mut call, tool, args).await?
+                    box_tool(|| memory::handle(&mut call, tool, args)).await?
                 }
                 ToolName::GetNote => {
-                    let note = get_note::get(&mut call, args).await?;
+                    let note = box_tool(|| get_note::get(&mut call, args)).await?;
                     display = Some(note.display);
                     note.structured
                 }
                 ToolName::ListNotes
                 | ToolName::RecentActivity
                 | ToolName::Search
-                | ToolName::Recall => read_tools::handle(&mut call, tool, args).await?,
+                | ToolName::Recall => {
+                    box_tool(|| read_tools::handle(&mut call, tool, args)).await?
+                }
                 ToolName::CreateNote
                 | ToolName::CreateNotes
                 | ToolName::EditNote
                 | ToolName::DeleteNote
                 | ToolName::MoveNote
-                | ToolName::RenameNote => note_tools::handle(&mut call, tool, args).await?,
+                | ToolName::RenameNote => {
+                    box_tool(|| note_tools::handle(&mut call, tool, args)).await?
+                }
                 ToolName::MoveFolder
                 | ToolName::RenameFolder
                 | ToolName::RenameProject
                 | ToolName::Link
-                | ToolName::LinkMany => organize::handle(&mut call, tool, args).await?,
+                | ToolName::LinkMany => {
+                    box_tool(|| organize::handle(&mut call, tool, args)).await?
+                }
             };
             McpToolResult::new(tool, payload, display, std::mem::take(&mut call.provenance))
         }

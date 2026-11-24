@@ -152,12 +152,10 @@ pub trait ControlCatalogPort: Send + Sync {
     /// run's liveness during rollback fencing without leaking zero-edit private runs.
     fn agent_run_has_head(
         &self,
-        _budget: CallBudget,
-        _space: SpaceId,
-        _run: AgentRunId,
-    ) -> PortFuture<'_, bool> {
-        Box::pin(async { Ok(false) })
-    }
+        budget: CallBudget,
+        space: SpaceId,
+        run: AgentRunId,
+    ) -> PortFuture<'_, bool>;
     fn projects(
         &self,
         ctx: SpaceContext,

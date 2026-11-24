@@ -54,6 +54,7 @@ pub(super) async fn note_in_space(
     id: &NoteId,
 ) -> Result<CatalogNote, PortError> {
     let note = catalog_note(call, &scope.scope().space_id, id).await?;
+    admit_provider_note_read(call, scope, &note).await?;
     scope.auth().authorize_read(&note.facts)?;
     Ok(note)
 }
@@ -83,6 +84,7 @@ pub(super) async fn locate_note(
     }
     call.auth.can_view_resource(&note.facts)?;
     let scope = session::space(call, &note.reference.space_id).await?;
+    admit_provider_note_read(call, &scope, &note).await?;
     scope.auth().authorize_read(&note.facts)?;
     Ok((scope, note))
 }

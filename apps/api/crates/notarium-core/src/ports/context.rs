@@ -314,6 +314,15 @@ impl SpaceContext {
         self.auth = self.auth.restrict_to_project(project)?;
         Ok(self)
     }
+    pub fn restrict_read_classes(
+        mut self,
+        allowed: &std::collections::BTreeSet<crate::classes::DocClass>,
+    ) -> DomainResult<Self> {
+        self.auth = self
+            .auth
+            .restrict_read_classes(&self.scope.space_id, allowed)?;
+        Ok(self)
+    }
     pub fn check_current(&self, current: &HistoryScope) -> DomainResult<()> {
         current.check(&self.scope)
     }

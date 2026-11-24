@@ -183,12 +183,16 @@ async fn apply_one(
 ) -> Result<Value, PortError> {
     const LABEL: &str = "notarium.mcp.confirmed-create-notes-batch.v1";
     let creates_folder = draft.destination.exact().is_none();
-    let (folder_ctx, folder_identity) = step(&project.scope, "create_destination", index)?;
-    let folder_scope = folder_ctx.restrict_to_project(&project.reference)?;
+    let (folder_ctx, folder_identity) = step(&project.scope, "create_destination", index)
+        .map_err(|error| batch_operational_error(LABEL, error, *committed_any))?;
+    let folder_scope = folder_ctx
+        .restrict_to_project(&project.reference)
+        .map_err(|error| batch_operational_error(LABEL, error.into(), *committed_any))?;
     let parent = draft
         .destination
         .apply(owner, folder_scope, folder_identity, None)
-        .await?;
+        .await
+        .map_err(|error| batch_operational_error(LABEL, error, *committed_any))?;
     if creates_folder {
         *committed_any = true;
     }
@@ -224,10 +228,7 @@ async fn apply_one(
             },
         )
         .await
-        .map_err(|error| match error {
-            PortError::Domain(domain) => PortError::Domain(domain),
-            operational => batch_operational_error(LABEL, operational, *committed_any),
-        })?;
+        .map_err(|error| batch_operational_error(LABEL, error, *committed_any))?;
     *committed_any = true;
     let mut result = receipt_result(owner, scope, &draft.note, committed, "created")
         .await
@@ -287,10 +288,12 @@ pub(in crate::mcp::note_tools) async fn apply(
                 value["ok"] = json!(true);
                 results.push(value);
             }
-            Err(PortError::Domain(error)) => {
-                results.push(json!({"index": index, "ok": false, "error":error.code()}));
-            }
-            Err(error) => return Err(batch_operational_error(LABEL, error, committed_any)),
+            Err(error) => match batch_operational_error(LABEL, error, committed_any) {
+                PortError::Domain(domain) => {
+                    results.push(json!({"index": index, "ok": false, "error": domain.code()}));
+                }
+                operational => return Err(operational),
+            },
         }
     }
     Ok(json!({"results":results}))
