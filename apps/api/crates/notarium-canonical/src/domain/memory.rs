@@ -383,7 +383,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn b03_receipt_replays_without_new_metadata() {
+    fn legacy_receipt_replays_without_new_metadata() {
         let legacy = StoredCommittedNoteRevV1 {
             value: NoteRevision {
                 note: NoteId::from_bytes([1; 16]),

@@ -793,6 +793,13 @@ pub(crate) async fn get_note_sqlite_local_fast(
                 live_head.ability_id.clone(),
                 false,
             )?;
+            let live_effective_lc = crate::domain::common::combine_lifecycle(
+                live_head.lifecycle,
+                ancestry.folder_lifecycle,
+            );
+            if live_effective_lc == Lifecycle::Purged {
+                return Err(DomainError::ResourceNotFound.into());
+            }
             auth.authorize_read(&live_facts)?;
 
             let target_rev_id = req_rev_opt.unwrap_or_else(|| live_head.head_rev_id.clone());
@@ -838,7 +845,7 @@ pub(crate) async fn get_note_sqlite_local_fast(
             );
             let parent_opt = (nm.parent_folder_id != space_rec.root_folder_id).then_some(nm.parent_folder_id);
             let effective_lc = if target_rev_id == live_head.head_rev_id {
-                live_head.lifecycle
+                live_effective_lc
             } else {
                 nm.lifecycle
             };
@@ -4750,6 +4757,7 @@ fn load_folder_ancestry_rusqlite(
     let mut current = folder_id.clone();
     let mut project = None;
     let mut cover_note = None;
+    let mut folder_lifecycle = Lifecycle::Active;
 
     for _depth in 0..=MAX_FOLDER_DEPTH {
         if !visited.insert(current.clone()) {
@@ -4762,6 +4770,8 @@ fn load_folder_ancestry_rusqlite(
         if require_all_active && row.lifecycle != Lifecycle::Active {
             return Err(DomainError::ResourceNotFound.into());
         }
+        folder_lifecycle =
+            crate::domain::common::combine_lifecycle(folder_lifecycle, row.lifecycle);
         if row.write_locked {
             write_locked = true;
         }
@@ -4787,6 +4797,7 @@ fn load_folder_ancestry_rusqlite(
                 folder_path,
                 project,
                 cover_note,
+                folder_lifecycle,
             });
         }
         segments_rev.push(row.slug);

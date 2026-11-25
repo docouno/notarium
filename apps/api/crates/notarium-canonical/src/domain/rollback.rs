@@ -1830,6 +1830,15 @@ fn build_rollback_execute_fn(
 
                     // Build mutable working group lists excluding notes being trashed by this rollback,
                     // materializing initial ranks for any unranked existing rows in each group.
+                    let moved_targets_on_view: BTreeSet<&NoteId> = run_moves_cl
+                        .iter()
+                        .filter(|bmh| {
+                            &bmh.view == view
+                                && eligible_all_ids.contains(&bmh.target_note_id)
+                                && !trashed_created_ids.contains(&bmh.target_note_id)
+                        })
+                        .map(|bmh| &bmh.target_note_id)
+                        .collect();
                     let mut working_groups: Vec<(GroupKey, Vec<ExistingRankedItem>)> = Vec::new();
                     let mut neighbor_dirty: BTreeMap<NoteId, (GroupKey, String, bool)> =
                         BTreeMap::new();
@@ -1852,7 +1861,7 @@ fn build_rollback_execute_fn(
                         if all_unranked {
                             let init = evenly_spaced_ranks(kept_notes.len())?;
                             for (nid, r) in kept_notes.iter().zip(init) {
-                                if !eligible_all_ids.contains(nid) {
+                                if !moved_targets_on_view.contains(nid) {
                                     neighbor_dirty
                                         .insert(nid.clone(), (eg.group.clone(), r.clone(), false));
                                 }
@@ -1892,11 +1901,11 @@ fn build_rollback_execute_fn(
                                         {
                                             it.rank = pr.clone();
                                         }
-                                        if !eligible_all_ids.contains(&pn) {
+                                        if !moved_targets_on_view.contains(&pn) {
                                             neighbor_dirty.insert(pn, (eg.group.clone(), pr, true));
                                         }
                                     }
-                                    if !eligible_all_ids.contains(nid) {
+                                    if !moved_targets_on_view.contains(nid) {
                                         neighbor_dirty.insert(
                                             nid.clone(),
                                             (eg.group.clone(), tail.target_rank.clone(), false),
@@ -2003,7 +2012,7 @@ fn build_rollback_execute_fn(
                                         target_final_state.get_mut(&pn)
                                     {
                                         *tr_rank = pr;
-                                    } else if !eligible_all_ids.contains(&pn) {
+                                    } else if !moved_targets_on_view.contains(&pn) {
                                         neighbor_dirty.insert(pn, (group.clone(), pr, true));
                                     }
                                 }
@@ -5662,9 +5671,10 @@ async fn try_execute_pg_root_rollback(
     let scope = scope.clone();
     let writer = writer.clone();
     let commit = async move {
-        // Retain the backup safe point and room fences until the database
-        // answers, including when the caller stops waiting for the ACK.
+        // Retain the backup safe point, live visibility write lock, and room fences
+        // until the database answers, including when the caller stops waiting for the ACK.
         let _gate = _commit_gate;
+        let _visibility = visibility;
         fences_guard.armed_for_drop_consume = true;
         let connection = match sqlx::raw_sql("COMMIT").execute(transaction.conn()).await {
             Ok(_) => {

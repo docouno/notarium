@@ -254,10 +254,7 @@ pub(super) async fn prepare(
     let _probes_foreign_corpus = match admit_proposal_targets(call, &planning, &args).await {
         Ok(probes) => probes,
         Err(error) => {
-            if matches!(
-                error,
-                PortError::Domain(DomainError::SpaceReadOnly | DomainError::AbilityWriteForbidden)
-            ) {
+            if !matches!(error, PortError::Domain(DomainError::ResourceNotFound)) {
                 call.commit_external_read();
             }
             return Err(error);
@@ -566,6 +563,29 @@ pub(super) fn reversible(tool: ToolName) -> bool {
     )
 }
 
+fn validate_reversible_input(tool: ToolName, args: &Value) -> Result<(), PortError> {
+    match tool {
+        ToolName::CreateNote
+        | ToolName::CreateNotes
+        | ToolName::EditNote
+        | ToolName::DeleteNote
+        | ToolName::MoveNote
+        | ToolName::RenameNote => {
+            note_tools::validate_proposal_input(tool, args)?;
+            Ok(())
+        }
+        ToolName::Link | ToolName::LinkMany => {
+            organize::validate_link_proposal_input(tool, args)?;
+            Ok(())
+        }
+        ToolName::RememberAboutUser | ToolName::RememberAboutProject => {
+            let _ = MemoryArgs::parse(args.clone())?;
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
 pub(super) async fn needs_proposal(
     call: &ToolCallContext<'_>,
     args: &Value,
@@ -573,6 +593,10 @@ pub(super) async fn needs_proposal(
     if !reversible(call.tool) {
         return Ok(false);
     }
+    // Validate pure semantic argument syntax before resolving any foreign
+    // note or project handle so invalid calls cannot distinguish missing vs
+    // existing cross-space targets without tainting.
+    validate_reversible_input(call.tool, args)?;
     if call.auth.taint().is_tainted() {
         return Ok(true);
     }

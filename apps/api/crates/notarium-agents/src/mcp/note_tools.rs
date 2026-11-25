@@ -26,7 +26,7 @@ mod proposal;
 pub(super) use create::{batch_operational_error, post_commit_error};
 pub(super) use proposal::{
     PreparedNoteAction, apply_proposal, describe_proposal, plan_proposal, preflight_proposal,
-    preview_proposal,
+    preview_proposal, validate_proposal_input,
 };
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

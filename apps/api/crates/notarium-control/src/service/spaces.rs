@@ -232,7 +232,8 @@ impl ControlService {
                         )
                         .with_human_management(ctx.auth().human_management())
                         .with_credential(credential),
-                    ))
+                    )
+                    .mark_spaces_narrowed())
                 },
                 CommitEffect::NotCommitted,
             )

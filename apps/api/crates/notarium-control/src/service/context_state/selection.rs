@@ -474,12 +474,13 @@ impl ControlService {
         scope: ContextScope,
         page: ControlPageRequest,
     ) -> Result<ControlPage<ContextEntryInfo>, PortError> {
+        const MAX_SCAN: usize = 4096;
         let budget = OperationBudget::new(ctx.budget.clone());
         let (mut tx, auth) = self
             .open_revalidated_read(&budget, &ctx.budget.request, ctx.auth())
             .await?;
         let current = AccountContext::new(auth, budget.context(ctx.budget.request.clone()));
-        let db_result = budget
+        let init_result = budget
             .run(
                 async {
                     let owner =
@@ -503,7 +504,7 @@ impl ControlService {
                     }) {
                         return Err(invalid(ValidationReason::CursorStale));
                     }
-                    let mut after = cursor.map_or(
+                    let after = cursor.map_or(
                         EntryRow {
                             rank: i64::MIN,
                             kind: String::new(),
@@ -512,12 +513,32 @@ impl ControlService {
                         },
                         |cursor| cursor.last,
                     );
-                    let target = usize::from(page.limit());
-                    let limit = i64::from(page.limit()) + 1;
-                    let mut visible = Vec::with_capacity(target + 1);
-                    let mut has_more = false;
-                    let mut scanned = 0usize;
-                    loop {
+                    Ok::<_, PortError>((key, digest, after))
+                },
+                CommitEffect::NotCommitted,
+            )
+            .await;
+        budget
+            .run(tx.rollback(), CommitEffect::NotCommitted)
+            .await?;
+        let (key, digest, mut after) = init_result?;
+        budget
+            .run(
+                self.context_scope_read(&current, &scope, &key),
+                CommitEffect::NotCommitted,
+            )
+            .await?;
+        let target = usize::from(page.limit());
+        let batch_limit = i64::from(page.limit()).saturating_add(1).max(16);
+        let mut items = Vec::with_capacity(target);
+        let mut last_visible: Option<EntryRow> = None;
+        let mut has_more = false;
+        let mut scanned = 0usize;
+        loop {
+            let mut tx = self.store.read(budget.clone()).await?;
+            let batch_result = budget
+                .run(
+                    async {
                         let batch: Vec<EntryRow> = match tx.inner_mut() {
                             Transaction::Sqlite(tx) => {
                                 sqlx::query_as(include_str!("entries.sqlite.sql"))
@@ -527,7 +548,7 @@ impl ControlService {
                                     .bind(&after.kind)
                                     .bind(&after.space)
                                     .bind(&after.entity)
-                                    .bind(limit)
+                                    .bind(batch_limit)
                                     .fetch_all(&mut **tx)
                                     .await
                                     .map_err(crate::error::database)?
@@ -540,116 +561,132 @@ impl ControlService {
                                     .bind(&after.kind)
                                     .bind(&after.space)
                                     .bind(&after.entity)
-                                    .bind(limit)
+                                    .bind(batch_limit)
                                     .fetch_all(&mut **tx)
                                     .await
                                     .map_err(crate::error::database)?
                             }
                         };
                         let batch_len = batch.len();
+                        let mut next_after = EntryRow {
+                            kind: after.kind.clone(),
+                            space: after.space.clone(),
+                            entity: after.entity.clone(),
+                            rank: after.rank,
+                        };
+                        let mut candidates = Vec::with_capacity(batch_len);
                         for row in batch {
-                            scanned = scanned.saturating_add(1);
-                            after = EntryRow {
+                            next_after = EntryRow {
                                 kind: row.kind.clone(),
                                 space: row.space.clone(),
                                 entity: row.entity.clone(),
                                 rank: row.rank,
                             };
-                            if row.kind == "set" {
-                                let set_id = ContextSetId::parse(&row.entity)?;
-                                let Some(bundle_row) =
-                                    sets::bundle(tx.inner_mut(), &set_id, false).await?
-                                else {
-                                    continue;
-                                };
-                                match self
-                                    .check_bundle_attachment_db(
-                                        tx.inner_mut(),
-                                        &current,
-                                        &bundle_row,
-                                    )
-                                    .await
-                                {
-                                    Ok(()) => (),
-                                    Err(error) if hidden(&error) => continue,
-                                    Err(error) => return Err(error),
+                            match row.kind.as_str() {
+                                "set" => {
+                                    let set_id = ContextSetId::parse(&row.entity)?;
+                                    let Some(bundle_row) =
+                                        sets::bundle(tx.inner_mut(), &set_id, false).await?
+                                    else {
+                                        continue;
+                                    };
+                                    match self
+                                        .check_bundle_attachment_db(
+                                            tx.inner_mut(),
+                                            &current,
+                                            &bundle_row,
+                                        )
+                                        .await
+                                    {
+                                        Ok(()) => candidates.push(row),
+                                        Err(error) if hidden(&error) => continue,
+                                        Err(error) => return Err(error),
+                                    }
                                 }
+                                "note" => {
+                                    let space_id = SpaceId::parse(&row.space)?;
+                                    if current
+                                        .auth()
+                                        .spaces()
+                                        .get(&space_id)
+                                        .is_some_and(|grant| !grant.read_classes.is_empty())
+                                    {
+                                        candidates.push(row);
+                                    }
+                                }
+                                _ => return Err(invalid(ValidationReason::InvalidState)),
                             }
-                            if visible.len() == target {
-                                has_more = true;
-                                break;
-                            }
-                            visible.push(row);
                         }
-                        if has_more || batch_len < usize::try_from(limit).unwrap_or(usize::MAX) {
-                            break;
-                        }
-                        if scanned >= 4096 {
-                            return Err(invalid(ValidationReason::BudgetExceeded));
-                        }
-                    }
-                    let continuation = if has_more {
-                        let last = visible.last().expect("positive page limit");
-                        Some(
-                            serde_json::to_string(&EntryCursor {
-                                version: 1,
-                                scope: digest,
-                                last: EntryRow {
-                                    kind: last.kind.clone(),
-                                    space: last.space.clone(),
-                                    entity: last.entity.clone(),
-                                    rank: last.rank,
-                                },
-                            })
-                            .map_err(|_| invalid(ValidationReason::InvalidState))?,
-                        )
-                    } else {
-                        None
-                    };
-                    Ok::<_, PortError>((key, visible, continuation))
-                },
-                CommitEffect::NotCommitted,
-            )
-            .await;
-        budget
-            .run(tx.rollback(), CommitEffect::NotCommitted)
-            .await?;
-        let (key, rows, continuation) = db_result?;
-        budget
-            .run(
-                async {
-                    self.context_scope_read(&current, &scope, &key).await?;
-                    let mut items = Vec::with_capacity(rows.len());
-                    for row in rows {
-                        let entry = match row.kind.as_str() {
-                            "set" => ContextEntry::Set(ContextSetId::parse(&row.entity)?),
-                            "note" => {
-                                let note = NoteRef {
-                                    space_id: SpaceId::parse(&row.space)?,
-                                    note_id: NoteId::parse(&row.entity)?,
-                                };
-                                match self.catalog_note(&current, &note).await {
-                                    Ok(_) => (),
-                                    Err(error) if hidden(&error) => continue,
-                                    Err(error) => return Err(error),
-                                };
-                                ContextEntry::Note(note)
-                            }
-                            _ => return Err(invalid(ValidationReason::InvalidState)),
+                        Ok::<_, PortError>((batch_len, next_after, candidates))
+                    },
+                    CommitEffect::NotCommitted,
+                )
+                .await;
+            budget
+                .run(tx.rollback(), CommitEffect::NotCommitted)
+                .await?;
+            let (batch_len, next_after, candidates) = batch_result?;
+            scanned = scanned.saturating_add(batch_len);
+            after = next_after;
+            for row in candidates {
+                let entry = match row.kind.as_str() {
+                    "set" => ContextEntry::Set(ContextSetId::parse(&row.entity)?),
+                    "note" => {
+                        let note = NoteRef {
+                            space_id: SpaceId::parse(&row.space)?,
+                            note_id: NoteId::parse(&row.entity)?,
                         };
-                        items.push(ContextEntryInfo {
-                            entry,
-                            rank: row.rank,
-                        });
+                        let visible = budget
+                            .run(
+                                async {
+                                    match self.catalog_note(&current, &note).await {
+                                        Ok(_) => Ok(true),
+                                        Err(error) if hidden(&error) => Ok(false),
+                                        Err(error) => Err(error),
+                                    }
+                                },
+                                CommitEffect::NotCommitted,
+                            )
+                            .await?;
+                        if !visible {
+                            continue;
+                        }
+                        ContextEntry::Note(note)
                     }
-                    Ok(ControlPage {
-                        items,
-                        continuation,
-                    })
-                },
-                CommitEffect::NotCommitted,
+                    _ => return Err(invalid(ValidationReason::InvalidState)),
+                };
+                if items.len() == target {
+                    has_more = true;
+                    break;
+                }
+                let rank = row.rank;
+                items.push(ContextEntryInfo { entry, rank });
+                last_visible = Some(row);
+            }
+            if has_more || batch_len < usize::try_from(batch_limit).unwrap_or(usize::MAX) {
+                break;
+            }
+            if scanned >= MAX_SCAN {
+                return Err(invalid(ValidationReason::BudgetExceeded));
+            }
+        }
+        let continuation = if has_more {
+            let last = last_visible.expect("positive page limit");
+            Some(
+                serde_json::to_string(&EntryCursor {
+                    version: 1,
+                    scope: digest,
+                    last,
+                })
+                .map_err(|_| invalid(ValidationReason::InvalidState))?,
             )
-            .await
+        } else {
+            None
+        };
+        Ok(ControlPage {
+            items,
+            continuation,
+        })
     }
 }
 

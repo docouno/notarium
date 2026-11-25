@@ -173,8 +173,34 @@ async fn exercise(pg: bool) {
         .await
         .unwrap();
     assert_eq!(full.detail.unwrap().resources.len(), 1);
+    // Space-narrowed PATs cannot inspect account-wide agent call logs.
+    assert!(matches!(
+        service
+            .get_agent_call(delegated.clone(), RequestId::from_bytes([2; 16]))
+            .await,
+        Err(notarium_core::error::PortError::Domain(
+            notarium_core::DomainError::AccessDenied
+        ))
+    ));
+    assert!(matches!(
+        service
+            .list_agent_calls(
+                delegated.clone(),
+                ControlPageRequest::new(10, None).unwrap()
+            )
+            .await,
+        Err(notarium_core::error::PortError::Domain(
+            notarium_core::DomainError::AccessDenied
+        ))
+    ));
+    // An un-narrowed PAT whose Space grants lack read_classes still filters hidden resources.
+    let mut no_read_grants = ctx.auth().spaces().clone();
+    for grant in no_read_grants.values_mut() {
+        grant.read_classes.clear();
+    }
+    let unreadable = AccountContext::new(ctx.auth().for_pat(no_read_grants).unwrap(), budget());
     let limited = service
-        .get_agent_call(delegated.clone(), RequestId::from_bytes([2; 16]))
+        .get_agent_call(unreadable, RequestId::from_bytes([2; 16]))
         .await
         .unwrap();
     assert!(limited.detail.unwrap().resources.is_empty());

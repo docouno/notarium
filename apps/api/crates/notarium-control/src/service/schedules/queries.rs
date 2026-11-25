@@ -119,18 +119,65 @@ impl ControlService {
         ctx: SpaceContext,
         page: ControlPageRequest,
     ) -> Result<ControlPage<AgentSchedule>, PortError> {
+        const MAX_SCAN: usize = 4096;
         let budget = OperationBudget::new(ctx.budget.clone());
         let (mut tx, auth) = self
             .open_revalidated_read(&budget, &ctx.budget.request, ctx.auth())
             .await?;
-        let (current, scope, rows) = budget.run(async {
-            let current = AccountContext::new(auth, budget.context(ctx.budget.request.clone()));
-            let scope = digest(current.auth(), ("schedules", ctx.scope()))?;
-            let cursor = cursor(&page, scope)?;
-            let after = cursor.as_ref().map_or("", |c| c.last.as_str());
-            let rows = rows!(tx.inner_mut(),AgentSchedulesRow,fetch_all,"SELECT * FROM agent_schedules WHERE owner_id=$1 AND space_id=$2 AND deleted_at IS NULL AND schedule_id>$3 ORDER BY schedule_id LIMIT $4","SELECT * FROM v1_control.agent_schedules WHERE owner_id=$1 AND space_id=$2 AND deleted_at IS NULL AND schedule_id COLLATE \"C\">$3 ORDER BY schedule_id COLLATE \"C\" LIMIT $4";current.auth().principal().as_str(),ctx.scope().space_id.as_str(),after,i64::from(page.limit())+1)?;
-            Ok((current, scope, rows))
-        }, CommitEffect::NotCommitted).await?;
+        let (current, scope, items, has_more) = budget
+            .run(
+                async {
+                    let current =
+                        AccountContext::new(auth, budget.context(ctx.budget.request.clone()));
+                    let scope = digest(current.auth(), ("schedules", ctx.scope()))?;
+                    let cursor = cursor(&page, scope)?;
+                    let mut after = cursor.map_or_else(String::new, |c| c.last);
+                    let target = usize::from(page.limit());
+                    let batch_limit = i64::from(page.limit()).saturating_add(1).max(16);
+                    let mut items = Vec::with_capacity(target);
+                    let mut has_more = false;
+                    let mut scanned = 0usize;
+                    loop {
+                        let batch = rows!(
+                            tx.inner_mut(),
+                            AgentSchedulesRow,
+                            fetch_all,
+                            "SELECT * FROM agent_schedules WHERE owner_id=$1 AND space_id=$2 AND deleted_at IS NULL AND schedule_id>$3 ORDER BY schedule_id LIMIT $4",
+                            "SELECT * FROM v1_control.agent_schedules WHERE owner_id=$1 AND space_id=$2 AND deleted_at IS NULL AND schedule_id COLLATE \"C\">$3 ORDER BY schedule_id COLLATE \"C\" LIMIT $4";
+                            current.auth().principal().as_str(),
+                            ctx.scope().space_id.as_str(),
+                            &after,
+                            batch_limit
+                        )?;
+                        let batch_len = batch.len();
+                        for row in batch {
+                            scanned = scanned.saturating_add(1);
+                            after = row.schedule_id.clone();
+                            match Self::readable_schedule_in_space(&current, &row) {
+                                Ok(value) => {
+                                    if items.len() == target {
+                                        has_more = true;
+                                        break;
+                                    }
+                                    items.push(value);
+                                }
+                                Err(e) if hidden(&e) => (),
+                                Err(e) => return Err(e),
+                            }
+                        }
+                        if has_more || batch_len < usize::try_from(batch_limit).unwrap_or(usize::MAX)
+                        {
+                            break;
+                        }
+                        if scanned >= MAX_SCAN {
+                            return Err(invalid(ValidationReason::BudgetExceeded));
+                        }
+                    }
+                    Ok((current, scope, items, has_more))
+                },
+                CommitEffect::NotCommitted,
+            )
+            .await?;
         budget.run(tx.finish(), CommitEffect::NotCommitted).await?;
         budget
             .run(
@@ -139,22 +186,12 @@ impl ControlService {
                         .await?
                         .history
                         .check(ctx.scope())?;
-                    let has_more = rows.len() > usize::from(page.limit());
-                    let mut items = Vec::new();
-                    let mut last = None;
-                    for row in rows.into_iter().take(usize::from(page.limit())) {
-                        last = Some(row.schedule_id.clone());
-                        match Self::readable_schedule_in_space(&current, &row) {
-                            Ok(value) => items.push(value),
-                            Err(e) if hidden(&e) => (),
-                            Err(e) => return Err(e),
-                        }
-                    }
                     let continuation = if has_more {
+                        let last = items.last().expect("positive page").id.to_string();
                         Some(json(&Cursor {
                             version: 1,
                             scope,
-                            last: last.expect("positive page"),
+                            last,
                             slot: 0,
                         })?)
                     } else {

@@ -781,22 +781,14 @@ async fn memory_targets_and_favorites(
         .get_mut(&(one.note.space_id.clone(), one.note.note_id.clone()))
         .unwrap()
         .lifecycle = Lifecycle::Trashed;
-    let skipped = service
+    let last = service
         .list_favorites(
             ctx.clone(),
             ControlPageRequest::new(1, first.continuation).unwrap(),
         )
         .await
         .unwrap();
-    assert!(skipped.items.is_empty());
-    assert!(skipped.continuation.is_some());
-    let last = service
-        .list_favorites(
-            ctx.clone(),
-            ControlPageRequest::new(1, skipped.continuation).unwrap(),
-        )
-        .await
-        .unwrap();
+    assert_eq!(last.items.len(), 1);
     assert_eq!(
         last.items[0].reference,
         FavoriteRef::Note(project_memory.note.clone())

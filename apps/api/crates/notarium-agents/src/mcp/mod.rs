@@ -12,6 +12,8 @@ mod schema;
 mod session;
 
 pub(crate) use ability_tools::bind_chat_role;
+#[cfg(any(test, feature = "test-support"))]
+pub use ability_tools::bind_chat_role as bind_chat_role_for_test;
 pub use proposals::{
     ConfirmProposedDiff, ConfirmedDiffOutcome, PersonalToolInvocation, ProposedDiffPreview,
 };

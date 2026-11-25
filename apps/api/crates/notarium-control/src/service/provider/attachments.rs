@@ -382,25 +382,36 @@ impl ProviderService {
             if input.expires_at_ms.is_some_and(|expires| expires<=now || expires.saturating_sub(now)>365*24*60*60*1000) {return Err(invalid(ValidationReason::InvalidTimestamp));}
             let space=target_space(&input.target);
             let previous=before_attachment(tx, &input.target, &catalog.space, false, clock.as_ref()).await?;check_member_for_target(tx,&auth,&input.target).await?;
-            let resource=resource(tx,input.resource.as_str()).await?;let credential_epoch=epochs(tx,&resource).await?;
-            if input.resource_consent_epoch!=resource.consent_epoch as u64 || input.credential_consent_epoch!=credential_epoch.map(|epoch|epoch as u64) {return Err(DomainError::AccessDenied.into());}
+            let resource=resource(tx,input.resource.as_str()).await?;
             let (kind,target_owner,target_project,state)=match &input.target {
                 ProviderAttachmentTarget::Personal{owner:target_owner,..}=>{
                     owned(&owner.user_id,target_owner.as_str())?;
                     // An individual may consent to an offered shared resource,
-                    // but cannot discover or attach an unrelated private one.
+                    // but cannot discover or attach an unrelated private one,
+                    // nor attach to a stale offer whose underlying credential rotated.
                     if resource.owner_id!=owner.user_id {
-                        let offered=rows!(tx,(i64,),fetch_one,"SELECT count(*) FROM provider_attachments WHERE resource_id=$1 AND target_space=$2 AND target_kind IN ('space','project') AND state='approved' AND resource_epoch=$3 AND (expires_at IS NULL OR expires_at>$4)","SELECT count(*) FROM v1_control.provider_attachments WHERE resource_id=$1 AND target_space=$2 AND target_kind IN ('space','project') AND state='approved' AND resource_epoch=$3 AND (expires_at IS NULL OR expires_at>$4)";&resource.id,space.as_str(),resource.consent_epoch,now)?.0;
+                        let offered=rows!(tx,(i64,),fetch_one,
+                            "SELECT count(*) FROM provider_attachments a JOIN provider_resources r ON r.id=a.resource_id LEFT JOIN credentials c ON c.id=r.credential_id WHERE a.resource_id=$1 AND a.target_space=$2 AND a.target_kind IN ('space','project') AND a.state='approved' AND a.resource_epoch=r.consent_epoch AND ((r.credential_id IS NULL AND a.credential_epoch IS NULL) OR (c.owner_id=r.owner_id AND a.credential_epoch=c.consent_epoch)) AND (a.expires_at IS NULL OR a.expires_at>$3)",
+                            "SELECT count(*) FROM v1_control.provider_attachments a JOIN v1_control.provider_resources r ON r.id=a.resource_id LEFT JOIN v1_control.credentials c ON c.id=r.credential_id WHERE a.resource_id=$1 AND a.target_space=$2 AND a.target_kind IN ('space','project') AND a.state='approved' AND a.resource_epoch=r.consent_epoch AND ((r.credential_id IS NULL AND a.credential_epoch IS NULL) OR (c.owner_id=r.owner_id AND a.credential_epoch=c.consent_epoch)) AND (a.expires_at IS NULL OR a.expires_at>$3)";
+                            &resource.id,space.as_str(),now)?.0;
                         if offered==0 {return Err(DomainError::ResourceNotFound.into());}
                     }
                     ("personal",Some(target_owner.to_string()),None,"approved")
                 },
-                ProviderAttachmentTarget::Space(_)=>{owned(&owner.user_id,&resource.owner_id)?;("space",None,None,"pending")},
-                ProviderAttachmentTarget::Project(project)=>{owned(&owner.user_id,&resource.owner_id)?;("project",None,Some(project.folder_id.to_string()),"pending")},
+                ProviderAttachmentTarget::Space(_)=>{
+                    if resource.owner_id!=owner.user_id {return Err(DomainError::ResourceNotFound.into());}
+                    ("space",None,None,"pending")
+                },
+                ProviderAttachmentTarget::Project(project)=>{
+                    if resource.owner_id!=owner.user_id {return Err(DomainError::ResourceNotFound.into());}
+                    ("project",None,Some(project.folder_id.to_string()),"pending")
+                },
             };
+            let credential_epoch=epochs(tx,&resource).await?;
+            if input.resource_consent_epoch!=resource.consent_epoch as u64 || input.credential_consent_epoch!=credential_epoch.map(|epoch|epoch as u64) {return Err(DomainError::AccessDenied.into());}
             let old=rows!(tx,ProviderAttachmentsRow,fetch_optional,"SELECT * FROM provider_attachments WHERE id=$1","SELECT * FROM v1_control.provider_attachments WHERE id=$1";input.id.as_str())?;
             let rev=if let Some(old)=&old {
-                if old.resource_id!=resource.id || attachment_target(old)?!=input.target {return Err(DomainError::AccessDenied.into());}
+                if old.resource_id!=resource.id || attachment_target(old)?!=input.target {return Err(DomainError::ResourceNotFound.into());}
                 revision(old.revision,input.expected.ok_or_else(||invalid(ValidationReason::InvalidState))?)?;next(old.revision)?
             } else {if input.expected.is_some(){return Err(DomainError::ResourceNotFound.into());} 0};
             let row=ProviderAttachmentsRow{id:input.id.to_string(),resource_id:resource.id.clone(),target_kind:kind.into(),target_owner,target_space:space.to_string(),target_project,resource_epoch:resource.consent_epoch,credential_epoch,state:state.into(),disclosure:json(input.consent.disclosure())?,expires_at:input.expires_at_ms,revision:rev};

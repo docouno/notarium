@@ -365,6 +365,13 @@ fn post_commit_step_error(label: &str, error: PortError, committed: bool) -> Por
     super::super::note_tools::batch_operational_error(label, error, committed)
 }
 
+fn post_commit_ability_error(label: &str, error: PortError) -> PortError {
+    if matches!(error, PortError::Domain(DomainError::AuthenticationFailed)) {
+        return error;
+    }
+    super::super::note_tools::post_commit_error(label, error)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn committed_response(
     reference: &AbilityRef,
@@ -1032,7 +1039,10 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
                             authored_changed,
                         },
                     )
-                    .await?;
+                    .await
+                    .map_err(|error| {
+                        post_commit_ability_error("notarium.mcp.edit-ability.v1", error)
+                    })?;
             }
         }
         if plan.promote {
@@ -1257,7 +1267,13 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
         Some(slug) => slug,
         None => original_slug(call, &plan, plan_replayed)
             .await
-            .map_err(|error| post_commit_step_error(EDIT_LABEL, error, applied_any))?,
+            .map_err(|error| {
+                if applied_any {
+                    post_commit_ability_error(EDIT_LABEL, error)
+                } else {
+                    post_commit_step_error(EDIT_LABEL, error, false)
+                }
+            })?,
     };
     let mut result = committed_response(
         &reference,

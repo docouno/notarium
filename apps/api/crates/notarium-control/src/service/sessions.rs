@@ -426,17 +426,23 @@ impl ControlService {
                 selected_spaces,
             } => {
                 let mut spaces = self.active_space_grants(tx, current_user, lock).await?;
+                let narrowed = selected_spaces.is_some();
                 if let Some(selected) = selected_spaces {
                     spaces.retain(|id, _| selected.contains(id));
                 }
-                Ok(EngineAuthContext::for_bearer(VerifiedBearer::attest(
+                let auth = EngineAuthContext::for_bearer(VerifiedBearer::attest(
                     PrincipalId::parse(&current_user.user_id)?,
                     source,
                     credential,
                     spaces,
                     scope,
                     ability_write,
-                )))
+                ));
+                Ok(if narrowed {
+                    auth.mark_spaces_narrowed()
+                } else {
+                    auth
+                })
             }
         }
     }

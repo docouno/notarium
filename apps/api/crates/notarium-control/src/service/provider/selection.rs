@@ -883,7 +883,7 @@ impl ProviderService {
                 let preferred=self.preference(tx.inner_mut(),&auth,&space.space.id,request.project.as_ref(),wanted_kind).await?;
                 (ProviderResourceId::parse(&preferred.resource_id)?,Some(ModelProfileId::parse(&preferred.model_id)?))
             };
-            let resource=resource_read(tx.inner_mut(),id.as_str()).await?;
+            let resource=resource_read(tx.inner_mut(),id.as_str()).await.map_err(|_| unavailable())?;
             let owner_active = rows!(tx.inner_mut(),(i64,),fetch_one,"SELECT count(*) FROM users WHERE user_id=$1 AND disabled_at IS NULL","SELECT count(*) FROM v1_control.users WHERE user_id=$1 AND disabled_at IS NULL";&resource.owner_id)?.0;
             if owner_active != 1 {
                 return Err(unavailable());
@@ -1010,15 +1010,17 @@ impl ProviderService {
                 Some(space) => SearchDefaultWitness::capture(tx, &space, clock.now_ms()?).await?,
                 None => None,
             };
-            let resource=resource(tx,input.resource.as_str()).await?;let credential_epoch=epochs(tx,&resource).await?;
+            let resource=resource(tx,input.resource.as_str()).await?;
+            super::inventory::resource_visible(tx,&auth,&owner.user_id,&resource).await?;
+            let credential_epoch=epochs(tx,&resource).await?;
+            if let Some(catalog)=&catalog {
+                let project=match &input.scope{ProviderPreferenceScope::Project(project)=>Some(project),_=>None};
+                shared_attachment(tx,&resource,credential_epoch,&catalog.space.id,project,now,true).await?;
+            }
             let loaded=model_info(&model(tx,&resource.id,input.model.as_str()).await?)?;
             if !matches_preference_kind(&loaded.model.kind, input.kind) {
                 return Err(invalid(ValidationReason::InvalidQuery));
             }
-            if let Some(catalog)=&catalog {
-                let project=match &input.scope{ProviderPreferenceScope::Project(project)=>Some(project),_=>None};
-                shared_attachment(tx,&resource,credential_epoch,&catalog.space.id,project,now,true).await?;
-            } else {super::inventory::resource_visible(tx,&auth,&owner.user_id,&resource).await?;}
             let (kind,id)=preference_scope(&input.scope,auth.principal());
             let wanted_kind = model_kind_name(input.kind);
             // Space/project preferences belong to that scope and model_kind. The

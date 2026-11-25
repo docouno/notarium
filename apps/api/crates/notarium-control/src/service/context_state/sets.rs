@@ -195,91 +195,180 @@ impl ControlService {
         home: SpaceId,
         page: ControlPageRequest,
     ) -> Result<ControlPage<ContextSetInfo>, PortError> {
+        const MAX_SCAN: usize = 4096;
         let budget = OperationBudget::new(ctx.budget.clone());
         let (mut tx, auth) = self
             .open_revalidated_read(&budget, &ctx.budget.request, ctx.auth())
             .await?;
         let current = AccountContext::new(auth, budget.context(ctx.budget.request.clone()));
-        let db_result = budget.run(async {
-            let grant = current
-                .auth()
-                .spaces()
-                .get(&home)
-                .ok_or(DomainError::ResourceNotFound)?;
-            if grant.read_classes.is_empty() {
-                return Err(DomainError::ResourceNotFound.into());
-            }
-            let scope = self.context_digest(tx.inner_mut(), &current, ("context-sets", &home)).await?;
-            let cursor: Option<Cursor> = page.continuation().map(|value| serde_json::from_str(value).map_err(|_| invalid(ValidationReason::InvalidQuery))).transpose()?;
-            if cursor.as_ref().is_some_and(|cursor| cursor.version != 1 || cursor.scope != scope) { return Err(invalid(ValidationReason::CursorStale)); }
-            let after = cursor.as_ref().map_or("", |cursor| cursor.last.as_str());
-            let project_target = grant
-                .project_root
-                .as_ref()
-                .map(|root| {
-                    serde_json::to_string(&FolderRef {
-                        space_id: home.clone(),
-                        folder_id: root.clone(),
-                    })
-                    .map_err(|_| invalid(ValidationReason::InvalidState))
-                })
-                .transpose()?;
-            let mut values = if let Some(target) = &project_target {
-                rows!(
-                    tx.inner_mut(),
-                    ContextSetsRow,
-                    fetch_all,
-                    "SELECT s.* FROM context_sets s WHERE s.home_space=$1 AND s.set_id>$2 AND EXISTS (SELECT 1 FROM context_set_attachments a WHERE a.set_id=s.set_id AND a.target_kind='project' AND a.target_id=$3 AND a.target_space=$1) ORDER BY s.set_id LIMIT $4",
-                    "SELECT s.* FROM v1_control.context_sets s WHERE s.home_space=$1 AND s.set_id>$2 AND EXISTS (SELECT 1 FROM v1_control.context_set_attachments a WHERE a.set_id=s.set_id AND a.target_kind='project' AND a.target_id=$3 AND a.target_space=$1) ORDER BY s.set_id LIMIT $4";
-                    home.as_str(),
-                    after,
-                    target,
-                    i64::from(page.limit()) + 1
-                )?
-            } else {
-                rows!(tx.inner_mut(),ContextSetsRow,fetch_all,"SELECT * FROM context_sets WHERE home_space=$1 AND set_id>$2 ORDER BY set_id LIMIT $3","SELECT * FROM v1_control.context_sets WHERE home_space=$1 AND set_id>$2 ORDER BY set_id LIMIT $3";home.as_str(),after,i64::from(page.limit())+1)?
-            };
-            let continuation = if values.len() > usize::from(page.limit()) {
-                values.pop(); Some(serde_json::to_string(&Cursor { version: 1, scope, last: ContextSetId::parse(&values.last().expect("positive page limit").set_id)? }).map_err(|_| invalid(ValidationReason::InvalidState))?)
-            } else { None };
-            let mut allowed_rows = Vec::with_capacity(values.len());
-            for row in values {
-                match self.check_bundle_attachment_db(tx.inner_mut(), &current, &row).await {
-                    Ok(()) => allowed_rows.push(row),
-                    Err(error) if hidden(&error) => (),
-                    Err(error) => return Err(error),
-                }
-            }
-            Ok::<_, PortError>((allowed_rows, continuation))
-        }, CommitEffect::NotCommitted).await;
-        budget
-            .run(tx.rollback(), CommitEffect::NotCommitted)
-            .await?;
-        let (allowed_rows, continuation) = db_result?;
-        budget
+        let init_result = budget
             .run(
                 async {
-                    let home_space = self.catalog_space(&current, &home).await?;
-                    let mut items = Vec::with_capacity(allowed_rows.len());
-                    let mut note_cache = BTreeMap::new();
-                    for row in allowed_rows {
-                        match self
-                            .context_bundle_info(&current, row, Some(&home_space), &mut note_cache)
-                            .await
-                        {
-                            Ok(value) => items.push(value),
-                            Err(error) if hidden(&error) => (),
-                            Err(error) => return Err(error),
-                        }
+                    let grant = current
+                        .auth()
+                        .spaces()
+                        .get(&home)
+                        .ok_or(DomainError::ResourceNotFound)?;
+                    if grant.read_classes.is_empty() {
+                        return Err(DomainError::ResourceNotFound.into());
                     }
-                    Ok(ControlPage {
-                        items,
-                        continuation,
-                    })
+                    let scope = self
+                        .context_digest(tx.inner_mut(), &current, ("context-sets", &home))
+                        .await?;
+                    let cursor: Option<Cursor> = page
+                        .continuation()
+                        .map(|value| {
+                            serde_json::from_str(value)
+                                .map_err(|_| invalid(ValidationReason::InvalidQuery))
+                        })
+                        .transpose()?;
+                    if cursor
+                        .as_ref()
+                        .is_some_and(|cursor| cursor.version != 1 || cursor.scope != scope)
+                    {
+                        return Err(invalid(ValidationReason::CursorStale));
+                    }
+                    let after = cursor.map_or_else(String::new, |cursor| cursor.last.to_string());
+                    let project_target = grant
+                        .project_root
+                        .as_ref()
+                        .map(|root| {
+                            serde_json::to_string(&FolderRef {
+                                space_id: home.clone(),
+                                folder_id: root.clone(),
+                            })
+                            .map_err(|_| invalid(ValidationReason::InvalidState))
+                        })
+                        .transpose()?;
+                    Ok::<_, PortError>((scope, after, project_target))
                 },
                 CommitEffect::NotCommitted,
             )
-            .await
+            .await;
+        budget
+            .run(tx.rollback(), CommitEffect::NotCommitted)
+            .await?;
+        let (scope, mut after, project_target) = init_result?;
+        let home_space = budget
+            .run(
+                self.catalog_space(&current, &home),
+                CommitEffect::NotCommitted,
+            )
+            .await?;
+        let target = usize::from(page.limit());
+        let batch_limit = i64::from(page.limit()).saturating_add(1).max(16);
+        let mut items = Vec::with_capacity(target);
+        let mut note_cache = BTreeMap::new();
+        let mut has_more = false;
+        let mut scanned = 0usize;
+        loop {
+            let mut tx = self.store.read(budget.clone()).await?;
+            let batch_result = budget
+                .run(
+                    async {
+                        let values = if let Some(target_proj) = &project_target {
+                            rows!(
+                                tx.inner_mut(),
+                                ContextSetsRow,
+                                fetch_all,
+                                "SELECT s.* FROM context_sets s WHERE s.home_space=$1 AND s.set_id>$2 AND EXISTS (SELECT 1 FROM context_set_attachments a WHERE a.set_id=s.set_id AND a.target_kind='project' AND a.target_id=$3 AND a.target_space=$1) ORDER BY s.set_id LIMIT $4",
+                                "SELECT s.* FROM v1_control.context_sets s WHERE s.home_space=$1 AND s.set_id>$2 AND EXISTS (SELECT 1 FROM v1_control.context_set_attachments a WHERE a.set_id=s.set_id AND a.target_kind='project' AND a.target_id=$3 AND a.target_space=$1) ORDER BY s.set_id LIMIT $4";
+                                home.as_str(),
+                                &after,
+                                target_proj,
+                                batch_limit
+                            )?
+                        } else {
+                            rows!(
+                                tx.inner_mut(),
+                                ContextSetsRow,
+                                fetch_all,
+                                "SELECT * FROM context_sets WHERE home_space=$1 AND set_id>$2 ORDER BY set_id LIMIT $3",
+                                "SELECT * FROM v1_control.context_sets WHERE home_space=$1 AND set_id>$2 ORDER BY set_id LIMIT $3";
+                                home.as_str(),
+                                &after,
+                                batch_limit
+                            )?
+                        };
+                        let batch_len = values.len();
+                        let mut next_after = after.clone();
+                        let mut allowed_rows = Vec::with_capacity(batch_len);
+                        for row in values {
+                            next_after = row.set_id.clone();
+                            match self
+                                .check_bundle_attachment_db(tx.inner_mut(), &current, &row)
+                                .await
+                            {
+                                Ok(()) => allowed_rows.push(row),
+                                Err(error) if hidden(&error) => (),
+                                Err(error) => return Err(error),
+                            }
+                        }
+                        Ok::<_, PortError>((batch_len, next_after, allowed_rows))
+                    },
+                    CommitEffect::NotCommitted,
+                )
+                .await;
+            budget
+                .run(tx.rollback(), CommitEffect::NotCommitted)
+                .await?;
+            let (batch_len, next_after, allowed_rows) = batch_result?;
+            scanned = scanned.saturating_add(batch_len);
+            after = next_after;
+            for row in allowed_rows {
+                let value = budget
+                    .run(
+                        async {
+                            match self
+                                .context_bundle_info(
+                                    &current,
+                                    row,
+                                    Some(&home_space),
+                                    &mut note_cache,
+                                )
+                                .await
+                            {
+                                Ok(value) => Ok(Some(value)),
+                                Err(error) if hidden(&error) => Ok(None),
+                                Err(error) => Err(error),
+                            }
+                        },
+                        CommitEffect::NotCommitted,
+                    )
+                    .await?;
+                let Some(value) = value else {
+                    continue;
+                };
+                if items.len() == target {
+                    has_more = true;
+                    break;
+                }
+                items.push(value);
+            }
+            if has_more || batch_len < usize::try_from(batch_limit).unwrap_or(usize::MAX) {
+                break;
+            }
+            if scanned >= MAX_SCAN {
+                return Err(invalid(ValidationReason::BudgetExceeded));
+            }
+        }
+        let continuation = if has_more {
+            let last = items.last().expect("positive page limit").id.clone();
+            Some(
+                serde_json::to_string(&Cursor {
+                    version: 1,
+                    scope,
+                    last,
+                })
+                .map_err(|_| invalid(ValidationReason::InvalidState))?,
+            )
+        } else {
+            None
+        };
+        Ok(ControlPage {
+            items,
+            continuation,
+        })
     }
     pub async fn put_context_set(
         &self,

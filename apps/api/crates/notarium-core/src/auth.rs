@@ -521,12 +521,20 @@ impl EngineAuthContext {
         }
         grant.project_root = Some(project.folder_id.clone());
         let spaces = BTreeMap::from([(project.space_id.clone(), grant)]);
+        let spaces_narrowed = self.spaces_narrowed || self.spaces.len() > 1;
         let ability_write = self.ability_write && Self::has_writable_space(&spaces);
         Ok(Self {
             spaces,
+            spaces_narrowed,
             ability_write,
             ..self.clone()
         })
+    }
+    /// Monotonically mark this context as space-narrowed so downstream
+    /// account-wide management endpoints cannot widen its Space set.
+    pub fn mark_spaces_narrowed(mut self) -> Self {
+        self.spaces_narrowed = true;
+        self
     }
     /// Monotonically narrow one Space grant's readable document classes (never widens).
     pub fn restrict_read_classes(
@@ -873,6 +881,7 @@ impl EngineAuthContext {
         fresh.authorize_proposal_confirmation()?;
         let narrowed = prior.intersect_current(&fresh)?;
         fresh.spaces = narrowed.spaces;
+        fresh.spaces_narrowed = narrowed.spaces_narrowed;
         fresh.write_space = narrowed.write_space;
         fresh.ability_write = false;
         if access == ProposalHumanAccess::ReadOnly {

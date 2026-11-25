@@ -463,6 +463,40 @@ impl Destination {
     }
 }
 
+/// Validate pure note-tool proposal argument syntax without touching canonical
+/// or catalog state. Runs before proposal target resolution so malformed inputs
+/// cannot distinguish missing vs existing foreign targets.
+pub(in crate::mcp) fn validate_proposal_input(
+    tool: ToolName,
+    args: &Value,
+) -> Result<bool, PortError> {
+    match tool {
+        ToolName::CreateNote | ToolName::CreateNotes => {
+            create::proposal::preflight_input(tool, args)
+        }
+        ToolName::EditNote => {
+            let input: EditInput = decode(args.clone())?;
+            input.validate()?;
+            Ok(true)
+        }
+        ToolName::DeleteNote => {
+            let _: NoteInput = decode(args.clone())?;
+            Ok(true)
+        }
+        ToolName::RenameNote => {
+            let input: RenameInput = decode(args.clone())?;
+            let _ = validated_title(&input.title)?;
+            Ok(true)
+        }
+        ToolName::MoveNote => {
+            let input: MoveInput = decode(args.clone())?;
+            let _ = clean_path(&input.to_folder)?;
+            Ok(true)
+        }
+        _ => Err(invalid(ValidationReason::InvalidQuery)),
+    }
+}
+
 /// Validate pure note-tool proposal arguments and (for `MoveNote`) destination
 /// folder consent before marking cross-space `BranchTaint` or probing any note
 /// bodies under detached human authority. Returns `true` when planning will

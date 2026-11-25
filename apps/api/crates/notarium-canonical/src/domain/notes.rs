@@ -6669,6 +6669,13 @@ pub(super) async fn get_note_impl(
                     false,
                 )
                 .await?;
+                let live_effective_lc = super::common::combine_lifecycle(
+                    live_head.lifecycle,
+                    live_ancestry.folder_lifecycle,
+                );
+                if live_effective_lc == Lifecycle::Purged {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
                 auth.authorize_read(&live_facts)?;
 
                 let historical = req_rev_opt.is_some();
@@ -6730,9 +6737,14 @@ pub(super) async fn get_note_impl(
                 );
                 let parent_opt = (nm.parent_folder_id != space_rec.root_folder_id).then_some(nm.parent_folder_id);
                 let effective_lc = if target_rev_id == live_head.head_rev_id {
-                    live_head.lifecycle
+                    live_effective_lc
                 } else {
-                    nm.lifecycle
+                    let lc =
+                        super::common::combine_lifecycle(nm.lifecycle, ancestry.folder_lifecycle);
+                    if lc == Lifecycle::Purged {
+                        return Err(DomainError::ResourceNotFound.into());
+                    }
+                    lc
                 };
 
                 // Re-evaluate against live Space schema if reading live head!
@@ -6892,6 +6904,13 @@ pub(super) async fn get_note_metadata_impl(
                     false,
                 )
                 .await?;
+                let live_effective_lc = super::common::combine_lifecycle(
+                    live_head.lifecycle,
+                    live_ancestry.folder_lifecycle,
+                );
+                if live_effective_lc == Lifecycle::Purged {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
                 auth.authorize_read(&live_facts)?;
 
                 let historical = req_rev_opt.is_some();
@@ -6964,9 +6983,14 @@ pub(super) async fn get_note_metadata_impl(
                 let parent_opt =
                     (nm.parent_folder_id != space_rec.root_folder_id).then_some(nm.parent_folder_id);
                 let effective_lc = if target_rev_id == live_head.head_rev_id {
-                    live_head.lifecycle
+                    live_effective_lc
                 } else {
-                    nm.lifecycle
+                    let lc =
+                        super::common::combine_lifecycle(nm.lifecycle, ancestry.folder_lifecycle);
+                    if lc == Lifecycle::Purged {
+                        return Err(DomainError::ResourceNotFound.into());
+                    }
+                    lc
                 };
 
                 Ok((
@@ -6974,7 +6998,7 @@ pub(super) async fn get_note_metadata_impl(
                     recorded_facts,
                     live_facts,
                     effective_lc,
-                    live_head.lifecycle,
+                    live_effective_lc,
                     digest,
                     parent_opt,
                     provenance,

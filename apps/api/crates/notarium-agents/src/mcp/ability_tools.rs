@@ -801,17 +801,47 @@ enum AbilityTaintCommit {
     ForeignProject {
         scope: SpaceContext,
     },
+    ForeignBranch {
+        taint: notarium_core::auth::BranchTaint,
+    },
+}
+
+fn placement_is_foreign(
+    call: &ToolCallContext<'_>,
+    placement: &AbilityPlacement,
+    entrypoint: Option<&notarium_core::model::NoteRef>,
+) -> bool {
+    let Some(pin) = call.auth.pinned_write_space() else {
+        return false;
+    };
+    if let Some(entry) = entrypoint {
+        return &entry.space_id != pin;
+    }
+    match placement {
+        AbilityPlacement::System => false,
+        AbilityPlacement::OwnedPersonal(_) => {
+            call.auth.chat_audience() == Some(ChatAudience::Shared)
+        }
+        AbilityPlacement::OwnedSpace(space) => space != pin,
+        AbilityPlacement::OwnedProject(folder) => &folder.space_id != pin,
+    }
+}
+
+fn commit_deferred_taints_on_error(call: &ToolCallContext<'_>, taints: &[AbilityTaintCommit]) {
+    if taints.iter().any(AbilityTaintCommit::would_taint_branch) {
+        call.commit_external_read();
+    }
 }
 
 impl AbilityTaintCommit {
     fn would_taint_branch(&self) -> bool {
-        let scope = match self {
-            Self::Resource { scope, .. } | Self::ForeignProject { scope } => scope,
-        };
-        scope
-            .auth()
-            .pinned_write_space()
-            .is_some_and(|pin| pin != &scope.scope().space_id)
+        match self {
+            Self::Resource { scope, .. } | Self::ForeignProject { scope } => scope
+                .auth()
+                .pinned_write_space()
+                .is_some_and(|pin| pin != &scope.scope().space_id),
+            Self::ForeignBranch { .. } => true,
+        }
     }
 
     fn commit(self) -> Result<(), PortError> {
@@ -838,6 +868,9 @@ impl AbilityTaintCommit {
                 {
                     scope.auth().taint().mark_external_read();
                 }
+            }
+            Self::ForeignBranch { taint } => {
+                taint.mark_external_read();
             }
         }
         Ok(())
@@ -1404,6 +1437,25 @@ async fn list(
                     .source
                     .is_some_and(|expected| source(&descriptor.reference) != expected)
                 {
+                    if view == View::Runtime
+                        && args.source == Some(Source::System)
+                        && !use_provider_runtime_overlay
+                        && placement_is_foreign(
+                            call,
+                            &descriptor.reference.placement,
+                            descriptor.entrypoint.as_ref(),
+                        )
+                        && crate::abilities::is_reserved_ability_name(&descriptor.name)
+                        && role_placement_matches_project(
+                            &descriptor.reference.placement,
+                            project.as_ref(),
+                        )
+                        && provider_ability_allowed(call, &inspection, project.as_ref())
+                    {
+                        deferred_taints.push(AbilityTaintCommit::ForeignBranch {
+                            taint: call.auth.taint().clone(),
+                        });
+                    }
                     continue;
                 }
                 if (view == View::Runtime || project.is_some())
@@ -1441,6 +1493,14 @@ async fn list(
                         }
                     };
                     if !winners.contains(&descriptor.reference) {
+                        if winners
+                            .iter()
+                            .any(|winner| placement_is_foreign(call, &winner.placement, None))
+                        {
+                            deferred_taints.push(AbilityTaintCommit::ForeignBranch {
+                                taint: call.auth.taint().clone(),
+                            });
+                        }
                         continue;
                     }
                 }
@@ -1498,9 +1558,7 @@ async fn list(
                     control_cursor,
                 })
             } else {
-                for commit in deferred_taints {
-                    let _ = commit.commit();
-                }
+                commit_deferred_taints_on_error(call, &deferred_taints);
                 return Err(invalid(ValidationReason::BudgetExceeded));
             }
         } else {
@@ -1583,14 +1641,15 @@ async fn get(call: &mut ToolCallContext<'_>, args: GetArgs) -> Result<Value, Por
     let body = read_body_inner(call, &inspection.descriptor, project.as_ref(), false)
         .await
         .map_err(|error| collapse_provider_error(call, error))?;
-    let mut bytes = body.instructions.len();
-    let in_app = matches!(call.target, EgressTarget::InAppProvider { .. });
-    if in_app && bytes > MAX_IN_APP_PACKAGE_BODY_BYTES {
-        return Err(invalid(ValidationReason::BudgetExceeded));
-    }
     let mut deferred_taints = Vec::new();
     if let Some(taint) = body.deferred_taint {
         deferred_taints.push(taint);
+    }
+    let mut bytes = body.instructions.len();
+    let in_app = matches!(call.target, EgressTarget::InAppProvider { .. });
+    if in_app && bytes > MAX_IN_APP_PACKAGE_BODY_BYTES {
+        commit_deferred_taints_on_error(call, &deferred_taints);
+        return Err(invalid(ValidationReason::BudgetExceeded));
     }
     let mut result = summary(
         &inspection,
@@ -1615,16 +1674,19 @@ async fn get(call: &mut ToolCallContext<'_>, args: GetArgs) -> Result<Value, Por
             Err(error) if visible_error(&error) => continue,
             Err(error) => return Err(error),
         };
-        bytes = bytes
-            .checked_add(resource.text.len())
-            .ok_or_else(|| invalid(ValidationReason::BudgetExceeded))?;
-        if in_app && bytes > MAX_IN_APP_PACKAGE_BODY_BYTES {
-            return Err(invalid(ValidationReason::BudgetExceeded));
-        }
-        call.record_origin(resource.origin, resource.project)?;
         if let Some(taint) = resource.deferred_taint {
             deferred_taints.push(taint);
         }
+        let Some(next_bytes) = bytes.checked_add(resource.text.len()) else {
+            commit_deferred_taints_on_error(call, &deferred_taints);
+            return Err(invalid(ValidationReason::BudgetExceeded));
+        };
+        bytes = next_bytes;
+        if in_app && bytes > MAX_IN_APP_PACKAGE_BODY_BYTES {
+            commit_deferred_taints_on_error(call, &deferred_taints);
+            return Err(invalid(ValidationReason::BudgetExceeded));
+        }
+        call.record_origin(resource.origin, resource.project)?;
         files.push(path.clone());
         resources.push(json!({"path":path,"content":resource.text}));
     }
@@ -1818,7 +1880,7 @@ async fn locate_chat_role_by_id(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn bind_chat_role(
+pub async fn bind_chat_role(
     registry: &ToolRegistry,
     owner_account: AccountContext,
     primary: SpaceContext,
@@ -2061,9 +2123,7 @@ pub(crate) async fn bind_chat_role(
             *ability
         }
         AbilityResolution::Disabled | AbilityResolution::Stale => {
-            if let Some(reference) = exact_ar1_ref.as_ref()
-                && reference.placement != AbilityPlacement::System
-            {
+            if let Some(reference) = exact_ar1_ref.as_ref() {
                 let check_descriptor = |descriptor: &AbilityDescriptor| {
                     descriptor.kind == AbilityKind::Role
                         && role_placement_matches_project(&descriptor.reference.placement, project)
@@ -2075,32 +2135,24 @@ pub(crate) async fn bind_chat_role(
                     .await
                 {
                     Ok(inspection) => check_descriptor(&inspection.descriptor),
-                    Err(error) if visible_error(&error) => {
-                        let candidates = registry
-                            .catalog
-                            .locate_ability(resolve_account.clone(), reference.id.clone())
-                            .await?;
-                        let mut found = false;
-                        for candidate in candidates {
+                    Err(error) if visible_error(&error) => match &reference.placement {
+                        AbilityPlacement::OwnedProject(folder) => {
+                            let promoted = AbilityIdentity {
+                                id: reference.id.clone(),
+                                placement: AbilityPlacement::OwnedSpace(folder.space_id.clone()),
+                            };
                             match registry
                                 .control
-                                .inspect_ability(
-                                    resolve_account.clone(),
-                                    candidate.reference.identity(),
-                                )
+                                .inspect_ability(resolve_account.clone(), promoted)
                                 .await
                             {
-                                Ok(inspection) if check_descriptor(&inspection.descriptor) => {
-                                    found = true;
-                                    break;
-                                }
-                                Ok(_) => (),
-                                Err(error) if visible_error(&error) => (),
+                                Ok(inspection) => check_descriptor(&inspection.descriptor),
+                                Err(error) if visible_error(&error) => false,
                                 Err(error) => return Err(error),
                             }
                         }
-                        found
-                    }
+                        _ => false,
+                    },
                     Err(error) => return Err(error),
                 };
                 if !admitted {
@@ -2192,13 +2244,29 @@ async fn use_ability(
         None
     };
     let descriptor = resolve(call, &selector, kind, project.clone()).await?;
-    let (rendered, mut deferred_taints) = activation(
+    let (rendered, mut deferred_taints) = match activation(
         call,
         &descriptor,
         project.as_ref(),
         args.budget_tokens.unwrap_or(DEFAULT_ACTIVATION_TOKENS),
     )
-    .await?;
+    .await
+    {
+        Ok(value) => value,
+        Err(error) => {
+            if matches!(
+                &error,
+                PortError::Domain(DomainError::ValidationFailed { diagnostic })
+                    if diagnostic.reason == ValidationReason::BudgetExceeded
+            ) && foreign_project_taint
+                .as_ref()
+                .is_some_and(AbilityTaintCommit::would_taint_branch)
+            {
+                call.commit_external_read();
+            }
+            return Err(error);
+        }
+    };
     if let Some(taint) = foreign_project_taint {
         deferred_taints.push(taint);
     }
@@ -2235,6 +2303,13 @@ pub(super) async fn validate_session_role(
         .await
         .map_err(|error| collapse_provider_error(call, error))?;
     if body.instructions.len() > MAX_ACTIVATION_TOKENS {
+        if body
+            .deferred_taint
+            .as_ref()
+            .is_some_and(AbilityTaintCommit::would_taint_branch)
+        {
+            call.commit_external_read();
+        }
         return Err(invalid(ValidationReason::BudgetExceeded));
     }
     Ok(())
@@ -2268,6 +2343,13 @@ pub(super) async fn activate_session_role(
     let budget = if body.instructions.len() <= MAX_ACTIVATION_TOKENS {
         DEFAULT_ACTIVATION_TOKENS.max(body.instructions.len())
     } else if explicit.is_some() {
+        if body
+            .deferred_taint
+            .as_ref()
+            .is_some_and(AbilityTaintCommit::would_taint_branch)
+        {
+            call.commit_external_read();
+        }
         return Err(invalid(ValidationReason::BudgetExceeded));
     } else {
         return Ok(None);
@@ -2372,9 +2454,16 @@ async fn activation_with_body(
     budget: usize,
 ) -> Result<(Value, Vec<AbilityTaintCommit>), PortError> {
     // Each UTF-8 byte can be a token in a byte-fallback tokenizer.
-    let mut remaining = budget
-        .checked_sub(body.instructions.len())
-        .ok_or_else(|| invalid(ValidationReason::BudgetExceeded))?;
+    let Some(mut remaining) = budget.checked_sub(body.instructions.len()) else {
+        if body
+            .deferred_taint
+            .as_ref()
+            .is_some_and(AbilityTaintCommit::would_taint_branch)
+        {
+            call.commit_external_read();
+        }
+        return Err(invalid(ValidationReason::BudgetExceeded));
+    };
     let mut deferred_taints = Vec::new();
     if let Some(taint) = body.deferred_taint {
         deferred_taints.push(taint);

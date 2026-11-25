@@ -62,6 +62,22 @@ pub(super) fn episode_project_admitted(
     }
 }
 
+fn episode_visible_to_narrowed(
+    auth: &notarium_core::auth::EngineAuthContext,
+    project: Option<&FolderRef>,
+) -> bool {
+    if auth.is_space_narrowed()
+        || auth
+            .spaces()
+            .values()
+            .any(|grant| grant.project_root.is_some())
+    {
+        episode_project_admitted(auth, project)
+    } else {
+        true
+    }
+}
+
 fn name(value: Option<&str>) -> Result<(), PortError> {
     if value.is_some_and(|value| {
         value.is_empty() || value.chars().count() > 128 || value.contains('\0')
@@ -133,6 +149,9 @@ impl ControlService {
     ) -> Result<LoadedEpisodeDb, PortError> {
         let row = episode(tx, ctx.auth().principal(), id).await?;
         if row.owner_id != ctx.auth().principal().as_str() {
+            return Err(DomainError::ResourceNotFound.into());
+        }
+        if !episode_visible_to_narrowed(ctx.auth(), stored_project_ref(&row)?.as_ref()) {
             return Err(DomainError::ResourceNotFound.into());
         }
         let followed_role = if let Some(value) = &row.active_role {
@@ -495,21 +514,43 @@ impl ControlService {
         let preview = budget
             .run(
                 async {
-                    let matches = rows!(
-                        tx.inner_mut(),
-                        AgentEpisodesRow,
-                        fetch_all,
-                        "SELECT * FROM agent_episodes WHERE owner_id=$1 AND name=$2 AND lifecycle<>'closed' ORDER BY episode_id LIMIT 2",
-                        "SELECT * FROM v1_control.agent_episodes WHERE owner_id=$1 AND name=$2 AND lifecycle<>'closed' ORDER BY episode_id LIMIT 2";
-                        current.auth().principal().as_str(),
-                        &episode_name
-                    )?;
-                    match matches.len() {
-                        0 => Ok(NamedEpisodePreview::NoMatch),
-                        1 => Ok(NamedEpisodePreview::Unique(stored_project_ref(
-                            &matches[0],
-                        )?)),
-                        _ => Ok(NamedEpisodePreview::Ambiguous),
+                    let mut after = String::new();
+                    let mut admitted: Vec<Option<FolderRef>> = Vec::with_capacity(2);
+                    let mut scanned = 0usize;
+                    loop {
+                        let matches = rows!(
+                            tx.inner_mut(),
+                            AgentEpisodesRow,
+                            fetch_all,
+                            "SELECT * FROM agent_episodes WHERE owner_id=$1 AND name=$2 AND lifecycle<>'closed' AND episode_id>$3 ORDER BY episode_id LIMIT 64",
+                            "SELECT * FROM v1_control.agent_episodes WHERE owner_id=$1 AND name=$2 AND lifecycle<>'closed' AND episode_id>$3 ORDER BY episode_id LIMIT 64";
+                            current.auth().principal().as_str(),
+                            &episode_name,
+                            &after
+                        )?;
+                        let batch_len = matches.len();
+                        for row in matches {
+                            scanned = scanned.saturating_add(1);
+                            after = row.episode_id.clone();
+                            let project = stored_project_ref(&row)?;
+                            if !episode_visible_to_narrowed(current.auth(), project.as_ref()) {
+                                continue;
+                            }
+                            admitted.push(project);
+                            if admitted.len() >= 2 {
+                                return Ok(NamedEpisodePreview::Ambiguous);
+                            }
+                        }
+                        if batch_len < 64 {
+                            break;
+                        }
+                        if scanned >= 4096 {
+                            return Err(invalid(ValidationReason::BudgetExceeded));
+                        }
+                    }
+                    match admitted.pop() {
+                        None => Ok(NamedEpisodePreview::NoMatch),
+                        Some(project) => Ok(NamedEpisodePreview::Unique(project)),
                     }
                 },
                 CommitEffect::NotCommitted,

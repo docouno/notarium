@@ -1629,6 +1629,14 @@ pub(crate) async fn load_note_heads_batch_tx(
     Ok(out)
 }
 
+pub(crate) fn combine_lifecycle(a: Lifecycle, b: Lifecycle) -> Lifecycle {
+    match (a, b) {
+        (Lifecycle::Purged, _) | (_, Lifecycle::Purged) => Lifecycle::Purged,
+        (Lifecycle::Trashed, _) | (_, Lifecycle::Trashed) => Lifecycle::Trashed,
+        (Lifecycle::Active, Lifecycle::Active) => Lifecycle::Active,
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct FolderAncestryFacts {
     pub ancestors: Vec<FolderId>,
@@ -1638,6 +1646,8 @@ pub(crate) struct FolderAncestryFacts {
     pub folder_path: String,
     pub project: Option<FolderId>,
     pub cover_note: Option<NoteId>,
+    /// Most restrictive lifecycle across this folder and all of its ancestors.
+    pub folder_lifecycle: Lifecycle,
 }
 
 impl FolderAncestryFacts {
@@ -1832,6 +1842,7 @@ impl FolderAncestryCache {
                     folder_path: String::new(),
                     project: None,
                     cover_note: row.cover_note,
+                    folder_lifecycle: row.lifecycle,
                 };
                 self.resolved.insert(
                     (space_id.clone(), row.folder_id.clone(), require_all_active),
@@ -1883,6 +1894,7 @@ impl FolderAncestryCache {
                     acc.project
                 },
                 cover_note: child_row.cover_note,
+                folder_lifecycle: combine_lifecycle(acc.folder_lifecycle, child_row.lifecycle),
             };
             self.resolved.insert(
                 (space_id.clone(), child_row.folder_id, require_all_active),
@@ -1911,7 +1923,7 @@ impl FolderAncestryCache {
         {
             return Ok(None);
         }
-        let (facts, _) = self
+        let (facts, anc) = self
             .build_resource_facts_tx(
                 tx,
                 space,
@@ -1921,7 +1933,11 @@ impl FolderAncestryCache {
                 active_only,
             )
             .await?;
-        Ok(Some((facts, head.lifecycle)))
+        let effective = combine_lifecycle(head.lifecycle, anc.folder_lifecycle);
+        if effective == Lifecycle::Purged || (active_only && effective != Lifecycle::Active) {
+            return Ok(None);
+        }
+        Ok(Some((facts, effective)))
     }
 
     pub(crate) async fn build_resource_facts_tx(
@@ -1993,6 +2009,7 @@ pub(crate) async fn load_folder_ancestry_tx(
     let mut current = folder_id.clone();
     let mut project = None;
     let mut cover_note = None;
+    let mut folder_lifecycle = Lifecycle::Active;
 
     for _depth in 0..=MAX_FOLDER_DEPTH {
         if !visited.insert(current.clone()) {
@@ -2005,6 +2022,7 @@ pub(crate) async fn load_folder_ancestry_tx(
         if require_all_active && row.lifecycle != Lifecycle::Active {
             return Err(DomainError::ResourceNotFound.into());
         }
+        folder_lifecycle = combine_lifecycle(folder_lifecycle, row.lifecycle);
         if row.write_locked {
             write_locked = true;
         }
@@ -2030,6 +2048,7 @@ pub(crate) async fn load_folder_ancestry_tx(
                 folder_path,
                 project,
                 cover_note,
+                folder_lifecycle,
             });
         }
         segments_rev.push(row.slug);

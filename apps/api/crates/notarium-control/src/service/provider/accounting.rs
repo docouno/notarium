@@ -488,7 +488,13 @@ impl ProviderService {
             .control
             .open_revalidated_read(&budget, &ctx.budget.request, ctx.auth())
             .await?;
-        if let Err(err) = super::super::authority::require_unpinned_human(&auth) {
+        if let Err(err) = super::super::authority::require_unpinned_human(&auth).and_then(|()| {
+            if auth.is_space_narrowed() {
+                Err(DomainError::AccessDenied.into())
+            } else {
+                Ok(())
+            }
+        }) {
             let _ = budget.run(tx.rollback(), CommitEffect::NotCommitted).await;
             return Err(err);
         }

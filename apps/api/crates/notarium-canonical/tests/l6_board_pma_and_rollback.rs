@@ -3227,6 +3227,457 @@ async fn run_sibling_slug_swap_rollback_suite(store: &CanonicalStore) {
     }
 }
 
+async fn run_board_unmoved_run_touched_neighbor_rollback_suite(store: &CanonicalStore) {
+    let owner = sample_principal_id(47);
+    let (scope, _root) = seed_space(
+        store,
+        sample_space_id(47),
+        sample_incarnation(47),
+        owner.clone(),
+    )
+    .await;
+    let human_ctx = owner_ctx(&scope, owner.clone());
+
+    let view1_note = sample_note_id(220);
+    let view1_c = store
+        .create_note(
+            human_ctx.clone(),
+            next_mutation(
+                &scope,
+                &owner,
+                CreateNote {
+                    folder_page: false,
+                    note: view1_note.clone(),
+                    parent: None,
+                    slug: "unranked-neighbor-board".to_owned(),
+                    class: DocClass::UserDoc,
+                    carrier: "---\ntitle: Unranked Board\n---\n# Unranked Board\n".to_owned(),
+                },
+            ),
+        )
+        .await
+        .expect("create view1");
+    let view1 = ViewRef {
+        note: view1_note,
+        key: ViewKey::from_bytes([0x67; 16]),
+    };
+
+    let view2_note = sample_note_id(221);
+    let view2_c = store
+        .create_note(
+            human_ctx.clone(),
+            next_mutation(
+                &scope,
+                &owner,
+                CreateNote {
+                    folder_page: false,
+                    note: view2_note.clone(),
+                    parent: None,
+                    slug: "pma-neighbor-board".to_owned(),
+                    class: DocClass::UserDoc,
+                    carrier: "---\ntitle: PMA Board\n---\n# PMA Board\n".to_owned(),
+                },
+            ),
+        )
+        .await
+        .expect("create view2");
+    let view2 = ViewRef {
+        note: view2_note,
+        key: ViewKey::from_bytes([0x68; 16]),
+    };
+
+    let e1 = sample_note_id(222);
+    let t1 = sample_note_id(223);
+    let n1 = sample_note_id(224);
+    let e2 = sample_note_id(225);
+    let t2 = sample_note_id(226);
+    let n2 = sample_note_id(227);
+
+    let planner = CanonicalTestBoardPlanner::new(
+        store.clone(),
+        [
+            e1.clone(),
+            t1.clone(),
+            n1.clone(),
+            e2.clone(),
+            t2.clone(),
+            n2.clone(),
+        ],
+    );
+    store
+        .register_board_facts_provider(planner)
+        .expect("register planner");
+
+    let todo_grp = GroupKey::Value(ScalarValue::String("todo".to_owned()));
+    let doing_grp = GroupKey::Value(ScalarValue::String("doing".to_owned()));
+
+    // Case 1: Unranked group materialization.
+    // All three notes start unranked in `todo` with order `[e1, t1, n1]` (note_id tiebreak).
+    for (nid, slug, title) in [
+        (&e1, "unranked-e1", "Unranked E1"),
+        (&t1, "unranked-t1", "Unranked T1"),
+        (&n1, "unranked-n1", "Unranked N1"),
+    ] {
+        store
+            .create_note(
+                human_ctx.clone(),
+                next_mutation(
+                    &scope,
+                    &owner,
+                    CreateNote {
+                        folder_page: false,
+                        note: nid.clone(),
+                        parent: None,
+                        slug: slug.to_owned(),
+                        class: DocClass::UserDoc,
+                        carrier: format!("---\ntitle: {title}\nstatus: todo\n---\n# {title}\n"),
+                    },
+                ),
+            )
+            .await
+            .expect("create unranked case note");
+    }
+    let t1_snap = store
+        .get_note(
+            human_ctx.clone(),
+            GetNote {
+                note: t1.clone(),
+                revision: None,
+                causal: CausalBasis::Exact(ReceiptSet::default()),
+            },
+        )
+        .await
+        .expect("t1 snap");
+
+    let run1 = sample_run_id(220);
+    let run1_ctx = agent_run_ctx(&human_ctx, run1.clone());
+    // Run edits E1 metadata/body (no board move on view1) and moves T1 from `todo` -> `doing`.
+    let e1_snap = store
+        .get_note(
+            human_ctx.clone(),
+            GetNote {
+                note: e1.clone(),
+                revision: None,
+                causal: CausalBasis::Exact(ReceiptSet::default()),
+            },
+        )
+        .await
+        .expect("e1 snap");
+    let e1_plan = extract::finalize_document(
+        e1_snap
+            .document
+            .explicit_read(human_ctx.auth())
+            .expect("read e1"),
+        DocClass::UserDoc,
+        &e1,
+        &[FieldEdit::Set {
+            key: "agent_touched".to_owned(),
+            value: YamlValue::Bool(true),
+        }],
+    )
+    .expect("e1 plan");
+    let e1_edited = store
+        .edit_note(
+            run1_ctx.clone(),
+            next_mutation(
+                &scope,
+                &owner,
+                EditNote {
+                    note: e1.clone(),
+                    plan: e1_plan,
+                },
+            ),
+        )
+        .await
+        .expect("run1 edits e1");
+    let t1_moved = store
+        .move_board_card(
+            run1_ctx,
+            next_mutation(
+                &scope,
+                &owner,
+                MoveBoardCard {
+                    view: view1.clone(),
+                    note: t1.clone(),
+                    group: doing_grp.clone(),
+                    before: None,
+                    after: None,
+                    fields: BTreeMap::from([(
+                        "status".to_owned(),
+                        Some(YamlValue::String("doing".to_owned())),
+                    )]),
+                    expected_note: t1_snap.document.revision().clone(),
+                    expected_view: view1_c.value.revision.clone(),
+                    expected_rank: RankExpectation::Absent,
+                },
+            ),
+        )
+        .await
+        .expect("run1 moves t1 to doing");
+    let run1_rev = store
+        .inspect_agent_run_revision_for_test(&scope.space_id, &run1)
+        .await
+        .unwrap()
+        .unwrap();
+    let cur_ov1 = store
+        .inspect_view_overlays_for_test(&scope.space_id, &view1)
+        .await
+        .unwrap();
+    assert!(
+        !cur_ov1.contains_key(&e1) && !cur_ov1.contains_key(&n1),
+        "e1 and n1 must start unranked before rollback"
+    );
+    store
+        .rollback_agent_run(
+            human_ctx.clone(),
+            next_mutation(
+                &scope,
+                &owner,
+                RollbackAgentRun {
+                    run: run1,
+                    expected_run_revision: run1_rev,
+                    expected_entities: vec![e1_edited.value, t1_moved.value.revision.clone()],
+                    associated_board_expectations: vec![AssociatedBoardExpectation {
+                        view: view1.clone(),
+                        note: t1.clone(),
+                        expected_rank: RankExpectation::Existing(cur_ov1[&t1].rank_rev_id.clone()),
+                        expected_placement_revision: cur_ov1[&t1].placement_revision.clone(),
+                    }],
+                },
+            ),
+        )
+        .await
+        .expect("unranked neighbor rollback must succeed");
+    let post_ov1 = store
+        .inspect_view_overlays_for_test(&scope.space_id, &view1)
+        .await
+        .unwrap();
+    assert!(
+        post_ov1.contains_key(&e1) && post_ov1.contains_key(&t1) && post_ov1.contains_key(&n1),
+        "rollback must materialize overlay rank for run-touched unmoved neighbor e1: {post_ov1:?}"
+    );
+    assert!(
+        post_ov1[&e1].sort_rank_lexo < post_ov1[&t1].sort_rank_lexo
+            && post_ov1[&t1].sort_rank_lexo < post_ov1[&n1].sort_rank_lexo,
+        "restored order must preserve [e1, t1, n1], got e1={} t1={} n1={}",
+        post_ov1[&e1].sort_rank_lexo,
+        post_ov1[&t1].sort_rank_lexo,
+        post_ov1[&n1].sort_rank_lexo
+    );
+
+    // Case 2: Window-PMA rank rebalance for adjacent extreme ranks (`e2 = RANK_SPACE - 2`,
+    // `n2 = RANK_SPACE - 1`) while `e2` is body-edited by the run (not moved on view2).
+    let mut c2_revs = BTreeMap::new();
+    for (nid, slug, title) in [
+        (&e2, "pma-e2", "PMA E2"),
+        (&t2, "pma-t2", "PMA T2"),
+        (&n2, "pma-n2", "PMA N2"),
+    ] {
+        let c = store
+            .create_note(
+                human_ctx.clone(),
+                next_mutation(
+                    &scope,
+                    &owner,
+                    CreateNote {
+                        folder_page: false,
+                        note: nid.clone(),
+                        parent: None,
+                        slug: slug.to_owned(),
+                        class: DocClass::UserDoc,
+                        carrier: format!("---\ntitle: {title}\nstatus: todo\n---\n# {title}\n"),
+                    },
+                ),
+            )
+            .await
+            .expect("create pma case note");
+        c2_revs.insert(nid.clone(), c.value.revision);
+    }
+    // Materialize initial overlays for e2, t2, n2 in `todo` on view2.
+    let t2_init_mv = store
+        .move_board_card(
+            human_ctx.clone(),
+            next_mutation(
+                &scope,
+                &owner,
+                MoveBoardCard {
+                    view: view2.clone(),
+                    note: t2.clone(),
+                    group: todo_grp.clone(),
+                    before: Some(RankNeighbor {
+                        note: n2.clone(),
+                        expected_rank: RankExpectation::Absent,
+                    }),
+                    after: Some(RankNeighbor {
+                        note: e2.clone(),
+                        expected_rank: RankExpectation::Absent,
+                    }),
+                    fields: BTreeMap::new(),
+                    expected_note: c2_revs[&t2].clone(),
+                    expected_view: view2_c.value.revision.clone(),
+                    expected_rank: RankExpectation::Absent,
+                },
+            ),
+        )
+        .await
+        .expect("materialize view2 todo ranks");
+
+    let run2 = sample_run_id(221);
+    let run2_ctx = agent_run_ctx(&human_ctx, run2.clone());
+    // Run edits e2 metadata/body (no board move on view2) and moves t2 from `todo` -> `doing`.
+    let e2_snap = store
+        .get_note(
+            human_ctx.clone(),
+            GetNote {
+                note: e2.clone(),
+                revision: None,
+                causal: CausalBasis::Exact(ReceiptSet::default()),
+            },
+        )
+        .await
+        .expect("e2 snap");
+    let e2_plan = extract::finalize_document(
+        e2_snap
+            .document
+            .explicit_read(human_ctx.auth())
+            .expect("read e2"),
+        DocClass::UserDoc,
+        &e2,
+        &[FieldEdit::Set {
+            key: "agent_touched".to_owned(),
+            value: YamlValue::Bool(true),
+        }],
+    )
+    .expect("e2 plan");
+    let e2_edited = store
+        .edit_note(
+            run2_ctx.clone(),
+            next_mutation(
+                &scope,
+                &owner,
+                EditNote {
+                    note: e2.clone(),
+                    plan: e2_plan,
+                },
+            ),
+        )
+        .await
+        .expect("run2 edits e2");
+    let t2_moved = store
+        .move_board_card(
+            run2_ctx,
+            next_mutation(
+                &scope,
+                &owner,
+                MoveBoardCard {
+                    view: view2.clone(),
+                    note: t2.clone(),
+                    group: doing_grp,
+                    before: None,
+                    after: None,
+                    fields: BTreeMap::from([(
+                        "status".to_owned(),
+                        Some(YamlValue::String("doing".to_owned())),
+                    )]),
+                    expected_note: t2_init_mv.value.revision.revision.clone(),
+                    expected_view: view2_c.value.revision.clone(),
+                    expected_rank: RankExpectation::Existing(t2_init_mv.value.rank_revision),
+                },
+            ),
+        )
+        .await
+        .expect("run2 moves t2 to doing");
+    // Compress `e2` and `n2` to adjacent extreme base36 ranks so inserting `t2` between
+    // them during rollback MUST trigger Window-PMA neighbor rebalancing on both `e2` and `n2`.
+    let max_minus_1 = "zzzzzzzzzzzy";
+    let max_rank = "zzzzzzzzzzzz";
+    for (nid, extreme) in [(&e2, max_minus_1), (&n2, max_rank)] {
+        let updated = store
+            .execute_diagnostic_write_sql_for_test(&format!(
+                "UPDATE view_rank_overlays SET sort_rank_lexo='{extreme}' \
+                 WHERE space_id='{}' AND view_note_id='{}' AND view_key='{}' AND target_note_id='{}'",
+                scope.space_id.as_str(),
+                view2.note.as_str(),
+                view2.key.as_str(),
+                nid.as_str(),
+            ))
+            .await
+            .expect("seed adjacent extreme ranks");
+        assert_eq!(updated, 1);
+    }
+    let run2_rev = store
+        .inspect_agent_run_revision_for_test(&scope.space_id, &run2)
+        .await
+        .unwrap()
+        .unwrap();
+    let cur_ov2 = store
+        .inspect_view_overlays_for_test(&scope.space_id, &view2)
+        .await
+        .unwrap();
+    store
+        .rollback_agent_run(
+            human_ctx,
+            next_mutation(
+                &scope,
+                &owner,
+                RollbackAgentRun {
+                    run: run2,
+                    expected_run_revision: run2_rev,
+                    expected_entities: vec![e2_edited.value, t2_moved.value.revision.clone()],
+                    associated_board_expectations: vec![AssociatedBoardExpectation {
+                        view: view2.clone(),
+                        note: t2.clone(),
+                        expected_rank: RankExpectation::Existing(cur_ov2[&t2].rank_rev_id.clone()),
+                        expected_placement_revision: cur_ov2[&t2].placement_revision.clone(),
+                    }],
+                },
+            ),
+        )
+        .await
+        .expect("PMA neighbor rollback must succeed");
+    let post_ov2 = store
+        .inspect_view_overlays_for_test(&scope.space_id, &view2)
+        .await
+        .unwrap();
+    assert_ne!(
+        post_ov2[&e2].sort_rank_lexo, max_minus_1,
+        "Window-PMA rebalance must persist updated rank for run-touched unmoved neighbor e2"
+    );
+    assert!(
+        post_ov2[&e2].sort_rank_lexo < post_ov2[&t2].sort_rank_lexo
+            && post_ov2[&t2].sort_rank_lexo < post_ov2[&n2].sort_rank_lexo,
+        "PMA-rebalanced rollback must preserve strict order [e2, t2, n2], got e2={} t2={} n2={}",
+        post_ov2[&e2].sort_rank_lexo,
+        post_ov2[&t2].sort_rank_lexo,
+        post_ov2[&n2].sort_rank_lexo
+    );
+}
+
+#[tokio::test]
+async fn l6_rollback_board_unmoved_run_touched_neighbor_dual_dialect_parity() {
+    {
+        let root = TempDataRoot::new("l6-nbr-sqlite");
+        let cfg = CanonicalConfig::local_default(sample_installation_id(13), root.data_root());
+        let (store, runtime) = CanonicalRuntime::open(cfg).await.expect("open sqlite");
+        run_board_unmoved_run_touched_neighbor_rollback_suite(&store).await;
+        runtime.shutdown().await.expect("shutdown sqlite");
+    }
+    {
+        let fixtures = StorageTestFixtures::load_required();
+        let schema = fixtures.fresh_pg_schema();
+        let bucket = fixtures.fresh_s3_bucket("l6nbr");
+        let s3_cfg = fixtures.s3_config(&bucket, S3BucketModePolicy::DetectFromBucket);
+        admin_ensure_bucket(&s3_cfg, Some("Enabled"))
+            .await
+            .expect("ensure S3 bucket");
+        let cfg = fixtures.pg_s3_config(sample_installation_id(14), &schema, s3_cfg);
+        let (store, runtime) = CanonicalRuntime::open(cfg).await.expect("open pg+s3");
+        run_board_unmoved_run_touched_neighbor_rollback_suite(&store).await;
+        runtime.shutdown().await.expect("shutdown pg+s3");
+        fixtures.drop_pg_schema(&schema).await;
+    }
+}
+
 #[tokio::test]
 async fn l6_rollback_sibling_slug_swap_and_chains_dual_dialect_parity() {
     {

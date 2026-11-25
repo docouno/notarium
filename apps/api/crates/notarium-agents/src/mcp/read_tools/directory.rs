@@ -111,11 +111,24 @@ pub(super) async fn list(call: &mut ToolCallContext<'_>, args: Value) -> Result<
     } else {
         scope.with_preflight_taint()
     };
+    let foreign_space = !external
+        && scope
+            .auth()
+            .pinned_write_space()
+            .is_some_and(|pin| pin != &scope.scope().space_id);
     let limit = PageLimit::new(args.limit.unwrap_or(50))?;
+    let previous = args
+        .cursor
+        .as_deref()
+        .map(|raw| call.registry.note_cursors.open(call.auth.principal(), raw))
+        .transpose()?;
     let Some(folder) = directory(call, &target, &preflight_scope, args.path.as_deref()).await?
     else {
-        if args.cursor.is_some() {
+        if previous.is_some() {
             return Err(invalid(ValidationReason::CursorStale));
+        }
+        if foreign_space && args.path.is_some() {
+            call.commit_external_read();
         }
         return Ok(empty(external));
     };
@@ -137,22 +150,26 @@ pub(super) async fn list(call: &mut ToolCallContext<'_>, args: Value) -> Result<
     .await
     {
         if corpus::hidden(&error) {
-            if args.cursor.is_some() {
+            if previous.is_some() {
                 return Err(invalid(ValidationReason::CursorStale));
             }
             return Ok(empty(external));
         }
         return Err(error);
     }
-    let schema = if args.fields.is_empty() {
-        BTreeMap::new()
+    if foreign_space && (!args.fields.is_empty() || args.path.is_some()) {
+        call.commit_external_read();
+    }
+    let filter = if args.fields.is_empty() || (!external && !allow_user_doc) {
+        args.fields.compile(&BTreeMap::new())?
     } else {
-        call.registry
+        let schema = call
+            .registry
             .engine
             .space_schema(preflight_scope.clone())
-            .await?
+            .await?;
+        args.fields.compile(&schema)?
     };
-    let filter = args.fields.compile(&schema)?;
     let tag = args.tag.map(|tag| lookup_key(&tag));
     let auth = scope.auth();
     let grant = auth
@@ -183,11 +200,6 @@ pub(super) async fn list(call: &mut ToolCallContext<'_>, args: Value) -> Result<
     ))
     .map_err(|_| invalid(ValidationReason::InvalidState))?;
     let fingerprint = ContentDigest::from_bytes(*blake3::hash(&encoded).as_bytes());
-    let previous = args
-        .cursor
-        .as_deref()
-        .map(|raw| call.registry.note_cursors.open(call.auth.principal(), raw))
-        .transpose()?;
     if let Some(previous) = &previous {
         scope.scope().check(&previous.scope)?;
         if previous.folder != folder.reference || previous.fingerprint != fingerprint {
