@@ -401,24 +401,39 @@ pub(super) async fn note_metadata_visible_preflight(
     Ok(())
 }
 
+pub(super) async fn skill_selection(
+    call: &ToolCallContext<'_>,
+    space_id: &SpaceId,
+    project: Option<FolderRef>,
+) -> Result<Option<ProviderSelection>, PortError> {
+    let scope = match session::space(call, space_id).await {
+        Ok(scope) => scope,
+        Err(error) if hidden(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let Some(selection) = (match select_source(call, &scope, project, Some(&call.policies)).await {
+        Ok(selection) => selection,
+        Err(error) if hidden(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    }) else {
+        return Ok(None);
+    };
+    Ok(selection
+        .policy
+        .allowed_classes
+        .contains(&DocClass::Skill)
+        .then_some(selection))
+}
+
 pub(super) async fn space_admits_skill(
     call: &ToolCallContext<'_>,
     space_id: &SpaceId,
     project: Option<FolderRef>,
 ) -> Result<bool, PortError> {
-    let scope = match session::space(call, space_id).await {
-        Ok(scope) => scope,
-        Err(error) if hidden(&error) => return Ok(false),
-        Err(error) => return Err(error),
-    };
-    let Some(selection) = (match select_source(call, &scope, project, Some(&call.policies)).await {
-        Ok(selection) => selection,
-        Err(error) if hidden(&error) => return Ok(false),
-        Err(error) => return Err(error),
-    }) else {
+    if matches!(call.target, EgressTarget::ExternalMcp) {
         return Ok(true);
-    };
-    Ok(selection.policy.allowed_classes.contains(&DocClass::Skill))
+    }
+    Ok(skill_selection(call, space_id, project).await?.is_some())
 }
 
 pub(super) async fn note_metadata_origin(

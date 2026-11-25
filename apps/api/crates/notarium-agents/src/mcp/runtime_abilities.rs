@@ -1,5 +1,5 @@
 //! Resolve runtime ability packages and keep their canonical provenance through dispatch.
-use std::collections::{BTreeMap, btree_map::Entry};
+use std::collections::BTreeMap;
 
 use notarium_core::{
     DomainError,
@@ -97,7 +97,7 @@ pub async fn interactive(
         validate_descriptor(&inspection.descriptor, AbilityKind::Skill)?;
         descriptors.push(inspection.descriptor);
     }
-    reader.load(role, descriptors, role_project).await
+    reader.load(role, descriptors, role_project, true).await
 }
 
 /// Validate that a role can be loaded and admitted for `selection` before
@@ -119,7 +119,9 @@ pub(super) async fn preflight_role(
         AbilityPlacement::OwnedSpace(space) => hint.filter(|project| &project.space_id == space),
         _ => hint,
     };
-    let _ = reader.load(role.clone(), Vec::new(), role_project).await?;
+    let _ = reader
+        .load(role.clone(), Vec::new(), role_project, false)
+        .await?;
     Ok(())
 }
 
@@ -164,7 +166,7 @@ pub async fn keeper(
         descriptors.push(reader.approved(approved, AbilityKind::Skill).await?);
     }
     reader
-        .load(role, descriptors, selection.project.as_ref())
+        .load(role, descriptors, selection.project.as_ref(), false)
         .await
 }
 
@@ -300,89 +302,127 @@ impl<'a> Reader<'a> {
         role: AbilityDescriptor,
         skills: Vec<AbilityDescriptor>,
         hint: Option<&FolderRef>,
+        omit_hidden_skills: bool,
     ) -> Result<RuntimeAbilities, PortError> {
         let mut result = RuntimeAbilities::default();
         let mut secondary = BTreeMap::<(SpaceId, Option<FolderId>), ProviderSelection>::new();
-        for descriptor in std::iter::once(role).chain(skills) {
-            let part = if let Some(entry) = &descriptor.entrypoint {
-                let mut source = self.source(&entry.space_id).await?;
-                let project =
-                    ability_project(&descriptor.reference.placement, &entry.space_id, hint)?;
-                let selection = if source.scope().space_id == self.primary.scope().space_id {
-                    self.selection
-                } else {
-                    let key = (
-                        entry.space_id.clone(),
-                        project.map(|project| project.folder_id.clone()),
-                    );
-                    match secondary.entry(key) {
-                        Entry::Occupied(existing) => existing.into_mut(),
-                        Entry::Vacant(available) => {
-                            let chosen = self
-                                .registry
-                                .control
-                                .select_provider(
-                                    source.clone(),
-                                    SelectProvider {
-                                        kind: PreferenceModelKind::Completion,
-                                        resource: Some(self.selection.provider.clone()),
-                                        model: Some(self.selection.model.clone()),
-                                        project: project.cloned(),
-                                    },
-                                )
-                                .await?;
-                            check_selection(&source, self.selection, &chosen, project)?;
-                            if let Some(project) = &chosen.project {
-                                if result.secondary_projects.len()
-                                    >= MAX_PROVIDER_SECONDARY_PROJECTS
-                                {
-                                    return Err(invalid(ValidationReason::InvalidLimit));
-                                }
-                                result.secondary_projects.push(project.clone());
-                            }
-                            available.insert(chosen)
-                        }
-                    }
-                };
-                if let Some(project) = &selection.project_only
-                    && (!descriptor.reference.placement.in_project(project)
-                        || descriptor
-                            .promoted_from
-                            .as_ref()
-                            .is_some_and(|prev| !prev.placement.in_project(project)))
-                {
-                    return Err(DomainError::AccessDenied.into());
-                }
-                source.budget = self.budget();
-                let body = read_exact_resource(
-                    self.registry,
-                    &source.with_preflight_taint(),
+        for (index, descriptor) in std::iter::once(role).chain(skills).enumerate() {
+            let omit_hidden = omit_hidden_skills && index > 0;
+            let loaded = self
+                .load_one(
                     &descriptor,
-                    AbilityResourceName::Entrypoint,
+                    hint,
+                    &mut secondary,
+                    &mut result.secondary_projects,
+                    omit_hidden,
                 )
-                .await?;
-                if selection
-                    .project_only
-                    .as_ref()
-                    .is_some_and(|project| !body.in_project(project))
-                {
-                    return Err(DomainError::AccessDenied.into());
-                }
-                ProviderMessage::Ability(Box::new(ClassEgressFence::ability(
-                    body,
-                    source.auth(),
-                    &selection.policy,
-                )?))
-            } else {
-                let builtin = read_system_ability(&self.account(), &descriptor.reference)?;
-                ProviderMessage::SystemAbility(ClassEgressFence::system_ability(
-                    builtin,
-                    &self.selection.policy,
-                )?)
-            };
-            result.parts.push(part);
+                .await;
+            match loaded {
+                Ok(Some(part)) => result.parts.push(part),
+                Ok(None) => (),
+                Err(error) if omit_hidden && corpus::hidden(&error) => (),
+                Err(error) => return Err(error),
+            }
         }
         Ok(result)
+    }
+
+    async fn load_one(
+        &self,
+        descriptor: &AbilityDescriptor,
+        hint: Option<&FolderRef>,
+        secondary: &mut BTreeMap<(SpaceId, Option<FolderId>), ProviderSelection>,
+        secondary_projects: &mut Vec<FolderRef>,
+        omit_hidden: bool,
+    ) -> Result<Option<ProviderMessage>, PortError> {
+        let Some(entry) = &descriptor.entrypoint else {
+            let builtin = read_system_ability(&self.account(), &descriptor.reference)?;
+            let fenced = ClassEgressFence::system_ability(builtin, &self.selection.policy)?;
+            return Ok(Some(ProviderMessage::SystemAbility(fenced)));
+        };
+        let mut source = self.source(&entry.space_id).await?;
+        let project = ability_project(&descriptor.reference.placement, &entry.space_id, hint)?;
+        let (pending_key, selection) = if source.scope().space_id == self.primary.scope().space_id {
+            (None, self.selection.clone())
+        } else {
+            let key = (
+                entry.space_id.clone(),
+                project.map(|project| project.folder_id.clone()),
+            );
+            if let Some(existing) = secondary.get(&key) {
+                (None, existing.clone())
+            } else {
+                let probe_source = if omit_hidden {
+                    source.with_preflight_taint()
+                } else {
+                    source.clone()
+                };
+                let chosen = self
+                    .registry
+                    .control
+                    .select_provider(
+                        probe_source,
+                        SelectProvider {
+                            kind: PreferenceModelKind::Completion,
+                            resource: Some(self.selection.provider.clone()),
+                            model: Some(self.selection.model.clone()),
+                            project: project.cloned(),
+                        },
+                    )
+                    .await?;
+                check_selection(&source, self.selection, &chosen, project)?;
+                if chosen.project.is_some()
+                    && secondary_projects.len() >= MAX_PROVIDER_SECONDARY_PROJECTS
+                {
+                    if omit_hidden {
+                        return Ok(None);
+                    }
+                    return Err(invalid(ValidationReason::InvalidLimit));
+                }
+                (Some(key), chosen)
+            }
+        };
+        if let Some(project) = &selection.project_only
+            && (!descriptor.reference.placement.in_project(project)
+                || descriptor
+                    .promoted_from
+                    .as_ref()
+                    .is_some_and(|prev| !prev.placement.in_project(project)))
+        {
+            return Err(DomainError::AccessDenied.into());
+        }
+        source.budget = self.budget();
+        let body = read_exact_resource(
+            self.registry,
+            &source.with_preflight_taint(),
+            descriptor,
+            AbilityResourceName::Entrypoint,
+        )
+        .await?;
+        if selection
+            .project_only
+            .as_ref()
+            .is_some_and(|project| !body.in_project(project))
+        {
+            return Err(DomainError::AccessDenied.into());
+        }
+        if omit_hidden {
+            // Preflight egress on detached taint so an omitted skill never taints
+            // the branch or leaks into secondary_projects.
+            let _ = ClassEgressFence::ability(
+                body.clone(),
+                &source.auth().with_preflight_taint(),
+                &selection.policy,
+            )?;
+        }
+        let admitted = ClassEgressFence::ability(body, source.auth(), &selection.policy)?;
+        if let Some(key) = pending_key {
+            if let Some(project) = &selection.project {
+                secondary_projects.push(project.clone());
+            }
+            secondary.insert(key, selection);
+        }
+        Ok(Some(ProviderMessage::Ability(Box::new(admitted))))
     }
 }
 

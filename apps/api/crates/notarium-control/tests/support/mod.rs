@@ -385,7 +385,7 @@ impl ControlCatalogPort for Catalog {
                 .unwrap()
                 .iter()
                 .filter(|value| value.reference.id == id)
-                .take(2)
+                .take(200)
                 .cloned()
                 .collect())
         })

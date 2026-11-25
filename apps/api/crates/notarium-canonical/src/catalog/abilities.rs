@@ -5,12 +5,19 @@ const READ_REVISION: &str =
     "SELECT metadata_msgpack, visibility_seq
     FROM revisions
     WHERE space_id=$1 AND rev_id=$2 AND history_incarnation=$3 AND entity_type='ability' AND entity_key=$4";
-const LIST_PACKAGES: &str = "SELECT ability_id, created_seq
+const LIST_PACKAGES_SQLITE: &str = "SELECT ability_id, created_seq
     FROM ability_packages
     WHERE space_id=$1 AND ability_id>$2 AND lifecycle_state='active'
     AND ($3='' OR kind=$3)
     AND ($4='' OR slug_fold=$4)
     ORDER BY ability_id
+    LIMIT $5";
+const LIST_PACKAGES_PG: &str = "SELECT ability_id, created_seq
+    FROM ability_packages
+    WHERE space_id=$1 AND ability_id COLLATE \"C\" > $2 AND lifecycle_state='active'
+    AND ($3='' OR kind=$3)
+    AND ($4='' OR slug_fold=$4)
+    ORDER BY ability_id COLLATE \"C\"
     LIMIT $5";
 
 use super::*;
@@ -443,7 +450,7 @@ pub(super) async fn locate(
                              WHERE space_id = ANY($1)
                                AND ability_id = $2
                                AND lifecycle_state = 'active'
-                             ORDER BY space_id",
+                             ORDER BY space_id COLLATE \"C\"",
                         )
                         .bind(&spaces)
                         .bind(id.as_str())
@@ -466,7 +473,7 @@ pub(super) async fn locate(
                     match descriptor(tx, ctx.auth(), &space, &id, None).await {
                         Ok(desc) => {
                             found.push(desc);
-                            if found.len() >= 2 {
+                            if found.len() >= 200 {
                                 break;
                             }
                         }
@@ -623,16 +630,30 @@ pub(super) async fn page(
                         _ => String::new(),
                     };
                     let remaining = (cap + 1 - keys.len()) as i64;
-                    let ids: Vec<(String, i64)> = db!(
-                        read tx,
-                        sqlx::query_as(LIST_PACKAGES),
-                        fetch_all,
-                        rec.space.id.as_str(),
-                        after_id,
-                        query.kind.map_or("", crate::codec::ability_kind_to_db),
-                        query.name.as_deref().unwrap_or(""),
-                        remaining
-                    )?;
+                    let ids: Vec<(String, i64)> = match tx {
+                        BackendConn::Sqlite(conn) => sqlx::query_as(LIST_PACKAGES_SQLITE)
+                            .bind(rec.space.id.as_str())
+                            .bind(&after_id)
+                            .bind(query.kind.map_or("", crate::codec::ability_kind_to_db))
+                            .bind(query.name.as_deref().unwrap_or(""))
+                            .bind(remaining)
+                            .fetch_all(&mut **conn)
+                            .await
+                            .map_err(|err| {
+                                crate::runtime::pg_read_error("list_ability_packages", err)
+                            })?,
+                        BackendConn::Postgres(conn) => sqlx::query_as(LIST_PACKAGES_PG)
+                            .bind(rec.space.id.as_str())
+                            .bind(&after_id)
+                            .bind(query.kind.map_or("", crate::codec::ability_kind_to_db))
+                            .bind(query.name.as_deref().unwrap_or(""))
+                            .bind(remaining)
+                            .fetch_all(&mut **conn)
+                            .await
+                            .map_err(|err| {
+                                crate::runtime::pg_read_error("list_ability_packages", err)
+                            })?,
+                    };
                     for (id, seq) in ids {
                         keys.push((index, AbilityId::parse(&id)?, seq));
                     }

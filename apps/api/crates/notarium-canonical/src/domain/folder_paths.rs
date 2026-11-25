@@ -192,13 +192,20 @@ pub(super) async fn list_children(
                     space.last_seq
                 };
 
-                let sql = "SELECT folder_id, parent_folder_id, CAST(is_root AS INTEGER), slug,
+                let sql_sqlite = "SELECT folder_id, parent_folder_id, CAST(is_root AS INTEGER), slug,
                         slug_fold, display_name, CAST(is_project AS INTEGER), project_slug,
                         project_slug_fold, description, cover_note_id, write_lock_json,
                         lifecycle_state, head_rev_id
                     FROM folder_heads
                     WHERE space_id=$1 AND parent_folder_id=$2 AND folder_id>$3 AND lifecycle_state='active'
                     ORDER BY folder_id LIMIT $4";
+                let sql_pg = "SELECT folder_id, parent_folder_id, CAST(is_root AS INTEGER), slug,
+                        slug_fold, display_name, CAST(is_project AS INTEGER), project_slug,
+                        project_slug_fold, description, cover_note_id, write_lock_json,
+                        lifecycle_state, head_rev_id
+                    FROM folder_heads
+                    WHERE space_id=$1 AND parent_folder_id=$2 AND folder_id COLLATE \"C\" > $3 AND lifecycle_state='active'
+                    ORDER BY folder_id COLLATE \"C\" LIMIT $4";
                 let after = after.as_ref().map_or("", FolderId::as_str);
                 let size = usize::from(limit.get());
                 #[allow(clippy::type_complexity)]
@@ -218,10 +225,10 @@ pub(super) async fn list_children(
                     String,
                     String,
                 )> = match tx {
-                    BackendConn::Sqlite(conn) => sqlx::query_as(sql)
+                    BackendConn::Sqlite(conn) => sqlx::query_as(sql_sqlite)
                         .bind(scope.space_id.as_str()).bind(base.as_str()).bind(after)
                         .bind(i64::from(limit.get()) + 1).fetch_all(&mut **conn).await,
-                    BackendConn::Postgres(conn) => sqlx::query_as(sql)
+                    BackendConn::Postgres(conn) => sqlx::query_as(sql_pg)
                         .bind(scope.space_id.as_str()).bind(base.as_str()).bind(after)
                         .bind(i64::from(limit.get()) + 1).fetch_all(&mut **conn).await,
                 }.map_err(|err| crate::runtime::pg_read_error("list_child_folders", err))?;

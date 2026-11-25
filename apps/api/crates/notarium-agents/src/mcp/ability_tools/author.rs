@@ -542,7 +542,6 @@ struct EditPlan {
     original: AbilityRef,
     previous_note: RevisionId,
     kind: Kind,
-    slug: String,
     overlays: AbilityOverlayState,
     initial_availability: AbilityProjects,
     initial_healthy: bool,
@@ -651,7 +650,6 @@ async fn edit_plan(call: &ToolCallContext<'_>, args: &EditArgs) -> Result<EditPl
         original: descriptor.reference,
         previous_note: note.metadata.revision().clone(),
         kind: kind_value(descriptor.kind),
-        slug: descriptor.name,
         overlays: inspection.overlays,
         initial_availability: inspection.availability,
         initial_healthy: descriptor.healthy,
@@ -686,6 +684,32 @@ async fn original_package(
         .catalog
         .ability(call.account(), plan.original.clone())
         .await
+}
+
+async fn original_slug(call: &ToolCallContext<'_>, plan: &EditPlan) -> Result<String, PortError> {
+    match original_package(call, plan).await {
+        Ok(package) => return Ok(package.name),
+        Err(PortError::Domain(DomainError::ResourceNotFound)) => (),
+        Err(error) => return Err(error),
+    }
+    let scope = call.space(plan.scope.clone())?;
+    let note = call
+        .registry
+        .engine
+        .get_note_metadata(
+            scope.clone(),
+            read_note_request(plan.entrypoint.clone(), Some(plan.previous_note.clone())),
+        )
+        .await?;
+    note.metadata.listing(scope.auth())?;
+    let path = note
+        .provenance
+        .as_ref()
+        .map(|meta| meta.path.as_str())
+        .ok_or_else(|| invalid(ValidationReason::SourceMismatch))?;
+    let file = path.rsplit('/').next().unwrap_or(path);
+    let stem = file.strip_suffix(".md").unwrap_or(file);
+    Ok(notarium_syntax::unicode::lookup_key(stem))
 }
 
 async fn auxiliary_files(
@@ -778,12 +802,14 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
     let mut carrier_moved = false;
     let mut published = false;
     let mut promotion = None;
+    let mut resolved_slug: Option<String> = None;
     let mut phase = if authored { "authored" } else { "home" };
     let package_result: Result<(), PortError> = async {
         if !authored && !plan.promote {
             return Ok(());
         }
         let original = original_package(call, &plan).await?;
+        resolved_slug = Some(original.name.clone());
         let files = auxiliary_files(call, &plan, &original).await?;
         let attachments = args
             .attachments
@@ -853,7 +879,7 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
                         input: MoveNote {
                             note: plan.entrypoint.clone(),
                             parent: Some(parent),
-                            slug: plan.slug.clone(),
+                            slug: original.name.clone(),
                         },
                     },
                 )
@@ -987,7 +1013,7 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
         .as_ref()
         .and_then(|settled| settled.destination.availability.clone())
         .unwrap_or_else(|| plan.initial_availability.clone());
-    if let Some(availability) = plan.requested_availability {
+    if let Some(availability) = plan.requested_availability.clone() {
         let result = if let Some(promotion) = &promotion
             && promotion.source.binding_revision != plan.overlays.binding_revision
         {
@@ -1107,10 +1133,16 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
         plan.initial_healthy
     };
     let committed_enabled = overlays.binding_enabled && committed_preference_enabled;
+    let slug = match resolved_slug {
+        Some(slug) => slug,
+        None => original_slug(call, &plan)
+            .await
+            .map_err(|error| post_commit_step_error(EDIT_LABEL, error, applied_any))?,
+    };
     let mut result = committed_response(
         &reference,
         committed_binding_rev,
-        &plan.slug,
+        &slug,
         AbilityKind::from(plan.kind),
         &committed_availability,
         committed_enabled,

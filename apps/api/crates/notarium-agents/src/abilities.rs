@@ -293,7 +293,7 @@ impl<C: ControlCatalogPort + ?Sized> ControlCatalogPort for SystemAbilityCatalog
             let owned = self.owned.locate_ability(ctx, id).await?;
             for item in owned {
                 found.push(item);
-                if found.len() >= 2 {
+                if found.len() >= 200 {
                     break;
                 }
             }

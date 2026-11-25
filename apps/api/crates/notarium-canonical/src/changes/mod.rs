@@ -2134,13 +2134,16 @@ async fn list_note_keys_at_or_below_cutoff_tx(
 ) -> Result<Vec<String>, PortError> {
     // The enclosing snapshot has checked the space incarnation. Head identity and
     // creation sequence survive edits, trash and purge; revisions supply the state at the cut.
-    const PAGE: &str = "SELECT note_id FROM note_heads
+    const PAGE_SQLITE: &str = "SELECT note_id FROM note_heads
         WHERE space_id = $1 AND note_id > $2 AND created_seq <= $3
         ORDER BY note_id LIMIT $4";
+    const PAGE_PG: &str = "SELECT note_id FROM note_heads
+        WHERE space_id = $1 AND note_id COLLATE \"C\" > $2 AND created_seq <= $3
+        ORDER BY note_id COLLATE \"C\" LIMIT $4";
     let after = after_key.unwrap_or(""); // All NoteIds are nonempty.
     let cut = cutoff.get() as i64;
     match tx {
-        BackendConn::Sqlite(conn) => sqlx::query_scalar(PAGE)
+        BackendConn::Sqlite(conn) => sqlx::query_scalar(PAGE_SQLITE)
             .bind(scope.space_id.as_str())
             .bind(after)
             .bind(cut)
@@ -2148,7 +2151,7 @@ async fn list_note_keys_at_or_below_cutoff_tx(
             .fetch_all(&mut **conn)
             .await
             .map_err(|err| internal_not_committed("sqlite_seed_note_keys", err.to_string())),
-        BackendConn::Postgres(conn) => sqlx::query_scalar(PAGE)
+        BackendConn::Postgres(conn) => sqlx::query_scalar(PAGE_PG)
             .bind(scope.space_id.as_str())
             .bind(after)
             .bind(cut)
@@ -2166,13 +2169,16 @@ pub(crate) async fn list_thread_keys_at_or_below_cutoff_tx(
     after_key: Option<&str>,
     limit: i64,
 ) -> Result<Vec<String>, PortError> {
-    const PAGE: &str = "SELECT thread_id FROM chat_threads
+    const PAGE_SQLITE: &str = "SELECT thread_id FROM chat_threads
         WHERE space_id = $1 AND thread_id > $2 AND created_seq <= $3 AND history_incarnation = $4
         ORDER BY thread_id LIMIT $5";
+    const PAGE_PG: &str = "SELECT thread_id FROM chat_threads
+        WHERE space_id = $1 AND thread_id COLLATE \"C\" > $2 AND created_seq <= $3 AND history_incarnation = $4
+        ORDER BY thread_id COLLATE \"C\" LIMIT $5";
     let after = after_key.unwrap_or(""); // All ChatThreadIds are nonempty.
     let cut = cutoff.get() as i64;
     match tx {
-        BackendConn::Sqlite(conn) => sqlx::query_scalar(PAGE)
+        BackendConn::Sqlite(conn) => sqlx::query_scalar(PAGE_SQLITE)
             .bind(scope.space_id.as_str())
             .bind(after)
             .bind(cut)
@@ -2181,7 +2187,7 @@ pub(crate) async fn list_thread_keys_at_or_below_cutoff_tx(
             .fetch_all(&mut **conn)
             .await
             .map_err(|err| internal_not_committed("sqlite_seed_thread_keys", err.to_string())),
-        BackendConn::Postgres(conn) => sqlx::query_scalar(PAGE)
+        BackendConn::Postgres(conn) => sqlx::query_scalar(PAGE_PG)
             .bind(scope.space_id.as_str())
             .bind(after)
             .bind(cut)

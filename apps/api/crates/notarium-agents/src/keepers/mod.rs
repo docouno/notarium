@@ -1290,5 +1290,38 @@ mod tests {
             forward_probed.contains(&Some(Timestamp::parse("2026-03-05T10:06:00Z").unwrap())),
             "mid-loop forward NTP overshoot must rewind across jumped interval to 10:06:00, got {forward_probed:?}"
         );
+
+        // Case 4: Exhausted finite schedule whose `None` candidate was already tried
+        // must not repeatedly re-seed `backward_state` on subsequent wall-clock ticks.
+        let finite_cutoff = Timestamp::parse("2026-03-05T10:02:00Z").unwrap();
+        let finite_next = |after: Timestamp| -> Result<Option<Timestamp>, DomainError> {
+            let candidate = next(after)?;
+            Ok(candidate.filter(|ts| *ts <= finite_cutoff))
+        };
+        let late0 = Timestamp::parse("2026-03-05T10:05:00Z").unwrap();
+        let mut finite_retry = NextSlotRetry::new(slot, late0, late0, None);
+        let first_rewind = finite_retry
+            .next_candidate(
+                Timestamp::parse("2026-03-05T10:06:00Z").unwrap(),
+                0,
+                &finite_next,
+            )
+            .unwrap();
+        assert_eq!(
+            first_rewind,
+            Some(Some(Timestamp::parse("2026-03-05T10:02:00Z").unwrap()))
+        );
+        let second_rewind = finite_retry
+            .next_candidate(
+                Timestamp::parse("2026-03-05T10:07:00Z").unwrap(),
+                1,
+                &finite_next,
+            )
+            .unwrap();
+        assert_eq!(
+            second_rewind,
+            Some(Some(Timestamp::parse("2026-03-05T10:01:00Z").unwrap())),
+            "advancing wall clock after finite schedule exhaustion must continue rewinding instead of resetting backward_state"
+        );
     }
 }

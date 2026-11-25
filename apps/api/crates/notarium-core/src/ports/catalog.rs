@@ -181,9 +181,9 @@ pub trait ControlCatalogPort: Send + Sync {
         ctx: AccountContext,
         identity: AbilityIdentity,
     ) -> PortFuture<'_, AbilityDescriptor>;
-    /// Locate up to two active owned ability packages matching `id` across the
-    /// caller's authorized Spaces in a single read (used for O(1) raw-ID lookup
-    /// and ambiguity detection).
+    /// Locate active ability packages matching `id` across the caller's
+    /// authorized Spaces in a single bounded read (up to 200 entries, used for
+    /// raw-ID lookup and ambiguity detection after control/provider filtering).
     fn locate_ability(
         &self,
         ctx: AccountContext,

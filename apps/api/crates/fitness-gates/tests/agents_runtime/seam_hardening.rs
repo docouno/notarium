@@ -217,6 +217,12 @@ async fn exercise_seams(pg: bool) {
         confirmed_link_many_trashed_target_and_project_move_note_replays(&fixture, &personal)
     })
     .await;
+    box_step(|| {
+        runtime_skill_omission_project_only_shadowing_and_dedup_hygiene(&mut fixture, &personal)
+    })
+    .await;
+    box_step(|| locate_ability_cap_and_legacy_mixed_case_id_pagination_parity(&fixture, &personal))
+        .await;
 
     fixture.close().await;
 }
@@ -10833,4 +10839,1253 @@ async fn confirmed_link_many_trashed_target_and_project_move_note_replays(
     .expect("project-scoped move_note replay must survive rename_project via journaled destination")
     .structured_content;
     assert_eq!(replayed_move, moved);
+}
+
+#[inline(never)]
+async fn runtime_skill_omission_project_only_shadowing_and_dedup_hygiene(
+    fixture: &mut RuntimeFixture,
+    personal: &SpaceContext,
+) {
+    {
+        let fixture: &RuntimeFixture = &*fixture;
+        let owner = fresh_owner(fixture).await;
+        let actor = owner.auth().principal().clone();
+        let pscope = personal.scope().clone();
+        let acc_id = |sub: u8| {
+            let owner = owner.clone();
+            let actor = actor.clone();
+            async move {
+                let rev = fixture
+                    .control
+                    .account(owner, actor.clone())
+                    .await
+                    .unwrap()
+                    .revision;
+                AccountCommandIdentity {
+                    owner: actor.clone(),
+                    actor,
+                    expected: rev,
+                    key: CommandKey::from_bytes([
+                        0xC1, sub, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, sub,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xC1; 32]),
+                }
+            }
+        };
+        let mk_space = |sub: u8, name: &str| {
+            let name = name.to_owned();
+            async move {
+                let owner = fresh_owner(fixture).await;
+                fixture
+                    .control
+                    .create_space(
+                        owner,
+                        AccountMutation {
+                            identity: acc_id(sub).await,
+                            input: CreateSpace {
+                                id: SpaceId::from_bytes([
+                                    0xC1, sub, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, sub,
+                                ]),
+                                kind: SpaceKind::Shared,
+                                name,
+                            },
+                        },
+                    )
+                    .await
+                    .unwrap()
+                    .value
+            }
+        };
+        let s_uncons = mk_space(1, "Unconsented Skill Space").await;
+        let s_po = mk_space(2, "Project Only Promo Space").await;
+        let s_a = mk_space(3, "Unrelated Skill Space A").await;
+        let s_b = mk_space(4, "UserDoc Only Space B").await;
+        let owner = fresh_owner(fixture).await;
+
+        let po_p1 = create_project_folder(
+            fixture,
+            &s_po.history,
+            &actor,
+            FolderId::from_bytes([0xC1, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10]),
+            "po-p1",
+        )
+        .await;
+        let po_p2 = create_project_folder(
+            fixture,
+            &s_po.history,
+            &actor,
+            FolderId::from_bytes([0xC1, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 11]),
+            "po-p2",
+        )
+        .await;
+        let b_proj = create_project_folder(
+            fixture,
+            &s_b.history,
+            &actor,
+            FolderId::from_bytes([0xC1, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 12]),
+            "b-udoc",
+        )
+        .await;
+
+        // Publish skills for (1): one in unconsented s_uncons, one in consented Personal,
+        // then attach BOTH to a Personal role.
+        let uncons_skill = call_mcp(
+            &fixture.registry,
+            &owner,
+            [0xC1, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 20],
+            "create_ability",
+            json!({
+                "kind": "skill",
+                "name": "unconsented-attached-skill",
+                "description": "Unconsented attached skill",
+                "instructions": "UNCONSENTED-SKILL-MARKER",
+                "placement": { "home": "space", "space": s_uncons.slug },
+            }),
+        )
+        .await
+        .unwrap()
+        .structured_content["ref"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let cons_skill = call_mcp(
+            &fixture.registry,
+            &owner,
+            [0xC1, 21, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 21],
+            "create_ability",
+            json!({
+                "kind": "skill",
+                "name": "consented-attached-skill",
+                "description": "Consented attached skill",
+                "instructions": "CONSENTED-SKILL-MARKER",
+                "placement": { "home": "personal" },
+            }),
+        )
+        .await
+        .unwrap()
+        .structured_content["ref"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let _ = call_mcp(
+            &fixture.registry,
+            &owner,
+            [0xC1, 22, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 22],
+            "create_ability",
+            json!({
+                "kind": "role",
+                "name": "mixed-attach-role",
+                "description": "Role with mixed consent skills",
+                "instructions": "MIXED-ROLE-MARKER",
+                "placement": { "home": "personal" },
+                "attachments": [
+                    { "ref": uncons_skill, "label": "unconsented" },
+                    { "ref": cons_skill, "label": "consented" },
+                ],
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Publish roles for (2): role authored in po_p2 then promoted to OwnedSpace(s_po),
+        // alongside a same-named consented Personal role.
+        let po_p2_handle = format!("{}/po-p2", s_po.slug);
+        let po_p1_handle = format!("{}/po-p1", s_po.slug);
+        let promo_created = call_mcp(
+            &fixture.registry,
+            &owner,
+            [0xC1, 23, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 23],
+            "create_ability",
+            json!({
+                "kind": "role",
+                "name": "promo-shadow-role",
+                "description": "Promoted from unconsented po_p2",
+                "instructions": "PO-P2-PROMOTED-MARKER",
+                "placement": { "home": "project", "project": po_p2_handle },
+            }),
+        )
+        .await
+        .unwrap()
+        .structured_content;
+        let _ = call_mcp(
+            &fixture.registry,
+            &owner,
+            [0xC1, 24, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 24],
+            "edit_ability",
+            json!({
+                "ref": promo_created["ref"],
+                "versionToken": promo_created["versionToken"],
+                "home": { "home": "space" },
+            }),
+        )
+        .await
+        .unwrap();
+        let personal_promo_ref = call_mcp(
+            &fixture.registry,
+            &owner,
+            [0xC1, 25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 25],
+            "create_ability",
+            json!({
+                "kind": "role",
+                "name": "promo-shadow-role",
+                "description": "Consented Personal fallback role",
+                "instructions": "PERSONAL-PROMO-FALLBACK-MARKER",
+                "placement": { "home": "personal" },
+            }),
+        )
+        .await
+        .unwrap()
+        .structured_content["ref"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        // Publish roles for (3): Space A roles + Personal role, and (4): dedup hygiene role.
+        for (tag, name, placement, instructions) in [
+            (
+                26u8,
+                "space-a-exclusive",
+                json!({ "home": "space", "space": s_a.slug }),
+                "SPACE-A-EXCLUSIVE-MARKER",
+            ),
+            (
+                27u8,
+                "personal-not-shadowed",
+                json!({ "home": "space", "space": s_a.slug }),
+                "SPACE-A-SHADOW-MARKER",
+            ),
+            (
+                28u8,
+                "personal-not-shadowed",
+                json!({ "home": "personal" }),
+                "PERSONAL-NOT-SHADOWED-MARKER",
+            ),
+            (
+                29u8,
+                "secret-edit-ability-slug-r51",
+                json!({ "home": "project", "project": po_p2_handle }),
+                "SECRET-SLUG-HYGIENE-BODY",
+            ),
+        ] {
+            let created = call_mcp(
+                &fixture.registry,
+                &owner,
+                [0xC1, tag, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, tag],
+                "create_ability",
+                json!({
+                    "kind": "role",
+                    "name": name,
+                    "description": "R51 seam role",
+                    "instructions": instructions,
+                    "placement": placement,
+                }),
+            )
+            .await
+            .unwrap()
+            .structured_content;
+            if tag == 29 {
+                // Promote via edit_ability to exercise EditPlan journaling without persisting slug.
+                let _ = call_mcp(
+                    &fixture.registry,
+                    &owner,
+                    [0xC1, 30, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 30],
+                    "edit_ability",
+                    json!({
+                        "ref": created["ref"],
+                        "versionToken": created["versionToken"],
+                        "home": { "home": "space" },
+                    }),
+                )
+                .await
+                .unwrap();
+            }
+        }
+
+        // Exercise EpisodeRolePlan journaling via use_role on a named episode, then verify
+        // control.mcp_dedup.safe_result contains neither EditPlan.slug nor Episode.name.
+        let started_ep = call_mcp(
+            &fixture.registry,
+            &owner,
+            [0xC1, 31, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 31],
+            "start_session",
+            json!({ "session": { "name": "secret-episode-name-r51" } }),
+        )
+        .await
+        .unwrap()
+        .structured_content;
+        let ep_id = started_ep["session"]["id"].as_str().unwrap().to_owned();
+        let _ = call_mcp(
+            &fixture.registry,
+            &owner,
+            [0xC1, 32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 32],
+            "use_role",
+            json!({ "role": "personal-not-shadowed", "session": ep_id }),
+        )
+        .await
+        .unwrap();
+
+        // Attach loopback provider with carefully separated consent policies:
+        // - Personal: UserDoc + Skill
+        // - s_po: ONLY Project(po_p1) with UserDoc + Skill (no Space consent, no po_p2)
+        // - s_a: Space(s_a) with UserDoc + Skill
+        // - s_b: Project(b_proj) with UserDoc ONLY (no Skill)
+        // - s_uncons: NO consent at all
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local = loopback_provider(fixture, &owner, &listener, 0xC2, true).await;
+        let attach = |sub: u8, target: ProviderAttachmentTarget, classes: [DocClass; 2]| {
+            let local = &local;
+            let owner = owner.clone();
+            async move {
+                let consent = || {
+                    ProviderDisclosureConsent::attest_checked(ProviderDisclosure {
+                        classes: classes.into_iter().collect(),
+                    })
+                };
+                let att = local
+                    .provider
+                    .request_attachment(
+                        owner.clone(),
+                        AccountMutation {
+                            identity: acc_id(40 + sub).await,
+                            input: RequestProviderAttachment {
+                                id: RequestId::from_bytes([
+                                    0xC2, 0x51, sub, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, sub,
+                                ]),
+                                expected: None,
+                                resource: local.resource.id.clone(),
+                                resource_consent_epoch: local.resource.consent_epoch,
+                                credential_consent_epoch: None,
+                                target,
+                                consent: consent(),
+                                expires_at_ms: None,
+                            },
+                        },
+                    )
+                    .await
+                    .unwrap()
+                    .value;
+                if att.state != ProviderAttachmentState::Approved {
+                    local
+                        .provider
+                        .approve_attachment(
+                            owner,
+                            AccountMutation {
+                                identity: acc_id(60 + sub).await,
+                                input: ApproveProviderAttachment {
+                                    id: att.id,
+                                    expected: att.revision,
+                                    resource_consent_epoch: att.resource_consent_epoch,
+                                    credential_consent_epoch: att.credential_consent_epoch,
+                                    consent: consent(),
+                                },
+                            },
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+        };
+        attach(
+            1,
+            ProviderAttachmentTarget::Personal {
+                owner: actor.clone(),
+                space: pscope.space_id.clone(),
+            },
+            [DocClass::UserDoc, DocClass::Skill],
+        )
+        .await;
+        attach(
+            2,
+            ProviderAttachmentTarget::Project(po_p1.clone()),
+            [DocClass::UserDoc, DocClass::Skill],
+        )
+        .await;
+        attach(
+            3,
+            ProviderAttachmentTarget::Personal {
+                owner: actor.clone(),
+                space: s_po.history.space_id.clone(),
+            },
+            [DocClass::UserDoc, DocClass::Skill],
+        )
+        .await;
+        attach(
+            4,
+            ProviderAttachmentTarget::Space(s_a.history.space_id.clone()),
+            [DocClass::UserDoc, DocClass::Skill],
+        )
+        .await;
+        attach(
+            5,
+            ProviderAttachmentTarget::Personal {
+                owner: actor.clone(),
+                space: s_a.history.space_id.clone(),
+            },
+            [DocClass::UserDoc, DocClass::Skill],
+        )
+        .await;
+        attach(
+            6,
+            ProviderAttachmentTarget::Project(b_proj.clone()),
+            [DocClass::UserDoc, DocClass::UserDoc],
+        )
+        .await;
+        attach(
+            7,
+            ProviderAttachmentTarget::Personal {
+                owner: actor.clone(),
+                space: s_b.history.space_id.clone(),
+            },
+            [DocClass::UserDoc, DocClass::UserDoc],
+        )
+        .await;
+
+        // (1) Interactive chat run with Personal role attaching BOTH consented Personal skill
+        //     and unconsented s_uncons skill must omit the unconsented skill and succeed.
+        let supervisor = AgentRunSupervisor::new_local(
+            local.registry.clone(),
+            fixture.revocations.clone(),
+            ExclusiveDataRoot::attest_open_writer(),
+        );
+        let base_opts = |role: Option<&str>| ChatRunOptions {
+            provider: Some(local.resource.id.clone()),
+            model: Some(local.model.clone()),
+            role: role.map(ToOwned::to_owned),
+            limits: RunLimits {
+                max_steps: 2,
+                max_tokens: 16_000,
+                timeout_ms: 15_000,
+            },
+        };
+        let p_thread =
+            ChatThreadId::from_bytes([0xC1, 80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        let p_cmd = |sub: u8| CommandIdentity {
+            scope: pscope.clone(),
+            actor: actor.clone(),
+            key: CommandKey::from_bytes([0xC1, 80, sub, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, sub]),
+            hash: ContentDigest::from_bytes([0xC1; 32]),
+        };
+        fixture
+            .canonical
+            .create_chat(
+                personal.clone(),
+                Mutation {
+                    identity: p_cmd(1),
+                    preconditions: Preconditions::default(),
+                    input: CreateChat {
+                        thread: p_thread.clone(),
+                        kind: ChatThreadKind::Personal,
+                        owner: actor.clone(),
+                        project_folder: None,
+                        title: "Attached skill omission thread".into(),
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        let msg1 = fixture
+            .canonical
+            .append_chat(
+                personal.clone(),
+                Mutation {
+                    identity: p_cmd(2),
+                    preconditions: Preconditions::default(),
+                    input: AppendChat {
+                        thread: p_thread.clone(),
+                        parent: ThreadEntrySeq::ZERO,
+                        kind: ChatEntryKind::Human,
+                        body: ChatInputBody::Text("Run mixed skill role".into()),
+                        tool_calls: vec![],
+                        provenance: None,
+                        interruption: None,
+                        proposed_diff: None,
+                        proposed_effect: None,
+                        referenced_notes: vec![],
+                        tainted: false,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        supervisor
+            .start(
+                owner.clone(),
+                StartChatRun {
+                    scope: pscope.clone(),
+                    thread: p_thread.clone(),
+                    expected_leaf: msg1.value.seq,
+                    options: base_opts(Some("mixed-attach-role")),
+                },
+            )
+            .await
+            .unwrap();
+        let (mut wire1, req1) = timeout(Duration::from_secs(15), read_request(&listener))
+        .await
+        .expect(
+            "interactive run with unconsented attached skill must omit skill instead of poisoning",
+        );
+        let req1_text = req1.to_string();
+        assert!(req1_text.contains("MIXED-ROLE-MARKER"));
+        assert!(req1_text.contains("CONSENTED-SKILL-MARKER"));
+        assert!(
+            !req1_text.contains("UNCONSENTED-SKILL-MARKER"),
+            "unconsented attached skill must never be disclosed to provider"
+        );
+        send_ollama(
+            &mut wire1,
+            json!({"role": "assistant", "content": "Mixed skill ok."}),
+            "stop",
+        )
+        .await;
+        let leaf1 = idle_leaf(fixture, personal, &p_thread).await;
+        // Follow-up turn with role=None reloads bound role cleanly.
+        supervisor
+            .start(
+                owner.clone(),
+                StartChatRun {
+                    scope: pscope.clone(),
+                    thread: p_thread.clone(),
+                    expected_leaf: leaf1,
+                    options: base_opts(None),
+                },
+            )
+            .await
+            .unwrap();
+        let (mut wire2, _) = timeout(Duration::from_secs(15), read_request(&listener))
+            .await
+            .expect("subsequent turn with role=None must succeed without episode poisoning");
+        send_ollama(
+            &mut wire2,
+            json!({"role": "assistant", "content": "Follow-up ok."}),
+            "stop",
+        )
+        .await;
+        let _ = idle_leaf(fixture, personal, &p_thread).await;
+
+        // (2) InAppProvider list_abilities(view="runtime", project="s_po/po-p1") AND
+        //     bind_chat_role on a po_p1-scoped Personal chat must resolve Personal's
+        //     "promo-shadow-role" rather than being shadowed by s_po's role promoted from po_p2.
+        let run_auth = owner
+            .auth()
+            .for_agent_run(
+                AgentRunId::from_bytes([0xC1, 90, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+                pscope.space_id.clone(),
+                ChatAudience::Personal,
+                owner.auth().spaces().clone(),
+            )
+            .unwrap();
+        let run_acc = AccountContext::new(run_auth, budget());
+        let mk_ctx = |tag: u8, primary_project: Option<FolderRef>| McpInvocationContext {
+            account: run_acc.clone(),
+            target: EgressTarget::InAppProvider {
+                provider: local.resource.id.clone(),
+                model: local.model.clone(),
+                primary_project,
+            },
+            request_key: CommandKey::from_bytes([
+                0xC1, 91, tag, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, tag,
+            ]),
+        };
+        let listed_po = local
+            .registry
+            .call_tool(
+                mk_ctx(1, None),
+                "list_abilities",
+                json!({ "view": "runtime", "kind": "role", "project": po_p1_handle, "limit": 50 }),
+            )
+            .await
+            .unwrap()
+            .structured_content;
+        let po_items = listed_po["items"].as_array().unwrap();
+        assert!(
+            po_items
+                .iter()
+                .any(|item| item["ref"] == personal_promo_ref),
+            "project_only promoted_from role from po_p2 must not shadow Personal promo-shadow-role in runtime list_abilities: {listed_po}"
+        );
+        // Start a Personal chat anchored in s_po/po_p1 requesting "promo-shadow-role":
+        // bind_chat_role must skip the po_p2-promoted role and bind Personal's fallback role.
+        let po_scope =
+            SpaceContext::new(owner.auth().clone(), s_po.history.clone(), budget()).unwrap();
+        let po_thread =
+            ChatThreadId::from_bytes([0xC1, 81, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        let po_cmd = |sub: u8| CommandIdentity {
+            scope: s_po.history.clone(),
+            actor: actor.clone(),
+            key: CommandKey::from_bytes([0xC1, 81, sub, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, sub]),
+            hash: ContentDigest::from_bytes([0xC1; 32]),
+        };
+        fixture
+            .canonical
+            .create_chat(
+                po_scope.clone(),
+                Mutation {
+                    identity: po_cmd(1),
+                    preconditions: Preconditions::default(),
+                    input: CreateChat {
+                        thread: po_thread.clone(),
+                        kind: ChatThreadKind::Personal,
+                        owner: actor.clone(),
+                        project_folder: Some(po_p1.folder_id.clone()),
+                        title: "Project-only promo role binding".into(),
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        let po_msg = fixture
+            .canonical
+            .append_chat(
+                po_scope.clone(),
+                Mutation {
+                    identity: po_cmd(2),
+                    preconditions: Preconditions::default(),
+                    input: AppendChat {
+                        thread: po_thread.clone(),
+                        parent: ThreadEntrySeq::ZERO,
+                        kind: ChatEntryKind::Human,
+                        body: ChatInputBody::Text("Use promo-shadow-role".into()),
+                        tool_calls: vec![],
+                        provenance: None,
+                        interruption: None,
+                        proposed_diff: None,
+                        proposed_effect: None,
+                        referenced_notes: vec![],
+                        tainted: false,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        supervisor
+            .start(
+                owner.clone(),
+                StartChatRun {
+                    scope: s_po.history.clone(),
+                    thread: po_thread.clone(),
+                    expected_leaf: po_msg.value.seq,
+                    options: base_opts(Some("promo-shadow-role")),
+                },
+            )
+            .await
+            .unwrap();
+        let (mut wire3, req3) = timeout(Duration::from_secs(15), read_request(&listener))
+        .await
+        .expect(
+            "bind_chat_role must bypass unconsented po_p2-promoted role and bind Personal fallback",
+        );
+        let req3_text = req3.to_string();
+        assert!(req3_text.contains("PERSONAL-PROMO-FALLBACK-MARKER"));
+        assert!(!req3_text.contains("PO-P2-PROMOTED-MARKER"));
+        send_ollama(
+            &mut wire3,
+            json!({"role": "assistant", "content": "Promo fallback ok."}),
+            "stop",
+        )
+        .await;
+        let _ = idle_leaf(fixture, &po_scope, &po_thread).await;
+
+        // (3) UserDoc-only project s_b/b-udoc must NEVER leak unrelated Shared Space A's
+        //     abilities or let Space A shadow Personal abilities in runtime or authoring views.
+        let b_handle = format!("{}/b-udoc", s_b.slug);
+        for (tag, view) in [(2u8, "runtime"), (3u8, "authoring")] {
+            let listed_b = local
+                .registry
+                .call_tool(
+                    mk_ctx(tag, None),
+                    "list_abilities",
+                    json!({ "view": view, "kind": "role", "project": b_handle, "limit": 50 }),
+                )
+                .await
+                .unwrap()
+                .structured_content;
+            let items = listed_b["items"].as_array().unwrap();
+            assert!(
+                !items.iter().any(|item| item["name"] == "space-a-exclusive"),
+                "unrelated Shared Space A ability must not leak for UserDoc-only project {b_handle} in view={view}: {listed_b}"
+            );
+            if view == "runtime" {
+                assert!(
+                    items.iter().any(|item| {
+                        item["name"] == "personal-not-shadowed"
+                            && item["scope"].get("OwnedPersonal").is_some()
+                    }),
+                    "Personal ability must not be shadowed by unrelated Shared Space A for UserDoc-only project: {listed_b}"
+                );
+            }
+        }
+        let _ = po_p2;
+    }
+    let leaked_dedup = fixture
+        .storage
+        .observer
+        .count(
+            "SELECT COUNT(*) FROM mcp_dedup \
+             WHERE safe_result LIKE '%secret-edit-ability-slug-r51%' \
+                OR safe_result LIKE '%secret-episode-name-r51%'",
+        )
+        .await;
+    assert_eq!(
+        leaked_dedup, 0,
+        "mcp_dedup.safe_result must not persist EditPlan.slug or EpisodeRolePlan episode name"
+    );
+}
+
+#[inline(never)]
+async fn locate_ability_cap_and_legacy_mixed_case_id_pagination_parity(
+    fixture: &RuntimeFixture,
+    personal: &SpaceContext,
+) {
+    let owner = fresh_owner(fixture).await;
+    let actor = owner.auth().principal().clone();
+    let pscope = personal.scope().clone();
+    let acc_id = |sub: u8| {
+        let owner = owner.clone();
+        let actor = actor.clone();
+        async move {
+            let rev = fixture
+                .control
+                .account(owner, actor.clone())
+                .await
+                .unwrap()
+                .revision;
+            AccountCommandIdentity {
+                owner: actor.clone(),
+                actor,
+                expected: rev,
+                key: CommandKey::from_bytes([
+                    0xC3, sub, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, sub,
+                ]),
+                hash: ContentDigest::from_bytes([0xC3; 32]),
+            }
+        }
+    };
+    let mut spaces = Vec::new();
+    for idx in 1u8..=3 {
+        let sp = fixture
+            .control
+            .create_space(
+                fresh_owner(fixture).await,
+                AccountMutation {
+                    identity: acc_id(idx).await,
+                    input: CreateSpace {
+                        id: SpaceId::from_bytes([
+                            0xC3, idx, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, idx,
+                        ]),
+                        kind: SpaceKind::Shared,
+                        name: format!("Locate Cap Space {idx}"),
+                    },
+                },
+            )
+            .await
+            .unwrap()
+            .value;
+        spaces.push(sp);
+    }
+    let owner = fresh_owner(fixture).await;
+
+    // (1) Publish the SAME raw AbilityId across 3 Spaces (L1 < L2 < L3), disable
+    //     L1 and L2 bindings, and verify raw-id use_role and get_ability resolve L3.
+    let shared_ab_id =
+        AbilityId::from_bytes([0xC3, 0xAB, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    let mut published_refs = Vec::new();
+    for (idx, sp) in spaces.iter().enumerate() {
+        let tag = 10 + idx as u8;
+        let sc = SpaceContext::new(owner.auth().clone(), sp.history.clone(), budget()).unwrap();
+        let note_id = NoteId::from_bytes([0xC3, tag, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, tag]);
+        let note_rev = fixture
+            .canonical
+            .create_note(
+                sc.clone(),
+                Mutation {
+                    identity: CommandIdentity {
+                        scope: sp.history.clone(),
+                        actor: actor.clone(),
+                        key: CommandKey::from_bytes([
+                            0xC3, tag, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, tag,
+                        ]),
+                        hash: ContentDigest::from_bytes([0xC3; 32]),
+                    },
+                    preconditions: Preconditions::default(),
+                    input: CreateNote {
+                        note: note_id.clone(),
+                        parent: None,
+                        slug: format!("locate-cap-role-{idx}"),
+                        class: DocClass::Skill,
+                        carrier: format!(
+                            "---\nclass: skill\nkind: role\ntitle: locate-cap-role-{idx}\ndescription: Locate cap {idx}\n---\n\nLOCATE-CAP-MARKER-{idx}\n"
+                        ),
+                        folder_page: false,
+                    },
+                },
+            )
+            .await
+            .unwrap()
+            .value
+            .revision;
+        let pkg = fixture
+            .canonical
+            .publish_ability_package(
+                sc,
+                Mutation {
+                    identity: CommandIdentity {
+                        scope: sp.history.clone(),
+                        actor: actor.clone(),
+                        key: CommandKey::from_bytes([
+                            0xC3, tag, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, tag,
+                        ]),
+                        hash: ContentDigest::from_bytes([0xC3; 32]),
+                    },
+                    preconditions: Preconditions::default(),
+                    input: PublishAbilityPackage {
+                        ability: shared_ab_id.clone(),
+                        kind: AbilityKind::Role,
+                        entrypoint: note_id,
+                        files: vec![],
+                        attached_skills: vec![],
+                        expected_package_revision: None,
+                        expected_entrypoint_revision: Some(note_rev),
+                        requires_explicit_binding: false,
+                    },
+                },
+            )
+            .await
+            .unwrap()
+            .value;
+        published_refs.push(AbilityRef {
+            id: shared_ab_id.clone(),
+            placement: AbilityPlacement::OwnedSpace(sp.history.space_id.clone()),
+            revision: pkg.revision,
+        });
+    }
+    // Disable L1 and L2 bindings so only L3 is visible to InAppProvider.
+    for (idx, ability) in published_refs.iter().enumerate().take(2) {
+        fixture
+            .control
+            .update_ability_binding(
+                owner.clone(),
+                AccountMutation {
+                    identity: acc_id(20 + idx as u8).await,
+                    input: AbilityBindingUpdate {
+                        ability: ability.clone(),
+                        enabled: false,
+                        projects: AbilityProjects::All,
+                        expected: AbilityOverlayGuard::Authored(None),
+                    },
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    // (2) Legacy mixed-case IDs in L3 alongside v1 lowercase IDs for abilities,
+    //     folders, and notes (verifying PostgreSQL COLLATE "C" matches Rust Ord).
+    let l3 = &spaces[2];
+    let l3_sc = SpaceContext::new(owner.auth().clone(), l3.history.clone(), budget()).unwrap();
+    let legacy_ab_id = AbilityId::parse("ZZ0000000003").unwrap();
+    let legacy_ab_note = NoteId::parse("ZZ0000000004").unwrap();
+    let leg_rev = fixture
+        .canonical
+        .create_note(
+            l3_sc.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: l3.history.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([0xC3, 30, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+                    hash: ContentDigest::from_bytes([0xC3; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: CreateNote {
+                    note: legacy_ab_note.clone(),
+                    parent: None,
+                    slug: "legacy-id-role".into(),
+                    class: DocClass::Skill,
+                    carrier: "---\nclass: skill\nkind: role\ntitle: legacy-id-role\ndescription: Legacy ID role\n---\n\nLEGACY-ID-ROLE-BODY\n".into(),
+                    folder_page: false,
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value
+        .revision;
+    let _ = fixture
+        .canonical
+        .publish_ability_package(
+            l3_sc.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: l3.history.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([
+                        0xC3, 30, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xC3; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: PublishAbilityPackage {
+                    ability: legacy_ab_id.clone(),
+                    kind: AbilityKind::Role,
+                    entrypoint: legacy_ab_note,
+                    files: vec![],
+                    attached_skills: vec![],
+                    expected_package_revision: None,
+                    expected_entrypoint_revision: Some(leg_rev),
+                    requires_explicit_binding: false,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let l3_proj = create_project_folder(
+        fixture,
+        &l3.history,
+        &actor,
+        FolderId::from_bytes([0xC3, 31, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+        "collate-proj",
+    )
+    .await;
+    let active_epoch = fixture
+        .canonical
+        .read_space(&l3.history.space_id)
+        .await
+        .unwrap()
+        .active_epoch;
+    let legacy_folder_id = FolderId::parse("ZZ0000000001").unwrap();
+    let v1_folder_id = FolderId::from_bytes([0xC3, 32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+    for (fid, slug) in [(&legacy_folder_id, "legacy-sub"), (&v1_folder_id, "v1-sub")] {
+        fixture
+            .canonical
+            .create_folder(CreateFolderSpec {
+                scope: l3.history.clone(),
+                active_epoch,
+                folder_id: fid.clone(),
+                parent: Some(l3_proj.folder_id.clone()),
+                slug: slug.into(),
+                display_name: slug.into(),
+                is_project: false,
+                project_slug: None,
+                actor: actor.clone(),
+                timestamp: None,
+            })
+            .await
+            .unwrap();
+    }
+    let legacy_note_id = NoteId::parse("ZZ0000000002").unwrap();
+    let v1_note_id = NoteId::from_bytes([0xC3, 33, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3]);
+    for (idx, nid) in [&legacy_note_id, &v1_note_id].into_iter().enumerate() {
+        fixture
+            .canonical
+            .create_note(
+                l3_sc.clone(),
+                Mutation {
+                    identity: CommandIdentity {
+                        scope: l3.history.clone(),
+                        actor: actor.clone(),
+                        key: CommandKey::from_bytes([
+                            0xC3, 33, idx as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, idx as u8,
+                        ]),
+                        hash: ContentDigest::from_bytes([0xC3; 32]),
+                    },
+                    preconditions: Preconditions::default(),
+                    input: CreateNote {
+                        note: nid.clone(),
+                        parent: Some(l3_proj.folder_id.clone()),
+                        slug: format!("collate-note-{idx}"),
+                        class: DocClass::UserDoc,
+                        carrier: format!("# Collate Note {idx}\n\nBody.\n"),
+                        folder_page: false,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+    }
+    fixture.projections.install(ProjectionFixture {
+        view_owner: NoteRef {
+            space_id: l3.history.space_id.clone(),
+            note_id: legacy_note_id.clone(),
+        },
+        notes: vec![legacy_note_id.clone(), v1_note_id.clone()],
+    });
+
+    // Consent Personal + L1 + L2 + L3 for UserDoc + Skill.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local = loopback_provider(fixture, &owner, &listener, 0x68, true).await;
+    let mut targets = vec![ProviderAttachmentTarget::Personal {
+        owner: actor.clone(),
+        space: pscope.space_id.clone(),
+    }];
+    for sp in &spaces {
+        targets.push(ProviderAttachmentTarget::Space(sp.history.space_id.clone()));
+        targets.push(ProviderAttachmentTarget::Personal {
+            owner: actor.clone(),
+            space: sp.history.space_id.clone(),
+        });
+    }
+    for (sub, target) in targets.into_iter().enumerate() {
+        let sub = sub as u8;
+        let consent = || {
+            ProviderDisclosureConsent::attest_checked(ProviderDisclosure {
+                classes: [DocClass::UserDoc, DocClass::Skill].into(),
+            })
+        };
+        let att = local
+            .provider
+            .request_attachment(
+                owner.clone(),
+                AccountMutation {
+                    identity: acc_id(40 + sub).await,
+                    input: RequestProviderAttachment {
+                        id: RequestId::from_bytes([
+                            0x68, 0x51, sub, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, sub,
+                        ]),
+                        expected: None,
+                        resource: local.resource.id.clone(),
+                        resource_consent_epoch: local.resource.consent_epoch,
+                        credential_consent_epoch: None,
+                        target,
+                        consent: consent(),
+                        expires_at_ms: None,
+                    },
+                },
+            )
+            .await
+            .unwrap()
+            .value;
+        if att.state != ProviderAttachmentState::Approved {
+            local
+                .provider
+                .approve_attachment(
+                    owner.clone(),
+                    AccountMutation {
+                        identity: acc_id(60 + sub).await,
+                        input: ApproveProviderAttachment {
+                            id: att.id,
+                            expected: att.revision,
+                            resource_consent_epoch: att.resource_consent_epoch,
+                            credential_consent_epoch: att.credential_consent_epoch,
+                            consent: consent(),
+                        },
+                    },
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    let run_auth = owner
+        .auth()
+        .for_agent_run(
+            AgentRunId::from_bytes([0xC3, 90, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+            pscope.space_id.clone(),
+            ChatAudience::Personal,
+            owner.auth().spaces().clone(),
+        )
+        .unwrap();
+    let run_acc = AccountContext::new(run_auth, budget());
+    let mk_ctx = |tag: u8| McpInvocationContext {
+        account: run_acc.clone(),
+        target: EgressTarget::InAppProvider {
+            provider: local.resource.id.clone(),
+            model: local.model.clone(),
+            primary_project: None,
+        },
+        request_key: CommandKey::from_bytes([
+            0xC3, 91, tag, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, tag,
+        ]),
+    };
+
+    // Raw AbilityId lookup via BOTH use_role and get_ability must find L3 despite L1 & L2.
+    let used = local
+        .registry
+        .call_tool(
+            mk_ctx(1),
+            "use_role",
+            json!({ "role": shared_ab_id.as_str() }),
+        )
+        .await
+        .expect("raw AbilityId use_role must not be starved by 2 disabled Spaces sorting before L3")
+        .structured_content;
+    assert!(
+        used["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("LOCATE-CAP-MARKER-2")
+    );
+    let got = local
+        .registry
+        .call_tool(
+            mk_ctx(2),
+            "get_ability",
+            json!({ "ref": shared_ab_id.as_str() }),
+        )
+        .await
+        .expect(
+            "raw AbilityId get_ability must not be starved by 2 disabled Spaces sorting before L3",
+        )
+        .structured_content;
+    assert!(
+        got["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("LOCATE-CAP-MARKER-2")
+    );
+
+    // Drain ALL pages of InAppProvider list_abilities(limit=1) -> must include BOTH
+    // legacy mixed-case `ZZ0000000003` ("legacy-id-role") and `ab_...` ("locate-cap-role-2").
+    let mut ab_names = Vec::new();
+    let mut ab_cursor: Option<String> = None;
+    let mut tag = 10u8;
+    loop {
+        let mut args = json!({ "view": "authoring", "kind": "role", "limit": 1 });
+        if let Some(c) = &ab_cursor {
+            args["cursor"] = json!(c);
+        }
+        let page = local
+            .registry
+            .call_tool(mk_ctx(tag), "list_abilities", args)
+            .await
+            .unwrap()
+            .structured_content;
+        tag += 1;
+        for item in page["items"].as_array().unwrap() {
+            ab_names.push(item["name"].as_str().unwrap().to_owned());
+        }
+        ab_cursor = page["nextCursor"].as_str().map(ToOwned::to_owned);
+        if ab_cursor.is_none() {
+            break;
+        }
+    }
+    assert!(
+        ab_names.iter().any(|n| n == "legacy-id-role")
+            && ab_names.iter().any(|n| n == "locate-cap-role-2"),
+        "legacy mixed-case AbilityId pagination must yield both legacy and v1 abilities without drop: {ab_names:?}"
+    );
+
+    // Drain ALL pages of list_notes(project="l3/collate-proj", limit=1) -> must yield
+    // both `legacy-sub` ("ZZ0000000001") and `v1-sub` without InvalidState.
+    let l3_proj_handle = format!("{}/collate-proj", l3.slug);
+    let mut folder_raw = Vec::new();
+    let mut note_cursor: Option<String> = None;
+    loop {
+        let mut args = json!({ "project": l3_proj_handle, "limit": 1 });
+        if let Some(c) = &note_cursor {
+            args["cursor"] = json!(c);
+        }
+        let page = local
+            .registry
+            .call_tool(mk_ctx(tag), "list_notes", args)
+            .await
+            .expect("legacy mixed-case child folder pagination must not fail InvalidState")
+            .structured_content;
+        tag += 1;
+        for f in page["folders"].as_array().unwrap() {
+            folder_raw.push(serde_json::to_string(f).unwrap());
+        }
+        note_cursor = page["nextCursor"].as_str().map(ToOwned::to_owned);
+        if note_cursor.is_none() {
+            break;
+        }
+    }
+    assert!(
+        folder_raw.iter().any(|s| s.contains("legacy-sub"))
+            && folder_raw.iter().any(|s| s.contains("v1-sub")),
+        "child folder pagination must yield both legacy and v1 folders: {folder_raw:?}"
+    );
+
+    // Also create legacy mixed-case + v1 ChatThreads in L3 and drain canonical
+    // ChangeRead::Seed(limit=1), asserting strictly monotonic Rust Ord advancement
+    // for BOTH NotesAfter and ThreadsAfter cursors (verifying PostgreSQL COLLATE "C").
+    let legacy_thread_id = ChatThreadId::parse("ZZ0000000005").unwrap();
+    let v1_thread_id =
+        ChatThreadId::from_bytes([0xC3, 34, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5]);
+    let mut cutoff = SpaceSeq::ZERO;
+    for (idx, tid) in [&legacy_thread_id, &v1_thread_id].into_iter().enumerate() {
+        let committed = fixture
+            .canonical
+            .create_chat(
+                l3_sc.clone(),
+                Mutation {
+                    identity: CommandIdentity {
+                        scope: l3.history.clone(),
+                        actor: actor.clone(),
+                        key: CommandKey::from_bytes([
+                            0xC3, 34, idx as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, idx as u8,
+                        ]),
+                        hash: ContentDigest::from_bytes([0xC3; 32]),
+                    },
+                    preconditions: Preconditions::default(),
+                    input: CreateChat {
+                        thread: tid.clone(),
+                        kind: ChatThreadKind::SpaceGroup,
+                        owner: actor.clone(),
+                        project_folder: None,
+                        title: format!("Collate Thread {idx}"),
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        cutoff = cutoff.max(committed.receipt.seq());
+    }
+    let mut seed_cursor: Option<SeedCursor> = None;
+    let mut seen_seed_notes = Vec::new();
+    let mut seen_seed_threads = Vec::new();
+    for _ in 0..32 {
+        let req = match &seed_cursor {
+            None => ChangeRead::Seed {
+                scope: l3.history.clone(),
+                cutoff: Some(cutoff),
+                limit: PageLimit::new(1).unwrap(),
+            },
+            Some(cursor) => ChangeRead::ContinueSeed {
+                cursor: cursor.clone(),
+            },
+        };
+        let res = fixture
+            .canonical
+            .read_changes(l3_sc.clone(), req)
+            .await
+            .unwrap();
+        let ChangeReadResult::Seed(page) = res else {
+            panic!("expected Seed page");
+        };
+        for note in &page.notes {
+            seen_seed_notes.push(note.document.reference().note_id.clone());
+        }
+        for thread in &page.threads {
+            seen_seed_threads.push(thread.id.clone());
+        }
+        if let (Some(prev), Some(next)) = (&seed_cursor, &page.next) {
+            match (&prev.after, &next.after) {
+                (SeedPosition::NotesAfter(old), SeedPosition::NotesAfter(new)) => {
+                    assert!(
+                        new > old,
+                        "NotesAfter must strictly increase in Rust byte order: old={old}, new={new}"
+                    );
+                }
+                (SeedPosition::ThreadsAfter(old), SeedPosition::ThreadsAfter(new)) => {
+                    assert!(
+                        new > old,
+                        "ThreadsAfter must strictly increase in Rust byte order: old={old}, new={new}"
+                    );
+                }
+                _ => (),
+            }
+        }
+        match page.next {
+            Some(next) => seed_cursor = Some(next),
+            None => break,
+        }
+    }
+    assert!(
+        seen_seed_notes.contains(&legacy_note_id) && seen_seed_notes.contains(&v1_note_id),
+        "Seed pagination must yield both legacy and v1 NoteIds in byte order: {seen_seed_notes:?}"
+    );
+    assert!(
+        seen_seed_threads.contains(&legacy_thread_id) && seen_seed_threads.contains(&v1_thread_id),
+        "Seed pagination must yield both legacy and v1 ChatThreadIds in byte order: {seen_seed_threads:?}"
+    );
 }
