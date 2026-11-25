@@ -242,10 +242,10 @@ impl ClassifiedMetadata {
         self.facts.in_project(project)
     }
     pub fn listing(&self, auth: &EngineAuthContext) -> DomainResult<ListedDocument> {
-        self.facts.authorize(auth)?;
         if self.lifecycle == Lifecycle::Purged {
             return Err(DomainError::ResourceNotFound);
         }
+        self.facts.authorize(auth)?;
         Ok(ListedDocument(self.clone()))
     }
 }
@@ -346,10 +346,10 @@ impl ClassifiedDocument {
         self.facts.in_project(project)
     }
     pub fn explicit_read<'a>(&'a self, auth: &EngineAuthContext) -> DomainResult<&'a str> {
-        self.facts.authorize(auth)?;
         if self.lifecycle == Lifecycle::Purged {
             return Err(DomainError::ResourceNotFound);
         }
+        self.facts.authorize(auth)?;
         Ok(&self.content)
     }
 }
@@ -423,10 +423,10 @@ impl ClassifiedAbilityResource {
         self.lifecycle
     }
     pub fn explicit_read<'a>(&'a self, auth: &EngineAuthContext) -> DomainResult<&'a str> {
-        self.provenance.authorize(auth)?;
         if self.lifecycle == Lifecycle::Purged {
             return Err(DomainError::ResourceNotFound);
         }
+        self.provenance.authorize(auth)?;
         Ok(&self.content)
     }
 }

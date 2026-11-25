@@ -436,6 +436,51 @@ impl ControlService {
                     return Err(DomainError::AbilityWriteForbidden.into());
                 }
                 let owner = user(tx.inner_mut(), auth.principal().as_str()).await?;
+                match &input.ability.placement {
+                    AbilityPlacement::System => {
+                        if !auth.human_management() {
+                            return Err(DomainError::AbilityWriteForbidden.into());
+                        }
+                    }
+                    AbilityPlacement::OwnedPersonal(id) if id != auth.principal() => {
+                        return Err(DomainError::ResourceNotFound.into());
+                    }
+                    AbilityPlacement::OwnedPersonal(_)
+                    | AbilityPlacement::OwnedSpace(_)
+                    | AbilityPlacement::OwnedProject(_) => {
+                        let space = match &input.ability.placement {
+                            AbilityPlacement::OwnedSpace(space) => space.clone(),
+                            AbilityPlacement::OwnedProject(project) => project.space_id.clone(),
+                            AbilityPlacement::OwnedPersonal(_) => SpaceId::parse(
+                                owner
+                                    .personal_space_id
+                                    .as_deref()
+                                    .ok_or(DomainError::ResourceNotFound)?,
+                            )?,
+                            AbilityPlacement::System => unreachable!(),
+                        };
+                        let grant = auth.spaces().get(&space).ok_or_else(|| {
+                            if auth.human_management() {
+                                DomainError::ResourceNotFound.into()
+                            } else {
+                                access_denied()
+                            }
+                        })?;
+                        if !auth.human_management()
+                            && (grant.role == SpaceRole::Viewer
+                                || !grant.write_classes.contains(&DocClass::Skill)
+                                || grant.project_root.as_ref().is_some_and(|root| {
+                                    !matches!(
+                                        &input.ability.placement,
+                                        AbilityPlacement::OwnedProject(folder)
+                                            if &folder.folder_id == root
+                                    )
+                                }))
+                        {
+                            return Err(access_denied());
+                        }
+                    }
+                }
                 (owner, AccountContext::new(auth, ctx.budget.clone()))
             };
             if let Some(replay) = command.replay::<AbilityPreferenceUpdate>(tx.inner_mut()).await? { return Ok(replay); }

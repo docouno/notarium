@@ -1,7 +1,8 @@
 mod proposal;
 
 pub(in super::super) use proposal::{
-    ProposalLink, apply_links, describe_links, plan_links, validate_link_proposal_input,
+    ProposalLink, apply_links, authorize_link_source_owner, describe_links, plan_links,
+    validate_link_proposal_input,
 };
 
 use std::collections::BTreeMap;
@@ -166,6 +167,28 @@ fn authored_name(value: &str) -> Result<&str, PortError> {
         return Err(invalid(ValidationReason::InvalidPathComponent));
     }
     Ok(value)
+}
+
+pub(in super::super) fn validate_link_args(edge: &LinkArgs) -> Result<(), PortError> {
+    let relation = edge.relation.trim();
+    if relation.is_empty()
+        || relation.chars().any(char::is_control)
+        || relation.contains([':', '[', ']', '|', '\\'])
+    {
+        return Err(invalid(ValidationReason::InvalidPathComponent));
+    }
+    corpus::validate_field_key(relation)?;
+    match (edge.to.as_deref(), edge.to_title.as_deref()) {
+        (Some(id), None) => {
+            let _ = NoteId::parse(id)?;
+            Ok(())
+        }
+        (None, Some(name)) => {
+            let _ = authored_name(name)?;
+            Ok(())
+        }
+        _ => Err(invalid(ValidationReason::InvalidQuery)),
+    }
 }
 
 pub(in super::super) fn format_link_line(

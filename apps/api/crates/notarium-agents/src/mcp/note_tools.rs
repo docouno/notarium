@@ -109,7 +109,10 @@ pub(super) async fn observe_note(
     })
 }
 
-fn authorize_note_write(scope: &SpaceContext, facts: &ResourceFacts) -> Result<(), PortError> {
+pub(super) fn authorize_note_write(
+    scope: &SpaceContext,
+    facts: &ResourceFacts,
+) -> Result<(), PortError> {
     scope.auth().authorize_direct_write(facts, facts)?;
     // Package writes need package validation and the control-side binding.
     if facts.ability_package.is_some() {

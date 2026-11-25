@@ -152,7 +152,12 @@ mod tests {
         // Per-principal quota prevents one noisy principal from evicting another,
         // and cross-principal cursor lookups fail uniformly with CursorStale.
         let noisy = PrincipalId::from_bytes([10; 16]);
-        assert!(cursors.open(&noisy, &token).is_err());
+        assert!(matches!(
+            cursors.open(&noisy, &token),
+            Err(PortError::Domain(
+                notarium_core::DomainError::ValidationFailed { diagnostic }
+            )) if diagnostic.reason == ValidationReason::CursorStale
+        ));
         for _ in 0..(MAX_CURSORS_PER_PRINCIPAL * 2) {
             let _ = cursors
                 .insert(

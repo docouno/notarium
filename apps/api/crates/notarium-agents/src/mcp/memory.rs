@@ -33,6 +33,19 @@ struct MemoryRoute {
     target: MemoryTarget,
 }
 
+pub(super) fn validate_category(category: &str) -> Result<(), PortError> {
+    if category.is_empty()
+        || category.len() > 64
+        || !category.as_bytes()[0].is_ascii_lowercase()
+        || !category
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    {
+        return Err(invalid(ValidationReason::InvalidQuery));
+    }
+    Ok(())
+}
+
 impl MemoryArgs {
     pub(super) fn parse(args: Value) -> Result<Self, PortError> {
         let mut args: Self = decode(args)?;
@@ -40,7 +53,16 @@ impl MemoryArgs {
         if args.observation.is_empty() {
             return Err(invalid(ValidationReason::InvalidQuery));
         }
+        validate_category(&args.category)?;
         Ok(args)
+    }
+
+    pub(super) fn category(&self) -> &str {
+        &self.category
+    }
+
+    pub(super) fn has_version_token(&self) -> bool {
+        self.version_token.is_some()
     }
 
     pub(super) async fn resolve_target(

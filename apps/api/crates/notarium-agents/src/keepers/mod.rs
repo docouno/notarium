@@ -1070,13 +1070,17 @@ impl NextSlotRetry {
             self.last_clock = self.last_clock.max(latest);
             self.forward_cursor = latest;
             let latest_candidate = next(latest)?;
-            self.backward_state = (self.slot < latest).then_some((latest, latest_candidate));
             if !self.tried.contains(&latest_candidate) {
+                self.backward_state = (self.slot < latest).then_some((latest, latest_candidate));
                 if let Some(ts) = latest_candidate {
                     self.forward_cursor = self.forward_cursor.max(ts);
                 }
                 Some(latest_candidate)
             } else {
+                if latest_candidate.is_some() {
+                    self.backward_state =
+                        (self.slot < latest).then_some((latest, latest_candidate));
+                }
                 match self.advance_untried(next)? {
                     Some(found) => Some(found),
                     None => self.rewind_untried(next)?,

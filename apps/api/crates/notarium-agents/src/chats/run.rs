@@ -167,11 +167,12 @@ impl AgentRunSupervisor {
             .ok_or_else(|| invalid(ValidationReason::MissingModelProfile))?;
         let episode = self.open_episode(run, &budget).await?;
         if let Some(role) = &run.options.role {
-            let call_budget = run.context(budget.remaining())?.budget;
+            let primary = run.context(budget.remaining())?;
             crate::mcp::bind_chat_role(
                 registry,
-                AccountContext::new(run.owner_auth.clone(), call_budget.clone()),
-                AccountContext::new(run.auth.clone(), call_budget),
+                AccountContext::new(run.owner_auth.clone(), primary.budget.clone()),
+                primary,
+                &selection,
                 &episode,
                 role,
                 run.project.as_ref(),

@@ -100,6 +100,29 @@ pub async fn interactive(
     reader.load(role, descriptors, role_project).await
 }
 
+/// Validate that a role can be loaded and admitted for `selection` before
+/// durably binding it onto the chat episode. Runs on a detached preflight taint
+/// so a rejected role never taints the active run or poisons subsequent turns.
+pub(super) async fn preflight_role(
+    registry: &ToolRegistry,
+    primary: &SpaceContext,
+    selection: &ProviderSelection,
+    role: &AbilityDescriptor,
+    hint: Option<&FolderRef>,
+) -> Result<(), PortError> {
+    validate_descriptor(role, AbilityKind::Role)?;
+    validate_attachments(&role.attached_skills)?;
+    let preflight_primary = primary.with_preflight_taint();
+    let reader = Reader::new(registry, &preflight_primary, selection)?;
+    let role_project = match &role.reference.placement {
+        AbilityPlacement::OwnedProject(project) => Some(project),
+        AbilityPlacement::OwnedSpace(space) => hint.filter(|project| &project.space_id == space),
+        _ => hint,
+    };
+    let _ = reader.load(role.clone(), Vec::new(), role_project).await?;
+    Ok(())
+}
+
 /// A scheduled run already carries exact approved references and its scoped
 /// credential. Reading it never opens a human account session or episode.
 pub async fn keeper(

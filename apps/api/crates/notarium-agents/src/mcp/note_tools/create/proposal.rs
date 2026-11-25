@@ -101,20 +101,27 @@ pub(in crate::mcp::note_tools) fn preflight_input(
             if input.draft.body.len() > max_body {
                 return Err(invalid(ValidationReason::BudgetExceeded));
             }
-            Ok(!input.draft.links.is_empty())
+            super::validate_draft_syntax(&input.draft, input.folder_page)
         }
         ToolName::CreateNotes => {
             let input: BatchInput = decode(args.clone())?;
             let mut total_body = 0usize;
+            let mut any_ready = false;
             let mut has_links = false;
             for raw in input.notes {
                 if let Ok(draft) = decode::<super::NoteDraft>(raw) {
                     total_body = total_body.saturating_add(draft.body.len());
-                    has_links |= !draft.links.is_empty();
+                    if let Ok(item_links) = super::validate_draft_syntax(&draft, false) {
+                        any_ready = true;
+                        has_links |= item_links;
+                    }
                 }
             }
             if total_body > max_body {
                 return Err(invalid(ValidationReason::BudgetExceeded));
+            }
+            if !any_ready {
+                return Err(invalid(ValidationReason::InvalidQuery));
             }
             Ok(has_links)
         }

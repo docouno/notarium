@@ -1326,3 +1326,146 @@ fn provider_policy_rejection_does_not_flip_cross_space_branch_taint() {
     assert!(ClassEgressFence::ability(ability, &ab_auth, &all_allowed).is_ok());
     assert!(ab_auth.taint().is_tainted());
 }
+
+#[test]
+fn staged_taint_restrict_to_spaces_and_purged_carriers_preserve_invariants() {
+    let owner = human(SpaceRole::Owner, true);
+    let s1 = SpaceId::from_bytes([1; 16]);
+    let s2 = SpaceId::from_bytes([2; 16]);
+    let s3 = SpaceId::from_bytes([3; 16]);
+
+    // (1) with_staged_taint preserves grants/rights while isolating BranchTaint
+    //     until explicit merge; an already-tainted caller starts staged tainted.
+    let agent = owner
+        .for_agent_run(
+            AgentRunId::from_bytes([7; 16]),
+            s1.clone(),
+            ChatAudience::Personal,
+            grants(SpaceRole::Owner),
+        )
+        .unwrap();
+    let staged = agent.with_staged_taint();
+    assert_eq!(
+        staged.spaces().keys().collect::<Vec<_>>(),
+        agent.spaces().keys().collect::<Vec<_>>()
+    );
+    assert!(!agent.taint().is_tainted());
+    assert!(!staged.taint().is_tainted());
+    staged.taint().mark_external_read();
+    assert!(staged.taint().is_tainted());
+    assert!(
+        !agent.taint().is_tainted(),
+        "marking staged taint must not taint caller before merge"
+    );
+    agent.taint().merge(staged.taint());
+    assert!(agent.taint().is_tainted());
+    assert!(
+        agent.with_staged_taint().taint().is_tainted(),
+        "staging from an already-tainted caller must preserve tainted state"
+    );
+
+    // (2) restrict_to_spaces narrows spaces AND recomputes ability_write when no
+    //     writable space survives the intersection.
+    let mut mixed_spaces = BTreeMap::new();
+    mixed_spaces.insert(
+        s1.clone(),
+        SpaceGrant {
+            role: SpaceRole::Owner,
+            read_classes: DocClass::all(),
+            write_classes: DocClass::all(),
+            project_root: None,
+        },
+    );
+    mixed_spaces.insert(
+        s2.clone(),
+        SpaceGrant {
+            role: SpaceRole::Viewer,
+            read_classes: DocClass::all(),
+            write_classes: BTreeSet::new(),
+            project_root: None,
+        },
+    );
+    let pat = EngineAuthContext::for_bearer(VerifiedBearer::attest(
+        PrincipalId::from_bytes([9; 16]),
+        GrantId::from_bytes([9; 16]),
+        BearerCredential::Pat(CredentialTokenId::parse("090909090909").unwrap()),
+        mixed_spaces,
+        notarium_core::ports::BearerScope::Write,
+        true,
+    ));
+    assert!(pat.has_cap(Cap::AbilityWrite));
+    let still_writable = pat.restrict_to_spaces(&[s1.clone(), s3.clone()].into());
+    assert_eq!(still_writable.spaces().len(), 1);
+    assert!(still_writable.spaces().contains_key(&s1));
+    assert!(still_writable.has_cap(Cap::AbilityWrite));
+    let viewer_only = pat.restrict_to_spaces(&[s2.clone()].into());
+    assert_eq!(viewer_only.spaces().len(), 1);
+    assert!(!viewer_only.has_cap(Cap::AbilityWrite));
+    let empty_spaces = pat.restrict_to_spaces(&BTreeSet::new());
+    assert!(empty_spaces.spaces().is_empty());
+    assert!(!empty_spaces.has_cap(Cap::AbilityWrite));
+
+    // (3) Purged cross-space carriers must fail ResourceNotFound BEFORE
+    //     authorize(auth) so they never flip BranchTaint.
+    let clean_agent = owner
+        .for_agent_run(
+            AgentRunId::from_bytes([8; 16]),
+            s1.clone(),
+            ChatAudience::Personal,
+            grants(SpaceRole::Owner),
+        )
+        .unwrap();
+    let purged_doc = ClassifiedDocument::from_canonical(
+        NoteRef {
+            space_id: s2.clone(),
+            note_id: NoteId::from_bytes([4; 16]),
+        },
+        RevisionId::from_bytes([4; 16]),
+        facts(2, DocClass::UserDoc),
+        Lifecycle::Purged,
+        "purged".into(),
+        ContentDigest::from_bytes([4; 32]),
+    )
+    .unwrap();
+    assert_eq!(
+        purged_doc.metadata().listing(&clean_agent).unwrap_err(),
+        DomainError::ResourceNotFound
+    );
+    assert_eq!(
+        purged_doc.explicit_read(&clean_agent).unwrap_err(),
+        DomainError::ResourceNotFound
+    );
+    let mut ab_facts = facts(2, DocClass::Skill);
+    ab_facts.ability_package = Some(AbilityId::from_bytes([5; 16]));
+    let purged_ability = ClassifiedAbilityResource::from_canonical(
+        AbilityResourceRef {
+            space: s2.clone(),
+            ability: AbilityId::from_bytes([5; 16]),
+            package_revision: RevisionId::from_bytes([5; 16]),
+            resource: AbilityResourceName::Entrypoint,
+        },
+        AbilityResourceProvenance {
+            current: AbilityResourceLocation {
+                placement: AbilityPlacement::OwnedSpace(s2.clone()),
+                facts: ab_facts.clone(),
+            },
+            published: AbilityResourceLocation {
+                placement: AbilityPlacement::OwnedSpace(s2),
+                facts: ab_facts,
+            },
+            promoted_from: None,
+        },
+        Lifecycle::Purged,
+        "purged skill".into(),
+        ContentDigest::from_bytes([5; 32]),
+    )
+    .unwrap();
+    assert_eq!(
+        purged_ability.explicit_read(&clean_agent).unwrap_err(),
+        DomainError::ResourceNotFound
+    );
+    assert!(
+        !clean_agent.taint().is_tainted(),
+        "reading purged cross-space carriers must not flip BranchTaint"
+    );
+}

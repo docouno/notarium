@@ -95,9 +95,15 @@ async fn admit_proposal_targets(
             corpus::admit_provider_note_read(call, &scope, &note)
                 .await
                 .map_err(collapse)?;
+            let owner_scope = planning.space(scope.scope().clone())?;
+            let owner_note =
+                corpus::note_in_space_preflight(planning, &owner_scope, &note_id).await?;
+            corpus::admit_note_write(planning, &owner_scope, &owner_note).await?;
+            note_tools::authorize_note_write(&owner_scope, &owner_note.facts)?;
             note_tools::preflight_proposal(call, planning, call.tool, args).await
         }
         ToolName::CreateNote | ToolName::CreateNotes => {
+            let has_links = note_tools::preflight_proposal(call, planning, call.tool, args).await?;
             let handle = args["project"]
                 .as_str()
                 .ok_or_else(|| invalid(ValidationReason::InvalidQuery))?;
@@ -126,10 +132,23 @@ async fn admit_proposal_targets(
             )
             .await
             .map_err(collapse)?;
-            note_tools::preflight_proposal(call, planning, call.tool, args).await
+            let owner_scope = planning.space(scope.scope().clone())?;
+            let owner_write_scope = owner_scope.clone().restrict_to_project(&project.folder)?;
+            let facts = notarium_core::auth::ResourceFacts {
+                space: folder.space,
+                class: notarium_core::classes::DocClass::UserDoc,
+                project: Some(project.folder.folder_id.clone()),
+                ancestor_folders: folder.ancestor_folders,
+                folder_write_locked: folder.write_locked,
+                ability_package: None,
+            };
+            owner_write_scope
+                .auth()
+                .authorize_direct_write(&facts, &facts)?;
+            Ok(has_links)
         }
         ToolName::Link => {
-            organize::validate_link_proposal_input(call.tool, args)?;
+            let probes = organize::validate_link_proposal_input(call.tool, args)?;
             let note_id = reference(args, "from")?;
             let (scope, note) = corpus::locate_note_preflight(call, &note_id)
                 .await
@@ -137,26 +156,23 @@ async fn admit_proposal_targets(
             corpus::admit_provider_note_read(call, &scope, &note)
                 .await
                 .map_err(collapse)?;
-            Ok(true)
+            let owner_scope = planning.space(scope.scope().clone())?;
+            let owner_note =
+                corpus::note_in_space_preflight(planning, &owner_scope, &note_id).await?;
+            corpus::admit_note_write(planning, &owner_scope, &owner_note).await?;
+            organize::authorize_link_source_owner(&owner_scope, &owner_note.facts)?;
+            Ok(probes)
         }
-        ToolName::LinkMany => {
-            organize::validate_link_proposal_input(call.tool, args)?;
-            Ok(true)
-        }
+        ToolName::LinkMany => organize::validate_link_proposal_input(call.tool, args),
         ToolName::RememberAboutUser => {
-            let _: MemoryArgs = super::decode(args.clone())?;
-            let target = MemoryTarget::User {
-                owner: call.auth.principal().clone(),
-            };
-            let category = args
-                .get("category")
-                .and_then(Value::as_str)
-                .unwrap_or("general")
-                .to_owned();
+            let parsed = MemoryArgs::parse(args.clone())?;
+            let target = parsed
+                .resolve_target(call, ToolName::RememberAboutUser)
+                .await?;
             let snapshot = call
                 .registry
                 .control
-                .inspect_memory_target(planning.account(), target, category)
+                .inspect_memory_target(planning.account(), target, parsed.category().to_owned())
                 .await
                 .map_err(collapse)?;
             if call
@@ -172,27 +188,42 @@ async fn admit_proposal_targets(
                 space_id: scope.scope().space_id.clone(),
                 folder_id: snapshot.parent,
             };
-            let required_class = args
-                .get("versionToken")
-                .filter(|v| !v.is_null())
-                .map(|_| notarium_core::classes::DocClass::AgentMemory);
+            let required_class = parsed
+                .has_version_token()
+                .then_some(notarium_core::classes::DocClass::AgentMemory);
             corpus::admit_folder_boundary(call, &scope, &folder_ref, None, &[], required_class)
                 .await
                 .map_err(collapse)?;
             Ok(true)
         }
         ToolName::RememberAboutProject => {
-            let _: MemoryArgs = super::decode(args.clone())?;
-            let handle = args["project"]
-                .as_str()
-                .ok_or_else(|| invalid(ValidationReason::InvalidQuery))?;
-            let project = session::resolve_project(call, handle)
+            let parsed = MemoryArgs::parse(args.clone())?;
+            let target = parsed
+                .resolve_target(call, ToolName::RememberAboutProject)
                 .await
                 .map_err(collapse)?;
-            let has_version_token = args.get("versionToken").is_some_and(|v| !v.is_null());
-            super::memory::admit_project_boundary(call, &project.folder, has_version_token)
-                .await
-                .map_err(collapse)?;
+            let MemoryTarget::Project { folder } = &target else {
+                return Err(invalid(ValidationReason::InvalidQuery));
+            };
+            let scope =
+                super::memory::admit_project_boundary(call, folder, parsed.has_version_token())
+                    .await
+                    .map_err(collapse)?;
+            let owner_scope = planning.space(scope.scope().clone())?;
+            let info = call
+                .registry
+                .catalog
+                .folder(planning.account(), folder.clone())
+                .await?;
+            let facts = notarium_core::auth::ResourceFacts {
+                space: info.space,
+                class: notarium_core::classes::DocClass::AgentMemory,
+                project: Some(folder.folder_id.clone()),
+                ancestor_folders: info.ancestor_folders,
+                folder_write_locked: info.write_locked,
+                ability_package: None,
+            };
+            owner_scope.auth().authorize_direct_write(&facts, &facts)?;
             Ok(true)
         }
         _ => Err(invalid(ValidationReason::InvalidQuery)),

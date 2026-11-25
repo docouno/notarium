@@ -1783,3 +1783,328 @@ async fn postgres_concurrent_authored_preferences_and_promotion_merge_cas() {
     ))
     .await;
 }
+
+async fn account_preference_replay_enforces_live_placement_authority(pg: bool) {
+    let _serial = AUTH_TEST_LOCK.lock().await;
+    let fixture = Fixture::new(pg, "abilities_account_pref_replay").await;
+    let service = fixture.service(AuthenticationMode::Password).await.unwrap();
+    let bootstrap = service
+        .bootstrap(
+            empty(),
+            budget(),
+            BootstrapAccount {
+                username: "owner".into(),
+                email: None,
+                display_name: "Owner".into(),
+                password: Some(SecretString::new("owner ability replay pass".into())),
+            },
+        )
+        .await
+        .unwrap();
+    let owner_token = bootstrap.session.unwrap().token;
+    async fn resolve_owner(service: &ControlService, token: &SecretString) -> AccountContext {
+        let mut ev = evidence(AuthEvidenceKind::Session, token.expose());
+        ev.evidence = ev.evidence.with_ability_write();
+        AccountContext::new(service.resolve(ev).await.unwrap(), budget())
+    }
+    let owner_ctx = resolve_owner(&service, &owner_token).await;
+    let s1 = service
+        .create_space(
+            owner_ctx.clone(),
+            AccountMutation {
+                identity: identity(&service, &owner_ctx, 1).await,
+                input: CreateSpace {
+                    id: SpaceId::from_bytes([81; 16]),
+                    kind: SpaceKind::Shared,
+                    name: "PrefReplayS1".into(),
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    let owner_ctx = resolve_owner(&service, &owner_token).await;
+    let s2 = service
+        .create_space(
+            owner_ctx.clone(),
+            AccountMutation {
+                identity: identity(&service, &owner_ctx, 2).await,
+                input: CreateSpace {
+                    id: SpaceId::from_bytes([82; 16]),
+                    kind: SpaceKind::Shared,
+                    name: "PrefReplayS2".into(),
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    let owner_ctx = resolve_owner(&service, &owner_token).await;
+
+    let sys_ability = add(
+        &fixture,
+        &s1.space,
+        AbilityPlacement::System,
+        83,
+        "sys-pref",
+        vec![],
+    );
+    let s2_ability = add(
+        &fixture,
+        &s2.space,
+        AbilityPlacement::OwnedSpace(s2.space.id.clone()),
+        84,
+        "s2-pref",
+        vec![],
+    );
+
+    // Owner commits Account-guarded preferences on BOTH System and S2 abilities.
+    let sys_req = AccountMutation {
+        identity: identity(&service, &owner_ctx, 10).await,
+        input: AbilityPreferenceChange {
+            preference: AbilityPreferenceUpdate {
+                ability: sys_ability.clone(),
+                enabled: false,
+            },
+            expected: AbilityPreferenceGuard::Account,
+        },
+    };
+    let sys_committed = service
+        .set_ability_preference(owner_ctx.clone(), sys_req.clone())
+        .await
+        .unwrap();
+    let s2_owner_req = AccountMutation {
+        identity: identity(&service, &owner_ctx, 11).await,
+        input: AbilityPreferenceChange {
+            preference: AbilityPreferenceUpdate {
+                ability: s2_ability.clone(),
+                enabled: false,
+            },
+            expected: AbilityPreferenceGuard::Account,
+        },
+    };
+    let _ = service
+        .set_ability_preference(owner_ctx.clone(), s2_owner_req.clone())
+        .await
+        .unwrap();
+
+    // Mint a PAT with AbilityWrite scoped ONLY to S1 (NOT S2, NOT human_management).
+    let owner_rev = service
+        .account(owner_ctx.clone(), owner_ctx.auth().principal().clone())
+        .await
+        .unwrap()
+        .revision;
+    let s1_pat = service
+        .create_pat(
+            owner_ctx.clone(),
+            CreatePat {
+                name: "s1-only-pat".into(),
+                scope: BearerScope::Write,
+                ability_write: true,
+                selected_spaces: Some(vec![s1.space.id.clone()]),
+                expires_at_ms: None,
+                expected: owner_rev,
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    let s1_pat_ctx = AccountContext::new(
+        service
+            .resolve(PreAuthContext {
+                budget: budget(),
+                evidence: AuthEvidence::new(AuthEvidenceKind::Pat, s1_pat.token.expose().into()),
+            })
+            .await
+            .unwrap(),
+        budget(),
+    );
+
+    // (1) S1-only PAT replaying the owner's committed System preference MUST fail
+    //     AbilityWriteForbidden BEFORE command.replay.
+    assert!(matches!(
+        service
+            .set_ability_preference(s1_pat_ctx.clone(), sys_req.clone())
+            .await,
+        Err(PortError::Domain(DomainError::AbilityWriteForbidden))
+    ));
+    // (2) S1-only PAT replaying the owner's committed S2 preference MUST fail
+    //     AccessDenied BEFORE command.replay.
+    assert!(matches!(
+        service
+            .set_ability_preference(s1_pat_ctx.clone(), s2_owner_req.clone())
+            .await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+    // Positive control: Owner can still replay System preference.
+    let sys_replayed = service
+        .set_ability_preference(owner_ctx.clone(), sys_req)
+        .await
+        .unwrap();
+    assert_eq!(sys_replayed.revision, sys_committed.revision);
+
+    // (3) A PAT with valid S2 write authority commits an S2 preference, then S2
+    //     ability is trashed -> legitimate post-trash replay STILL succeeds.
+    //     Then after an Editor is demoted to Viewer in S2, their S2 PAT replay MUST fail!
+    let editor = service
+        .create_account(
+            owner_ctx.clone(),
+            AccountMutation {
+                identity: identity(&service, &owner_ctx, 12).await,
+                input: NewAccount {
+                    username: "pref-editor".into(),
+                    email: None,
+                    display_name: "Pref Editor".into(),
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    service
+        .change_password(
+            owner_ctx.clone(),
+            ChangePassword {
+                account: editor.id.clone(),
+                current: None,
+                replacement: SecretString::new("pref editor pass".into()),
+                expected: editor.revision,
+            },
+        )
+        .await
+        .unwrap();
+    for (idx, sp) in [(13u8, &s1), (14u8, &s2)] {
+        let rev = service
+            .context_scope(owner_ctx.clone(), ContextScope::Space(sp.space.id.clone()))
+            .await
+            .unwrap()
+            .revision;
+        service
+            .change_membership(
+                SpaceContext::new(owner_ctx.auth().clone(), sp.history.clone(), budget()).unwrap(),
+                MembershipChange {
+                    command: CommandKey::from_bytes([idx; 16]),
+                    member: editor.id.clone(),
+                    role: Some(SpaceRole::Editor),
+                    expected: rev,
+                },
+            )
+            .await
+            .unwrap();
+    }
+    let ed_login = service
+        .login(
+            budget(),
+            PasswordLogin {
+                identifier: "pref-editor".into(),
+                password: SecretString::new("pref editor pass".into()),
+            },
+        )
+        .await
+        .unwrap();
+    let ed_session = AccountContext::new(
+        service
+            .resolve(evidence(AuthEvidenceKind::Session, ed_login.token.expose()))
+            .await
+            .unwrap(),
+        budget(),
+    );
+    let ed_rev = service
+        .account(ed_session.clone(), editor.id.clone())
+        .await
+        .unwrap()
+        .revision;
+    let ed_pat = service
+        .create_pat(
+            ed_session.clone(),
+            CreatePat {
+                name: "ed-s1-s2-pat".into(),
+                scope: BearerScope::Write,
+                ability_write: true,
+                selected_spaces: Some(vec![s1.space.id.clone(), s2.space.id.clone()]),
+                expires_at_ms: None,
+                expected: ed_rev,
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    let ed_pat_ctx = AccountContext::new(
+        service
+            .resolve(PreAuthContext {
+                budget: budget(),
+                evidence: AuthEvidence::new(AuthEvidenceKind::Pat, ed_pat.token.expose().into()),
+            })
+            .await
+            .unwrap(),
+        budget(),
+    );
+    let ed_req = AccountMutation {
+        identity: identity(&service, &ed_session, 15).await,
+        input: AbilityPreferenceChange {
+            preference: AbilityPreferenceUpdate {
+                ability: s2_ability.clone(),
+                enabled: false,
+            },
+            expected: AbilityPreferenceGuard::Account,
+        },
+    };
+    let ed_committed = service
+        .set_ability_preference(ed_pat_ctx.clone(), ed_req.clone())
+        .await
+        .unwrap();
+    // Trash S2 ability from catalog: while still Editor, exact replay succeeds!
+    fixture
+        .catalog
+        .ability_entries
+        .lock()
+        .unwrap()
+        .retain(|entry| entry.reference != s2_ability);
+    let ed_replayed = service
+        .set_ability_preference(ed_pat_ctx.clone(), ed_req.clone())
+        .await
+        .unwrap();
+    assert_eq!(ed_replayed.revision, ed_committed.revision);
+
+    // Demote editor to Viewer in S2 (keeping Editor in S1 so PAT still has AbilityWrite!).
+    let s2_rev = service
+        .context_scope(owner_ctx.clone(), ContextScope::Space(s2.space.id.clone()))
+        .await
+        .unwrap()
+        .revision;
+    service
+        .change_membership(
+            SpaceContext::new(owner_ctx.auth().clone(), s2.history.clone(), budget()).unwrap(),
+            MembershipChange {
+                command: CommandKey::from_bytes([16; 16]),
+                member: editor.id.clone(),
+                role: Some(SpaceRole::Viewer),
+                expected: s2_rev,
+            },
+        )
+        .await
+        .unwrap();
+    // Replaying the S2 preference with the now-Viewer PAT MUST fail AccessDenied!
+    assert!(matches!(
+        service.set_ability_preference(ed_pat_ctx, ed_req).await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+
+    drop(service);
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn sqlite_account_preference_replay_enforces_live_placement_authority() {
+    Box::pin(account_preference_replay_enforces_live_placement_authority(
+        false,
+    ))
+    .await;
+}
+#[tokio::test]
+async fn postgres_account_preference_replay_enforces_live_placement_authority() {
+    Box::pin(account_preference_replay_enforces_live_placement_authority(
+        true,
+    ))
+    .await;
+}

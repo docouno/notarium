@@ -39,21 +39,19 @@ const MAX_PROVIDER_ABILITY_SCAN_PAGES: usize = 64;
 const PROVIDER_ABILITY_SCAN_PAGE_SIZE: u16 = 100;
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
-struct AbilitySortKey {
-    is_system: bool,
-    space: String,
-    id: String,
+enum AbilitySortKey {
+    Owned { space: String, id: String },
+    System { rank: usize },
 }
 
 fn ability_sort_key(descriptor: &AbilityDescriptor) -> Result<AbilitySortKey, PortError> {
     match (&descriptor.reference.placement, &descriptor.entrypoint) {
-        (AbilityPlacement::System, _) => Ok(AbilitySortKey {
-            is_system: true,
-            space: String::new(),
-            id: descriptor.reference.id.as_str().to_owned(),
-        }),
-        (_, Some(entry)) => Ok(AbilitySortKey {
-            is_system: false,
+        (AbilityPlacement::System, _) => {
+            let rank = crate::abilities::system_ability_rank(&descriptor.reference.id)
+                .ok_or_else(|| invalid(ValidationReason::InvalidState))?;
+            Ok(AbilitySortKey::System { rank })
+        }
+        (_, Some(entry)) => Ok(AbilitySortKey::Owned {
             space: entry.space_id.as_str().to_owned(),
             id: descriptor.reference.id.as_str().to_owned(),
         }),
@@ -398,24 +396,129 @@ async fn resolve_selector_for_account(
     Ok(by_name)
 }
 
+fn role_placement_matches_project(
+    placement: &AbilityPlacement,
+    project: Option<&FolderRef>,
+) -> bool {
+    match placement {
+        AbilityPlacement::OwnedProject(role_project) => project == Some(role_project),
+        AbilityPlacement::OwnedSpace(role_space) => {
+            project.is_none_or(|active| &active.space_id == role_space)
+        }
+        AbilityPlacement::OwnedPersonal(_) | AbilityPlacement::System => true,
+    }
+}
+
+async fn provider_skill_spaces(
+    call: &ToolCallContext<'_>,
+    project: Option<&FolderRef>,
+) -> Result<BTreeSet<SpaceId>, PortError> {
+    let mut allowed = BTreeSet::new();
+    for (space_id, grant) in call.auth.spaces() {
+        if !grant.read_classes.contains(&DocClass::Skill) {
+            continue;
+        }
+        let probe_project = project.filter(|p| &p.space_id == space_id).cloned();
+        if corpus::space_admits_skill(call, space_id, probe_project).await? {
+            allowed.insert(space_id.clone());
+        }
+    }
+    Ok(allowed)
+}
+
+async fn provider_placement_visible(
+    call: &ToolCallContext<'_>,
+    descriptor: &AbilityDescriptor,
+    project: Option<&FolderRef>,
+) -> Result<bool, PortError> {
+    let EgressTarget::InAppProvider {
+        primary_project, ..
+    } = &call.target
+    else {
+        return Ok(true);
+    };
+    let reference = &descriptor.reference;
+    if reference.placement == AbilityPlacement::System {
+        let Some(space) = call.auth.pinned_write_space() else {
+            return Ok(false);
+        };
+        return corpus::space_admits_skill(call, space, primary_project.clone()).await;
+    }
+    let Some(entry) = &descriptor.entrypoint else {
+        return Ok(false);
+    };
+    let scope = match session::space(call, &entry.space_id).await {
+        Ok(scope) => scope,
+        Err(error) if visible_error(&error) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let req_project = requested_project(call, reference, &entry.space_id, project);
+    let selection = match call.provider_selection(&scope, req_project).await {
+        Ok(selection) => selection,
+        Err(error) if visible_error(&error) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let Some(sel) = selection else {
+        return Ok(true);
+    };
+    if !sel.policy.allowed_classes.contains(&DocClass::Skill) {
+        return Ok(false);
+    }
+    if let Some(required) = &sel.project_only
+        && (!reference.placement.in_project(required)
+            || descriptor
+                .promoted_from
+                .as_ref()
+                .is_some_and(|prev| !prev.placement.in_project(required)))
+    {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
 async fn raw_reference_for_call(
     call: &ToolCallContext<'_>,
     id: AbilityId,
     project: Option<&FolderRef>,
+    allow_unpinned_projects: bool,
 ) -> Result<Option<AbilityRef>, PortError> {
     let account = call.account();
     if matches!(call.target, EgressTarget::ExternalMcp) {
         return raw_reference_for_account(call.registry, &account, id).await;
     }
-    let candidates = call
+    let allowed = provider_skill_spaces(call, project).await?;
+    let discover_account =
+        AccountContext::new(call.auth.restrict_to_spaces(&allowed), call.budget());
+    let mut candidates = call
         .registry
         .catalog
-        .locate_ability(account.clone(), id)
+        .locate_ability(discover_account, id.clone())
         .await?;
+    if allow_unpinned_projects && project.is_none() {
+        for (space_id, grant) in call.auth.spaces() {
+            if allowed.contains(space_id) || !grant.read_classes.contains(&DocClass::Skill) {
+                continue;
+            }
+            let scoped = AccountContext::new(call.auth.restrict_to_space(space_id)?, call.budget());
+            for candidate in call
+                .registry
+                .catalog
+                .locate_ability(scoped, id.clone())
+                .await?
+            {
+                if matches!(
+                    candidate.reference.placement,
+                    AbilityPlacement::OwnedProject(_)
+                ) {
+                    candidates.push(candidate);
+                }
+            }
+        }
+    }
     if candidates.is_empty() {
         return Ok(None);
     }
-    let mut visible = None;
+    let mut visible: Option<AbilityRef> = None;
     for candidate in candidates {
         let inspection = match call
             .registry
@@ -432,6 +535,11 @@ async fn raw_reference_for_call(
         }
         match read_body_inner(call, &inspection.descriptor, project, false).await {
             Ok(_) => {
+                if let Some(existing) = &visible
+                    && existing.identity() == inspection.descriptor.reference.identity()
+                {
+                    continue;
+                }
                 if visible.replace(inspection.descriptor.reference).is_some() {
                     return Err(invalid(ValidationReason::ScopeMismatch));
                 }
@@ -463,7 +571,7 @@ async fn resolve_selector_for_call(
             .await;
     }
     if let Ok(id) = AbilityId::parse_v1(selector)
-        && let Some(reference) = raw_reference_for_call(call, id, project.as_ref()).await?
+        && let Some(reference) = raw_reference_for_call(call, id, project.as_ref(), false).await?
     {
         return call
             .registry
@@ -471,23 +579,91 @@ async fn resolve_selector_for_call(
             .resolve_ability(account, AbilitySelection::Exact { reference, project })
             .await;
     }
-    let by_name = call
+    // Resolve name selectors strictly over provider-visible Spaces/placements so
+    // unconsented Spaces cannot shadow consented Personal/Space abilities or
+    // trigger cross-space ambiguity oracles.
+    let allowed = provider_skill_spaces(call, project.as_ref()).await?;
+    let discover_account =
+        AccountContext::new(call.auth.restrict_to_spaces(&allowed), call.budget());
+    let query_project = project
+        .as_ref()
+        .filter(|p| allowed.contains(&p.space_id))
+        .cloned();
+    let name = notarium_syntax::unicode::lookup_key(selector);
+    let page = call
         .registry
         .control
-        .resolve_ability(
-            account.clone(),
-            AbilitySelection::Name {
-                name: notarium_syntax::unicode::lookup_key(selector),
-                kind,
-                project: project.clone(),
+        .discover_abilities(
+            discover_account.clone(),
+            AbilityQuery {
+                page: ControlPageRequest::new(200, None)?,
+                project: query_project.clone(),
+                kind: None,
+                name: Some(name),
+                authoring: true,
             },
         )
         .await?;
+    if page.continuation.is_some() {
+        return Err(invalid(ValidationReason::BudgetExceeded));
+    }
+    let mut winners: Vec<AbilityRef> = Vec::new();
+    let mut best_prec: Option<u8> = None;
+    for inspection in page.items {
+        let reference = &inspection.descriptor.reference;
+        if !role_placement_matches_project(&reference.placement, project.as_ref()) {
+            continue;
+        }
+        if !provider_placement_visible(call, &inspection.descriptor, project.as_ref()).await? {
+            continue;
+        }
+        let prec = reference.placement.precedence();
+        match best_prec {
+            Some(best) if prec > best => continue,
+            Some(best) if prec == best => {
+                if winners
+                    .iter()
+                    .all(|existing| existing.identity() != reference.identity())
+                {
+                    winners.push(reference.clone());
+                }
+            }
+            _ => {
+                best_prec = Some(prec);
+                winners.clear();
+                winners.push(reference.clone());
+            }
+        }
+    }
+    let by_name = match winners.len() {
+        0 => AbilityResolution::Missing,
+        1 => {
+            let reference = winners.pop().expect("single winner");
+            let exact = call
+                .registry
+                .control
+                .resolve_ability(
+                    discover_account,
+                    AbilitySelection::Exact {
+                        reference,
+                        project: query_project,
+                    },
+                )
+                .await?;
+            match exact {
+                AbilityResolution::Resolved(value) if value.kind != kind => {
+                    AbilityResolution::WrongKind
+                }
+                other => other,
+            }
+        }
+        _ => return Err(invalid(ValidationReason::InvalidState)),
+    };
     if !matches!(by_name, AbilityResolution::Missing) {
         return Ok(by_name);
     }
     if let Ok(id) = AbilityId::parse(selector)
-        && let Some(reference) = raw_reference_for_call(call, id, project.as_ref()).await?
+        && let Some(reference) = raw_reference_for_call(call, id, project.as_ref(), false).await?
     {
         return call
             .registry
@@ -506,7 +682,7 @@ async fn inspect_with_project(
     let reference: AbilityRef = if text.starts_with("ar1:") {
         parse_token(text, "ar1:", MAX_TOKEN_BYTES)?
     } else {
-        raw_reference_for_call(call, AbilityId::parse(text)?, project)
+        raw_reference_for_call(call, AbilityId::parse(text)?, project, true)
             .await?
             .ok_or(DomainError::ResourceNotFound)?
     };
@@ -1027,25 +1203,17 @@ async fn list(
         };
         // Narrow owned-space discovery to Skill-consented Spaces whenever space-level
         // consent governs visibility so unconsented Spaces never enter catalog paging.
-        let discover_auth = if args.source == Some(Source::System) {
-            call.auth.restrict_to_spaces(&BTreeSet::new())
+        let (discover_auth, query_project) = if args.source == Some(Source::System) {
+            (call.auth.restrict_to_spaces(&BTreeSet::new()), None)
         } else if view == View::Runtime || project.is_some() {
-            let mut allowed = BTreeSet::new();
-            for (space_id, grant) in call.auth.spaces() {
-                if !grant.read_classes.contains(&DocClass::Skill) {
-                    continue;
-                }
-                let probe_project = project
-                    .as_ref()
-                    .filter(|p| &p.space_id == space_id)
-                    .cloned();
-                if corpus::space_admits_skill(call, space_id, probe_project).await? {
-                    allowed.insert(space_id.clone());
-                }
-            }
-            call.auth.restrict_to_spaces(&allowed)
+            let allowed = provider_skill_spaces(call, project.as_ref()).await?;
+            let query_project = project
+                .as_ref()
+                .filter(|p| allowed.contains(&p.space_id))
+                .cloned();
+            (call.auth.restrict_to_spaces(&allowed), query_project)
         } else {
-            call.auth.clone()
+            (call.auth.clone(), None)
         };
         let discover_account = AccountContext::new(discover_auth, call.budget());
         let cap = usize::from(limit);
@@ -1063,7 +1231,7 @@ async fn list(
                             PROVIDER_ABILITY_SCAN_PAGE_SIZE,
                             control_cursor,
                         )?,
-                        project: project.clone(),
+                        project: query_project.clone(),
                         kind: args.kind.map(Into::into),
                         name: None,
                         authoring: view == View::Authoring,
@@ -1355,24 +1523,86 @@ async fn resolve(
     Ok(ability)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn bind_chat_role(
     registry: &ToolRegistry,
     owner_account: AccountContext,
-    run_account: AccountContext,
+    primary: SpaceContext,
+    selection: &ProviderSelection,
     episode_id: &EpisodeId,
     selector: &str,
     project: Option<&FolderRef>,
     run: &AgentRunId,
 ) -> Result<(), PortError> {
+    let run_auth = primary.auth().with_preflight_taint();
+    let run_account = AccountContext::new(run_auth.clone(), primary.budget.clone());
     // Resolve the requested role inside the run's narrowed Space/Audience/Project
-    // authority so SpaceGroup threads neither collide with unrelated Spaces nor
-    // durably bind a role unreachable to `runtime_abilities::interactive`.
+    // and Skill-consented provider authority so unconsented Spaces neither shadow
+    // consented roles nor durably bind a role unreachable to `runtime_abilities`.
+    let resolve_account = if selector.starts_with("ar1:") {
+        run_account
+    } else {
+        let mut allowed = BTreeSet::new();
+        for (space_id, grant) in run_auth.spaces() {
+            if !grant.read_classes.contains(&DocClass::Skill) {
+                continue;
+            }
+            if space_id == &primary.scope().space_id {
+                if selection.policy.allowed_classes.contains(&DocClass::Skill) {
+                    allowed.insert(space_id.clone());
+                }
+                continue;
+            }
+            let live = match registry
+                .catalog
+                .space(primary.budget.clone(), space_id.clone())
+                .await
+            {
+                Ok(live) => live,
+                Err(error) if visible_error(&error) => continue,
+                Err(error) => return Err(error),
+            };
+            if live.space.lifecycle != notarium_core::auth::SpaceLifecycle::Active {
+                continue;
+            }
+            let space_ctx =
+                SpaceContext::new(run_auth.clone(), live.history, primary.budget.clone())?;
+            let probe_project = project.filter(|p| &p.space_id == space_id).cloned();
+            match registry
+                .control
+                .select_provider(
+                    space_ctx,
+                    SelectProvider {
+                        kind: PreferenceModelKind::Completion,
+                        resource: Some(selection.provider.clone()),
+                        model: Some(selection.model.clone()),
+                        project: probe_project,
+                    },
+                )
+                .await
+            {
+                Ok(chosen) if chosen.policy.allowed_classes.contains(&DocClass::Skill) => {
+                    allowed.insert(space_id.clone());
+                }
+                Ok(_) => (),
+                Err(error) if visible_error(&error) => (),
+                Err(error) => return Err(error),
+            }
+        }
+        AccountContext::new(
+            run_auth.restrict_to_spaces(&allowed),
+            primary.budget.clone(),
+        )
+    };
+    let resolve_project = project
+        .filter(|p| resolve_account.auth().spaces().contains_key(&p.space_id))
+        .cloned();
     let ability = match resolve_selector_for_account(
         registry,
-        &run_account,
+        &resolve_account,
         selector,
         AbilityKind::Role,
-        project.cloned(),
+        resolve_project,
     )
     .await?
     {
@@ -1385,6 +1615,10 @@ pub(crate) async fn bind_chat_role(
         AbilityResolution::Stale => return Err(invalid(ValidationReason::SourceMismatch)),
         _ => return Err(DomainError::ResourceNotFound.into()),
     };
+    // Preflight provider egress and ClassEgressFence before committing BindRole so
+    // an unconsented or Skill-disallowed role cannot durably poison subsequent turns.
+    super::runtime_abilities::preflight_role(registry, &primary, selection, &ability, project)
+        .await?;
     let episode = registry
         .control
         .get_episode(owner_account.clone(), episode_id.clone())

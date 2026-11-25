@@ -588,8 +588,10 @@ impl EngineAuthContext {
     pub fn restrict_to_spaces(&self, allowed: &BTreeSet<SpaceId>) -> Self {
         let mut spaces = self.spaces.clone();
         spaces.retain(|space_id, _| allowed.contains(space_id));
+        let ability_write = self.ability_write && Self::has_writable_space(&spaces);
         Self {
             spaces,
+            ability_write,
             ..self.clone()
         }
     }

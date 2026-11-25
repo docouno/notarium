@@ -50,6 +50,12 @@ pub(crate) fn is_reserved_ability_name(name: &str) -> bool {
     BUILTINS.iter().any(|builtin| builtin.name == key)
 }
 
+/// Stable catalog emission ordinal of a shipped built-in ability so provider
+/// pagination cursors stay strictly monotonic with `system_page`.
+pub(crate) fn system_ability_rank(id: &AbilityId) -> Option<usize> {
+    BUILTINS.iter().position(|builtin| builtin.id() == *id)
+}
+
 /// Reads the exact built-in revision. The text is a typed system source so it
 /// can be pinned and checked again by the provider rather than cast to a prompt.
 pub fn read_system_ability(
@@ -524,5 +530,80 @@ impl<C: ProviderEgressCatalogPort + ?Sized> ProviderEgressCatalogPort for System
             };
             Ok(Box::new(SystemEgressLease { inner, current }) as Box<dyn ProviderEgressLease>)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use notarium_core::auth::{EngineAuthContext, SpaceGrant, SpaceRole, VerifiedHuman};
+    use notarium_core::classes::DocClass;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn system_builtins_and_pages_follow_strictly_monotonic_ranks() {
+        let expected_ranks: Vec<usize> = (0..BUILTINS.len()).collect();
+        let actual_ranks: Vec<usize> = BUILTINS
+            .iter()
+            .map(|b| system_ability_rank(&b.id()).expect("builtin rank"))
+            .collect();
+        assert_eq!(actual_ranks, expected_ranks);
+        let mut spaces = BTreeMap::new();
+        spaces.insert(
+            SpaceId::from_bytes([1; 16]),
+            SpaceGrant {
+                role: SpaceRole::Owner,
+                read_classes: DocClass::all(),
+                write_classes: DocClass::all(),
+                project_root: None,
+            },
+        );
+        let auth = EngineAuthContext::for_human(
+            VerifiedHuman::attest(
+                PrincipalId::from_bytes([2; 16]),
+                GrantId::from_bytes([3; 16]),
+                spaces,
+                true,
+            )
+            .with_human_management(true),
+        );
+        let ctx = AccountContext::new(
+            auth,
+            CallBudget {
+                request: RequestId::from_bytes([4; 16]),
+                cancellation: Cancellation::default(),
+                remaining: std::time::Duration::from_secs(5),
+            },
+        );
+        let query = AbilityQuery {
+            page: ControlPageRequest::new(1, None).unwrap(),
+            project: None,
+            kind: None,
+            name: None,
+            authoring: false,
+        };
+        for limit in 1..=BUILTINS.len() {
+            let mut seen_ranks = Vec::new();
+            let mut cursor: Option<String> = None;
+            loop {
+                let raw_cursor = cursor
+                    .as_deref()
+                    .and_then(|c| c.strip_prefix(SYSTEM_CURSOR_PREFIX));
+                let page = system_page(&ctx, &query, raw_cursor, limit).unwrap();
+                seen_ranks.extend(
+                    page.items
+                        .into_iter()
+                        .map(|d| system_ability_rank(&d.reference.id).unwrap()),
+                );
+                match page.continuation {
+                    Some(next) => cursor = Some(next),
+                    None => break,
+                }
+            }
+            assert_eq!(
+                seen_ranks, expected_ranks,
+                "limit={limit} must yield all builtins in strictly monotonic rank order"
+            );
+        }
     }
 }

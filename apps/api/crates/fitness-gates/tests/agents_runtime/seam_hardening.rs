@@ -9442,6 +9442,326 @@ async fn space_group_role_isolation_and_ability_list_oracle_probes(
         .structured_content;
     assert_eq!(page2["items"].as_array().unwrap().len(), 1);
     assert_ne!(page2["items"][0]["ref"], page1["items"][0]["ref"]);
+
+    // Drain ALL remaining pages of InAppProvider list_abilities(kind="role", limit=1)
+    // and verify (a) both system roles `grooming` and `research` appear with zero
+    // duplicates and (b) unconsented S2 roles NEVER appear on any page.
+    let mut role_names = vec![
+        page1["items"][0]["name"].as_str().unwrap().to_owned(),
+        page2["items"][0]["name"].as_str().unwrap().to_owned(),
+    ];
+    let mut role_refs = vec![
+        page1["items"][0]["ref"].as_str().unwrap().to_owned(),
+        page2["items"][0]["ref"].as_str().unwrap().to_owned(),
+    ];
+    let mut cursor = page2["nextCursor"].as_str().map(ToOwned::to_owned);
+    let mut step_tag = 3u8;
+    while let Some(next) = cursor {
+        let p = local
+            .registry
+            .call_tool(
+                mk_ctx(step_tag),
+                "list_abilities",
+                json!({ "view": "authoring", "kind": "role", "limit": 1, "cursor": next }),
+            )
+            .await
+            .unwrap()
+            .structured_content;
+        step_tag += 1;
+        let items = p["items"].as_array().unwrap();
+        assert!(
+            !items.is_empty(),
+            "provider pagination must never emit empty page: {p}"
+        );
+        for item in items {
+            role_names.push(item["name"].as_str().unwrap().to_owned());
+            role_refs.push(item["ref"].as_str().unwrap().to_owned());
+        }
+        cursor = p["nextCursor"].as_str().map(ToOwned::to_owned);
+    }
+    let unique_refs: std::collections::BTreeSet<&str> =
+        role_refs.iter().map(String::as_str).collect();
+    assert_eq!(
+        unique_refs.len(),
+        role_refs.len(),
+        "InAppProvider list_abilities pagination must never emit duplicate refs: {role_names:?}"
+    );
+    assert!(
+        role_names.iter().any(|n| n == "grooming") && role_names.iter().any(|n| n == "research"),
+        "all built-in system roles must remain reachable across limit=1 pages: {role_names:?}"
+    );
+    assert!(
+        !role_names.iter().any(|n| n == "s2-extra-unconsented-role"),
+        "unconsented S2 roles must never leak into InAppProvider list_abilities: {role_names:?}"
+    );
+
+    // Also verify source="system", limit=3 pagination returns all 4 built-in system
+    // abilities without duplicating research/research-evidence or dropping grooming-evidence.
+    let mut sys_names = Vec::new();
+    let mut sys_cursor: Option<String> = None;
+    loop {
+        let mut args = json!({ "view": "runtime", "source": "system", "limit": 3 });
+        if let Some(c) = &sys_cursor {
+            args["cursor"] = json!(c);
+        }
+        let p = local
+            .registry
+            .call_tool(mk_ctx(step_tag), "list_abilities", args)
+            .await
+            .unwrap()
+            .structured_content;
+        step_tag += 1;
+        for item in p["items"].as_array().unwrap() {
+            sys_names.push(item["name"].as_str().unwrap().to_owned());
+        }
+        sys_cursor = p["nextCursor"].as_str().map(ToOwned::to_owned);
+        if sys_cursor.is_none() {
+            break;
+        }
+    }
+    assert_eq!(
+        sys_names.len(),
+        4,
+        "must yield all 4 system builtins without duplicates: {sys_names:?}"
+    );
+    for expected in [
+        "grooming",
+        "grooming-evidence",
+        "research",
+        "research-evidence",
+    ] {
+        assert!(
+            sys_names.iter().any(|n| n == expected),
+            "missing system builtin {expected} in {sys_names:?}"
+        );
+    }
+
+    // (4) Unconsented Spaces must NOT shadow consented Personal/Space roles or
+    //     create InvalidState ambiguity oracles in InAppProvider use_role, nor
+    //     allow bind_chat_role to durably poison a Personal thread's episode.
+    let s3 = fixture
+        .control
+        .create_space(
+            owner.clone(),
+            AccountMutation {
+                identity: acc_id(0x30).await,
+                input: CreateSpace {
+                    id: SpaceId::from_bytes([0x5A, 0x30, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3]),
+                    kind: SpaceKind::Shared,
+                    name: "Unconsented S3".into(),
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    let owner = fresh_owner(fixture).await;
+    let mut s2_shadow_ref = String::new();
+    for (tag, name, placement, instructions) in [
+        (
+            0x31u8,
+            "shared-shadow-role",
+            json!({ "home": "personal" }),
+            "PERSONAL-SHADOW-WINNER-MARKER",
+        ),
+        (
+            0x32u8,
+            "shared-shadow-role",
+            json!({ "home": "space", "space": s2.slug }),
+            "S2-UNCONSENTED-SHADOW-MARKER",
+        ),
+        (
+            0x33u8,
+            "dual-unconsented-role",
+            json!({ "home": "space", "space": s2.slug }),
+            "S2-DUAL-UNCONSENTED",
+        ),
+        (
+            0x34u8,
+            "dual-unconsented-role",
+            json!({ "home": "space", "space": s3.slug }),
+            "S3-DUAL-UNCONSENTED",
+        ),
+    ] {
+        let created = call_mcp(
+            &fixture.registry,
+            &owner,
+            [0x5A, tag, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, tag],
+            "create_ability",
+            json!({
+                "kind": "role",
+                "name": name,
+                "description": "Shadowing and oracle isolation test",
+                "instructions": instructions,
+                "placement": placement,
+            }),
+        )
+        .await
+        .unwrap()
+        .structured_content;
+        if tag == 0x32 {
+            s2_shadow_ref = created["ref"].as_str().unwrap().to_owned();
+        }
+    }
+    let run_auth2 = owner
+        .auth()
+        .for_agent_run(
+            AgentRunId::from_bytes([0x5A, 0x35, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+            pscope.space_id.clone(),
+            ChatAudience::Personal,
+            owner.auth().spaces().clone(),
+        )
+        .unwrap();
+    let run_acc2 = AccountContext::new(run_auth2, budget());
+    let mk_ctx2 = |tag: u8| McpInvocationContext {
+        account: run_acc2.clone(),
+        target: EgressTarget::InAppProvider {
+            provider: local.resource.id.clone(),
+            model: local.model.clone(),
+            primary_project: None,
+        },
+        request_key: CommandKey::from_bytes([
+            0x5A, 0x36, tag, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, tag,
+        ]),
+    };
+    // Personal role wins despite unconsented S2 defining the same name.
+    let personal_win = local
+        .registry
+        .call_tool(
+            mk_ctx2(1),
+            "use_role",
+            json!({ "role": "shared-shadow-role" }),
+        )
+        .await
+        .expect("unconsented S2 role must not shadow consented Personal role")
+        .structured_content;
+    assert!(
+        personal_win["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("PERSONAL-SHADOW-WINNER-MARKER")
+    );
+    // Consented S1 role wins despite unconsented S2 defining the same name.
+    let s1_win = local
+        .registry
+        .call_tool(mk_ctx2(2), "use_role", json!({ "role": "group-reviewer" }))
+        .await
+        .expect("unconsented S2 role must not DoS consented S1 role with InvalidState")
+        .structured_content;
+    assert!(
+        s1_win["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("S1-GROUP-REVIEWER-MARKER")
+    );
+    // Duplicate name across two unconsented Spaces collapses uniformly to ResourceNotFound.
+    let oracle_err = local
+        .registry
+        .call_tool(
+            mk_ctx2(3),
+            "use_role",
+            json!({ "role": "dual-unconsented-role" }),
+        )
+        .await;
+    assert!(
+        matches!(
+            oracle_err,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ),
+        "duplicate name across unconsented S2 & S3 must collapse to ResourceNotFound (not InvalidState), got {:?}",
+        oracle_err.as_ref().err()
+    );
+
+    // bind_chat_role on a Personal chat must preflight-reject an unconsented S2
+    // role (by exact ar1: ref) WITHOUT poisoning the episode for role=None turns.
+    let p_thread = ChatThreadId::from_bytes([0x5A, 0x40, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    let p_cmd = |sub: u8| CommandIdentity {
+        scope: pscope.clone(),
+        actor: actor.clone(),
+        key: CommandKey::from_bytes([0x5A, 0x40, sub, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, sub]),
+        hash: ContentDigest::from_bytes([0x5A; 32]),
+    };
+    fixture
+        .canonical
+        .create_chat(
+            personal.clone(),
+            Mutation {
+                identity: p_cmd(1),
+                preconditions: Preconditions::default(),
+                input: CreateChat {
+                    thread: p_thread.clone(),
+                    kind: ChatThreadKind::Personal,
+                    owner: actor.clone(),
+                    project_folder: None,
+                    title: "Personal role egress preflight".into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let p_msg = fixture
+        .canonical
+        .append_chat(
+            personal.clone(),
+            Mutation {
+                identity: p_cmd(2),
+                preconditions: Preconditions::default(),
+                input: AppendChat {
+                    thread: p_thread.clone(),
+                    parent: ThreadEntrySeq::ZERO,
+                    kind: ChatEntryKind::Human,
+                    body: ChatInputBody::Text("Try unconsented S2 role".into()),
+                    tool_calls: vec![],
+                    provenance: None,
+                    interruption: None,
+                    proposed_diff: None,
+                    proposed_effect: None,
+                    referenced_notes: vec![],
+                    tainted: false,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    supervisor
+        .start(
+            owner.clone(),
+            StartChatRun {
+                scope: pscope.clone(),
+                thread: p_thread.clone(),
+                expected_leaf: p_msg.value.seq,
+                options: base_opts(Some(&s2_shadow_ref)),
+            },
+        )
+        .await
+        .unwrap();
+    let p_leaf_after_err = idle_leaf(fixture, personal, &p_thread).await;
+    assert_eq!(
+        p_leaf_after_err, p_msg.value.seq,
+        "unconsented S2 role ref must fail before completion without appending"
+    );
+    supervisor
+        .start(
+            owner.clone(),
+            StartChatRun {
+                scope: pscope.clone(),
+                thread: p_thread.clone(),
+                expected_leaf: p_msg.value.seq,
+                options: base_opts(None),
+            },
+        )
+        .await
+        .unwrap();
+    let (mut wire3, _) = timeout(Duration::from_secs(15), read_request(&listener))
+        .await
+        .expect("Personal thread episode must not be poisoned after unconsented S2 role rejection");
+    send_ollama(
+        &mut wire3,
+        json!({"role": "assistant", "content": "Personal episode unpoisoned."}),
+        "stop",
+    )
+    .await;
+    let _ = idle_leaf(fixture, personal, &p_thread).await;
 }
 
 #[inline(never)]
@@ -9652,10 +9972,11 @@ async fn staged_taint_list_notes_cursor_and_proposal_preflight_probes(
     };
 
     // (1) list_notes stale cursor rejected in engine.list_child_folders must NOT
-    //     flip BranchTaint on a fresh untainted AgentRun handle.
+    //     flip BranchTaint on a fresh untainted AgentRun handle, while the
+    //     succeeding cross-Space page 1 call MUST commit staged taint.
     //     With 1 note + 2 child folders and limit=1, page 1 opens `folders_cut`
     //     (leaving `child-b` for page 2).
-    let (_open_auth, open_acc) = make_run(1);
+    let (open_auth, open_acc) = make_run(1);
     let p1_handle = format!("{}/consented-p1", shared.slug);
     let opened = local
         .registry
@@ -9667,6 +9988,10 @@ async fn staged_taint_list_notes_cursor_and_proposal_preflight_probes(
         .await
         .unwrap()
         .structured_content;
+    assert!(
+        open_auth.taint().is_tainted(),
+        "succeeding cross-Space list_notes MUST commit staged BranchTaint"
+    );
     let valid_cursor = opened["nextCursor"]
         .as_str()
         .expect("1 note + 2 child folders at limit=1 must produce folder continuation nextCursor")
@@ -9801,9 +10126,40 @@ async fn staged_taint_list_notes_cursor_and_proposal_preflight_probes(
     for (idx, (tool, args, expect_not_found)) in [
         ("edit_note", json!({ "ref": n1 }), false),
         ("rename_note", json!({ "ref": n1, "title": "   " }), false),
+        ("link", json!({ "from": n1, "relation": "relates" }), false),
         (
-            "link_many",
-            json!({ "links": [{ "from": n1, "bad": 1 }] }),
+            "link",
+            json!({ "from": n1, "to": n1, "relation": "relates" }),
+            false,
+        ),
+        (
+            "remember_about_project",
+            json!({ "project": p1_handle, "observation": "   " }),
+            false,
+        ),
+        (
+            "remember_about_project",
+            json!({ "project": p1_handle, "observation": "valid", "category": "INVALID_CAT" }),
+            false,
+        ),
+        (
+            "create_note",
+            json!({
+                "project": p1_handle,
+                "title": "Oversized",
+                "body": "x".repeat(notarium_core::ports::AppendChat::MAX_STRUCTURED_BODY_BYTES),
+            }),
+            false,
+        ),
+        (
+            "create_note",
+            json!({
+                "project": p1_handle,
+                "title": "Reserved Filename",
+                "body": "ok",
+                "fileName": "index.md",
+                "links": [{ "relation": "relates", "to": n1 }],
+            }),
             false,
         ),
         (
@@ -9893,6 +10249,119 @@ async fn staged_taint_list_notes_cursor_and_proposal_preflight_probes(
         matched_prop.structured_content["outcome"],
         "approvalRequired"
     );
+
+    // Paired positive controls on fresh untainted runs: consented MoveNote and
+    // link-free CreateNote proposals MUST succeed (approvalRequired) and flip taint.
+    for (sub, tool, args) in [
+        (
+            4u8,
+            "move_note",
+            json!({ "ref": n1, "toFolder": "consented-p1/child-a" }),
+        ),
+        (
+            5u8,
+            "create_note",
+            json!({ "project": p1_handle, "title": "Link Free", "body": "Fresh note body." }),
+        ),
+    ] {
+        let th =
+            ChatThreadId::from_bytes([0x9A, 0x41, sub, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, sub]);
+        fixture
+            .canonical
+            .create_chat(
+                personal.clone(),
+                Mutation {
+                    identity: CommandIdentity {
+                        scope: pscope.clone(),
+                        actor: actor.clone(),
+                        key: CommandKey::from_bytes([
+                            0x9A, 0x41, sub, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, sub,
+                        ]),
+                        hash: ContentDigest::from_bytes([0x9A; 32]),
+                    },
+                    preconditions: Preconditions::default(),
+                    input: CreateChat {
+                        thread: th.clone(),
+                        kind: ChatThreadKind::Personal,
+                        owner: actor.clone(),
+                        project_folder: None,
+                        title: format!("Positive proposal {tool}"),
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        let (fresh_auth, fresh_acc) = make_run(sub);
+        let run_id = match fresh_auth.kind() {
+            notarium_core::auth::PrincipalKind::AgentRun(id) => id.clone(),
+            _ => unreachable!(),
+        };
+        let sc = SpaceContext::new(fresh_auth.clone(), pscope.clone(), budget()).unwrap();
+        fixture
+            .canonical
+            .claim_active_run(
+                sc.clone(),
+                ClaimChatRun {
+                    thread: th.clone(),
+                    run: run_id,
+                    expected_leaf: ThreadEntrySeq::ZERO,
+                    previous_run: None,
+                },
+            )
+            .await
+            .unwrap();
+        let entry = fixture
+            .canonical
+            .append_chat(
+                sc,
+                Mutation {
+                    identity: CommandIdentity {
+                        scope: pscope.clone(),
+                        actor: actor.clone(),
+                        key: CommandKey::from_bytes([
+                            0x9A, 0x41, sub, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, sub,
+                        ]),
+                        hash: ContentDigest::from_bytes([0x9A; 32]),
+                    },
+                    preconditions: Preconditions::default(),
+                    input: AppendChat {
+                        thread: th.clone(),
+                        parent: ThreadEntrySeq::ZERO,
+                        kind: ChatEntryKind::Model,
+                        body: ChatInputBody::Text("Positive control.".into()),
+                        tool_calls: vec![],
+                        provenance: Some(ChatProvenance::default()),
+                        interruption: None,
+                        proposed_diff: None,
+                        proposed_effect: None,
+                        referenced_notes: vec![],
+                        tainted: false,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        let ok = local
+            .registry
+            .call_personal_tool(
+                make_ctx(&fresh_acc, 30 + sub),
+                PersonalToolInvocation {
+                    source: pscope.clone(),
+                    thread: th,
+                    leaf: entry.value.seq,
+                    owner: owner.clone(),
+                },
+                tool,
+                args,
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok.structured_content["outcome"], "approvalRequired");
+        assert!(
+            fresh_auth.taint().is_tainted(),
+            "accepted external proposal {tool} MUST commit BranchTaint"
+        );
+    }
 }
 
 #[inline(never)]
@@ -10137,7 +10606,7 @@ async fn confirmed_link_many_trashed_target_and_project_move_note_replays(
         .registry
         .call_personal_tool(
             McpInvocationContext {
-                account: AccountContext::new(run_auth, budget()),
+                account: AccountContext::new(run_auth.clone(), budget()),
                 target: EgressTarget::InAppProvider {
                     provider: local.resource.id.clone(),
                     model: local.model.clone(),
@@ -10160,7 +10629,7 @@ async fn confirmed_link_many_trashed_target_and_project_move_note_replays(
     let tool_entry = fixture
         .canonical
         .append_chat(
-            run_scope,
+            run_scope.clone(),
             Mutation {
                 identity: p_cmd(3),
                 preconditions: Preconditions::default(),
@@ -10181,11 +10650,107 @@ async fn confirmed_link_many_trashed_target_and_project_move_note_replays(
         )
         .await
         .unwrap();
+    // Prepare a second, unconfirmed link_many proposal targeting T1 before T1 is trashed,
+    // to prove as a paired negative control that a FIRST confirm after trash STILL fails.
+    let fresh_link_args = json!({
+        "links": [{ "from": src_id, "to": t1_id, "relation": "mentions" }]
+    });
+    let fresh_call_key =
+        CommandKey::from_bytes([0x17, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 16]);
+    let model_entry_2 = fixture
+        .canonical
+        .append_chat(
+            run_scope.clone(),
+            Mutation {
+                identity: p_cmd(4),
+                preconditions: Preconditions::default(),
+                input: AppendChat {
+                    thread: thread.clone(),
+                    parent: tool_entry.value.seq,
+                    kind: ChatEntryKind::Model,
+                    body: ChatInputBody::Text("Link T1 fresh.".into()),
+                    tool_calls: vec![ProviderToolCall {
+                        id: ProviderToolCallId::new(fresh_call_key.as_str().into()).unwrap(),
+                        name: "link_many".into(),
+                        arguments: fresh_link_args
+                            .as_object()
+                            .unwrap()
+                            .clone()
+                            .into_iter()
+                            .collect(),
+                    }],
+                    provenance: Some(ChatProvenance::default()),
+                    interruption: None,
+                    proposed_diff: None,
+                    proposed_effect: None,
+                    referenced_notes: vec![],
+                    tainted: true,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let fresh_prop_res = local
+        .registry
+        .call_personal_tool(
+            McpInvocationContext {
+                account: AccountContext::new(run_auth, budget()),
+                target: EgressTarget::InAppProvider {
+                    provider: local.resource.id.clone(),
+                    model: local.model.clone(),
+                    primary_project: None,
+                },
+                request_key: fresh_call_key.clone(),
+            },
+            PersonalToolInvocation {
+                source: pscope.clone(),
+                thread: thread.clone(),
+                leaf: model_entry_2.value.seq,
+                owner: owner.clone(),
+            },
+            "link_many",
+            fresh_link_args,
+        )
+        .await
+        .unwrap();
+    let fresh_proposal = fresh_prop_res.proposal().expect("fresh link_many proposal");
+    let fresh_tool_entry = fixture
+        .canonical
+        .append_chat(
+            run_scope,
+            Mutation {
+                identity: p_cmd(5),
+                preconditions: Preconditions::default(),
+                input: AppendChat {
+                    thread: thread.clone(),
+                    parent: model_entry_2.value.seq,
+                    kind: ChatEntryKind::Tool {
+                        call_id: fresh_call_key,
+                    },
+                    body: ChatInputBody::Text(fresh_prop_res.content[0].text.clone()),
+                    tool_calls: vec![],
+                    provenance: Some(fresh_prop_res.provenance.clone()),
+                    interruption: None,
+                    proposed_diff: Some(fresh_proposal.envelope().to_owned()),
+                    proposed_effect: Some(fresh_proposal.effect()),
+                    referenced_notes: vec![],
+                    tainted: true,
+                },
+            },
+        )
+        .await
+        .unwrap();
     let confirm = ConfirmProposedDiff {
         source: pscope.clone(),
-        thread,
+        thread: thread.clone(),
         entry: tool_entry.value.seq,
         proposal: proposal.id(),
+    };
+    let confirm_fresh = ConfirmProposedDiff {
+        source: pscope.clone(),
+        thread,
+        entry: fresh_tool_entry.value.seq,
+        proposal: fresh_proposal.id(),
     };
     let applied = local
         .registry
@@ -10216,6 +10781,22 @@ async fn confirmed_link_many_trashed_target_and_project_move_note_replays(
     assert_eq!(
         replayed.result, applied.result,
         "replaying confirmed LinkMany after trashing T1 must preserve both committed receipts without idempotency_key_reused"
+    );
+    // Paired negative control: confirming a FRESH (never-applied) proposal targeting
+    // trashed T1 must STILL fail via canonical authorize_link_target_tx.
+    let fresh_applied = local
+        .registry
+        .apply_proposed_diff(owner.clone(), confirm_fresh)
+        .await
+        .unwrap();
+    assert_eq!(
+        fresh_applied.result["results"][0]["ok"], false,
+        "fresh confirm against trashed target T1 must be rejected: {:?}",
+        fresh_applied.result
+    );
+    assert_eq!(
+        fresh_applied.result["results"][0]["error"],
+        "resource_not_found"
     );
 
     // (2) Project-scoped move_note replay must survive a subsequent rename_project.

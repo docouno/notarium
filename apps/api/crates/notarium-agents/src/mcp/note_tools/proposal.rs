@@ -539,6 +539,7 @@ pub(in crate::mcp) async fn preflight_proposal(
             )
             .await
             .map_err(collapse)?;
+            authorize_folder(owner, &owner_scope, &destination.anchor, note.facts.class).await?;
             Ok(true)
         }
         _ => Err(invalid(ValidationReason::InvalidQuery)),

@@ -37,22 +37,45 @@ fn proposal_class(class: DocClass) -> Result<(), PortError> {
     }
 }
 
+pub(in crate::mcp) fn authorize_link_source_owner(
+    scope: &SpaceContext,
+    facts: &notarium_core::auth::ResourceFacts,
+) -> Result<(), PortError> {
+    scope.auth().authorize_direct_write(facts, facts)?;
+    proposal_class(facts.class)
+}
+
+fn validate_single_link_input(input: &LinkInput) -> Result<(), PortError> {
+    let source = NoteId::parse(&input.source)?;
+    validate_link_args(&input.edge)?;
+    if let Some(to) = input.edge.to.as_deref()
+        && NoteId::parse(to)? == source
+    {
+        return Err(invalid(ValidationReason::InvalidQuery));
+    }
+    Ok(())
+}
+
 pub(in crate::mcp) fn validate_link_proposal_input(
     name: ToolName,
     args: &Value,
-) -> Result<(), PortError> {
+) -> Result<bool, PortError> {
     match name {
         ToolName::Link => {
             let input: LinkInput = decode(args.clone())?;
-            let _ = NoteId::parse(&input.source)?;
-            Ok(())
+            validate_single_link_input(&input)?;
+            Ok(true)
         }
         ToolName::LinkMany => {
             let input: LinkManyInput = decode(args.clone())?;
             if input.links.is_empty() || input.links.len() > 100 {
                 return Err(invalid(ValidationReason::InvalidLimit));
             }
-            Ok(())
+            let any_valid = input
+                .links
+                .iter()
+                .any(|item| validate_single_link_input(item).is_ok());
+            Ok(any_valid)
         }
         _ => Err(DomainError::ResourceNotFound.into()),
     }

@@ -166,6 +166,35 @@ async fn project_placement(
     })
 }
 
+fn validate_draft_syntax(draft: &NoteDraft, folder_page: bool) -> Result<bool, PortError> {
+    if folder_page && draft.file_name.is_some() {
+        return Err(invalid(ValidationReason::InvalidPathComponent));
+    }
+    let title = draft_title(draft)?;
+    if !folder_page && let Some(raw) = &draft.file_name {
+        let name = raw.trim();
+        let name = name
+            .get(..name.len().saturating_sub(3))
+            .filter(|_| name.to_ascii_lowercase().ends_with(".md"))
+            .unwrap_or(name);
+        validate_component(name)?;
+        if lookup_key(name) == "index" {
+            return Err(invalid(ValidationReason::InvalidPathComponent));
+        }
+    }
+    let _ = clean_path(draft.path.as_deref().unwrap_or_default())?;
+    let _ = finalize_document(
+        &draft.body,
+        DocClass::UserDoc,
+        &NoteId::from_bytes([1; 16]),
+        &fields(draft, &title),
+    )?;
+    for link in &draft.links {
+        organize::validate_link_args(link)?;
+    }
+    Ok(!draft.links.is_empty())
+}
+
 impl PreparedDraft {
     fn new(
         call: &ToolCallContext<'_>,
