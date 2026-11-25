@@ -62,7 +62,7 @@ pub(super) fn episode_project_admitted(
     }
 }
 
-fn episode_visible_to_narrowed(
+pub(super) fn episode_visible_to_narrowed(
     auth: &notarium_core::auth::EngineAuthContext,
     project: Option<&FolderRef>,
 ) -> bool {
@@ -400,27 +400,56 @@ impl ControlService {
                 EpisodeSelector::New { requested, name } => (None, requested.clone(), name.clone()),
                 EpisodeSelector::Id(id) | EpisodeSelector::Resume(id) => (Some(episode(tx.inner_mut(), current.auth().principal(), id).await?), EpisodeId::from_bytes(crate::auth::token::random()?), None),
                 EpisodeSelector::Name(name) => {
-                    let matches = rows!(tx.inner_mut(),AgentEpisodesRow,fetch_all,
-                        "SELECT * FROM agent_episodes WHERE owner_id=$1 AND name=$2 AND lifecycle<>'closed' ORDER BY episode_id LIMIT 201",
-                        "SELECT * FROM v1_control.agent_episodes WHERE owner_id=$1 AND name=$2 AND lifecycle<>'closed' ORDER BY episode_id LIMIT 201";&owner.user_id,name)?;
-                    if matches.len() > 200 { return Err(invalid(ValidationReason::BudgetExceeded)); }
-                    if matches.len() > 1 {
-                        let mut admitted = Vec::with_capacity(matches.len());
-                        for row in &matches {
-                            if episode_project_admitted(current.auth(), stored_project_ref(row)?.as_ref()) {
-                                admitted.push(EpisodeId::parse(&row.episode_id)?);
+                    let mut after = String::new();
+                    let mut admitted_rows: Vec<AgentEpisodesRow> = Vec::new();
+                    let mut scanned = 0usize;
+                    loop {
+                        let batch = rows!(
+                            tx.inner_mut(),
+                            AgentEpisodesRow,
+                            fetch_all,
+                            "SELECT * FROM agent_episodes WHERE owner_id=$1 AND name=$2 AND lifecycle<>'closed' AND episode_id>$3 ORDER BY episode_id LIMIT 64",
+                            "SELECT * FROM v1_control.agent_episodes WHERE owner_id=$1 AND name=$2 AND lifecycle<>'closed' AND episode_id>$3 ORDER BY episode_id LIMIT 64";
+                            &owner.user_id,
+                            name,
+                            &after
+                        )?;
+                        let batch_len = batch.len();
+                        for row in batch {
+                            scanned = scanned.saturating_add(1);
+                            after = row.episode_id.clone();
+                            let project = stored_project_ref(&row)?;
+                            if !episode_project_admitted(current.auth(), project.as_ref()) {
+                                continue;
+                            }
+                            admitted_rows.push(row);
+                            if admitted_rows.len() > 200 {
+                                return Err(invalid(ValidationReason::BudgetExceeded));
                             }
                         }
-                        if admitted.len() <= 1 {
-                            return Err(DomainError::ResourceNotFound.into());
+                        if batch_len < 64 {
+                            break;
                         }
+                        if scanned >= 4096 {
+                            return Err(invalid(ValidationReason::BudgetExceeded));
+                        }
+                    }
+                    if admitted_rows.len() > 1 {
+                        let admitted = admitted_rows
+                            .iter()
+                            .map(|row| EpisodeId::parse(&row.episode_id))
+                            .collect::<Result<Vec<_>, _>>()?;
                         let value = Started::Ambiguous(admitted);
                         let revision = bump_owner(tx.inner_mut(), &owner).await?;
                         let saved = SavedResult { value, events: vec![] };
                         command.save(tx.inner_mut(), revision, &saved, now).await?;
                         return Ok((revision, current, saved.value));
                     }
-                    (matches.into_iter().next(), EpisodeId::from_bytes(crate::auth::token::random()?), Some(name.clone()))
+                    (
+                        admitted_rows.into_iter().next(),
+                        EpisodeId::from_bytes(crate::auth::token::random()?),
+                        Some(name.clone()),
+                    )
                 },
             };
             let started = if let Some(mut old) = existing {

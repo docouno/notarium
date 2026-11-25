@@ -56,6 +56,12 @@ fn validate_single_link_input(input: &LinkInput) -> Result<(), PortError> {
     Ok(())
 }
 
+pub(in crate::mcp) fn is_valid_link_item(item: &Value) -> bool {
+    decode::<LinkInput>(item.clone())
+        .and_then(|parsed| validate_single_link_input(&parsed))
+        .is_ok()
+}
+
 pub(in crate::mcp) fn validate_link_proposal_input(
     name: ToolName,
     args: &Value,
@@ -75,7 +81,10 @@ pub(in crate::mcp) fn validate_link_proposal_input(
                 .links
                 .iter()
                 .any(|item| validate_single_link_input(item).is_ok());
-            Ok(any_valid)
+            if !any_valid {
+                return Err(invalid(ValidationReason::InvalidQuery));
+            }
+            Ok(true)
         }
         _ => Err(DomainError::ResourceNotFound.into()),
     }

@@ -63,7 +63,7 @@ pub(in crate::mcp::note_tools) async fn describe(
     reviewer: &mut ToolCallContext<'_>,
     plan: &ProposedCreates,
 ) -> Result<Value, PortError> {
-    let placement = project_placement(reviewer, plan.project.clone()).await?;
+    let placement = project_placement(reviewer, plan.project.clone(), false).await?;
     let mut notes = Vec::with_capacity(plan.steps.len());
     for (index, step) in plan.steps.iter().enumerate() {
         let detail = match step {
@@ -157,7 +157,7 @@ pub(in crate::mcp::note_tools) async fn prepare(
         _ => return Err(invalid(ValidationReason::InvalidQuery)),
     };
     let project = observe_project(owner, &project).await?;
-    let place = project_placement(owner, project).await?;
+    let place = project_placement(owner, project, false).await?;
     let mut draft_plans = Vec::with_capacity(drafts.len());
     for (index, draft) in drafts.into_iter().enumerate() {
         let plan = async {

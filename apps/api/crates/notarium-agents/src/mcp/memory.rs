@@ -65,6 +65,24 @@ impl MemoryArgs {
         self.version_token.is_some()
     }
 
+    pub(super) async fn resolve_target_for_direct_write(
+        &self,
+        call: &ToolCallContext<'_>,
+        name: ToolName,
+    ) -> Result<MemoryTarget, PortError> {
+        match (name, self.project.as_deref()) {
+            (ToolName::RememberAboutUser, None) => Ok(MemoryTarget::User {
+                owner: call.account().auth().principal().clone(),
+            }),
+            (ToolName::RememberAboutProject, Some(handle)) => Ok(MemoryTarget::Project {
+                folder: session::resolve_project_for_direct_write(call, handle)
+                    .await?
+                    .folder,
+            }),
+            _ => Err(invalid(ValidationReason::InvalidQuery)),
+        }
+    }
+
     pub(super) async fn resolve_target(
         &self,
         call: &ToolCallContext<'_>,
@@ -174,7 +192,7 @@ pub(super) async fn handle(
     // has been reassigned since the original call.
     let route: MemoryRoute = call
         .journal("memory_route", || async {
-            let target = args.resolve_target(call, name).await?;
+            let target = args.resolve_target_for_direct_write(call, name).await?;
             if matches!(call.target, EgressTarget::InAppProvider { .. })
                 && let MemoryTarget::Project { folder } = &target
             {

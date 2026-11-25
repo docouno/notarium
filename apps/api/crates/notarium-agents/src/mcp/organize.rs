@@ -6,7 +6,8 @@ use serde_json::Value;
 
 pub(super) use links::{
     LinkArgs, ProposalLink as LinkPlan, apply_links, authorize_link_source_owner, describe_links,
-    format_link_line, plan_links, resolve_target, validate_link_args, validate_link_proposal_input,
+    format_link_line, is_valid_link_item, plan_links, resolve_target, validate_link_args,
+    validate_link_proposal_input,
 };
 
 use super::{ToolCallContext, ToolName};

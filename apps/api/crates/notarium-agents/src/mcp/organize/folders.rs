@@ -186,7 +186,7 @@ impl FolderAddress {
         project: Option<&str>,
         episode: Option<&EpisodeId>,
     ) -> Result<Self, PortError> {
-        let selected = session::selected_project(call, project, episode).await?;
+        let selected = session::selected_project_for_direct_write(call, project, episode).await?;
         let space = match &selected {
             Some(project) => project.space_id.clone(),
             None => match call.auth.pinned_write_space() {
@@ -366,7 +366,7 @@ async fn plan(
             FolderRoute::new(source, operation, ancestor_revisions)
         }
         ParsedFolderArgs::RenameProject(args) => {
-            let project = session::resolve_project(call, &args.project).await?;
+            let project = session::resolve_project_for_direct_write(call, &args.project).await?;
             if call
                 .auth
                 .pinned_write_space()

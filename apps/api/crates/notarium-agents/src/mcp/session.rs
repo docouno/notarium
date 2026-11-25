@@ -5,7 +5,8 @@ mod delta;
 use super::{EgressTarget, ToolCallContext, ToolName, ability_tools, corpus, decode, invalid};
 use address::visible_projects;
 pub(super) use address::{
-    project_for_folder, readable_space, readable_spaces, resolve_project, resolve_space, space,
+    project_for_folder, readable_space, readable_spaces, resolve_project,
+    resolve_project_for_direct_write, resolve_space, space,
 };
 pub(super) use delta::BootstrapContinuations;
 
@@ -142,6 +143,62 @@ pub(super) async fn selected_project_for_episode(
         episode.and_then(|value| value.project_hint.as_ref()),
     )
     .await
+}
+
+pub(super) async fn selected_project_for_direct_write(
+    call: &ToolCallContext<'_>,
+    project: Option<&str>,
+    episode: Option<&EpisodeId>,
+) -> Result<Option<FolderRef>, PortError> {
+    let Some(pin) = call.auth.pinned_write_space() else {
+        return selected_project(call, project, episode).await;
+    };
+    let loaded = match episode {
+        Some(id) => Some(
+            call.registry
+                .control
+                .get_episode(call.account(), id.clone())
+                .await?,
+        ),
+        None => None,
+    };
+    if project.is_none()
+        && loaded.as_ref().is_some_and(|value| {
+            value
+                .diagnostics
+                .contains(&EpisodeDiagnostic::ProjectUnavailable)
+        })
+    {
+        return Err(DomainError::ResourceNotFound.into());
+    }
+    let target = match project {
+        Some(handle) => Some(resolve_project_for_direct_write(call, handle).await?.folder),
+        None => match loaded
+            .as_ref()
+            .and_then(|value| value.project_hint.as_ref())
+        {
+            Some(folder) => {
+                if &folder.space_id != pin {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+                Some(project_for_folder(call, folder).await?.folder)
+            }
+            None => None,
+        },
+    };
+    let target = match &call.target {
+        EgressTarget::InAppProvider {
+            primary_project, ..
+        } => target.or_else(|| primary_project.clone()),
+        EgressTarget::ExternalMcp => target,
+    };
+    if target
+        .as_ref()
+        .is_some_and(|folder| &folder.space_id != pin)
+    {
+        return Err(DomainError::ResourceNotFound.into());
+    }
+    Ok(target)
 }
 
 pub(super) async fn selected_project(

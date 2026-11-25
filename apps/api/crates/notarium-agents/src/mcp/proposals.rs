@@ -588,9 +588,23 @@ fn validate_reversible_input(tool: ToolName, args: &Value) -> Result<(), PortErr
 
 pub(super) async fn needs_proposal(
     call: &ToolCallContext<'_>,
+    binding: &PersonalToolInvocation,
     args: &Value,
 ) -> Result<bool, PortError> {
     if !reversible(call.tool) {
+        return Ok(false);
+    }
+    // Only chats anchored in a Personal Space can emit ProposedDiffs. Checking
+    // the source Space kind before resolving any foreign target prevents a
+    // Personal chat anchored in a Shared Space from probing foreign targets
+    // and failing `personal_source` with untainted `AccessDenied`.
+    let source_space = call
+        .registry
+        .catalog
+        .space(call.budget(), binding.source.space_id.clone())
+        .await?;
+    binding.source.check(&source_space.history)?;
+    if source_space.space.kind != SpaceKind::Personal {
         return Ok(false);
     }
     // Validate pure semantic argument syntax before resolving any foreign
@@ -631,6 +645,9 @@ pub(super) async fn needs_proposal(
                 .as_array()
                 .ok_or_else(|| invalid(ValidationReason::InvalidQuery))?;
             for item in items {
+                if !organize::is_valid_link_item(item) {
+                    continue;
+                }
                 let Ok(note) = reference(item, "from") else {
                     continue;
                 };

@@ -1,8 +1,8 @@
 mod proposal;
 
 pub(in super::super) use proposal::{
-    ProposalLink, apply_links, authorize_link_source_owner, describe_links, plan_links,
-    validate_link_proposal_input,
+    ProposalLink, apply_links, authorize_link_source_owner, describe_links, is_valid_link_item,
+    plan_links, validate_link_proposal_input,
 };
 
 use std::collections::BTreeMap;
@@ -224,6 +224,7 @@ async fn metadata_snapshot(
     note: &NoteId,
     revision: Option<RevisionId>,
     receipts: ReceiptSet,
+    allow_trashed: bool,
 ) -> Result<NoteMetadataSnapshot, PortError> {
     let expected = revision.clone();
     let found = call
@@ -238,12 +239,17 @@ async fn metadata_snapshot(
             },
         )
         .await?;
+    let lifecycle_hidden = if allow_trashed {
+        found.metadata.lifecycle() == Lifecycle::Purged
+    } else {
+        found.metadata.lifecycle() != Lifecycle::Active
+    };
     if found.metadata.reference().space_id != scope.scope().space_id
         || found.metadata.reference().note_id != *note
         || expected
             .as_ref()
             .is_some_and(|rev| found.metadata.revision() != rev)
-        || found.metadata.lifecycle() != Lifecycle::Active
+        || lifecycle_hidden
         || found.metadata.class() == DocClass::EncryptedNote
     {
         return Err(DomainError::ResourceNotFound.into());
@@ -287,7 +293,7 @@ async fn resolve(
                 corpus::note_in_space(call, scope, &note).await?;
             }
             let current =
-                metadata_snapshot(call, scope, &note, None, ReceiptSet::default()).await?;
+                metadata_snapshot(call, scope, &note, None, ReceiptSet::default(), false).await?;
             corpus::note_metadata_origin(check, &check_scope, &current.metadata)
                 .await
                 .map_err(collapse)?;
@@ -326,7 +332,13 @@ pub(in super::super) async fn plan_link(
     edge: &LinkArgs,
     observe_revision: bool,
 ) -> Result<LinkPlan, PortError> {
-    let (scope, note) = corpus::locate_note_preflight(call, &source).await?;
+    let (scope, note) = if let Some(pin) = call.auth.pinned_write_space() {
+        let scope = super::super::session::space(call, pin).await?;
+        let note = corpus::note_in_space_preflight(call, &scope, &source).await?;
+        (scope, note)
+    } else {
+        corpus::locate_note_preflight(call, &source).await?
+    };
     plan_link_located(call, provider, scope, note, edge, observe_revision).await
 }
 
@@ -361,6 +373,7 @@ async fn plan_link_located(
                 &note.reference.note_id,
                 None,
                 ReceiptSet::default(),
+                false,
             )
             .await?,
         )
@@ -504,6 +517,7 @@ async fn authorize(
                 note,
                 Some(alias.revision.clone()),
                 ReceiptSet::default(),
+                allow_trashed_replay,
             )
             .await?;
             let title = current
@@ -568,6 +582,7 @@ async fn hydrate_journaled(
                         &note,
                         Some(revision.clone()),
                         ReceiptSet::default(),
+                        true,
                     )
                     .await?;
                     let title = current
@@ -632,6 +647,7 @@ async fn render(
                 &plan.source,
                 Some(exact_rev.clone()),
                 ReceiptSet::new([committed.receipt])?,
+                true,
             )
             .await?;
             let (origin, project) =

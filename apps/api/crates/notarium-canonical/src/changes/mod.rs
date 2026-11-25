@@ -1378,6 +1378,13 @@ impl CanonicalStore {
                                         false,
                                     )
                                     .await?;
+                                let recorded_lifecycle = crate::domain::common::combine_lifecycle(
+                                    note_meta.lifecycle,
+                                    ancestry.folder_lifecycle,
+                                );
+                                if recorded_lifecycle == Lifecycle::Purged {
+                                    continue;
+                                }
 
                                 if let Some(auth) = &auth_in
                                     && (auth.authorize_read(&live_facts).is_err()
@@ -1417,6 +1424,7 @@ impl CanonicalStore {
                                         != space_rec.root_folder_id)
                                         .then(|| note_meta.parent_folder_id.clone()),
                                     facts: snap_facts,
+                                    recorded_lifecycle,
                                     meta: note_meta,
                                     digest,
                                     provenance,
@@ -1561,7 +1569,7 @@ impl CanonicalStore {
                 },
                 pending.revision_id,
                 pending.facts,
-                pending.meta.lifecycle,
+                pending.recorded_lifecycle,
                 carrier,
                 pending.digest,
             )?;
@@ -1653,6 +1661,7 @@ struct PendingSeedNote {
     note_id: NoteId,
     revision_id: RevisionId,
     facts: ResourceFacts,
+    recorded_lifecycle: Lifecycle,
     meta: NoteRevisionMetadata,
     digest: ContentDigest,
     provenance: notarium_core::ports::NoteProvenance,

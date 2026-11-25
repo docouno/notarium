@@ -3653,6 +3653,473 @@ async fn run_board_unmoved_run_touched_neighbor_rollback_suite(store: &Canonical
     );
 }
 
+async fn run_board_restored_note_and_group_reconciliation_suite(store: &CanonicalStore) {
+    let owner = sample_principal_id(61);
+    let (scope, _root) = seed_space(
+        store,
+        sample_space_id(61),
+        sample_incarnation(61),
+        owner.clone(),
+    )
+    .await;
+    let human_ctx = owner_ctx(&scope, owner.clone());
+
+    let view_note = sample_note_id(230);
+    let view_c = store
+        .create_note(
+            human_ctx.clone(),
+            next_mutation(
+                &scope,
+                &owner,
+                CreateNote {
+                    folder_page: false,
+                    note: view_note.clone(),
+                    parent: None,
+                    slug: "reconcile-board".to_owned(),
+                    class: DocClass::UserDoc,
+                    carrier: "---\ntitle: Reconcile Board\n---\n# Reconcile Board\n".to_owned(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let view = ViewRef {
+        note: view_note,
+        key: ViewKey::from_bytes([0x69; 16]),
+    };
+
+    let n_trashed = sample_note_id(231);
+    let n_ranked = sample_note_id(232);
+    let n_anchor = sample_note_id(233);
+    let m_card = sample_note_id(234);
+    let n_outside = sample_note_id(235);
+    let d_card = sample_note_id(236);
+
+    let planner = CanonicalTestBoardPlanner::new(
+        store.clone(),
+        [
+            n_trashed.clone(),
+            n_ranked.clone(),
+            n_anchor.clone(),
+            m_card.clone(),
+            n_outside.clone(),
+            d_card.clone(),
+        ],
+    );
+    store
+        .register_board_facts_provider(planner)
+        .expect("register planner");
+
+    let todo_grp = GroupKey::Value(ScalarValue::String("todo".to_owned()));
+    let doing_grp = GroupKey::Value(ScalarValue::String("doing".to_owned()));
+    let done_grp = GroupKey::Value(ScalarValue::String("done".to_owned()));
+
+    // Case 1: Agent run restores a pre-existing trashed note and moves it on board V.
+    // Rollback must succeed (retiring the note back to Trashed) instead of failing InvalidState.
+    let n_trashed_c = store
+        .create_note(
+            human_ctx.clone(),
+            next_mutation(
+                &scope,
+                &owner,
+                CreateNote {
+                    folder_page: false,
+                    note: n_trashed.clone(),
+                    parent: None,
+                    slug: "was-trashed".to_owned(),
+                    class: DocClass::UserDoc,
+                    carrier: "---\ntitle: Was Trashed\nstatus: todo\n---\nBody\n".to_owned(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let n_trashed_del = store
+        .delete_note(
+            human_ctx.clone(),
+            next_mutation(
+                &scope,
+                &owner,
+                notarium_core::ports::DeleteNote {
+                    note: n_trashed.clone(),
+                    disposition: notarium_core::ports::DeleteDisposition::Trash,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    assert_ne!(n_trashed_c.value.revision, n_trashed_del.value.revision);
+
+    let run1 = sample_run_id(231);
+    let run1_ctx = agent_run_ctx(&human_ctx, run1.clone());
+    let n_restored = store
+        .delete_note(
+            run1_ctx.clone(),
+            next_mutation(
+                &scope,
+                &owner,
+                notarium_core::ports::DeleteNote {
+                    note: n_trashed.clone(),
+                    disposition: notarium_core::ports::DeleteDisposition::Restore,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let n_moved = store
+        .move_board_card(
+            run1_ctx,
+            next_mutation(
+                &scope,
+                &owner,
+                MoveBoardCard {
+                    view: view.clone(),
+                    note: n_trashed.clone(),
+                    group: done_grp.clone(),
+                    before: None,
+                    after: None,
+                    fields: BTreeMap::from([(
+                        "status".to_owned(),
+                        Some(YamlValue::String("done".to_owned())),
+                    )]),
+                    expected_note: n_restored.value.revision.clone(),
+                    expected_view: view_c.value.revision.clone(),
+                    expected_rank: RankExpectation::Absent,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let run1_rev = store
+        .inspect_agent_run_revision_for_test(&scope.space_id, &run1)
+        .await
+        .unwrap()
+        .unwrap();
+    let ov1 = store
+        .inspect_view_overlays_for_test(&scope.space_id, &view)
+        .await
+        .unwrap();
+    assert!(ov1.contains_key(&n_trashed));
+    let rb1 = store
+        .rollback_agent_run(
+            human_ctx.clone(),
+            next_mutation(
+                &scope,
+                &owner,
+                RollbackAgentRun {
+                    run: run1,
+                    expected_run_revision: run1_rev,
+                    expected_entities: vec![n_moved.value.revision.clone()],
+                    associated_board_expectations: vec![AssociatedBoardExpectation {
+                        view: view.clone(),
+                        note: n_trashed.clone(),
+                        expected_rank: RankExpectation::Existing(
+                            ov1[&n_trashed].rank_rev_id.clone(),
+                        ),
+                        expected_placement_revision: ov1[&n_trashed].placement_revision.clone(),
+                    }],
+                },
+            ),
+        )
+        .await
+        .expect("rollback of restored-from-trash moved board card must succeed");
+    let post_ov1 = store
+        .inspect_view_overlays_for_test(&scope.space_id, &view)
+        .await
+        .unwrap();
+    assert!(
+        !post_ov1.contains_key(&n_trashed),
+        "retired restored-from-trash card must have its overlay removed"
+    );
+    let post_n_trashed = note_metadata_at(
+        store,
+        &scope,
+        rb1.value
+            .restored
+            .iter()
+            .find(|r| r.note == n_trashed)
+            .unwrap(),
+        &rb1.receipt,
+    )
+    .await;
+    assert_eq!(post_n_trashed.lifecycle, Lifecycle::Trashed);
+
+    // Case 2 (Traces A, B, C combined):
+    // - n_ranked, n_anchor, m_card start with persisted overlays in `todo`: [n_ranked, n_anchor, m_card].
+    // - d_card starts unranked in `doing`.
+    // - n_outside starts with `status: archived` (OutsideView, unranked).
+    // In run2:
+    // - move_board_card moves m_card `todo -> done` (before_placement pred=n_anchor) and d_card `doing -> done`.
+    // - edit_note edits n_ranked `todo -> doing` (Trace A: must keep original `(todo, r0)`, never materialize in `doing` when d_card rolls back into `doing`).
+    // - edit_note edits n_anchor `todo -> doing` (Trace C: must reconcile back to `todo` so m_card finds pred=n_anchor).
+    // - edit_note edits n_outside `archived -> todo` (Trace B: must be excluded from `todo`, never getting a phantom overlay when m_card rolls back into `todo`).
+    let mut created_revs: BTreeMap<NoteId, RevisionId> = BTreeMap::new();
+    for (nid, slug, status) in [
+        (&n_ranked, "n-ranked", "todo"),
+        (&n_anchor, "n-anchor", "todo"),
+        (&m_card, "m-card", "todo"),
+        (&n_outside, "n-outside", "archived"),
+        (&d_card, "d-card", "doing"),
+    ] {
+        let c = store
+            .create_note(
+                human_ctx.clone(),
+                next_mutation(
+                    &scope,
+                    &owner,
+                    CreateNote {
+                        folder_page: false,
+                        note: nid.clone(),
+                        parent: None,
+                        slug: slug.to_owned(),
+                        class: DocClass::UserDoc,
+                        carrier: format!("---\ntitle: {slug}\nstatus: {status}\n---\nBody\n"),
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        created_revs.insert(nid.clone(), c.value.revision);
+    }
+    // Materialize initial overlays for [n_ranked, n_anchor, m_card] in `todo`.
+    store
+        .move_board_card(
+            human_ctx.clone(),
+            next_mutation(
+                &scope,
+                &owner,
+                MoveBoardCard {
+                    view: view.clone(),
+                    note: n_anchor.clone(),
+                    group: todo_grp.clone(),
+                    before: Some(RankNeighbor {
+                        note: m_card.clone(),
+                        expected_rank: RankExpectation::Absent,
+                    }),
+                    after: Some(RankNeighbor {
+                        note: n_ranked.clone(),
+                        expected_rank: RankExpectation::Absent,
+                    }),
+                    fields: BTreeMap::new(),
+                    expected_note: created_revs[&n_anchor].clone(),
+                    expected_view: view_c.value.revision.clone(),
+                    expected_rank: RankExpectation::Absent,
+                },
+            ),
+        )
+        .await
+        .expect("materialize todo ranks");
+
+    let pre_ov2 = store
+        .inspect_view_overlays_for_test(&scope.space_id, &view)
+        .await
+        .unwrap();
+    let n_ranked_pre_rank = pre_ov2[&n_ranked].sort_rank_lexo.clone();
+    let n_ranked_pre_group = pre_ov2[&n_ranked].group.clone();
+    assert_eq!(n_ranked_pre_group, todo_grp);
+    assert!(
+        pre_ov2[&n_ranked].sort_rank_lexo < pre_ov2[&n_anchor].sort_rank_lexo
+            && pre_ov2[&n_anchor].sort_rank_lexo < pre_ov2[&m_card].sort_rank_lexo
+    );
+    assert!(!pre_ov2.contains_key(&n_outside));
+    assert!(!pre_ov2.contains_key(&d_card));
+
+    let run2 = sample_run_id(232);
+    let run2_ctx = agent_run_ctx(&human_ctx, run2.clone());
+    // Step 1: move m_card `todo -> done` and d_card `doing -> done`.
+    let m_moved = store
+        .move_board_card(
+            run2_ctx.clone(),
+            next_mutation(
+                &scope,
+                &owner,
+                MoveBoardCard {
+                    view: view.clone(),
+                    note: m_card.clone(),
+                    group: done_grp.clone(),
+                    before: None,
+                    after: None,
+                    fields: BTreeMap::from([(
+                        "status".to_owned(),
+                        Some(YamlValue::String("done".to_owned())),
+                    )]),
+                    expected_note: created_revs[&m_card].clone(),
+                    expected_view: view_c.value.revision.clone(),
+                    expected_rank: RankExpectation::Existing(pre_ov2[&m_card].rank_rev_id.clone()),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let d_moved = store
+        .move_board_card(
+            run2_ctx.clone(),
+            next_mutation(
+                &scope,
+                &owner,
+                MoveBoardCard {
+                    view: view.clone(),
+                    note: d_card.clone(),
+                    group: done_grp.clone(),
+                    before: None,
+                    after: None,
+                    fields: BTreeMap::from([(
+                        "status".to_owned(),
+                        Some(YamlValue::String("done".to_owned())),
+                    )]),
+                    expected_note: created_revs[&d_card].clone(),
+                    expected_view: view_c.value.revision.clone(),
+                    expected_rank: RankExpectation::Absent,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+
+    // Step 2: edit n_ranked (`todo -> doing`), n_anchor (`todo -> doing`), n_outside (`archived -> todo`).
+    let mut edited_revs = Vec::new();
+    for (nid, new_status) in [
+        (&n_ranked, "doing"),
+        (&n_anchor, "doing"),
+        (&n_outside, "todo"),
+    ] {
+        let snap = store
+            .get_note(
+                run2_ctx.clone(),
+                GetNote {
+                    note: nid.clone(),
+                    revision: None,
+                    causal: CausalBasis::Exact(ReceiptSet::default()),
+                },
+            )
+            .await
+            .unwrap();
+        let raw = snap.document.explicit_read(run2_ctx.auth()).unwrap();
+        let plan = extract::finalize_document(
+            raw,
+            DocClass::UserDoc,
+            nid,
+            &[FieldEdit::Set {
+                key: "status".to_owned(),
+                value: YamlValue::String(new_status.to_owned()),
+            }],
+        )
+        .unwrap();
+        let ed = store
+            .edit_note(
+                run2_ctx.clone(),
+                next_mutation(
+                    &scope,
+                    &owner,
+                    EditNote {
+                        note: nid.clone(),
+                        plan,
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        edited_revs.push(ed.value);
+    }
+
+    let run2_rev = store
+        .inspect_agent_run_revision_for_test(&scope.space_id, &run2)
+        .await
+        .unwrap()
+        .unwrap();
+    let cur_ov2 = store
+        .inspect_view_overlays_for_test(&scope.space_id, &view)
+        .await
+        .unwrap();
+    let mut expected_entities = edited_revs;
+    expected_entities.push(m_moved.value.revision.clone());
+    expected_entities.push(d_moved.value.revision.clone());
+    store
+        .rollback_agent_run(
+            human_ctx,
+            next_mutation(
+                &scope,
+                &owner,
+                RollbackAgentRun {
+                    run: run2,
+                    expected_run_revision: run2_rev,
+                    expected_entities,
+                    associated_board_expectations: vec![
+                        AssociatedBoardExpectation {
+                            view: view.clone(),
+                            note: m_card.clone(),
+                            expected_rank: RankExpectation::Existing(
+                                cur_ov2[&m_card].rank_rev_id.clone(),
+                            ),
+                            expected_placement_revision: cur_ov2[&m_card]
+                                .placement_revision
+                                .clone(),
+                        },
+                        AssociatedBoardExpectation {
+                            view: view.clone(),
+                            note: d_card.clone(),
+                            expected_rank: RankExpectation::Existing(
+                                cur_ov2[&d_card].rank_rev_id.clone(),
+                            ),
+                            expected_placement_revision: cur_ov2[&d_card]
+                                .placement_revision
+                                .clone(),
+                        },
+                    ],
+                },
+            ),
+        )
+        .await
+        .expect("board rollback reconciling non-moved edited notes must succeed");
+
+    let post_ov2 = store
+        .inspect_view_overlays_for_test(&scope.space_id, &view)
+        .await
+        .unwrap();
+    // Trace A: n_ranked keeps its exact original `(todo, r0)` overlay (never corrupted to `doing`).
+    assert_eq!(post_ov2[&n_ranked].group, n_ranked_pre_group);
+    assert_eq!(post_ov2[&n_ranked].sort_rank_lexo, n_ranked_pre_rank);
+    // Trace B: n_outside has NO phantom overlay row in view_rank_overlays.
+    assert!(
+        !post_ov2.contains_key(&n_outside),
+        "note restored outside board view must not receive a phantom rank overlay"
+    );
+    // Trace C: m_card restored cleanly into `todo` strictly after `n_anchor`, and d_card back in `doing`.
+    assert_eq!(post_ov2[&m_card].group, todo_grp);
+    assert_eq!(post_ov2[&n_anchor].group, todo_grp);
+    assert_eq!(post_ov2[&d_card].group, doing_grp);
+    assert!(
+        post_ov2[&n_ranked].sort_rank_lexo < post_ov2[&n_anchor].sort_rank_lexo
+            && post_ov2[&n_anchor].sort_rank_lexo < post_ov2[&m_card].sort_rank_lexo,
+        "restored todo order must remain [n_ranked, n_anchor, m_card]"
+    );
+}
+
+#[tokio::test]
+async fn l6_rollback_board_restored_note_and_non_moved_group_reconciliation_dual_dialect_parity() {
+    {
+        let root = TempDataRoot::new("l6-rec-sqlite");
+        let cfg = CanonicalConfig::local_default(sample_installation_id(15), root.data_root());
+        let (store, runtime) = CanonicalRuntime::open(cfg).await.expect("open sqlite");
+        run_board_restored_note_and_group_reconciliation_suite(&store).await;
+        runtime.shutdown().await.expect("shutdown sqlite");
+    }
+    {
+        let fixtures = StorageTestFixtures::load_required();
+        let schema = fixtures.fresh_pg_schema();
+        let bucket = fixtures.fresh_s3_bucket("l6rec");
+        let s3_cfg = fixtures.s3_config(&bucket, S3BucketModePolicy::DetectFromBucket);
+        admin_ensure_bucket(&s3_cfg, Some("Enabled"))
+            .await
+            .expect("ensure S3 bucket");
+        let cfg = fixtures.pg_s3_config(sample_installation_id(16), &schema, s3_cfg);
+        let (store, runtime) = CanonicalRuntime::open(cfg).await.expect("open pg+s3");
+        run_board_restored_note_and_group_reconciliation_suite(&store).await;
+        runtime.shutdown().await.expect("shutdown pg+s3");
+        fixtures.drop_pg_schema(&schema).await;
+    }
+}
+
 #[tokio::test]
 async fn l6_rollback_board_unmoved_run_touched_neighbor_dual_dialect_parity() {
     {

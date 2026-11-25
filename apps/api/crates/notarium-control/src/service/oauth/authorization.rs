@@ -51,35 +51,65 @@ impl OAuthService {
         ctx: &AccountContext,
         user: &UsersRow,
         spaces: Option<&[SpaceId]>,
+        access: BearerScope,
         lock: bool,
     ) -> Result<(), PortError> {
+        let auth = self
+            .control
+            .human_context(
+                tx,
+                user,
+                ctx.auth().credential().cloned().ok_or_else(denied)?,
+                ctx.auth().grant().clone(),
+                false,
+                false,
+                lock,
+            )
+            .await?;
+        let all_classes = notarium_core::classes::DocClass::all();
+        let check_caller_grant = |id: &SpaceId,
+                                  caller_grant: &notarium_core::auth::SpaceGrant|
+         -> Result<(), PortError> {
+            if caller_grant.read_classes != all_classes {
+                return Err(rejected(OAuthErrorCode::AccessDenied));
+            }
+            if access == BearerScope::Write {
+                let live_writable = auth
+                    .spaces()
+                    .get(id)
+                    .map(|g| g.role != notarium_core::auth::SpaceRole::Viewer)
+                    .unwrap_or(caller_grant.role != notarium_core::auth::SpaceRole::Viewer);
+                if live_writable
+                    && (caller_grant.role == notarium_core::auth::SpaceRole::Viewer
+                        || caller_grant.write_classes != all_classes)
+                {
+                    return Err(rejected(OAuthErrorCode::AccessDenied));
+                }
+            }
+            Ok(())
+        };
         if let Some(spaces) = spaces {
             if spaces.len() > usize::from(self.control.config.max_auth_spaces).min(256) {
                 return Err(rejected(OAuthErrorCode::InvalidScope));
             }
-            if spaces
-                .iter()
-                .any(|id| !ctx.auth().spaces().contains_key(id))
-            {
+            for id in spaces {
+                let caller_grant = ctx
+                    .auth()
+                    .spaces()
+                    .get(id)
+                    .ok_or_else(|| rejected(OAuthErrorCode::AccessDenied))?;
+                if !auth.spaces().contains_key(id) {
+                    return Err(rejected(OAuthErrorCode::AccessDenied));
+                }
+                check_caller_grant(id, caller_grant)?;
+            }
+        } else {
+            if ctx.auth().is_space_narrowed() {
                 return Err(rejected(OAuthErrorCode::AccessDenied));
             }
-            let auth = self
-                .control
-                .human_context(
-                    tx,
-                    user,
-                    ctx.auth().credential().cloned().ok_or_else(denied)?,
-                    ctx.auth().grant().clone(),
-                    false,
-                    false,
-                    lock,
-                )
-                .await?;
-            if spaces.iter().any(|id| !auth.spaces().contains_key(id)) {
-                return Err(rejected(OAuthErrorCode::AccessDenied));
+            for (id, caller_grant) in ctx.auth().spaces() {
+                check_caller_grant(id, caller_grant)?;
             }
-        } else if ctx.auth().is_space_narrowed() {
-            return Err(rejected(OAuthErrorCode::AccessDenied));
         }
         Ok(())
     }
@@ -127,6 +157,7 @@ impl OAuthService {
                             &ctx,
                             &user,
                             spaces.as_deref(),
+                            scope.access,
                             false,
                         )
                         .await
@@ -155,8 +186,15 @@ impl OAuthService {
                         .control
                         .manager_read(rtx.inner_mut(), ctx.auth(), ctx.auth().principal())
                         .await?;
-                    self.check_spaces(rtx.inner_mut(), &ctx, &user, spaces.as_deref(), false)
-                        .await?;
+                    self.check_spaces(
+                        rtx.inner_mut(),
+                        &ctx,
+                        &user,
+                        spaces.as_deref(),
+                        scope.access,
+                        false,
+                    )
+                    .await?;
                     let current = clients::observed(rtx.inner_mut(), &request.client_id).await?;
                     if !client.matches(&current, now) {
                         return Err(rejected(OAuthErrorCode::InvalidClient));
@@ -268,7 +306,7 @@ impl OAuthService {
             let (_,user)=self.control.manager(tx.inner_mut(),ctx.auth(),&intent.user).await?;
             let now=self.control.clock.now_ms()?;
             if user.auth_version!=intent.auth_version || intent.expires<=now {return Err(invalid_grant());}
-            self.check_spaces(tx.inner_mut(),&ctx,&user,intent.spaces.as_deref(),true).await?;
+            self.check_spaces(tx.inner_mut(),&ctx,&user,intent.spaces.as_deref(),intent.scope.access,true).await?;
             let current=clients::locked(tx.inner_mut(),&intent.client_id).await?;
             if !client.matches(&current,now) || clients::digest(&current)!=intent.client_digest {return Err(rejected(OAuthErrorCode::InvalidClient));}
             witness.verify(tx.inner_mut()).await?;

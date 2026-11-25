@@ -346,6 +346,72 @@ async fn raw_reference_for_account(
     Ok(visible)
 }
 
+async fn exact_ability_matches_kind(
+    registry: &ToolRegistry,
+    account: &AccountContext,
+    reference: &AbilityRef,
+    expected_kind: AbilityKind,
+) -> Result<bool, PortError> {
+    match registry
+        .control
+        .inspect_ability(account.clone(), reference.identity())
+        .await
+    {
+        Ok(inspection) => Ok(inspection.descriptor.kind == expected_kind),
+        Err(error) if visible_error(&error) => match &reference.placement {
+            AbilityPlacement::OwnedProject(folder) => {
+                let promoted = AbilityIdentity {
+                    id: reference.id.clone(),
+                    placement: AbilityPlacement::OwnedSpace(folder.space_id.clone()),
+                };
+                match registry
+                    .control
+                    .inspect_ability(account.clone(), promoted)
+                    .await
+                {
+                    Ok(inspection) => Ok(inspection.descriptor.kind == expected_kind),
+                    Err(error) if visible_error(&error) => Ok(false),
+                    Err(error) => Err(error),
+                }
+            }
+            _ => Ok(false),
+        },
+        Err(error) => Err(error),
+    }
+}
+
+async fn resolve_exact_for_kind(
+    registry: &ToolRegistry,
+    account: &AccountContext,
+    reference: AbilityRef,
+    kind: AbilityKind,
+    project: Option<FolderRef>,
+) -> Result<AbilityResolution, PortError> {
+    let resolution = registry
+        .control
+        .resolve_ability(
+            account.clone(),
+            AbilitySelection::Exact {
+                reference: reference.clone(),
+                project,
+            },
+        )
+        .await?;
+    match resolution {
+        AbilityResolution::Resolved(value) if value.kind != kind => {
+            Ok(AbilityResolution::WrongKind)
+        }
+        AbilityResolution::Disabled | AbilityResolution::Stale => {
+            if exact_ability_matches_kind(registry, account, &reference, kind).await? {
+                Ok(resolution)
+            } else {
+                Ok(AbilityResolution::WrongKind)
+            }
+        }
+        other => Ok(other),
+    }
+}
+
 async fn resolve_selector_for_account(
     registry: &ToolRegistry,
     account: &AccountContext,
@@ -355,24 +421,12 @@ async fn resolve_selector_for_account(
 ) -> Result<AbilityResolution, PortError> {
     if selector.starts_with("ar1:") {
         let reference = parse_token(selector, "ar1:", MAX_TOKEN_BYTES)?;
-        return registry
-            .control
-            .resolve_ability(
-                account.clone(),
-                AbilitySelection::Exact { reference, project },
-            )
-            .await;
+        return resolve_exact_for_kind(registry, account, reference, kind, project).await;
     }
     if let Ok(id) = AbilityId::parse_v1(selector)
         && let Some(reference) = raw_reference_for_account(registry, account, id).await?
     {
-        return registry
-            .control
-            .resolve_ability(
-                account.clone(),
-                AbilitySelection::Exact { reference, project },
-            )
-            .await;
+        return resolve_exact_for_kind(registry, account, reference, kind, project).await;
     }
     let by_name = registry
         .control
@@ -391,13 +445,7 @@ async fn resolve_selector_for_account(
     if let Ok(id) = AbilityId::parse(selector)
         && let Some(reference) = raw_reference_for_account(registry, account, id).await?
     {
-        return registry
-            .control
-            .resolve_ability(
-                account.clone(),
-                AbilitySelection::Exact { reference, project },
-            )
-            .await;
+        return resolve_exact_for_kind(registry, account, reference, kind, project).await;
     }
     Ok(by_name)
 }
@@ -451,13 +499,18 @@ async fn provider_skill_spaces(
     Ok((allowed, any_project_only))
 }
 
+struct RuntimeWinners {
+    active: Vec<AbilityRef>,
+    any_foreign_winner: bool,
+}
+
 async fn provider_runtime_winners(
     call: &ToolCallContext<'_>,
     discover_account: &AccountContext,
     query_project: &Option<FolderRef>,
     project: Option<&FolderRef>,
     name: &str,
-) -> Result<Vec<AbilityRef>, PortError> {
+) -> Result<RuntimeWinners, PortError> {
     let page = call
         .registry
         .control
@@ -473,6 +526,15 @@ async fn provider_runtime_winners(
         )
         .await?;
     if page.continuation.is_some() {
+        if call.auth.pinned_write_space().is_some_and(|pin| {
+            discover_account
+                .auth()
+                .spaces()
+                .keys()
+                .any(|space| space != pin)
+        }) {
+            call.commit_external_read();
+        }
         return Err(invalid(ValidationReason::BudgetExceeded));
     }
     let mut winners: Vec<AbilityDescriptor> = Vec::new();
@@ -504,11 +566,18 @@ async fn provider_runtime_winners(
             }
         }
     }
-    Ok(winners
+    let any_foreign_winner = winners
+        .iter()
+        .any(|w| placement_is_foreign(call, &w.reference.placement, w.entrypoint.as_ref()));
+    let active = winners
         .into_iter()
         .filter(|w| w.enabled && w.healthy)
         .map(|w| w.reference)
-        .collect())
+        .collect();
+    Ok(RuntimeWinners {
+        active,
+        any_foreign_winner,
+    })
 }
 
 async fn provider_placement_visible(
@@ -603,7 +672,7 @@ async fn raw_reference_for_call(
     if candidates.is_empty() {
         return Ok(None);
     }
-    let mut visible: Option<AbilityRef> = None;
+    let mut visible: Option<AbilityDescriptor> = None;
     for candidate in candidates {
         let inspection = match call
             .registry
@@ -621,11 +690,23 @@ async fn raw_reference_for_call(
         match read_body_inner(call, &inspection.descriptor, project, false).await {
             Ok(_) => {
                 if let Some(existing) = &visible
-                    && existing.identity() == inspection.descriptor.reference.identity()
+                    && existing.reference.identity() == inspection.descriptor.reference.identity()
                 {
                     continue;
                 }
-                if visible.replace(inspection.descriptor.reference).is_some() {
+                if let Some(prev) = visible.replace(inspection.descriptor) {
+                    let current = visible.as_ref().expect("just inserted");
+                    if placement_is_foreign(
+                        call,
+                        &prev.reference.placement,
+                        prev.entrypoint.as_ref(),
+                    ) || placement_is_foreign(
+                        call,
+                        &current.reference.placement,
+                        current.entrypoint.as_ref(),
+                    ) {
+                        call.commit_external_read();
+                    }
                     return Err(invalid(ValidationReason::ScopeMismatch));
                 }
             }
@@ -633,7 +714,7 @@ async fn raw_reference_for_call(
             Err(error) => return Err(error),
         }
     }
-    Ok(visible)
+    Ok(visible.map(|descriptor| descriptor.reference))
 }
 
 async fn resolve_selector_for_call(
@@ -690,16 +771,24 @@ async fn resolve_selector_for_call(
         )
         .await?;
     if page.continuation.is_some() {
+        if call
+            .auth
+            .pinned_write_space()
+            .is_some_and(|pin| allowed.iter().any(|space| space != pin))
+        {
+            call.commit_external_read();
+        }
         return Err(invalid(ValidationReason::BudgetExceeded));
     }
-    let mut winners: Vec<AbilityRef> = Vec::new();
+    let mut winners: Vec<AbilityDescriptor> = Vec::new();
     let mut best_prec: Option<u8> = None;
     for inspection in page.items {
-        let reference = &inspection.descriptor.reference;
+        let descriptor = inspection.descriptor;
+        let reference = &descriptor.reference;
         if !role_placement_matches_project(&reference.placement, project.as_ref()) {
             continue;
         }
-        if !provider_placement_visible(call, &inspection.descriptor, project.as_ref()).await? {
+        if !provider_placement_visible(call, &descriptor, project.as_ref()).await? {
             continue;
         }
         let prec = reference.placement.precedence();
@@ -708,41 +797,56 @@ async fn resolve_selector_for_call(
             Some(best) if prec == best => {
                 if winners
                     .iter()
-                    .all(|existing| existing.identity() != reference.identity())
+                    .all(|existing| existing.reference.identity() != reference.identity())
                 {
-                    winners.push(reference.clone());
+                    winners.push(descriptor);
                 }
             }
             _ => {
                 best_prec = Some(prec);
                 winners.clear();
-                winners.push(reference.clone());
+                winners.push(descriptor);
             }
         }
     }
     let by_name = match winners.len() {
         0 => AbilityResolution::Missing,
         1 => {
-            let reference = winners.pop().expect("single winner");
-            let exact = call
-                .registry
-                .control
-                .resolve_ability(
-                    discover_account,
-                    AbilitySelection::Exact {
-                        reference,
-                        project: query_project,
-                    },
-                )
-                .await?;
-            match exact {
-                AbilityResolution::Resolved(value) if value.kind != kind => {
-                    AbilityResolution::WrongKind
+            let winner = winners.pop().expect("single winner");
+            if winner.kind != kind {
+                AbilityResolution::WrongKind
+            } else {
+                let exact = call
+                    .registry
+                    .control
+                    .resolve_ability(
+                        discover_account,
+                        AbilitySelection::Exact {
+                            reference: winner.reference,
+                            project: query_project,
+                        },
+                    )
+                    .await?;
+                match exact {
+                    AbilityResolution::Resolved(value) if value.kind != kind => {
+                        AbilityResolution::WrongKind
+                    }
+                    other => other,
                 }
-                other => other,
             }
         }
-        _ => return Err(invalid(ValidationReason::InvalidState)),
+        _ => {
+            if winners.iter().any(|winner| {
+                placement_is_foreign(
+                    call,
+                    &winner.reference.placement,
+                    winner.entrypoint.as_ref(),
+                )
+            }) {
+                call.commit_external_read();
+            }
+            return Err(invalid(ValidationReason::InvalidState));
+        }
     };
     if !matches!(by_name, AbilityResolution::Missing) {
         return Ok(by_name);
@@ -819,9 +923,7 @@ fn placement_is_foreign(
     }
     match placement {
         AbilityPlacement::System => false,
-        AbilityPlacement::OwnedPersonal(_) => {
-            call.auth.chat_audience() == Some(ChatAudience::Shared)
-        }
+        AbilityPlacement::OwnedPersonal(_) => true,
         AbilityPlacement::OwnedSpace(space) => space != pin,
         AbilityPlacement::OwnedProject(folder) => &folder.space_id != pin,
     }
@@ -1351,12 +1453,21 @@ async fn list(
         // consent governs visibility so unconsented Spaces never enter catalog paging.
         // For Runtime view, keep consented owned Spaces even when filtering by System
         // so owned abilities shadowing built-in names still suppress shadowed System items.
-        let (discover_auth, query_project, any_project_only) =
+        let (discover_auth, query_project, any_project_only, has_foreign_consented_space) =
             if args.source == Some(Source::System) && view == View::Authoring {
-                (call.auth.restrict_to_spaces(&BTreeSet::new()), None, false)
+                (
+                    call.auth.restrict_to_spaces(&BTreeSet::new()),
+                    None,
+                    false,
+                    false,
+                )
             } else if view == View::Runtime || project.is_some() {
                 let (allowed, any_project_only) =
                     provider_skill_spaces(call, project.as_ref()).await?;
+                let has_foreign = call
+                    .auth
+                    .pinned_write_space()
+                    .is_some_and(|pin| allowed.iter().any(|space| space != pin));
                 let query_project = project
                     .as_ref()
                     .filter(|p| allowed.contains(&p.space_id))
@@ -1365,18 +1476,20 @@ async fn list(
                     call.auth.restrict_to_spaces(&allowed),
                     query_project,
                     any_project_only,
+                    has_foreign,
                 )
             } else {
-                (call.auth.clone(), None, false)
+                (call.auth.clone(), None, false, false)
             };
-        let use_provider_runtime_overlay = view == View::Runtime && any_project_only;
+        let use_provider_runtime_overlay =
+            view == View::Runtime && (any_project_only || has_foreign_consented_space);
         let discover_account = AccountContext::new(discover_auth, call.budget());
         let cap = usize::from(limit);
         let mut last_key: Option<AbilitySortKey> = None;
         let mut resume_cursor: Option<String> = None;
         let mut has_more = false;
         let mut reached_end = false;
-        let mut runtime_winner_cache: BTreeMap<String, Vec<AbilityRef>> = BTreeMap::new();
+        let mut runtime_winner_cache: BTreeMap<String, RuntimeWinners> = BTreeMap::new();
         'scan: for page_idx in 0..MAX_PROVIDER_ABILITY_SCAN_PAGES {
             let mut page_start_cursor = control_cursor.clone();
             let page = match call
@@ -1423,9 +1536,15 @@ async fn list(
                                 authoring: view == View::Authoring || use_provider_runtime_overlay,
                             },
                         )
-                        .await?
+                        .await
+                        .inspect_err(|_| {
+                            commit_deferred_taints_on_error(call, &deferred_taints);
+                        })?
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    commit_deferred_taints_on_error(call, &deferred_taints);
+                    return Err(error);
+                }
             };
             for inspection in page.items {
                 let descriptor = &inspection.descriptor;
@@ -1470,10 +1589,12 @@ async fn list(
                     continue;
                 }
                 if use_provider_runtime_overlay {
-                    if !descriptor.enabled
-                        || !descriptor.healthy
-                        || !provider_placement_visible(call, descriptor, project.as_ref()).await?
-                    {
+                    let visible = provider_placement_visible(call, descriptor, project.as_ref())
+                        .await
+                        .inspect_err(|_| {
+                            commit_deferred_taints_on_error(call, &deferred_taints);
+                        })?;
+                    if !descriptor.enabled || !descriptor.healthy || !visible {
                         continue;
                     }
                     let winners = match runtime_winner_cache.get(&descriptor.name) {
@@ -1486,17 +1607,17 @@ async fn list(
                                 project.as_ref(),
                                 &descriptor.name,
                             )
-                            .await?;
+                            .await
+                            .inspect_err(|_| {
+                                commit_deferred_taints_on_error(call, &deferred_taints);
+                            })?;
                             runtime_winner_cache
                                 .entry(descriptor.name.clone())
                                 .or_insert(computed)
                         }
                     };
-                    if !winners.contains(&descriptor.reference) {
-                        if winners
-                            .iter()
-                            .any(|winner| placement_is_foreign(call, &winner.placement, None))
-                        {
+                    if !winners.active.contains(&descriptor.reference) {
+                        if winners.any_foreign_winner {
                             deferred_taints.push(AbilityTaintCommit::ForeignBranch {
                                 taint: call.auth.taint().clone(),
                             });
@@ -1507,7 +1628,10 @@ async fn list(
                 let body = match read_body_inner(call, descriptor, project.as_ref(), false).await {
                     Ok(body) => body,
                     Err(error) if visible_error(&error) => continue,
-                    Err(error) => return Err(error),
+                    Err(error) => {
+                        commit_deferred_taints_on_error(call, &deferred_taints);
+                        return Err(error);
+                    }
                 };
                 if query.as_ref().is_some_and(|query| {
                     !notarium_syntax::unicode::lookup_key(&descriptor.name).contains(query)
@@ -1672,7 +1796,10 @@ async fn get(call: &mut ToolCallContext<'_>, args: GetArgs) -> Result<Value, Por
         {
             Ok(resource) => resource,
             Err(error) if visible_error(&error) => continue,
-            Err(error) => return Err(error),
+            Err(error) => {
+                commit_deferred_taints_on_error(call, &deferred_taints);
+                return Err(error);
+            }
         };
         if let Some(taint) = resource.deferred_taint {
             deferred_taints.push(taint);
@@ -1686,7 +1813,10 @@ async fn get(call: &mut ToolCallContext<'_>, args: GetArgs) -> Result<Value, Por
             commit_deferred_taints_on_error(call, &deferred_taints);
             return Err(invalid(ValidationReason::BudgetExceeded));
         }
-        call.record_origin(resource.origin, resource.project)?;
+        if let Err(error) = call.record_origin(resource.origin, resource.project) {
+            commit_deferred_taints_on_error(call, &deferred_taints);
+            return Err(error);
+        }
         files.push(path.clone());
         resources.push(json!({"path":path,"content":resource.text}));
     }
@@ -1699,7 +1829,13 @@ async fn get(call: &mut ToolCallContext<'_>, args: GetArgs) -> Result<Value, Por
             .iter()
             .find(|attach| attach.identity == dependency.identity())
             .and_then(|attach| attach.label.clone());
-        let mut child = current_skill(call, dependency, project.as_ref()).await?;
+        let mut child = match current_skill(call, dependency, project.as_ref()).await {
+            Ok(child) => child,
+            Err(error) => {
+                commit_deferred_taints_on_error(call, &deferred_taints);
+                return Err(error);
+            }
+        };
         if matches!(call.target, EgressTarget::InAppProvider { .. })
             && let Some(inspection) = &child
         {
@@ -1708,13 +1844,19 @@ async fn get(call: &mut ToolCallContext<'_>, args: GetArgs) -> Result<Value, Por
             } else {
                 match read_body_inner(call, &inspection.descriptor, project.as_ref(), false).await {
                     Ok(body) => {
-                        call.record_origin(body.origin, body.project)?;
                         if let Some(taint) = body.deferred_taint {
                             deferred_taints.push(taint);
                         }
+                        if let Err(error) = call.record_origin(body.origin, body.project) {
+                            commit_deferred_taints_on_error(call, &deferred_taints);
+                            return Err(error);
+                        }
                     }
                     Err(error) if visible_error(&error) => child = None,
-                    Err(error) => return Err(error),
+                    Err(error) => {
+                        commit_deferred_taints_on_error(call, &deferred_taints);
+                        return Err(error);
+                    }
                 }
             }
         }
@@ -1729,10 +1871,20 @@ async fn get(call: &mut ToolCallContext<'_>, args: GetArgs) -> Result<Value, Por
             Some(inspection) => ("disabled", inspection.descriptor.reference),
             None => ("missing", dependency.clone()),
         };
-        attachments.push(json!({"ref":reference_token(&reference)?,"label":label,"status":status}));
+        let encoded = match reference_token(&reference) {
+            Ok(token) => token,
+            Err(error) => {
+                commit_deferred_taints_on_error(call, &deferred_taints);
+                return Err(error);
+            }
+        };
+        attachments.push(json!({"ref":encoded,"label":label,"status":status}));
     }
     result["attachments"] = json!(attachments);
-    call.record_origin(body.origin, body.project)?;
+    if let Err(error) = call.record_origin(body.origin, body.project) {
+        commit_deferred_taints_on_error(call, &deferred_taints);
+        return Err(error);
+    }
     for taint in deferred_taints {
         taint.commit()?;
     }
@@ -1857,7 +2009,9 @@ async fn locate_chat_role_by_id(
             Err(error) if visible_error(&error) => continue,
             Err(error) => return Err(error),
         };
-        if !role_placement_matches_project(&inspection.descriptor.reference.placement, project) {
+        if inspection.descriptor.kind != AbilityKind::Role
+            || !role_placement_matches_project(&inspection.descriptor.reference.placement, project)
+        {
             continue;
         }
         if !selection_admits_descriptor(
@@ -2033,7 +2187,7 @@ pub async fn bind_chat_role(
         if page.continuation.is_some() {
             return Err(invalid(ValidationReason::BudgetExceeded));
         }
-        let mut winners: Vec<AbilityRef> = Vec::new();
+        let mut winners: Vec<(AbilityRef, AbilityKind)> = Vec::new();
         let mut best_prec: Option<u8> = None;
         for inspection in page.items {
             let reference = &inspection.descriptor.reference;
@@ -2050,37 +2204,41 @@ pub async fn bind_chat_role(
                 Some(best) if prec == best => {
                     if winners
                         .iter()
-                        .all(|existing| existing.identity() != reference.identity())
+                        .all(|(existing, _)| existing.identity() != reference.identity())
                     {
-                        winners.push(reference.clone());
+                        winners.push((reference.clone(), inspection.descriptor.kind));
                     }
                 }
                 _ => {
                     best_prec = Some(prec);
                     winners.clear();
-                    winners.push(reference.clone());
+                    winners.push((reference.clone(), inspection.descriptor.kind));
                 }
             }
         }
         let by_name = match winners.len() {
             0 => AbilityResolution::Missing,
             1 => {
-                let reference = winners.pop().expect("single winner");
-                let exact = registry
-                    .control
-                    .resolve_ability(
-                        resolve_account.clone(),
-                        AbilitySelection::Exact {
-                            reference,
-                            project: resolve_project.clone(),
-                        },
-                    )
-                    .await?;
-                match exact {
-                    AbilityResolution::Resolved(value) if value.kind != AbilityKind::Role => {
-                        AbilityResolution::WrongKind
+                let (reference, winner_kind) = winners.pop().expect("single winner");
+                if winner_kind != AbilityKind::Role {
+                    AbilityResolution::WrongKind
+                } else {
+                    let exact = registry
+                        .control
+                        .resolve_ability(
+                            resolve_account.clone(),
+                            AbilitySelection::Exact {
+                                reference,
+                                project: resolve_project.clone(),
+                            },
+                        )
+                        .await?;
+                    match exact {
+                        AbilityResolution::Resolved(value) if value.kind != AbilityKind::Role => {
+                            AbilityResolution::WrongKind
+                        }
+                        other => other,
                     }
-                    other => other,
                 }
             }
             _ => return Err(invalid(ValidationReason::InvalidState)),
@@ -2471,7 +2629,13 @@ async fn activation_with_body(
     let mut skills = Vec::new();
     let mut omitted = Vec::new();
     for dependency in &descriptor.attached_skills {
-        let inspection = current_skill(call, dependency, project).await?;
+        let inspection = match current_skill(call, dependency, project).await {
+            Ok(inspection) => inspection,
+            Err(error) => {
+                commit_deferred_taints_on_error(call, &deferred_taints);
+                return Err(error);
+            }
+        };
         let mut added = false;
         if let Some(inspection) = inspection.as_ref()
             && inspection.binding_enabled
@@ -2481,28 +2645,61 @@ async fn activation_with_body(
             match read_body_inner(call, &inspection.descriptor, project, false).await {
                 Ok(child) if child.instructions.len() <= remaining => {
                     remaining -= child.instructions.len();
+                    let encoded = match reference_token(&inspection.descriptor.reference) {
+                        Ok(token) => token,
+                        Err(error) => {
+                            commit_deferred_taints_on_error(call, &deferred_taints);
+                            return Err(error);
+                        }
+                    };
                     let row = json!({
-                        "ref":reference_token(&inspection.descriptor.reference)?,
+                        "ref":encoded,
                         "name":inspection.descriptor.name,
                         "instructions":child.instructions,
                     });
-                    call.record_origin(child.origin, child.project)?;
                     if let Some(taint) = child.deferred_taint {
                         deferred_taints.push(taint);
+                    }
+                    if let Err(error) = call.record_origin(child.origin, child.project) {
+                        commit_deferred_taints_on_error(call, &deferred_taints);
+                        return Err(error);
                     }
                     skills.push(row);
                     added = true;
                 }
-                Ok(_) => (),
+                Ok(child) => {
+                    if child
+                        .deferred_taint
+                        .as_ref()
+                        .is_some_and(AbilityTaintCommit::would_taint_branch)
+                    {
+                        deferred_taints.push(AbilityTaintCommit::ForeignBranch {
+                            taint: call.auth.taint().clone(),
+                        });
+                    }
+                }
                 Err(error) if visible_error(&error) => (),
-                Err(error) => return Err(error),
+                Err(error) => {
+                    commit_deferred_taints_on_error(call, &deferred_taints);
+                    return Err(error);
+                }
             }
         }
         if !added {
-            omitted.push(reference_token(dependency)?);
+            let encoded = match reference_token(dependency) {
+                Ok(token) => token,
+                Err(error) => {
+                    commit_deferred_taints_on_error(call, &deferred_taints);
+                    return Err(error);
+                }
+            };
+            omitted.push(encoded);
         }
     }
-    call.record_origin(body.origin, body.project)?;
+    if let Err(error) = call.record_origin(body.origin, body.project) {
+        commit_deferred_taints_on_error(call, &deferred_taints);
+        return Err(error);
+    }
     Ok((
         json!({
             "ref":reference_token(&descriptor.reference)?,

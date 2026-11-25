@@ -223,7 +223,7 @@ impl ProviderService {
                         for row in batch.rows {
                             after = row.id.clone();
                             scanned += 1;
-                            if !owns_resource {
+                            if !owns_resource || ctx.auth().is_space_narrowed() {
                                 let space = SpaceId::parse(&row.target_space)?;
                                 if !ctx.auth().spaces().contains_key(&space) {
                                     continue;
@@ -302,6 +302,10 @@ impl ProviderService {
                                 other => other,
                             });
                         }
+                    } else if ctx.auth().is_space_narrowed()
+                        && !ctx.auth().spaces().contains_key(&space)
+                    {
+                        return Err(DomainError::ResourceNotFound.into());
                     }
                     let current_credential_consent_epoch = if let Some(id) = &resource.credential_id
                     {

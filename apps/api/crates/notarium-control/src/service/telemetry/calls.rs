@@ -20,7 +20,19 @@ impl ControlService {
                 if existing.owner_id!=auth.principal().as_str() || existing.fingerprint!=fingerprint.as_bytes(){return Err(DomainError::IdempotencyKeyReused.into());}return Ok(());
             }
             let episode = match &request.episode {
-                Some(id) => Some(super::super::episodes::episode(tx.inner_mut(), auth.principal(), id).await?),
+                Some(id) => {
+                    let row =
+                        super::super::episodes::episode(tx.inner_mut(), auth.principal(), id)
+                            .await?;
+                    let project = super::super::episodes::stored_project_ref(&row)?;
+                    if !super::super::episodes::episode_visible_to_narrowed(
+                        &auth,
+                        project.as_ref(),
+                    ) {
+                        return Err(DomainError::ResourceNotFound.into());
+                    }
+                    Some(row)
+                }
                 None => None,
             };
             let agent=match auth.kind(){PrincipalKind::AgentRun(run)|PrincipalKind::Keeper(run)=>Some(run.to_string()),_=>None};
@@ -95,6 +107,7 @@ impl ControlService {
                 }
             } else if let Some(episode) = episode
                 && matches!(request.transport, AgentTransport::Mcp)
+                && auth.bearer_scope() != Some(BearerScope::Read)
                 && !auth.taint().is_tainted()
                 && !matches!(
                     auth.kind(),

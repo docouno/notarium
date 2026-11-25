@@ -96,7 +96,7 @@ pub(super) async fn observe_project(
     call: &ToolCallContext<'_>,
     handle: &str,
 ) -> Result<CreateProject, PortError> {
-    let project = session::resolve_project(call, handle).await?;
+    let project = session::resolve_project_for_direct_write(call, handle).await?;
     let scope = session::space(call, &project.folder.space_id).await?;
     Ok(CreateProject {
         reference: project.folder,
@@ -105,39 +105,52 @@ pub(super) async fn observe_project(
 }
 
 async fn placement(call: &ToolCallContext<'_>, handle: &str) -> Result<CreatePlacement, PortError> {
+    let mut replayed = true;
     let project: CreateProject = call
-        .journal("create_project", || observe_project(call, handle))
+        .journal("create_project", || async {
+            replayed = false;
+            observe_project(call, handle).await
+        })
         .await?;
-    project_placement(call, project).await
+    project_placement(call, project, replayed).await
 }
 
 async fn project_placement(
     call: &ToolCallContext<'_>,
     project: CreateProject,
+    allow_trashed_replay: bool,
 ) -> Result<CreatePlacement, PortError> {
     if project.scope.space_id != project.reference.space_id {
         return Err(invalid(ValidationReason::ScopeMismatch));
     }
     let read_scope = call.space(project.scope.clone())?;
     let write_scope = read_scope.clone().restrict_to_project(&project.reference)?;
-    let live = call
-        .registry
-        .catalog
-        .project(write_scope.clone(), project.reference.clone())
-        .await?;
-    if live.folder != project.reference {
-        return Err(invalid(ValidationReason::SourceMismatch));
-    }
     let folder = call
         .registry
         .catalog
         .folder(call.account(), project.reference.clone())
         .await?;
+    let lifecycle_hidden = if allow_trashed_replay {
+        folder.lifecycle == Lifecycle::Purged
+    } else {
+        folder.lifecycle != Lifecycle::Active
+    };
     if folder.reference != project.reference
         || folder.space.id != project.scope.space_id
-        || folder.lifecycle != Lifecycle::Active
+        || lifecycle_hidden
     {
         return Err(DomainError::ResourceNotFound.into());
+    }
+    let is_trashed_replay = allow_trashed_replay && folder.lifecycle == Lifecycle::Trashed;
+    if !is_trashed_replay {
+        let live = call
+            .registry
+            .catalog
+            .project(write_scope.clone(), project.reference.clone())
+            .await?;
+        if live.folder != project.reference {
+            return Err(invalid(ValidationReason::SourceMismatch));
+        }
     }
     corpus::admit_folder_write(
         call,
@@ -157,12 +170,18 @@ async fn project_placement(
         ability_package: None,
     };
     write_scope.auth().authorize_direct_write(&facts, &facts)?;
-    let live = folder_base(call, &write_scope, &project.reference.folder_id).await?;
+    let path = if is_trashed_replay {
+        String::new()
+    } else {
+        folder_base(call, &write_scope, &project.reference.folder_id)
+            .await?
+            .path
+    };
     Ok(CreatePlacement {
         project,
         read_scope,
         write_scope,
-        path: live.path,
+        path,
     })
 }
 

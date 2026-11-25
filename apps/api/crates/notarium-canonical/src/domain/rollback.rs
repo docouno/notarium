@@ -1694,12 +1694,10 @@ fn build_rollback_execute_fn(
 
             // 3. Validate folder existence and post-trash slug uniqueness for all eligible restored notes.
             let eligible_all_ids: BTreeSet<NoteId> = eligible_notes.keys().cloned().collect();
-            let trashed_created_ids: BTreeSet<NoteId> = eligible_notes
+            let retired_note_ids: BTreeSet<NoteId> = eligible_notes
                 .iter()
-                .filter_map(|(nid, act)| match act {
-                    CandidateAction::TrashCreated { .. } => Some(nid.clone()),
-                    CandidateAction::RestorePreExisting { .. } => None,
-                })
+                .filter(|(_, act)| rank_removal::removes_ranks(Some(act)))
+                .map(|(nid, _)| nid.clone())
                 .collect();
 
             let mut planned_active_slots: HashMap<(FolderId, String), NoteId> = HashMap::new();
@@ -1828,42 +1826,79 @@ fn build_rollback_execute_fn(
                         }
                     }
 
-                    // Build mutable working group lists excluding notes being trashed by this rollback,
-                    // materializing initial ranks for any unranked existing rows in each group.
+                    // Build mutable working group lists excluding notes retired by this rollback
+                    // and reconciling non-moved eligible notes against `post_restore_membership`,
+                    // materializing initial ranks for any unranked surviving rows in each group.
                     let moved_targets_on_view: BTreeSet<&NoteId> = run_moves_cl
                         .iter()
                         .filter(|bmh| {
                             &bmh.view == view
                                 && eligible_all_ids.contains(&bmh.target_note_id)
-                                && !trashed_created_ids.contains(&bmh.target_note_id)
+                                && !retired_note_ids.contains(&bmh.target_note_id)
                         })
                         .map(|bmh| &bmh.target_note_id)
                         .collect();
+                    let mut kept_groups: Vec<(GroupKey, Vec<NoteId>)> =
+                        Vec::with_capacity(view_facts.groups.len());
+                    for eg in &view_facts.groups {
+                        let kept: Vec<NoteId> = eg
+                            .rows
+                            .iter()
+                            .filter(|r| {
+                                if retired_note_ids.contains(&r.note) {
+                                    return false;
+                                }
+                                if moved_targets_on_view.contains(&r.note)
+                                    || !eligible_all_ids.contains(&r.note)
+                                {
+                                    return true;
+                                }
+                                view_facts
+                                    .post_restore_membership
+                                    .get(&r.note)
+                                    .and_then(|opt| opt.as_ref())
+                                    == Some(&eg.group)
+                            })
+                            .map(|r| r.note.clone())
+                            .collect();
+                        kept_groups.push((eg.group.clone(), kept));
+                    }
+                    for (nid, post_opt) in &view_facts.post_restore_membership {
+                        if retired_note_ids.contains(nid) || moved_targets_on_view.contains(nid) {
+                            continue;
+                        }
+                        if let Some(post_grp) = post_opt {
+                            if let Some((_, entry)) =
+                                kept_groups.iter_mut().find(|(gk, _)| gk == post_grp)
+                            {
+                                if !entry.contains(nid) {
+                                    entry.push(nid.clone());
+                                }
+                            } else {
+                                kept_groups.push((post_grp.clone(), vec![nid.clone()]));
+                            }
+                        }
+                    }
+
                     let mut working_groups: Vec<(GroupKey, Vec<ExistingRankedItem>)> = Vec::new();
                     let mut neighbor_dirty: BTreeMap<NoteId, (GroupKey, String, bool)> =
                         BTreeMap::new();
 
-                    for eg in &view_facts.groups {
-                        let kept_notes: Vec<NoteId> = eg
-                            .rows
-                            .iter()
-                            .filter(|r| !trashed_created_ids.contains(&r.note))
-                            .map(|r| r.note.clone())
-                            .collect();
+                    for (group, kept_notes) in kept_groups {
                         if kept_notes.is_empty() {
-                            working_groups.push((eg.group.clone(), Vec::new()));
+                            working_groups.push((group, Vec::new()));
                             continue;
                         }
                         let all_unranked = kept_notes
                             .iter()
-                            .all(|nid| overlays.get(nid).map(|o| &o.group) != Some(&eg.group));
+                            .all(|nid| overlays.get(nid).map(|o| &o.group) != Some(&group));
                         let mut items = Vec::with_capacity(kept_notes.len());
                         if all_unranked {
                             let init = evenly_spaced_ranks(kept_notes.len())?;
                             for (nid, r) in kept_notes.iter().zip(init) {
                                 if !moved_targets_on_view.contains(nid) {
                                     neighbor_dirty
-                                        .insert(nid.clone(), (eg.group.clone(), r.clone(), false));
+                                        .insert(nid.clone(), (group.clone(), r.clone(), false));
                                 }
                                 items.push(ExistingRankedItem {
                                     note_id: nid.clone(),
@@ -1875,7 +1910,7 @@ fn build_rollback_execute_fn(
                                 .iter()
                                 .filter_map(|nid| {
                                     let o = overlays.get(nid)?;
-                                    if o.group == eg.group {
+                                    if o.group == group {
                                         Some(ExistingRankedItem {
                                             note_id: nid.clone(),
                                             rank: o.sort_rank_lexo.clone(),
@@ -1890,10 +1925,8 @@ fn build_rollback_execute_fn(
                             });
                             items.extend(ranked_only);
                             for nid in &kept_notes {
-                                let in_grp = overlays
-                                    .get(nid)
-                                    .map(|o| o.group == eg.group)
-                                    .unwrap_or(false);
+                                let in_grp =
+                                    overlays.get(nid).map(|o| o.group == group).unwrap_or(false);
                                 if !in_grp {
                                     let tail = compute_rank_placement(&items, nid, items.len())?;
                                     for (pn, pr) in tail.pma_neighbor_updates {
@@ -1902,13 +1935,13 @@ fn build_rollback_execute_fn(
                                             it.rank = pr.clone();
                                         }
                                         if !moved_targets_on_view.contains(&pn) {
-                                            neighbor_dirty.insert(pn, (eg.group.clone(), pr, true));
+                                            neighbor_dirty.insert(pn, (group.clone(), pr, true));
                                         }
                                     }
                                     if !moved_targets_on_view.contains(nid) {
                                         neighbor_dirty.insert(
                                             nid.clone(),
-                                            (eg.group.clone(), tail.target_rank.clone(), false),
+                                            (group.clone(), tail.target_rank.clone(), false),
                                         );
                                     }
                                     items.push(ExistingRankedItem {
@@ -1918,10 +1951,10 @@ fn build_rollback_execute_fn(
                                 }
                             }
                         }
-                        working_groups.push((eg.group.clone(), items));
+                        working_groups.push((group, items));
                     }
 
-                    // Replay run's board moves on `view` for non-trashed eligible notes in DESC order!
+                    // Replay run's board moves on `view` for non-retired eligible notes in DESC order!
                     let mut target_final_state: BTreeMap<
                         NoteId,
                         Option<(GroupKey, String, Option<RevisionId>)>,
@@ -1930,7 +1963,7 @@ fn build_rollback_execute_fn(
                     for bmh in &run_moves_cl {
                         if &bmh.view != view
                             || !eligible_all_ids.contains(&bmh.target_note_id)
-                            || trashed_created_ids.contains(&bmh.target_note_id)
+                            || retired_note_ids.contains(&bmh.target_note_id)
                         {
                             continue;
                         }
@@ -2070,6 +2103,17 @@ fn build_rollback_execute_fn(
                     }
 
                     for (nbr_id, (grp, rnk, is_pma)) in neighbor_dirty {
+                        if eligible_all_ids.contains(&nbr_id)
+                            && view_facts
+                                .post_restore_membership
+                                .get(&nbr_id)
+                                .and_then(|opt| opt.as_ref())
+                                != Some(&grp)
+                        {
+                            return Err(
+                                DomainError::validation(ValidationReason::InvalidState).into()
+                            );
+                        }
                         planned_neighbor_updates.push(PlannedNeighborRankUpdate {
                             view: view.clone(),
                             neighbor_note: nbr_id,

@@ -200,6 +200,31 @@ async fn space_by_slug(call: &ToolCallContext<'_>, slug: &str) -> Result<SpaceCo
     call.space(scope)
 }
 
+pub(in super::super) async fn resolve_project_for_direct_write(
+    call: &ToolCallContext<'_>,
+    handle: &str,
+) -> Result<ProjectInfo, PortError> {
+    let Some(pin) = call.auth.pinned_write_space() else {
+        return resolve_project(call, handle).await;
+    };
+    let (space_slug, slug) = project_handle(handle)?;
+    let pin_space = readable_space(call, pin).await?;
+    if lookup_key(&pin_space.slug) != lookup_key(space_slug) {
+        return Err(DomainError::ResourceNotFound.into());
+    }
+    let scope = call.space(pin_space.history)?;
+    let project = call
+        .registry
+        .catalog
+        .project_by_slug(scope.clone(), slug.to_owned())
+        .await?;
+    if project.folder.space_id != scope.scope().space_id {
+        return Err(invalid(ValidationReason::InvalidState));
+    }
+    admit_in_app_address(call, &scope, Some(&project.folder)).await?;
+    Ok(project)
+}
+
 pub(in super::super) async fn resolve_project(
     call: &ToolCallContext<'_>,
     handle: &str,

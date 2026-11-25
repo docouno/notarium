@@ -89,6 +89,7 @@ async fn authorize_entrypoint_tx(
     auth: &notarium_core::auth::EngineAuthContext,
     entrypoint: &notarium_core::ids::NoteId,
     ability: &AbilityId,
+    require_active_folders: bool,
 ) -> Result<AuthorizedEntrypoint, PortError> {
     auth.authorize_ability_mutation()?;
     let live_space = load_space_record(tx, &scope.space_id).await?;
@@ -100,9 +101,12 @@ async fn authorize_entrypoint_tx(
         &head.parent_folder_id,
         head.doc_class,
         head.ability_id.clone(),
-        true,
+        require_active_folders,
     )
     .await?;
+    if ancestry.folder_lifecycle == Lifecycle::Purged {
+        return Err(DomainError::ResourceNotFound.into());
+    }
     let mut after = before.clone();
     after.ability_package = Some(ability.clone());
     auth.authorize_direct_write(&before, &after)?;
@@ -122,7 +126,8 @@ async fn check_package_publication_tx(
     expected: PublicationExpectation<'_>,
     aux_raw_bytes: u64,
 ) -> Result<PublicationCheck, PortError> {
-    let entrypoint_facts = authorize_entrypoint_tx(tx, scope, auth, entrypoint, ability).await?;
+    let entrypoint_facts =
+        authorize_entrypoint_tx(tx, scope, auth, entrypoint, ability, true).await?;
     let entry_head = &entrypoint_facts.head;
     let live_space = &entrypoint_facts.space;
 
@@ -436,6 +441,7 @@ pub(crate) async fn publish_ability_package_impl(
                         &preflight_auth,
                         &entrypoint,
                         &ability,
+                        false,
                     )
                     .await?;
                     if receipt.command_hash != replay_key.command_hash {

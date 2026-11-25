@@ -527,7 +527,7 @@ pub(super) async fn create(
             },
         )
         .await
-        .map_err(|error| super::super::note_tools::post_commit_error(CREATE_LABEL, error))?;
+        .map_err(|error| post_commit_ability_error(CREATE_LABEL, error))?;
     committed_response(
         &reference,
         ControlRevision::new(1)?,
@@ -837,6 +837,7 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
             return Ok(());
         }
         let mut trashed_replay = false;
+        let mut trashed_live_parent: Option<FolderId> = None;
         let journaled_outcome = if plan_replayed {
             call.lookup_journal_with_key::<PackageReplayOutcome>(
                 "edit-ability-package-outcome",
@@ -881,6 +882,7 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
                         return Err(DomainError::ResourceNotFound.into());
                     }
                     live.metadata.listing(scope.auth())?;
+                    trashed_live_parent = live.parent.clone();
                     let slug = original_slug(call, &plan, plan_replayed).await?;
                     trashed_replay = true;
                     (
@@ -959,18 +961,46 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
             }
             if plan.promote {
                 phase = "home";
-                let parent = if trashed_replay {
+                let journaled_parent = if plan_replayed {
+                    call.lookup_journal_with_key::<FolderId>(
+                        "edit-ability-promote-folder",
+                        &call.request_key,
+                        call.request_hash,
+                    )
+                    .await?
+                } else {
+                    None
+                };
+                let parent = if let Some(folder) = journaled_parent {
+                    folder
+                } else if trashed_replay {
                     let scope = call.space(plan.scope.clone())?;
-                    call.registry
+                    if let Some(found) = call
+                        .registry
                         .engine
                         .resolve_folder_path(scope, None, ".abilities".to_owned())
                         .await?
-                        .ok_or(DomainError::ResourceNotFound)?
-                        .reference
-                        .folder_id
+                    {
+                        found.reference.folder_id
+                    } else {
+                        trashed_live_parent
+                            .clone()
+                            .ok_or(DomainError::ResourceNotFound)?
+                    }
                 } else {
                     let folder = ability_folder(call, &plan.scope, None).await?;
                     folder_ensured = true;
+                    let _ = call
+                        .record_journal_with_key(
+                            "edit-ability-promote-folder",
+                            &call.request_key,
+                            call.request_hash,
+                            &folder,
+                        )
+                        .await
+                        .map_err(|error| {
+                            post_commit_ability_error("notarium.mcp.edit-ability.v1", error)
+                        })?;
                     folder
                 };
                 let settled = call

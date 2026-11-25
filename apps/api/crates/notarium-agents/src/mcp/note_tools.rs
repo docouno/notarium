@@ -80,7 +80,13 @@ pub(super) async fn observe_note(
     note: &NoteId,
     expected: Option<&RevisionId>,
 ) -> Result<NoteRoute, PortError> {
-    let (scope, catalog) = corpus::locate_note_preflight(call, note).await?;
+    let (scope, catalog) = if let Some(pin) = call.auth.pinned_write_space() {
+        let scope = session::space(call, pin).await?;
+        let catalog = corpus::note_in_space_preflight(call, &scope, note).await?;
+        (scope, catalog)
+    } else {
+        corpus::locate_note_preflight(call, note).await?
+    };
     corpus::admit_note_write(call, &scope, &catalog).await?;
     authorize_note_write(&scope, &catalog.facts)?;
     let current = metadata_snapshot(
@@ -454,6 +460,7 @@ async fn validate_destination(
     class: DocClass,
     ensured: JournaledDestination,
     has_path: bool,
+    allow_trashed_replay: bool,
 ) -> Result<(FolderRef, bool), PortError> {
     const ERR_LABEL: &str = "notarium.mcp.folder-destination.v1";
     let (destination, created) = ensured.into_parts(has_path);
@@ -465,51 +472,83 @@ async fn validate_destination(
             mismatch
         });
     }
-    let live = call
+    let map_err = |error: PortError| {
+        if created {
+            post_commit_error(ERR_LABEL, error)
+        } else {
+            batch_operational_error(ERR_LABEL, error, false)
+        }
+    };
+    let map_replay_err = |error: PortError| {
+        if allow_trashed_replay && matches!(error, PortError::Domain(_)) {
+            error
+        } else {
+            map_err(error)
+        }
+    };
+    let live_opt = match call
         .registry
         .catalog
         .folder(call.account(), destination.clone())
         .await
-        .map_err(|error| {
-            if created {
-                post_commit_error(ERR_LABEL, error)
-            } else {
-                batch_operational_error(ERR_LABEL, error, false)
-            }
-        })?;
-    if live.reference != destination
-        || live.space.id != destination.space_id
-        || live.lifecycle != Lifecycle::Active
     {
-        let not_found: PortError = DomainError::ResourceNotFound.into();
-        return Err(if created {
-            post_commit_error(ERR_LABEL, not_found)
+        Ok(live) => Some(live),
+        Err(PortError::Domain(DomainError::ResourceNotFound)) if allow_trashed_replay => None,
+        Err(error) => return Err(map_replay_err(error)),
+    };
+    if let Some(live) = live_opt {
+        let lifecycle_hidden = if allow_trashed_replay {
+            live.lifecycle == Lifecycle::Purged
         } else {
-            not_found
-        });
-    }
-    scope
-        .auth()
-        .can_view_folder(&live.space, &destination.folder_id, &live.ancestor_folders)
-        .map_err(|error| {
-            let err: PortError = error.into();
-            if created {
-                post_commit_error(ERR_LABEL, err)
-            } else {
-                err
-            }
-        })?;
-    if matches!(call.target, EgressTarget::InAppProvider { .. }) {
-        let resolved = folder_base(call, scope, &destination.folder_id)
+            live.lifecycle != Lifecycle::Active
+        };
+        if live.reference != destination
+            || live.space.id != destination.space_id
+            || lifecycle_hidden
+        {
+            let not_found: PortError = DomainError::ResourceNotFound.into();
+            return Err(map_replay_err(not_found));
+        }
+        scope
+            .auth()
+            .can_view_folder(&live.space, &destination.folder_id, &live.ancestor_folders)
+            .map_err(|error| map_replay_err(error.into()))?;
+        if matches!(call.target, EgressTarget::InAppProvider { .. }) {
+            let resolved = folder_base(call, scope, &destination.folder_id)
+                .await
+                .map_err(map_replay_err)?;
+            let project = resolved.project.map(|folder_id| FolderRef {
+                space_id: destination.space_id.clone(),
+                folder_id,
+            });
+            corpus::admit_folder_write(
+                call,
+                scope,
+                &destination,
+                project,
+                &live.ancestor_folders,
+                class,
+            )
             .await
-            .map_err(|error| {
-                if created {
-                    post_commit_error(ERR_LABEL, error)
-                } else {
-                    batch_operational_error(ERR_LABEL, error, false)
-                }
-            })?;
-        let project = resolved.project.map(|folder_id| FolderRef {
+            .map_err(map_replay_err)?;
+        }
+        return Ok((destination, created));
+    }
+    let trashed_account = notarium_core::ports::AccountContext::new(
+        scope.auth().with_preflight_taint(),
+        call.budget(),
+    );
+    let trashed = call
+        .registry
+        .catalog
+        .trashed_folder_ancestry(trashed_account, destination.clone())
+        .await
+        .map_err(map_replay_err)?;
+    if trashed.reference != destination {
+        return Err(DomainError::ResourceNotFound.into());
+    }
+    if matches!(call.target, EgressTarget::InAppProvider { .. }) {
+        let project = trashed.project.map(|folder_id| FolderRef {
             space_id: destination.space_id.clone(),
             folder_id,
         });
@@ -518,17 +557,11 @@ async fn validate_destination(
             scope,
             &destination,
             project,
-            &live.ancestor_folders,
+            &trashed.ancestors,
             class,
         )
         .await
-        .map_err(|error| {
-            if created {
-                post_commit_error(ERR_LABEL, error)
-            } else {
-                batch_operational_error(ERR_LABEL, error, false)
-            }
-        })?;
+        .map_err(map_replay_err)?;
     }
     Ok((destination, created))
 }
@@ -544,10 +577,9 @@ async fn ensure_destination(
     label: &str,
     expected_source: Option<&NoteRoute>,
 ) -> Result<(FolderRef, bool), PortError> {
-    admit_destination_anchor(call, scope, &base, &path, class).await?;
     const ERR_LABEL: &str = "notarium.mcp.folder-destination.v1";
     let has_path = !path.is_empty();
-    let ensured: JournaledDestination = if let Some(hit) = call
+    let (ensured, allow_trashed_replay): (JournaledDestination, bool) = if let Some(hit) = call
         .lookup_journal_with_key::<JournaledDestination>(
             label,
             &content_command.key,
@@ -555,8 +587,9 @@ async fn ensure_destination(
         )
         .await?
     {
-        hit
+        (hit, true)
     } else {
+        admit_destination_anchor(call, scope, &base, &path, class).await?;
         // Persist the pre-existence check before calling `ensure_folder_path`
         // so a dedup failure after folder creation cannot lose `created: true`
         // on retry or falsely report `NotCommitted`.
@@ -621,7 +654,8 @@ async fn ensure_destination(
             folder,
             created: !existed,
         };
-        call.record_journal_with_key(label, &content_command.key, content_command.hash, &plan)
+        let recorded = call
+            .record_journal_with_key(label, &content_command.key, content_command.hash, &plan)
             .await
             .map_err(|error| {
                 if !existed {
@@ -629,9 +663,10 @@ async fn ensure_destination(
                 } else {
                     batch_operational_error(ERR_LABEL, error, false)
                 }
-            })?
+            })?;
+        (recorded, false)
     };
-    validate_destination(call, scope, class, ensured, has_path).await
+    validate_destination(call, scope, class, ensured, has_path, allow_trashed_replay).await
 }
 
 async fn move_note(call: &mut ToolCallContext<'_>, input: MoveInput) -> Result<Value, PortError> {
@@ -652,7 +687,7 @@ async fn move_note(call: &mut ToolCallContext<'_>, input: MoveInput) -> Result<V
         )
         .await?
     {
-        validate_destination(call, &scope, class, hit, !folder.is_empty()).await?
+        validate_destination(call, &scope, class, hit, !folder.is_empty(), true).await?
     } else {
         let base = scope
             .auth()

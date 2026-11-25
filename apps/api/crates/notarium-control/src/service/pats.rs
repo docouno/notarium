@@ -85,29 +85,63 @@ impl ControlService {
                     if request.expires_at_ms.is_some_and(|time| time <= now) {
                         return Err(invalid(ValidationReason::InvalidTimestamp));
                     }
+                    let auth = self
+                        .human_context(
+                            tx.inner_mut(),
+                            &current,
+                            ctx.auth().credential().cloned().ok_or_else(denied)?,
+                            ctx.auth().grant().clone(),
+                            false,
+                            false,
+                            true,
+                        )
+                        .await?;
+                    // Minted bearers resolve against live `DocClass::all()` grants;
+                    // reject any class-narrowed caller before issuance.
+                    let all_classes = notarium_core::classes::DocClass::all();
+                    let check_caller_grant = |id: &SpaceId,
+                                              caller_grant: &notarium_core::auth::SpaceGrant|
+                     -> Result<(), PortError> {
+                        if caller_grant.read_classes != all_classes {
+                            return Err(access_denied());
+                        }
+                        if request.scope == BearerScope::Write {
+                            let live_writable = auth
+                                .spaces()
+                                .get(id)
+                                .map(|g| g.role != notarium_core::auth::SpaceRole::Viewer)
+                                .unwrap_or(
+                                    caller_grant.role != notarium_core::auth::SpaceRole::Viewer,
+                                );
+                            if live_writable
+                                && (caller_grant.role == notarium_core::auth::SpaceRole::Viewer
+                                    || caller_grant.write_classes != all_classes)
+                            {
+                                return Err(access_denied());
+                            }
+                        }
+                        Ok(())
+                    };
                     if let Some(spaces) = &request.selected_spaces {
                         if spaces
                             .iter()
                             .any(|id| !ctx.auth().spaces().contains_key(id))
+                            || spaces.iter().any(|id| !auth.spaces().contains_key(id))
                         {
                             return Err(DomainError::ResourceNotFound.into());
                         }
-                        let auth = self
-                            .human_context(
-                                tx.inner_mut(),
-                                &current,
-                                ctx.auth().credential().cloned().ok_or_else(denied)?,
-                                ctx.auth().grant().clone(),
-                                false,
-                                false,
-                                true,
-                            )
-                            .await?;
-                        if spaces.iter().any(|id| !auth.spaces().contains_key(id)) {
-                            return Err(DomainError::ResourceNotFound.into());
+                        for id in spaces {
+                            let caller_grant =
+                                ctx.auth().spaces().get(id).ok_or_else(access_denied)?;
+                            check_caller_grant(id, caller_grant)?;
                         }
-                    } else if ctx.auth().is_space_narrowed() {
-                        return Err(access_denied());
+                    } else {
+                        if ctx.auth().is_space_narrowed() {
+                            return Err(access_denied());
+                        }
+                        for (id, caller_grant) in ctx.auth().spaces() {
+                            check_caller_grant(id, caller_grant)?;
+                        }
                     }
                     let spaces = request.selected_spaces.map(|spaces| {
                         spaces
@@ -179,6 +213,9 @@ impl ControlService {
                     let (_, current) = self
                         .manager_read(rtx.inner_mut(), ctx.auth(), &account)
                         .await?;
+                    if ctx.auth().is_space_narrowed() {
+                        return Err(access_denied());
+                    }
                     if let Some(cursor) = &cursor {
                         if cursor.version != 1 || cursor.owner != account {
                             return Err(invalid(ValidationReason::ScopeMismatch));
@@ -244,6 +281,7 @@ impl ControlService {
         let mut tx = self.store.write(budget.clone()).await?;
         let (revision,saved)=budget.run(async {
             let (_,current)=self.manager(tx.inner_mut(),ctx.auth(),&request.input.account).await?;
+            if ctx.auth().is_space_narrowed() {return Err(access_denied());}
             if let Some(replay)=command.replay::<()>(tx.inner_mut()).await? {return Ok(replay);}
             expect_revision(&current,command.identity.expected)?;
             let pat = match pat(tx.inner_mut(), request.input.token.as_str()).await {

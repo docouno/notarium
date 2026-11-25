@@ -372,9 +372,12 @@ async fn authorize_resource(
         ReplayResource::ReadLinkFolder(folder, source) => {
             let head =
                 crate::domain::common::load_note_head_row_tx(tx, &srec.space.id, source).await?;
-            let (facts, _) =
-                build_resource_facts_tx(tx, &srec.space, folder, head.doc_class, None, true)
+            let (facts, ancestry) =
+                build_resource_facts_tx(tx, &srec.space, folder, head.doc_class, None, false)
                     .await?;
+            if ancestry.folder_lifecycle == notarium_core::model::Lifecycle::Purged {
+                return Err(DomainError::ResourceNotFound.into());
+            }
             return Ok(auth.authorize_read(&facts)?);
         }
         ReplayResource::View(note) => {
@@ -389,28 +392,39 @@ async fn authorize_resource(
     };
     let head = load_note_head_row_opt_tx(tx, &srec.space.id, note).await?;
     if let Some((parent, class)) = destination(target, head.as_ref().map(|h| h.doc_class)) {
-        let (facts, _) = build_resource_facts_tx(
+        let (facts, ancestry) = build_resource_facts_tx(
             tx,
             &srec.space,
             parent.unwrap_or(&srec.root_folder_id),
             class,
             None,
-            true,
+            false,
         )
         .await?;
+        if ancestry.folder_lifecycle == notarium_core::model::Lifecycle::Purged {
+            return Err(DomainError::ResourceNotFound.into());
+        }
         auth.authorize_direct_write(&facts, &facts)?;
     }
     if let Some(head) = head {
-        let (facts, _) = build_resource_facts_tx(
+        let (facts, ancestry) = build_resource_facts_tx(
             tx,
             &srec.space,
             &head.parent_folder_id,
             head.doc_class,
             head.ability_id,
-            true,
+            false,
         )
         .await?;
-        authorize_head(auth, target, &facts, head.lifecycle)?;
+        if ancestry.folder_lifecycle == notarium_core::model::Lifecycle::Purged {
+            return Err(DomainError::ResourceNotFound.into());
+        }
+        authorize_head(
+            auth,
+            target,
+            &facts,
+            crate::domain::common::combine_lifecycle(head.lifecycle, ancestry.folder_lifecycle),
+        )?;
     } else if !matches!(target, ReplayResource::Create(..)) {
         return Err(DomainError::ResourceNotFound.into());
     }

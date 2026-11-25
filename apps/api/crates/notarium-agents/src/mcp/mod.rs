@@ -441,7 +441,7 @@ impl ToolRegistry {
 
         let result = async {
             if let Some(binding) = &personal
-                && proposals::needs_proposal(&call, &args).await?
+                && proposals::needs_proposal(&call, binding, &args).await?
             {
                 let draft =
                     box_tool(|| proposals::prepare(&mut call, binding, &ctx.request_key, args))

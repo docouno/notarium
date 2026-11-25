@@ -8369,11 +8369,16 @@ async fn cross_space_taint_oracle_and_write_isolation_probes(
         mem_list.structured_content
     );
 
-    // (2) Cross-space rejected write tools MUST return SpaceReadOnly without
-    //     flipping BranchTaint (no CrossSpaceTainted conversion or taint leak).
+    // (2) Direct cross-space write tools from a pinned run (without proposal routing)
+    //     MUST resolve strictly within the pinned write Space and return uniform
+    //     ResourceNotFound without flipping BranchTaint (zero cross-Space existence oracle).
     let (write_auth, write_acc) = make_run(3);
     for (idx, (tool, args)) in [
         ("delete_note", json!({ "ref": write_note })),
+        (
+            "delete_note",
+            json!({ "ref": NoteId::from_bytes([0x89, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]) }),
+        ),
         (
             "edit_note",
             json!({ "ref": write_note, "operation": "append", "content": "nope" }),
@@ -8402,6 +8407,13 @@ async fn cross_space_taint_oracle_and_write_isolation_probes(
             }),
         ),
         (
+            "rename_project",
+            json!({
+                "project": format!("{}/missing-proj", space_write.slug),
+                "slug": "write-proj-renamed",
+            }),
+        ),
+        (
             "link",
             json!({
                 "from": write_note,
@@ -8418,8 +8430,8 @@ async fn cross_space_taint_oracle_and_write_isolation_probes(
             .call_tool(make_ctx(&write_acc, 10 + idx as u8), tool, args)
             .await;
         assert!(
-            matches!(res, Err(PortError::Domain(DomainError::SpaceReadOnly))),
-            "cross-space direct {tool} must fail with SpaceReadOnly, got {:?}",
+            matches!(res, Err(PortError::Domain(DomainError::ResourceNotFound))),
+            "cross-space direct {tool} must fail uniformly with ResourceNotFound, got {:?}",
             res.err()
         );
         assert!(
@@ -16352,7 +16364,7 @@ async fn run_control_replay_and_taint_hardening(pg: bool) {
 
     box_step(|| {
         authority_cursors_oracles_and_trashed_ancestry_hardening(
-            &fixture, &local, &personal, &s1, &s2, &s1_p1, &s2_p1, &actor,
+            &fixture, &local, &personal, &s1, &s2, &s1_p1, &s1_p2, &s2_p1, &actor,
         )
     })
     .await;
@@ -16897,23 +16909,31 @@ async fn episodes_context_and_ability_overlay_replay_hardening(
             .await,
         Err(PortError::Domain(DomainError::ResourceNotFound))
     ));
-    assert!(matches!(
-        fixture
-            .control
-            .start_or_resume_episode(
-                only_s1.clone(),
-                AccountMutation {
-                    identity: identity(fixture, &owner, 0xF3).await,
-                    input: StartEpisode {
-                        selector: EpisodeSelector::Name("ep-s2".into()),
-                        project_hint: None,
-                        guard: EpisodeRevisionGuard::Account,
-                    },
+    let s1_named_new = fixture
+        .control
+        .start_or_resume_episode(
+            only_s1.clone(),
+            AccountMutation {
+                identity: identity(fixture, &owner, 0xF3).await,
+                input: StartEpisode {
+                    selector: EpisodeSelector::Name("ep-s2".into()),
+                    project_hint: None,
+                    guard: EpisodeRevisionGuard::Account,
                 },
-            )
-            .await,
-        Err(PortError::Domain(DomainError::ResourceNotFound))
-    ));
+            },
+        )
+        .await
+        .expect("narrowed caller starting episode with hidden excluded-Space name must create New instead of leaking existence");
+    match s1_named_new.value {
+        EpisodeStartResult::New(ep) => {
+            assert_ne!(
+                ep.id, ep_s2,
+                "must not resume hidden excluded-Space episode"
+            );
+            assert!(ep.project_hint.is_none());
+        }
+        other => panic!("expected EpisodeStartResult::New, got {other:?}"),
+    }
     assert!(matches!(
         fixture
             .control
@@ -18335,6 +18355,7 @@ async fn authority_cursors_oracles_and_trashed_ancestry_hardening(
     s1: &AccessibleSpace,
     s2: &AccessibleSpace,
     s1_p1: &FolderRef,
+    s1_p2: &FolderRef,
     s2_p1: &FolderRef,
     actor: &PrincipalId,
 ) {
@@ -18518,7 +18539,7 @@ async fn authority_cursors_oracles_and_trashed_ancestry_hardening(
             .control
             .bootstrap_context(
                 pat_s1.clone(),
-                s2_ep_id,
+                s2_ep_id.clone(),
                 None,
                 ControlPageRequest::new(10, None).unwrap(),
             )
@@ -18537,119 +18558,149 @@ async fn authority_cursors_oracles_and_trashed_ancestry_hardening(
     );
 
     // (3) Cleartext pagination cursors in list_favorites, list_context_entries (notes),
-    //     list_context_sets, and list_schedules must never leak hidden cross-Space/out-of-project IDs.
-    let s2_hidden_note = NoteId::from_bytes([0xE9, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
-    let s1_vis_note = NoteId::from_bytes([0xE9, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
-    fixture
-        .canonical
-        .create_note(
-            s2_sc.clone(),
-            Mutation {
-                identity: CommandIdentity {
-                    scope: s2.history.clone(),
-                    actor: actor.clone(),
-                    key: CommandKey::from_bytes([
-                        0xE9, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                    ]),
-                    hash: ContentDigest::from_bytes([0xE9; 32]),
+    //     list_context_sets, and list_schedules must never leak hidden cross-Space/out-of-project IDs,
+    //     and must emit non-empty continuations cleanly across visible1 -> hidden -> visible2.
+    let s1_vis_note_1 = NoteId::from_bytes([0xE9, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    let s2_hidden_note = NoteId::from_bytes([0xE9, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+    let s1_vis_note_2 = NoteId::from_bytes([0xE9, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3]);
+    for (idx, (sc_ctx, hist, proj, nid, slug)) in [
+        (
+            &s1_sc,
+            &s1.history,
+            s1_p1,
+            &s1_vis_note_1,
+            "visible-cursor-note-1",
+        ),
+        (
+            &s2_sc,
+            &s2.history,
+            s2_p1,
+            &s2_hidden_note,
+            "hidden-cursor-note",
+        ),
+        (
+            &s1_sc,
+            &s1.history,
+            s1_p1,
+            &s1_vis_note_2,
+            "visible-cursor-note-2",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        fixture
+            .canonical
+            .create_note(
+                sc_ctx.clone(),
+                Mutation {
+                    identity: CommandIdentity {
+                        scope: hist.clone(),
+                        actor: actor.clone(),
+                        key: CommandKey::from_bytes([
+                            0xE9,
+                            1,
+                            1,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            (idx + 1) as u8,
+                        ]),
+                        hash: ContentDigest::from_bytes([0xE9; 32]),
+                    },
+                    preconditions: Preconditions::default(),
+                    input: CreateNote {
+                        note: nid.clone(),
+                        parent: Some(proj.folder_id.clone()),
+                        slug: slug.into(),
+                        class: DocClass::UserDoc,
+                        carrier: format!("# {slug}\n"),
+                        folder_page: false,
+                    },
                 },
-                preconditions: Preconditions::default(),
-                input: CreateNote {
-                    note: s2_hidden_note.clone(),
-                    parent: Some(s2_p1.folder_id.clone()),
-                    slug: "hidden-cursor-note".into(),
-                    class: DocClass::UserDoc,
-                    carrier: "# Hidden Cursor Note\n".into(),
-                    folder_page: false,
-                },
-            },
-        )
-        .await
-        .unwrap();
-    fixture
-        .canonical
-        .create_note(
-            s1_sc.clone(),
-            Mutation {
-                identity: CommandIdentity {
-                    scope: s1.history.clone(),
-                    actor: actor.clone(),
-                    key: CommandKey::from_bytes([
-                        0xE9, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
-                    ]),
-                    hash: ContentDigest::from_bytes([0xE9; 32]),
-                },
-                preconditions: Preconditions::default(),
-                input: CreateNote {
-                    note: s1_vis_note.clone(),
-                    parent: Some(s1_p1.folder_id.clone()),
-                    slug: "visible-cursor-note".into(),
-                    class: DocClass::UserDoc,
-                    carrier: "# Visible Cursor Note\n".into(),
-                    folder_page: false,
-                },
-            },
-        )
-        .await
-        .unwrap();
+            )
+            .await
+            .unwrap();
+    }
+    let s1_note_ref_1 = NoteRef {
+        space_id: s1.history.space_id.clone(),
+        note_id: s1_vis_note_1.clone(),
+    };
     let s2_note_ref = NoteRef {
         space_id: s2.history.space_id.clone(),
         note_id: s2_hidden_note.clone(),
     };
-    let s1_note_ref = NoteRef {
+    let s1_note_ref_2 = NoteRef {
         space_id: s1.history.space_id.clone(),
-        note_id: s1_vis_note.clone(),
+        note_id: s1_vis_note_2.clone(),
     };
-    fixture
-        .control
-        .set_favorite(
-            owner.clone(),
-            AccountMutation {
-                identity: identity(fixture, &owner, 0x44).await,
-                input: SetFavorite {
-                    reference: FavoriteRef::Note(s2_note_ref.clone()),
-                    saved: true,
-                    rank: 1,
+    for (k, nref, rank) in [
+        (0x44_u8, &s1_note_ref_1, 1_i64),
+        (0x45_u8, &s2_note_ref, 2_i64),
+        (0x4A_u8, &s1_note_ref_2, 3_i64),
+    ] {
+        fixture
+            .control
+            .set_favorite(
+                owner.clone(),
+                AccountMutation {
+                    identity: identity(fixture, &owner, k).await,
+                    input: SetFavorite {
+                        reference: FavoriteRef::Note(nref.clone()),
+                        saved: true,
+                        rank,
+                    },
                 },
-            },
-        )
-        .await
-        .unwrap();
-    fixture
-        .control
-        .set_favorite(
-            owner.clone(),
-            AccountMutation {
-                identity: identity(fixture, &owner, 0x45).await,
-                input: SetFavorite {
-                    reference: FavoriteRef::Note(s1_note_ref.clone()),
-                    saved: true,
-                    rank: 2,
-                },
-            },
-        )
-        .await
-        .unwrap();
-    let fav_page = fixture
+            )
+            .await
+            .unwrap();
+    }
+    let fav_page1 = fixture
         .control
         .list_favorites(pat_s1.clone(), ControlPageRequest::new(1, None).unwrap())
         .await
         .unwrap();
-    assert_eq!(fav_page.items.len(), 1);
+    assert_eq!(fav_page1.items.len(), 1);
     assert_eq!(
-        fav_page.items[0].reference,
-        FavoriteRef::Note(s1_note_ref.clone())
+        fav_page1.items[0].reference,
+        FavoriteRef::Note(s1_note_ref_1.clone())
     );
-    if let Some(cont) = &fav_page.continuation {
-        assert!(
-            !cont.contains(s2.history.space_id.as_str()) && !cont.contains(s2_hidden_note.as_str()),
-            "list_favorites continuation must never leak hidden Space/Note ID: {cont}"
-        );
-    }
-    // Pin hidden s2 note first and visible s1 note second inside s1 scope,
-    // then drain list_context_entries(limit=1) with s1-only PAT asserting
-    // no continuation leaks hidden Space/Note IDs and visible s1 note is returned.
-    let s1_ctx_rev = fixture
+    let fav_cont = fav_page1.continuation.expect(
+        "list_favorites must emit non-None continuation for visible1 -> hidden -> visible2",
+    );
+    assert!(
+        !fav_cont.contains(s2.history.space_id.as_str())
+            && !fav_cont.contains(s2_hidden_note.as_str()),
+        "list_favorites continuation must never leak hidden Space/Note ID: {fav_cont}"
+    );
+    let fav_page2 = fixture
+        .control
+        .list_favorites(
+            pat_s1.clone(),
+            ControlPageRequest::new(1, Some(fav_cont)).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fav_page2.items.len(), 1);
+    assert_eq!(
+        fav_page2.items[0].reference,
+        FavoriteRef::Note(s1_note_ref_2.clone())
+    );
+    assert!(fav_page2.continuation.is_none());
+
+    // Pin visible1, hidden s2 note, and visible2 inside s1 scope, then paginate
+    // list_context_entries(limit=1) with s1-only PAT asserting non-vacuous
+    // continuation without leaking hidden Space/Note IDs and exact visible coverage.
+    let mut s1_ctx_rev = fixture
         .control
         .context_scope(
             owner.clone(),
@@ -18658,75 +18709,194 @@ async fn authority_cursors_oracles_and_trashed_ancestry_hardening(
         .await
         .unwrap()
         .revision;
-    let pin1 = fixture
-        .control
-        .set_context_pin(
-            owner.clone(),
-            AccountMutation {
-                identity: identity(fixture, &owner, 0x46).await,
-                input: SetContextPin {
-                    scope: ContextScope::Space(s1.history.space_id.clone()),
-                    expected: s1_ctx_rev,
-                    note: s2_note_ref.clone(),
-                    pinned: true,
+    for (k, nref) in [
+        (0x46_u8, &s1_note_ref_1),
+        (0x47_u8, &s2_note_ref),
+        (0x4B_u8, &s1_note_ref_2),
+    ] {
+        let pin = fixture
+            .control
+            .set_context_pin(
+                owner.clone(),
+                AccountMutation {
+                    identity: identity(fixture, &owner, k).await,
+                    input: SetContextPin {
+                        scope: ContextScope::Space(s1.history.space_id.clone()),
+                        expected: s1_ctx_rev,
+                        note: nref.clone(),
+                        pinned: true,
+                    },
                 },
-            },
+            )
+            .await
+            .unwrap();
+        s1_ctx_rev = pin.value.revision;
+    }
+    let ctx_page1 = fixture
+        .control
+        .list_context_entries(
+            pat_s1.clone(),
+            ContextScope::Space(s1.history.space_id.clone()),
+            ControlPageRequest::new(1, None).unwrap(),
         )
         .await
         .unwrap();
-    fixture
-        .control
-        .set_context_pin(
-            owner.clone(),
-            AccountMutation {
-                identity: identity(fixture, &owner, 0x47).await,
-                input: SetContextPin {
-                    scope: ContextScope::Space(s1.history.space_id.clone()),
-                    expected: pin1.value.revision,
-                    note: s1_note_ref.clone(),
-                    pinned: true,
-                },
-            },
-        )
-        .await
-        .unwrap();
-    let mut ctx_cont: Option<String> = None;
-    let mut saw_s1_note = false;
-    let mut saw_s2_note = false;
-    for _ in 0..32 {
-        let ctx_page = fixture
+    assert_eq!(ctx_page1.items.len(), 1);
+    let ctx_cont = ctx_page1.continuation.expect(
+        "list_context_entries must emit non-None continuation for visible1 -> hidden -> visible2",
+    );
+    assert!(
+        !ctx_cont.contains(s2.history.space_id.as_str())
+            && !ctx_cont.contains(s2_hidden_note.as_str()),
+        "list_context_entries continuation must never leak hidden note/space ID: {ctx_cont}"
+    );
+    let mut ctx_seen = vec![ctx_page1.items[0].entry.clone()];
+    let mut next_ctx_cont = Some(ctx_cont);
+    for _ in 0..16 {
+        let Some(cont) = next_ctx_cont.take() else {
+            break;
+        };
+        let page = fixture
             .control
             .list_context_entries(
                 pat_s1.clone(),
                 ContextScope::Space(s1.history.space_id.clone()),
-                ControlPageRequest::new(1, ctx_cont.clone()).unwrap(),
+                ControlPageRequest::new(1, Some(cont)).unwrap(),
             )
             .await
             .unwrap();
-        for item in &ctx_page.items {
-            if item.entry == ContextEntry::Note(s1_note_ref.clone()) {
-                saw_s1_note = true;
-            }
-            if item.entry == ContextEntry::Note(s2_note_ref.clone()) {
-                saw_s2_note = true;
-            }
+        for item in page.items {
+            ctx_seen.push(item.entry);
         }
-        if let Some(cont) = &ctx_page.continuation {
+        if let Some(c) = page.continuation {
             assert!(
-                !cont.contains(s2.history.space_id.as_str())
-                    && !cont.contains(s2_hidden_note.as_str()),
-                "list_context_entries continuation must never leak hidden note/space ID: {cont}"
+                !c.contains(s2.history.space_id.as_str()) && !c.contains(s2_hidden_note.as_str()),
+                "subsequent list_context_entries continuation leaked hidden ID: {c}"
             );
-            ctx_cont = Some(cont.clone());
-        } else {
-            break;
+            next_ctx_cont = Some(c);
         }
     }
-    assert!(saw_s1_note, "s1-only PAT must see visible pinned s1 note");
-    assert!(
-        !saw_s2_note,
-        "s1-only PAT must never see hidden pinned s2 note"
+    assert!(ctx_seen.contains(&ContextEntry::Note(s1_note_ref_1.clone())));
+    assert!(ctx_seen.contains(&ContextEntry::Note(s1_note_ref_2.clone())));
+    assert!(!ctx_seen.contains(&ContextEntry::Note(s2_note_ref.clone())));
+    assert_eq!(ctx_seen.len(), 2);
+
+    // Filtered list_schedules(limit=1) over visible1 (s1_p1) -> hidden (s1_p2) -> visible2 (s1_p1).
+    let sched_vis_1 = ScheduleId::from_bytes([0xE9, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    let sched_hidden = ScheduleId::from_bytes([0xE9, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+    let sched_vis_2 = ScheduleId::from_bytes([0xE9, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3]);
+    call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xE9, 3, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9],
+        "create_ability",
+        json!({
+            "kind": "role",
+            "name": "sched-page-role",
+            "description": "Standalone schedule pagination role",
+            "instructions": "Run scheduled checks.",
+            "placement": { "home": "space", "space": s1.slug },
+        }),
+    )
+    .await
+    .unwrap();
+    let sched_role_ref = fixture
+        .control
+        .discover_abilities(
+            owner.clone(),
+            AbilityQuery {
+                page: ControlPageRequest::new(50, None).unwrap(),
+                project: Some(s1_p1.clone()),
+                kind: Some(AbilityKind::Role),
+                name: Some("sched-page-role".into()),
+                authoring: true,
+            },
+        )
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .find(|item| {
+            item.descriptor.reference.placement
+                == AbilityPlacement::OwnedSpace(s1.history.space_id.clone())
+        })
+        .expect("s1 sched-page-role")
+        .descriptor
+        .reference;
+    let next_slot = Timestamp::parse("2028-01-02T09:00:00Z").unwrap();
+    for (idx, (sid, proj, title)) in [
+        (&sched_vis_1, s1_p1, "sched-vis-1"),
+        (&sched_hidden, s1_p2, "sched-hidden"),
+        (&sched_vis_2, s1_p1, "sched-vis-2"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        fixture
+            .control
+            .create_schedule(
+                owner.clone(),
+                AccountMutation {
+                    identity: identity(fixture, &owner, 0x4C + idx as u8).await,
+                    input: CreateSchedule {
+                        id: sid.clone(),
+                        definition: ScheduleDefinition {
+                            space: s1.history.space_id.clone(),
+                            project: Some(proj.clone()),
+                            title: title.into(),
+                            init_prompt: "Check tasks.".into(),
+                            cron: "0 0 9 * * * *".into(),
+                            timezone: "UTC".into(),
+                            approved_role: sched_role_ref.clone(),
+                            limits: RunLimits {
+                                max_steps: 3,
+                                max_tokens: 64_000,
+                                timeout_ms: 15_000,
+                            },
+                        },
+                        approved_skills: vec![],
+                        next_slot,
+                        paused: false,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+    }
+    let s1_p1_pinned = SpaceContext::new(
+        owner.auth().restrict_to_project(s1_p1).unwrap(),
+        s1.history.clone(),
+        budget(),
+    )
+    .unwrap();
+    let sch_page1 = fixture
+        .control
+        .list_schedules(
+            s1_p1_pinned.clone(),
+            ControlPageRequest::new(1, None).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sch_page1.items.len(), 1);
+    assert_eq!(sch_page1.items[0].id, sched_vis_1);
+    let sch_cont = sch_page1.continuation.expect(
+        "list_schedules must emit non-None continuation across visible1 -> hidden -> visible2",
     );
+    assert!(
+        !sch_cont.contains(sched_hidden.as_str()),
+        "list_schedules continuation must never leak hidden ScheduleId: {sch_cont}"
+    );
+    let sch_page2 = fixture
+        .control
+        .list_schedules(
+            s1_p1_pinned,
+            ControlPageRequest::new(1, Some(sch_cont)).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sch_page2.items.len(), 1);
+    assert_eq!(sch_page2.items[0].id, sched_vis_2);
+    assert!(sch_page2.continuation.is_none());
 
     // (4) Foreign provider resource/attachment/preference/select_provider oracle hardening.
     let unknown_res = ProviderResourceId::from_bytes([0xE9; 16]);
@@ -19019,7 +19189,7 @@ async fn authority_cursors_oracles_and_trashed_ancestry_hardening(
     let fake_proj = format!("{}/does-not-exist-proj", s2.slug);
     let prop_binding = PersonalToolInvocation {
         source: pscope.clone(),
-        thread: oracle_thread,
+        thread: oracle_thread.clone(),
         leaf: prop_leaf,
         owner: owner.clone(),
     };
@@ -19172,7 +19342,7 @@ async fn authority_cursors_oracles_and_trashed_ancestry_hardening(
     let doc = fixture
         .canonical
         .get_note(
-            s2_sc,
+            s2_sc.clone(),
             GetNote {
                 note: child_note.clone(),
                 revision: None,
@@ -19251,5 +19421,1064 @@ async fn authority_cursors_oracles_and_trashed_ancestry_hardening(
             )),
         "InAppProvider recent_activity must not record trashed-folder descendant in provenance: {:?}",
         recent_in_app.provenance
+    );
+
+    box_step(|| {
+        authority_and_cursor_edge_seams(
+            fixture,
+            local,
+            &owner,
+            &mgmt_s1,
+            &pat_s1,
+            &pat_s1_created.value.metadata.id,
+            &s2_ep_id,
+            s1,
+            s2,
+            s1_p1,
+            s2_p1,
+            actor,
+        )
+    })
+    .await;
+    box_step(|| {
+        ability_taint_and_kind_edge_seams(
+            fixture,
+            local,
+            &owner,
+            &pscope,
+            &s2_sc,
+            s2,
+            s2_p1,
+            &s2_skill_ab,
+        )
+    })
+    .await;
+    box_step(|| {
+        shared_proposal_and_trashed_replay_edge_seams(
+            fixture,
+            local,
+            &owner,
+            &pscope,
+            &s1_sc,
+            &s2_sc,
+            s1,
+            s2,
+            s1_p1,
+            s2_p1,
+            &s2_hidden_note,
+            &oracle_thread,
+            prop_leaf,
+            s2_epoch,
+            actor,
+        )
+    })
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn authority_and_cursor_edge_seams(
+    fixture: &RuntimeFixture,
+    local: &LoopbackProvider,
+    owner: &AccountContext,
+    mgmt_s1: &SpaceContext,
+    pat_s1: &AccountContext,
+    pat_s1_id: &CredentialTokenId,
+    s2_ep_id: &EpisodeId,
+    s1: &AccessibleSpace,
+    s2: &AccessibleSpace,
+    s1_p1: &FolderRef,
+    s2_p1: &FolderRef,
+    actor: &PrincipalId,
+) {
+    // 7a. Class-narrowed DirectHuman cannot launder DocClass::all() via create_pat;
+    //     space-narrowed DirectHuman (mgmt_s1) cannot list/inspect excluded-Space attachments
+    //     or list/revoke cross-Space PATs; narrowed PAT cannot oracle hidden episodes in begin_agent_call.
+    let class_narrow_s1 = owner
+        .auth()
+        .restrict_read_classes(&s1.history.space_id, &BTreeSet::from([DocClass::UserDoc]))
+        .unwrap();
+    let owner_rev_7 = fixture
+        .control
+        .account(owner.clone(), actor.clone())
+        .await
+        .unwrap()
+        .revision;
+    for sel in [Some(vec![s1.history.space_id.clone()]), None] {
+        let err = fixture
+            .control
+            .create_pat(
+                AccountContext::new(class_narrow_s1.clone(), budget()),
+                CreatePat {
+                    name: "class-laundered".into(),
+                    scope: BearerScope::Write,
+                    ability_write: false,
+                    selected_spaces: sel,
+                    expires_at_ms: None,
+                    expected: owner_rev_7,
+                },
+            )
+            .await;
+        assert!(
+            matches!(err, Err(PortError::Domain(DomainError::AccessDenied))),
+            "class-narrowed DirectHuman must be denied create_pat, got {err:?}"
+        );
+    }
+    let mgmt_s1_acc = AccountContext::new(mgmt_s1.auth().clone(), budget());
+    let mgmt_atts = local
+        .provider
+        .list_attachments(
+            mgmt_s1_acc.clone(),
+            local.resource.id.clone(),
+            ControlPageRequest::new(50, None).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        mgmt_atts.items.iter().all(|att| {
+            let target_space = match &att.target {
+                ProviderAttachmentTarget::Personal { space, .. }
+                | ProviderAttachmentTarget::Space(space) => space,
+                ProviderAttachmentTarget::Project(folder) => &folder.space_id,
+            };
+            target_space == &s1.history.space_id
+        }),
+        "space-narrowed list_attachments must filter out excluded-Space attachments: {:?}",
+        mgmt_atts.items
+    );
+    let s2_att_id = local
+        .provider
+        .list_attachments(
+            owner.clone(),
+            local.resource.id.clone(),
+            ControlPageRequest::new(50, None).unwrap(),
+        )
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .find(|att| {
+            matches!(
+                &att.target,
+                ProviderAttachmentTarget::Space(sp) | ProviderAttachmentTarget::Personal { space: sp, .. }
+                    if sp == &s2.history.space_id
+            )
+        })
+        .expect("s2 attachment")
+        .id;
+    assert!(matches!(
+        local
+            .provider
+            .inspect_attachment(mgmt_s1_acc.clone(), s2_att_id)
+            .await,
+        Err(PortError::Domain(DomainError::ResourceNotFound))
+    ));
+    assert!(matches!(
+        fixture
+            .control
+            .list_pats(
+                mgmt_s1_acc.clone(),
+                actor.clone(),
+                ControlPageRequest::new(10, None).unwrap(),
+            )
+            .await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+    assert!(matches!(
+        fixture
+            .control
+            .revoke_pat(
+                mgmt_s1_acc,
+                AccountMutation {
+                    identity: identity(fixture, owner, 0x51).await,
+                    input: RevokePat {
+                        account: actor.clone(),
+                        token: pat_s1_id.clone(),
+                    },
+                },
+            )
+            .await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+    // begin_agent_call rejects excluded-Space episode ID for narrowed pat_s1.
+    let begin_hidden_ep = fixture
+        .control
+        .begin_agent_call(
+            pat_s1.clone(),
+            BeginAgentCall {
+                call: RequestId::from_bytes([0xE9, 7, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+                request: RequestId::from_bytes([0xE9, 7, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]),
+                episode: Some(s2_ep_id.clone()),
+                operation: AgentOperation::Read,
+                transport: AgentTransport::Mcp,
+                effect: AgentEffect::Read,
+                input_bytes: 16,
+            },
+        )
+        .await;
+    assert!(
+        matches!(
+            begin_hidden_ep,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ),
+        "begin_agent_call must hide excluded-Space episode from narrowed PAT, got {begin_hidden_ep:?}"
+    );
+
+    // 7b. EpisodeSelector::Name resumes sole visible s1 episode even when a hidden s2 episode shares its name.
+    let dup_s1_id = EpisodeId::from_bytes([0xE9, 7, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    let dup_s2_id = EpisodeId::from_bytes([0xE9, 7, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+    for (k, eid, proj) in [(0x52_u8, &dup_s1_id, s1_p1), (0x53_u8, &dup_s2_id, s2_p1)] {
+        fixture
+            .control
+            .start_or_resume_episode(
+                owner.clone(),
+                AccountMutation {
+                    identity: identity(fixture, owner, k).await,
+                    input: StartEpisode {
+                        selector: EpisodeSelector::New {
+                            requested: eid.clone(),
+                            name: Some("dup-vis-hid".into()),
+                        },
+                        project_hint: Some(proj.clone()),
+                        guard: EpisodeRevisionGuard::Account,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+    }
+    let dup_res = fixture
+        .control
+        .start_or_resume_episode(
+            pat_s1.clone(),
+            AccountMutation {
+                identity: identity(fixture, owner, 0x54).await,
+                input: StartEpisode {
+                    selector: EpisodeSelector::Name("dup-vis-hid".into()),
+                    project_hint: Some(s1_p1.clone()),
+                    guard: EpisodeRevisionGuard::Target,
+                },
+            },
+        )
+        .await
+        .expect(
+            "narrowed PAT must resume/fork sole visible named episode despite hidden duplicate",
+        );
+    match dup_res.value {
+        EpisodeStartResult::Resumed(ep) => assert_eq!(ep.id, dup_s1_id),
+        EpisodeStartResult::Forked(ep) => assert_eq!(ep.parent.as_ref(), Some(&dup_s1_id)),
+        other => panic!("expected Resumed/Forked of sole visible s1 episode, got {other:?}"),
+    }
+
+    // 7c. list_notes with own-Space cursor + missing foreign path fails scope check before directory() without taint.
+    let s1_sc_cur = SpaceContext::new(owner.auth().clone(), s1.history.clone(), budget()).unwrap();
+    let cur_n1 = NoteId::from_bytes([0xE9, 7, 3, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    let cur_n2 = NoteId::from_bytes([0xE9, 7, 3, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+    for (idx, (nid, slug)) in [(&cur_n1, "cur-n1"), (&cur_n2, "cur-n2")]
+        .into_iter()
+        .enumerate()
+    {
+        fixture
+            .canonical
+            .create_note(
+                s1_sc_cur.clone(),
+                Mutation {
+                    identity: CommandIdentity {
+                        scope: s1.history.clone(),
+                        actor: actor.clone(),
+                        key: CommandKey::from_bytes([
+                            0xE9,
+                            7,
+                            3,
+                            1,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            10 + idx as u8,
+                        ]),
+                        hash: ContentDigest::from_bytes([0xE9; 32]),
+                    },
+                    preconditions: Preconditions::default(),
+                    input: CreateNote {
+                        note: nid.clone(),
+                        parent: Some(s1_p1.folder_id.clone()),
+                        slug: slug.into(),
+                        class: DocClass::UserDoc,
+                        carrier: format!("# {slug}\n"),
+                        folder_page: false,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+    }
+    fixture.projections.install(ProjectionFixture {
+        view_owner: NoteRef {
+            space_id: s1.history.space_id.clone(),
+            note_id: cur_n1.clone(),
+        },
+        notes: vec![cur_n1, cur_n2],
+    });
+    let run_cur = AgentRunId::from_bytes([0xE9, 7, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    let run_cur_auth = owner
+        .auth()
+        .for_agent_run(
+            run_cur,
+            s1.history.space_id.clone(),
+            ChatAudience::Personal,
+            owner.auth().spaces().clone(),
+        )
+        .unwrap();
+    let own_cur_page = local
+        .registry
+        .call_tool(
+            McpInvocationContext {
+                account: AccountContext::new(run_cur_auth.clone(), budget()),
+                target: EgressTarget::InAppProvider {
+                    provider: local.resource.id.clone(),
+                    model: local.model.clone(),
+                    primary_project: None,
+                },
+                request_key: CommandKey::from_bytes([
+                    0xE9, 7, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
+                ]),
+            },
+            "list_notes",
+            json!({ "project": format!("{}/h-s1-p1", s1.slug), "limit": 1 }),
+        )
+        .await
+        .unwrap()
+        .structured_content;
+    let s1_cursor = own_cur_page["nextCursor"]
+        .as_str()
+        .expect("s1_p1 has >=2 notes so limit=1 emits nextCursor")
+        .to_owned();
+    assert!(!run_cur_auth.taint().is_tainted());
+    for (idx, probe_path) in ["secret-locked", "no-such-folder-xyz"]
+        .into_iter()
+        .enumerate()
+    {
+        let cross_cur = local
+            .registry
+            .call_tool(
+                McpInvocationContext {
+                    account: AccountContext::new(run_cur_auth.clone(), budget()),
+                    target: EgressTarget::InAppProvider {
+                        provider: local.resource.id.clone(),
+                        model: local.model.clone(),
+                        primary_project: None,
+                    },
+                    request_key: CommandKey::from_bytes([
+                        0xE9,
+                        7,
+                        3,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        3 + idx as u8,
+                    ]),
+                },
+                "list_notes",
+                json!({
+                    "project": format!("{}/h-s2-p1", s2.slug),
+                    "path": probe_path,
+                    "cursor": s1_cursor,
+                }),
+            )
+            .await;
+        assert!(
+            matches!(
+                cross_cur,
+                Err(PortError::Domain(DomainError::ResourceNotFound))
+            ),
+            "own-Space cursor against foreign Space ({probe_path}) must fail ResourceNotFound before folder probe, got {:?}",
+            cross_cur.err()
+        );
+        assert!(!run_cur_auth.taint().is_tainted());
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn ability_taint_and_kind_edge_seams(
+    fixture: &RuntimeFixture,
+    local: &LoopbackProvider,
+    owner: &AccountContext,
+    pscope: &HistoryScope,
+    s2_sc: &SpaceContext,
+    s2: &AccessibleSpace,
+    s2_p1: &FolderRef,
+    s2_skill_ab: &serde_json::Value,
+) {
+    // 7d. Disabled foreign OwnedSpace(s2) Skill shadowing a local OwnedPersonal Role commits
+    //     BranchTaint in list_abilities(view="runtime", source="owned", kind="role") even though
+    //     zero foreign Role bodies are read.
+    call_mcp(
+        &fixture.registry,
+        owner,
+        [0xE9, 7, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        "create_ability",
+        json!({
+            "kind": "role",
+            "name": "shadow-probe",
+            "description": "Local personal role shadowed by disabled s2 skill",
+            "instructions": "Local personal body.",
+            "placement": { "home": "personal" },
+        }),
+    )
+    .await
+    .unwrap();
+    let s2_shadow_sys = call_mcp(
+        &fixture.registry,
+        owner,
+        [0xE9, 7, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "create_ability",
+        json!({
+            "kind": "skill",
+            "name": "shadow-probe",
+            "description": "Shadow local personal role",
+            "instructions": "Shadow body.",
+            "placement": { "home": "space", "space": s2.slug },
+        }),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    call_mcp(
+        &fixture.registry,
+        owner,
+        [0xE9, 7, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
+        "edit_ability",
+        json!({
+            "ref": s2_shadow_sys["ref"],
+            "versionToken": s2_shadow_sys["versionToken"],
+            "enabled": false,
+        }),
+    )
+    .await
+    .unwrap();
+    let run_shadow = AgentRunId::from_bytes([0xE9, 7, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3]);
+    let run_shadow_auth = owner
+        .auth()
+        .for_agent_run(
+            run_shadow,
+            pscope.space_id.clone(),
+            ChatAudience::Personal,
+            owner.auth().spaces().clone(),
+        )
+        .unwrap();
+    let shadowed_list = local
+        .registry
+        .call_tool(
+            McpInvocationContext {
+                account: AccountContext::new(run_shadow_auth.clone(), budget()),
+                target: EgressTarget::InAppProvider {
+                    provider: local.resource.id.clone(),
+                    model: local.model.clone(),
+                    primary_project: None,
+                },
+                request_key: CommandKey::from_bytes([
+                    0xE9, 7, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4,
+                ]),
+            },
+            "list_abilities",
+            json!({ "view": "runtime", "source": "owned", "kind": "role", "limit": 50 }),
+        )
+        .await
+        .unwrap()
+        .structured_content;
+    assert!(
+        shadowed_list["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["name"] != "shadow-probe"),
+        "disabled foreign OwnedSpace skill must suppress shadowed local OwnedPersonal ability"
+    );
+    assert!(
+        run_shadow_auth.taint().is_tainted(),
+        "disabled foreign winner suppressing local ability MUST commit BranchTaint"
+    );
+
+    // 7e. Disabled wrong-kind ability (Skill) returns ResourceNotFound (not InvalidState) in
+    //     ExternalMcp use_role(ar1 / raw ID) and bind_chat_role(raw ID / name).
+    let disabled_skill_ar1 = s2_shadow_sys["ref"].as_str().unwrap().to_owned();
+    let disabled_skill_id = fixture
+        .control
+        .discover_abilities(
+            owner.clone(),
+            AbilityQuery {
+                page: ControlPageRequest::new(50, None).unwrap(),
+                project: None,
+                kind: Some(AbilityKind::Skill),
+                name: Some("shadow-probe".into()),
+                authoring: true,
+            },
+        )
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .find(|item| {
+            item.descriptor.reference.placement
+                == AbilityPlacement::OwnedSpace(s2.history.space_id.clone())
+        })
+        .expect("s2 disabled shadow-probe skill")
+        .descriptor
+        .reference
+        .id
+        .to_string();
+    for (idx, selector) in [disabled_skill_ar1.as_str(), disabled_skill_id.as_str()]
+        .into_iter()
+        .enumerate()
+    {
+        let res = call_mcp(
+            &fixture.registry,
+            owner,
+            [
+                0xE9,
+                7,
+                5,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                1 + idx as u8,
+            ],
+            "use_role",
+            json!({ "role": selector }),
+        )
+        .await;
+        assert!(
+            matches!(res, Err(PortError::Domain(DomainError::ResourceNotFound))),
+            "ExternalMcp use_role on disabled Skill ({selector}) must return ResourceNotFound, got {:?}",
+            res.err()
+        );
+    }
+    let s2_sel = local
+        .provider
+        .select_provider(
+            s2_sc.clone(),
+            SelectProvider {
+                kind: PreferenceModelKind::Completion,
+                resource: Some(local.resource.id.clone()),
+                model: Some(local.model.clone()),
+                project: None,
+            },
+        )
+        .await
+        .unwrap();
+    let bind_ep = EpisodeId::from_bytes([0xE9, 7, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9]);
+    fixture
+        .control
+        .start_or_resume_episode(
+            owner.clone(),
+            AccountMutation {
+                identity: identity(fixture, owner, 0x55).await,
+                input: StartEpisode {
+                    selector: EpisodeSelector::New {
+                        requested: bind_ep.clone(),
+                        name: Some("bind-wrong-kind".into()),
+                    },
+                    project_hint: Some(s2_p1.clone()),
+                    guard: EpisodeRevisionGuard::Account,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    for selector in [disabled_skill_id.as_str(), "shadow-probe"] {
+        let bind_err = notarium_agents::mcp::bind_chat_role_for_test(
+            &local.registry,
+            owner.clone(),
+            s2_sc.clone(),
+            &s2_sel,
+            &bind_ep,
+            selector,
+            Some(s2_p1),
+            &AgentRunId::from_bytes([0xE9, 7, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8]),
+        )
+        .await;
+        assert!(
+            matches!(
+                bind_err,
+                Err(PortError::Domain(DomainError::ResourceNotFound))
+            ),
+            "bind_chat_role on disabled Skill ({selector}) must return ResourceNotFound, got {bind_err:?}"
+        );
+    }
+
+    // 7f. Attached foreign Skill exceeding budgetTokens in use_role omits skill AND commits BranchTaint.
+    let s1_parent_role = call_mcp(
+        &fixture.registry,
+        owner,
+        [0xE9, 7, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "create_ability",
+        json!({
+            "kind": "role",
+            "name": "local-role-with-foreign-skill",
+            "description": "Local role attaching foreign skill",
+            "instructions": "Short role body.",
+            "placement": { "home": "personal" },
+            "attachments": [{ "ref": s2_skill_ab["ref"], "label": "Big Foreign Skill" }],
+        }),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    let run_attach = AgentRunId::from_bytes([0xE9, 7, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+    let run_attach_auth = owner
+        .auth()
+        .for_agent_run(
+            run_attach,
+            pscope.space_id.clone(),
+            ChatAudience::Personal,
+            owner.auth().spaces().clone(),
+        )
+        .unwrap();
+    let attached_res = local
+        .registry
+        .call_tool(
+            McpInvocationContext {
+                account: AccountContext::new(run_attach_auth.clone(), budget()),
+                target: EgressTarget::InAppProvider {
+                    provider: local.resource.id.clone(),
+                    model: local.model.clone(),
+                    primary_project: None,
+                },
+                request_key: CommandKey::from_bytes([
+                    0xE9, 7, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3,
+                ]),
+            },
+            "use_role",
+            json!({ "role": s1_parent_role["ref"], "budgetTokens": 100 }),
+        )
+        .await
+        .unwrap()
+        .structured_content;
+    assert_eq!(attached_res["skills"], json!([]));
+    assert!(
+        !attached_res["omittedSkills"].as_array().unwrap().is_empty(),
+        "oversized foreign attached skill must appear in omittedSkills"
+    );
+    assert!(
+        run_attach_auth.taint().is_tainted(),
+        "omitting a foreign attached skill due to budgetTokens MUST commit BranchTaint"
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn shared_proposal_and_trashed_replay_edge_seams(
+    fixture: &RuntimeFixture,
+    local: &LoopbackProvider,
+    owner: &AccountContext,
+    pscope: &HistoryScope,
+    s1_sc: &SpaceContext,
+    s2_sc: &SpaceContext,
+    s1: &AccessibleSpace,
+    s2: &AccessibleSpace,
+    s1_p1: &FolderRef,
+    s2_p1: &FolderRef,
+    s2_hidden_note: &NoteId,
+    oracle_thread: &ChatThreadId,
+    prop_leaf: ThreadEntrySeq,
+    s2_epoch: LeaseEpoch,
+    actor: &PrincipalId,
+) {
+    // 7g. Personal chat anchored in SpaceKind::Shared (s1): existing vs missing foreign note returns
+    //     uniform ResourceNotFound with BranchTaint == false; all-invalid link_many returns InvalidQuery.
+    let shared_personal_thread =
+        ChatThreadId::from_bytes([0xE9, 7, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    fixture
+        .canonical
+        .create_chat(
+            s1_sc.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: s1.history.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([
+                        0xE9, 7, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xE9; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: CreateChat {
+                    thread: shared_personal_thread.clone(),
+                    kind: ChatThreadKind::Personal,
+                    owner: actor.clone(),
+                    project_folder: Some(s1_p1.folder_id.clone()),
+                    title: "Shared personal oracle check".into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let shared_msg = fixture
+        .canonical
+        .append_chat(
+            s1_sc.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: s1.history.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([
+                        0xE9, 7, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xE9; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: AppendChat {
+                    thread: shared_personal_thread.clone(),
+                    parent: ThreadEntrySeq::ZERO,
+                    kind: ChatEntryKind::Human,
+                    body: ChatInputBody::Text("hello".into()),
+                    tool_calls: vec![],
+                    provenance: None,
+                    interruption: None,
+                    proposed_diff: None,
+                    proposed_effect: None,
+                    referenced_notes: vec![],
+                    tainted: false,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let shared_binding = PersonalToolInvocation {
+        source: s1.history.clone(),
+        thread: shared_personal_thread,
+        leaf: shared_msg.value.seq,
+        owner: owner.clone(),
+    };
+    let run_sp = AgentRunId::from_bytes([0xE9, 7, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3]);
+    let run_sp_auth = owner
+        .auth()
+        .for_agent_run(
+            run_sp,
+            s1.history.space_id.clone(),
+            ChatAudience::Personal,
+            owner.auth().spaces().clone(),
+        )
+        .unwrap();
+    for (idx, target_note) in [
+        s2_hidden_note,
+        &NoteId::from_bytes([0xE9, 7, 7, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9]),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let res = local
+            .registry
+            .call_personal_tool(
+                McpInvocationContext {
+                    account: AccountContext::new(run_sp_auth.clone(), budget()),
+                    target: EgressTarget::InAppProvider {
+                        provider: local.resource.id.clone(),
+                        model: local.model.clone(),
+                        primary_project: None,
+                    },
+                    request_key: CommandKey::from_bytes([
+                        0xE9,
+                        7,
+                        7,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        4 + idx as u8,
+                    ]),
+                },
+                shared_binding.clone(),
+                "delete_note",
+                json!({ "ref": target_note }),
+            )
+            .await;
+        assert!(
+            matches!(res, Err(PortError::Domain(DomainError::ResourceNotFound))),
+            "Personal chat in Shared Space must return uniform ResourceNotFound on foreign note, got {:?}",
+            res.err()
+        );
+        assert!(!run_sp_auth.taint().is_tainted());
+    }
+    let bad_lm = local
+        .registry
+        .call_personal_tool(
+            McpInvocationContext {
+                account: AccountContext::new(
+                    owner
+                        .auth()
+                        .for_agent_run(
+                            AgentRunId::from_bytes([
+                                0xE9, 7, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10,
+                            ]),
+                            pscope.space_id.clone(),
+                            ChatAudience::Personal,
+                            owner.auth().spaces().clone(),
+                        )
+                        .unwrap(),
+                    budget(),
+                ),
+                target: EgressTarget::InAppProvider {
+                    provider: local.resource.id.clone(),
+                    model: local.model.clone(),
+                    primary_project: None,
+                },
+                request_key: CommandKey::from_bytes([
+                    0xE9, 7, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 11,
+                ]),
+            },
+            PersonalToolInvocation {
+                source: pscope.clone(),
+                thread: oracle_thread.clone(),
+                leaf: prop_leaf,
+                owner: owner.clone(),
+            },
+            "link_many",
+            json!({
+                "links": [{
+                    "from": s2_hidden_note,
+                    "to": s2_hidden_note,
+                    "relation": "bad:colon",
+                }]
+            }),
+        )
+        .await;
+    assert!(
+        matches!(
+            bad_lm,
+            Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
+                if diagnostic.reason == ValidationReason::InvalidQuery
+        ),
+        "all-invalid link_many must fail InvalidQuery before foreign lookup, got {:?}",
+        bad_lm.err()
+    );
+
+    // 7h. Post-ancestor-folder-trash idempotent replay (edit_note, move_note, link with alias)
+    //     and ChangeRead::Seed historical folder lifecycle folding.
+    let anc_dir = FolderId::from_bytes([0xE9, 7, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    let (_, anc_dir_rev, _) = fixture
+        .canonical
+        .create_folder(CreateFolderSpec {
+            scope: s2.history.clone(),
+            active_epoch: s2_epoch,
+            folder_id: anc_dir.clone(),
+            parent: Some(s2_p1.folder_id.clone()),
+            slug: "anc-replay-dir".into(),
+            display_name: "Anc Replay Dir".into(),
+            is_project: false,
+            project_slug: None,
+            actor: actor.clone(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+    let anc_a = call_mcp(
+        &fixture.registry,
+        owner,
+        [0xE9, 7, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
+        "create_note",
+        json!({
+            "project": format!("{}/h-s2-p1", s2.slug),
+            "path": "anc-replay-dir",
+            "title": "Anc Replay A",
+            "body": "# Anc Replay A\n\nInitial.\n",
+        }),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    let anc_b = call_mcp(
+        &fixture.registry,
+        owner,
+        [0xE9, 7, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3],
+        "create_note",
+        json!({
+            "project": format!("{}/h-s2-p1", s2.slug),
+            "path": "anc-replay-dir",
+            "title": "Anc Replay B",
+            "body": "# Anc Replay B\n\nTarget.\n",
+        }),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    let anc_edit_key = [0xE9, 7, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4];
+    let anc_edit_args = json!({
+        "ref": anc_a["noteId"],
+        "operation": "append",
+        "content": "\nEdited before ancestor trash.\n",
+    });
+    let anc_edit_1 = call_mcp(
+        &fixture.registry,
+        owner,
+        anc_edit_key,
+        "edit_note",
+        anc_edit_args.clone(),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    let anc_link_key = [0xE9, 7, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5];
+    let anc_link_args = json!({
+        "from": anc_a["noteId"],
+        "to": anc_b["noteId"],
+        "relation": "relates",
+    });
+    let anc_link_1 = call_mcp(
+        &fixture.registry,
+        owner,
+        anc_link_key,
+        "link",
+        anc_link_args.clone(),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    let anc_move_key = [0xE9, 7, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6];
+    let anc_move_args = json!({
+        "ref": anc_a["noteId"],
+        "toFolder": "h-s2-p1/anc-replay-dir/sub",
+    });
+    let anc_move_1 = call_mcp(
+        &fixture.registry,
+        owner,
+        anc_move_key,
+        "move_note",
+        anc_move_args.clone(),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    let (trashed_anc_rev, trashed_anc_seq) = fixture
+        .canonical
+        .set_folder_lifecycle(
+            &s2.history,
+            s2_epoch,
+            &anc_dir,
+            &anc_dir_rev,
+            notarium_core::model::Lifecycle::Trashed,
+            actor,
+            None,
+        )
+        .await
+        .unwrap();
+    let anc_edit_2 = call_mcp(
+        &fixture.registry,
+        owner,
+        anc_edit_key,
+        "edit_note",
+        anc_edit_args,
+    )
+    .await
+    .expect("edit_note idempotent replay must succeed after ancestor folder trash")
+    .structured_content;
+    assert_eq!(anc_edit_2["versionToken"], anc_edit_1["versionToken"]);
+    let anc_link_2 = call_mcp(
+        &fixture.registry,
+        owner,
+        anc_link_key,
+        "link",
+        anc_link_args,
+    )
+    .await
+    .expect("link with alias idempotent replay must succeed after ancestor folder trash")
+    .structured_content;
+    assert_eq!(anc_link_2["versionToken"], anc_link_1["versionToken"]);
+    let anc_move_2 = call_mcp(
+        &fixture.registry,
+        owner,
+        anc_move_key,
+        "move_note",
+        anc_move_args,
+    )
+    .await
+    .expect("move_note idempotent replay must succeed after ancestor folder trash")
+    .structured_content;
+    assert_eq!(anc_move_2["versionToken"], anc_move_1["versionToken"]);
+    // Restore anc_dir AFTER trashed_anc_seq, then read ChangeRead::Seed pinned at trashed_anc_seq:
+    // the note snapshot MUST carry recorded lifecycle Trashed (folded from historical ancestor).
+    fixture
+        .canonical
+        .set_folder_lifecycle(
+            &s2.history,
+            s2_epoch,
+            &anc_dir,
+            &trashed_anc_rev,
+            notarium_core::model::Lifecycle::Active,
+            actor,
+            None,
+        )
+        .await
+        .unwrap();
+    let anc_a_id = NoteId::parse(anc_a["noteId"].as_str().unwrap()).unwrap();
+    let mut seed_cursor = None;
+    let mut saw_anc_a_seed = None;
+    for _ in 0..32 {
+        let req = match seed_cursor.take() {
+            None => ChangeRead::Seed {
+                scope: s2.history.clone(),
+                cutoff: Some(trashed_anc_seq),
+                limit: PageLimit::new(50).unwrap(),
+            },
+            Some(cursor) => ChangeRead::ContinueSeed { cursor },
+        };
+        let res = fixture
+            .canonical
+            .read_changes(s2_sc.clone(), req)
+            .await
+            .unwrap();
+        let ChangeReadResult::Seed(seed) = res else {
+            panic!("expected ChangeReadResult::Seed");
+        };
+        if let Some(found) = seed
+            .notes
+            .iter()
+            .find(|snap| snap.document.reference().note_id == anc_a_id)
+        {
+            saw_anc_a_seed = Some(found.document.lifecycle());
+            break;
+        }
+        if let Some(next) = seed.next {
+            seed_cursor = Some(next);
+        } else {
+            break;
+        }
+    }
+    assert_eq!(
+        saw_anc_a_seed,
+        Some(notarium_core::model::Lifecycle::Trashed),
+        "ChangeRead::Seed must fold historical Trashed ancestor lifecycle at cutoff even after later restore"
     );
 }

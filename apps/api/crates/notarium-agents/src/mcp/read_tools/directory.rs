@@ -122,13 +122,16 @@ pub(super) async fn list(call: &mut ToolCallContext<'_>, args: Value) -> Result<
         .as_deref()
         .map(|raw| call.registry.note_cursors.open(call.auth.principal(), raw))
         .transpose()?;
+    if let Some(previous) = &previous {
+        scope.scope().check(&previous.scope)?;
+    }
     let Some(folder) = directory(call, &target, &preflight_scope, args.path.as_deref()).await?
     else {
-        if previous.is_some() {
-            return Err(invalid(ValidationReason::CursorStale));
-        }
         if foreign_space && args.path.is_some() {
             call.commit_external_read();
+        }
+        if previous.is_some() {
+            return Err(invalid(ValidationReason::CursorStale));
         }
         return Ok(empty(external));
     };

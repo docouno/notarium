@@ -4346,14 +4346,17 @@ fn authorize_replay_targets_rusqlite(
             }
             ReplayResource::ReadLinkFolder(folder, source) => {
                 let head = load_note_head_row_rusqlite(conn, &srec.space.id, source)?;
-                let (facts, _) = build_resource_facts_rusqlite(
+                let (facts, ancestry) = build_resource_facts_rusqlite(
                     conn,
                     &srec.space,
                     folder,
                     head.doc_class,
                     None,
-                    true,
+                    false,
                 )?;
+                if ancestry.folder_lifecycle == notarium_core::model::Lifecycle::Purged {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
                 auth.authorize_read(&facts)?;
                 continue;
             }
@@ -4370,26 +4373,37 @@ fn authorize_replay_targets_rusqlite(
         }
         let head = load_note_head_row_opt_rusqlite(conn, &srec.space.id, note)?;
         if let Some((parent, class)) = destination(target, head.as_ref().map(|h| h.doc_class)) {
-            let (facts, _) = build_resource_facts_rusqlite(
+            let (facts, ancestry) = build_resource_facts_rusqlite(
                 conn,
                 &srec.space,
                 parent.unwrap_or(&srec.root_folder_id),
                 class,
                 None,
-                true,
+                false,
             )?;
+            if ancestry.folder_lifecycle == notarium_core::model::Lifecycle::Purged {
+                return Err(DomainError::ResourceNotFound.into());
+            }
             auth.authorize_direct_write(&facts, &facts)?;
         }
         if let Some(head) = head {
-            let (facts, _) = build_resource_facts_rusqlite(
+            let (facts, ancestry) = build_resource_facts_rusqlite(
                 conn,
                 &srec.space,
                 &head.parent_folder_id,
                 head.doc_class,
                 head.ability_id,
-                true,
+                false,
             )?;
-            authorize_head(auth, target, &facts, head.lifecycle)?;
+            if ancestry.folder_lifecycle == notarium_core::model::Lifecycle::Purged {
+                return Err(DomainError::ResourceNotFound.into());
+            }
+            authorize_head(
+                auth,
+                target,
+                &facts,
+                crate::domain::common::combine_lifecycle(head.lifecycle, ancestry.folder_lifecycle),
+            )?;
         } else if !matches!(target, ReplayResource::Create(..)) {
             return Err(DomainError::ResourceNotFound.into());
         }

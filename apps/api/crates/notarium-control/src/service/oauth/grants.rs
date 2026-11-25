@@ -40,6 +40,7 @@ impl OAuthService {
         let mut rtx = self.control.store.read(budget.clone()).await?;
         let result=budget.run(async {
             let (_,user)=self.control.manager_read(rtx.inner_mut(),ctx.auth(),ctx.auth().principal()).await?;
+            if ctx.auth().is_space_narrowed() {return Err(access_denied());}
             if let Some(cursor)=&cursor {
                 if cursor.version!=1 || cursor.owner!=*ctx.auth().principal() {return Err(invalid_grant());}
                 expect_revision(&user,cursor.revision)?;
@@ -64,6 +65,7 @@ impl OAuthService {
         let mut tx = self.control.store.write(budget.clone()).await?;
         let (revision,saved)=budget.run(async {
             let (_,user)=self.control.manager(tx.inner_mut(),ctx.auth(),ctx.auth().principal()).await?;
+            if ctx.auth().is_space_narrowed() {return Err(access_denied());}
             if let Some(replay)=command.replay::<()>(tx.inner_mut()).await? {return Ok(replay);}
             expect_revision(&user,command.identity.expected)?;
             let grant = rows!(
