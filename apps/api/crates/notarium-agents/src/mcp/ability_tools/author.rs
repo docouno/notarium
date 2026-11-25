@@ -673,8 +673,11 @@ async fn edit_plan(call: &ToolCallContext<'_>, args: &EditArgs) -> Result<EditPl
 async fn original_package(
     call: &ToolCallContext<'_>,
     plan: &EditPlan,
+    allow_promoted: bool,
 ) -> Result<AbilityDescriptor, PortError> {
-    if plan.promote {
+    if (plan.promote || allow_promoted)
+        && matches!(plan.original.placement, AbilityPlacement::OwnedProject(_))
+    {
         let relocated = AbilityRef {
             placement: AbilityPlacement::OwnedSpace(plan.scope.space_id.clone()),
             ..plan.original.clone()
@@ -696,8 +699,12 @@ async fn original_package(
         .await
 }
 
-async fn original_slug(call: &ToolCallContext<'_>, plan: &EditPlan) -> Result<String, PortError> {
-    match original_package(call, plan).await {
+async fn original_slug(
+    call: &ToolCallContext<'_>,
+    plan: &EditPlan,
+    allow_promoted: bool,
+) -> Result<String, PortError> {
+    match original_package(call, plan, allow_promoted).await {
         Ok(package) => return Ok(package.name),
         Err(PortError::Domain(DomainError::ResourceNotFound)) => (),
         Err(error) => return Err(error),
@@ -823,11 +830,30 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
             return Ok(());
         }
         let mut trashed_replay = false;
+        let journaled_outcome = if plan_replayed {
+            call.lookup_journal_with_key::<PackageReplayOutcome>(
+                "edit-ability-package-outcome",
+                &call.request_key,
+                call.request_hash,
+            )
+            .await?
+        } else {
+            None
+        };
         let (orig_slug, orig_attached_skills, files, already_published) =
-            match original_package(call, &plan).await {
+            match original_package(call, &plan, plan_replayed).await {
                 Ok(original) => {
-                    let files = auxiliary_files(call, &plan, &original).await?;
-                    (original.name, original.attached_skills, files, None)
+                    if let Some(done) = journaled_outcome {
+                        (
+                            original.name,
+                            original.attached_skills,
+                            Vec::new(),
+                            Some(done),
+                        )
+                    } else {
+                        let files = auxiliary_files(call, &plan, &original).await?;
+                        (original.name, original.attached_skills, files, None)
+                    }
                 }
                 Err(PortError::Domain(DomainError::ResourceNotFound)) if plan_replayed => {
                     let scope = call.space(plan.scope.clone())?;
@@ -848,20 +874,13 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
                         return Err(DomainError::ResourceNotFound.into());
                     }
                     live.metadata.listing(scope.auth())?;
-                    let slug = original_slug(call, &plan).await?;
-                    let outcome = call
-                        .lookup_journal_with_key::<PackageReplayOutcome>(
-                            "edit-ability-package-outcome",
-                            &call.request_key,
-                            call.request_hash,
-                        )
-                        .await?;
+                    let slug = original_slug(call, &plan, plan_replayed).await?;
                     trashed_replay = true;
                     (
                         slug,
                         plan.initial_attached_skills.clone(),
                         Vec::new(),
-                        outcome,
+                        journaled_outcome,
                     )
                 }
                 Err(error) => return Err(error),
@@ -971,7 +990,10 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
             }
             if authored_changed || plan.promote {
                 if trashed_replay && plan.has_auxiliary_files {
-                    return Err(DomainError::ResourceNotFound.into());
+                    return Err(super::super::note_tools::post_commit_error(
+                        "notarium.mcp.edit-ability.v1",
+                        DomainError::ResourceNotFound.into(),
+                    ));
                 }
                 let package = call
                     .registry
@@ -1233,7 +1255,7 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
     let committed_enabled = overlays.binding_enabled && committed_preference_enabled;
     let slug = match resolved_slug {
         Some(slug) => slug,
-        None => original_slug(call, &plan)
+        None => original_slug(call, &plan, plan_replayed)
             .await
             .map_err(|error| post_commit_step_error(EDIT_LABEL, error, applied_any))?,
     };

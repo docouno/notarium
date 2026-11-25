@@ -258,8 +258,7 @@ impl ControlService {
         .await;
         let (prechecked, mut pin) = match prechecked {
             Ok((value, pin)) => (Ok(value), pin),
-            Err(error) if authoring => (Err(error), None),
-            Err(error) => return Err(error),
+            Err(error) => (Err(error), None),
         };
         let mut tx = match self.store.write(budget.clone()).await {
             Ok(tx) => tx,
@@ -279,11 +278,11 @@ impl ControlService {
             let key = placement(&ability.placement)?;
             let project = match &ability.placement { AbilityPlacement::OwnedProject(project) => Some(project), _ => None };
             if let Some((revision, saved)) = command.replay::<AbilityRef>(tx.inner_mut()).await? {
-                let descriptor = if authoring {
-                    None
-                } else {
-                    let descriptor = prechecked?;
-                    Some(self.overlay(tx.inner_mut(), &ctx, descriptor, project).await?)
+                let descriptor = match (authoring, prechecked) {
+                    (false, Ok(descriptor)) => {
+                        Some(self.overlay(tx.inner_mut(), &ctx, descriptor, project).await?)
+                    }
+                    _ => None,
                 };
                 return Ok((revision, saved.value, descriptor));
             }
@@ -719,8 +718,7 @@ impl ControlService {
         };
         let (prechecked, mut promotion_pin) = match prechecked {
             Ok((pair, pin)) => (Ok(pair), pin),
-            Err(error) if promotion => (Err(error), None),
-            Err(error) => return Err(error),
+            Err(error) => (Err(error), None),
         };
         let has_promotion_pin = promotion_pin.is_some();
         let mut tx = match self.store.write(budget.clone()).await {

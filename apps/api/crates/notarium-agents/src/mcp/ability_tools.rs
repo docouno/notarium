@@ -1453,9 +1453,15 @@ async fn list(
                     !notarium_syntax::unicode::lookup_key(&descriptor.name).contains(query)
                         && !notarium_syntax::unicode::lookup_key(&body.description).contains(query)
                 }) {
+                    if let Some(taint) = body.deferred_taint {
+                        deferred_taints.push(taint);
+                    }
                     continue;
                 }
                 if items.len() == cap {
+                    if let Some(taint) = body.deferred_taint {
+                        deferred_taints.push(taint);
+                    }
                     has_more = true;
                     resume_cursor = page_start_cursor;
                     break 'scan;
@@ -1492,6 +1498,9 @@ async fn list(
                     control_cursor,
                 })
             } else {
+                for commit in deferred_taints {
+                    let _ = commit.commit();
+                }
                 return Err(invalid(ValidationReason::BudgetExceeded));
             }
         } else {
@@ -1898,22 +1907,12 @@ pub(crate) async fn bind_chat_role(
                 }
             }
             AbilityPlacement::OwnedSpace(space) => {
-                let Some(sel) = allowed_selections.get(space) else {
-                    return Err(DomainError::ResourceNotFound.into());
-                };
-                if sel.project_only.is_some() {
+                if !allowed_selections.contains_key(space) {
                     return Err(DomainError::ResourceNotFound.into());
                 }
             }
             AbilityPlacement::OwnedProject(folder) => {
-                let Some(sel) = allowed_selections.get(&folder.space_id) else {
-                    return Err(DomainError::ResourceNotFound.into());
-                };
-                if sel
-                    .project_only
-                    .as_ref()
-                    .is_some_and(|required| required != folder)
-                {
+                if !allowed_selections.contains_key(&folder.space_id) {
                     return Err(DomainError::ResourceNotFound.into());
                 }
             }
@@ -2064,27 +2063,44 @@ pub(crate) async fn bind_chat_role(
         AbilityResolution::Disabled | AbilityResolution::Stale => {
             if let Some(reference) = exact_ar1_ref.as_ref()
                 && reference.placement != AbilityPlacement::System
-                && (!role_placement_matches_project(&reference.placement, project)
-                    || allowed_selections
-                        .values()
-                        .any(|sel| sel.project_only.is_some()))
             {
+                let check_descriptor = |descriptor: &AbilityDescriptor| {
+                    descriptor.kind == AbilityKind::Role
+                        && role_placement_matches_project(&descriptor.reference.placement, project)
+                        && selection_admits_descriptor(selection, &allowed_selections, descriptor)
+                };
                 let admitted = match registry
                     .control
                     .inspect_ability(resolve_account.clone(), reference.identity())
                     .await
                 {
-                    Ok(inspection) => {
-                        role_placement_matches_project(
-                            &inspection.descriptor.reference.placement,
-                            project,
-                        ) && selection_admits_descriptor(
-                            selection,
-                            &allowed_selections,
-                            &inspection.descriptor,
-                        )
+                    Ok(inspection) => check_descriptor(&inspection.descriptor),
+                    Err(error) if visible_error(&error) => {
+                        let candidates = registry
+                            .catalog
+                            .locate_ability(resolve_account.clone(), reference.id.clone())
+                            .await?;
+                        let mut found = false;
+                        for candidate in candidates {
+                            match registry
+                                .control
+                                .inspect_ability(
+                                    resolve_account.clone(),
+                                    candidate.reference.identity(),
+                                )
+                                .await
+                            {
+                                Ok(inspection) if check_descriptor(&inspection.descriptor) => {
+                                    found = true;
+                                    break;
+                                }
+                                Ok(_) => (),
+                                Err(error) if visible_error(&error) => (),
+                                Err(error) => return Err(error),
+                            }
+                        }
+                        found
                     }
-                    Err(error) if visible_error(&error) => false,
                     Err(error) => return Err(error),
                 };
                 if !admitted {

@@ -515,6 +515,61 @@ impl ControlCatalogPort for CanonicalStore {
             .await
         })
     }
+    fn trashed_folder_ancestry(
+        &self,
+        ctx: AccountContext,
+        reference: FolderRef,
+    ) -> PortFuture<'_, TrashedFolderAncestry> {
+        Box::pin(async move {
+            let budget = ctx.budget.clone();
+            self.with_read_tx_budget(Some(&budget), move |tx| {
+                Box::pin(async move {
+                    if !ctx.auth().spaces().contains_key(&reference.space_id) {
+                        return Err(DomainError::ResourceNotFound.into());
+                    }
+                    let rec = load_space_record(tx, &reference.space_id).await?;
+                    if reference.space_id != rec.space.id {
+                        return Err(DomainError::ResourceNotFound.into());
+                    }
+                    let row =
+                        load_folder_head_row(tx, &reference.space_id, &reference.folder_id).await?;
+                    if row.lifecycle == Lifecycle::Purged {
+                        return Err(DomainError::ResourceNotFound.into());
+                    }
+                    let mut ancestry_cache = crate::domain::common::FolderAncestryCache::default();
+                    ancestry_cache.insert_preloaded_row(rec.space.id.clone(), row.clone());
+                    let ancestry = ancestry_cache
+                        .load_ancestry_tx(tx, &reference.space_id, &reference.folder_id, false)
+                        .await?;
+                    let mut has_trashed = row.lifecycle == Lifecycle::Trashed;
+                    for anc_id in &ancestry.ancestors {
+                        if anc_id == &reference.folder_id {
+                            continue;
+                        }
+                        let anc_row = load_folder_head_row(tx, &reference.space_id, anc_id).await?;
+                        if anc_row.lifecycle == Lifecycle::Purged {
+                            return Err(DomainError::ResourceNotFound.into());
+                        }
+                        has_trashed |= anc_row.lifecycle == Lifecycle::Trashed;
+                    }
+                    if !has_trashed {
+                        return Err(DomainError::ResourceNotFound.into());
+                    }
+                    ctx.auth().can_view_folder(
+                        &rec.space,
+                        &reference.folder_id,
+                        &ancestry.ancestors,
+                    )?;
+                    Ok(TrashedFolderAncestry {
+                        reference,
+                        project: ancestry.project,
+                        ancestors: ancestry.ancestors,
+                    })
+                })
+            })
+            .await
+        })
+    }
     fn note(&self, ctx: AccountContext, reference: NoteRef) -> PortFuture<'_, CatalogNote> {
         Box::pin(async move {
             let budget = ctx.budget.clone();

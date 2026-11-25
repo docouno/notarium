@@ -19,6 +19,13 @@ pub struct CatalogNote {
     pub lifecycle: Lifecycle,
     pub facts: ResourceFacts,
 }
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TrashedFolderAncestry {
+    pub reference: FolderRef,
+    pub project: Option<FolderId>,
+    pub ancestors: Vec<FolderId>,
+}
+
 #[derive(Clone, Debug)]
 pub struct CatalogFolder {
     pub reference: FolderRef,
@@ -202,6 +209,18 @@ pub trait ControlCatalogPort: Send + Sync {
     /// Locate a single note across the caller's authorized Spaces in one read.
     fn locate_note(&self, ctx: AccountContext, note: NoteId) -> PortFuture<'_, CatalogNote>;
     fn folder(&self, ctx: AccountContext, folder: FolderRef) -> PortFuture<'_, CatalogFolder>;
+    /// Live canonical ancestry for a trashed folder (or folder under a trashed
+    /// ancestor) used exclusively to enforce live provider consent during
+    /// idempotent folder-mutation replay without trusting stale journaled
+    /// ancestry. Rejects purged folders and active folders without trashed
+    /// ancestry with `ResourceNotFound`.
+    fn trashed_folder_ancestry(
+        &self,
+        _ctx: AccountContext,
+        _folder: FolderRef,
+    ) -> PortFuture<'_, TrashedFolderAncestry> {
+        Box::pin(async { Err(DomainError::ResourceNotFound.into()) })
+    }
     fn ensure_space(
         &self,
         budget: CallBudget,

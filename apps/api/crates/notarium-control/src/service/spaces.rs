@@ -183,9 +183,9 @@ impl ControlService {
                         scope.space_id.as_str(),
                         &current.user_id
                     )?
-                    .ok_or_else(access_denied)?;
+                    .ok_or(DomainError::ResourceNotFound)?;
                     if member.role != "owner" || member.admission != "active" {
-                        return Err(access_denied());
+                        return Err(DomainError::ResourceNotFound.into());
                     }
                     let (read_classes, write_classes) = if space.state == "active" {
                         let existing = ctx
@@ -201,11 +201,12 @@ impl ControlService {
                             existing.write_classes.clone(),
                         )
                     } else {
-                        if ctx
-                            .auth()
-                            .spaces()
-                            .values()
-                            .any(|grant| grant.project_root.is_some())
+                        if ctx.auth().is_space_narrowed()
+                            || ctx
+                                .auth()
+                                .spaces()
+                                .values()
+                                .any(|grant| grant.project_root.is_some())
                         {
                             return Err(access_denied());
                         }
@@ -428,9 +429,8 @@ impl ControlService {
         scope: HistoryScope,
         request: MembershipChange,
     ) -> Result<ControlCommit<MembershipResult>, PortError> {
-        if ctx.auth().kind() != &PrincipalKind::DirectHuman {
-            return Err(access_denied());
-        }
+        ctx.auth().authorize_human_management()?;
+        require_unpinned_human(ctx.auth())?;
         let command = membership_command(ctx.auth(), &scope, &request)?;
         let budget = OperationBudget::new(ctx.budget.clone());
         let mut rtx = self.store.read(budget.clone()).await?;

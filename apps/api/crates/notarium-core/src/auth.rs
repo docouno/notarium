@@ -219,6 +219,7 @@ pub struct EngineAuthContext {
     grant: GrantId,
     kind: PrincipalKind,
     spaces: BTreeMap<SpaceId, SpaceGrant>,
+    spaces_narrowed: bool,
     human_management: bool,
     proposal_read: bool,
     ability_write: bool,
@@ -257,6 +258,7 @@ impl EngineAuthContext {
             grant: verified.grant,
             kind: PrincipalKind::DirectHuman,
             spaces: verified.spaces,
+            spaces_narrowed: false,
             human_management: verified.human_management,
             proposal_read: false,
             ability_write: verified.human_management && verified.ability_write,
@@ -302,6 +304,7 @@ impl EngineAuthContext {
                 && verified.ability_write
                 && Self::has_writable_space(&spaces),
             spaces,
+            spaces_narrowed: false,
             human_management: false,
             proposal_read: false,
             write_space: None,
@@ -341,6 +344,7 @@ impl EngineAuthContext {
                     project_root: None,
                 },
             )]),
+            spaces_narrowed: true,
             human_management: false,
             proposal_read: false,
             ability_write: false,
@@ -591,9 +595,14 @@ impl EngineAuthContext {
         let ability_write = self.ability_write && Self::has_writable_space(&spaces);
         Self {
             spaces,
+            spaces_narrowed: true,
             ability_write,
             ..self.clone()
         }
+    }
+
+    pub fn is_space_narrowed(&self) -> bool {
+        self.spaces_narrowed
     }
 
     fn narrow(&self, requested: BTreeMap<SpaceId, SpaceGrant>) -> DomainResult<Self> {
@@ -629,8 +638,10 @@ impl EngineAuthContext {
                 },
             );
         }
+        let spaces_narrowed = self.spaces_narrowed || spaces.len() < self.spaces.len();
         Ok(Self {
             spaces,
+            spaces_narrowed,
             human_management: false,
             ability_write: false,
             bearer_scope: self.bearer_scope,
@@ -648,6 +659,7 @@ impl EngineAuthContext {
             .ok_or(DomainError::ResourceNotFound)?;
         let mut scoped = self.clone();
         scoped.spaces = BTreeMap::from([(space.clone(), grant.clone())]);
+        scoped.spaces_narrowed = true;
         scoped.ability_write &= Self::has_writable_space(&scoped.spaces);
         Ok(scoped)
     }
@@ -688,6 +700,9 @@ impl EngineAuthContext {
                 .cloned()
                 .collect();
         }
+        result.spaces_narrowed = self.spaces_narrowed
+            || current.spaces_narrowed
+            || result.spaces.len() < current.spaces.len();
         result.human_management = self.human_management() && current.human_management();
         result.bearer_scope = match (self.bearer_scope, current.bearer_scope) {
             (Some(BearerScope::Read), _) | (_, Some(BearerScope::Read)) => Some(BearerScope::Read),

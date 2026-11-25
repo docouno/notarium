@@ -68,7 +68,7 @@ impl ControlService {
         }
         Ok(values)
     }
-    async fn check_bundle_attachment_db(
+    pub(super) async fn check_bundle_attachment_db(
         &self,
         tx: &mut Transaction,
         ctx: &AccountContext,
@@ -201,11 +201,44 @@ impl ControlService {
             .await?;
         let current = AccountContext::new(auth, budget.context(ctx.budget.request.clone()));
         let db_result = budget.run(async {
+            let grant = current
+                .auth()
+                .spaces()
+                .get(&home)
+                .ok_or(DomainError::ResourceNotFound)?;
+            if grant.read_classes.is_empty() {
+                return Err(DomainError::ResourceNotFound.into());
+            }
             let scope = self.context_digest(tx.inner_mut(), &current, ("context-sets", &home)).await?;
             let cursor: Option<Cursor> = page.continuation().map(|value| serde_json::from_str(value).map_err(|_| invalid(ValidationReason::InvalidQuery))).transpose()?;
             if cursor.as_ref().is_some_and(|cursor| cursor.version != 1 || cursor.scope != scope) { return Err(invalid(ValidationReason::CursorStale)); }
             let after = cursor.as_ref().map_or("", |cursor| cursor.last.as_str());
-            let mut values = rows!(tx.inner_mut(),ContextSetsRow,fetch_all,"SELECT * FROM context_sets WHERE home_space=$1 AND set_id>$2 ORDER BY set_id LIMIT $3","SELECT * FROM v1_control.context_sets WHERE home_space=$1 AND set_id>$2 ORDER BY set_id LIMIT $3";home.as_str(),after,i64::from(page.limit())+1)?;
+            let project_target = grant
+                .project_root
+                .as_ref()
+                .map(|root| {
+                    serde_json::to_string(&FolderRef {
+                        space_id: home.clone(),
+                        folder_id: root.clone(),
+                    })
+                    .map_err(|_| invalid(ValidationReason::InvalidState))
+                })
+                .transpose()?;
+            let mut values = if let Some(target) = &project_target {
+                rows!(
+                    tx.inner_mut(),
+                    ContextSetsRow,
+                    fetch_all,
+                    "SELECT s.* FROM context_sets s WHERE s.home_space=$1 AND s.set_id>$2 AND EXISTS (SELECT 1 FROM context_set_attachments a WHERE a.set_id=s.set_id AND a.target_kind='project' AND a.target_id=$3 AND a.target_space=$1) ORDER BY s.set_id LIMIT $4",
+                    "SELECT s.* FROM v1_control.context_sets s WHERE s.home_space=$1 AND s.set_id>$2 AND EXISTS (SELECT 1 FROM v1_control.context_set_attachments a WHERE a.set_id=s.set_id AND a.target_kind='project' AND a.target_id=$3 AND a.target_space=$1) ORDER BY s.set_id LIMIT $4";
+                    home.as_str(),
+                    after,
+                    target,
+                    i64::from(page.limit()) + 1
+                )?
+            } else {
+                rows!(tx.inner_mut(),ContextSetsRow,fetch_all,"SELECT * FROM context_sets WHERE home_space=$1 AND set_id>$2 ORDER BY set_id LIMIT $3","SELECT * FROM v1_control.context_sets WHERE home_space=$1 AND set_id>$2 ORDER BY set_id LIMIT $3";home.as_str(),after,i64::from(page.limit())+1)?
+            };
             let continuation = if values.len() > usize::from(page.limit()) {
                 values.pop(); Some(serde_json::to_string(&Cursor { version: 1, scope, last: ContextSetId::parse(&values.last().expect("positive page limit").set_id)? }).map_err(|_| invalid(ValidationReason::InvalidState))?)
             } else { None };
@@ -363,17 +396,28 @@ impl ControlService {
         let command = Command::new(request.identity, "delete-context-set", &request.input)?;
         command.require(ctx.auth().principal(), ctx.auth().principal())?;
         ctx.auth().authorize_human_management()?;
+        require_unpinned_human(ctx.auth())?;
         let budget = OperationBudget::new(ctx.budget.clone());
+        let current = self.current_account(&ctx, &budget).await?;
         let observed = self
             .observe_context_attachments(&budget, &request.input.id)
             .await?;
         let observed_home = budget.run(async { read_rows!(&self.store.backend,ContextSetsRow,fetch_optional,"SELECT * FROM context_sets WHERE set_id=$1","SELECT * FROM v1_control.context_sets WHERE set_id=$1";request.input.id.as_str()) }, CommitEffect::NotCommitted).await?;
-        let space_kinds = if let Some(home_row) = &observed_home {
-            let home = SpaceId::parse(&home_row.home_space)?;
-            let current = self.current_account(&ctx, &budget).await?;
+        let observed_home = match observed_home {
+            Some(home_row) => {
+                let home = SpaceId::parse(&home_row.home_space)?;
+                if current.auth().spaces().contains_key(&home) {
+                    Some((home_row, home))
+                } else {
+                    None
+                }
+            }
+            None => None,
+        };
+        let space_kinds = if let Some((_, home)) = &observed_home {
             budget
                 .run(
-                    self.context_precheck_spaces(&current, &BTreeMap::from([(home, true)])),
+                    self.context_precheck_spaces(&current, &BTreeMap::from([(home.clone(), true)])),
                     CommitEffect::NotCommitted,
                 )
                 .await?
@@ -384,8 +428,11 @@ impl ControlService {
         let revision = budget.run(async {
             let owner = self.context_manager(tx.inner_mut(), &ctx).await?;
             if let Some((revision, _)) = command.replay::<()>(tx.inner_mut()).await? { return Ok(revision); }
+            let home = observed_home
+                .as_ref()
+                .map(|(_, home)| home.clone())
+                .ok_or(DomainError::ResourceNotFound)?;
             expect_revision(&owner, command.identity.expected)?;
-            let home = SpaceId::parse(&observed_home.as_ref().ok_or(DomainError::ResourceNotFound)?.home_space)?;
             let mut spaces = BTreeMap::from([(home.clone(), true)]);
             for row in &observed { spaces.insert(SpaceId::parse(&row.target_space)?, true); }
             self.context_write_spaces(tx.inner_mut(), &ctx, &owner, &BTreeMap::from([(home.clone(), true)]), &spaces, &space_kinds).await?;

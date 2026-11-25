@@ -6796,6 +6796,52 @@ impl SqliteSyncItemPlan for RollbackDirectSqliteFastPlan {
 
         // 2b. Restore pre-existing eligible notes (`restored_from_rev_id = Some(pre_rev_id)`).
         {
+            let full_restore_ids: Vec<&str> = eligible_notes
+                .iter()
+                .filter_map(|(nid, action)| match action {
+                    CandidateAction::RestorePreExisting {
+                        needs_note_mutation: true,
+                        head_unchanged_placement: false,
+                        ..
+                    } => Some(nid.as_str()),
+                    _ => None,
+                })
+                .collect();
+            let has_full_active = eligible_notes.iter().any(|(_, action)| {
+                matches!(
+                    action,
+                    CandidateAction::RestorePreExisting {
+                        needs_note_mutation: true,
+                        head_unchanged_placement: false,
+                        pre_meta,
+                        ..
+                    } if pre_meta.lifecycle == Lifecycle::Active
+                )
+            });
+            if full_restore_ids.len() > 1 && has_full_active {
+                let mut vacate_stmt = conn
+                    .prepare_cached(
+                        "UPDATE note_heads
+                         SET lifecycle_state = 'trashed'
+                         WHERE space_id = ?1 AND note_id = ?2 AND lifecycle_state = 'active'",
+                    )
+                    .map_err(|err| {
+                        FastItemExecError::PostWrite(internal_not_committed(
+                            "sqlite_rb_vacate_prep",
+                            err.to_string(),
+                        ))
+                    })?;
+                for nid in full_restore_ids {
+                    vacate_stmt
+                        .execute(rusqlite::params![self.scope.space_id.as_str(), nid])
+                        .map_err(|err| {
+                            FastItemExecError::PostWrite(internal_not_committed(
+                                "sqlite_rb_vacate_exec",
+                                err.to_string(),
+                            ))
+                        })?;
+                }
+            }
             let mut restore_full_stmt = conn
                 .prepare_cached(
                     "UPDATE note_heads

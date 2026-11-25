@@ -4071,8 +4071,25 @@ async fn update_note_heads_restored_batch_tx(
     if items.is_empty() {
         return Ok(());
     }
+    let needs_vacate = items.len() > 1 && items.iter().any(|i| i.lifecycle_str == "active");
     match tx {
         BackendConn::Sqlite(conn) => {
+            if needs_vacate {
+                for it in items {
+                    sqlx::query(
+                        "UPDATE note_heads
+                         SET lifecycle_state = 'trashed'
+                         WHERE space_id = ? AND note_id = ? AND lifecycle_state = 'active'",
+                    )
+                    .bind(space_id.as_str())
+                    .bind(it.note_id.as_str())
+                    .execute(&mut **conn)
+                    .await
+                    .map_err(|err| {
+                        internal_not_committed("sqlite_rb_vacate_head", err.to_string())
+                    })?;
+                }
+            }
             for it in items {
                 let digest_slice = it.content_digest.as_ref().map(|d| d.as_bytes().as_slice());
                 sqlx::query(
@@ -4108,6 +4125,20 @@ async fn update_note_heads_restored_batch_tx(
         }
         BackendConn::Postgres(conn) => {
             let note_ids: Vec<&str> = items.iter().map(|i| i.note_id.as_str()).collect();
+            if needs_vacate {
+                sqlx::query(
+                    "UPDATE note_heads
+                     SET lifecycle_state = 'trashed'
+                     WHERE space_id = $1 AND note_id = ANY($2) AND lifecycle_state = 'active'",
+                )
+                .bind(space_id.as_str())
+                .bind(&note_ids)
+                .execute(&mut **conn)
+                .await
+                .map_err(|err| {
+                    internal_not_committed("pg_rb_vacate_head_batch", err.to_string())
+                })?;
+            }
             let parents: Vec<&str> = items.iter().map(|i| i.parent_folder_id.as_str()).collect();
             let slugs: Vec<&str> = items.iter().map(|i| i.slug).collect();
             let slug_folds: Vec<&str> = items.iter().map(|i| i.slug_fold).collect();
@@ -4260,6 +4291,19 @@ async fn execute_pg_rollback_domain_writes_cte(
         rv_digests.push(it.content_blake3.as_ref().map(|d| d.as_bytes().as_slice()));
         rv_metas.push(it.metadata_msgpack);
         rv_runs.push(it.agent_run_id.map(AgentRunId::as_str));
+    }
+
+    if restore_heads.len() > 1 && restore_heads.iter().any(|i| i.lifecycle_str == "active") {
+        sqlx::query(
+            "UPDATE note_heads
+             SET lifecycle_state = 'trashed'
+             WHERE space_id = $1 AND note_id = ANY($2) AND lifecycle_state = 'active'",
+        )
+        .bind(scope.space_id.as_str())
+        .bind(&rh_note_ids)
+        .execute(&mut *conn)
+        .await
+        .map_err(|err| internal_not_committed("pg_rb_direct_vacate_head", err.to_string()))?;
     }
 
     let carrier_digests = || {

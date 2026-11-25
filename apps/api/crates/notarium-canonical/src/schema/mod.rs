@@ -653,6 +653,17 @@ BEGIN
           AND nh.note_id = u.nid;
     END IF;
 
+    IF p_has_full AND COALESCE(array_length(p_m_nids, 1), 0) > 1 THEN
+        UPDATE note_heads AS nh
+        SET lifecycle_state = 'trashed'
+        FROM UNNEST(p_m_is_full, p_m_nids, p_m_op_kinds) AS u(is_full, nid, op_kind)
+        WHERE u.is_full
+          AND u.op_kind <> 'trash'
+          AND nh.space_id = p_space_id
+          AND nh.note_id = u.nid
+          AND nh.lifecycle_state = 'active';
+    END IF;
+
     WITH muts AS MATERIALIZED (
         SELECT *
         FROM UNNEST(

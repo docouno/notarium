@@ -135,6 +135,24 @@ impl SearchModelResolverPort for SeamSearchModelResolver {
     }
 }
 
+fn deterministic_episode_id(
+    actor: &PrincipalId,
+    space_id: &SpaceId,
+    thread: &ChatThreadId,
+) -> EpisodeId {
+    let mut hash = blake3::Hasher::new_derive_key("notarium.chats.episode.v1");
+    for part in [
+        space_id.as_str().as_bytes(),
+        thread.as_str().as_bytes(),
+        actor.as_str().as_bytes(),
+    ] {
+        hash.update(&(part.len() as u64).to_be_bytes());
+        hash.update(part);
+    }
+    let digest = hash.finalize();
+    EpisodeId::from_bytes(digest.as_bytes()[..16].try_into().expect("sixteen bytes"))
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sqlite_seam_hardening() {
     let _guard = support::AUTH_TEST_LOCK.lock().await;
@@ -190,6 +208,18 @@ async fn sqlite_centralized_control_and_delta_taint_isolation() {
 async fn postgres_centralized_control_and_delta_taint_isolation() {
     let _guard = support::AUTH_TEST_LOCK.lock().await;
     Box::pin(run_centralized_control_and_delta_taint_isolation(true)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sqlite_control_replay_and_taint_hardening() {
+    let _guard = support::AUTH_TEST_LOCK.lock().await;
+    Box::pin(run_control_replay_and_taint_hardening(false)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_control_replay_and_taint_hardening() {
+    let _guard = support::AUTH_TEST_LOCK.lock().await;
+    Box::pin(run_control_replay_and_taint_hardening(true)).await;
 }
 
 async fn run_centralized_control_and_delta_taint_isolation(pg: bool) {
@@ -8481,10 +8511,26 @@ async fn cross_space_recent_and_ability_filter_taint_probes(
         "recent_activity delivering a cross-Space item MUST flip BranchTaint"
     );
 
-    // (4) list_abilities(q: "nonexistent-needle-xyz") must NOT flip BranchTaint
-    //     when cross-Space abilities fail the query filter, while matching
-    //     `write-space-role` returns it AND flips BranchTaint (positive control).
-    let (ab_auth, ab_acc) = make_run(5);
+    // (4) list_abilities(source: "system", q: ...) reads no foreign Space ability
+    //     bodies and stays untainted, while an unscoped cross-Space `q` miss that
+    //     evaluates consented foreign Space ability bodies MUST commit BranchTaint
+    //     so repeated misses cannot brute-force foreign ability names/descriptions.
+    let (ab_sys_auth, ab_sys_acc) = make_run(5);
+    let ab_sys_res = local
+        .registry
+        .call_tool(
+            make_ctx(&ab_sys_acc, 20),
+            "list_abilities",
+            json!({ "view": "runtime", "source": "system", "limit": 50, "q": "nonexistent-needle-xyz" }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ab_sys_res.structured_content["items"], json!([]));
+    assert!(
+        !ab_sys_auth.taint().is_tainted(),
+        "list_abilities(source: system) with no foreign reads must not flip BranchTaint"
+    );
+    let (ab_auth, ab_acc) = make_run(6);
     let ab_res = local
         .registry
         .call_tool(
@@ -8496,8 +8542,8 @@ async fn cross_space_recent_and_ability_filter_taint_probes(
         .unwrap();
     assert_eq!(ab_res.structured_content["items"], json!([]));
     assert!(
-        !ab_auth.taint().is_tainted(),
-        "list_abilities with zero matching cross-Space items must not flip BranchTaint"
+        ab_auth.taint().is_tainted(),
+        "cross-Space list_abilities q miss over consented foreign ability body MUST commit BranchTaint"
     );
     let ab_pos = local
         .registry
@@ -11487,8 +11533,10 @@ async fn runtime_skill_omission_project_only_shadowing_and_dedup_hygiene(
                 .any(|item| item["ref"] == personal_promo_ref),
             "project_only promoted_from role from po_p2 must not shadow Personal promo-shadow-role in runtime list_abilities: {listed_po}"
         );
-        // Start a Personal chat anchored in s_po/po_p1 requesting "promo-shadow-role":
-        // bind_chat_role must skip the po_p2-promoted role and bind Personal's fallback role.
+        // Create a Personal chat anchored in Shared Space `s_po/po_p1` and verify
+        // both `use_role` (from Personal Space, activating the Personal fallback)
+        // and `bind_chat_role` (on the Shared-Space thread, rejecting both the
+        // unconsented `po_p2`-promoted role and the cross-Space Personal role).
         let po_scope =
             SpaceContext::new(owner.auth().clone(), s_po.history.clone(), budget()).unwrap();
         let po_thread =
@@ -11564,7 +11612,7 @@ async fn runtime_skill_omission_project_only_shadowing_and_dedup_hygiene(
         // On a Shared Space chat in `s_po/po-p1`, `bind_chat_role` must reject BOTH the
         // unconsented po_p2-promoted role AND the cross-Space Personal role (which would
         // taint the Shared Space chat and fail `append_chat` with CrossSpaceTainted).
-        let po_res = supervisor
+        let _po_run = supervisor
             .start(
                 owner.clone(),
                 StartChatRun {
@@ -11574,13 +11622,19 @@ async fn runtime_skill_omission_project_only_shadowing_and_dedup_hygiene(
                     options: base_opts(Some("promo-shadow-role")),
                 },
             )
-            .await;
-        if let Ok(_run) = po_res {
-            let leaf = idle_leaf(fixture, &po_scope, &po_thread).await;
-            assert_eq!(
-                leaf.get(),
-                1,
-                "shared chat must not bind unconsented promoted role or cross-space personal role"
+            .await
+            .expect("supervisor.start should claim turn before async bind_chat_role rejects");
+        let leaf = idle_leaf(fixture, &po_scope, &po_thread).await;
+        assert_eq!(
+            leaf.get(),
+            1,
+            "shared chat must not bind unconsented promoted role or cross-space personal role"
+        );
+        let po_ep_id = deterministic_episode_id(&actor, &s_po.history.space_id, &po_thread);
+        if let Ok(po_ep) = fixture.control.get_episode(owner.clone(), po_ep_id).await {
+            assert!(
+                po_ep.active_role.is_none(),
+                "rejected role binding must leave episode active_role unset: {po_ep:?}"
             );
         }
 
@@ -12987,7 +13041,7 @@ async fn schedule_provider_replay_shared_chat_and_post_trash_seams(
         .unwrap();
     let mut bad_role_opts = base_opts.clone();
     bad_role_opts.role = Some("personal-only-cross-role".into());
-    let started_bad = supervisor
+    let _started_bad = supervisor
         .start(
             owner.clone(),
             StartChatRun {
@@ -12997,15 +13051,23 @@ async fn schedule_provider_replay_shared_chat_and_post_trash_seams(
                 options: bad_role_opts,
             },
         )
-        .await;
-    // Wait for run to fail fast without binding the cross-space personal role,
-    // OR reject synchronously.
-    if let Ok(_run) = started_bad {
-        let leaf = idle_leaf(fixture, &s1_sc, &shared_chat).await;
-        assert_eq!(
-            leaf.get(),
-            1,
-            "cross-space personal role must fail before append"
+        .await
+        .expect("supervisor.start should claim turn before async bind_chat_role rejects");
+    let leaf = idle_leaf(fixture, &s1_sc, &shared_chat).await;
+    assert_eq!(
+        leaf.get(),
+        1,
+        "cross-space personal role must fail before append"
+    );
+    let shared_ep_id = deterministic_episode_id(&actor, &s1.history.space_id, &shared_chat);
+    if let Ok(shared_ep) = fixture
+        .control
+        .get_episode(owner.clone(), shared_ep_id)
+        .await
+    {
+        assert!(
+            shared_ep.active_role.is_none(),
+            "rejected cross-space personal role must leave episode active_role unset: {shared_ep:?}"
         );
     }
     // Now start with `shared-with-personal-skill` -> must cleanly omit personal skill & succeed!
@@ -16134,5 +16196,2017 @@ async fn delta_log_and_seed_with_tainted_chat_assertions(
     assert!(
         !clean_caller.auth().taint().is_tainted(),
         "start_session Seed after PurgeResync must not taint a clean human caller via discarded chat threads"
+    );
+}
+
+async fn run_control_replay_and_taint_hardening(pg: bool) {
+    let mut fixture = RuntimeFixture::open_named(pg, "control_replay_taint_hardening").await;
+    let personal = fixture.personal_scope().await;
+    let owner = fresh_owner(&fixture).await;
+    let actor = owner.auth().principal().clone();
+
+    let s1 = fixture
+        .control
+        .create_space(
+            owner.clone(),
+            AccountMutation {
+                identity: identity(&fixture, &owner, 0xE1).await,
+                input: CreateSpace {
+                    id: SpaceId::from_bytes([0xE1; 16]),
+                    kind: SpaceKind::Shared,
+                    name: "Hardening Shared One".into(),
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    let s2 = fixture
+        .control
+        .create_space(
+            owner.clone(),
+            AccountMutation {
+                identity: identity(&fixture, &owner, 0xE2).await,
+                input: CreateSpace {
+                    id: SpaceId::from_bytes([0xE2; 16]),
+                    kind: SpaceKind::Shared,
+                    name: "Hardening Shared Two".into(),
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    let owner = fresh_owner(&fixture).await;
+
+    let s1_p1 = create_project_folder(
+        &fixture,
+        &s1.history,
+        &actor,
+        FolderId::from_bytes([0xE1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+        "h-s1-p1",
+    )
+    .await;
+    let s1_p2 = create_project_folder(
+        &fixture,
+        &s1.history,
+        &actor,
+        FolderId::from_bytes([0xE1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]),
+        "h-s1-p2",
+    )
+    .await;
+    let s2_p1 = create_project_folder(
+        &fixture,
+        &s2.history,
+        &actor,
+        FolderId::from_bytes([0xE2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+        "h-s2-p1",
+    )
+    .await;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local = loopback_provider(&fixture, &owner, &listener, 0xE3, false).await;
+
+    box_step(|| {
+        provider_visibility_pat_space_and_check_connection_hardening(
+            &mut fixture,
+            &local,
+            personal.scope(),
+            &s1.history,
+            &s2.history,
+            &s1_p1,
+            &actor,
+        )
+    })
+    .await;
+
+    box_step(|| {
+        episodes_context_and_ability_overlay_replay_hardening(
+            &fixture,
+            personal.scope(),
+            &s1.history,
+            &s2.history,
+            &s1_p1,
+            &s1_p2,
+            &s2_p1,
+            &actor,
+        )
+    })
+    .await;
+
+    box_step(|| {
+        mcp_taint_folder_replay_and_ability_edit_hardening(
+            &mut fixture,
+            &local,
+            &personal,
+            &s1,
+            &s2,
+            &s1_p1,
+            &s1_p2,
+            &s2_p1,
+            &actor,
+        )
+    })
+    .await;
+
+    fixture.close().await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn provider_visibility_pat_space_and_check_connection_hardening(
+    fixture: &mut RuntimeFixture,
+    local: &LoopbackProvider,
+    pscope: &HistoryScope,
+    s1_history: &HistoryScope,
+    s2_history: &HistoryScope,
+    s1_p1: &FolderRef,
+    actor: &PrincipalId,
+) {
+    let owner = fresh_owner(fixture).await;
+    // Create a second member Carol (Editor in s1) who attaches her own private
+    // provider resource via Personal consent inside s1 without offering it to s1.
+    let carol_info = fixture
+        .control
+        .create_account(
+            owner.clone(),
+            AccountMutation {
+                identity: identity(fixture, &owner, 0x70).await,
+                input: NewAccount {
+                    username: "carol_provider_iso".into(),
+                    email: None,
+                    display_name: "Carol".into(),
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    let carol_id = carol_info.id.clone();
+    let membership_cmd =
+        CommandKey::from_bytes([0xE4, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    let s1_owner_ctx =
+        SpaceContext::new(owner.auth().clone(), s1_history.clone(), budget()).unwrap();
+    let membership_req = MembershipChange {
+        command: membership_cmd,
+        expected: ControlRevision::ZERO,
+        member: carol_id.clone(),
+        role: Some(SpaceRole::Editor),
+    };
+    let added = fixture
+        .control
+        .change_membership(s1_owner_ctx, membership_req.clone())
+        .await
+        .unwrap();
+    let carol_token = mint(TokenKind::Session).unwrap();
+    fixture
+        .storage
+        .observer
+        .seed_session(
+            &carol_id,
+            &AuthSessionId::from_bytes([0xE4; 16]),
+            &carol_token,
+            fixture.storage.clock.0.load(Ordering::SeqCst),
+        )
+        .await;
+    let carol_auth = fixture
+        .control
+        .resolve(PreAuthContext {
+            budget: budget(),
+            evidence: AuthEvidence::new(
+                AuthEvidenceKind::Session,
+                carol_token.secret.expose().to_owned(),
+            )
+            .with_human_management()
+            .with_ability_write(),
+        })
+        .await
+        .unwrap();
+    let carol_ctx = AccountContext::new(carol_auth, budget());
+
+    let carol_res_id =
+        ProviderResourceId::from_bytes([0xE4, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    let carol_res = local
+        .provider
+        .create_resource(
+            carol_ctx.clone(),
+            AccountMutation {
+                identity: identity(fixture, &carol_ctx, 1).await,
+                input: ProviderResourceSpec {
+                    id: carol_res_id.clone(),
+                    name: "Carol Private Provider".into(),
+                    wire: ProviderWireKind::OpenaiCompatible,
+                    base_url: "https://api.example.com/v1".into(),
+                    credential: None,
+                    headers: Vec::new(),
+                    limits: ProviderLimits::default(),
+                    timeout_ms: 1_000,
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    let carol_model_id =
+        ModelProfileId::from_bytes([0xE4, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+    local
+        .provider
+        .put_model(
+            carol_ctx.clone(),
+            AccountMutation {
+                identity: identity(fixture, &carol_ctx, 2).await,
+                input: PutProviderModel {
+                    resource: carol_res_id.clone(),
+                    expected: carol_res.revision,
+                    model: ProviderModelSpec {
+                        id: carol_model_id.clone(),
+                        wire_name: "carol-private-model".into(),
+                        kind: ProviderModelKind::Completion,
+                        accounting: TokenAccountingProfile::ConservativeModelCapV1,
+                        max_input_tokens: 4096,
+                        max_output_tokens: 1024,
+                        tools: true,
+                    },
+                    default: true,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let carol_att_id = RequestId::from_bytes([0xE4, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3]);
+    let carol_att = local
+        .provider
+        .request_attachment(
+            carol_ctx.clone(),
+            AccountMutation {
+                identity: identity(fixture, &carol_ctx, 3).await,
+                input: RequestProviderAttachment {
+                    id: carol_att_id.clone(),
+                    expected: None,
+                    resource: carol_res_id.clone(),
+                    resource_consent_epoch: carol_res.consent_epoch + 1,
+                    credential_consent_epoch: None,
+                    target: ProviderAttachmentTarget::Personal {
+                        owner: carol_id.clone(),
+                        space: s1_history.space_id.clone(),
+                    },
+                    consent: ProviderDisclosureConsent::attest_checked(ProviderDisclosure {
+                        classes: BTreeSet::from([DocClass::UserDoc]),
+                    }),
+                    expires_at_ms: None,
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+
+    // Space owner Bob MUST NOT see Carol's private Personal attachment, resource, or models.
+    assert!(matches!(
+        local
+            .provider
+            .inspect_attachment(owner.clone(), carol_att_id.clone())
+            .await,
+        Err(PortError::Domain(DomainError::ResourceNotFound))
+    ));
+    assert!(matches!(
+        local
+            .provider
+            .list_attachments(
+                owner.clone(),
+                carol_res_id.clone(),
+                ControlPageRequest::new(10, None).unwrap()
+            )
+            .await,
+        Err(PortError::Domain(DomainError::ResourceNotFound))
+    ));
+    assert!(matches!(
+        local
+            .provider
+            .list_models(
+                owner.clone(),
+                carol_res_id.clone(),
+                ControlPageRequest::new(10, None).unwrap()
+            )
+            .await,
+        Err(PortError::Domain(DomainError::ResourceNotFound))
+    ));
+    assert!(matches!(
+        local
+            .provider
+            .set_preference(
+                owner.clone(),
+                AccountMutation {
+                    identity: identity(fixture, &owner, 0x71).await,
+                    input: SetProviderPreference {
+                        scope: ProviderPreferenceScope::Personal,
+                        kind: PreferenceModelKind::Completion,
+                        resource: carol_res_id.clone(),
+                        model: carol_model_id.clone(),
+                    },
+                },
+            )
+            .await,
+        Err(PortError::Domain(DomainError::ResourceNotFound))
+    ));
+
+    // Space-narrowed DirectHuman (only personal space) must NOT see s1 shared attachments
+    // on a resource owned by Carol, nor approve/revoke foreign or missing attachments
+    // with distinguishing errors.
+    let missing_att_id = RequestId::from_bytes([0xE4, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9]);
+    let missing_space_id = SpaceId::from_bytes([0xE4, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8]);
+    assert!(matches!(
+        local
+            .provider
+            .approve_attachment(
+                owner.clone(),
+                AccountMutation {
+                    identity: identity(fixture, &owner, 0x72).await,
+                    input: ApproveProviderAttachment {
+                        id: carol_att.id.clone(),
+                        expected: carol_att.revision,
+                        resource_consent_epoch: carol_att.resource_consent_epoch,
+                        credential_consent_epoch: carol_att.credential_consent_epoch,
+                        consent: ProviderDisclosureConsent::attest_checked(ProviderDisclosure {
+                            classes: BTreeSet::from([DocClass::UserDoc]),
+                        }),
+                    },
+                },
+            )
+            .await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+    assert!(matches!(
+        local
+            .provider
+            .approve_attachment(
+                owner.clone(),
+                AccountMutation {
+                    identity: identity(fixture, &owner, 0x73).await,
+                    input: ApproveProviderAttachment {
+                        id: missing_att_id.clone(),
+                        expected: ControlRevision::ZERO,
+                        resource_consent_epoch: 1,
+                        credential_consent_epoch: None,
+                        consent: ProviderDisclosureConsent::attest_checked(ProviderDisclosure {
+                            classes: BTreeSet::from([DocClass::UserDoc]),
+                        }),
+                    },
+                },
+            )
+            .await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+    assert!(matches!(
+        local
+            .provider
+            .revoke_attachment(
+                owner.clone(),
+                AccountMutation {
+                    identity: identity(fixture, &owner, 0x74).await,
+                    input: RevokeProviderAttachment {
+                        id: carol_att.id.clone(),
+                        expected: carol_att.revision,
+                    },
+                },
+            )
+            .await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+    assert!(matches!(
+        local
+            .provider
+            .revoke_attachment(
+                owner.clone(),
+                AccountMutation {
+                    identity: identity(fixture, &owner, 0x75).await,
+                    input: RevokeProviderAttachment {
+                        id: missing_att_id,
+                        expected: ControlRevision::ZERO,
+                    },
+                },
+            )
+            .await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+    assert!(matches!(
+        local
+            .provider
+            .request_attachment(
+                owner.clone(),
+                AccountMutation {
+                    identity: identity(fixture, &owner, 0x76).await,
+                    input: RequestProviderAttachment {
+                        id: RequestId::from_bytes([0xEA; 16]),
+                        expected: None,
+                        resource: local.resource.id.clone(),
+                        resource_consent_epoch: local.resource.consent_epoch,
+                        credential_consent_epoch: None,
+                        target: ProviderAttachmentTarget::Space(missing_space_id),
+                        consent: ProviderDisclosureConsent::attest_checked(ProviderDisclosure {
+                            classes: BTreeSet::from([DocClass::UserDoc]),
+                        }),
+                        expires_at_ms: None,
+                    },
+                },
+            )
+            .await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+
+    // check_connection rejects project-pinned humans before existing_read and collapses
+    // missing vs foreign ProviderResourceId to ResourceNotFound.
+    let pinned_owner =
+        AccountContext::new(owner.auth().restrict_to_project(s1_p1).unwrap(), budget());
+    assert!(matches!(
+        local
+            .provider
+            .check_connection(
+                pinned_owner.clone(),
+                CheckProviderConnection {
+                    resource: local.resource.id.clone(),
+                    intent: CommandKey::from_bytes([0xEB; 16]),
+                },
+            )
+            .await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+    let missing_res_id = ProviderResourceId::from_bytes([0xEB; 16]);
+    for probe_res in [&carol_res_id, &missing_res_id] {
+        assert!(matches!(
+            local
+                .provider
+                .check_connection(
+                    owner.clone(),
+                    CheckProviderConnection {
+                        resource: probe_res.clone(),
+                        intent: CommandKey::from_bytes([0xEC; 16]),
+                    },
+                )
+                .await,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ));
+    }
+
+    // Space-narrowed DirectHuman cannot mint PATs covering excluded Spaces or all spaces,
+    // and revoke_pat collapses missing vs foreign token_id to ResourceNotFound.
+    let only_personal = AccountContext::new(
+        owner
+            .auth()
+            .restrict_to_spaces(&BTreeSet::from([pscope.space_id.clone()])),
+        budget(),
+    );
+    let owner_rev = fixture
+        .control
+        .account(owner.clone(), actor.clone())
+        .await
+        .unwrap()
+        .revision;
+    assert!(matches!(
+        fixture
+            .control
+            .create_pat(
+                only_personal.clone(),
+                CreatePat {
+                    name: "narrowed-pat-all".into(),
+                    scope: BearerScope::Write,
+                    ability_write: false,
+                    selected_spaces: None,
+                    expires_at_ms: None,
+                    expected: owner_rev,
+                },
+            )
+            .await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+    assert!(matches!(
+        fixture
+            .control
+            .create_pat(
+                only_personal.clone(),
+                CreatePat {
+                    name: "narrowed-pat-excluded".into(),
+                    scope: BearerScope::Write,
+                    ability_write: false,
+                    selected_spaces: Some(vec![s1_history.space_id.clone()]),
+                    expires_at_ms: None,
+                    expected: owner_rev,
+                },
+            )
+            .await,
+        Err(PortError::Domain(DomainError::ResourceNotFound))
+    ));
+    let carol_rev = fixture
+        .control
+        .account(carol_ctx.clone(), carol_id.clone())
+        .await
+        .unwrap()
+        .revision;
+    let carol_pat = fixture
+        .control
+        .create_pat(
+            carol_ctx.clone(),
+            CreatePat {
+                name: "carol-pat".into(),
+                scope: BearerScope::Read,
+                ability_write: false,
+                selected_spaces: None,
+                expires_at_ms: None,
+                expected: carol_rev,
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    let missing_pat = CredentialTokenId::parse("deadbeef0001").unwrap();
+    for (idx, probe_pat) in [carol_pat.metadata.id, missing_pat].into_iter().enumerate() {
+        assert!(matches!(
+            fixture
+                .control
+                .revoke_pat(
+                    owner.clone(),
+                    AccountMutation {
+                        identity: identity(fixture, &owner, 0x77 + idx as u8).await,
+                        input: RevokePat {
+                            account: actor.clone(),
+                            token: probe_pat,
+                        },
+                    },
+                )
+                .await,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ));
+    }
+
+    // resume_membership_change rejects tainted & project-pinned DirectHuman.
+    let tainted_owner = AccountContext::new(owner.auth().with_staged_taint(), budget());
+    tainted_owner.auth().taint().mark_external_read();
+    assert!(matches!(
+        fixture
+            .control
+            .resume_membership_change(tainted_owner, s1_history.clone(), membership_req.clone(),)
+            .await,
+        Err(PortError::Domain(DomainError::CrossSpaceTainted))
+    ));
+    assert!(matches!(
+        fixture
+            .control
+            .resume_membership_change(pinned_owner, s1_history.clone(), membership_req)
+            .await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+    // Non-member Carol calling admit_space_management on s2 (where she is not a member)
+    // gets ResourceNotFound matching a nonexistent Space.
+    let carol_s2_err = fixture
+        .control
+        .admit_space_management(carol_ctx.clone(), s2_history.clone())
+        .await;
+    assert!(matches!(
+        carol_s2_err,
+        Err(PortError::Domain(DomainError::ResourceNotFound))
+    ));
+    let _ = added;
+    let _ = actor;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn episodes_context_and_ability_overlay_replay_hardening(
+    fixture: &RuntimeFixture,
+    pscope: &HistoryScope,
+    s1_history: &HistoryScope,
+    _s2_history: &HistoryScope,
+    s1_p1: &FolderRef,
+    s1_p2: &FolderRef,
+    s2_p1: &FolderRef,
+    actor: &PrincipalId,
+) {
+    let owner = fresh_owner(fixture).await;
+    let ep_s1_p2 = EpisodeId::from_bytes([0xE5, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    let ep_s2 = EpisodeId::from_bytes([0xE5, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+    let created_p2 = fixture
+        .control
+        .start_or_resume_episode(
+            owner.clone(),
+            AccountMutation {
+                identity: identity(fixture, &owner, 0xF0).await,
+                input: StartEpisode {
+                    selector: EpisodeSelector::New {
+                        requested: ep_s1_p2.clone(),
+                        name: Some("ep-p2".into()),
+                    },
+                    project_hint: Some(s1_p2.clone()),
+                    guard: EpisodeRevisionGuard::Account,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let EpisodeStartResult::New(ep_p2_info) = created_p2.value else {
+        panic!("expected new episode");
+    };
+    fixture
+        .control
+        .start_or_resume_episode(
+            owner.clone(),
+            AccountMutation {
+                identity: identity(fixture, &owner, 0xF1).await,
+                input: StartEpisode {
+                    selector: EpisodeSelector::New {
+                        requested: ep_s2.clone(),
+                        name: Some("ep-s2".into()),
+                    },
+                    project_hint: Some(s2_p1.clone()),
+                    guard: EpisodeRevisionGuard::Account,
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+    // Narrowed caller pinned to s1_p1 must not start/resume/fork/update/touch/ack ep_s1_p2
+    // or ep_s2, nor create an unscoped (project_hint: None) episode, nor ack delta with
+    // project_root or partial read_classes.
+    let pinned_p1 = AccountContext::new(owner.auth().restrict_to_project(s1_p1).unwrap(), budget());
+    let only_s1 = AccountContext::new(
+        owner
+            .auth()
+            .restrict_to_spaces(&BTreeSet::from([s1_history.space_id.clone()])),
+        budget(),
+    );
+    assert!(matches!(
+        fixture
+            .control
+            .start_or_resume_episode(
+                pinned_p1.clone(),
+                AccountMutation {
+                    identity: identity(fixture, &owner, 0xF2).await,
+                    input: StartEpisode {
+                        selector: EpisodeSelector::Resume(ep_s1_p2.clone()),
+                        project_hint: None,
+                        guard: EpisodeRevisionGuard::Target,
+                    },
+                },
+            )
+            .await,
+        Err(PortError::Domain(DomainError::ResourceNotFound))
+    ));
+    assert!(matches!(
+        fixture
+            .control
+            .start_or_resume_episode(
+                only_s1.clone(),
+                AccountMutation {
+                    identity: identity(fixture, &owner, 0xF3).await,
+                    input: StartEpisode {
+                        selector: EpisodeSelector::Name("ep-s2".into()),
+                        project_hint: None,
+                        guard: EpisodeRevisionGuard::Account,
+                    },
+                },
+            )
+            .await,
+        Err(PortError::Domain(DomainError::ResourceNotFound))
+    ));
+    assert!(matches!(
+        fixture
+            .control
+            .start_or_resume_episode(
+                pinned_p1.clone(),
+                AccountMutation {
+                    identity: identity(fixture, &owner, 0xF4).await,
+                    input: StartEpisode {
+                        selector: EpisodeSelector::New {
+                            requested: EpisodeId::from_bytes([0xE5; 16]),
+                            name: None,
+                        },
+                        project_hint: None,
+                        guard: EpisodeRevisionGuard::Account,
+                    },
+                },
+            )
+            .await,
+        Err(PortError::Domain(DomainError::ResourceNotFound))
+    ));
+    assert!(matches!(
+        fixture
+            .control
+            .update_episode(
+                pinned_p1.clone(),
+                AccountMutation {
+                    identity: identity(fixture, &owner, 0xF5).await,
+                    input: EpisodeMutation::Full(EpisodeUpdate {
+                        episode: ep_s1_p2.clone(),
+                        expected: ep_p2_info.revision,
+                        name: Some("hijacked".into()),
+                        active_role: None,
+                        project_hint: Some(s1_p1.clone()),
+                        lifecycle: EpisodeLifecycle::Closed,
+                    }),
+                },
+            )
+            .await,
+        Err(PortError::Domain(DomainError::ResourceNotFound))
+    ));
+    assert!(matches!(
+        fixture
+            .control
+            .touch_episode(pinned_p1.clone(), ep_s1_p2.clone())
+            .await,
+        Err(PortError::Domain(DomainError::ResourceNotFound))
+    ));
+    let real_pat = fixture.pat(BearerScope::Write, false).await;
+    let mut partial_grants = real_pat.auth().spaces().clone();
+    partial_grants
+        .get_mut(&s1_history.space_id)
+        .unwrap()
+        .read_classes
+        .remove(&DocClass::Skill);
+    let partial_read =
+        AccountContext::new(real_pat.auth().for_pat(partial_grants).unwrap(), budget());
+    for restricted in [pinned_p1.clone(), partial_read] {
+        assert!(matches!(
+            fixture
+                .control
+                .acknowledge_delta(
+                    restricted,
+                    AccountMutation {
+                        identity: identity(fixture, &owner, 0xF6).await,
+                        input: AcknowledgeDelta {
+                            owner: AckOwner::Account,
+                            delivered: notarium_core::receipt::ChangeCursor {
+                                scope: s1_history.clone(),
+                                after: SpaceSeq::ZERO,
+                            },
+                        },
+                    },
+                )
+                .await,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ));
+    }
+
+    // context_state: project-pinned caller cannot read Space/Personal scope or see hidden
+    // ContextSetIds in list_context_sets continuation cursors, nor mutate via delete/attach.
+    let set_hidden = ContextSetId::from_bytes([0xE6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    let set_visible = ContextSetId::from_bytes([0xE6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+    let set_visible_2 =
+        ContextSetId::from_bytes([0xE6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3]);
+    let mut created_sets = Vec::new();
+    for (idx, sid) in [&set_hidden, &set_visible, &set_visible_2]
+        .into_iter()
+        .enumerate()
+    {
+        let res = fixture
+            .control
+            .put_context_set(
+                owner.clone(),
+                AccountMutation {
+                    identity: identity(fixture, &owner, 0xA0 + idx as u8).await,
+                    input: PutContextSet {
+                        id: sid.clone(),
+                        home: s1_history.space_id.clone(),
+                        expected: None,
+                        name: format!("Set {idx}"),
+                        notes: vec![],
+                    },
+                },
+            )
+            .await
+            .unwrap()
+            .value;
+        created_sets.push(res);
+    }
+    // Attach only set_visible and set_visible_2 to s1_p1; leave set_hidden unattached to s1_p1.
+    let mut p1_scope_rev = fixture
+        .control
+        .context_scope(owner.clone(), ContextScope::Project(s1_p1.clone()))
+        .await
+        .unwrap()
+        .revision;
+    for (idx, set_info) in [&created_sets[1], &created_sets[2]].into_iter().enumerate() {
+        let attached = fixture
+            .control
+            .set_context_attachment(
+                owner.clone(),
+                AccountMutation {
+                    identity: identity(fixture, &owner, 0xA4 + idx as u8).await,
+                    input: SetContextAttachment {
+                        scope: ContextScope::Project(s1_p1.clone()),
+                        expected: p1_scope_rev,
+                        set: set_info.id.clone(),
+                        set_revision: set_info.revision,
+                        attached: true,
+                    },
+                },
+            )
+            .await
+            .unwrap()
+            .value;
+        p1_scope_rev = attached.revision;
+    }
+    assert!(matches!(
+        fixture
+            .control
+            .context_scope(
+                pinned_p1.clone(),
+                ContextScope::Space(s1_history.space_id.clone())
+            )
+            .await,
+        Err(PortError::Domain(DomainError::ResourceNotFound))
+    ));
+    assert!(matches!(
+        fixture
+            .control
+            .list_context_entries(
+                pinned_p1.clone(),
+                ContextScope::Space(s1_history.space_id.clone()),
+                ControlPageRequest::new(10, None).unwrap(),
+            )
+            .await,
+        Err(PortError::Domain(DomainError::ResourceNotFound))
+    ));
+    let page1 = fixture
+        .control
+        .list_context_sets(
+            pinned_p1.clone(),
+            s1_history.space_id.clone(),
+            ControlPageRequest::new(1, None).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(page1.items.len(), 1);
+    assert_eq!(page1.items[0].id, set_visible);
+    let cont = page1
+        .continuation
+        .expect("second visible set yields continuation");
+    assert!(
+        !cont.contains(set_hidden.as_str()),
+        "hidden set id must never leak in list_context_sets continuation cursor: {cont}"
+    );
+    assert!(matches!(
+        fixture
+            .control
+            .delete_context_set(
+                pinned_p1.clone(),
+                AccountMutation {
+                    identity: identity(fixture, &owner, 0xA8).await,
+                    input: DeleteContextSet {
+                        id: set_hidden.clone(),
+                        expected: created_sets[0].revision,
+                    },
+                },
+            )
+            .await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+
+    // Control update_ability_binding(Account) and set_ability_trail(Set) MUST replay
+    // cleanly even after the target ability advances or is trashed.
+    let s1_sc = SpaceContext::new(owner.auth().clone(), s1_history.clone(), budget()).unwrap();
+    let ab_folder = FolderId::from_bytes([0xE7, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    let s1_epoch = fixture
+        .canonical
+        .read_space(&s1_history.space_id)
+        .await
+        .unwrap()
+        .active_epoch;
+    let (ab_ref_folder, _, _) = fixture
+        .canonical
+        .create_folder(CreateFolderSpec {
+            scope: s1_history.clone(),
+            active_epoch: s1_epoch,
+            folder_id: ab_folder.clone(),
+            parent: Some(s1_p1.folder_id.clone()),
+            slug: "abilities".into(),
+            display_name: "Abilities".into(),
+            is_project: false,
+            project_slug: None,
+            actor: actor.clone(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+    let ab_parent = ab_ref_folder.folder_id;
+    let ab_note_a = NoteId::from_bytes([0xE7, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    let ab_id_a = AbilityId::from_bytes([0xE7, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+    let created_n_a = fixture
+        .canonical
+        .create_note(
+            s1_sc.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: s1_history.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([
+                        0xE7, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xE7; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: CreateNote {
+                    note: ab_note_a.clone(),
+                    parent: Some(ab_parent.clone()),
+                    slug: "replay-bind-role".into(),
+                    class: DocClass::Skill,
+                    carrier: "---\nability_kind: role\ndescription: v1\n---\n# v1\n".into(),
+                    folder_page: false,
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    let pub_a = fixture
+        .canonical
+        .publish_ability_package(
+            s1_sc.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: s1_history.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([
+                        0xE7, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xE7; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: PublishAbilityPackage {
+                    ability: ab_id_a.clone(),
+                    kind: AbilityKind::Role,
+                    entrypoint: ab_note_a.clone(),
+                    files: vec![],
+                    attached_skills: vec![],
+                    expected_package_revision: None,
+                    expected_entrypoint_revision: Some(created_n_a.revision.clone()),
+                    requires_explicit_binding: false,
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    let ab_ref_a = AbilityRef {
+        id: ab_id_a.clone(),
+        placement: AbilityPlacement::OwnedProject(s1_p1.clone()),
+        revision: pub_a.revision.clone(),
+    };
+    let ab_note_b = NoteId::from_bytes([0xE7, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    let ab_id_b = AbilityId::from_bytes([0xE7, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+    let created_n_b = fixture
+        .canonical
+        .create_note(
+            s1_sc.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: s1_history.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([
+                        0xE7, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xE8; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: CreateNote {
+                    note: ab_note_b.clone(),
+                    parent: Some(ab_parent),
+                    slug: "replay-trail-dest".into(),
+                    class: DocClass::Skill,
+                    carrier: "---\nability_kind: role\ndescription: dest\n---\n# dest\n".into(),
+                    folder_page: false,
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    let pub_b = fixture
+        .canonical
+        .publish_ability_package(
+            s1_sc.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: s1_history.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([
+                        0xE7, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xE8; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: PublishAbilityPackage {
+                    ability: ab_id_b.clone(),
+                    kind: AbilityKind::Role,
+                    entrypoint: ab_note_b.clone(),
+                    files: vec![],
+                    attached_skills: vec![],
+                    expected_package_revision: None,
+                    expected_entrypoint_revision: Some(created_n_b.revision),
+                    requires_explicit_binding: false,
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    let ab_ref_b = AbilityRef {
+        id: ab_id_b.clone(),
+        placement: AbilityPlacement::OwnedProject(s1_p1.clone()),
+        revision: pub_b.revision.clone(),
+    };
+
+    let bind_req = AccountMutation {
+        identity: identity(fixture, &owner, 0xB0).await,
+        input: AbilityBindingUpdate {
+            ability: ab_ref_a.clone(),
+            expected: AbilityOverlayGuard::Account(ControlRevision::ZERO),
+            projects: AbilityProjects::All,
+            enabled: false,
+        },
+    };
+    let first_bind = fixture
+        .control
+        .update_ability_binding(owner.clone(), bind_req.clone())
+        .await
+        .unwrap();
+    let trail_req = AccountMutation {
+        identity: identity(fixture, &owner, 0xB1).await,
+        input: AbilityTrailMutation::Set(AbilityTrailUpdate {
+            source: ab_ref_a.clone(),
+            expected_destination: None,
+            destination: Some(ab_ref_b),
+        }),
+    };
+    let first_trail = fixture
+        .control
+        .set_ability_trail(owner.clone(), trail_req.clone())
+        .await
+        .unwrap();
+
+    // Trash ability A; exact retries of BOTH Account-guarded binding and Set trail must replay!
+    fixture
+        .canonical
+        .trash_ability_package(
+            s1_sc,
+            Mutation {
+                identity: CommandIdentity {
+                    scope: s1_history.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([
+                        0xE7, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xE9; 32]),
+                },
+                preconditions: Preconditions {
+                    revision: Some(created_n_a.revision),
+                    ..Preconditions::default()
+                },
+                input: TrashAbilityPackage {
+                    ability: ab_id_a,
+                    entrypoint: ab_note_a,
+                    package_revision: pub_a.revision,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let replayed_bind = fixture
+        .control
+        .update_ability_binding(owner.clone(), bind_req)
+        .await
+        .expect("Account-guarded update_ability_binding must replay after ability is trashed");
+    assert_eq!(replayed_bind.revision, first_bind.revision);
+    assert!(replayed_bind.value.descriptor.is_none());
+    let replayed_trail = fixture
+        .control
+        .set_ability_trail(owner, trail_req)
+        .await
+        .expect("Set set_ability_trail must replay after source ability is trashed");
+    assert_eq!(replayed_trail.revision, first_trail.revision);
+    let _ = pscope;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn mcp_taint_folder_replay_and_ability_edit_hardening(
+    fixture: &mut RuntimeFixture,
+    local: &LoopbackProvider,
+    personal: &SpaceContext,
+    s1: &AccessibleSpace,
+    s2: &AccessibleSpace,
+    s1_p1: &FolderRef,
+    s1_p2: &FolderRef,
+    s2_p1: &FolderRef,
+    actor: &PrincipalId,
+) {
+    let owner = fresh_owner(fixture).await;
+    let pscope = personal.scope().clone();
+    let s1_sc = SpaceContext::new(owner.auth().clone(), s1.history.clone(), budget()).unwrap();
+    let s2_sc = SpaceContext::new(owner.auth().clone(), s2.history.clone(), budget()).unwrap();
+    let consent_all = || {
+        ProviderDisclosureConsent::attest_checked(ProviderDisclosure {
+            classes: BTreeSet::from([DocClass::UserDoc, DocClass::Skill, DocClass::AgentMemory]),
+        })
+    };
+
+    // Attach personal space (full), s1_p1 (project-only on s1!), and s2 (full) to local.resource.
+    for (sub, target) in [
+        (
+            0xC0u8,
+            ProviderAttachmentTarget::Personal {
+                owner: actor.clone(),
+                space: pscope.space_id.clone(),
+            },
+        ),
+        (
+            0xC1u8,
+            ProviderAttachmentTarget::Personal {
+                owner: actor.clone(),
+                space: s1.history.space_id.clone(),
+            },
+        ),
+        (0xC2u8, ProviderAttachmentTarget::Project(s1_p1.clone())),
+        (
+            0xC3u8,
+            ProviderAttachmentTarget::Personal {
+                owner: actor.clone(),
+                space: s2.history.space_id.clone(),
+            },
+        ),
+        (
+            0xC4u8,
+            ProviderAttachmentTarget::Space(s2.history.space_id.clone()),
+        ),
+    ] {
+        let att = local
+            .provider
+            .request_attachment(
+                owner.clone(),
+                AccountMutation {
+                    identity: identity(fixture, &owner, sub).await,
+                    input: RequestProviderAttachment {
+                        id: RequestId::from_bytes([
+                            0xE8, sub, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, sub,
+                        ]),
+                        expected: None,
+                        resource: local.resource.id.clone(),
+                        resource_consent_epoch: local.resource.consent_epoch,
+                        credential_consent_epoch: None,
+                        target,
+                        consent: consent_all(),
+                        expires_at_ms: None,
+                    },
+                },
+            )
+            .await
+            .unwrap()
+            .value;
+        if att.state != ProviderAttachmentState::Approved {
+            local
+                .provider
+                .approve_attachment(
+                    owner.clone(),
+                    AccountMutation {
+                        identity: identity(fixture, &owner, sub + 8).await,
+                        input: ApproveProviderAttachment {
+                            id: att.id,
+                            expected: att.revision,
+                            resource_consent_epoch: att.resource_consent_epoch,
+                            credential_consent_epoch: att.credential_consent_epoch,
+                            consent: consent_all(),
+                        },
+                    },
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    // (1) Link-free create_note / create_notes proposal targeting a write-locked subfolder
+    //     in consented foreign Space s2 MUST commit external-read taint even on failure.
+    let locked_sub = FolderId::from_bytes([0xE8, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    let s2_epoch = fixture
+        .canonical
+        .read_space(&s2.history.space_id)
+        .await
+        .unwrap()
+        .active_epoch;
+    fixture
+        .canonical
+        .create_folder(CreateFolderSpec {
+            scope: s2.history.clone(),
+            active_epoch: s2_epoch,
+            folder_id: locked_sub.clone(),
+            parent: Some(s2_p1.folder_id.clone()),
+            slug: "secret-locked".into(),
+            display_name: "Secret Locked".into(),
+            is_project: false,
+            project_slug: None,
+            actor: actor.clone(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+    fixture
+        .canonical
+        .set_folder_write_lock(s2_sc.clone(), locked_sub, true)
+        .await
+        .unwrap();
+    let s2_p1_handle = format!("{}/h-s2-p1", s2.slug);
+    for (idx, (tool, args, expect_space_ro)) in [
+        (
+            "create_note",
+            json!({
+                "project": s2_p1_handle,
+                "path": "secret-locked",
+                "title": "Probe",
+                "body": "link-free body",
+            }),
+            true,
+        ),
+        (
+            "create_notes",
+            json!({
+                "project": s2_p1_handle,
+                "notes": [{
+                    "path": "secret-locked",
+                    "title": "Batch Probe",
+                    "body": "link-free batch",
+                }],
+            }),
+            false,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let p_thread =
+            ChatThreadId::from_bytes([0xE8, 2, idx as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        fixture
+            .canonical
+            .create_chat(
+                personal.clone(),
+                Mutation {
+                    identity: CommandIdentity {
+                        scope: pscope.clone(),
+                        actor: actor.clone(),
+                        key: CommandKey::from_bytes([
+                            0xE8, 2, idx as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                        ]),
+                        hash: ContentDigest::from_bytes([0xE8; 32]),
+                    },
+                    preconditions: Preconditions::default(),
+                    input: CreateChat {
+                        thread: p_thread.clone(),
+                        kind: ChatThreadKind::Personal,
+                        owner: actor.clone(),
+                        project_folder: None,
+                        title: format!("Proposal probe thread {idx}"),
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        let run_id =
+            AgentRunId::from_bytes([0xE8, 3, idx as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        let run_auth = owner
+            .auth()
+            .for_agent_run(
+                run_id.clone(),
+                pscope.space_id.clone(),
+                ChatAudience::Personal,
+                owner.auth().spaces().clone(),
+            )
+            .unwrap();
+        let run_personal = SpaceContext::new(run_auth.clone(), pscope.clone(), budget()).unwrap();
+        fixture
+            .canonical
+            .claim_active_run(
+                run_personal.clone(),
+                ClaimChatRun {
+                    thread: p_thread.clone(),
+                    expected_leaf: ThreadEntrySeq::ZERO,
+                    run: run_id.clone(),
+                    previous_run: None,
+                },
+            )
+            .await
+            .unwrap();
+        let p_leaf = fixture
+            .canonical
+            .append_chat(
+                run_personal,
+                Mutation {
+                    identity: CommandIdentity {
+                        scope: pscope.clone(),
+                        actor: actor.clone(),
+                        key: CommandKey::from_bytes([
+                            0xE8, 2, idx as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3,
+                        ]),
+                        hash: ContentDigest::from_bytes([0xE8; 32]),
+                    },
+                    preconditions: Preconditions::default(),
+                    input: AppendChat {
+                        thread: p_thread.clone(),
+                        parent: ThreadEntrySeq::ZERO,
+                        kind: ChatEntryKind::Model,
+                        body: ChatInputBody::Text("creating".into()),
+                        tool_calls: vec![],
+                        provenance: Some(ChatProvenance::default()),
+                        interruption: None,
+                        proposed_diff: None,
+                        proposed_effect: None,
+                        referenced_notes: vec![],
+                        tainted: false,
+                    },
+                },
+            )
+            .await
+            .unwrap()
+            .value
+            .seq;
+        let err = local
+            .registry
+            .call_personal_tool(
+                McpInvocationContext {
+                    account: AccountContext::new(run_auth.clone(), budget()),
+                    target: EgressTarget::InAppProvider {
+                        provider: local.resource.id.clone(),
+                        model: local.model.clone(),
+                        primary_project: None,
+                    },
+                    request_key: CommandKey::from_bytes([
+                        0xE8, 3, idx as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
+                    ]),
+                },
+                PersonalToolInvocation {
+                    source: pscope.clone(),
+                    thread: p_thread.clone(),
+                    leaf: p_leaf,
+                    owner: owner.clone(),
+                },
+                tool,
+                args,
+            )
+            .await;
+        if expect_space_ro {
+            assert!(
+                matches!(err, Err(PortError::Domain(DomainError::SpaceReadOnly))),
+                "{tool} against write-locked foreign subfolder must fail SpaceReadOnly, got {:?}",
+                err.err()
+            );
+        } else {
+            assert!(
+                matches!(
+                    err,
+                    Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
+                        if diagnostic.reason == ValidationReason::InvalidQuery
+                ),
+                "{tool} against write-locked foreign subfolder must fail InvalidQuery, got {:?}",
+                err.err()
+            );
+        }
+        assert!(
+            run_auth.taint().is_tainted(),
+            "failed link-free {tool} proposal against foreign write-locked folder MUST commit BranchTaint"
+        );
+    }
+
+    // (2) list_abilities in InAppProvider mode MUST commit BranchTaint both on `q` miss
+    //     over a foreign Space ability AND on `limit: 1` lookahead `nextCursor`.
+    local
+        .registry
+        .call_tool(
+            McpInvocationContext {
+                account: owner.clone(),
+                target: EgressTarget::ExternalMcp,
+                request_key: CommandKey::from_bytes([
+                    0xE8, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                ]),
+            },
+            "create_ability",
+            json!({
+                "kind": "role",
+                "name": "aaa-personal-ability",
+                "description": "Local personal role",
+                "instructions": "Local instructions",
+                "placement": { "home": "personal" },
+            }),
+        )
+        .await
+        .unwrap();
+    let created_s2_role = local
+        .registry
+        .call_tool(
+            McpInvocationContext {
+                account: owner.clone(),
+                target: EgressTarget::ExternalMcp,
+                request_key: CommandKey::from_bytes([
+                    0xE8, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
+                ]),
+            },
+            "create_ability",
+            json!({
+                "kind": "role",
+                "name": "zzz-foreign-secret-ability",
+                "description": "Secret foreign description token",
+                "instructions": "Foreign instructions",
+                "placement": { "home": "project", "project": s2_p1_handle },
+            }),
+        )
+        .await
+        .unwrap()
+        .structured_content;
+    let s2_role_ref = created_s2_role["ref"].as_str().unwrap().to_owned();
+    let s2_role_ver = created_s2_role["versionToken"].as_str().unwrap().to_owned();
+
+    let miss_auth = owner
+        .auth()
+        .for_agent_run(
+            AgentRunId::from_bytes([0xE8, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+            pscope.space_id.clone(),
+            ChatAudience::Personal,
+            owner.auth().spaces().clone(),
+        )
+        .unwrap();
+    let miss_res = local
+        .registry
+        .call_tool(
+            McpInvocationContext {
+                account: AccountContext::new(miss_auth.clone(), budget()),
+                target: EgressTarget::InAppProvider {
+                    provider: local.resource.id.clone(),
+                    model: local.model.clone(),
+                    primary_project: None,
+                },
+                request_key: CommandKey::from_bytes([
+                    0xE8, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
+                ]),
+            },
+            "list_abilities",
+            json!({ "view": "authoring", "kind": "role", "q": "no-such-needle-999", "limit": 50 }),
+        )
+        .await
+        .unwrap()
+        .structured_content;
+    assert!(miss_res["items"].as_array().unwrap().is_empty());
+    assert!(
+        miss_auth.taint().is_tainted(),
+        "list_abilities q miss after reading foreign Space ability body MUST commit BranchTaint"
+    );
+
+    let lookahead_auth = owner
+        .auth()
+        .for_agent_run(
+            AgentRunId::from_bytes([0xE8, 5, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+            pscope.space_id.clone(),
+            ChatAudience::Personal,
+            owner.auth().spaces().clone(),
+        )
+        .unwrap();
+    let lookahead_res = local
+        .registry
+        .call_tool(
+            McpInvocationContext {
+                account: AccountContext::new(lookahead_auth.clone(), budget()),
+                target: EgressTarget::InAppProvider {
+                    provider: local.resource.id.clone(),
+                    model: local.model.clone(),
+                    primary_project: None,
+                },
+                request_key: CommandKey::from_bytes([
+                    0xE8, 5, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
+                ]),
+            },
+            "list_abilities",
+            json!({ "view": "authoring", "kind": "role", "source": "owned", "limit": 1 }),
+        )
+        .await
+        .unwrap()
+        .structured_content;
+    assert_eq!(lookahead_res["items"].as_array().unwrap().len(), 1);
+    assert!(lookahead_res["nextCursor"].is_string());
+    assert!(
+        lookahead_auth.taint().is_tainted(),
+        "list_abilities nextCursor lookahead triggered by foreign Space ability MUST commit BranchTaint"
+    );
+
+    // (3) Non-promoting edit_ability replays cleanly after subsequent promotion (OwnedProject -> OwnedSpace).
+    let non_promo_key = CommandKey::from_bytes([0xE8, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    let edited_v2 = local
+        .registry
+        .call_tool(
+            McpInvocationContext {
+                account: owner.clone(),
+                target: EgressTarget::ExternalMcp,
+                request_key: non_promo_key.clone(),
+            },
+            "edit_ability",
+            json!({
+                "ref": s2_role_ref,
+                "versionToken": s2_role_ver,
+                "description": "Updated before promotion",
+                "instructions": "Instructions v2",
+            }),
+        )
+        .await
+        .unwrap()
+        .structured_content;
+    let promoted_v3 = local
+        .registry
+        .call_tool(
+            McpInvocationContext {
+                account: owner.clone(),
+                target: EgressTarget::ExternalMcp,
+                request_key: CommandKey::from_bytes([
+                    0xE8, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
+                ]),
+            },
+            "edit_ability",
+            json!({
+                "ref": edited_v2["ref"].as_str().unwrap(),
+                "versionToken": edited_v2["versionToken"].as_str().unwrap(),
+                "home": { "home": "space" },
+                "availability": { "mode": "all-projects" },
+            }),
+        )
+        .await
+        .unwrap()
+        .structured_content;
+    let replayed_non_promo = local
+        .registry
+        .call_tool(
+            McpInvocationContext {
+                account: owner.clone(),
+                target: EgressTarget::ExternalMcp,
+                request_key: non_promo_key,
+            },
+            "edit_ability",
+            json!({
+                "ref": s2_role_ref,
+                "versionToken": s2_role_ver,
+                "description": "Updated before promotion",
+                "instructions": "Instructions v2",
+            }),
+        )
+        .await
+        .expect("non-promoting edit_ability must replay cleanly after subsequent promotion")
+        .structured_content;
+    assert_eq!(replayed_non_promo["ref"], edited_v2["ref"]);
+
+    // (4) bind_chat_role with pre-promotion ar1: token on a promoted Space-wide role in s2
+    //     (while unrelated Space s1 has project_only) returns InvalidState (not ResourceNotFound!)
+    //     when disabled, and SourceMismatch when stale.
+    local
+        .registry
+        .call_tool(
+            McpInvocationContext {
+                account: owner.clone(),
+                target: EgressTarget::ExternalMcp,
+                request_key: CommandKey::from_bytes([
+                    0xE8, 6, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                ]),
+            },
+            "edit_ability",
+            json!({
+                "ref": promoted_v3["ref"].as_str().unwrap(),
+                "versionToken": promoted_v3["versionToken"].as_str().unwrap(),
+                "enabled": false,
+            }),
+        )
+        .await
+        .unwrap();
+    let supervisor = AgentRunSupervisor::new_local(
+        local.registry.clone(),
+        fixture.revocations.clone(),
+        ExclusiveDataRoot::attest_open_writer(),
+    );
+    let s2_thread = ChatThreadId::from_bytes([0xE8, 6, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    fixture
+        .canonical
+        .create_chat(
+            s2_sc.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: s2.history.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([
+                        0xE8, 6, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xE8; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: CreateChat {
+                    thread: s2_thread.clone(),
+                    kind: ChatThreadKind::Personal,
+                    owner: actor.clone(),
+                    project_folder: None,
+                    title: "Promoted ar1 bind check".into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let s2_msg = fixture
+        .canonical
+        .append_chat(
+            s2_sc.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: s2.history.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([
+                        0xE8, 6, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xE8; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: AppendChat {
+                    thread: s2_thread.clone(),
+                    parent: ThreadEntrySeq::ZERO,
+                    kind: ChatEntryKind::Human,
+                    body: ChatInputBody::Text("Bind disabled promoted ar1".into()),
+                    tool_calls: vec![],
+                    provenance: None,
+                    interruption: None,
+                    proposed_diff: None,
+                    proposed_effect: None,
+                    referenced_notes: vec![],
+                    tainted: false,
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value
+        .seq;
+    let started_disabled = supervisor
+        .start(
+            owner.clone(),
+            StartChatRun {
+                scope: s2.history.clone(),
+                thread: s2_thread.clone(),
+                expected_leaf: s2_msg,
+                options: ChatRunOptions {
+                    provider: Some(local.resource.id.clone()),
+                    model: Some(local.model.clone()),
+                    role: Some(edited_v2["ref"].as_str().unwrap().to_owned()),
+                    limits: RunLimits::default(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let sub_opt = supervisor
+        .subscribe(
+            owner.clone(),
+            s2.history.clone(),
+            s2_thread.clone(),
+            Some(&notarium_agents::chats::stream::StreamCursor {
+                run: started_disabled,
+                byte_offset: 0,
+            }),
+        )
+        .await
+        .unwrap();
+    let mut failure_code: Option<String> = None;
+    if let Some(mut sub) = sub_opt {
+        loop {
+            match timeout(Duration::from_secs(10), sub.next()).await.unwrap() {
+                notarium_agents::chats::stream::StreamRead::Frame(frame) => {
+                    let parsed: Value = serde_json::from_slice(frame.payload()).unwrap();
+                    if parsed["type"] == "run_failed" {
+                        failure_code = parsed["code"].as_str().map(ToOwned::to_owned);
+                    }
+                }
+                notarium_agents::chats::stream::StreamRead::Closed => break,
+                notarium_agents::chats::stream::StreamRead::CatchUpRequired(_) => break,
+            }
+        }
+    }
+    let _ = idle_leaf(fixture, &s2_sc, &s2_thread).await;
+    if let Some(code) = failure_code.as_deref() {
+        assert_eq!(
+            code, "internal",
+            "disabled promoted Space-wide role via pre-promotion ar1: must fail InvalidState (mapped to internal), NOT ResourceNotFound (history_unavailable)"
+        );
+    }
+    supervisor.shutdown();
+
+    // (5) rename_folder trashed replay MUST use live ancestry (trashed_folder_ancestry):
+    //     moving a folder from consented s1_p1 into unconsented s1_p2 and trashing it
+    //     must reject InAppProvider replay with ResourceNotFound.
+    let movable_folder = FolderId::from_bytes([0xE8, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    let s1_epoch = fixture
+        .canonical
+        .read_space(&s1.history.space_id)
+        .await
+        .unwrap()
+        .active_epoch;
+    fixture
+        .canonical
+        .create_folder(CreateFolderSpec {
+            scope: s1.history.clone(),
+            active_epoch: s1_epoch,
+            folder_id: movable_folder.clone(),
+            parent: Some(s1_p1.folder_id.clone()),
+            slug: "move-target".into(),
+            display_name: "Move Target".into(),
+            is_project: false,
+            project_slug: None,
+            actor: actor.clone(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+    let s1_run_auth = owner
+        .auth()
+        .for_agent_run(
+            AgentRunId::from_bytes([0xE8, 7, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+            s1.history.space_id.clone(),
+            ChatAudience::Personal,
+            std::collections::BTreeMap::from([(
+                s1.history.space_id.clone(),
+                owner.auth().spaces()[&s1.history.space_id].clone(),
+            )]),
+        )
+        .unwrap();
+    let rename_key = CommandKey::from_bytes([0xE8, 7, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    let s1_p1_handle = format!("{}/h-s1-p1", s1.slug);
+    local
+        .registry
+        .call_tool(
+            McpInvocationContext {
+                account: AccountContext::new(s1_run_auth.clone(), budget()),
+                target: EgressTarget::InAppProvider {
+                    provider: local.resource.id.clone(),
+                    model: local.model.clone(),
+                    primary_project: None,
+                },
+                request_key: rename_key.clone(),
+            },
+            "rename_folder",
+            json!({
+                "project": s1_p1_handle,
+                "folder": "move-target",
+                "name": "renamed-in-p1",
+            }),
+        )
+        .await
+        .unwrap();
+    // Move folder out of consented s1_p1 into unconsented s1_p2 and trash it.
+    let _moved_out = fixture
+        .canonical
+        .move_folder(
+            s1_sc.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: s1.history.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([
+                        0xE8, 7, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xE8; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: MoveFolder {
+                    folder: movable_folder.clone(),
+                    new_parent: Some(s1_p2.folder_id.clone()),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let trashed_rows = fixture
+        .canonical
+        .execute_diagnostic_write_sql_for_test(&format!(
+            "UPDATE folder_heads SET lifecycle_state='trashed' WHERE space_id='{}' AND folder_id='{}'",
+            s1.history.space_id.as_str(),
+            movable_folder.as_str(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(trashed_rows, 1);
+    let replay_denied = local
+        .registry
+        .call_tool(
+            McpInvocationContext {
+                account: AccountContext::new(s1_run_auth, budget()),
+                target: EgressTarget::InAppProvider {
+                    provider: local.resource.id.clone(),
+                    model: local.model.clone(),
+                    primary_project: None,
+                },
+                request_key: rename_key,
+            },
+            "rename_folder",
+            json!({
+                "project": s1_p1_handle,
+                "folder": "move-target",
+                "name": "renamed-in-p1",
+            }),
+        )
+        .await;
+    assert!(
+        matches!(
+            replay_denied,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ),
+        "trashed folder moved to unconsented project must fail replay via live ancestry, got {:?}",
+        replay_denied.err()
+    );
+
+    // (6) edit_ability with auxiliary files: if package-outcome journal entry is absent
+    //     and ability is trashed before retry, replay must return CommitEffect::Unknown
+    //     (Unavailable) instead of fabricating outcome="partial" + stale ref.
+    let aux_folder = FolderId::from_bytes([0xE8, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    let s1_epoch2 = fixture
+        .canonical
+        .read_space(&s1.history.space_id)
+        .await
+        .unwrap()
+        .active_epoch;
+    let (aux_ref_folder, _, _) = fixture
+        .canonical
+        .create_folder(CreateFolderSpec {
+            scope: s1.history.clone(),
+            active_epoch: s1_epoch2,
+            folder_id: aux_folder,
+            parent: Some(s1_p2.folder_id.clone()),
+            slug: "abilities".into(),
+            display_name: "Abilities".into(),
+            is_project: false,
+            project_slug: None,
+            actor: actor.clone(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+    let aux_parent = aux_ref_folder.folder_id;
+    let aux_note = NoteId::from_bytes([0xE8, 8, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    let aux_ab = AbilityId::from_bytes([0xE8, 8, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+    let aux_entry = fixture
+        .canonical
+        .create_note(
+            s1_sc.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: s1.history.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([
+                        0xE8, 8, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xE8; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: CreateNote {
+                    note: aux_note.clone(),
+                    parent: Some(aux_parent),
+                    slug: "aux-replay-role".into(),
+                    class: DocClass::Skill,
+                    carrier: "---\nability_kind: role\ndescription: aux v1\n---\n# aux v1\n".into(),
+                    folder_page: false,
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    let aux_file_content = "auxiliary helper text\n".to_owned();
+    let _aux_pub = fixture
+        .canonical
+        .publish_ability_package(
+            s1_sc.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: s1.history.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([
+                        0xE8, 8, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xE8; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: PublishAbilityPackage {
+                    ability: aux_ab.clone(),
+                    kind: AbilityKind::Role,
+                    entrypoint: aux_note.clone(),
+                    files: vec![AbilityFile {
+                        path: "helper.txt".into(),
+                        digest: ContentDigest::from_bytes(
+                            *blake3::hash(aux_file_content.as_bytes()).as_bytes(),
+                        ),
+                        content: aux_file_content,
+                    }],
+                    attached_skills: vec![],
+                    expected_package_revision: None,
+                    expected_entrypoint_revision: Some(aux_entry.revision),
+                    requires_explicit_binding: false,
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    let s1_p2_handle = format!("{}/h-s1-p2", s1.slug);
+    let listed_aux = local
+        .registry
+        .call_tool(
+            McpInvocationContext {
+                account: owner.clone(),
+                target: EgressTarget::ExternalMcp,
+                request_key: CommandKey::from_bytes([
+                    0xE8, 8, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                ]),
+            },
+            "list_abilities",
+            json!({ "view": "authoring", "project": s1_p2_handle, "q": "aux-replay-role" }),
+        )
+        .await
+        .unwrap()
+        .structured_content;
+    let aux_item = listed_aux["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["name"] == "aux-replay-role")
+        .unwrap();
+    let aux_ref = aux_item["ref"].as_str().unwrap().to_owned();
+    let aux_ver = aux_item["versionToken"].as_str().unwrap().to_owned();
+    let aux_edit_key = CommandKey::from_bytes([0xE8, 8, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    let aux_edited = local
+        .registry
+        .call_tool(
+            McpInvocationContext {
+                account: owner.clone(),
+                target: EgressTarget::ExternalMcp,
+                request_key: aux_edit_key.clone(),
+            },
+            "edit_ability",
+            json!({
+                "ref": aux_ref,
+                "versionToken": aux_ver,
+                "description": "aux v2",
+                "instructions": "aux v2 body",
+            }),
+        )
+        .await
+        .unwrap()
+        .structured_content;
+    assert_eq!(aux_edited["outcome"], "updated");
+    // Simulate a crash right before recording `edit-ability-package-outcome` by deleting
+    // only that mcp_dedup row (keeping `edit-ability-plan` and the canonical commit),
+    // then trashing the ability and retrying with the exact same request key.
+    fixture
+        .storage
+        .observer
+        .execute(
+            "DELETE FROM mcp_dedup WHERE operation='edit_ability' AND safe_result NOT LIKE '%has_auxiliary_files%'",
+        )
+        .await;
+    fixture
+        .canonical
+        .delete_note(
+            s1_sc,
+            Mutation {
+                identity: CommandIdentity {
+                    scope: s1.history.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([
+                        0xE8, 8, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xE8; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: DeleteNote {
+                    note: aux_note,
+                    disposition: DeleteDisposition::Trash,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let aux_retry = local
+        .registry
+        .call_tool(
+            McpInvocationContext {
+                account: owner,
+                target: EgressTarget::ExternalMcp,
+                request_key: aux_edit_key,
+            },
+            "edit_ability",
+            json!({
+                "ref": aux_ref,
+                "versionToken": aux_ver,
+                "description": "aux v2",
+                "instructions": "aux v2 body",
+            }),
+        )
+        .await;
+    assert!(
+        matches!(
+            aux_retry,
+            Err(PortError::Unavailable(ref f))
+                if f.effect() == CommitEffect::Unknown && f.retry() == RetryAdvice::RetrySameCommand
+        ),
+        "trashed replay of edit_ability with auxiliary files without outcome journal must return CommitEffect::Unknown (not fabricated partial), got {:?}",
+        aux_retry.err()
     );
 }

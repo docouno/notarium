@@ -169,7 +169,10 @@ impl ControlService {
             .auth()
             .spaces()
             .get(&delivered.scope.space_id)
-            .is_none_or(|g| g.read_classes.is_empty())
+            .is_none_or(|g| {
+                g.project_root.is_some()
+                    || g.read_classes != notarium_core::classes::DocClass::all()
+            })
         {
             return Err(DomainError::ResourceNotFound.into());
         }
@@ -200,11 +203,21 @@ impl ControlService {
             {
                 return Err(DomainError::SpaceReadOnly.into());
             }
-            if auth.spaces().get(&delivered.scope.space_id).is_none_or(|g| g.read_classes.is_empty()) {
+            if auth
+                .spaces()
+                .get(&delivered.scope.space_id)
+                .is_none_or(|g| {
+                    g.project_root.is_some()
+                        || g.read_classes != notarium_core::classes::DocClass::all()
+                })
+            {
                 return Err(DomainError::ResourceNotFound.into());
             }
             if let AckOwner::Episode(id) = &request.input.owner {
                 let row = episode(tx.inner_mut(), auth.principal(), id).await?;
+                if !super::episode_project_admitted(&auth, super::stored_project_ref(&row)?.as_ref()) {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
                 if row.lifecycle == "closed" {
                     return Err(invalid(ValidationReason::InvalidState));
                 }

@@ -9,7 +9,7 @@ use super::{
 use crate::{
     error::{invalid, unavailable},
     outbound::{OutboundRequest, OutboundResponse},
-    store::{lease::OperationBudget, target::ProviderCallLogRow},
+    store::{lease::OperationBudget, statements::rows, target::ProviderCallLogRow},
 };
 use http::{
     Method,
@@ -393,6 +393,23 @@ impl ProviderService {
         runtime
             .run(
                 async {
+                    if job.scope.is_none() {
+                        auth.authorize_human_management()?;
+                        super::super::authority::require_unpinned_human(&auth)?;
+                        let owner = rows!(
+                            tx.inner_mut(),
+                            (String,),
+                            fetch_optional,
+                            "SELECT owner_id FROM provider_resources WHERE id=$1",
+                            "SELECT owner_id FROM v1_control.provider_resources WHERE id=$1";
+                            job.resource().as_str()
+                        )?;
+                        if owner.as_ref().map(|(id,)| id.as_str())
+                            != Some(auth.principal().as_str())
+                        {
+                            return Err(DomainError::ResourceNotFound.into());
+                        }
+                    }
                     accounting::existing_read(
                         tx.inner_mut(),
                         auth.principal().as_str(),

@@ -2790,3 +2790,464 @@ async fn l6_note_only_rollback_dual_dialect_parity() {
         fixtures.drop_pg_schema(&schema).await;
     }
 }
+
+async fn run_sibling_slug_swap_rollback_suite(store: &CanonicalStore) {
+    let owner = sample_principal_id(46);
+    let (scope, _root) = seed_space(
+        store,
+        sample_space_id(46),
+        sample_incarnation(46),
+        owner.clone(),
+    )
+    .await;
+    let human_ctx = owner_ctx(&scope, owner.clone());
+
+    for (mode_idx, mix_folder) in [(0u8, false), (1u8, true)] {
+        let base = 210u8 + mode_idx * 20;
+        let folder_id = FolderId::from_bytes([base; 16]);
+        let (folder_ref, _, _) = store
+            .create_folder(notarium_canonical::CreateFolderSpec {
+                scope: scope.clone(),
+                active_epoch: LeaseEpoch::new(1).unwrap(),
+                folder_id: folder_id.clone(),
+                parent: None,
+                slug: format!("rb-swap-dir-{mode_idx}"),
+                display_name: format!("RB Swap Dir {mode_idx}"),
+                is_project: false,
+                project_slug: None,
+                actor: owner.clone(),
+                timestamp: None,
+            })
+            .await
+            .expect("create folder");
+        let parent = Some(folder_ref.folder_id.clone());
+        let mix_dir = if mix_folder {
+            let mix_id = FolderId::from_bytes([base + 15; 16]);
+            store
+                .create_folder(notarium_canonical::CreateFolderSpec {
+                    scope: scope.clone(),
+                    active_epoch: LeaseEpoch::new(1).unwrap(),
+                    folder_id: mix_id.clone(),
+                    parent: parent.clone(),
+                    slug: "mix-sub-orig".into(),
+                    display_name: "Mix Sub Orig".into(),
+                    is_project: false,
+                    project_slug: None,
+                    actor: owner.clone(),
+                    timestamp: None,
+                })
+                .await
+                .expect("create mix subfolder");
+            Some(mix_id)
+        } else {
+            None
+        };
+
+        // Scenario 1: Intra-batch sibling slug swap (A: alpha -> tmp, B: beta -> alpha, A: tmp -> beta).
+        let a = NoteId::from_bytes([base, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        let b = NoteId::from_bytes([base, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+        assert!(a.as_str() < b.as_str());
+        for (nid, slug, title) in [(&a, "alpha", "Alpha"), (&b, "beta", "Beta")] {
+            store
+                .create_note(
+                    human_ctx.clone(),
+                    next_mutation(
+                        &scope,
+                        &owner,
+                        CreateNote {
+                            folder_page: false,
+                            note: nid.clone(),
+                            parent: parent.clone(),
+                            slug: slug.into(),
+                            class: DocClass::UserDoc,
+                            carrier: format!("# {title}\n"),
+                        },
+                    ),
+                )
+                .await
+                .unwrap();
+        }
+        let swap_run = sample_run_id(base + 1);
+        let swap_ctx = agent_run_ctx(&human_ctx, swap_run.clone());
+        let a_tmp = store
+            .move_note(
+                swap_ctx.clone(),
+                next_mutation(
+                    &scope,
+                    &owner,
+                    notarium_core::ports::MoveNote {
+                        note: a.clone(),
+                        parent: parent.clone(),
+                        slug: "tmp".into(),
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        let b_alpha = store
+            .move_note(
+                swap_ctx.clone(),
+                next_mutation(
+                    &scope,
+                    &owner,
+                    notarium_core::ports::MoveNote {
+                        note: b.clone(),
+                        parent: parent.clone(),
+                        slug: "alpha".into(),
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        let a_beta = store
+            .move_note(
+                swap_ctx.clone(),
+                next_mutation(
+                    &scope,
+                    &owner,
+                    notarium_core::ports::MoveNote {
+                        note: a.clone(),
+                        parent: parent.clone(),
+                        slug: "beta".into(),
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        let expected = vec![a_beta.value.clone(), b_alpha.value.clone()];
+        if let Some(mix_id) = &mix_dir {
+            let renamed = store
+                .rename_folder(
+                    swap_ctx.clone(),
+                    next_mutation(
+                        &scope,
+                        &owner,
+                        notarium_core::ports::RenameFolder {
+                            folder: mix_id.clone(),
+                            name: "mix-sub-1".into(),
+                        },
+                    ),
+                )
+                .await
+                .unwrap();
+            let _ = renamed;
+        }
+        let _ = a_tmp;
+        let run_rev = store
+            .inspect_agent_run_revision_for_test(&scope.space_id, &swap_run)
+            .await
+            .unwrap()
+            .unwrap();
+        let rb = store
+            .rollback_agent_run(
+                human_ctx.clone(),
+                next_mutation(
+                    &scope,
+                    &owner,
+                    RollbackAgentRun {
+                        run: swap_run,
+                        expected_run_revision: run_rev,
+                        expected_entities: expected,
+                        associated_board_expectations: Vec::new(),
+                    },
+                ),
+            )
+            .await
+            .expect("sibling slug swap rollback must succeed");
+        assert_eq!(rb.value.restored.len(), 2);
+        let a_after = note_metadata_at(
+            store,
+            &scope,
+            rb.value.restored.iter().find(|r| r.note == a).unwrap(),
+            &rb.receipt,
+        )
+        .await;
+        let b_after = note_metadata_at(
+            store,
+            &scope,
+            rb.value.restored.iter().find(|r| r.note == b).unwrap(),
+            &rb.receipt,
+        )
+        .await;
+        assert_eq!(a_after.slug, "alpha");
+        assert_eq!(b_after.slug, "beta");
+
+        // Scenario 2: 2-step rename chain (NoteId(c) < NoteId(d): c: c-one -> c-gamma, d: c-two -> c-one).
+        let c = NoteId::from_bytes([base, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        let d = NoteId::from_bytes([base, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+        assert!(c.as_str() < d.as_str());
+        for (nid, slug) in [(&c, "c-one"), (&d, "c-two")] {
+            store
+                .create_note(
+                    human_ctx.clone(),
+                    next_mutation(
+                        &scope,
+                        &owner,
+                        CreateNote {
+                            folder_page: false,
+                            note: nid.clone(),
+                            parent: parent.clone(),
+                            slug: slug.into(),
+                            class: DocClass::UserDoc,
+                            carrier: format!("# {slug}\n"),
+                        },
+                    ),
+                )
+                .await
+                .unwrap();
+        }
+        let chain_run = sample_run_id(base + 2);
+        let chain_ctx = agent_run_ctx(&human_ctx, chain_run.clone());
+        let c_moved = store
+            .move_note(
+                chain_ctx.clone(),
+                next_mutation(
+                    &scope,
+                    &owner,
+                    notarium_core::ports::MoveNote {
+                        note: c.clone(),
+                        parent: parent.clone(),
+                        slug: "c-gamma".into(),
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        let d_moved = store
+            .move_note(
+                chain_ctx.clone(),
+                next_mutation(
+                    &scope,
+                    &owner,
+                    notarium_core::ports::MoveNote {
+                        note: d.clone(),
+                        parent: parent.clone(),
+                        slug: "c-one".into(),
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        let expected = vec![c_moved.value.clone(), d_moved.value.clone()];
+        if let Some(mix_id) = &mix_dir {
+            store
+                .rename_folder(
+                    chain_ctx.clone(),
+                    next_mutation(
+                        &scope,
+                        &owner,
+                        notarium_core::ports::RenameFolder {
+                            folder: mix_id.clone(),
+                            name: "mix-sub-2".into(),
+                        },
+                    ),
+                )
+                .await
+                .unwrap();
+        }
+        let run_rev = store
+            .inspect_agent_run_revision_for_test(&scope.space_id, &chain_run)
+            .await
+            .unwrap()
+            .unwrap();
+        let rb = store
+            .rollback_agent_run(
+                human_ctx.clone(),
+                next_mutation(
+                    &scope,
+                    &owner,
+                    RollbackAgentRun {
+                        run: chain_run,
+                        expected_run_revision: run_rev,
+                        expected_entities: expected,
+                        associated_board_expectations: Vec::new(),
+                    },
+                ),
+            )
+            .await
+            .expect("rename chain rollback must succeed");
+        assert_eq!(rb.value.restored.len(), 2);
+        let c_after = note_metadata_at(
+            store,
+            &scope,
+            rb.value.restored.iter().find(|r| r.note == c).unwrap(),
+            &rb.receipt,
+        )
+        .await;
+        let d_after = note_metadata_at(
+            store,
+            &scope,
+            rb.value.restored.iter().find(|r| r.note == d).unwrap(),
+            &rb.receipt,
+        )
+        .await;
+        assert_eq!(c_after.slug, "c-one");
+        assert_eq!(d_after.slug, "c-two");
+
+        // Scenario 3: Trash + slug reuse (NoteId(e) < NoteId(f): e active at reuse-slug,
+        // f trashed at reuse-slug; run trashes e and restores f at reuse-slug).
+        let e = NoteId::from_bytes([base, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        let f = NoteId::from_bytes([base, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+        assert!(e.as_str() < f.as_str());
+        store
+            .create_note(
+                human_ctx.clone(),
+                next_mutation(
+                    &scope,
+                    &owner,
+                    CreateNote {
+                        folder_page: false,
+                        note: f.clone(),
+                        parent: parent.clone(),
+                        slug: "reuse-slug".into(),
+                        class: DocClass::UserDoc,
+                        carrier: "# F\n".into(),
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        store
+            .delete_note(
+                human_ctx.clone(),
+                next_mutation(
+                    &scope,
+                    &owner,
+                    notarium_core::ports::DeleteNote {
+                        note: f.clone(),
+                        disposition: notarium_core::ports::DeleteDisposition::Trash,
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        store
+            .create_note(
+                human_ctx.clone(),
+                next_mutation(
+                    &scope,
+                    &owner,
+                    CreateNote {
+                        folder_page: false,
+                        note: e.clone(),
+                        parent: parent.clone(),
+                        slug: "reuse-slug".into(),
+                        class: DocClass::UserDoc,
+                        carrier: "# E\n".into(),
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        let reuse_run = sample_run_id(base + 3);
+        let reuse_ctx = agent_run_ctx(&human_ctx, reuse_run.clone());
+        let e_trashed = store
+            .delete_note(
+                reuse_ctx.clone(),
+                next_mutation(
+                    &scope,
+                    &owner,
+                    notarium_core::ports::DeleteNote {
+                        note: e.clone(),
+                        disposition: notarium_core::ports::DeleteDisposition::Trash,
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        let f_restored = store
+            .delete_note(
+                reuse_ctx.clone(),
+                next_mutation(
+                    &scope,
+                    &owner,
+                    notarium_core::ports::DeleteNote {
+                        note: f.clone(),
+                        disposition: notarium_core::ports::DeleteDisposition::Restore,
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        let expected = vec![e_trashed.value.clone(), f_restored.value.clone()];
+        if let Some(mix_id) = &mix_dir {
+            store
+                .rename_folder(
+                    reuse_ctx.clone(),
+                    next_mutation(
+                        &scope,
+                        &owner,
+                        notarium_core::ports::RenameFolder {
+                            folder: mix_id.clone(),
+                            name: "mix-sub-3".into(),
+                        },
+                    ),
+                )
+                .await
+                .unwrap();
+        }
+        let run_rev = store
+            .inspect_agent_run_revision_for_test(&scope.space_id, &reuse_run)
+            .await
+            .unwrap()
+            .unwrap();
+        let rb = store
+            .rollback_agent_run(
+                human_ctx.clone(),
+                next_mutation(
+                    &scope,
+                    &owner,
+                    RollbackAgentRun {
+                        run: reuse_run,
+                        expected_run_revision: run_rev,
+                        expected_entities: expected,
+                        associated_board_expectations: Vec::new(),
+                    },
+                ),
+            )
+            .await
+            .expect("trash+reuse rollback must succeed");
+        let e_after = note_metadata_at(
+            store,
+            &scope,
+            rb.value.restored.iter().find(|r| r.note == e).unwrap(),
+            &rb.receipt,
+        )
+        .await;
+        let f_after = note_metadata_at(
+            store,
+            &scope,
+            rb.value.restored.iter().find(|r| r.note == f).unwrap(),
+            &rb.receipt,
+        )
+        .await;
+        assert_eq!(e_after.lifecycle, Lifecycle::Active);
+        assert_eq!(e_after.slug, "reuse-slug");
+        assert_eq!(f_after.lifecycle, Lifecycle::Trashed);
+    }
+}
+
+#[tokio::test]
+async fn l6_rollback_sibling_slug_swap_and_chains_dual_dialect_parity() {
+    {
+        let root = TempDataRoot::new("l6-swap-sqlite");
+        let cfg = CanonicalConfig::local_default(sample_installation_id(11), root.data_root());
+        let (store, runtime) = CanonicalRuntime::open(cfg).await.expect("open sqlite");
+        run_sibling_slug_swap_rollback_suite(&store).await;
+        runtime.shutdown().await.expect("shutdown sqlite");
+    }
+    {
+        let fixtures = StorageTestFixtures::load_required();
+        let schema = fixtures.fresh_pg_schema();
+        let bucket = fixtures.fresh_s3_bucket("l6swp");
+        let s3_cfg = fixtures.s3_config(&bucket, S3BucketModePolicy::DetectFromBucket);
+        admin_ensure_bucket(&s3_cfg, Some("Enabled"))
+            .await
+            .expect("ensure S3 bucket");
+        let cfg = fixtures.pg_s3_config(sample_installation_id(12), &schema, s3_cfg);
+        let (store, runtime) = CanonicalRuntime::open(cfg).await.expect("open pg+s3");
+        run_sibling_slug_swap_rollback_suite(&store).await;
+        runtime.shutdown().await.expect("shutdown pg+s3");
+        fixtures.drop_pg_schema(&schema).await;
+    }
+}

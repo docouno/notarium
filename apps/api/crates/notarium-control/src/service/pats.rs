@@ -86,6 +86,12 @@ impl ControlService {
                         return Err(invalid(ValidationReason::InvalidTimestamp));
                     }
                     if let Some(spaces) = &request.selected_spaces {
+                        if spaces
+                            .iter()
+                            .any(|id| !ctx.auth().spaces().contains_key(id))
+                        {
+                            return Err(DomainError::ResourceNotFound.into());
+                        }
                         let auth = self
                             .human_context(
                                 tx.inner_mut(),
@@ -100,6 +106,8 @@ impl ControlService {
                         if spaces.iter().any(|id| !auth.spaces().contains_key(id)) {
                             return Err(DomainError::ResourceNotFound.into());
                         }
+                    } else if ctx.auth().is_space_narrowed() {
+                        return Err(access_denied());
                     }
                     let spaces = request.selected_spaces.map(|spaces| {
                         spaces
@@ -238,7 +246,13 @@ impl ControlService {
             let (_,current)=self.manager(tx.inner_mut(),ctx.auth(),&request.input.account).await?;
             if let Some(replay)=command.replay::<()>(tx.inner_mut()).await? {return Ok(replay);}
             expect_revision(&current,command.identity.expected)?;
-            let pat=pat(tx.inner_mut(),request.input.token.as_str()).await?;
+            let pat = match pat(tx.inner_mut(), request.input.token.as_str()).await {
+                Ok(pat) => pat,
+                Err(PortError::Domain(DomainError::AuthenticationFailed)) => {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+                Err(err) => return Err(err),
+            };
             if pat.user_id!=current.user_id {return Err(DomainError::ResourceNotFound.into());}
             let now=self.clock.now_ms()?;
             let mut events=super::outbox::pending(tx.inner_mut(),RevocationSelector::Grant(grant("pat",&pat.token_id))).await?;

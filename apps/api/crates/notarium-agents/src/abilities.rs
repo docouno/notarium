@@ -204,6 +204,14 @@ impl<C: ControlCatalogPort + ?Sized> ControlCatalogPort for SystemAbilityCatalog
         self.owned.project_by_slug(ctx, slug)
     }
 
+    fn trashed_folder_ancestry(
+        &self,
+        ctx: AccountContext,
+        reference: FolderRef,
+    ) -> PortFuture<'_, notarium_core::ports::TrashedFolderAncestry> {
+        self.owned.trashed_folder_ancestry(ctx, reference)
+    }
+
     fn abilities(
         &self,
         ctx: AccountContext,

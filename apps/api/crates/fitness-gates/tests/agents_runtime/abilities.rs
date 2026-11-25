@@ -962,7 +962,7 @@ async fn promotion_concurrent_source_overlay_conflicts(
     .unwrap()
     .structured_content;
     // Perform a pre-promotion authored edit so we can later verify that
-    // replaying it after promotion fails with ResourceNotFound (never partial).
+    // replaying it after promotion returns the exact original result (never partial).
     let pre_promo_authored_edit = json!({
         "ref":bind_src_initial["ref"],
         "versionToken":bind_src_initial["versionToken"],
@@ -1054,8 +1054,8 @@ async fn promotion_concurrent_source_overlay_conflicts(
         .unwrap()
         .structured_content;
     assert_eq!(bind_replayed, bind_blocked);
-    // Replaying the pre-promotion authored edit after promotion must propagate
-    // ResourceNotFound rather than returning Ok(partial).
+    // Replaying the pre-promotion authored edit after promotion must return the
+    // exact original applied response rather than ResourceNotFound or Ok(partial).
     let pre_promo_replayed = call(
         fixture,
         human,
@@ -1064,15 +1064,9 @@ async fn promotion_concurrent_source_overlay_conflicts(
         pre_promo_authored_edit,
     )
     .await
-    .err()
-    .expect("replaying pre-promotion authored edit after promotion must return ResourceNotFound");
-    assert!(
-        matches!(
-            pre_promo_replayed,
-            PortError::Domain(DomainError::ResourceNotFound)
-        ),
-        "{pre_promo_replayed:?}"
-    );
+    .expect("replaying pre-promotion authored edit after promotion must replay cleanly")
+    .structured_content;
+    assert_eq!(pre_promo_replayed, bind_src);
     // Revoking the caller's PAT after package republication must propagate
     // AuthenticationFailed on the trailing preference step instead of Ok(partial).
     let revoked_author = fixture.pat(BearerScope::Write, true).await;

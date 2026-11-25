@@ -173,6 +173,19 @@ impl ProviderService {
     ) -> Result<CatalogSpace, PortError> {
         let budget = OperationBudget::new(ctx.budget.clone());
         let id = target_space(target);
+        let grant = ctx
+            .auth()
+            .spaces()
+            .get(id)
+            .ok_or(DomainError::AccessDenied)?;
+        if let ProviderAttachmentTarget::Project(project) = target
+            && grant
+                .project_root
+                .as_ref()
+                .is_some_and(|root| root != &project.folder_id)
+        {
+            return Err(DomainError::AccessDenied.into());
+        }
         let space = budget
             .run(
                 self.control
@@ -210,7 +223,105 @@ impl ProviderService {
         ctx: &AccountContext,
         id: &RequestId,
     ) -> Result<ProviderAttachmentsRow, PortError> {
-        OperationBudget::new(ctx.budget.clone()).run(async {read_rows!(&self.control.store.backend,ProviderAttachmentsRow,fetch_optional,"SELECT * FROM provider_attachments WHERE id=$1","SELECT * FROM v1_control.provider_attachments WHERE id=$1";id.as_str())?.ok_or(DomainError::ResourceNotFound.into())},CommitEffect::NotCommitted).await
+        OperationBudget::new(ctx.budget.clone())
+            .run(
+                async {
+                    read_rows!(
+                        &self.control.store.backend,
+                        ProviderAttachmentsRow,
+                        fetch_optional,
+                        "SELECT * FROM provider_attachments WHERE id=$1",
+                        "SELECT * FROM v1_control.provider_attachments WHERE id=$1";
+                        id.as_str()
+                    )?
+                    .ok_or(DomainError::ResourceNotFound.into())
+                },
+                CommitEffect::NotCommitted,
+            )
+            .await
+    }
+    fn observe_attachment_authorized<'a>(
+        &'a self,
+        ctx: &'a AccountContext,
+        id: &'a RequestId,
+        allow_resource_owner: bool,
+    ) -> PortFuture<'a, ProviderAttachmentsRow> {
+        Box::pin(async move {
+            let budget = OperationBudget::new(ctx.budget.clone());
+            let (mut tx, auth) = self
+                .control
+                .open_revalidated_read(&budget, &ctx.budget.request, ctx.auth())
+                .await?;
+            let result = budget
+                .run(
+                    async {
+                        let row = rows!(
+                            tx.inner_mut(),
+                            ProviderAttachmentsRow,
+                            fetch_optional,
+                            "SELECT * FROM provider_attachments WHERE id=$1",
+                            "SELECT * FROM v1_control.provider_attachments WHERE id=$1";
+                            id.as_str()
+                        )?
+                        .ok_or(DomainError::AccessDenied)?;
+                        let target = attachment_target(&row)?;
+                        let resource_owner = if allow_resource_owner {
+                            rows!(
+                                tx.inner_mut(),
+                                (String,),
+                                fetch_optional,
+                                "SELECT owner_id FROM provider_resources WHERE id=$1",
+                                "SELECT owner_id FROM v1_control.provider_resources WHERE id=$1";
+                                &row.resource_id
+                            )?
+                            .is_some_and(|(owner_id,)| owner_id == auth.principal().as_str())
+                        } else {
+                            false
+                        };
+                        if !resource_owner {
+                            match &target {
+                                ProviderAttachmentTarget::Personal { owner, .. } => {
+                                    if owner != auth.principal() {
+                                        return Err(DomainError::AccessDenied.into());
+                                    }
+                                    if !allow_resource_owner {
+                                        check_member_for_target(tx.inner_mut(), &auth, &target)
+                                            .await
+                                            .map_err(|_| {
+                                                PortError::Domain(DomainError::AccessDenied)
+                                            })?;
+                                    }
+                                }
+                                _ => {
+                                    if !auth.spaces().contains_key(target_space(&target)) {
+                                        return Err(DomainError::AccessDenied.into());
+                                    }
+                                    let is_owner = rows!(
+                                        tx.inner_mut(),
+                                        (i64,),
+                                        fetch_one,
+                                        "SELECT count(*) FROM space_members WHERE space_id=$1 AND user_id=$2 AND role='owner' AND admission='active'",
+                                        "SELECT count(*) FROM v1_control.space_members WHERE space_id=$1 AND user_id=$2 AND role='owner' AND admission='active'";
+                                        target_space(&target).as_str(),
+                                        auth.principal().as_str()
+                                    )?
+                                    .0;
+                                    if is_owner != 1 {
+                                        return Err(DomainError::AccessDenied.into());
+                                    }
+                                }
+                            }
+                        }
+                        Ok(row)
+                    },
+                    CommitEffect::NotCommitted,
+                )
+                .await;
+            budget
+                .run(tx.rollback(), CommitEffect::NotCommitted)
+                .await?;
+            result
+        })
     }
     pub async fn request_attachment(
         &self,
@@ -311,7 +422,9 @@ impl ProviderService {
         let input = request.input;
         let budget = OperationBudget::new(ctx.budget.clone());
         self.management(&ctx).await?;
-        let observed = self.observe_attachment(&ctx, &input.id).await?;
+        let observed = self
+            .observe_attachment_authorized(&ctx, &input.id, false)
+            .await?;
         let target = attachment_target(&observed)?;
         let catalog = self.target_catalog(&ctx, &target).await?;
         disclosure(input.consent.disclosure(), catalog.space.kind)?;
@@ -380,7 +493,9 @@ impl ProviderService {
         let input = request.input;
         let budget = OperationBudget::new(ctx.budget.clone());
         self.management(&ctx).await?;
-        let observed = self.observe_attachment(&ctx, &input.id).await?;
+        let observed = self
+            .observe_attachment_authorized(&ctx, &input.id, true)
+            .await?;
         let target = attachment_target(&observed)?;
         let command = Command::new(
             request.identity,

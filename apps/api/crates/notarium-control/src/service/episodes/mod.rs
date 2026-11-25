@@ -32,7 +32,7 @@ enum Started {
     Forked(EpisodeId),
     Ambiguous(Vec<EpisodeId>),
 }
-fn stored_project_ref(row: &AgentEpisodesRow) -> Result<Option<FolderRef>, PortError> {
+pub(super) fn stored_project_ref(row: &AgentEpisodesRow) -> Result<Option<FolderRef>, PortError> {
     match (&row.project_space, &row.project_folder) {
         (Some(space), Some(folder)) => Ok(Some(FolderRef {
             space_id: SpaceId::parse(space)?,
@@ -40,6 +40,25 @@ fn stored_project_ref(row: &AgentEpisodesRow) -> Result<Option<FolderRef>, PortE
         })),
         (None, None) => Ok(None),
         _ => Err(invalid(ValidationReason::InvalidState)),
+    }
+}
+
+pub(super) fn episode_project_admitted(
+    auth: &notarium_core::auth::EngineAuthContext,
+    project: Option<&FolderRef>,
+) -> bool {
+    match project {
+        Some(reference) => auth.spaces().get(&reference.space_id).is_some_and(|grant| {
+            !grant.read_classes.is_empty()
+                && grant
+                    .project_root
+                    .as_ref()
+                    .is_none_or(|root| root == &reference.folder_id)
+        }),
+        None => auth
+            .spaces()
+            .values()
+            .all(|grant| grant.project_root.is_none()),
     }
 }
 
@@ -321,6 +340,22 @@ impl ControlService {
         )?;
         command.require(ctx.auth().principal(), ctx.auth().principal())?;
         let budget = OperationBudget::new(ctx.budget.clone());
+        let prechecked_project = if matches!(
+            request.input.selector,
+            EpisodeSelector::New { .. } | EpisodeSelector::Name(_)
+        ) && let Some(project) = &request.input.project_hint
+        {
+            let current_pre = self.current_account(&ctx, &budget).await?;
+            budget
+                .run(
+                    self.catalog_project(&current_pre, project),
+                    CommitEffect::NotCommitted,
+                )
+                .await
+                .map(|_| ())
+        } else {
+            Ok(())
+        };
         let keeper = self
             .precheck_keeper_catalog(ctx.auth(), &budget, &ctx.budget.request)
             .await?;
@@ -351,7 +386,16 @@ impl ControlService {
                         "SELECT * FROM v1_control.agent_episodes WHERE owner_id=$1 AND name=$2 AND lifecycle<>'closed' ORDER BY episode_id LIMIT 201";&owner.user_id,name)?;
                     if matches.len() > 200 { return Err(invalid(ValidationReason::BudgetExceeded)); }
                     if matches.len() > 1 {
-                        let value = Started::Ambiguous(matches.iter().map(|row| EpisodeId::parse(&row.episode_id)).collect::<Result<_,_>>()?);
+                        let mut admitted = Vec::with_capacity(matches.len());
+                        for row in &matches {
+                            if episode_project_admitted(current.auth(), stored_project_ref(row)?.as_ref()) {
+                                admitted.push(EpisodeId::parse(&row.episode_id)?);
+                            }
+                        }
+                        if admitted.len() <= 1 {
+                            return Err(DomainError::ResourceNotFound.into());
+                        }
+                        let value = Started::Ambiguous(admitted);
                         let revision = bump_owner(tx.inner_mut(), &owner).await?;
                         let saved = SavedResult { value, events: vec![] };
                         command.save(tx.inner_mut(), revision, &saved, now).await?;
@@ -361,6 +405,9 @@ impl ControlService {
                 },
             };
             let started = if let Some(mut old) = existing {
+                if !episode_project_admitted(current.auth(), stored_project_ref(&old)?.as_ref()) {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
                 if guard == EpisodeRevisionGuard::Target && let Some(project) = &request.input.project_hint
                     && (old.project_space.as_deref() != Some(project.space_id.as_str())
                         || old.project_folder.as_deref() != Some(project.folder_id.as_str())) {
@@ -385,6 +432,10 @@ impl ControlService {
                     Started::Forked(requested)
                 }
             } else {
+                prechecked_project?;
+                if !episode_project_admitted(current.auth(), request.input.project_hint.as_ref()) {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
                 let collision = rows!(tx.inner_mut(),AgentEpisodesRow,fetch_optional,"SELECT * FROM agent_episodes WHERE episode_id=$1","SELECT * FROM v1_control.agent_episodes WHERE episode_id=$1";requested.as_str())?;
                 if collision.is_some() { return Err(DomainError::ResourceNotFound.into()); }
                 let row = AgentEpisodesRow { episode_id: requested.to_string(), owner_id: owner.user_id.clone(), name: chosen_name,
@@ -650,13 +701,17 @@ impl ControlService {
                 expect_revision(&owner, command.identity.expected)?;
             }
             let old = episode(tx.inner_mut(), current.auth().principal(), &episode_id).await?;
+            let old_project = stored_project_ref(&old)?;
+            if !episode_project_admitted(current.auth(), old_project.as_ref()) {
+                return Err(DomainError::ResourceNotFound.into());
+            }
             if old.revision as u64 != expected.get() {
                 return Err(DomainError::ControlRevisionConflict { current: ControlRevision::new(old.revision as u64)? }.into());
             }
             if old.lifecycle == "closed" { return Err(invalid(ValidationReason::InvalidState)); }
             let is_full = full_fields.is_some();
             let effective_project = if !is_full && project_hint.is_none() {
-                match stored_project_ref(&old)? {
+                match old_project {
                     Some(preserved) => match prechecked_preserved {
                         Some(Ok(checked)) if checked == preserved => Some(preserved),
                         Some(Ok(_)) | None => return Err(DomainError::ResourceNotFound.into()),
@@ -667,6 +722,9 @@ impl ControlService {
             } else {
                 project_hint.clone()
             };
+            if !episode_project_admitted(current.auth(), effective_project.as_ref()) {
+                return Err(DomainError::ResourceNotFound.into());
+            }
             if let Some(raw) = prechecked_role
                 && !self
                     .current_role_db_only(
@@ -748,6 +806,9 @@ impl ControlService {
                         return Err(DomainError::CrossSpaceTainted.into());
                     }
                     let row = episode(tx.inner_mut(), auth.principal(), &id).await?;
+                    if !episode_project_admitted(&auth, stored_project_ref(&row)?.as_ref()) {
+                        return Err(DomainError::ResourceNotFound.into());
+                    }
                     if row.lifecycle != "active" {
                         return Err(invalid(ValidationReason::InvalidState));
                     }

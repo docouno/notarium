@@ -51,8 +51,10 @@ struct FolderRoute {
     #[serde(default)]
     ancestor_revisions: Vec<(FolderId, RevisionId)>,
     #[serde(default)]
+    #[allow(dead_code)]
     project: Option<FolderId>,
     #[serde(default)]
+    #[allow(dead_code)]
     ancestors: Vec<FolderId>,
 }
 
@@ -62,8 +64,10 @@ enum FolderOperation {
     Move {
         parent: FolderId,
         #[serde(default)]
+        #[allow(dead_code)]
         parent_project: Option<FolderId>,
         #[serde(default)]
+        #[allow(dead_code)]
         parent_ancestors: Vec<FolderId>,
     },
     Rename,
@@ -494,23 +498,29 @@ async fn admit_trashed_replay_folder(
     call: &ToolCallContext<'_>,
     scope: &SpaceContext,
     folder_id: &FolderId,
-    project: Option<&FolderId>,
-    ancestors: &[FolderId],
 ) -> Result<(), PortError> {
     let reference = FolderRef {
         space_id: scope.scope().space_id.clone(),
         folder_id: folder_id.clone(),
     };
-    let project_ref = project.map(|id| FolderRef {
+    let live = call
+        .registry
+        .catalog
+        .trashed_folder_ancestry(call.account().with_preflight_taint(), reference.clone())
+        .await?;
+    if live.reference != reference {
+        return Err(DomainError::ResourceNotFound.into());
+    }
+    let project_ref = live.project.map(|id| FolderRef {
         space_id: scope.scope().space_id.clone(),
-        folder_id: id.clone(),
+        folder_id: id,
     });
     corpus::admit_folder_write(
         call,
         scope,
         &reference,
         project_ref,
-        ancestors,
+        &live.ancestors,
         DocClass::UserDoc,
     )
     .await
@@ -538,34 +548,15 @@ pub(super) async fn handle(
         match snapshot_by_id(call, &scope, &route.folder).await {
             Ok(source) => admit_folder_snapshot(call, &scope, &source).await?,
             Err(PortError::Domain(DomainError::ResourceNotFound)) if replayed => {
-                admit_trashed_replay_folder(
-                    call,
-                    &scope,
-                    &route.folder,
-                    route.project.as_ref(),
-                    &route.ancestors,
-                )
-                .await?;
+                admit_trashed_replay_folder(call, &scope, &route.folder).await?;
             }
             Err(error) => return Err(error),
         }
-        if let FolderOperation::Move {
-            parent,
-            parent_project,
-            parent_ancestors,
-        } = &route.operation
-        {
+        if let FolderOperation::Move { parent, .. } = &route.operation {
             match snapshot_by_id(call, &scope, parent).await {
                 Ok(live_dest) => admit_folder_snapshot(call, &scope, &live_dest).await?,
                 Err(PortError::Domain(DomainError::ResourceNotFound)) if replayed => {
-                    admit_trashed_replay_folder(
-                        call,
-                        &scope,
-                        parent,
-                        parent_project.as_ref(),
-                        parent_ancestors,
-                    )
-                    .await?;
+                    admit_trashed_replay_folder(call, &scope, parent).await?;
                 }
                 Err(error) => return Err(error),
             }

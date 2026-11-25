@@ -57,6 +57,12 @@ impl OAuthService {
             if spaces.len() > usize::from(self.control.config.max_auth_spaces).min(256) {
                 return Err(rejected(OAuthErrorCode::InvalidScope));
             }
+            if spaces
+                .iter()
+                .any(|id| !ctx.auth().spaces().contains_key(id))
+            {
+                return Err(rejected(OAuthErrorCode::AccessDenied));
+            }
             let auth = self
                 .control
                 .human_context(
@@ -72,6 +78,8 @@ impl OAuthService {
             if spaces.iter().any(|id| !auth.spaces().contains_key(id)) {
                 return Err(rejected(OAuthErrorCode::AccessDenied));
             }
+        } else if ctx.auth().is_space_narrowed() {
+            return Err(rejected(OAuthErrorCode::AccessDenied));
         }
         Ok(())
     }
@@ -105,6 +113,31 @@ impl OAuthService {
                 .collect::<Vec<_>>()
         });
         let budget = OperationBudget::new(ctx.budget.clone());
+        {
+            let mut pre_rtx = self.control.store.read(budget.clone()).await?;
+            budget
+                .run(
+                    async {
+                        let (_, user) = self
+                            .control
+                            .manager_read(pre_rtx.inner_mut(), ctx.auth(), ctx.auth().principal())
+                            .await?;
+                        self.check_spaces(
+                            pre_rtx.inner_mut(),
+                            &ctx,
+                            &user,
+                            spaces.as_deref(),
+                            false,
+                        )
+                        .await
+                    },
+                    CommitEffect::NotCommitted,
+                )
+                .await?;
+            budget
+                .run(pre_rtx.finish(), CommitEffect::NotCommitted)
+                .await?;
+        }
         let client = self
             .client(
                 budget.context(ctx.budget.request.clone()),
@@ -178,9 +211,26 @@ impl OAuthService {
         consent: OAuthConsent,
     ) -> Result<IssuedAuthorizationCode, PortError> {
         ctx.auth().authorize_human_management()?;
+        require_unpinned_human(ctx.auth())?;
         let (protected, browser) = consent.into_parts();
         let browser = validation::browser(browser.expose())?;
         let budget = OperationBudget::new(ctx.budget.clone());
+        {
+            let mut pre_rtx = self.control.store.read(budget.clone()).await?;
+            budget
+                .run(
+                    self.control.manager_read(
+                        pre_rtx.inner_mut(),
+                        ctx.auth(),
+                        ctx.auth().principal(),
+                    ),
+                    CommitEffect::NotCommitted,
+                )
+                .await?;
+            budget
+                .run(pre_rtx.finish(), CommitEffect::NotCommitted)
+                .await?;
+        }
         let (plaintext, witness) = self
             .keyring
             .open_verified(

@@ -485,6 +485,7 @@ impl ControlService {
                     let owner =
                         user_read(tx.inner_mut(), current.auth().principal().as_str()).await?;
                     let key = scope_key(&owner, &scope)?;
+                    Self::context_scope_grant_ok(current.auth(), &scope, &key)?;
                     let digest = self
                         .context_digest(tx.inner_mut(), &current, ("context-entries", &key))
                         .await?;
@@ -502,7 +503,7 @@ impl ControlService {
                     }) {
                         return Err(invalid(ValidationReason::CursorStale));
                     }
-                    let after = cursor.map_or(
+                    let mut after = cursor.map_or(
                         EntryRow {
                             rank: i64::MIN,
                             kind: String::new(),
@@ -511,46 +512,93 @@ impl ControlService {
                         },
                         |cursor| cursor.last,
                     );
+                    let target = usize::from(page.limit());
                     let limit = i64::from(page.limit()) + 1;
-                    let mut rows: Vec<EntryRow> = match tx.inner_mut() {
-                        Transaction::Sqlite(tx) => {
-                            sqlx::query_as(include_str!("entries.sqlite.sql"))
-                                .bind(&key.kind)
-                                .bind(&key.id)
-                                .bind(after.rank)
-                                .bind(&after.kind)
-                                .bind(&after.space)
-                                .bind(&after.entity)
-                                .bind(limit)
-                                .fetch_all(&mut **tx)
-                                .await
-                                .map_err(crate::error::database)?
+                    let mut visible = Vec::with_capacity(target + 1);
+                    let mut has_more = false;
+                    let mut scanned = 0usize;
+                    loop {
+                        let batch: Vec<EntryRow> = match tx.inner_mut() {
+                            Transaction::Sqlite(tx) => {
+                                sqlx::query_as(include_str!("entries.sqlite.sql"))
+                                    .bind(&key.kind)
+                                    .bind(&key.id)
+                                    .bind(after.rank)
+                                    .bind(&after.kind)
+                                    .bind(&after.space)
+                                    .bind(&after.entity)
+                                    .bind(limit)
+                                    .fetch_all(&mut **tx)
+                                    .await
+                                    .map_err(crate::error::database)?
+                            }
+                            Transaction::Postgres(tx) => {
+                                sqlx::query_as(include_str!("entries.postgres.sql"))
+                                    .bind(&key.kind)
+                                    .bind(&key.id)
+                                    .bind(after.rank)
+                                    .bind(&after.kind)
+                                    .bind(&after.space)
+                                    .bind(&after.entity)
+                                    .bind(limit)
+                                    .fetch_all(&mut **tx)
+                                    .await
+                                    .map_err(crate::error::database)?
+                            }
+                        };
+                        let batch_len = batch.len();
+                        for row in batch {
+                            scanned = scanned.saturating_add(1);
+                            after = EntryRow {
+                                kind: row.kind.clone(),
+                                space: row.space.clone(),
+                                entity: row.entity.clone(),
+                                rank: row.rank,
+                            };
+                            if row.kind == "set" {
+                                let set_id = ContextSetId::parse(&row.entity)?;
+                                let Some(bundle_row) =
+                                    sets::bundle(tx.inner_mut(), &set_id, false).await?
+                                else {
+                                    continue;
+                                };
+                                match self
+                                    .check_bundle_attachment_db(
+                                        tx.inner_mut(),
+                                        &current,
+                                        &bundle_row,
+                                    )
+                                    .await
+                                {
+                                    Ok(()) => (),
+                                    Err(error) if hidden(&error) => continue,
+                                    Err(error) => return Err(error),
+                                }
+                            }
+                            if visible.len() == target {
+                                has_more = true;
+                                break;
+                            }
+                            visible.push(row);
                         }
-                        Transaction::Postgres(tx) => {
-                            sqlx::query_as(include_str!("entries.postgres.sql"))
-                                .bind(&key.kind)
-                                .bind(&key.id)
-                                .bind(after.rank)
-                                .bind(&after.kind)
-                                .bind(&after.space)
-                                .bind(&after.entity)
-                                .bind(limit)
-                                .fetch_all(&mut **tx)
-                                .await
-                                .map_err(crate::error::database)?
+                        if has_more || batch_len < usize::try_from(limit).unwrap_or(usize::MAX) {
+                            break;
                         }
-                    };
-                    let continuation = if rows.len() > usize::from(page.limit()) {
-                        rows.pop();
+                        if scanned >= 4096 {
+                            return Err(invalid(ValidationReason::BudgetExceeded));
+                        }
+                    }
+                    let continuation = if has_more {
+                        let last = visible.last().expect("positive page limit");
                         Some(
                             serde_json::to_string(&EntryCursor {
                                 version: 1,
                                 scope: digest,
                                 last: EntryRow {
-                                    kind: rows.last().unwrap().kind.clone(),
-                                    space: rows.last().unwrap().space.clone(),
-                                    entity: rows.last().unwrap().entity.clone(),
-                                    rank: rows.last().unwrap().rank,
+                                    kind: last.kind.clone(),
+                                    space: last.space.clone(),
+                                    entity: last.entity.clone(),
+                                    rank: last.rank,
                                 },
                             })
                             .map_err(|_| invalid(ValidationReason::InvalidState))?,
@@ -558,7 +606,7 @@ impl ControlService {
                     } else {
                         None
                     };
-                    Ok::<_, PortError>((key, rows, continuation))
+                    Ok::<_, PortError>((key, visible, continuation))
                 },
                 CommitEffect::NotCommitted,
             )

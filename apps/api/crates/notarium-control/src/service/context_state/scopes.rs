@@ -1,5 +1,4 @@
 use super::*;
-use crate::store::statements::read_rows;
 
 enum Change {
     Attachment(ContextSetId, ControlRevision, bool),
@@ -78,23 +77,33 @@ impl ControlService {
     ) -> Result<ControlCommit<ContextScopeInfo>, PortError> {
         command.require(ctx.auth().principal(), ctx.auth().principal())?;
         ctx.auth().authorize_human_management()?;
+        require_unpinned_human(ctx.auth())?;
         let budget = OperationBudget::new(ctx.budget.clone());
-        let home = if let Change::Attachment(id, _, true) = &change {
-            budget.run(async { read_rows!(&self.store.backend,ContextSetsRow,fetch_optional,"SELECT * FROM context_sets WHERE set_id=$1","SELECT * FROM v1_control.context_sets WHERE set_id=$1";id.as_str()) }, CommitEffect::NotCommitted).await?.map(|row| SpaceId::parse(&row.home_space)).transpose()?
-        } else {
-            None
-        };
-        let (pre_key, space_kinds) = {
+        let (pre_key, home, space_kinds) = {
             let (mut rtx, auth) = self
                 .open_revalidated_read(&budget, &ctx.budget.request, ctx.auth())
                 .await?;
-            let (current, owner) = budget
+            let (current, owner, home) = budget
                 .run(
                     async {
                         let owner = user_read(rtx.inner_mut(), auth.principal().as_str()).await?;
+                        let home = if let Change::Attachment(id, _, true) = &change {
+                            sets::bundle(rtx.inner_mut(), id, false)
+                                .await?
+                                .map(|row| SpaceId::parse(&row.home_space))
+                                .transpose()?
+                                .filter(|space| {
+                                    auth.spaces()
+                                        .get(space)
+                                        .is_some_and(|grant| !grant.read_classes.is_empty())
+                                })
+                        } else {
+                            None
+                        };
                         Ok((
                             AccountContext::new(auth, budget.context(ctx.budget.request.clone())),
                             owner,
+                            home,
                         ))
                     },
                     CommitEffect::NotCommitted,
@@ -129,7 +138,7 @@ impl ControlService {
                     CommitEffect::NotCommitted,
                 )
                 .await?;
-            (key, kinds)
+            (key, home, kinds)
         };
         let mut tx = self.store.write(budget.clone()).await?;
         let (revision, saved) = budget.run(async {
@@ -154,8 +163,9 @@ impl ControlService {
                 Change::Attachment(id, expected_set, attached) => {
                     let old = rows!(tx.inner_mut(),ContextSetAttachmentsRow,fetch_optional,"SELECT * FROM context_set_attachments WHERE set_id=$1 AND target_kind=$2 AND target_id=$3","SELECT * FROM v1_control.context_set_attachments WHERE set_id=$1 AND target_kind=$2 AND target_id=$3";id.as_str(),&key.kind,&key.id)?;
                     if attached {
+                        let expected_home = home.as_ref().ok_or(DomainError::ResourceNotFound)?;
                         let row = sets::bundle(tx.inner_mut(), &id, true).await?.ok_or(DomainError::ResourceNotFound)?;
-                        if home.as_ref().is_none_or(|home| home.as_str() != row.home_space) { return Err(invalid(ValidationReason::CursorStale)); }
+                        if expected_home.as_str() != row.home_space { return Err(invalid(ValidationReason::CursorStale)); }
                         if row.revision as u64 != expected_set.get() { return Err(DomainError::ControlRevisionConflict { current: ControlRevision::new(row.revision as u64)? }.into()); }
                         if old.is_none() {
                             if sets::attachments(tx.inner_mut(), &id).await?.len() >= 64 { return Err(invalid(ValidationReason::BudgetExceeded)); }

@@ -29,19 +29,29 @@ struct Cursor {
 }
 pub(super) async fn resource_visible(
     tx: &mut Transaction,
+    auth: &notarium_core::auth::EngineAuthContext,
     owner: &str,
     row: &ProviderResourcesRow,
 ) -> Result<(), PortError> {
     if row.owner_id == owner {
         return Ok(());
     }
-    let count=rows!(tx,(i64,),fetch_one,
-        "SELECT count(*) FROM provider_attachments p JOIN space_members m ON m.space_id=p.target_space AND m.user_id=$2 JOIN space_admission a ON a.space_id=m.space_id WHERE p.resource_id=$1 AND m.admission='active' AND a.state='active' AND (p.target_owner=$2 OR m.role='owner')",
-        "SELECT count(*) FROM v1_control.provider_attachments p JOIN v1_control.space_members m ON m.space_id=p.target_space AND m.user_id=$2 JOIN v1_control.space_admission a ON a.space_id=m.space_id WHERE p.resource_id=$1 AND m.admission='active' AND a.state='active' AND (p.target_owner=$2 OR m.role='owner')";&row.id,owner)?.0;
-    if count == 0 {
-        return Err(DomainError::ResourceNotFound.into());
+    let spaces = rows!(
+        tx,
+        (String,),
+        fetch_all,
+        "SELECT DISTINCT p.target_space FROM provider_attachments p JOIN space_members m ON m.space_id=p.target_space AND m.user_id=$2 JOIN space_admission a ON a.space_id=m.space_id WHERE p.resource_id=$1 AND m.admission='active' AND a.state='active' AND ((p.target_kind='personal' AND p.target_owner=$2) OR (p.target_kind IN ('space','project') AND p.target_owner IS NULL AND m.role='owner'))",
+        "SELECT DISTINCT p.target_space FROM v1_control.provider_attachments p JOIN v1_control.space_members m ON m.space_id=p.target_space AND m.user_id=$2 JOIN v1_control.space_admission a ON a.space_id=m.space_id WHERE p.resource_id=$1 AND m.admission='active' AND a.state='active' AND ((p.target_kind='personal' AND p.target_owner=$2) OR (p.target_kind IN ('space','project') AND p.target_owner IS NULL AND m.role='owner'))";
+        &row.id,
+        owner
+    )?;
+    for (space,) in spaces {
+        let space_id = SpaceId::parse(&space)?;
+        if auth.spaces().contains_key(&space_id) {
+            return Ok(());
+        }
     }
-    Ok(())
+    Err(DomainError::ResourceNotFound.into())
 }
 impl ProviderService {
     async fn inventory(
@@ -63,7 +73,7 @@ impl ProviderService {
                         .await?;
                     let resource_revision = if let Some(id) = &id {
                         let row = resource_read(tx.inner_mut(), id.as_str()).await?;
-                        resource_visible(tx.inner_mut(), &owner.user_id, &row).await?;
+                        resource_visible(tx.inner_mut(), ctx.auth(), &owner.user_id, &row).await?;
                         Some(row.revision)
                     } else {
                         None
@@ -184,19 +194,58 @@ impl ProviderService {
         let (mut tx, budget, cursor) = self
             .inventory(&ctx, "attachments", Some(id.clone()), &page)
             .await?;
-        let rows=budget.run(async {page_rows!(tx.inner_mut(),ProviderAttachmentsRow,TargetTable::ProviderAttachments,page.limit(),
-            "SELECT p.* FROM provider_attachments p JOIN provider_resources r ON r.id=p.resource_id WHERE p.resource_id=$1 AND p.id>$2 AND (r.owner_id=$3 OR EXISTS (SELECT 1 FROM space_members m JOIN space_admission a ON a.space_id=m.space_id WHERE m.space_id=p.target_space AND m.user_id=$3 AND m.admission='active' AND a.state='active' AND (p.target_owner=$3 OR m.role='owner'))) ORDER BY p.id LIMIT $4",
-            "SELECT p.* FROM v1_control.provider_attachments p JOIN v1_control.provider_resources r ON r.id=p.resource_id WHERE p.resource_id=$1 AND p.id>$2 AND (r.owner_id=$3 OR EXISTS (SELECT 1 FROM v1_control.space_members m JOIN v1_control.space_admission a ON a.space_id=m.space_id WHERE m.space_id=p.target_space AND m.user_id=$3 AND m.admission='active' AND a.state='active' AND (p.target_owner=$3 OR m.role='owner'))) ORDER BY p.id LIMIT $4";id.as_str(),&cursor.last,ctx.auth().principal().as_str(),i64::from(page.limit())+1)},CommitEffect::NotCommitted).await?;
-        let continuation = continuation(
-            cursor,
-            rows.has_more,
-            rows.rows.last().map(|row| row.id.as_str()),
-        )?;
-        let items = rows
-            .rows
-            .iter()
-            .map(attachment_info)
-            .collect::<Result<_, _>>()?;
+        let limit = usize::from(page.limit());
+        let (rows, has_more) = budget
+            .run(
+                async {
+                    let resource = resource_read(tx.inner_mut(), id.as_str()).await?;
+                    let owns_resource = resource.owner_id == ctx.auth().principal().as_str();
+                    let mut after = cursor.last.clone();
+                    let mut collected = Vec::with_capacity(limit);
+                    let mut has_more = false;
+                    let mut scanned = 0usize;
+                    const MAX_SCAN: usize = 2048;
+                    loop {
+                        let batch_size = (limit + 1).clamp(16, 200);
+                        let batch = page_rows!(
+                            tx.inner_mut(),
+                            ProviderAttachmentsRow,
+                            TargetTable::ProviderAttachments,
+                            batch_size as u16,
+                            "SELECT p.* FROM provider_attachments p JOIN provider_resources r ON r.id=p.resource_id WHERE p.resource_id=$1 AND p.id>$2 AND (r.owner_id=$3 OR EXISTS (SELECT 1 FROM space_members m JOIN space_admission a ON a.space_id=m.space_id WHERE m.space_id=p.target_space AND m.user_id=$3 AND m.admission='active' AND a.state='active' AND ((p.target_kind='personal' AND p.target_owner=$3) OR (p.target_kind IN ('space','project') AND p.target_owner IS NULL AND m.role='owner')))) ORDER BY p.id LIMIT $4",
+                            "SELECT p.* FROM v1_control.provider_attachments p JOIN v1_control.provider_resources r ON r.id=p.resource_id WHERE p.resource_id=$1 AND p.id>$2 AND (r.owner_id=$3 OR EXISTS (SELECT 1 FROM v1_control.space_members m JOIN v1_control.space_admission a ON a.space_id=m.space_id WHERE m.space_id=p.target_space AND m.user_id=$3 AND m.admission='active' AND a.state='active' AND ((p.target_kind='personal' AND p.target_owner=$3) OR (p.target_kind IN ('space','project') AND p.target_owner IS NULL AND m.role='owner')))) ORDER BY p.id LIMIT $4";
+                            id.as_str(),
+                            &after,
+                            ctx.auth().principal().as_str(),
+                            i64::try_from(batch_size + 1).unwrap_or(201)
+                        )?;
+                        let batch_len = batch.rows.len();
+                        for row in batch.rows {
+                            after = row.id.clone();
+                            scanned += 1;
+                            if !owns_resource {
+                                let space = SpaceId::parse(&row.target_space)?;
+                                if !ctx.auth().spaces().contains_key(&space) {
+                                    continue;
+                                }
+                            }
+                            if collected.len() == limit {
+                                has_more = true;
+                                break;
+                            }
+                            collected.push(row);
+                        }
+                        if has_more || !batch.has_more || batch_len == 0 || scanned >= MAX_SCAN {
+                            break;
+                        }
+                    }
+                    Ok::<_, PortError>((collected, has_more))
+                },
+                CommitEffect::NotCommitted,
+            )
+            .await?;
+        let continuation = continuation(cursor, has_more, rows.last().map(|row| row.id.as_str()))?;
+        let items = rows.iter().map(attachment_info).collect::<Result<_, _>>()?;
         budget
             .run(tx.rollback(), CommitEffect::NotCommitted)
             .await?;
@@ -226,13 +275,21 @@ impl ProviderService {
                         let admitted: Result<(), PortError> = async {
                             super::attachments::check_member(tx.inner_mut(), ctx.auth(), &space)
                                 .await?;
-                            if row.target_owner.as_deref() != Some(owner.user_id.as_str()) {
-                                super::super::spaces::require_owner_read(
-                                    tx.inner_mut(),
-                                    ctx.auth(),
-                                    &space,
-                                )
-                                .await?;
+                            match row.target_kind.as_str() {
+                                "personal" => {
+                                    if row.target_owner.as_deref() != Some(owner.user_id.as_str()) {
+                                        return Err(DomainError::ResourceNotFound.into());
+                                    }
+                                }
+                                "space" | "project" => {
+                                    super::super::spaces::require_owner_read(
+                                        tx.inner_mut(),
+                                        ctx.auth(),
+                                        &space,
+                                    )
+                                    .await?;
+                                }
+                                _ => return Err(DomainError::ResourceNotFound.into()),
                             }
                             Ok(())
                         }

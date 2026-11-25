@@ -1018,7 +1018,7 @@ impl ProviderService {
             if let Some(catalog)=&catalog {
                 let project=match &input.scope{ProviderPreferenceScope::Project(project)=>Some(project),_=>None};
                 shared_attachment(tx,&resource,credential_epoch,&catalog.space.id,project,now,true).await?;
-            } else {super::inventory::resource_visible(tx,&owner.user_id,&resource).await?;}
+            } else {super::inventory::resource_visible(tx,&auth,&owner.user_id,&resource).await?;}
             let (kind,id)=preference_scope(&input.scope,auth.principal());
             let wanted_kind = model_kind_name(input.kind);
             // Space/project preferences belong to that scope and model_kind. The

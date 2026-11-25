@@ -251,7 +251,7 @@ pub(super) async fn prepare(
     // under detached human authority. If an existing consented foreign target
     // fails write admission (`SpaceReadOnly` / `AbilityWriteForbidden`), commit
     // external-read taint so existence/lock/role probes cannot stay untainted.
-    let probes_foreign_corpus = match admit_proposal_targets(call, &planning, &args).await {
+    let _probes_foreign_corpus = match admit_proposal_targets(call, &planning, &args).await {
         Ok(probes) => probes,
         Err(error) => {
             if matches!(
@@ -263,16 +263,12 @@ pub(super) async fn prepare(
             return Err(error);
         }
     };
-    if probes_foreign_corpus {
-        // Mark permanent external-read taint before probing or planning via
-        // detached human authority so failed content probes cannot stay untainted.
-        call.commit_external_read();
-    } else {
-        // Link-free create proposals do not probe note bodies; stage taint so
-        // pre-delivery proposal budget failures remain untainted while any
-        // emitted proposal commits external-read taint on return.
-        call.auth.taint().mark_external_read();
-    }
+    // Every post-admission proposal planner inspects foreign-Space canonical
+    // state under detached human authority (including link-free `create_note` /
+    // `create_notes`, which probe ID collisions and folder write locks). Commit
+    // external-read taint unconditionally before planning so failed probes
+    // cannot leak foreign corpus or lock state while leaving the caller untainted.
+    call.commit_external_read();
     let action = match call.tool {
         ToolName::Link | ToolName::LinkMany => {
             ProposedAction::Links(organize::plan_links(&planning, call, call.tool, args).await?)

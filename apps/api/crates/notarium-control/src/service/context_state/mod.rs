@@ -180,20 +180,43 @@ impl ControlService {
         }
         bump_owner(tx, owner).await
     }
-    async fn context_scope_read(
-        &self,
-        ctx: &AccountContext,
+    pub(self) fn context_scope_grant_ok(
+        auth: &notarium_core::auth::EngineAuthContext,
         scope: &ContextScope,
         key: &ScopeKey,
     ) -> Result<(), PortError> {
-        let grant = ctx
-            .auth()
+        let grant = auth
             .spaces()
             .get(&key.space)
             .ok_or(DomainError::ResourceNotFound)?;
         if grant.read_classes.is_empty() {
             return Err(DomainError::ResourceNotFound.into());
         }
+        match scope {
+            ContextScope::Personal | ContextScope::Space(_) => {
+                if grant.project_root.is_some() {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+            }
+            ContextScope::Project(project) => {
+                if grant
+                    .project_root
+                    .as_ref()
+                    .is_some_and(|root| root != &project.folder_id)
+                {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+            }
+        }
+        Ok(())
+    }
+    async fn context_scope_read(
+        &self,
+        ctx: &AccountContext,
+        scope: &ContextScope,
+        key: &ScopeKey,
+    ) -> Result<(), PortError> {
+        Self::context_scope_grant_ok(ctx.auth(), scope, key)?;
         self.catalog_space(ctx, &key.space).await?;
         if let ContextScope::Project(project) = scope {
             self.catalog_project(ctx, project).await?;
@@ -216,6 +239,7 @@ impl ControlService {
                     let owner =
                         user_read(tx.inner_mut(), current.auth().principal().as_str()).await?;
                     let key = scope_key(&owner, &scope)?;
+                    Self::context_scope_grant_ok(current.auth(), &scope, &key)?;
                     let revision = self
                         .context_scope_revision(tx.inner_mut(), &owner, &key)
                         .await?;

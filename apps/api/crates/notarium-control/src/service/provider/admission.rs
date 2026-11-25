@@ -384,8 +384,9 @@ impl ProviderService {
         }
         if primary.is_none() {
             auth.authorize_human_management()?;
+            super::super::authority::require_unpinned_human(&auth)?;
             if auth.principal().as_str() != resource.owner_id {
-                return Err(DomainError::AccessDenied.into());
+                return Err(DomainError::ResourceNotFound.into());
             }
         }
         let mut project_by_space: BTreeMap<&SpaceId, Option<&FolderRef>> = BTreeMap::new();
