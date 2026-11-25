@@ -154,9 +154,13 @@ pub(in crate::mcp::note_tools) async fn prepare(
         .await;
         steps.push(match proposed {
             Ok(draft) => CreateStep::Ready(Box::new(draft)),
-            Err(PortError::Domain(error)) if batch => CreateStep::Invalid {
-                code: error.code().to_owned(),
-            },
+            Err(PortError::Domain(error))
+                if batch && !matches!(error, notarium_core::DomainError::RateLimited { .. }) =>
+            {
+                CreateStep::Invalid {
+                    code: error.code().to_owned(),
+                }
+            }
             Err(error) => return Err(error),
         });
     }
@@ -289,7 +293,9 @@ pub(in crate::mcp::note_tools) async fn apply(
                 results.push(value);
             }
             Err(error) => match batch_operational_error(LABEL, error, committed_any) {
-                PortError::Domain(domain) => {
+                PortError::Domain(domain)
+                    if !matches!(domain, notarium_core::DomainError::RateLimited { .. }) =>
+                {
                     results.push(json!({"index": index, "ok": false, "error": domain.code()}));
                 }
                 operational => return Err(operational),

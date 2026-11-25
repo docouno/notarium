@@ -30,7 +30,7 @@ use notarium_core::{
     classes::{AbilityKind, DocClass},
     error::{CommitEffect, PortError, RetryAdvice, ValidationReason},
     ids::*,
-    model::{FolderRef, HistoryScope},
+    model::{FolderRef, HistoryScope, NoteRef},
     ports::{schedules::*, *},
     receipt::{CausalBasis, CommandIdentity},
     value::Timestamp,
@@ -54,10 +54,11 @@ use tokio::{
 };
 
 use super::{
+    engine::{ProjectionFixture, ProjectionFixtures},
     real_reads::DerivedReads,
     runtime_ability_cases::{
-        approve_disclosure, identity, loopback_provider, loopback_provider_with_limits,
-        read_request, send_ollama,
+        LoopbackProvider, approve_disclosure, identity, loopback_provider,
+        loopback_provider_with_limits, read_request, send_ollama,
     },
     supervised_chat_cases::idle_leaf,
     *,
@@ -169,6 +170,7 @@ where
     Box::pin(make())
 }
 
+#[inline(never)]
 async fn exercise_seams(pg: bool) {
     let mut fixture = box_step(|| RuntimeFixture::open_named(pg, "seam_hardening")).await;
     let personal = fixture.personal_scope().await;
@@ -193,8 +195,18 @@ async fn exercise_seams(pg: bool) {
     box_step(|| folder_heads_space_updated_index_present(&fixture, pg)).await;
     box_step(|| tainted_personal_chat_in_shared_space_releases_claim_cleanly(&fixture, &personal))
         .await;
-    box_step(|| {
+    let promoted_setup = box_step(|| {
         project_only_consent_space_ability_and_unconsented_episode_hint(&fixture, &personal)
+    })
+    .await;
+    box_step(|| {
+        promoted_ability_project_only_consent_boundary(&fixture, &personal, promoted_setup)
+    })
+    .await;
+    let cross_setup =
+        box_step(|| cross_space_taint_oracle_and_write_isolation_probes(&fixture, &personal)).await;
+    box_step(|| {
+        cross_space_recent_and_ability_filter_taint_probes(&fixture, &personal, cross_setup)
     })
     .await;
 
@@ -2080,7 +2092,8 @@ async fn remote_embedding_sqlite_search_and_probes(
         deps,
     ));
     search.start_space(scope.clone()).unwrap();
-    let _ = fixture.projections.real.set(DerivedReads {
+    let emb_projections = Arc::new(ProjectionFixtures::default());
+    let _ = emb_projections.real.set(DerivedReads {
         projection_calls: Default::default(),
         notes: proj.note_reads(),
         projection: proj.clone(),
@@ -2227,10 +2240,7 @@ async fn remote_embedding_sqlite_search_and_probes(
     let emb_registry = ToolRegistry::new(
         Arc::new(ControlPlane::new(provider_svc.as_ref().clone())),
         catalog,
-        Arc::new(TestEngine(
-            fixture.canonical.clone(),
-            fixture.projections.clone(),
-        )),
+        Arc::new(TestEngine(fixture.canonical.clone(), emb_projections)),
         fixture.control.clone(),
     )
     .with_vector_search(true);
@@ -2468,8 +2478,8 @@ async fn remote_embedding_sqlite_search_and_probes(
         )
     })
     .await;
-    box_step(|| {
-        real_search_preflight_taint_and_class_isolation_probes(
+    let (space_udoc, user_doc_note) = box_step(|| {
+        real_search_preflight_setup_and_class_exclusion_probes(
             fixture,
             personal,
             &provider_svc,
@@ -2478,6 +2488,20 @@ async fn remote_embedding_sqlite_search_and_probes(
             &emb_registry,
             chat_narrow_res,
             chat_narrow_model,
+        )
+    })
+    .await;
+    box_step(|| {
+        real_search_preflight_taint_limit_and_engine_probes(
+            fixture,
+            personal,
+            &search,
+            &root,
+            &emb_registry,
+            chat_narrow_res,
+            chat_narrow_model,
+            &space_udoc,
+            &user_doc_note,
         )
     })
     .await;
@@ -6333,6 +6357,62 @@ async fn bootstrap_continuation_sliding_ttl_survives_multi_page_resync(fixture: 
             .unwrap();
     }
 
+    // First verify invalid session locator alongside deliveryReceipt fails
+    // upfront WITHOUT advancing the durable ack cursor (under default TTL so
+    // DB latency cannot eat into the short sliding-TTL window below).
+    let pre_page = call_mcp(
+        &fixture.registry,
+        &fresh_owner(fixture).await,
+        [0x43, 0xBA, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "start_session",
+        json!({}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        pre_page.structured_content["delta"]["complete"],
+        json!(false)
+    );
+    let pre_receipt = pre_page.structured_content["delta"]["deliveryReceipt"]
+        .as_str()
+        .expect("pre_page must emit a deliveryReceipt")
+        .to_owned();
+    let bad_session_with_receipt = call_mcp(
+        &fixture.registry,
+        &fresh_owner(fixture).await,
+        [0x43, 0xBB, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "start_session",
+        json!({ "deliveryReceipt": pre_receipt, "session": {} }),
+    )
+    .await;
+    assert!(
+        matches!(
+            bad_session_with_receipt,
+            Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
+                if diagnostic.reason == ValidationReason::InvalidQuery
+        ),
+        "start_session with invalid session locator and deliveryReceipt must fail with InvalidQuery, got {:?}",
+        bad_session_with_receipt.err()
+    );
+    let unacked_check = call_mcp(
+        &fixture.registry,
+        &fresh_owner(fixture).await,
+        [0x43, 0xBC, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
+        "start_session",
+        json!({ "acknowledge": false }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        unacked_check.structured_content["delta"]["complete"],
+        json!(false)
+    );
+    assert_eq!(
+        unacked_check.structured_content["delta"]["changes"],
+        pre_page.structured_content["delta"]["changes"],
+        "rejected start_session with invalid session locator must not advance durable ack cursor"
+    );
+
     let _restore = RestoreTtl(fixture.registry.clone());
     fixture
         .registry
@@ -6356,47 +6436,6 @@ async fn bootstrap_continuation_sliding_ttl_survives_multi_page_resync(fixture: 
         .as_str()
         .expect("page 1 must emit a deliveryReceipt")
         .to_owned();
-
-    // Invalid session locator alongside deliveryReceipt must fail upfront with
-    // InvalidQuery WITHOUT advancing the delta acknowledgement cursor.
-    let bad_session_with_receipt = call_mcp(
-        &fixture.registry,
-        &fresh_owner(fixture).await,
-        [0x43, 0xBB, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
-        "start_session",
-        json!({ "deliveryReceipt": receipt1, "session": {} }),
-    )
-    .await;
-    assert!(
-        matches!(
-            bad_session_with_receipt,
-            Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
-                if diagnostic.reason == ValidationReason::InvalidQuery
-        ),
-        "start_session with invalid session locator and deliveryReceipt must fail with InvalidQuery, got {:?}",
-        bad_session_with_receipt.err()
-    );
-    // Verify the durable delta acknowledgement cursor did NOT advance when
-    // `bad_session_with_receipt` failed upfront: a fresh `start_session` must
-    // still deliver the exact same page-1 changes as unacknowledged.
-    let unacked_check = call_mcp(
-        &fixture.registry,
-        &fresh_owner(fixture).await,
-        [0x43, 0xBC, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
-        "start_session",
-        json!({ "acknowledge": false }),
-    )
-    .await
-    .unwrap();
-    assert_eq!(
-        unacked_check.structured_content["delta"]["complete"],
-        json!(false)
-    );
-    assert_eq!(
-        unacked_check.structured_content["delta"]["changes"],
-        page1.structured_content["delta"]["changes"],
-        "rejected start_session with invalid session locator must not advance durable ack cursor"
-    );
 
     // Sleep 850ms (< 1500ms TTL, generous margin against CI jitter) and advance to Page 2.
     tokio::time::sleep(Duration::from_millis(850)).await;
@@ -6714,6 +6753,33 @@ async fn tainted_personal_chat_in_shared_space_releases_claim_cleanly(
         .expect("tainted run2 must list queued pending inputs");
     assert_eq!(pending2.len(), 1);
     assert_eq!(pending2[0].id, queued_id);
+    // Non-owning tainted AgentRun (run1_shared) must fail identically with
+    // InvalidAuthority for BOTH an absent PendingInputId AND the real queued_id
+    // (closing the pending-input existence oracle & non-owning lifecycle leak).
+    for probe_input in [
+        PendingInputId::from_bytes([0x32, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+        queued_id.clone(),
+    ] {
+        let non_owner_dismiss = fixture
+            .canonical
+            .dismiss_chat_input(
+                run1_shared.clone(),
+                DismissPending {
+                    thread: tid.clone(),
+                    input: probe_input,
+                },
+            )
+            .await;
+        assert!(
+            matches!(
+                non_owner_dismiss,
+                Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
+                    if diagnostic.reason == ValidationReason::InvalidAuthority
+            ),
+            "non-owning tainted AgentRun dismiss_chat_input must fail with InvalidAuthority, got {non_owner_dismiss:?}"
+        );
+    }
+
     assert!(
         fixture
             .canonical
@@ -6820,6 +6886,11 @@ async fn tainted_personal_chat_in_shared_space_releases_claim_cleanly(
     let (mut wire1, _) = timeout(Duration::from_secs(15), read_request(&listener))
         .await
         .expect("step 1 must reach provider");
+    let mut run_stream = supervisor
+        .subscribe(owner.clone(), shared.history.clone(), tid.clone(), None)
+        .await
+        .unwrap()
+        .expect("active run stream must be subscribable");
     send_ollama(
         &mut wire1,
         json!({
@@ -6836,17 +6907,33 @@ async fn tainted_personal_chat_in_shared_space_releases_claim_cleanly(
     )
     .await;
     // After get_note succeeds on Personal space, run.auth is cross-space tainted.
-    // Either step 2 replies and append_chat rejects with CrossSpaceTainted, or
-    // the supervisor stops before committing any assistant message into the Shared Space.
-    if let Ok((mut wire2, _)) = timeout(Duration::from_secs(3), read_request(&listener)).await {
-        send_ollama(
-            &mut wire2,
-            json!({"role": "assistant", "content": "Leaked personal text"}),
-            "stop",
-        )
-        .await;
-    }
+    // Committing the Tool entry into the Shared Space fails with CrossSpaceTainted
+    // before step 2 can be dispatched; wait directly on the stream closing cleanly.
+    let stream_ev: Vec<Value> = timeout(Duration::from_secs(15), async {
+        let mut events = Vec::new();
+        loop {
+            match run_stream.next().await {
+                notarium_agents::chats::stream::StreamRead::Frame(frame) => {
+                    events.push(serde_json::from_slice(frame.payload()).unwrap());
+                }
+                notarium_agents::chats::stream::StreamRead::Closed => return events,
+                notarium_agents::chats::stream::StreamRead::CatchUpRequired(_) => (),
+            }
+        }
+    })
+    .await
+    .expect("tainted run stream must close promptly");
+    assert_eq!(
+        stream_ev.last().and_then(|ev| ev.get("type")),
+        Some(&json!("run_failed")),
+        "tainted run must terminate with run_failed: {stream_ev:?}"
+    );
     let settled_leaf = idle_leaf(fixture, &shared_ctx, &tid).await;
+    assert_eq!(
+        settled_leaf,
+        ThreadEntrySeq::new(2).unwrap(),
+        "only Human(1) and Model(2) must commit before tainted Tool(3) is blocked"
+    );
     let branch_after_taint = fixture
         .canonical
         .read_chat(
@@ -6868,8 +6955,9 @@ async fn tainted_personal_chat_in_shared_space_releases_claim_cleanly(
         branch_after_taint
             .entries
             .iter()
-            .all(|e| !matches!(&e.body, ChatBody::Inline(s) if s.contains("Leaked personal text"))),
-        "tainted assistant response must never commit into Shared Space"
+            .all(|e| !matches!(e.kind, ChatEntryKind::Tool { .. })),
+        "tainted tool result must never commit into Shared Space: {:?}",
+        branch_after_taint.entries
     );
 
     // Follow-up clean turn on the exact same thread MUST succeed!
@@ -6919,11 +7007,19 @@ async fn tainted_personal_chat_in_shared_space_releases_claim_cleanly(
     let _ = clean_run;
 }
 
+struct PromotedAbilityProbeSetup {
+    proj_space: AccessibleSpace,
+    proj_p1: FolderRef,
+    p2_role_ref: String,
+    local: LoopbackProvider,
+    listener: TcpListener,
+}
+
 #[inline(never)]
 async fn project_only_consent_space_ability_and_unconsented_episode_hint(
     fixture: &RuntimeFixture,
     personal: &SpaceContext,
-) {
+) -> PromotedAbilityProbeSetup {
     let owner = fresh_owner(fixture).await;
     let actor = owner.auth().principal().clone();
     let pscope = personal.scope().clone();
@@ -7105,6 +7201,31 @@ async fn project_only_consent_space_ability_and_unconsented_episode_hint(
     )
     .await;
 
+    // Positive control: under ExternalMcp, `hint_ep_id` genuinely resolves `sub`.
+    fixture.projections.install(ProjectionFixture {
+        view_owner: NoteRef {
+            space_id: unconsented.history.space_id.clone(),
+            note_id: NoteId::from_bytes([0x36; 16]),
+        },
+        notes: Vec::new(),
+    });
+    let ext_list = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0x36, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4],
+        "list_notes",
+        json!({ "session": hint_ep_id }),
+    )
+    .await
+    .unwrap();
+    assert!(
+        serde_json::to_string(&ext_list.structured_content)
+            .unwrap()
+            .contains("\"sub\""),
+        "ExternalMcp positive control must resolve subfolder via episode.project_hint: {}",
+        ext_list.structured_content
+    );
+
     // (a) Unconsented episode.project_hint MUST fail with ResourceNotFound AND
     //     never flip cross-space BranchTaint across search, recall, list_notes,
     //     and rename_folder.
@@ -7252,7 +7373,7 @@ async fn project_only_consent_space_ability_and_unconsented_episode_hint(
                 target: EgressTarget::InAppProvider {
                     provider: local.resource.id.clone(),
                     model: local.model.clone(),
-                    primary_project: Some(proj_p1),
+                    primary_project: Some(proj_p1.clone()),
                 },
                 request_key: CommandKey::from_bytes([
                     0x39, 0x13, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3,
@@ -7265,12 +7386,953 @@ async fn project_only_consent_space_ability_and_unconsented_episode_hint(
     assert!(
         matches!(
             p2_denied,
-            Err(PortError::Domain(
-                DomainError::AccessDenied | DomainError::ResourceNotFound
-            ))
+            Err(PortError::Domain(DomainError::ResourceNotFound))
         ),
-        "sibling-project ability must be rejected under proj_p1-only consent, got {:?}",
+        "sibling-project ability must collapse to exact ResourceNotFound under proj_p1-only consent (no existence oracle), got {:?}",
         p2_denied.err()
+    );
+
+    PromotedAbilityProbeSetup {
+        proj_space,
+        proj_p1,
+        p2_role_ref,
+        local,
+        listener,
+    }
+}
+
+#[inline(never)]
+async fn promoted_ability_project_only_consent_boundary(
+    fixture: &RuntimeFixture,
+    personal: &SpaceContext,
+    setup: PromotedAbilityProbeSetup,
+) {
+    let PromotedAbilityProbeSetup {
+        proj_space,
+        proj_p1,
+        p2_role_ref,
+        local,
+        listener,
+    } = setup;
+    let owner = fresh_owner(fixture).await;
+
+    // (c) Promoted-from project-only consent boundary (including republished
+    //     OwnedSpace abilities and runtime_abilities + ProviderService::complete!):
+    //     Promote `p2-guide` (from unconsented `proj_p2`) to OwnedSpace and
+    //     republish so both `current` and `published` placements are OwnedSpace
+    //     while `promoted_from == OwnedProject(proj_p2)`. Do the same for a
+    //     `p1-guide` authored in consented `proj_p1` as positive control.
+    let p1_role = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0x39, 0x20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "create_ability",
+        json!({
+            "kind": "role",
+            "name": "p1-promoted-guide",
+            "description": "Consented project role to promote",
+            "instructions": "Consented p1 instructions v1.",
+            "placement": {
+                "home": "project",
+                "project": format!("{}/proj-one", proj_space.slug),
+            },
+        }),
+    )
+    .await
+    .unwrap();
+    let p1_role_ref = p1_role.structured_content["ref"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let p2_promoted_1 = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0x3A, 0x21, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "edit_ability",
+        json!({
+            "ref": p2_role_ref,
+            "home": { "home": "space" },
+        }),
+    )
+    .await
+    .unwrap();
+    let p2_promoted_ref_1 = p2_promoted_1.structured_content["ref"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let p2_republished = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0x3A, 0x22, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
+        "edit_ability",
+        json!({
+            "ref": p2_promoted_ref_1,
+            "versionToken": p2_promoted_1.structured_content["versionToken"],
+            "instructions": "Promoted p2 instructions v2 (republished at OwnedSpace).",
+            "availability": { "mode": "all-projects" },
+            "enabled": true,
+        }),
+    )
+    .await
+    .unwrap();
+    let p2_repub_ref = p2_republished.structured_content["ref"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let p1_promoted_1 = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0x39, 0x21, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "edit_ability",
+        json!({
+            "ref": p1_role_ref,
+            "home": { "home": "space" },
+        }),
+    )
+    .await
+    .unwrap();
+    let p1_promoted_ref_1 = p1_promoted_1.structured_content["ref"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let p1_republished = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0x39, 0x22, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
+        "edit_ability",
+        json!({
+            "ref": p1_promoted_ref_1,
+            "versionToken": p1_promoted_1.structured_content["versionToken"],
+            "instructions": "Promoted p1 instructions v2 (republished at OwnedSpace).",
+            "availability": { "mode": "all-projects" },
+            "enabled": true,
+        }),
+    )
+    .await
+    .unwrap();
+    let p1_repub_ref = p1_republished.structured_content["ref"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let p1_run_auth_2 = owner
+        .auth()
+        .for_agent_run(
+            AgentRunId::from_bytes([0x39, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]),
+            proj_space.history.space_id.clone(),
+            ChatAudience::Personal,
+            owner.auth().spaces().clone(),
+        )
+        .unwrap();
+    let p1_account_2 = AccountContext::new(p1_run_auth_2, budget());
+    for (idx, (tool, args)) in [
+        ("get_ability", json!({ "ref": p2_repub_ref })),
+        ("use_role", json!({ "role": p2_repub_ref })),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let denied = local
+            .registry
+            .call_tool(
+                McpInvocationContext {
+                    account: p1_account_2.clone(),
+                    target: EgressTarget::InAppProvider {
+                        provider: local.resource.id.clone(),
+                        model: local.model.clone(),
+                        primary_project: Some(proj_p1.clone()),
+                    },
+                    request_key: CommandKey::from_bytes([
+                        0x3A,
+                        0x30 + idx as u8,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        1,
+                    ]),
+                },
+                tool,
+                args,
+            )
+            .await;
+        assert!(
+            matches!(
+                denied,
+                Err(PortError::Domain(DomainError::ResourceNotFound))
+            ),
+            "{tool} must reject republished OwnedSpace ability promoted from unconsented proj_p2 with ResourceNotFound, got {:?}",
+            denied.err()
+        );
+    }
+    let p1_repub_ok = local
+        .registry
+        .call_tool(
+            McpInvocationContext {
+                account: p1_account_2,
+                target: EgressTarget::InAppProvider {
+                    provider: local.resource.id.clone(),
+                    model: local.model.clone(),
+                    primary_project: Some(proj_p1.clone()),
+                },
+                request_key: CommandKey::from_bytes([
+                    0x39, 0x30, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                ]),
+            },
+            "use_role",
+            json!({ "role": p1_repub_ref }),
+        )
+        .await
+        .expect("republished OwnedSpace ability promoted from consented proj_p1 must succeed");
+    assert!(
+        p1_repub_ok.structured_content["instructions"]
+            .as_str()
+            .is_some_and(|s| s.contains("Promoted p1 instructions v2"))
+    );
+
+    // Runtime loader + ProviderService::complete check (`runtime_abilities::interactive`
+    // and `admission.rs` `ProviderCurrentContent::Ability::in_project`):
+    // Run on `personal` primary Space (where `run.auth` has full read access to
+    // `proj_space` with `project_root = None`) and an episode whose `project_hint`
+    // is consented `proj_p1`, proving the denial comes from `promoted_from` and NOT
+    // from `project_root`!
+    let ep_id = EpisodeId::from_bytes([0x39, 0x40, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    let _ = fixture
+        .control
+        .start_or_resume_episode(
+            owner.clone(),
+            AccountMutation {
+                identity: identity(fixture, &owner, 0x4F).await,
+                input: StartEpisode {
+                    selector: EpisodeSelector::New {
+                        requested: ep_id.clone(),
+                        name: None,
+                    },
+                    project_hint: Some(proj_p1.clone()),
+                    guard: EpisodeRevisionGuard::Account,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let p1_handle = format!("{}/proj-one", proj_space.slug);
+    let _ = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0x39, 0x42, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "use_role",
+        json!({ "role": p2_repub_ref, "project": p1_handle, "session": ep_id }),
+    )
+    .await
+    .unwrap();
+
+    let run_auth = owner
+        .auth()
+        .for_agent_run(
+            AgentRunId::from_bytes([0x39, 0x40, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+            personal.scope().space_id.clone(),
+            ChatAudience::Personal,
+            owner.auth().spaces().clone(),
+        )
+        .unwrap();
+    let primary_ctx =
+        SpaceContext::new(run_auth.clone(), personal.scope().clone(), budget()).unwrap();
+    let primary_sel = local
+        .provider
+        .select_provider(
+            primary_ctx.clone(),
+            SelectProvider {
+                kind: PreferenceModelKind::Completion,
+                resource: Some(local.resource.id.clone()),
+                model: Some(local.model.clone()),
+                project: None,
+            },
+        )
+        .await
+        .unwrap();
+    let rt_denied = notarium_agents::mcp::runtime_abilities::interactive(
+        &local.registry,
+        &primary_ctx,
+        &primary_sel,
+        &ep_id,
+    )
+    .await;
+    assert!(
+        matches!(rt_denied, Err(PortError::Domain(DomainError::AccessDenied))),
+        "runtime_abilities::interactive must reject republished OwnedSpace ability promoted from unconsented proj_p2 with AccessDenied, got {:?}",
+        rt_denied.err()
+    );
+
+    // Direct ProviderService::complete defense-in-depth check: even if a caller
+    // constructs a `ProviderMessage::Ability` for `p2_repub` directly, `admission.rs`
+    // must reject it under `proj_p1`-only secondary consent before reaching the wire!
+    let p2_active = fixture
+        .control
+        .get_episode(owner.clone(), ep_id.clone())
+        .await
+        .unwrap()
+        .active_role
+        .expect("episode must have active p2_repub role");
+    let p2_repub_id = p2_active.id;
+    let p2_repub_rev = p2_active.revision;
+    let p2_space_ctx =
+        SpaceContext::new(run_auth.clone(), proj_space.history.clone(), budget()).unwrap();
+    let p2_sel = local
+        .provider
+        .select_provider(
+            p2_space_ctx.clone(),
+            SelectProvider {
+                kind: PreferenceModelKind::Completion,
+                resource: Some(local.resource.id.clone()),
+                model: Some(local.model.clone()),
+                project: Some(proj_p1.clone()),
+            },
+        )
+        .await
+        .unwrap();
+    let p2_res = fixture
+        .canonical
+        .read_ability_resource(
+            p2_space_ctx.clone(),
+            ReadAbilityResource {
+                ability: p2_repub_id,
+                package_revision: p2_repub_rev,
+                resource: notarium_core::model::AbilityResourceName::Entrypoint,
+            },
+        )
+        .await
+        .unwrap();
+    let p2_msg = notarium_core::classes::ProviderMessage::Ability(Box::new(
+        notarium_core::classes::ClassEgressFence::ability(
+            p2_res,
+            p2_space_ctx.auth(),
+            &p2_sel.policy,
+        )
+        .unwrap(),
+    ));
+    let direct_req = CompletionRequest {
+        intent: CommandKey::from_bytes([0x3A, 0x45, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+        selection: primary_sel.clone(),
+        secondary_projects: vec![proj_p1.clone()],
+        messages: vec![CompletionMessage {
+            role: CompletionRole::System,
+            instruction: Some(
+                ProviderInstruction::from_orchestrator("Use active role.".into()).unwrap(),
+            ),
+            parts: vec![p2_msg],
+            tool_calls: vec![],
+            result_for: None,
+        }],
+        tools: vec![],
+        budget: CompletionBudget {
+            max_input_tokens: 4096,
+            max_output_tokens: 256,
+            max_tool_calls: 0,
+        },
+    };
+    let direct_err = match local
+        .provider
+        .complete(primary_ctx.clone(), direct_req)
+        .await
+    {
+        Ok(mut stream) => stream
+            .next()
+            .await
+            .expect_err("ProviderService::complete must reject promoted proj_p2 ability"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(
+            direct_err,
+            PortError::Domain(DomainError::ValidationFailed { .. } | DomainError::AccessDenied)
+        ),
+        "ProviderService::complete must deny promoted proj_p2 ability under proj_p1-only consent: {direct_err:?}"
+    );
+    assert!(
+        timeout(Duration::from_millis(100), listener.accept())
+            .await
+            .is_err(),
+        "promoted proj_p2 role must never reach provider socket"
+    );
+
+    // Positive runtime control: switch episode to `p1_repub` (promoted from
+    // consented `proj_p1`) -> BOTH `runtime_abilities::interactive` AND
+    // `ProviderService::complete` MUST succeed and reach the wire!
+    let _ = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0x39, 0x43, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "use_role",
+        json!({ "role": p1_repub_ref, "project": p1_handle, "session": ep_id }),
+    )
+    .await
+    .unwrap();
+    let rt_ok = notarium_agents::mcp::runtime_abilities::interactive(
+        &local.registry,
+        &primary_ctx,
+        &primary_sel,
+        &ep_id,
+    )
+    .await
+    .expect("runtime_abilities::interactive must allow republished OwnedSpace ability promoted from consented proj_p1");
+    assert_eq!(rt_ok.secondary_projects, std::slice::from_ref(&proj_p1));
+    let ok_req = CompletionRequest {
+        intent: CommandKey::from_bytes([0x39, 0x45, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+        selection: primary_sel,
+        secondary_projects: rt_ok.secondary_projects,
+        messages: vec![CompletionMessage {
+            role: CompletionRole::System,
+            instruction: Some(
+                ProviderInstruction::from_orchestrator("Use active role.".into()).unwrap(),
+            ),
+            parts: rt_ok.parts,
+            tool_calls: vec![],
+            result_for: None,
+        }],
+        tools: vec![],
+        budget: CompletionBudget {
+            max_input_tokens: 4096,
+            max_output_tokens: 256,
+            max_tool_calls: 0,
+        },
+    };
+    let wire_task = tokio::spawn(async move {
+        let (mut ok_wire, ok_prompt) = timeout(Duration::from_secs(15), read_request(&listener))
+            .await
+            .expect("promoted proj_p1 role must reach provider");
+        send_ollama(
+            &mut ok_wire,
+            json!({"role": "assistant", "content": "Allowed promoted p1 ok."}),
+            "stop",
+        )
+        .await;
+        ok_prompt
+    });
+    let mut stream = local
+        .provider
+        .complete(primary_ctx, ok_req)
+        .await
+        .expect("ProviderService::complete must accept promoted proj_p1 role");
+    let mut finished = false;
+    while let Some(ev) = stream.next().await.unwrap() {
+        finished |= matches!(ev, CompletionEvent::Finished(CompletionFinish::Stop));
+    }
+    assert!(finished);
+    let ok_prompt = wire_task.await.unwrap();
+    assert!(
+        serde_json::to_string(&ok_prompt)
+            .unwrap()
+            .contains("Promoted p1 instructions v2"),
+        "prompt must carry consented promoted proj_p1 role instructions"
+    );
+}
+
+struct CrossSpaceProbeSetup {
+    local: LoopbackProvider,
+    _listener: TcpListener,
+}
+
+#[inline(never)]
+async fn cross_space_taint_oracle_and_write_isolation_probes(
+    fixture: &RuntimeFixture,
+    personal: &SpaceContext,
+) -> CrossSpaceProbeSetup {
+    let owner = fresh_owner(fixture).await;
+    let actor = owner.auth().principal().clone();
+    let pscope = personal.scope().clone();
+    let personal_root = fixture
+        .canonical
+        .read_space(&pscope.space_id)
+        .await
+        .unwrap()
+        .root_folder_id;
+
+    // 1. Shared Space consented ONLY for AgentMemory (no UserDoc!) with 2 UserDoc
+    //    notes inside `proj_iso` to verify list_notes hides pagination/incomplete
+    //    and missing paths never flip BranchTaint.
+    let space_mem = fixture
+        .control
+        .create_space(
+            owner.clone(),
+            AccountMutation {
+                identity: identity(fixture, &owner, 0x89).await,
+                input: CreateSpace {
+                    id: SpaceId::from_bytes([0x89; 16]),
+                    kind: SpaceKind::Shared,
+                    name: "AgentMemory Only List Space".into(),
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    let space_write = fixture
+        .control
+        .create_space(
+            owner.clone(),
+            AccountMutation {
+                identity: identity(fixture, &owner, 0x8A).await,
+                input: CreateSpace {
+                    id: SpaceId::from_bytes([0x8A; 16]),
+                    kind: SpaceKind::Shared,
+                    name: "Consented Cross Space Write Probe".into(),
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    let owner = fresh_owner(fixture).await;
+    let proj_mem = create_project_folder(
+        fixture,
+        &space_mem.history,
+        &actor,
+        FolderId::from_bytes([0x89; 16]),
+        "mem-proj",
+    )
+    .await;
+    let mem_ctx =
+        SpaceContext::new(owner.auth().clone(), space_mem.history.clone(), budget()).unwrap();
+    let mut mem_notes = Vec::new();
+    for idx in 1_u8..=3 {
+        let note_id = NoteId::from_bytes([0x89, idx, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, idx]);
+        fixture
+            .canonical
+            .create_note(
+                mem_ctx.clone(),
+                Mutation {
+                    identity: CommandIdentity {
+                        scope: space_mem.history.clone(),
+                        actor: actor.clone(),
+                        key: CommandKey::from_bytes([
+                            0x89, idx, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, idx,
+                        ]),
+                        hash: ContentDigest::from_bytes([0x89; 32]),
+                    },
+                    preconditions: Preconditions::default(),
+                    input: CreateNote {
+                        note: note_id.clone(),
+                        parent: Some(proj_mem.folder_id.clone()),
+                        slug: format!("hidden-udoc-{idx}"),
+                        class: DocClass::UserDoc,
+                        carrier: format!("# Hidden {idx}\n\nUnconsented user doc {idx}.\n"),
+                        folder_page: false,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        mem_notes.push(note_id);
+    }
+    fixture.projections.install(ProjectionFixture {
+        view_owner: NoteRef {
+            space_id: space_mem.history.space_id.clone(),
+            note_id: mem_notes[0].clone(),
+        },
+        notes: mem_notes,
+    });
+
+    let proj_write = create_project_folder(
+        fixture,
+        &space_write.history,
+        &actor,
+        FolderId::from_bytes([0x8A; 16]),
+        "write-proj",
+    )
+    .await;
+    let write_epoch = fixture
+        .canonical
+        .read_space(&space_write.history.space_id)
+        .await
+        .unwrap()
+        .active_epoch;
+    fixture
+        .canonical
+        .create_folder(CreateFolderSpec {
+            scope: space_write.history.clone(),
+            active_epoch: write_epoch,
+            folder_id: FolderId::from_bytes([0x8A, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]),
+            parent: Some(proj_write.folder_id.clone()),
+            slug: "wsub".into(),
+            display_name: "wsub".into(),
+            is_project: false,
+            project_slug: None,
+            actor: actor.clone(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+    let write_note = NoteId::from_bytes([0x8A; 16]);
+    fixture
+        .canonical
+        .create_note(
+            SpaceContext::new(owner.auth().clone(), space_write.history.clone(), budget()).unwrap(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: space_write.history.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([0x8A; 16]),
+                    hash: ContentDigest::from_bytes([0x8A; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: CreateNote {
+                    note: write_note.clone(),
+                    parent: Some(proj_write.folder_id.clone()),
+                    slug: "target-note".into(),
+                    class: DocClass::UserDoc,
+                    carrier: "# Target\n\nBody text.\n".into(),
+                    folder_page: false,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    // Add an OwnedSpace role in `space_write` to test `list_abilities(q: ...)` taint isolation.
+    let _ = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0x8A, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3],
+        "create_ability",
+        json!({
+            "kind": "role",
+            "name": "write-space-role",
+            "description": "Special role in write space",
+            "instructions": "Instructions for write space.",
+            "placement": { "home": "space", "space": space_write.slug },
+        }),
+    )
+    .await
+    .unwrap();
+    // Create a fresher personal note AFTER `space_write` so `recent_activity(limit: 1)`
+    // fills exclusively from `personal` without returning any `space_write` item.
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let fresh_personal_note = NoteId::from_bytes([0x8B; 16]);
+    fixture
+        .canonical
+        .create_note(
+            SpaceContext::new(owner.auth().clone(), pscope.clone(), budget()).unwrap(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: pscope.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([0x8B; 16]),
+                    hash: ContentDigest::from_bytes([0x8B; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: CreateNote {
+                    note: fresh_personal_note.clone(),
+                    parent: Some(personal_root),
+                    slug: "freshest-personal-note".into(),
+                    class: DocClass::UserDoc,
+                    carrier: "# Fresh Personal\n\nNewest item.\n".into(),
+                    folder_page: false,
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local = loopback_provider(fixture, &owner, &listener, 0x8B, true).await;
+    // Tags used: 0x8B, 0x8C (loopback); approvals use tag & tag+3 -> 0x8D(+0x90), 0x8E(+0x91?),
+    // avoid 0x91 (already used!). Use 0xF8..0xFE (100% unused!) or 0xA9..0xAF!
+    approve_disclosure(
+        fixture,
+        &owner,
+        &local,
+        0xA9,
+        ProviderAttachmentTarget::Personal {
+            owner: actor.clone(),
+            space: pscope.space_id.clone(),
+        },
+        [DocClass::UserDoc, DocClass::AgentMemory, DocClass::Skill].into(),
+    )
+    .await;
+    approve_disclosure(
+        fixture,
+        &owner,
+        &local,
+        0xAA,
+        ProviderAttachmentTarget::Space(space_mem.history.space_id.clone()),
+        [DocClass::AgentMemory].into(),
+    )
+    .await;
+    approve_disclosure(
+        fixture,
+        &owner,
+        &local,
+        0xAB,
+        ProviderAttachmentTarget::Personal {
+            owner: actor.clone(),
+            space: space_mem.history.space_id.clone(),
+        },
+        [DocClass::AgentMemory].into(),
+    )
+    .await;
+    approve_disclosure(
+        fixture,
+        &owner,
+        &local,
+        0xF8,
+        ProviderAttachmentTarget::Space(space_write.history.space_id.clone()),
+        [DocClass::UserDoc, DocClass::Skill].into(),
+    )
+    .await;
+    approve_disclosure(
+        fixture,
+        &owner,
+        &local,
+        0xF9,
+        ProviderAttachmentTarget::Personal {
+            owner: actor.clone(),
+            space: space_write.history.space_id.clone(),
+        },
+        [DocClass::UserDoc, DocClass::Skill].into(),
+    )
+    .await;
+
+    let make_run = |tag: u8| {
+        let auth = owner
+            .auth()
+            .for_agent_run(
+                AgentRunId::from_bytes([0x89, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, tag]),
+                pscope.space_id.clone(),
+                ChatAudience::Personal,
+                owner.auth().spaces().clone(),
+            )
+            .unwrap();
+        let acc = AccountContext::new(auth.clone(), budget());
+        (auth, acc)
+    };
+    let make_ctx = |acc: &AccountContext, tag: u8| McpInvocationContext {
+        account: acc.clone(),
+        target: EgressTarget::InAppProvider {
+            provider: local.resource.id.clone(),
+            model: local.model.clone(),
+            primary_project: None,
+        },
+        request_key: CommandKey::from_bytes([
+            0x89, 0x90, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, tag,
+        ]),
+    };
+
+    // (1) list_notes on AgentMemory-only Space: missing path returns empty +
+    //     ZERO taint, and listing root hides UserDoc items, nextCursor, and incomplete!
+    let (missing_auth, missing_acc) = make_run(1);
+    let missing_list = local
+        .registry
+        .call_tool(
+            make_ctx(&missing_acc, 1),
+            "list_notes",
+            json!({
+                "project": format!("{}/mem-proj", space_mem.slug),
+                "path": "does-not-exist",
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing_list.structured_content["items"], json!([]));
+    assert!(missing_list.structured_content.get("folderPage").is_none());
+    assert!(
+        !missing_auth.taint().is_tainted(),
+        "list_notes on missing cross-Space path must not flip BranchTaint"
+    );
+
+    // Positive control: under ExternalMcp, `space_mem/mem-proj` genuinely has
+    // paginated UserDoc items (1 item + nextCursor at limit 1).
+    let ext_mem_list = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0x89, 0x9F, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "list_notes",
+        json!({
+            "project": format!("{}/mem-proj", space_mem.slug),
+            "limit": 1,
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        ext_mem_list.structured_content["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        ext_mem_list.structured_content["nextCursor"].is_string(),
+        "ExternalMcp positive control must paginate the 3 UserDoc notes in space_mem"
+    );
+
+    let (_mem_auth, mem_acc) = make_run(2);
+    let mem_list = local
+        .registry
+        .call_tool(
+            make_ctx(&mem_acc, 2),
+            "list_notes",
+            json!({
+                "project": format!("{}/mem-proj", space_mem.slug),
+                "limit": 1,
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(mem_list.structured_content["items"], json!([]));
+    assert!(
+        mem_list.structured_content.get("nextCursor").is_none(),
+        "list_notes on AgentMemory-only Space must not emit nextCursor for unconsented UserDocs: {}",
+        mem_list.structured_content
+    );
+    assert!(
+        mem_list.structured_content.get("incomplete").is_none(),
+        "list_notes on AgentMemory-only Space must not emit incomplete for unconsented UserDocs"
+    );
+
+    // (2) Cross-space rejected write tools MUST return SpaceReadOnly without
+    //     flipping BranchTaint (no CrossSpaceTainted conversion or taint leak).
+    let (write_auth, write_acc) = make_run(3);
+    for (idx, (tool, args)) in [
+        ("delete_note", json!({ "ref": write_note })),
+        (
+            "edit_note",
+            json!({ "ref": write_note, "operation": "append", "content": "nope" }),
+        ),
+        (
+            "rename_folder",
+            json!({
+                "project": format!("{}/write-proj", space_write.slug),
+                "folder": "wsub",
+                "name": "renamed",
+            }),
+        ),
+        (
+            "move_folder",
+            json!({
+                "project": format!("{}/write-proj", space_write.slug),
+                "folder": "wsub",
+                "toFolder": "",
+            }),
+        ),
+        (
+            "rename_project",
+            json!({
+                "project": format!("{}/write-proj", space_write.slug),
+                "slug": "write-proj-renamed",
+            }),
+        ),
+        (
+            "link",
+            json!({
+                "from": write_note,
+                "toTitle": "Other",
+                "relation": "related",
+            }),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let res = local
+            .registry
+            .call_tool(make_ctx(&write_acc, 10 + idx as u8), tool, args)
+            .await;
+        assert!(
+            matches!(res, Err(PortError::Domain(DomainError::SpaceReadOnly))),
+            "cross-space direct {tool} must fail with SpaceReadOnly, got {:?}",
+            res.err()
+        );
+        assert!(
+            !write_auth.taint().is_tainted(),
+            "rejected cross-space direct {tool} must not flip BranchTaint"
+        );
+    }
+
+    CrossSpaceProbeSetup {
+        local,
+        _listener: listener,
+    }
+}
+
+#[inline(never)]
+async fn cross_space_recent_and_ability_filter_taint_probes(
+    fixture: &RuntimeFixture,
+    personal: &SpaceContext,
+    setup: CrossSpaceProbeSetup,
+) {
+    let CrossSpaceProbeSetup { local, _listener } = setup;
+    let owner = fresh_owner(fixture).await;
+    let pscope = personal.scope().clone();
+    let make_run = |tag: u8| {
+        let auth = owner
+            .auth()
+            .for_agent_run(
+                AgentRunId::from_bytes([0x89, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, tag]),
+                pscope.space_id.clone(),
+                ChatAudience::Personal,
+                owner.auth().spaces().clone(),
+            )
+            .unwrap();
+        let acc = AccountContext::new(auth.clone(), budget());
+        (auth, acc)
+    };
+    let make_ctx = |acc: &AccountContext, tag: u8| McpInvocationContext {
+        account: acc.clone(),
+        target: EgressTarget::InAppProvider {
+            provider: local.resource.id.clone(),
+            model: local.model.clone(),
+            primary_project: None,
+        },
+        request_key: CommandKey::from_bytes([
+            0x89, 0x90, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, tag,
+        ]),
+    };
+
+    // (3) recent_activity(limit: 1) filled exclusively by personal Space must
+    //     NOT flip BranchTaint even though consented `space_write` had changes!
+    let (recent_auth, recent_acc) = make_run(4);
+    let recent_res = local
+        .registry
+        .call_tool(
+            make_ctx(&recent_acc, 20),
+            "recent_activity",
+            json!({ "limit": 1 }),
+        )
+        .await
+        .unwrap();
+    let recent_items = recent_res.structured_content["items"].as_array().unwrap();
+    assert_eq!(recent_items.len(), 1);
+    assert_eq!(recent_items[0]["spaceId"], json!(pscope.space_id));
+    assert!(
+        !recent_auth.taint().is_tainted(),
+        "recent_activity returning 0 cross-Space items must not flip BranchTaint"
+    );
+
+    // (4) list_abilities(q: "nonexistent-needle-xyz") must NOT flip BranchTaint
+    //     when cross-Space abilities fail the query filter!
+    let (ab_auth, ab_acc) = make_run(5);
+    let ab_res = local
+        .registry
+        .call_tool(
+            make_ctx(&ab_acc, 21),
+            "list_abilities",
+            json!({ "view": "runtime", "q": "nonexistent-needle-xyz" }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ab_res.structured_content["items"], json!([]));
+    assert!(
+        !ab_auth.taint().is_tainted(),
+        "list_abilities with zero matching cross-Space items must not flip BranchTaint"
     );
 }
 
@@ -7294,7 +8356,7 @@ impl SearchRecipient for PreflightProbeRecipient {
 
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
-async fn real_search_preflight_taint_and_class_isolation_probes(
+async fn real_search_preflight_setup_and_class_exclusion_probes(
     fixture: &RuntimeFixture,
     personal: &SpaceContext,
     provider_svc: &Arc<ProviderService>,
@@ -7303,7 +8365,7 @@ async fn real_search_preflight_taint_and_class_isolation_probes(
     emb_registry: &ToolRegistry,
     chat_narrow_res: &ProviderResourceId,
     chat_narrow_model: &ModelProfileId,
-) {
+) -> (AccessibleSpace, NoteId) {
     let owner = fresh_owner(fixture).await;
     let actor = owner.auth().principal().clone();
     let space_udoc = fixture
@@ -7313,7 +8375,9 @@ async fn real_search_preflight_taint_and_class_isolation_probes(
             AccountMutation {
                 identity: identity(fixture, &owner, 0x3C).await,
                 input: CreateSpace {
-                    id: SpaceId::from_bytes([0x3C; 16]),
+                    id: SpaceId::from_bytes([
+                        0xFF, 0x3C, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x3C,
+                    ]),
                     kind: SpaceKind::Shared,
                     name: "UserDoc Only Preflight Space".into(),
                 },
@@ -7322,6 +8386,10 @@ async fn real_search_preflight_taint_and_class_isolation_probes(
         .await
         .unwrap()
         .value;
+    assert!(
+        personal.scope().space_id < space_udoc.history.space_id,
+        "personal SpaceId must sort ahead of space_udoc for deterministic tie-break"
+    );
     let owner = fresh_owner(fixture).await;
     // Consent ONLY DocClass::UserDoc (NOT AgentMemory) on `space_udoc`.
     let consent = || {
@@ -7543,7 +8611,153 @@ async fn real_search_preflight_taint_and_class_isolation_probes(
         );
     }
 
-    // 2. Direct real SearchEngine + ProjectionEngine preflight test: query
+    (space_udoc, user_doc_note)
+}
+
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+async fn real_search_preflight_taint_limit_and_engine_probes(
+    fixture: &RuntimeFixture,
+    personal: &SpaceContext,
+    search: &Arc<SearchEngine>,
+    root: &DataRoot,
+    emb_registry: &ToolRegistry,
+    chat_narrow_res: &ProviderResourceId,
+    chat_narrow_model: &ModelProfileId,
+    space_udoc: &AccessibleSpace,
+    user_doc_note: &NoteId,
+) {
+    let owner = fresh_owner(fixture).await;
+    let actor = owner.auth().principal().clone();
+    let probe_auth = owner
+        .auth()
+        .for_agent_run(
+            AgentRunId::from_bytes([0x3C, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8]),
+            personal.scope().space_id.clone(),
+            ChatAudience::Personal,
+            owner.auth().spaces().clone(),
+        )
+        .unwrap();
+    let probe_account = AccountContext::new(probe_auth.clone(), budget());
+
+    // 2. Multi-space search limit cut & recall maxPerSource packing MUST NOT
+    //    flip cross-space BranchTaint when zero hits from `space_udoc` are delivered!
+    let personal_root = fixture
+        .canonical
+        .read_space(&personal.scope().space_id)
+        .await
+        .unwrap()
+        .root_folder_id;
+    let personal_quartz = NoteId::from_bytes([0x3C, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9]);
+    let created_personal_q = fixture
+        .canonical
+        .create_note(
+            SpaceContext::new(owner.auth().clone(), personal.scope().clone(), budget()).unwrap(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: personal.scope().clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([
+                        0x3C, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9,
+                    ]),
+                    hash: ContentDigest::from_bytes([0x3E; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: CreateNote {
+                    note: personal_quartz.clone(),
+                    parent: Some(personal_root),
+                    slug: "personal-quartz-winner".into(),
+                    class: DocClass::UserDoc,
+                    carrier: "# Quartz Winner\n\nquartz-userdoc-allowed-token quartz-userdoc-allowed-token quartz-userdoc-allowed-token\n".into(),
+                    folder_page: false,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let personal_layout = SearchLayout::open(root, personal.scope().clone()).unwrap();
+    timeout(Duration::from_secs(15), async {
+        loop {
+            if let Ok(Some(manifest)) = personal_layout.search_manifest()
+                && manifest.tantivy_seq >= created_personal_q.receipt.seq()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("personal lexical index must catch up");
+
+    let limit_probe_auth = owner
+        .auth()
+        .for_agent_run(
+            AgentRunId::from_bytes([0x3C, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+            personal.scope().space_id.clone(),
+            ChatAudience::Personal,
+            owner.auth().spaces().clone(),
+        )
+        .unwrap();
+    let limit_probe_acc = AccountContext::new(limit_probe_auth.clone(), budget());
+    let limit_cut = emb_registry
+        .call_tool(
+            McpInvocationContext {
+                account: limit_probe_acc.clone(),
+                target: EgressTarget::InAppProvider {
+                    provider: chat_narrow_res.clone(),
+                    model: chat_narrow_model.clone(),
+                    primary_project: None,
+                },
+                request_key: CommandKey::from_bytes([
+                    0x3C, 0x25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                ]),
+            },
+            "search",
+            json!({ "query": "quartz-userdoc-allowed-token", "limit": 1 }),
+        )
+        .await
+        .unwrap();
+    let limit_results = limit_cut.structured_content["results"].as_array().unwrap();
+    assert_eq!(limit_results.len(), 1);
+    assert_eq!(
+        limit_results[0]["noteId"],
+        json!(personal_quartz),
+        "personal higher-scoring hit must win limit: 1"
+    );
+    assert!(
+        !limit_probe_auth.taint().is_tainted(),
+        "cross-Space search hit dropped by multi-space limit cut must not flip BranchTaint"
+    );
+
+    let pack_dropped = emb_registry
+        .call_tool(
+            McpInvocationContext {
+                account: limit_probe_acc,
+                target: EgressTarget::InAppProvider {
+                    provider: chat_narrow_res.clone(),
+                    model: chat_narrow_model.clone(),
+                    primary_project: None,
+                },
+                request_key: CommandKey::from_bytes([
+                    0x3C, 0x26, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
+                ]),
+            },
+            "recall",
+            json!({
+                "query": "quartz-userdoc-allowed-token",
+                "budgetTokens": 200,
+                "maxPerSource": 1,
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(pack_dropped.structured_content["sources"], json!([]));
+    assert!(
+        !limit_probe_auth.taint().is_tainted(),
+        "recall hit dropped by maxPerSource packing must not flip BranchTaint"
+    );
+
+    // 3. Direct real SearchEngine + ProjectionEngine preflight test: query
     //    matches `user_doc_note` lexically, `acquire_snapshot_preflight` +
     //    `NoteAdmission::select` runs, and recipient rejects all hits ->
     //    0 hits AND BranchTaint MUST remain false!
@@ -7601,7 +8815,7 @@ async fn real_search_preflight_taint_and_class_isolation_probes(
         admitted
             .hits
             .iter()
-            .any(|hit| hit.card.document.provenance().reference().note_id == user_doc_note),
+            .any(|hit| hit.card.document.provenance().reference().note_id == *user_doc_note),
         "positive control must return the admitted UserDoc hit"
     );
     assert!(

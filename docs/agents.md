@@ -38,8 +38,11 @@ preconditions when an unrelated account change advances the account revision.
 outcomes in input order. A `toTitle` link becomes a stable ID when exactly one
 committed item matches the title. Otherwise, the link remains authored by
 title. The tool journals each item's link decision before the edit, so retries
-recover the same receipt even when another item later succeeds. A `linkError`
-on a successful item reports an unconfirmed link upgrade.
+recover the same receipt even when another item later succeeds. Operational or
+rate-limit failures during link upgrades propagate with `CommitEffect::Unknown`
+and `RetryAdvice::RetrySameCommand` so callers retry with the same key; a
+`linkError` on a successful item reports a deterministic domain failure of the
+link upgrade.
 Confirmed creation proposals persist the title links shown during review.
 
 `start_session` opens an episode by starting, resuming or forking it. Pass the
@@ -92,8 +95,11 @@ active completion provider, and a project-only remote embedder also requires
 that every prior non-query disclosure in the run (and its active completion
 provider) stayed confined to that same project; otherwise remote query embedding
 degrades cleanly to lexical search with `provider_unavailable` (and direct
-embedding calls fail with `ClassEgressForbidden`). Opening a projection in another Space taints the
-branch before vector search runs. An unavailable remote embedding leaves
+embedding calls fail with `ClassEgressForbidden`). Recipient-filtered in-app
+searches keep projection and candidate preflight untainted until an admitted
+hit is delivered, while remote query embedding remains confined to the run's
+pinned Space (`authorize_remote_embedding_query`); direct non-recipient
+projection opens still taint on open. An unavailable remote embedding leaves
 full-text matches available and reports `provider_unavailable`. A scheduled
 Keeper's approved role and skills must still be current at dispatch. The
 embedding request carries only the query text.

@@ -53,13 +53,31 @@ pub(super) async fn note_in_space(
     scope: &SpaceContext,
     id: &NoteId,
 ) -> Result<CatalogNote, PortError> {
-    let note = catalog_note(call, &scope.scope().space_id, id).await?;
-    admit_provider_note_read(call, scope, &note).await?;
+    let note = note_in_space_preflight(call, scope, id).await?;
     scope.auth().authorize_read(&note.facts)?;
     Ok(note)
 }
 
+pub(super) async fn note_in_space_preflight(
+    call: &ToolCallContext<'_>,
+    scope: &SpaceContext,
+    id: &NoteId,
+) -> Result<CatalogNote, PortError> {
+    let note = catalog_note(call, &scope.scope().space_id, id).await?;
+    admit_provider_note_read(call, scope, &note).await?;
+    Ok(note)
+}
+
 pub(super) async fn locate_note(
+    call: &ToolCallContext<'_>,
+    id: &NoteId,
+) -> Result<(SpaceContext, CatalogNote), PortError> {
+    let (scope, note) = locate_note_preflight(call, id).await?;
+    scope.auth().authorize_read(&note.facts)?;
+    Ok((scope, note))
+}
+
+pub(super) async fn locate_note_preflight(
     call: &ToolCallContext<'_>,
     id: &NoteId,
 ) -> Result<(SpaceContext, CatalogNote), PortError> {
@@ -85,7 +103,6 @@ pub(super) async fn locate_note(
     call.auth.can_view_resource(&note.facts)?;
     let scope = session::space(call, &note.reference.space_id).await?;
     admit_provider_note_read(call, &scope, &note).await?;
-    scope.auth().authorize_read(&note.facts)?;
     Ok((scope, note))
 }
 
@@ -345,7 +362,7 @@ pub(super) async fn admit_search_card(
     )
     .await?
     {
-        ClassEgressFence::provider_note_metadata(card, scope.auth(), &selection.policy)?;
+        ClassEgressFence::provider_note_metadata_preflight(card, scope.auth(), &selection.policy)?;
     }
     Ok(())
 }
@@ -463,11 +480,24 @@ pub(super) async fn folder_metadata(
     folder: &FolderSnapshot,
 ) -> Result<Value, PortError> {
     scope.scope().check(&folder.history)?;
+    let project = folder.project.clone().map(|folder_id| FolderRef {
+        space_id: scope.scope().space_id.clone(),
+        folder_id,
+    });
+    admit_folder_boundary(
+        call,
+        scope,
+        &folder.reference,
+        project,
+        &folder.ancestor_folders,
+        None,
+    )
+    .await?;
     let proof = call
         .registry
         .catalog
         .disclosure(
-            call.account(),
+            call.account().with_preflight_taint(),
             CatalogDisclosure::Folder(folder.reference.clone()),
         )
         .await?;
@@ -482,20 +512,42 @@ pub(super) async fn folder_metadata_batch(
     if folders.is_empty() {
         return Ok(Vec::new());
     }
-    let refs = folders
-        .iter()
-        .map(|folder| {
-            scope.scope().check(&folder.history)?;
-            if folder.reference.space_id != scope.scope().space_id {
-                return Err(invalid(ValidationReason::ScopeMismatch));
+    let mut admitted_folders = Vec::with_capacity(folders.len());
+    let mut refs = Vec::with_capacity(folders.len());
+    for folder in folders {
+        scope.scope().check(&folder.history)?;
+        if folder.reference.space_id != scope.scope().space_id {
+            return Err(invalid(ValidationReason::ScopeMismatch));
+        }
+        let project = folder.project.clone().map(|folder_id| FolderRef {
+            space_id: scope.scope().space_id.clone(),
+            folder_id,
+        });
+        match admit_folder_boundary(
+            call,
+            scope,
+            &folder.reference,
+            project,
+            &folder.ancestor_folders,
+            None,
+        )
+        .await
+        {
+            Ok(()) => {
+                admitted_folders.push(folder);
+                refs.push(folder.reference.clone());
             }
-            Ok(folder.reference.clone())
-        })
-        .collect::<Result<Vec<_>, PortError>>()?;
+            Err(error) if hidden(&error) => (),
+            Err(error) => return Err(error),
+        }
+    }
+    if refs.is_empty() {
+        return Ok(Vec::new());
+    }
     let proofs = call
         .registry
         .catalog
-        .folder_disclosures(call.account(), refs)
+        .folder_disclosures(call.account().with_preflight_taint(), refs)
         .await?;
     let mut by_ref = std::collections::BTreeMap::new();
     for proof in proofs {
@@ -506,8 +558,8 @@ pub(super) async fn folder_metadata_batch(
             );
         }
     }
-    let mut out = Vec::with_capacity(folders.len());
-    for folder in folders {
+    let mut out = Vec::with_capacity(admitted_folders.len());
+    for folder in admitted_folders {
         let Some(proof) = by_ref.remove(&(
             folder.reference.space_id.clone(),
             folder.reference.folder_id.clone(),

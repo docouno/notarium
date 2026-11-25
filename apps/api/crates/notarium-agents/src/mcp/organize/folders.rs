@@ -124,6 +124,13 @@ impl FolderAddress {
                     .ok_or(DomainError::ResourceNotFound)?,
             },
         };
+        if call
+            .auth
+            .pinned_write_space()
+            .is_some_and(|pin| pin != &space)
+        {
+            return Err(DomainError::SpaceReadOnly.into());
+        }
         let scope = session::space(call, &space).await?;
         let grant = call
             .auth
@@ -197,7 +204,7 @@ async fn resolve_snapshot(
     let resolved = call
         .registry
         .engine
-        .resolve_folder_path(scope.clone(), base, path.to_owned())
+        .resolve_folder_path(scope.with_preflight_taint(), base, path.to_owned())
         .await?
         .ok_or(DomainError::ResourceNotFound)?;
     scope.scope().check(&resolved.history)?;
@@ -253,6 +260,13 @@ async fn plan(
         }
         ParsedFolderArgs::RenameProject(args) => {
             let project = session::resolve_project(call, &args.project).await?;
+            if call
+                .auth
+                .pinned_write_space()
+                .is_some_and(|pin| pin != &project.folder.space_id)
+            {
+                return Err(DomainError::SpaceReadOnly.into());
+            }
             let scope = session::space(call, &project.folder.space_id).await?;
             let source = snapshot_by_id(call, &scope, &project.folder.folder_id).await?;
             admit_folder_snapshot(call, &scope, &source).await?;

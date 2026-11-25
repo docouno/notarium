@@ -83,7 +83,11 @@ pub(super) async fn recent(
             .registry
             .engine
             .recent_activity(
-                read_scope,
+                if external {
+                    read_scope
+                } else {
+                    read_scope.with_preflight_taint()
+                },
                 ChangeRead::Log {
                     after: ChangeCursor {
                         scope: target.scope.clone(),
@@ -187,7 +191,11 @@ pub(super) async fn recent(
                 .registry
                 .engine
                 .get_note_metadata(
-                    scope.clone(),
+                    if external {
+                        scope.clone()
+                    } else {
+                        scope.with_preflight_taint()
+                    },
                     GetNote {
                         note: id.clone(),
                         revision: Some(change.revision.clone()),

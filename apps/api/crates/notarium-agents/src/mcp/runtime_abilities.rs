@@ -321,10 +321,19 @@ impl<'a> Reader<'a> {
                         }
                     }
                 };
+                if let Some(project) = &selection.project_only
+                    && (!descriptor.reference.placement.in_project(project)
+                        || descriptor
+                            .promoted_from
+                            .as_ref()
+                            .is_some_and(|prev| !prev.placement.in_project(project)))
+                {
+                    return Err(DomainError::AccessDenied.into());
+                }
                 source.budget = self.budget();
                 let body = read_exact_resource(
                     self.registry,
-                    &source,
+                    &source.with_preflight_taint(),
                     &descriptor,
                     AbilityResourceName::Entrypoint,
                 )

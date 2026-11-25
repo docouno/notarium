@@ -79,7 +79,7 @@ pub(super) async fn observe_note(
     note: &NoteId,
     expected: Option<&RevisionId>,
 ) -> Result<NoteRoute, PortError> {
-    let (scope, catalog) = corpus::locate_note(call, note).await?;
+    let (scope, catalog) = corpus::locate_note_preflight(call, note).await?;
     corpus::admit_note_write(call, &scope, &catalog).await?;
     authorize_note_write(&scope, &catalog.facts)?;
     let current = metadata_snapshot(
@@ -145,6 +145,13 @@ async fn route_inner(
         return Err(invalid(ValidationReason::SourceMismatch));
     }
     if matches!(call.target, EgressTarget::InAppProvider { .. }) {
+        if call
+            .auth
+            .pinned_write_space()
+            .is_some_and(|pin| pin != &route.scope.space_id)
+        {
+            return Err(DomainError::SpaceReadOnly.into());
+        }
         let scope = call.space(route.scope.clone())?;
         match corpus::note_in_space(call, &scope, &route.note).await {
             Ok(catalog) => corpus::admit_note_write(call, &scope, &catalog).await?,

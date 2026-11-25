@@ -442,51 +442,8 @@ impl KeeperScheduler {
         owner.check()?;
         let control = self.inner.registry.control();
         let mut result = control.claim_schedule(ctx.clone(), claim.clone()).await;
-        let mut tried = std::collections::BTreeSet::from([claim.next_slot]);
-        let mut forward_cursor = fresh;
-        // Track exact backward frontier `(anchor, upper)` where `next(anchor) == upper`.
-        // Rewinding uses bounded O(log(gap)) exponential backoff + binary search to
-        // locate the exact immediately preceding occurrence without skipping irregular
-        // slots or spinning across long misfire gaps.
-        let mut backward_state: Option<(Timestamp, Option<Timestamp>)> =
-            (slot < fresh).then_some((fresh, claim.next_slot));
-        let mut tried_now_probe = now == fresh;
+        let mut retry_stepper = NextSlotRetry::new(slot, now, fresh, claim.next_slot);
         const MAX_NEXT_SLOT_RETRIES: usize = 20;
-        let advance_untried = |cursor: &mut Timestamp,
-                               tried: &std::collections::BTreeSet<Option<Timestamp>>|
-         -> Result<Option<Option<Timestamp>>, PortError> {
-            let mut candidate = next(*cursor)?;
-            loop {
-                if !tried.contains(&candidate) {
-                    if let Some(ts) = candidate {
-                        *cursor = (*cursor).max(ts);
-                    }
-                    return Ok(Some(candidate));
-                }
-                let Some(next_ts) = candidate else {
-                    return Ok(None);
-                };
-                *cursor = (*cursor).max(next_ts);
-                candidate = next(*cursor)?;
-            }
-        };
-        let rewind_untried = |state: &mut Option<(Timestamp, Option<Timestamp>)>,
-                              tried: &std::collections::BTreeSet<Option<Timestamp>>|
-         -> Result<Option<Option<Timestamp>>, PortError> {
-            while let Some((anchor, upper)) = *state {
-                let Some((prev, next_anchor)) = find_previous_slot(slot, anchor, upper, &next)?
-                else {
-                    *state = None;
-                    return Ok(None);
-                };
-                *state = next_anchor.map(|ts| (ts, Some(prev)));
-                let candidate = Some(prev);
-                if !tried.contains(&candidate) {
-                    return Ok(Some(candidate));
-                }
-            }
-            Ok(None)
-        };
         for step in 0..MAX_NEXT_SLOT_RETRIES {
             if !matches!(&result, Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
                 if diagnostic.reason == ValidationReason::InvalidTimestamp)
@@ -508,48 +465,9 @@ impl KeeperScheduler {
             } else {
                 now
             };
-            let refreshed = if latest > forward_cursor {
-                forward_cursor = latest;
-                let latest_candidate = next(latest)?;
-                if !tried.contains(&latest_candidate) {
-                    if let Some(ts) = latest_candidate {
-                        forward_cursor = forward_cursor.max(ts);
-                    }
-                    Some(latest_candidate)
-                } else {
-                    match advance_untried(&mut forward_cursor, &tried)? {
-                        Some(found) => Some(found),
-                        None => rewind_untried(&mut backward_state, &tried)?,
-                    }
-                }
-            } else if !tried_now_probe {
-                tried_now_probe = true;
-                let probe = next(now)?;
-                if !tried.contains(&probe) {
-                    Some(probe)
-                } else {
-                    match advance_untried(&mut forward_cursor, &tried)? {
-                        Some(found) => Some(found),
-                        None => rewind_untried(&mut backward_state, &tried)?,
-                    }
-                }
-            } else if step % 2 == 1 && backward_state.is_some() {
-                match rewind_untried(&mut backward_state, &tried)? {
-                    Some(found) => Some(found),
-                    None => advance_untried(&mut forward_cursor, &tried)?,
-                }
-            } else {
-                match advance_untried(&mut forward_cursor, &tried)? {
-                    Some(found) => Some(found),
-                    None => rewind_untried(&mut backward_state, &tried)?,
-                }
-            };
-            let Some(refreshed) = refreshed else {
+            let Some(refreshed) = retry_stepper.next_candidate(latest, step, &next)? else {
                 break;
             };
-            if !tried.insert(refreshed) {
-                break;
-            }
             owner.check()?;
             claim.next_slot = refreshed;
             result = control.claim_schedule(ctx.clone(), claim.clone()).await;
@@ -1050,6 +968,151 @@ fn find_previous_slot(
     Ok(Some((best, next_anchor)))
 }
 
+struct NextSlotRetry {
+    slot: Timestamp,
+    now: Timestamp,
+    last_clock: Timestamp,
+    forward_cursor: Timestamp,
+    // Track exact backward frontier `(anchor, upper)` where `next(anchor) == upper`.
+    // Rewinding uses bounded O(log(gap)) exponential backoff + binary search to
+    // locate the exact immediately preceding occurrence without skipping irregular
+    // slots or spinning across long misfire gaps.
+    backward_state: Option<(Timestamp, Option<Timestamp>)>,
+    tried_now_probe: bool,
+    tried: std::collections::BTreeSet<Option<Timestamp>>,
+}
+
+impl NextSlotRetry {
+    fn new(
+        slot: Timestamp,
+        now: Timestamp,
+        fresh: Timestamp,
+        initial_next: Option<Timestamp>,
+    ) -> Self {
+        Self {
+            slot,
+            now,
+            last_clock: fresh,
+            forward_cursor: fresh,
+            backward_state: (slot < fresh).then_some((fresh, initial_next)),
+            tried_now_probe: now == fresh,
+            tried: std::collections::BTreeSet::from([initial_next]),
+        }
+    }
+
+    fn advance_untried<F>(&mut self, next: &F) -> Result<Option<Option<Timestamp>>, DomainError>
+    where
+        F: Fn(Timestamp) -> Result<Option<Timestamp>, DomainError>,
+    {
+        let mut candidate = next(self.forward_cursor)?;
+        loop {
+            if !self.tried.contains(&candidate) {
+                if let Some(ts) = candidate {
+                    self.forward_cursor = self.forward_cursor.max(ts);
+                }
+                return Ok(Some(candidate));
+            }
+            let Some(next_ts) = candidate else {
+                return Ok(None);
+            };
+            self.forward_cursor = self.forward_cursor.max(next_ts);
+            candidate = next(self.forward_cursor)?;
+        }
+    }
+
+    fn rewind_untried<F>(&mut self, next: &F) -> Result<Option<Option<Timestamp>>, DomainError>
+    where
+        F: Fn(Timestamp) -> Result<Option<Timestamp>, DomainError>,
+    {
+        while let Some((anchor, upper)) = self.backward_state {
+            let Some((prev, next_anchor)) = find_previous_slot(self.slot, anchor, upper, next)?
+            else {
+                self.backward_state = None;
+                return Ok(None);
+            };
+            self.backward_state = next_anchor.map(|ts| (ts, Some(prev)));
+            let candidate = Some(prev);
+            if !self.tried.contains(&candidate) {
+                return Ok(Some(candidate));
+            }
+        }
+        Ok(None)
+    }
+
+    fn next_candidate<F>(
+        &mut self,
+        latest: Timestamp,
+        step: usize,
+        next: &F,
+    ) -> Result<Option<Option<Timestamp>>, DomainError>
+    where
+        F: Fn(Timestamp) -> Result<Option<Timestamp>, DomainError>,
+    {
+        let refreshed = if latest < self.last_clock {
+            // Mid-loop backward NTP step: re-anchor both frontiers at `latest`
+            // and probe `next(latest)` immediately before resuming alternating search.
+            self.last_clock = latest;
+            let latest_candidate = next(latest)?;
+            self.forward_cursor = latest;
+            self.backward_state = (self.slot < latest).then_some((latest, latest_candidate));
+            if !self.tried.contains(&latest_candidate) {
+                if let Some(ts) = latest_candidate {
+                    self.forward_cursor = self.forward_cursor.max(ts);
+                }
+                Some(latest_candidate)
+            } else {
+                match self.rewind_untried(next)? {
+                    Some(found) => Some(found),
+                    None => self.advance_untried(next)?,
+                }
+            }
+        } else if latest > self.forward_cursor {
+            self.last_clock = self.last_clock.max(latest);
+            self.forward_cursor = latest;
+            let latest_candidate = next(latest)?;
+            if !self.tried.contains(&latest_candidate) {
+                if let Some(ts) = latest_candidate {
+                    self.forward_cursor = self.forward_cursor.max(ts);
+                }
+                Some(latest_candidate)
+            } else {
+                match self.advance_untried(next)? {
+                    Some(found) => Some(found),
+                    None => self.rewind_untried(next)?,
+                }
+            }
+        } else if !self.tried_now_probe {
+            self.tried_now_probe = true;
+            let probe = next(self.now)?;
+            if !self.tried.contains(&probe) {
+                Some(probe)
+            } else {
+                match self.advance_untried(next)? {
+                    Some(found) => Some(found),
+                    None => self.rewind_untried(next)?,
+                }
+            }
+        } else if step % 2 == 1 && self.backward_state.is_some() {
+            match self.rewind_untried(next)? {
+                Some(found) => Some(found),
+                None => self.advance_untried(next)?,
+            }
+        } else {
+            match self.advance_untried(next)? {
+                Some(found) => Some(found),
+                None => self.rewind_untried(next)?,
+            }
+        };
+        let Some(candidate) = refreshed else {
+            return Ok(None);
+        };
+        if !self.tried.insert(candidate) {
+            return Ok(None);
+        }
+        Ok(Some(candidate))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1156,9 +1219,9 @@ mod tests {
 
     #[test]
     fn backward_ntp_jump_fresh_before_now_reaches_both_backward_and_intervening_slots() {
-        // If NTP steps the clock backward mid-poll (`fresh < now`), both `forward_cursor`
-        // and `backward_state` must anchor at `fresh` where `next(fresh) == claim.next_slot`,
-        // so rewinding finds slots < fresh and advancing visits slots in (fresh, now).
+        // Case 1: NTP steps the clock backward before claim_and_run (`fresh < now`).
+        // Drives the production `NextSlotRetry` stepper directly and fails if
+        // `forward_cursor` or `backward_state` were anchored at `fresh.max(now)`.
         let cron = "0 * * * * * *";
         let slot = Timestamp::parse("2026-03-05T10:00:00Z").unwrap();
         let now = Timestamp::parse("2026-03-05T10:05:30Z").unwrap();
@@ -1171,23 +1234,38 @@ mod tests {
             Some(Timestamp::parse("2026-03-05T10:04:00Z").unwrap())
         );
 
-        // Rewinding from `(fresh, initial)` finds 10:03:00 (would return None if anchored at `now`).
-        let (prev, _) = find_previous_slot(slot, fresh, initial, &next)
-            .unwrap()
-            .expect("backward search anchored at fresh must find 10:03:00");
-        assert_eq!(prev, Timestamp::parse("2026-03-05T10:03:00Z").unwrap());
-
-        // Advancing from `forward_cursor = fresh` visits 10:05:00 in (fresh, now) without skipping it.
-        let mut cursor = fresh;
-        let tried = std::collections::BTreeSet::from([initial]);
-        let mut candidate = next(cursor).unwrap();
-        while tried.contains(&candidate) {
-            cursor = cursor.max(candidate.unwrap());
-            candidate = next(cursor).unwrap();
+        let mut stepper = NextSlotRetry::new(slot, now, fresh, initial);
+        let mut probed = Vec::new();
+        for step in 0..4 {
+            let cand = stepper
+                .next_candidate(fresh, step, &next)
+                .unwrap()
+                .expect("retry stepper must yield candidate");
+            probed.push(cand);
         }
+        assert!(
+            probed.contains(&Some(Timestamp::parse("2026-03-05T10:03:00Z").unwrap())),
+            "stepper must rewind below fresh to 10:03:00, got {probed:?}"
+        );
+        assert!(
+            probed.contains(&Some(Timestamp::parse("2026-03-05T10:05:00Z").unwrap())),
+            "stepper must advance across (fresh, now) to 10:05:00 without skipping it, got {probed:?}"
+        );
+
+        // Case 2: Mid-loop backward NTP jump (`slot <= latest < last_clock`).
+        // Scheduler clock starts 60m fast (11:00:00) then steps back to Control clock (10:00:30).
+        let fast = Timestamp::parse("2026-03-05T11:00:00Z").unwrap();
+        let initial_fast = next(fast).unwrap();
+        let mut mid_loop = NextSlotRetry::new(slot, fast, fast, initial_fast);
+        let corrected = Timestamp::parse("2026-03-05T10:00:30Z").unwrap();
+        let cand0 = mid_loop
+            .next_candidate(corrected, 0, &next)
+            .unwrap()
+            .expect("mid-loop backward jump must immediately probe next(latest)");
         assert_eq!(
-            candidate,
-            Some(Timestamp::parse("2026-03-05T10:05:00Z").unwrap())
+            cand0,
+            Some(Timestamp::parse("2026-03-05T10:01:00Z").unwrap()),
+            "mid-loop backward NTP jump must reach 10:01:00 on step 0"
         );
     }
 }

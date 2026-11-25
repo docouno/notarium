@@ -750,7 +750,9 @@ pub(super) async fn create_many(
                 created.push(Ok(item));
             }
             Err(error) => match batch_operational_error(LABEL, error, committed_any) {
-                PortError::Domain(domain) => created.push(Err(domain)),
+                PortError::Domain(domain) if !matches!(domain, DomainError::RateLimited { .. }) => {
+                    created.push(Err(domain));
+                }
                 operational => return Err(operational),
             },
         }
@@ -764,12 +766,18 @@ pub(super) async fn create_many(
                 continue;
             }
         };
-        let (committed, link_error) =
-            match resolve_batch_links(call, &placement, &draft, &titles).await {
-                Ok(Some(committed)) => (committed, None),
-                Ok(None) => (draft.committed, None),
-                Err(error) => (draft.committed, Some(error.code())),
-            };
+        let (committed, link_error) = match resolve_batch_links(call, &placement, &draft, &titles)
+            .await
+        {
+            Ok(Some(committed)) => (committed, None),
+            Ok(None) => (draft.committed, None),
+            Err(error) => match batch_operational_error(LABEL, error, true) {
+                PortError::Domain(domain) if !matches!(domain, DomainError::RateLimited { .. }) => {
+                    (draft.committed, Some(domain.code()))
+                }
+                operational => return Err(operational),
+            },
+        };
         let mut value = result(call, &placement, &draft.prepared, committed, draft.parent)
             .await
             .map_err(|error| batch_operational_error(LABEL, error, true))?;

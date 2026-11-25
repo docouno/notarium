@@ -209,6 +209,12 @@ impl AccountContext {
     pub fn auth(&self) -> &EngineAuthContext {
         &self.auth
     }
+    pub fn with_preflight_taint(&self) -> Self {
+        Self {
+            auth: self.auth.with_preflight_taint(),
+            budget: self.budget.clone(),
+        }
+    }
 }
 #[derive(Clone, Debug)]
 /// Account authority cannot stand in for a specific Space/history admission.
@@ -322,6 +328,15 @@ impl SpaceContext {
             .auth
             .restrict_read_classes(&self.scope.space_id, allowed)?;
         Ok(self)
+    }
+    pub fn with_preflight_taint(&self) -> Self {
+        Self {
+            auth: self.auth.with_preflight_taint(),
+            scope: self.scope.clone(),
+            confirmed_chat_step: None,
+            canonical_effect: None,
+            budget: self.budget.clone(),
+        }
     }
     pub fn check_current(&self, current: &HistoryScope) -> DomainResult<()> {
         current.check(&self.scope)

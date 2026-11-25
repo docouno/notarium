@@ -44,9 +44,73 @@ pub(super) async fn list(call: &mut ToolCallContext<'_>, args: Value) -> Result<
     else {
         return Ok(empty());
     };
-    let scope = call.space(target.scope.clone())?;
+    let mut scope = call.space(target.scope.clone())?;
+    let external = matches!(call.target, EgressTarget::ExternalMcp);
+    let mut allow_user_doc = true;
+    if !external {
+        let selection_project = target.project.clone().or_else(|| match &call.target {
+            EgressTarget::InAppProvider {
+                primary_project, ..
+            } => primary_project
+                .as_ref()
+                .filter(|project| project.space_id == target.scope.space_id)
+                .cloned(),
+            EgressTarget::ExternalMcp => None,
+        });
+        let selection = match call.provider_selection(&scope, selection_project).await {
+            Ok(selection) => selection,
+            Err(error) if corpus::hidden(&error) => {
+                if args.cursor.is_some() {
+                    return Err(invalid(ValidationReason::CursorStale));
+                }
+                return Ok(empty());
+            }
+            Err(error) => return Err(error),
+        };
+        if let Some(sel) = selection {
+            allow_user_doc = sel.policy.allowed_classes.contains(&DocClass::UserDoc);
+            if let Some(required) = &sel.project_only {
+                if target
+                    .project
+                    .as_ref()
+                    .is_some_and(|existing| existing != required)
+                {
+                    if args.cursor.is_some() {
+                        return Err(invalid(ValidationReason::CursorStale));
+                    }
+                    return Ok(empty());
+                }
+                scope = match scope.restrict_to_project(required) {
+                    Ok(narrowed) => narrowed,
+                    Err(_) => {
+                        if args.cursor.is_some() {
+                            return Err(invalid(ValidationReason::CursorStale));
+                        }
+                        return Ok(empty());
+                    }
+                };
+            }
+        }
+    }
+    if let Some(project) = &target.project {
+        scope = match scope.restrict_to_project(project) {
+            Ok(narrowed) => narrowed,
+            Err(_) => {
+                if args.cursor.is_some() {
+                    return Err(invalid(ValidationReason::CursorStale));
+                }
+                return Ok(empty());
+            }
+        };
+    }
+    let preflight_scope = if external {
+        scope.clone()
+    } else {
+        scope.with_preflight_taint()
+    };
     let limit = PageLimit::new(args.limit.unwrap_or(50))?;
-    let Some(folder) = directory(call, &target, &scope, args.path.as_deref()).await? else {
+    let Some(folder) = directory(call, &target, &preflight_scope, args.path.as_deref()).await?
+    else {
         if args.cursor.is_some() {
             return Err(invalid(ValidationReason::CursorStale));
         }
@@ -130,7 +194,6 @@ pub(super) async fn list(call: &mut ToolCallContext<'_>, args: Value) -> Result<
             causal: target.causal(),
         })
     };
-    let external = matches!(call.target, EgressTarget::ExternalMcp);
     let mut items = Vec::new();
     let mut next_notes = None;
     let mut incomplete = false;
@@ -139,11 +202,11 @@ pub(super) async fn list(call: &mut ToolCallContext<'_>, args: Value) -> Result<
     } else {
         None
     };
-    if let Some(request) = request {
+    if allow_user_doc && let Some(request) = request {
         let page = call
             .registry
             .engine
-            .list_notes(scope.clone(), request)
+            .list_notes(preflight_scope.clone(), request)
             .await?;
         scope.scope().check(&page.children.scope)?;
         if page.folder != folder.reference || page.children.items.len() > usize::from(limit.get()) {
@@ -191,7 +254,7 @@ pub(super) async fn list(call: &mut ToolCallContext<'_>, args: Value) -> Result<
             .registry
             .engine
             .list_child_folders(
-                scope.clone(),
+                preflight_scope.clone(),
                 Some(folder.reference.folder_id.clone()),
                 after.clone(),
                 at_seq,
@@ -251,7 +314,17 @@ pub(super) async fn list(call: &mut ToolCallContext<'_>, args: Value) -> Result<
     } else {
         None
     };
-    if let Some(page) = folder_page(call, &scope, &folder, &folder_info, handle.as_deref()).await? {
+    if let Some(page) = folder_page(
+        call,
+        &scope,
+        &preflight_scope,
+        allow_user_doc,
+        &folder,
+        &folder_info,
+        handle.as_deref(),
+    )
+    .await?
+    {
         output["folderPage"] = page;
     }
     Ok(output)
@@ -307,6 +380,8 @@ async fn directory(
 async fn folder_page(
     call: &mut ToolCallContext<'_>,
     scope: &SpaceContext,
+    preflight_scope: &SpaceContext,
+    allow_user_doc: bool,
     folder: &FolderSnapshot,
     folder_info: &Value,
     handle: Option<&str>,
@@ -319,11 +394,14 @@ async fn folder_page(
         })
     };
     if let Some(id) = &folder.cover_note {
+        if !allow_user_doc {
+            return Ok(None);
+        }
         let note = call
             .registry
             .engine
             .get_note_metadata(
-                scope.clone(),
+                preflight_scope.clone(),
                 GetNote {
                     note: id.clone(),
                     revision: None,

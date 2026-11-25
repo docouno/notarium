@@ -104,7 +104,10 @@ pub(in crate::mcp) async fn plan_links(
         .await;
         match attempted {
             Ok(plan) => planned.push(ProposalLink::Ready(plan)),
-            Err(PortError::Domain(error)) if name == ToolName::LinkMany => {
+            Err(PortError::Domain(error))
+                if name == ToolName::LinkMany
+                    && !matches!(error, DomainError::RateLimited { .. }) =>
+            {
                 planned.push(ProposalLink::Rejected {
                     error: error.code().to_owned(),
                 });
@@ -206,7 +209,7 @@ pub(in crate::mcp) async fn describe_links(
         .await;
         match checked {
             Ok(()) => (),
-            Err(PortError::Domain(error)) => {
+            Err(PortError::Domain(error)) if !matches!(error, DomainError::RateLimited { .. }) => {
                 output.push(json!({"index": index, "ok": false, "error": error.code()}));
                 continue;
             }
@@ -316,7 +319,9 @@ pub(in crate::mcp) async fn apply_links(
                     error,
                     !applied.is_empty(),
                 ) {
-                    PortError::Domain(domain) if !single => {
+                    PortError::Domain(domain)
+                        if !single && !matches!(domain, DomainError::RateLimited { .. }) =>
+                    {
                         output.push(json!({"index": index, "ok": false, "error": domain.code()}));
                     }
                     other => return Err(other),

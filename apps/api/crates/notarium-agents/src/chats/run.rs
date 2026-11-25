@@ -17,7 +17,7 @@ impl AgentRunSupervisor {
                 RunTaskStart::Admitted(leaf) => self.run_turn(&run, leaf).await,
                 RunTaskStart::DrainOnly(error) => Err(error),
             };
-            let own_reconciled = if result.is_err() {
+            let own_reconciled = if result.is_err() && !self.inner.shutdown.is_cancelled() {
                 self.refresh_current_head(&run, true).await.is_ok()
             } else {
                 true
@@ -84,14 +84,18 @@ impl AgentRunSupervisor {
                             return;
                         }
                         _ => {
-                            let _ = self.refresh_current_head(&run, !own_reconciled).await;
+                            if !self.inner.shutdown.is_cancelled() {
+                                let _ = self.refresh_current_head(&run, !own_reconciled).await;
+                            }
                             self.finish_and_remove_run(&run, result.err().or(Some(error)));
                             drop(admission);
                             return;
                         }
                     },
                     Ok(()) => {
-                        let _ = self.refresh_current_head(&run, !own_reconciled).await;
+                        if !self.inner.shutdown.is_cancelled() {
+                            let _ = self.refresh_current_head(&run, !own_reconciled).await;
+                        }
                         self.finish_and_remove_run(&run, result.err());
                         drop(admission);
                         return;

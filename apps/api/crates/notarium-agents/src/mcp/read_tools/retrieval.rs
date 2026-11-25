@@ -224,9 +224,17 @@ pub(super) async fn retrieve(
                 .as_ref()
                 .map(|project| project.folder_id.clone()),
         };
+        // Keep candidate gathering untainted across Spaces so hits dropped by
+        // multi-space limit/budget packing never flip cross-space BranchTaint;
+        // every hit admitted into `output` below passes live `corpus::*` gates.
+        let query_scope = if external {
+            scope.clone()
+        } else {
+            scope.with_preflight_taint()
+        };
         let recipient = Recipient {
             call,
-            scope: &scope,
+            scope: &query_scope,
             classes: &effective_classes,
             project: effective_project.as_ref(),
             source_classes,
@@ -236,7 +244,7 @@ pub(super) async fn retrieve(
             call.registry
                 .engine
                 .recall_for(
-                    scope.clone(),
+                    query_scope.clone(),
                     RecallQuery {
                         query,
                         graph_depth: args.depth.unwrap_or(1),
@@ -253,7 +261,7 @@ pub(super) async fn retrieve(
             let recipient = (!external).then_some(&recipient as &dyn SearchRecipient);
             call.registry
                 .engine
-                .search_for(scope.clone(), query, recipient)
+                .search_for(query_scope.clone(), query, recipient)
                 .await?
         };
         target.scope.check(&result.cut.scope)?;

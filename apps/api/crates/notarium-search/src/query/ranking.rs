@@ -390,7 +390,7 @@ async fn resolve_graph_notes<'a>(
             .services
             .deps
             .structural
-            .filter_live_visible(&ctx, &missing)
+            .filter_live_visible_preflight(&ctx, &missing)
             .await?;
         if flags.len() != missing.len() {
             return Err(internal("projection_live_batch"));

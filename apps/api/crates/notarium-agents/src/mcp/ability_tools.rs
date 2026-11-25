@@ -393,6 +393,28 @@ struct AbilityBody {
     attachments: Vec<AuthoredAttachment>,
     origin: ProviderOrigin,
     project: Option<FolderRef>,
+    deferred_taint: Option<AbilityTaintCommit>,
+}
+
+#[derive(Clone, Debug)]
+struct AbilityTaintCommit {
+    scope: SpaceContext,
+    resource: ClassifiedAbilityResource,
+    selection: Option<ProviderSelection>,
+}
+
+impl AbilityTaintCommit {
+    fn commit(self) -> Result<(), PortError> {
+        match self.selection {
+            Some(selection) => {
+                ClassEgressFence::ability(self.resource, self.scope.auth(), &selection.policy)?;
+            }
+            None => {
+                ClassEgressFence::mcp_ability(&self.resource, self.scope.auth())?;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -482,6 +504,15 @@ async fn read_body(
     descriptor: &AbilityDescriptor,
     hint: Option<&FolderRef>,
 ) -> Result<AbilityBody, PortError> {
+    read_body_inner(call, descriptor, hint, true).await
+}
+
+async fn read_body_inner(
+    call: &ToolCallContext<'_>,
+    descriptor: &AbilityDescriptor,
+    hint: Option<&FolderRef>,
+    commit_taint: bool,
+) -> Result<AbilityBody, PortError> {
     let reference = &descriptor.reference;
     if reference.placement == AbilityPlacement::System {
         let content = read_system_ability(&call.account(), reference)?;
@@ -505,9 +536,17 @@ async fn read_body(
             attachments: vec![],
             origin: content.origin(),
             project: None,
+            deferred_taint: None,
         });
     }
-    let body = read_owned_resource(call, descriptor, hint, AbilityResourceName::Entrypoint).await?;
+    let body = read_owned_resource_inner(
+        call,
+        descriptor,
+        hint,
+        AbilityResourceName::Entrypoint,
+        commit_taint,
+    )
+    .await?;
     let (description, instructions, attachments) = parse_body(&body.text)?;
     Ok(AbilityBody {
         description,
@@ -515,6 +554,7 @@ async fn read_body(
         attachments,
         origin: body.origin,
         project: body.project,
+        deferred_taint: body.deferred_taint,
     })
 }
 
@@ -522,6 +562,7 @@ struct ResourceBody {
     text: String,
     origin: ProviderOrigin,
     project: Option<FolderRef>,
+    deferred_taint: Option<AbilityTaintCommit>,
 }
 
 async fn read_owned_resource(
@@ -529,6 +570,16 @@ async fn read_owned_resource(
     descriptor: &AbilityDescriptor,
     hint: Option<&FolderRef>,
     resource: AbilityResourceName,
+) -> Result<ResourceBody, PortError> {
+    read_owned_resource_inner(call, descriptor, hint, resource, true).await
+}
+
+async fn read_owned_resource_inner(
+    call: &ToolCallContext<'_>,
+    descriptor: &AbilityDescriptor,
+    hint: Option<&FolderRef>,
+    resource: AbilityResourceName,
+    commit_taint: bool,
 ) -> Result<ResourceBody, PortError> {
     let reference = &descriptor.reference;
     let entry = descriptor
@@ -552,26 +603,61 @@ async fn read_owned_resource(
             return Err(DomainError::AccessDenied.into());
         }
     }
-    let body = read_exact_resource(call.registry, &scope, descriptor, resource).await?;
+    let body = read_exact_resource(
+        call.registry,
+        &scope.with_preflight_taint(),
+        descriptor,
+        resource,
+    )
+    .await?;
     let origin = body.origin();
-    let text = match selection {
+    let confined_project = selection.as_ref().and_then(|sel| sel.project_only.clone());
+    if let Some(sel) = &selection
+        && sel
+            .project_only
+            .as_ref()
+            .is_some_and(|project| !body.in_project(project))
+    {
+        return Err(DomainError::AccessDenied.into());
+    }
+    let fence_auth = if commit_taint {
+        scope.auth().clone()
+    } else {
+        scope.auth().with_preflight_taint()
+    };
+    let (text, deferred_taint) = match selection {
         Some(selection) => {
-            if selection
-                .project_only
-                .as_ref()
-                .is_some_and(|project| !body.in_project(project))
-            {
-                return Err(DomainError::AccessDenied.into());
+            if commit_taint {
+                let admitted = ClassEgressFence::ability(body, &fence_auth, &selection.policy)?;
+                (admitted.text().to_owned(), None)
+            } else {
+                let admitted =
+                    ClassEgressFence::ability(body.clone(), &fence_auth, &selection.policy)?;
+                (
+                    admitted.text().to_owned(),
+                    Some(AbilityTaintCommit {
+                        scope,
+                        resource: body,
+                        selection: Some(selection),
+                    }),
+                )
             }
-            let admitted = ClassEgressFence::ability(body, scope.auth(), &selection.policy)?;
-            admitted.text().to_owned()
         }
-        None => ClassEgressFence::mcp_ability(&body, scope.auth())?.to_owned(),
+        None => {
+            let text = ClassEgressFence::mcp_ability(&body, &fence_auth)?.to_owned();
+            let deferred = (!commit_taint).then_some(AbilityTaintCommit {
+                scope,
+                resource: body,
+                selection: None,
+            });
+            (text, deferred)
+        }
     };
     Ok(ResourceBody {
         text,
         origin,
-        project,
+        project: confined_project,
+        deferred_taint,
     })
 }
 
@@ -764,22 +850,35 @@ async fn list(
             continue;
         }
         let external = matches!(call.target, EgressTarget::ExternalMcp);
-        let (description, origin_record) =
-            if external && let Some(desc) = descriptor.description.as_ref() {
-                (desc.clone(), None)
-            } else {
-                let body = match read_body(call, descriptor, project.as_ref()).await {
+        let (description, origin_record, deferred_taint) = if external
+            && let Some(desc) = descriptor.description.as_ref()
+        {
+            (desc.clone(), None, None)
+        } else {
+            let body =
+                match read_body_inner(call, descriptor, project.as_ref(), query.is_none()).await {
                     Ok(body) => body,
                     Err(error) if visible_error(&error) => continue,
                     Err(error) => return Err(error),
                 };
-                (body.description, Some((body.origin, body.project)))
-            };
+            (
+                body.description,
+                Some((body.origin, body.project)),
+                body.deferred_taint,
+            )
+        };
         if query.as_ref().is_some_and(|query| {
             !notarium_syntax::unicode::lookup_key(&descriptor.name).contains(query)
                 && !notarium_syntax::unicode::lookup_key(&description).contains(query)
         }) {
             continue;
+        }
+        if let Some(commit) = deferred_taint {
+            match commit.commit() {
+                Ok(()) => (),
+                Err(error) if visible_error(&error) => continue,
+                Err(error) => return Err(error),
+            }
         }
         let enabled = if view == View::Runtime {
             descriptor.enabled
@@ -1117,7 +1216,9 @@ pub(super) async fn validate_session_role(
     project: Option<&FolderRef>,
 ) -> Result<(), PortError> {
     let descriptor = resolve(call, selector, AbilityKind::Role, project.cloned()).await?;
-    let body = read_body(call, &descriptor, project).await?;
+    let body = read_body(call, &descriptor, project)
+        .await
+        .map_err(|error| collapse_provider_error(call, error))?;
     if body.instructions.len() > MAX_ACTIVATION_TOKENS {
         return Err(invalid(ValidationReason::BudgetExceeded));
     }
@@ -1143,9 +1244,12 @@ pub(super) async fn activate_session_role(
         call.registry
             .control
             .get_ability(call.account(), reference.clone(), project.clone())
-            .await?
+            .await
+            .map_err(|error| collapse_provider_error(call, error))?
     };
-    let body = read_body(call, &descriptor, project.as_ref()).await?;
+    let body = read_body(call, &descriptor, project.as_ref())
+        .await
+        .map_err(|error| collapse_provider_error(call, error))?;
     let budget = if body.instructions.len() <= MAX_ACTIVATION_TOKENS {
         DEFAULT_ACTIVATION_TOKENS.max(body.instructions.len())
     } else if explicit.is_some() {
@@ -1230,7 +1334,9 @@ async fn activation(
     project: Option<&FolderRef>,
     budget: usize,
 ) -> Result<Value, PortError> {
-    let body = read_body(call, descriptor, project).await?;
+    let body = read_body(call, descriptor, project)
+        .await
+        .map_err(|error| collapse_provider_error(call, error))?;
     activation_with_body(call, descriptor, project, body, budget).await
 }
 

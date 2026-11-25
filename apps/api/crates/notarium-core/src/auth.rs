@@ -544,6 +544,30 @@ impl EngineAuthContext {
         })
     }
 
+    /// Derive a read-only preflight context with a detached `BranchTaint`
+    /// initialized from the caller's current taint state (never clearing
+    /// pre-existing taint and stripping all write/management privileges).
+    /// Callers MUST still enforce `ClassEgressFence` / `authorize_read` /
+    /// `authorize_folder_read` on the live `EngineAuthContext` for every
+    /// item actually admitted into a response.
+    pub fn with_preflight_taint(&self) -> Self {
+        let taint = BranchTaint::default();
+        if self.taint.is_tainted() {
+            taint.mark_external_read();
+        }
+        let mut spaces = self.spaces.clone();
+        for grant in spaces.values_mut() {
+            grant.write_classes.clear();
+        }
+        Self {
+            spaces,
+            human_management: false,
+            ability_write: false,
+            taint,
+            ..self.clone()
+        }
+    }
+
     fn narrow(&self, requested: BTreeMap<SpaceId, SpaceGrant>) -> DomainResult<Self> {
         if self.proposal_read {
             return Err(DomainError::AccessDenied);

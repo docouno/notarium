@@ -1,6 +1,11 @@
 use super::*;
 use notarium_canonical::CreateFolderSpec;
-use notarium_core::{classes::DocClass, model::NoteRef, value::YamlValue};
+use notarium_core::{
+    classes::DocClass,
+    error::{CommitEffect, RetryAdvice},
+    model::NoteRef,
+    value::YamlValue,
+};
 use notarium_syntax::extract::{ExtractedDocDelta, extract};
 
 pub(super) async fn edit_folder_cover_and_view(fixture: &RuntimeFixture, space: &SpaceContext) {
@@ -461,28 +466,54 @@ async fn replay_keeps_forward_link_receipt(
         ],
     });
     fixture.projections.lose_next_note_edit_ack();
-    let first = call(fixture, account, 171, "create_notes", args.clone())
+    let first_err = call(fixture, account, 171, "create_notes", args.clone())
         .await
+        .err()
+        .expect("lost link-upgrade ack must propagate CommitEffect::Unknown");
+    assert!(
+        matches!(
+            &first_err,
+            PortError::Unavailable(failure)
+                if failure.effect() == CommitEffect::Unknown
+                    && failure.retry() == RetryAdvice::RetrySameCommand
+        ),
+        "create_notes must surface Unknown/RetrySameCommand instead of swallowing lost link ack into linkError: {first_err:?}"
+    );
+    let recent = call(
+        fixture,
+        account,
+        172,
+        "recent_activity",
+        json!({"project": project, "limit": 10}),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    let items = recent["items"].as_array().unwrap();
+    let source = items
+        .iter()
+        .find(|item| item["title"] == "Retry source")
+        .expect("committed source note must appear in recent_activity")["noteId"]
+        .clone();
+    let target_a = items
+        .iter()
+        .find(|item| item["title"] == "Retry target")
+        .expect("committed target note must appear in recent_activity")["noteId"]
+        .as_str()
         .unwrap()
-        .structured_content;
-    assert!(first["results"][0]["linkError"].is_string());
-    assert_eq!(first["results"][1]["ok"], true);
-    assert_eq!(first["results"][2]["error"], "path_conflict");
-    let source = &first["results"][0]["noteId"];
-    let target_a = first["results"][1]["noteId"].as_str().unwrap();
+        .to_owned();
     let link = format!("- related: [[{target_a}|Retry target]]");
     let observed = call(
         fixture,
         account,
-        172,
+        176,
         "get_note",
-        json!({"ref":source, "responseFormat":"concise"}),
+        json!({"ref": source, "responseFormat": "concise"}),
     )
     .await
     .unwrap()
     .structured_content;
     let revision = &observed["versionToken"];
-    assert_ne!(*revision, first["results"][0]["versionToken"]);
     assert!(observed["content"].as_str().unwrap().contains(&link));
 
     call(

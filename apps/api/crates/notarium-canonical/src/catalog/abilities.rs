@@ -183,7 +183,11 @@ async fn resolve(
         },
         entrypoint,
         metadata: meta,
-        provenance: AbilityResourceProvenance { current, published },
+        provenance: AbilityResourceProvenance {
+            current,
+            published,
+            promoted_from: promoted_from.clone(),
+        },
         entrypoint_matches_manifest,
         promoted_from,
     })

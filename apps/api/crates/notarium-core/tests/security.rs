@@ -415,15 +415,48 @@ fn project_consent_covers_its_own_ability_and_the_spaces_ability() {
     let primary_placement = AbilityPlacement::OwnedProject(primary.clone());
     let sibling_placement = AbilityPlacement::OwnedProject(sibling);
     let shared_placement = AbilityPlacement::OwnedSpace(space);
-    for (current, published, inside) in [
-        (primary_placement.clone(), primary_placement.clone(), true),
-        (shared_placement.clone(), shared_placement.clone(), true),
-        (shared_placement, sibling_placement.clone(), false),
-        (primary_placement, sibling_placement, false),
+    let promoted_from_sibling = notarium_core::ports::AbilityRef {
+        id: reference.ability.clone(),
+        placement: sibling_placement.clone(),
+        revision: reference.package_revision.clone(),
+    };
+    let promoted_from_primary = notarium_core::ports::AbilityRef {
+        id: reference.ability.clone(),
+        placement: primary_placement.clone(),
+        revision: reference.package_revision.clone(),
+    };
+    for (current, published, promoted_from, inside) in [
+        (
+            primary_placement.clone(),
+            primary_placement.clone(),
+            None,
+            true,
+        ),
+        (
+            shared_placement.clone(),
+            shared_placement.clone(),
+            None,
+            true,
+        ),
+        (
+            shared_placement.clone(),
+            shared_placement.clone(),
+            Some(promoted_from_primary),
+            true,
+        ),
+        (
+            shared_placement.clone(),
+            shared_placement.clone(),
+            Some(promoted_from_sibling),
+            false,
+        ),
+        (shared_placement, sibling_placement.clone(), None, false),
+        (primary_placement, sibling_placement, None, false),
     ] {
         let provenance = AbilityResourceProvenance {
             current: location(current),
             published: location(published),
+            promoted_from: promoted_from.clone(),
         };
         let resource = ClassifiedAbilityResource::from_canonical(
             reference.clone(),
@@ -441,7 +474,7 @@ fn project_consent_covers_its_own_ability_and_the_spaces_ability() {
             digest,
             provenance: Box::new(provenance),
             lifecycle: Lifecycle::Active,
-            promoted_from: None,
+            promoted_from,
             requires_explicit_binding: false,
         };
         assert_eq!(part.in_project(&primary), inside);
@@ -1104,5 +1137,126 @@ fn agent_run_preserves_parent_taint_and_project_pin_clears_read_only_ability_wri
     assert_eq!(
         pinned_viewer.authorize_ability_mutation(),
         Err(DomainError::AbilityWriteForbidden)
+    );
+}
+
+#[test]
+fn provider_policy_rejection_does_not_flip_cross_space_branch_taint() {
+    let space1 = SpaceId::from_bytes([1; 16]);
+    let space2 = SpaceId::from_bytes([2; 16]);
+    let grants = BTreeMap::from([
+        (
+            space1.clone(),
+            SpaceGrant {
+                role: SpaceRole::Owner,
+                read_classes: DocClass::all(),
+                write_classes: DocClass::all(),
+                project_root: None,
+            },
+        ),
+        (
+            space2.clone(),
+            SpaceGrant {
+                role: SpaceRole::Owner,
+                read_classes: DocClass::all(),
+                write_classes: DocClass::all(),
+                project_root: None,
+            },
+        ),
+    ]);
+    let human = EngineAuthContext::for_human(VerifiedHuman::attest(
+        PrincipalId::from_bytes([1; 16]),
+        GrantId::from_bytes([1; 16]),
+        grants.clone(),
+        true,
+    ));
+    let auth = human
+        .for_agent_run(
+            AgentRunId::from_bytes([9; 16]),
+            space1,
+            ChatAudience::Personal,
+            grants,
+        )
+        .unwrap();
+    let user_doc_only = ProviderPolicy {
+        provider: ProviderResourceId::from_bytes([3; 16]),
+        audience: ProviderAudience::Shared {
+            space: space2.clone(),
+            attached: true,
+            space_consented: true,
+            sender_consented: true,
+        },
+        allowed_classes: BTreeSet::from([DocClass::UserDoc]),
+    };
+    let s2 = Space {
+        id: space2.clone(),
+        lifecycle: SpaceLifecycle::Active,
+        kind: SpaceKind::Shared,
+    };
+    let note_facts = ResourceFacts {
+        space: s2.clone(),
+        class: DocClass::AgentMemory,
+        project: None,
+        ancestor_folders: vec![FolderId::from_bytes([2; 16])],
+        folder_write_locked: false,
+        ability_package: None,
+    };
+    let doc = ClassifiedDocument::from_canonical(
+        NoteRef {
+            space_id: space2.clone(),
+            note_id: NoteId::from_bytes([4; 16]),
+        },
+        RevisionId::from_bytes([4; 16]),
+        note_facts,
+        Lifecycle::Active,
+        "secret memory".into(),
+        ContentDigest::from_bytes([4; 32]),
+    )
+    .unwrap();
+    let meta = doc.metadata();
+    assert!(ClassEgressFence::provider_note_metadata(&meta, &auth, &user_doc_only).is_err());
+    assert!(
+        !auth.taint().is_tainted(),
+        "policy-rejected provider_note_metadata must not flip cross-space BranchTaint"
+    );
+    assert!(ClassEgressFence::provider(doc.clone(), &auth, &user_doc_only).is_err());
+    assert!(
+        !auth.taint().is_tainted(),
+        "policy-rejected provider document must not flip cross-space BranchTaint"
+    );
+
+    let ability_id = AbilityId::from_bytes([5; 16]);
+    let ability_loc = AbilityResourceLocation {
+        placement: AbilityPlacement::OwnedSpace(space2.clone()),
+        facts: ResourceFacts {
+            space: s2,
+            class: DocClass::Skill,
+            project: None,
+            ancestor_folders: vec![FolderId::from_bytes([2; 16])],
+            folder_write_locked: false,
+            ability_package: Some(ability_id.clone()),
+        },
+    };
+    let ability = ClassifiedAbilityResource::from_canonical(
+        AbilityResourceRef {
+            space: space2,
+            ability: ability_id,
+            package_revision: RevisionId::from_bytes([5; 16]),
+            resource: AbilityResourceName::Entrypoint,
+        },
+        AbilityResourceProvenance {
+            current: ability_loc.clone(),
+            published: ability_loc,
+            promoted_from: None,
+        },
+        Lifecycle::Active,
+        "skill text".into(),
+        ContentDigest::from_bytes([5; 32]),
+    )
+    .unwrap();
+    assert!(ClassEgressFence::ability(ability, &auth, &user_doc_only).is_err());
+    assert!(
+        !auth.taint().is_tainted(),
+        "policy-rejected ability must not flip cross-space BranchTaint"
     );
 }

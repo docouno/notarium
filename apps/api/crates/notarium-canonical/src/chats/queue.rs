@@ -431,8 +431,9 @@ pub(super) async fn dismiss_pending(
                     authorize_chat_write_on_space(ctx.auth(), &space.space)?;
                     let thread =
                         load_thread_head_tx(tx, &space.scope.space_id, &request.thread).await?;
-                    if matches!(ctx.auth().kind(), PrincipalKind::AgentRun(_)) {
+                    if let PrincipalKind::AgentRun(id) = ctx.auth().kind() {
                         authorize_claim_lifecycle_leaf(tx, ctx.auth(), &space, &thread).await?;
+                        authorize_run_claim(&owned, &space, &thread, id)?;
                     } else {
                         authorize_current_leaf(tx, ctx.auth(), &space, &thread).await?;
                     }

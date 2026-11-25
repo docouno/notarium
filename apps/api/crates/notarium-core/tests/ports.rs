@@ -132,6 +132,7 @@ impl ReadFixture {
                 AbilityResourceProvenance {
                     current: location.clone(),
                     published: location,
+                    promoted_from: None,
                 },
                 Lifecycle::Active,
                 file.content,

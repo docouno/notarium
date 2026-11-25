@@ -144,6 +144,15 @@ impl DocumentFacts {
         self.authorize(auth)
     }
 
+    fn allow_egress_preflight(
+        &self,
+        lifecycle: Lifecycle,
+        auth: &EngineAuthContext,
+    ) -> DomainResult<()> {
+        self.check_egress(lifecycle)?;
+        self.can_view(auth)
+    }
+
     fn allow_provider(&self, policy: &ProviderPolicy) -> DomainResult<()> {
         self.iter().try_for_each(|facts| {
             ClassEgressFence::provider_policy(&facts.space, facts.class, policy)
@@ -429,11 +438,13 @@ pub struct AbilityResourceLocation {
 }
 
 /// An immutable package may have been published at a different location from
-/// its current entrypoint. Reading it requires rights at both locations.
+/// its current entrypoint, or promoted from an earlier project-scoped home.
+/// Reading or disclosing it requires rights across all of those locations.
 #[derive(Clone, Debug)]
 pub struct AbilityResourceProvenance {
     pub current: AbilityResourceLocation,
     pub published: AbilityResourceLocation,
+    pub promoted_from: Option<crate::ports::AbilityRef>,
 }
 
 impl AbilityResourceProvenance {
@@ -448,20 +459,29 @@ impl AbilityResourceProvenance {
                 && facts.class == DocClass::Skill
                 && facts.ability_package.as_ref() == Some(&reference.ability)
                 && ability_placement_matches(&location.placement, facts)
-        }) {
+        }) && self
+            .promoted_from
+            .as_ref()
+            .is_none_or(|prev| prev.id == reference.ability)
+        {
             Ok(())
         } else {
             Err(DomainError::validation(ValidationReason::ScopeMismatch))
         }
     }
 
-    fn authorize(&self, auth: &EngineAuthContext) -> DomainResult<()> {
+    fn can_view(&self, auth: &EngineAuthContext) -> DomainResult<()> {
         if self.locations().into_iter().any(|location| {
             matches!(&location.placement, AbilityPlacement::OwnedPersonal(owner) if owner != auth.principal())
         }) {
             return Err(DomainError::ResourceNotFound);
         }
         auth.can_view_resource(&self.current.facts)?;
+        auth.can_view_resource(&self.published.facts)
+    }
+
+    fn authorize(&self, auth: &EngineAuthContext) -> DomainResult<()> {
+        self.can_view(auth)?;
         auth.authorize_read(&self.published.facts)
     }
 
@@ -469,6 +489,10 @@ impl AbilityResourceProvenance {
         self.locations()
             .into_iter()
             .all(|location| location.placement.in_project(project))
+            && self
+                .promoted_from
+                .as_ref()
+                .is_none_or(|prev| prev.placement.in_project(project))
     }
 }
 
@@ -933,7 +957,16 @@ impl ProviderCurrentContent {
     pub fn in_project(&self, project: &crate::model::FolderRef) -> bool {
         match self {
             Self::Note(value) => value.in_project(project),
-            Self::Ability { provenance, .. } => provenance.in_project(project),
+            Self::Ability {
+                provenance,
+                promoted_from,
+                ..
+            } => {
+                provenance.in_project(project)
+                    && promoted_from
+                        .as_ref()
+                        .is_none_or(|prev| prev.placement.in_project(project))
+            }
             Self::Chat {
                 space,
                 project: current,
@@ -1143,7 +1176,25 @@ impl ClassEgressFence {
         auth: &EngineAuthContext,
         policy: &ProviderPolicy,
     ) -> DomainResult<ProviderOrigin> {
+        metadata
+            .facts
+            .allow_egress_preflight(metadata.lifecycle, auth)?;
+        metadata.facts.allow_provider(policy)?;
         metadata.facts.allow_egress(metadata.lifecycle, auth)?;
+        Ok(metadata.origin())
+    }
+
+    /// Untainted policy and visibility preflight for search candidate admission;
+    /// final delivery still marks cross-space taint via `provider_note_metadata`
+    /// or `provider_part`.
+    pub fn provider_note_metadata_preflight(
+        metadata: &ClassifiedMetadata,
+        auth: &EngineAuthContext,
+        policy: &ProviderPolicy,
+    ) -> DomainResult<ProviderOrigin> {
+        metadata
+            .facts
+            .allow_egress_preflight(metadata.lifecycle, auth)?;
         metadata.facts.allow_provider(policy)?;
         Ok(metadata.origin())
     }
@@ -1212,6 +1263,34 @@ impl ClassEgressFence {
         Self::authorize_audience(None, &policy.audience)
     }
 
+    fn can_view_metadata(
+        current: &ProviderCurrentContent,
+        auth: &EngineAuthContext,
+    ) -> DomainResult<()> {
+        match current {
+            ProviderCurrentContent::Folder {
+                history,
+                reference,
+                space,
+                lifecycle,
+                ancestor_folders,
+                ..
+            } if history.space_id == reference.space_id
+                && reference.space_id == space.id
+                && *lifecycle == Lifecycle::Active =>
+            {
+                auth.can_view_folder(space, &reference.folder_id, ancestor_folders)
+            }
+            ProviderCurrentContent::Space {
+                history,
+                space,
+                root,
+                ..
+            } if history.space_id == space.id => auth.can_view_folder(space, root, &[]),
+            _ => Err(DomainError::ResourceNotFound),
+        }
+    }
+
     fn authorize_metadata(
         current: &ProviderCurrentContent,
         auth: &EngineAuthContext,
@@ -1249,8 +1328,9 @@ impl ClassEgressFence {
     ) -> DomainResult<()> {
         match current {
             ProviderCurrentContent::Note(value) => {
-                value.facts.allow_egress(value.lifecycle, auth)?;
-                value.facts.allow_provider(policy)
+                value.facts.allow_egress_preflight(value.lifecycle, auth)?;
+                value.facts.allow_provider(policy)?;
+                value.facts.allow_egress(value.lifecycle, auth)
             }
             ProviderCurrentContent::Ability {
                 reference,
@@ -1262,8 +1342,9 @@ impl ClassEgressFence {
                     return Err(DomainError::ResourceNotFound);
                 }
                 provenance.validate(reference)?;
-                provenance.authorize(auth)?;
-                Self::ability_provider_policy(provenance, policy)
+                provenance.can_view(auth)?;
+                Self::ability_provider_policy(provenance, policy)?;
+                provenance.authorize(auth)
             }
             ProviderCurrentContent::Chat {
                 space,
@@ -1280,8 +1361,9 @@ impl ClassEgressFence {
             ProviderCurrentContent::SystemAbility { .. } => Self::check_system_policy(policy),
             ProviderCurrentContent::Folder { space, .. }
             | ProviderCurrentContent::Space { space, .. } => {
-                Self::authorize_metadata(current, auth)?;
-                Self::authorize_audience(Some(space), &policy.audience)
+                Self::can_view_metadata(current, auth)?;
+                Self::authorize_audience(Some(space), &policy.audience)?;
+                Self::authorize_metadata(current, auth)
             }
         }
     }
@@ -1347,10 +1429,16 @@ impl ClassEgressFence {
         auth: &EngineAuthContext,
         policy: &ProviderPolicy,
     ) -> DomainResult<()> {
-        Self::check(original, auth)?;
+        original
+            .facts
+            .allow_egress_preflight(original.lifecycle, auth)?;
         original.facts.allow_provider(policy)?;
-        current.facts.allow_egress(current.lifecycle, auth)?;
-        current.facts.allow_provider(policy)
+        current
+            .facts
+            .allow_egress_preflight(current.lifecycle, auth)?;
+        current.facts.allow_provider(policy)?;
+        Self::check(original, auth)?;
+        current.facts.allow_egress(current.lifecycle, auth)
     }
 
     pub fn search_part(part: ContentPart, auth: &EngineAuthContext) -> DomainResult<SearchPart> {
@@ -1362,8 +1450,11 @@ impl ClassEgressFence {
         auth: &EngineAuthContext,
         policy: &ProviderPolicy,
     ) -> DomainResult<ProviderPart> {
-        Self::check(part.provenance(), auth)?;
+        part.document
+            .facts
+            .allow_egress_preflight(part.document.lifecycle, auth)?;
         part.document.facts.allow_provider(policy)?;
+        Self::check(part.provenance(), auth)?;
         Ok(ProviderPart {
             part,
             provider: policy.provider.clone(),
@@ -1374,8 +1465,12 @@ impl ClassEgressFence {
         auth: &EngineAuthContext,
         policy: &ProviderPolicy,
     ) -> DomainResult<ProviderAbilityContent> {
-        Self::check_ability_resource(&resource, auth)?;
+        if resource.lifecycle != Lifecycle::Active {
+            return Err(DomainError::ResourceNotFound);
+        }
+        resource.provenance.can_view(auth)?;
         Self::ability_provider_policy(&resource.provenance, policy)?;
+        Self::check_ability_resource(&resource, auth)?;
         Ok(ProviderAbilityContent {
             resource,
             provider: policy.provider.clone(),
@@ -1502,8 +1597,11 @@ impl ClassEgressFence {
         auth: &EngineAuthContext,
         policy: &ProviderPolicy,
     ) -> DomainResult<ProviderContent> {
-        Self::check(&document, auth)?;
+        document
+            .facts
+            .allow_egress_preflight(document.lifecycle, auth)?;
         document.facts.allow_provider(policy)?;
+        Self::check(&document, auth)?;
         Ok(ProviderContent {
             document,
             provider: policy.provider.clone(),

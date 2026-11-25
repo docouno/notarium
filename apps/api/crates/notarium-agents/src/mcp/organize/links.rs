@@ -301,7 +301,7 @@ pub(in super::super) async fn plan_link(
     edge: &LinkArgs,
     observe_revision: bool,
 ) -> Result<LinkPlan, PortError> {
-    let (scope, note) = corpus::locate_note(call, &source).await?;
+    let (scope, note) = corpus::locate_note_preflight(call, &source).await?;
     plan_link_located(call, provider, scope, note, edge, observe_revision).await
 }
 
@@ -315,6 +315,9 @@ async fn plan_link_located(
 ) -> Result<LinkPlan, PortError> {
     let source = note.reference.note_id.clone();
     corpus::admit_note_write(call, &scope, &note).await?;
+    scope
+        .auth()
+        .authorize_direct_write(&note.facts, &note.facts)?;
     let target = resolve(
         call,
         provider,
@@ -381,7 +384,7 @@ async fn authorize(
     scope: &SpaceContext,
     plan: &LinkPlan,
 ) -> Result<DocClass, PortError> {
-    let source = corpus::note_in_space(call, scope, &plan.source).await?;
+    let source = corpus::note_in_space_preflight(call, scope, &plan.source).await?;
     corpus::admit_note_write(call, scope, &source).await?;
     scope
         .auth()
@@ -584,7 +587,7 @@ async fn many(call: &mut ToolCallContext<'_>, inputs: Vec<LinkInput>) -> Result<
                 .entry(plan.scope.space_id.clone())
                 .or_default()
                 .push(Prepared { ordinal, plan }),
-            Err(PortError::Domain(error)) => {
+            Err(PortError::Domain(error)) if !matches!(error, DomainError::RateLimited { .. }) => {
                 results[index] = Some(json!({"index": index, "ok": false, "error": error.code()}));
             }
             Err(error) => return Err(error),
@@ -616,7 +619,9 @@ async fn many(call: &mut ToolCallContext<'_>, inputs: Vec<LinkInput>) -> Result<
             Err(error) => {
                 match super::super::note_tools::batch_operational_error(LABEL, error, committed_any)
                 {
-                    PortError::Domain(error) => {
+                    PortError::Domain(error)
+                        if !matches!(error, DomainError::RateLimited { .. }) =>
+                    {
                         for prepared in batch {
                             let index = usize::from(prepared.ordinal);
                             results[index] = Some(json!({
