@@ -371,7 +371,7 @@ pub(super) async fn edit_folder_cover_and_view(fixture: &RuntimeFixture, space: 
             .unwrap()
             .contains("Existing destination")
     );
-    call(
+    let moved_folder = call(
         fixture,
         account,
         162,
@@ -381,8 +381,9 @@ pub(super) async fn edit_folder_cover_and_view(fixture: &RuntimeFixture, space: 
         }),
     )
     .await
-    .unwrap();
-    call(
+    .unwrap()
+    .structured_content;
+    let renamed_folder = call(
         fixture,
         account,
         163,
@@ -392,8 +393,35 @@ pub(super) async fn edit_folder_cover_and_view(fixture: &RuntimeFixture, space: 
         }),
     )
     .await
-    .unwrap();
-    call(
+    .unwrap()
+    .structured_content;
+    assert_ne!(moved_folder["versionToken"], renamed_folder["versionToken"]);
+    // Replaying move_folder after a later rename_folder must preserve the exact
+    // original committed versionToken and omit the later tip's mutated path.
+    let replayed_move = call(
+        fixture,
+        account,
+        162,
+        "move_folder",
+        json!({
+            "project":project,"folder":"guides","toFolder":"archive",
+        }),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    assert_eq!(replayed_move["outcome"], "applied");
+    assert_eq!(replayed_move["folderId"], moved_folder["folderId"]);
+    assert_eq!(replayed_move["versionToken"], moved_folder["versionToken"]);
+    assert_ne!(
+        replayed_move["versionToken"],
+        renamed_folder["versionToken"]
+    );
+    assert!(
+        replayed_move.get("path").is_none(),
+        "replaying move_folder after a later rename must not leak the later tip path: {replayed_move}"
+    );
+    let renamed_proj = call(
         fixture,
         account,
         164,
@@ -403,7 +431,25 @@ pub(super) async fn edit_folder_cover_and_view(fixture: &RuntimeFixture, space: 
         }),
     )
     .await
-    .unwrap();
+    .unwrap()
+    .structured_content;
+    assert_eq!(
+        renamed_proj["handle"],
+        json!(format!("{slug}/runtime-corpus-renamed"))
+    );
+    let replayed_proj = call(
+        fixture,
+        account,
+        164,
+        "rename_project",
+        json!({
+            "project":project,"slug":"runtime-corpus-renamed",
+        }),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    assert_eq!(replayed_proj, renamed_proj);
     let adjusted = call(
         fixture,
         account,

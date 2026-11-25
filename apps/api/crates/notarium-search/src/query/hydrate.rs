@@ -105,13 +105,9 @@ impl NoteAdmission<'_> {
             let ids: Vec<_> = batch.iter().map(&note).cloned().collect();
             let mut check_ctx = self.context.clone();
             check_ctx.budget = self.clock.remaining()?;
-            let flags = if self.recipient.is_some() {
-                structural
-                    .filter_live_visible_preflight(&check_ctx, &ids)
-                    .await?
-            } else {
-                structural.filter_live_visible(&check_ctx, &ids).await?
-            };
+            let flags = structural
+                .filter_live_visible_preflight(&check_ctx, &ids)
+                .await?;
             if flags.len() != ids.len() {
                 return Err(internal("projection_live_batch"));
             }
@@ -219,12 +215,7 @@ impl SearchEngine {
             .filter(|candidate| !overlay.contains_key(&candidate.note))
             .map(|candidate| candidate.note.clone())
             .collect();
-        let defer_taint = delivery.recipient.is_some();
-        let mut ctx = if defer_taint {
-            context.with_preflight_taint()
-        } else {
-            context.clone()
-        };
+        let mut ctx = context.with_preflight_taint();
         let hydrate_auth = ctx.auth().clone();
         let mut cards: BTreeMap<NoteId, NoteCard> = BTreeMap::new();
         if !projected.is_empty() {
@@ -366,7 +357,6 @@ impl SearchEngine {
         if hits.is_empty() && chats.is_empty() {
             return Ok((Vec::new(), false));
         }
-        let defer_taint = delivery.recipient.is_some();
         let ids: Vec<_> = hits
             .iter()
             .map(|hit| hit.card.document.provenance().reference().note_id.clone())
@@ -375,27 +365,17 @@ impl SearchEngine {
             .iter()
             .map(|chat| (chat.thread.clone(), chat.entry))
             .collect();
-        let mut check_ctx = if defer_taint {
-            ctx.with_preflight_taint()
-        } else {
-            ctx.clone()
-        };
+        let mut check_ctx = ctx.with_preflight_taint();
         let canonical = &self.services.deps.canonical;
         let (flags, chat_admission) = loop {
             check_ctx.budget = clock.remaining()?;
             let flags = if ids.is_empty() {
                 Vec::new()
-            } else if defer_taint {
-                self.services
-                    .deps
-                    .structural
-                    .filter_live_visible_preflight(&check_ctx, &ids)
-                    .await?
             } else {
                 self.services
                     .deps
                     .structural
-                    .filter_live_visible(&check_ctx, &ids)
+                    .filter_live_visible_preflight(&check_ctx, &ids)
                     .await?
             };
             check_ctx.budget = clock.remaining()?;
@@ -420,17 +400,12 @@ impl SearchEngine {
         let truncated = delivery
             .recall
             .is_some_and(|recall| pack(&mut visible, recall, delivery.recipient));
-        if defer_taint {
-            // Commit cross-space taint onto the caller's live auth ONLY for
-            // hits that survived live visibility and recall packing.
-            visible.retain(|hit| {
-                ClassEgressFence::search_metadata(
-                    hit.card.document.provenance().clone(),
-                    ctx.auth(),
-                )
+        // Commit cross-space taint onto the caller's live auth ONLY for
+        // hits that survived live visibility and recall packing.
+        visible.retain(|hit| {
+            ClassEgressFence::search_metadata(hit.card.document.provenance().clone(), ctx.auth())
                 .is_ok()
-            });
-        }
+        });
         let mut any_tainted = false;
         chats.retain(|chat| {
             if let Some(&tainted) = chat_admission

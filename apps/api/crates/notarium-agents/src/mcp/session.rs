@@ -173,6 +173,7 @@ async fn whoami(call: &mut ToolCallContext<'_>) -> Result<Value, PortError> {
     };
     let external = matches!(call.target, EgressTarget::ExternalMcp);
     let mut spaces = Vec::new();
+    let mut pending_taints = Vec::new();
     for card in readable_spaces(call).await?.into_values() {
         let space = card.space;
         let slug = if external {
@@ -180,9 +181,12 @@ async fn whoami(call: &mut ToolCallContext<'_>) -> Result<Value, PortError> {
         } else {
             let ctx = call.space(card.history)?;
             let source = CatalogDisclosure::Space(ctx.scope().clone());
-            let Some(proof) = project_metadata(call, ctx, source, None).await? else {
+            let Some((proof, taint)) = project_metadata(call, ctx, source, None).await? else {
                 continue;
             };
+            if let Some(taint) = taint {
+                pending_taints.push(taint);
+            }
             required_text(&proof, "slug")?.to_owned()
         };
         let space_kind = match space.kind {
@@ -200,6 +204,9 @@ async fn whoami(call: &mut ToolCallContext<'_>) -> Result<Value, PortError> {
             "kind": space_kind,
             "role": role,
         }));
+    }
+    for taint in pending_taints {
+        taint.commit()?;
     }
     let personal_space = principal.personal_space.filter(|id| {
         spaces
@@ -220,6 +227,7 @@ async fn projects(call: &mut ToolCallContext<'_>) -> Result<Value, PortError> {
     let spaces = readable_spaces(call).await?;
     let external = matches!(call.target, EgressTarget::ExternalMcp);
     let mut items = Vec::new();
+    let mut pending_taints = Vec::new();
     for card in visible_projects(call).await? {
         let Some(space) = spaces.get(&card.folder.space_id) else {
             continue;
@@ -229,11 +237,14 @@ async fn projects(call: &mut ToolCallContext<'_>) -> Result<Value, PortError> {
         } else {
             let scope = call.space(space.history.clone())?;
             let source = CatalogDisclosure::Folder(card.folder.clone());
-            let Some(proof) =
+            let Some((proof, taint)) =
                 project_metadata(call, scope, source, Some(card.folder.clone())).await?
             else {
                 continue;
             };
+            if let Some(taint) = taint {
+                pending_taints.push(taint);
+            }
             (
                 required_text(&proof, "spaceSlug")?.to_owned(),
                 required_text(&proof, "projectSlug")?.to_owned(),
@@ -254,7 +265,27 @@ async fn projects(call: &mut ToolCallContext<'_>) -> Result<Value, PortError> {
     if items.windows(2).any(|pair| pair[0].0 == pair[1].0) {
         return Err(invalid(ValidationReason::InvalidState));
     }
+    for taint in pending_taints {
+        taint.commit()?;
+    }
     Ok(json!({ "projects": items.into_iter().map(|(_, value)| value).collect::<Vec<_>>() }))
+}
+
+struct PendingMetadataTaint {
+    scope: SpaceContext,
+    proof: notarium_core::classes::CanonicalMetadataContent,
+    policy: Option<notarium_core::classes::ProviderPolicy>,
+}
+
+impl PendingMetadataTaint {
+    fn commit(self) -> Result<(), PortError> {
+        if let Some(policy) = self.policy {
+            ClassEgressFence::provider_metadata(self.proof, self.scope.auth(), &policy)?;
+        } else {
+            let _ = ClassEgressFence::mcp_metadata(&self.proof, self.scope.auth())?;
+        }
+        Ok(())
+    }
 }
 
 async fn project_metadata(
@@ -262,7 +293,7 @@ async fn project_metadata(
     scope: SpaceContext,
     source: CatalogDisclosure,
     project: Option<FolderRef>,
-) -> Result<Option<Value>, PortError> {
+) -> Result<Option<(Value, Option<PendingMetadataTaint>)>, PortError> {
     let auth = call.account();
     let project = match &call.target {
         EgressTarget::InAppProvider {
@@ -285,13 +316,15 @@ async fn project_metadata(
     let proof = match call
         .registry
         .catalog
-        .disclosure(call.account(), source)
+        .disclosure(call.account().with_preflight_taint(), source)
         .await
     {
         Ok(proof) => proof,
         Err(error) if corpus::hidden(&error) => return Ok(None),
         Err(error) => return Err(error),
     };
+    let preflight_auth = scope.auth().with_preflight_taint();
+    let mut deferred_policy = None;
     if let Some(selection) = selection {
         if let Some(project) = &selection.project_only
             && !matches!(proof.current(), ProviderCurrentContent::Folder { reference, ancestor_folders, .. }
@@ -301,7 +334,7 @@ async fn project_metadata(
             return Ok(None);
         }
         if let Err(error) =
-            ClassEgressFence::provider_metadata(proof.clone(), scope.auth(), &selection.policy)
+            ClassEgressFence::provider_metadata(proof.clone(), &preflight_auth, &selection.policy)
         {
             let error = PortError::from(error);
             return if corpus::hidden(&error) {
@@ -311,10 +344,18 @@ async fn project_metadata(
             };
         }
         call.record_origin(proof.current().origin(), selection.project_only)?;
+        deferred_policy = Some(selection.policy);
     }
-    let text = ClassEgressFence::mcp_metadata(&proof, scope.auth())?;
+    let text = ClassEgressFence::mcp_metadata(&proof, &preflight_auth)?;
     let value = serde_json::from_str(text).map_err(|_| invalid(ValidationReason::InvalidState))?;
-    Ok(Some(value))
+    Ok(Some((
+        value,
+        Some(PendingMetadataTaint {
+            scope,
+            proof,
+            policy: deferred_policy,
+        }),
+    )))
 }
 
 fn required_text<'a>(value: &'a Value, key: &str) -> Result<&'a str, PortError> {

@@ -505,33 +505,40 @@ async fn render(
             invalid(ValidationReason::SourceMismatch),
         ));
     }
-    let info: Result<Value, PortError> = async {
-        // Resolve the exact revision produced by this link command rather than
-        // reading the current tip, so an intervening manual edit's versionToken
-        // is never returned to a caller holding stale note text.
-        let exact_rev =
-            proposal::exact_link_revision(call, scope, &plan.source, &committed.receipt).await?;
-        let current = metadata_snapshot(
-            call,
-            scope,
-            &plan.source,
-            Some(exact_rev.clone()),
-            ReceiptSet::new([committed.receipt])?,
-        )
-        .await?;
-        let (origin, project) =
-            corpus::note_metadata_origin(call, scope, &current.metadata).await?;
-        call.record_origin(origin, project)?;
-        Ok(json!({"ok": true, "noteId": plan.source, "versionToken": exact_rev}))
-    }
-    .await;
-    match info {
-        Ok(result) => Ok(result),
-        Err(error) => {
-            tracing::debug!(code = error.code(), "link receipt metadata unavailable");
-            Ok(json!({"ok": true}))
+    // Resolve the exact revision produced by this link command rather than
+    // reading the current tip, so an intervening manual edit's versionToken
+    // is never returned to a caller holding stale note text.
+    let exact_rev = proposal::exact_link_revision(call, scope, &plan.source, &committed.receipt)
+        .await
+        .map_err(|error| super::super::note_tools::post_commit_error(LABEL, error))?;
+    if matches!(
+        call.target,
+        super::super::EgressTarget::InAppProvider { .. }
+    ) {
+        let admit: Result<(), PortError> = async {
+            let current = metadata_snapshot(
+                call,
+                scope,
+                &plan.source,
+                Some(exact_rev.clone()),
+                ReceiptSet::new([committed.receipt])?,
+            )
+            .await?;
+            let (origin, project) =
+                corpus::note_metadata_origin(call, scope, &current.metadata).await?;
+            call.record_origin(origin, project)?;
+            Ok(())
+        }
+        .await;
+        if let Err(error) = admit {
+            if corpus::hidden(&error) {
+                tracing::debug!(code = error.code(), "link receipt metadata unavailable");
+                return Ok(json!({"ok": true}));
+            }
+            return Err(super::super::note_tools::post_commit_error(LABEL, error));
         }
     }
+    Ok(json!({"ok": true, "noteId": plan.source, "versionToken": exact_rev}))
 }
 
 async fn single(call: &mut ToolCallContext<'_>, input: LinkInput) -> Result<Value, PortError> {

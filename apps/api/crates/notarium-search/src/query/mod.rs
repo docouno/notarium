@@ -122,7 +122,7 @@ impl SearchEngine {
                 .classes
                 .iter()
                 .all(|class| *class == DocClass::EncryptedNote);
-        let preflight = delivery.recipient.is_some_and(|r| r.filters_notes());
+        let preflight = true;
         if empty_query || encrypted_only {
             let snapshot = self
                 .projection(&ctx, request.causal, clock, preflight)

@@ -37,15 +37,18 @@ struct Args {
 
 pub(super) async fn list(call: &mut ToolCallContext<'_>, args: Value) -> Result<Value, PortError> {
     let args: Args = decode(args)?;
+    let external = matches!(call.target, EgressTarget::ExternalMcp);
     let Some(target) = targets(call, args.project.as_deref(), args.session.as_ref(), false)
         .await?
         .into_iter()
         .next()
     else {
-        return Ok(empty());
+        if args.cursor.is_some() {
+            return Err(invalid(ValidationReason::CursorStale));
+        }
+        return Ok(empty(external));
     };
     let mut scope = call.space(target.scope.clone())?;
-    let external = matches!(call.target, EgressTarget::ExternalMcp);
     let mut allow_user_doc = true;
     if !external {
         let selection_project = target.project.clone().or_else(|| match &call.target {
@@ -63,7 +66,7 @@ pub(super) async fn list(call: &mut ToolCallContext<'_>, args: Value) -> Result<
                 if args.cursor.is_some() {
                     return Err(invalid(ValidationReason::CursorStale));
                 }
-                return Ok(empty());
+                return Ok(empty(external));
             }
             Err(error) => return Err(error),
         };
@@ -78,7 +81,7 @@ pub(super) async fn list(call: &mut ToolCallContext<'_>, args: Value) -> Result<
                     if args.cursor.is_some() {
                         return Err(invalid(ValidationReason::CursorStale));
                     }
-                    return Ok(empty());
+                    return Ok(empty(external));
                 }
                 scope = match scope.restrict_to_project(required) {
                     Ok(narrowed) => narrowed,
@@ -86,7 +89,7 @@ pub(super) async fn list(call: &mut ToolCallContext<'_>, args: Value) -> Result<
                         if args.cursor.is_some() {
                             return Err(invalid(ValidationReason::CursorStale));
                         }
-                        return Ok(empty());
+                        return Ok(empty(external));
                     }
                 };
             }
@@ -99,7 +102,7 @@ pub(super) async fn list(call: &mut ToolCallContext<'_>, args: Value) -> Result<
                 if args.cursor.is_some() {
                     return Err(invalid(ValidationReason::CursorStale));
                 }
-                return Ok(empty());
+                return Ok(empty(external));
             }
         };
     }
@@ -114,22 +117,40 @@ pub(super) async fn list(call: &mut ToolCallContext<'_>, args: Value) -> Result<
         if args.cursor.is_some() {
             return Err(invalid(ValidationReason::CursorStale));
         }
-        return Ok(empty());
+        return Ok(empty(external));
     };
-    let folder_info = match corpus::folder_metadata(call, &scope, &folder).await {
-        Ok(info) => info,
-        Err(error) if corpus::hidden(&error) => {
+    let folder_project = folder
+        .project
+        .clone()
+        .map(|folder_id| notarium_core::model::FolderRef {
+            space_id: scope.scope().space_id.clone(),
+            folder_id,
+        });
+    if let Err(error) = corpus::admit_folder_boundary(
+        call,
+        &scope,
+        &folder.reference,
+        folder_project,
+        &folder.ancestor_folders,
+        None,
+    )
+    .await
+    {
+        if corpus::hidden(&error) {
             if args.cursor.is_some() {
                 return Err(invalid(ValidationReason::CursorStale));
             }
-            return Ok(empty());
+            return Ok(empty(external));
         }
-        Err(error) => return Err(error),
-    };
+        return Err(error);
+    }
     let schema = if args.fields.is_empty() {
         BTreeMap::new()
     } else {
-        call.registry.engine.space_schema(scope.clone()).await?
+        call.registry
+            .engine
+            .space_schema(preflight_scope.clone())
+            .await?
     };
     let filter = args.fields.compile(&schema)?;
     let tag = args.tag.map(|tag| lookup_key(&tag));
@@ -173,6 +194,16 @@ pub(super) async fn list(call: &mut ToolCallContext<'_>, args: Value) -> Result<
             return Err(invalid(ValidationReason::CursorScopeMismatch));
         }
     }
+    let folder_info = match corpus::folder_metadata(call, &scope, &folder).await {
+        Ok(info) => info,
+        Err(error) if corpus::hidden(&error) => {
+            if args.cursor.is_some() {
+                return Err(invalid(ValidationReason::CursorStale));
+            }
+            return Ok(empty(external));
+        }
+        Err(error) => return Err(error),
+    };
 
     let request = if let Some(previous) = &previous {
         previous
@@ -386,6 +417,9 @@ async fn folder_page(
     folder_info: &Value,
     handle: Option<&str>,
 ) -> Result<Option<Value>, PortError> {
+    if !allow_user_doc {
+        return Ok(None);
+    }
     let marker = |status: &str| {
         json!({
             "status": status,
@@ -394,9 +428,6 @@ async fn folder_page(
         })
     };
     if let Some(id) = &folder.cover_note {
-        if !allow_user_doc {
-            return Ok(None);
-        }
         let note = call
             .registry
             .engine
@@ -409,30 +440,31 @@ async fn folder_page(
                 },
             )
             .await;
-        let note = match note {
-            Ok(note) => note,
-            Err(error) if corpus::hidden(&error) => return Ok(None),
-            Err(error) => return Err(error),
-        };
-        let metadata = &note.metadata;
-        if metadata.class() != DocClass::UserDoc {
-            return Ok(None);
-        }
-        if metadata.reference().note_id != *id
-            || (note.parent.as_ref() != Some(&folder.reference.folder_id)
-                && (note.parent.is_some() || folder.parent.is_some()))
-        {
-            return Err(invalid(ValidationReason::InvalidState));
-        }
-        match corpus::note_metadata(call, scope, metadata).await {
-            Ok(()) => {
-                let mut page = marker("present");
-                page["noteId"] = json!(id);
-                page["versionToken"] = json!(metadata.revision());
-                page["title"] = json!(note.provenance.as_ref().map(|facts| &facts.title));
-                return Ok(Some(page));
+        match note {
+            Ok(note) => {
+                let metadata = &note.metadata;
+                if metadata.class() == DocClass::UserDoc {
+                    if metadata.reference().note_id != *id
+                        || (note.parent.as_ref() != Some(&folder.reference.folder_id)
+                            && (note.parent.is_some() || folder.parent.is_some()))
+                    {
+                        return Err(invalid(ValidationReason::InvalidState));
+                    }
+                    match corpus::note_metadata(call, scope, metadata).await {
+                        Ok(()) => {
+                            let mut page = marker("present");
+                            page["noteId"] = json!(id);
+                            page["versionToken"] = json!(metadata.revision());
+                            page["title"] =
+                                json!(note.provenance.as_ref().map(|facts| &facts.title));
+                            return Ok(Some(page));
+                        }
+                        Err(error) if corpus::hidden(&error) => (),
+                        Err(error) => return Err(error),
+                    }
+                }
             }
-            Err(error) if corpus::hidden(&error) => return Ok(None),
+            Err(error) if corpus::hidden(&error) => (),
             Err(error) => return Err(error),
         }
     }
@@ -441,7 +473,10 @@ async fn folder_page(
         let facts = match call
             .registry
             .catalog
-            .folder(call.account(), folder.reference.clone())
+            .folder(
+                call.account().with_preflight_taint(),
+                folder.reference.clone(),
+            )
             .await
         {
             Ok(facts)
@@ -475,6 +510,10 @@ async fn folder_page(
     Ok(Some(page))
 }
 
-fn empty() -> Value {
-    json!({ "items": [], "folders": [], "total": 0 })
+fn empty(external: bool) -> Value {
+    if external {
+        json!({ "items": [], "folders": [], "total": 0 })
+    } else {
+        json!({ "items": [], "folders": [] })
+    }
 }

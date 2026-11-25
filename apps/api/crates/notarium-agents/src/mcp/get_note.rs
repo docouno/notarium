@@ -50,12 +50,12 @@ async fn read(call: &mut ToolCallContext<'_>, args: Value) -> Result<NoteOutput,
             .ok_or_else(|| invalid(ValidationReason::InvalidQuery))?,
     )?;
     let detailed = args["responseFormat"].as_str() != Some("concise");
-    let (ctx, _) = corpus::locate_note(call, &note).await?;
+    let (ctx, _) = corpus::locate_note_preflight(call, &note).await?;
     let snapshot = call
         .registry
         .engine
         .get_note(
-            ctx.clone(),
+            ctx.with_preflight_taint(),
             GetNote {
                 note: note.clone(),
                 revision: None,
@@ -96,7 +96,7 @@ async fn read(call: &mut ToolCallContext<'_>, args: Value) -> Result<NoteOutput,
                 .registry
                 .engine
                 .resolve_folder_path(
-                    call.space(ctx.scope().clone())?,
+                    call.space(ctx.scope().clone())?.with_preflight_taint(),
                     snapshot.parent,
                     String::new(),
                 )

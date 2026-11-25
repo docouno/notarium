@@ -3,12 +3,13 @@ use notarium_core::{
     auth::ResourceFacts,
     classes::DocClass,
     error::{PortError, ValidationReason},
-    ids::{EpisodeId, FolderId, RevisionId},
+    ids::{EpisodeId, FolderId, RevisionId, SpaceSeq},
     model::{FolderRef, HistoryScope, Lifecycle},
     ports::{
-        FolderSnapshot, MoveFolder, Mutation, Preconditions, RenameFolder, RenameProject,
-        SpaceContext,
+        ChangeKind, ChangeRead, ChangeReadResult, EntityId, FolderSnapshot, MoveFolder, Mutation,
+        PageLimit, Preconditions, RenameFolder, RenameProject, SpaceContext,
     },
+    receipt::{ChangeCursor, MutationReceiptToken},
 };
 use notarium_syntax::unicode::validate_component;
 use serde::{Deserialize, Serialize};
@@ -334,6 +335,51 @@ async fn check_noop(
     Ok(())
 }
 
+async fn exact_folder_revision(
+    call: &ToolCallContext<'_>,
+    scope: &SpaceContext,
+    folder: &FolderId,
+    receipt: &MutationReceiptToken,
+    expected_kind: ChangeKind,
+) -> Result<RevisionId, PortError> {
+    scope.scope().check(receipt.scope())?;
+    let seq = receipt.seq();
+    let after = ChangeCursor {
+        scope: receipt.scope().clone(),
+        after: SpaceSeq::new(seq.get() - 1)?,
+    };
+    let result = call
+        .registry
+        .engine
+        .read_changes(
+            scope.with_preflight_taint(),
+            ChangeRead::Log {
+                after,
+                through: seq,
+                limit: PageLimit::new(1)?,
+            },
+        )
+        .await?;
+    let ChangeReadResult::Log(page) = result else {
+        return Err(invalid(ValidationReason::SourceMismatch));
+    };
+    if page.cutoff != seq || page.changes.len() != 1 || page.next.scope != *receipt.scope() {
+        return Err(invalid(ValidationReason::SourceMismatch));
+    }
+    let change = page.changes.into_iter().next().expect("one result");
+    if change.cursor.scope != *receipt.scope()
+        || change.cursor.after != seq
+        || change.command_range.first_seq != seq
+        || change.command_range.last_seq != seq
+        || change.entity != EntityId::Folder(folder.clone())
+        || change.kind != expected_kind
+        || change.lifecycle != Lifecycle::Active
+    {
+        return Err(invalid(ValidationReason::SourceMismatch));
+    }
+    Ok(change.revision)
+}
+
 pub(super) async fn handle(
     call: &mut ToolCallContext<'_>,
     name: ToolName,
@@ -342,10 +388,11 @@ pub(super) async fn handle(
     let parsed = parse_args(name, args)?;
     let route = call.journal("folder-route", || plan(call, &parsed)).await?;
     let scope = call.space(route.scope.clone())?;
-    if matches!(
+    let in_app = matches!(
         call.target,
         super::super::EgressTarget::InAppProvider { .. }
-    ) {
+    );
+    if in_app {
         let source = snapshot_by_id(call, &scope, &route.folder).await?;
         admit_folder_snapshot(call, &scope, &source).await?;
         if let FolderOperation::Move { parent } = &route.operation {
@@ -359,6 +406,11 @@ pub(super) async fn handle(
         ..Preconditions::default()
     };
     let folder = route.folder;
+    let expected_change_kind = match &route.operation {
+        FolderOperation::Move { .. } => Some(ChangeKind::Move),
+        FolderOperation::Rename | FolderOperation::RenameProject => Some(ChangeKind::Rename),
+        FolderOperation::Unchanged => None,
+    };
     let committed = match (route.operation, parsed) {
         (FolderOperation::Move { parent }, ParsedFolderArgs::Move(_)) => Some(
             call.registry
@@ -412,8 +464,8 @@ pub(super) async fn handle(
         (FolderOperation::Unchanged, _) => None,
         _ => return Err(invalid(ValidationReason::SourceMismatch)),
     };
-    if let Some(committed) = &committed {
-        const LABEL: &str = "notarium.mcp.folder-receipt.v1";
+    const LABEL: &str = "notarium.mcp.folder-receipt.v1";
+    if let Some(committed) = committed {
         route
             .scope
             .check(committed.receipt.scope())
@@ -429,45 +481,94 @@ pub(super) async fn handle(
                 invalid(ValidationReason::SourceMismatch),
             ));
         }
-    }
-    let outcome = if committed.is_some() {
-        "applied"
-    } else {
-        "unchanged"
-    };
-    let rendered: Result<Value, PortError> = async {
-        let current = snapshot_by_id(call, &scope, &folder).await?;
-        if committed.is_none() {
-            check_noop(call, &scope, &current, &route.revision).await?;
-        }
-        let proof = corpus::folder_metadata(call, &scope, &current).await?;
+        // Resolve the exact revision produced by this folder mutation from the
+        // immutable change log so replays never leak a later manual edit's revision.
+        let exact_rev = exact_folder_revision(
+            call,
+            &scope,
+            &folder,
+            &committed.receipt,
+            expected_change_kind.expect("committed folder op has change kind"),
+        )
+        .await
+        .map_err(|error| super::super::note_tools::post_commit_error(LABEL, error))?;
+        let snapshot = match snapshot_by_id(call, &scope, &folder).await {
+            Ok(current) => Some(current),
+            Err(error) if in_app && corpus::hidden(&error) => {
+                tracing::debug!(code = error.code(), "folder receipt metadata unavailable");
+                return Ok(json!({"outcome": "applied"}));
+            }
+            Err(PortError::Domain(DomainError::ResourceNotFound)) if !in_app => None,
+            Err(error) => return Err(super::super::note_tools::post_commit_error(LABEL, error)),
+        };
         let mut result = json!({
-            "outcome": outcome,
-            "folderId": current.reference.folder_id,
-            "path": proof["path"],
-            "versionToken": current.revision,
+            "outcome": "applied",
+            "folderId": folder,
+            "versionToken": exact_rev,
         });
-        if name == ToolName::RenameProject {
-            let space = proof["spaceSlug"]
-                .as_str()
-                .ok_or_else(|| invalid(ValidationReason::InvalidState))?;
-            let slug = proof["projectSlug"]
-                .as_str()
-                .ok_or_else(|| invalid(ValidationReason::InvalidState))?;
-            result["handle"] = Value::String(format!("{space}/{slug}"));
-            result["displayName"] = proof["name"].clone();
+        if let Some(current) = snapshot {
+            if current.revision == exact_rev {
+                let proof = match corpus::folder_metadata(call, &scope, &current).await {
+                    Ok(proof) => proof,
+                    Err(error) if in_app && corpus::hidden(&error) => {
+                        tracing::debug!(code = error.code(), "folder receipt metadata unavailable");
+                        return Ok(json!({"outcome": "applied"}));
+                    }
+                    Err(error) => {
+                        return Err(super::super::note_tools::post_commit_error(LABEL, error));
+                    }
+                };
+                result["path"] = proof["path"].clone();
+                if name == ToolName::RenameProject {
+                    let space = proof["spaceSlug"].as_str().ok_or_else(|| {
+                        super::super::note_tools::post_commit_error(
+                            LABEL,
+                            invalid(ValidationReason::InvalidState),
+                        )
+                    })?;
+                    let slug = proof["projectSlug"].as_str().ok_or_else(|| {
+                        super::super::note_tools::post_commit_error(
+                            LABEL,
+                            invalid(ValidationReason::InvalidState),
+                        )
+                    })?;
+                    result["handle"] = Value::String(format!("{space}/{slug}"));
+                    result["displayName"] = proof["name"].clone();
+                }
+            } else if in_app {
+                // Verify live provider disclosure visibility without returning
+                // a later manual edit's mutated path or display name.
+                if let Err(error) = corpus::folder_metadata(call, &scope, &current).await {
+                    if corpus::hidden(&error) {
+                        tracing::debug!(code = error.code(), "folder receipt metadata unavailable");
+                        return Ok(json!({"outcome": "applied"}));
+                    }
+                    return Err(super::super::note_tools::post_commit_error(LABEL, error));
+                }
+            }
         }
-        Ok(result)
+        return Ok(result);
     }
-    .await;
-    match rendered {
-        Ok(result) => Ok(result),
-        Err(error) if committed.is_some() => {
-            tracing::debug!(code = error.code(), "folder receipt metadata unavailable");
-            Ok(json!({"outcome": outcome}))
-        }
-        Err(error) => Err(error),
+    let current = snapshot_by_id(call, &scope, &folder).await?;
+    check_noop(call, &scope, &current, &route.revision).await?;
+    let proof = corpus::folder_metadata(call, &scope, &current).await?;
+    let mut result = json!({
+        "outcome": "unchanged",
+        "folderId": current.reference.folder_id,
+        "path": proof["path"],
+        "versionToken": current.revision,
+    });
+    if name == ToolName::RenameProject {
+        let space = proof["spaceSlug"]
+            .as_str()
+            .ok_or_else(|| invalid(ValidationReason::InvalidState))?;
+        let slug = proof["projectSlug"]
+            .as_str()
+            .ok_or_else(|| invalid(ValidationReason::InvalidState))?;
+        result["handle"] = Value::String(format!("{space}/{slug}"));
+        result["displayName"] = proof["name"].clone();
     }
+    Ok(result)
 }
 
 #[cfg(test)]

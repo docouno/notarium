@@ -365,18 +365,115 @@ async fn resolve_selector_for_account(
     Ok(by_name)
 }
 
-async fn raw_reference(
+async fn raw_reference_for_call(
     call: &ToolCallContext<'_>,
     id: AbilityId,
+    project: Option<&FolderRef>,
 ) -> Result<Option<AbilityRef>, PortError> {
-    raw_reference_for_account(call.registry, &call.account(), id).await
+    let account = call.account();
+    if matches!(call.target, EgressTarget::ExternalMcp) {
+        return raw_reference_for_account(call.registry, &account, id).await;
+    }
+    let candidates = call
+        .registry
+        .catalog
+        .locate_ability(account.clone(), id)
+        .await?;
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    let mut visible = None;
+    for candidate in candidates {
+        let inspection = match call
+            .registry
+            .control
+            .inspect_ability(account.clone(), candidate.reference.identity())
+            .await
+        {
+            Ok(inspection) => inspection,
+            Err(error) if visible_error(&error) => continue,
+            Err(error) => return Err(error),
+        };
+        if !provider_ability_allowed(call, &inspection, project) {
+            continue;
+        }
+        match read_body_inner(call, &inspection.descriptor, project, false).await {
+            Ok(_) => {
+                if visible.replace(inspection.descriptor.reference).is_some() {
+                    return Err(invalid(ValidationReason::ScopeMismatch));
+                }
+            }
+            Err(error) if visible_error(&error) => (),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(visible)
 }
 
-async fn inspect(call: &ToolCallContext<'_>, text: &str) -> Result<AbilityInspection, PortError> {
+async fn resolve_selector_for_call(
+    call: &ToolCallContext<'_>,
+    selector: &str,
+    kind: AbilityKind,
+    project: Option<FolderRef>,
+) -> Result<AbilityResolution, PortError> {
+    let account = call.account();
+    if matches!(call.target, EgressTarget::ExternalMcp) {
+        return resolve_selector_for_account(call.registry, &account, selector, kind, project)
+            .await;
+    }
+    if selector.starts_with("ar1:") {
+        let reference = parse_token(selector, "ar1:", MAX_TOKEN_BYTES)?;
+        return call
+            .registry
+            .control
+            .resolve_ability(account, AbilitySelection::Exact { reference, project })
+            .await;
+    }
+    if let Ok(id) = AbilityId::parse_v1(selector)
+        && let Some(reference) = raw_reference_for_call(call, id, project.as_ref()).await?
+    {
+        return call
+            .registry
+            .control
+            .resolve_ability(account, AbilitySelection::Exact { reference, project })
+            .await;
+    }
+    let by_name = call
+        .registry
+        .control
+        .resolve_ability(
+            account.clone(),
+            AbilitySelection::Name {
+                name: notarium_syntax::unicode::lookup_key(selector),
+                kind,
+                project: project.clone(),
+            },
+        )
+        .await?;
+    if !matches!(by_name, AbilityResolution::Missing) {
+        return Ok(by_name);
+    }
+    if let Ok(id) = AbilityId::parse(selector)
+        && let Some(reference) = raw_reference_for_call(call, id, project.as_ref()).await?
+    {
+        return call
+            .registry
+            .control
+            .resolve_ability(account, AbilitySelection::Exact { reference, project })
+            .await;
+    }
+    Ok(by_name)
+}
+
+async fn inspect_with_project(
+    call: &ToolCallContext<'_>,
+    text: &str,
+    project: Option<&FolderRef>,
+) -> Result<AbilityInspection, PortError> {
     let reference: AbilityRef = if text.starts_with("ar1:") {
         parse_token(text, "ar1:", MAX_TOKEN_BYTES)?
     } else {
-        raw_reference(call, AbilityId::parse(text)?)
+        raw_reference_for_call(call, AbilityId::parse(text)?, project)
             .await?
             .ok_or(DomainError::ResourceNotFound)?
     };
@@ -384,6 +481,10 @@ async fn inspect(call: &ToolCallContext<'_>, text: &str) -> Result<AbilityInspec
         .control
         .inspect_ability(call.account(), reference.identity())
         .await
+}
+
+async fn inspect(call: &ToolCallContext<'_>, text: &str) -> Result<AbilityInspection, PortError> {
+    inspect_with_project(call, text, None).await
 }
 
 #[derive(Clone, Debug)]
@@ -404,6 +505,13 @@ struct AbilityTaintCommit {
 }
 
 impl AbilityTaintCommit {
+    fn would_taint_branch(&self) -> bool {
+        self.scope
+            .auth()
+            .pinned_write_space()
+            .is_some_and(|pin| pin != &self.scope.scope().space_id)
+    }
+
     fn commit(self) -> Result<(), PortError> {
         match self.selection {
             Some(selection) => {
@@ -499,14 +607,6 @@ fn requested_project(
         .cloned()
 }
 
-async fn read_body(
-    call: &ToolCallContext<'_>,
-    descriptor: &AbilityDescriptor,
-    hint: Option<&FolderRef>,
-) -> Result<AbilityBody, PortError> {
-    read_body_inner(call, descriptor, hint, true).await
-}
-
 async fn read_body_inner(
     call: &ToolCallContext<'_>,
     descriptor: &AbilityDescriptor,
@@ -563,15 +663,6 @@ struct ResourceBody {
     origin: ProviderOrigin,
     project: Option<FolderRef>,
     deferred_taint: Option<AbilityTaintCommit>,
-}
-
-async fn read_owned_resource(
-    call: &ToolCallContext<'_>,
-    descriptor: &AbilityDescriptor,
-    hint: Option<&FolderRef>,
-    resource: AbilityResourceName,
-) -> Result<ResourceBody, PortError> {
-    read_owned_resource_inner(call, descriptor, hint, resource, true).await
 }
 
 async fn read_owned_resource_inner(
@@ -951,19 +1042,23 @@ pub(super) async fn session_ability_summaries(
 async fn get(call: &mut ToolCallContext<'_>, args: GetArgs) -> Result<Value, PortError> {
     let episode = load_episode(call, args.session.as_ref()).await?;
     let project = session::selected_project_for_episode(call, None, episode.as_ref()).await?;
-    let inspection = inspect(call, &args.reference)
+    let inspection = inspect_with_project(call, &args.reference, project.as_ref())
         .await
         .map_err(|error| collapse_provider_error(call, error))?;
     if !provider_ability_allowed(call, &inspection, project.as_ref()) {
         return Err(DomainError::ResourceNotFound.into());
     }
-    let body = read_body(call, &inspection.descriptor, project.as_ref())
+    let body = read_body_inner(call, &inspection.descriptor, project.as_ref(), false)
         .await
         .map_err(|error| collapse_provider_error(call, error))?;
     let mut bytes = body.instructions.len();
     let in_app = matches!(call.target, EgressTarget::InAppProvider { .. });
     if in_app && bytes > MAX_IN_APP_PACKAGE_BODY_BYTES {
         return Err(invalid(ValidationReason::BudgetExceeded));
+    }
+    let mut deferred_taints = Vec::new();
+    if let Some(taint) = body.deferred_taint {
+        deferred_taints.push(taint);
     }
     let mut result = summary(
         &inspection,
@@ -975,11 +1070,12 @@ async fn get(call: &mut ToolCallContext<'_>, args: GetArgs) -> Result<Value, Por
     let mut files = Vec::new();
     let mut resources = Vec::new();
     for path in &inspection.descriptor.auxiliary_files {
-        let resource = match read_owned_resource(
+        let resource = match read_owned_resource_inner(
             call,
             &inspection.descriptor,
             project.as_ref(),
             AbilityResourceName::Auxiliary(path.clone()),
+            false,
         )
         .await
         {
@@ -994,6 +1090,9 @@ async fn get(call: &mut ToolCallContext<'_>, args: GetArgs) -> Result<Value, Por
             return Err(invalid(ValidationReason::BudgetExceeded));
         }
         call.record_origin(resource.origin, resource.project)?;
+        if let Some(taint) = resource.deferred_taint {
+            deferred_taints.push(taint);
+        }
         files.push(path.clone());
         resources.push(json!({"path":path,"content":resource.text}));
     }
@@ -1013,8 +1112,13 @@ async fn get(call: &mut ToolCallContext<'_>, args: GetArgs) -> Result<Value, Por
             if !inspection.descriptor.healthy {
                 child = None;
             } else {
-                match read_body(call, &inspection.descriptor, project.as_ref()).await {
-                    Ok(body) => call.record_origin(body.origin, body.project)?,
+                match read_body_inner(call, &inspection.descriptor, project.as_ref(), false).await {
+                    Ok(body) => {
+                        call.record_origin(body.origin, body.project)?;
+                        if let Some(taint) = body.deferred_taint {
+                            deferred_taints.push(taint);
+                        }
+                    }
                     Err(error) if visible_error(&error) => child = None,
                     Err(error) => return Err(error),
                 }
@@ -1035,6 +1139,9 @@ async fn get(call: &mut ToolCallContext<'_>, args: GetArgs) -> Result<Value, Por
     }
     result["attachments"] = json!(attachments);
     call.record_origin(body.origin, body.project)?;
+    for taint in deferred_taints {
+        taint.commit()?;
+    }
     Ok(result)
 }
 
@@ -1072,15 +1179,9 @@ async fn resolve(
     kind: AbilityKind,
     project: Option<FolderRef>,
 ) -> Result<AbilityDescriptor, PortError> {
-    let resolved = resolve_selector_for_account(
-        call.registry,
-        &call.account(),
-        selector,
-        kind,
-        project.clone(),
-    )
-    .await
-    .map_err(|error| collapse_provider_error(call, error))?;
+    let resolved = resolve_selector_for_call(call, selector, kind, project.clone())
+        .await
+        .map_err(|error| collapse_provider_error(call, error))?;
     let in_app = matches!(call.target, EgressTarget::InAppProvider { .. });
     let ability = match resolved {
         AbilityResolution::Resolved(ability) if ability.kind == kind => *ability,
@@ -1194,7 +1295,7 @@ async fn use_ability(
         session::selected_project_for_episode(call, args.project.as_deref(), episode.as_ref())
             .await?;
     let descriptor = resolve(call, &selector, kind, project.clone()).await?;
-    let rendered = activation(
+    let (rendered, deferred_taints) = activation(
         call,
         &descriptor,
         project.as_ref(),
@@ -1205,7 +1306,17 @@ async fn use_ability(
         && let Some(episode) = episode.as_ref()
         && call.auth.chat_audience() != Some(ChatAudience::Shared)
     {
+        if call.auth.taint().is_tainted()
+            || deferred_taints
+                .iter()
+                .any(AbilityTaintCommit::would_taint_branch)
+        {
+            return Err(DomainError::CrossSpaceTainted.into());
+        }
         save_active_role(call, episode, &descriptor.reference, project).await?;
+    }
+    for taint in deferred_taints {
+        taint.commit()?;
     }
     Ok(rendered)
 }
@@ -1216,7 +1327,7 @@ pub(super) async fn validate_session_role(
     project: Option<&FolderRef>,
 ) -> Result<(), PortError> {
     let descriptor = resolve(call, selector, AbilityKind::Role, project.cloned()).await?;
-    let body = read_body(call, &descriptor, project)
+    let body = read_body_inner(call, &descriptor, project, false)
         .await
         .map_err(|error| collapse_provider_error(call, error))?;
     if body.instructions.len() > MAX_ACTIVATION_TOKENS {
@@ -1247,7 +1358,7 @@ pub(super) async fn activate_session_role(
             .await
             .map_err(|error| collapse_provider_error(call, error))?
     };
-    let body = read_body(call, &descriptor, project.as_ref())
+    let body = read_body_inner(call, &descriptor, project.as_ref(), false)
         .await
         .map_err(|error| collapse_provider_error(call, error))?;
     let budget = if body.instructions.len() <= MAX_ACTIVATION_TOKENS {
@@ -1257,9 +1368,20 @@ pub(super) async fn activate_session_role(
     } else {
         return Ok(None);
     };
-    let rendered = activation_with_body(call, &descriptor, project.as_ref(), body, budget).await?;
+    let (rendered, deferred_taints) =
+        activation_with_body(call, &descriptor, project.as_ref(), body, budget).await?;
     if explicit.is_some() && call.auth.bearer_scope() != Some(BearerScope::Read) {
+        if call.auth.taint().is_tainted()
+            || deferred_taints
+                .iter()
+                .any(AbilityTaintCommit::would_taint_branch)
+        {
+            return Err(DomainError::CrossSpaceTainted.into());
+        }
         save_active_role(call, episode, &descriptor.reference, project).await?;
+    }
+    for taint in deferred_taints {
+        taint.commit()?;
     }
     Ok(Some(rendered))
 }
@@ -1333,8 +1455,8 @@ async fn activation(
     descriptor: &AbilityDescriptor,
     project: Option<&FolderRef>,
     budget: usize,
-) -> Result<Value, PortError> {
-    let body = read_body(call, descriptor, project)
+) -> Result<(Value, Vec<AbilityTaintCommit>), PortError> {
+    let body = read_body_inner(call, descriptor, project, false)
         .await
         .map_err(|error| collapse_provider_error(call, error))?;
     activation_with_body(call, descriptor, project, body, budget).await
@@ -1346,11 +1468,15 @@ async fn activation_with_body(
     project: Option<&FolderRef>,
     body: AbilityBody,
     budget: usize,
-) -> Result<Value, PortError> {
+) -> Result<(Value, Vec<AbilityTaintCommit>), PortError> {
     // Each UTF-8 byte can be a token in a byte-fallback tokenizer.
     let mut remaining = budget
         .checked_sub(body.instructions.len())
         .ok_or_else(|| invalid(ValidationReason::BudgetExceeded))?;
+    let mut deferred_taints = Vec::new();
+    if let Some(taint) = body.deferred_taint {
+        deferred_taints.push(taint);
+    }
     let mut skills = Vec::new();
     let mut omitted = Vec::new();
     for dependency in &descriptor.attached_skills {
@@ -1361,7 +1487,7 @@ async fn activation_with_body(
             && inspection.preference_enabled
             && inspection.descriptor.healthy
         {
-            match read_body(call, &inspection.descriptor, project).await {
+            match read_body_inner(call, &inspection.descriptor, project, false).await {
                 Ok(child) if child.instructions.len() <= remaining => {
                     remaining -= child.instructions.len();
                     let row = json!({
@@ -1370,6 +1496,9 @@ async fn activation_with_body(
                         "instructions":child.instructions,
                     });
                     call.record_origin(child.origin, child.project)?;
+                    if let Some(taint) = child.deferred_taint {
+                        deferred_taints.push(taint);
+                    }
                     skills.push(row);
                     added = true;
                 }
@@ -1383,12 +1512,15 @@ async fn activation_with_body(
         }
     }
     call.record_origin(body.origin, body.project)?;
-    Ok(json!({
-        "ref":reference_token(&descriptor.reference)?,
-        "name":descriptor.name,
-        "kind":kind_name(descriptor.kind),
-        "instructions":body.instructions,
-        "skills":skills,
-        "omittedSkills":omitted,
-    }))
+    Ok((
+        json!({
+            "ref":reference_token(&descriptor.reference)?,
+            "name":descriptor.name,
+            "kind":kind_name(descriptor.kind),
+            "instructions":body.instructions,
+            "skills":skills,
+            "omittedSkills":omitted,
+        }),
+        deferred_taints,
+    ))
 }

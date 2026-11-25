@@ -111,6 +111,7 @@ fn overlay_state(
         preference_revision: preference
             .map(|row| ControlRevision::new(row.revision as u64))
             .transpose()?,
+        availability: None,
     })
 }
 

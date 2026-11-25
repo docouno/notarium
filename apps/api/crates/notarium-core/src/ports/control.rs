@@ -266,6 +266,8 @@ pub struct AbilityOverlayState {
     pub binding_enabled: bool,
     pub preference_revision: Option<ControlRevision>,
     pub preference_enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub availability: Option<AbilityProjects>,
 }
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct AbilityPromotionResult {

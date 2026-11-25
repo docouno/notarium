@@ -82,8 +82,9 @@ canonical folder paths and cover notes. Search, recall and detailed note views
 delegate to the injected ports. Recall budgets apply to approved chunks, with
 a per-source token cap that defaults to half the requested budget.
 External results use the current class and read fences. Provider results also
-require consent for the actual source and its project placement. Encrypted
-notes are excluded from both surfaces.
+require consent for the actual source and its project placement, including
+`promoted_from` provenance for Space abilities promoted from a project and
+republished at Space scope. Encrypted notes are excluded from both surfaces.
 
 Search and recall use the configured embedding provider for clean query text
 within a run's pinned Space under the same provider, project and class consent
@@ -95,11 +96,12 @@ active completion provider, and a project-only remote embedder also requires
 that every prior non-query disclosure in the run (and its active completion
 provider) stayed confined to that same project; otherwise remote query embedding
 degrades cleanly to lexical search with `provider_unavailable` (and direct
-embedding calls fail with `ClassEgressForbidden`). Recipient-filtered in-app
-searches keep projection and candidate preflight untainted until an admitted
-hit is delivered, while remote query embedding remains confined to the run's
-pinned Space (`authorize_remote_embedding_query`); direct non-recipient
-projection opens still taint on open. An unavailable remote embedding leaves
+embedding calls fail with `ClassEgressForbidden`). `SearchEngine` keeps
+projection and candidate preflight untainted until a surviving hit is delivered
+(after live visibility and recall packing), while remote query embedding remains
+confined to the run's pinned Space (`authorize_remote_embedding_query`); direct
+projection opens (`StructuralReadPort::acquire_snapshot` / `hydrate`) still
+taint on open. An unavailable remote embedding leaves
 full-text matches available and reports `provider_unavailable`. A scheduled
 Keeper's approved role and skills must still be current at dispatch. The
 embedding request carries only the query text.
@@ -107,8 +109,9 @@ embedding request carries only the query text.
 ## Chat runs and confirmation
 
 `AgentRunSupervisor` drives completion and tool calls for a canonical branch.
-A Personal run pins writes to its personal Space. External content reads taint
-that branch and its descendants. A reversible note or memory action with a
+A Personal run pins writes to its thread's Space (Personal or Shared). External
+content reads from other Spaces taint that branch and its descendants. A
+reversible note or memory action with a
 tainted branch or an out-of-Space target can produce a proposal when the
 interactive owner has permission on the target. The tool entry records the
 action and observed revision or expected absence. The supervisor emits an

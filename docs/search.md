@@ -225,9 +225,10 @@ token limits. Dispatch compares both resolved runtime generations and checks
 the shared taint. Chat runs and Keepers can disclose a query only in their
 pinned Space: `authorize_remote_embedding_query` blocks remote query embedding
 in any non-pinned Space locally so the lexical path serves cross-Space queries
-without disclosing query text, while recipient-filtered in-app searches defer
-cross-Space branch taint until an admitted hit is delivered (direct
-non-recipient snapshot opens still taint on open). A scheduled Keeper
+without disclosing query text, while `SearchEngine` defers cross-Space branch
+taint during snapshot, candidate, and recall-packing preflight until a
+surviving hit is delivered (direct `StructuralReadPort` opens still taint on
+open). A scheduled Keeper
 also needs a live lease and current approval of its role and skills. Query
 embedding sends the query text alone. Remote indexing excludes descendants of
 trashed folders. Chat transcript indexing stays lexical.

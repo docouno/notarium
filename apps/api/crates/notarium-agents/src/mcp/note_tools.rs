@@ -769,8 +769,11 @@ async fn receipt_result(
         }
         .await;
         if let Err(error) = read {
-            tracing::debug!(code = error.code(), "note receipt metadata unavailable");
-            return Ok(json!({ "outcome": outcome }));
+            if corpus::hidden(&error) {
+                tracing::debug!(code = error.code(), "note receipt metadata unavailable");
+                return Ok(json!({ "outcome": outcome }));
+            }
+            return Err(post_commit_error(LABEL, error));
         }
     }
     Ok(json!({

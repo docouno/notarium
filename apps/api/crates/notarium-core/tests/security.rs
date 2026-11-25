@@ -1229,7 +1229,7 @@ fn provider_policy_rejection_does_not_flip_cross_space_branch_taint() {
     let ability_loc = AbilityResourceLocation {
         placement: AbilityPlacement::OwnedSpace(space2.clone()),
         facts: ResourceFacts {
-            space: s2,
+            space: s2.clone(),
             class: DocClass::Skill,
             project: None,
             ancestor_folders: vec![FolderId::from_bytes([2; 16])],
@@ -1254,9 +1254,46 @@ fn provider_policy_rejection_does_not_flip_cross_space_branch_taint() {
         ContentDigest::from_bytes([5; 32]),
     )
     .unwrap();
-    assert!(ClassEgressFence::ability(ability, &auth, &user_doc_only).is_err());
+    assert!(ClassEgressFence::ability(ability.clone(), &auth, &user_doc_only).is_err());
     assert!(
         !auth.taint().is_tainted(),
         "policy-rejected ability must not flip cross-space BranchTaint"
+    );
+
+    // Chat policy rejection must also leave cross-space BranchTaint clean,
+    // while an allowing policy flips BranchTaint on delivery.
+    let chat_entry = CanonicalChatContent::from_canonical(
+        s2.clone(),
+        ChatThreadId::from_bytes([6; 16]),
+        ThreadEntrySeq::new(1).unwrap(),
+        false,
+        "hello".into(),
+        ContentDigest::from_bytes([6; 32]),
+        None,
+    );
+    let unconsented_chat = ProviderPolicy {
+        provider: ProviderResourceId::from_bytes([9; 16]),
+        allowed_classes: [DocClass::UserDoc].into(),
+        audience: ProviderAudience::Personal { consented: false },
+    };
+    assert!(ClassEgressFence::chat(chat_entry.clone(), &auth, &unconsented_chat).is_err());
+    assert!(
+        !auth.taint().is_tainted(),
+        "policy-rejected chat entry must not flip cross-space BranchTaint"
+    );
+    let consented_chat = ProviderPolicy {
+        provider: ProviderResourceId::from_bytes([9; 16]),
+        allowed_classes: [DocClass::UserDoc].into(),
+        audience: ProviderAudience::Shared {
+            space: s2.id.clone(),
+            attached: true,
+            space_consented: true,
+            sender_consented: true,
+        },
+    };
+    assert!(ClassEgressFence::chat(chat_entry, &auth, &consented_chat).is_ok());
+    assert!(
+        auth.taint().is_tainted(),
+        "admitted cross-space chat entry MUST flip BranchTaint"
     );
 }

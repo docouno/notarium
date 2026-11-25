@@ -149,24 +149,32 @@ async fn exercise_authoring_settlement(fixture: &RuntimeFixture) {
         inspect().await.unwrap().overlays.preference_revision,
         state.preference_revision
     );
-    // Exact replay of an earlier authoring edit replays its overlay receipt
-    // without mutating state, and fails at the final current-package check
-    // rather than returning a partial overlay error or a later package version.
+    // Exact replay of an earlier authoring edit replays its original committed
+    // receipt without mutating state or leaking later package/overlay edits.
     let earlier_replay = call(fixture, owner, 2, "edit_ability", edit)
         .await
-        .err()
-        .expect("replaying an older edit after a newer publication must report RevisionConflict");
-    assert!(
-        matches!(
-            earlier_replay,
-            PortError::Domain(DomainError::RevisionConflict { .. })
-        ),
-        "{earlier_replay:?}"
-    );
+        .expect("replaying an earlier committed edit must return its exact original receipt");
+    assert_eq!(earlier_replay.structured_content, updated);
     assert_eq!(
         inspect().await.unwrap().overlays.preference_revision,
         state.preference_revision
     );
+
+    // Replay of create_ability after later manual package & overlay edits must
+    // still return the exact original creation receipt (original versionToken).
+    let create_replay = call(
+        fixture,
+        owner,
+        1,
+        "create_ability",
+        json!({
+            "kind":"role", "name":"settlement-guide", "description":"Test guide",
+            "instructions":"Initial guide", "placement":{"home":"personal"},
+        }),
+    )
+    .await
+    .expect("replaying create_ability after later edits must return exact original receipt");
+    assert_eq!(create_replay.structured_content, created);
 
     let current = inspect().await.unwrap();
     fixture
@@ -743,19 +751,14 @@ async fn binding_replay_after_advance_and_trash(
         .unwrap();
     assert_eq!(replayed_direct_r2.value.reference, r1_ref);
     assert_eq!(replayed_direct_r2.revision, direct_committed.revision);
-    // MCP edit_ability(availability) replay fails cleanly at bound_ability with RevisionConflict (never Ok(partial)).
+    // MCP edit_ability(availability) replay returns the exact original receipt
+    // without mutating state or leaking later R2 package/binding revisions.
     let replayed_avail_r2 = call(fixture, human, 0xe1, "edit_ability", avail_edit.clone())
         .await
-        .err()
-        .expect("replaying availability edit after R1 -> R2 must return RevisionConflict");
-    assert!(
-        matches!(
-            replayed_avail_r2,
-            PortError::Domain(DomainError::RevisionConflict { .. })
-        ),
-        "{replayed_avail_r2:?}"
-    );
-    // Trash R2 and verify exact replays still succeed at ControlPort and fail cleanly (not partial) at MCP.
+        .expect("replaying availability edit after R1 -> R2 must return exact original receipt");
+    assert_eq!(replayed_avail_r2.structured_content, updated);
+    // Trash R2 and verify exact replays still return the exact committed receipt
+    // at both ControlPort and MCP (while authored edits fail cleanly on trash).
     call(
         fixture,
         human,
@@ -773,15 +776,8 @@ async fn binding_replay_after_advance_and_trash(
     assert_eq!(replayed_direct_trashed.value.reference, r1_ref);
     let replayed_avail_trashed = call(fixture, human, 0xe1, "edit_ability", avail_edit)
         .await
-        .err()
-        .expect("replaying availability edit after trash must return ResourceNotFound");
-    assert!(
-        matches!(
-            replayed_avail_trashed,
-            PortError::Domain(DomainError::ResourceNotFound)
-        ),
-        "{replayed_avail_trashed:?}"
-    );
+        .expect("replaying availability edit after trash must return exact original receipt");
+    assert_eq!(replayed_avail_trashed.structured_content, updated);
     // Replaying an authored edit after trash must propagate ResourceNotFound
     // instead of wrapping a zero-step failure as Ok(partial).
     let replayed_authored_trashed = call(fixture, human, 0xe4, "edit_ability", r2_edit)

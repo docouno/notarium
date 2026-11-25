@@ -365,53 +365,30 @@ fn post_commit_step_error(label: &str, error: PortError, committed: bool) -> Por
     super::super::note_tools::batch_operational_error(label, error, committed)
 }
 
-fn post_commit_ability_read_error(label: &str, error: PortError, committed: bool) -> PortError {
-    if !committed {
-        return super::super::note_tools::batch_operational_error(label, error, false);
-    }
-    if matches!(
-        error,
-        PortError::Domain(
-            DomainError::RevisionConflict { .. }
-                | DomainError::ResourceNotFound
-                | DomainError::AuthenticationFailed
-                | DomainError::AccessDenied
-        )
-    ) {
-        return error;
-    }
-    super::super::note_tools::post_commit_error(label, error)
-}
-
-async fn bound_ability(
-    call: &ToolCallContext<'_>,
+#[allow(clippy::too_many_arguments)]
+fn committed_response(
     reference: &AbilityRef,
-) -> Result<AbilityInspection, PortError> {
-    let inspection = call
-        .registry
-        .control
-        .inspect_ability(call.account(), reference.identity())
-        .await?;
-    if &inspection.descriptor.reference != reference {
-        return Err(DomainError::RevisionConflict {
-            current: inspection.descriptor.reference.revision,
-            lineage: None,
-        }
-        .into());
-    }
-    Ok(inspection)
-}
-
-fn write_response(inspection: &AbilityInspection, outcome: &str) -> Result<Value, PortError> {
+    binding_revision: ControlRevision,
+    name: &str,
+    kind: AbilityKind,
+    projects: &AbilityProjects,
+    enabled: bool,
+    healthy: bool,
+    outcome: &str,
+) -> Result<Value, PortError> {
+    let version = Version {
+        package: reference.revision.clone(),
+        binding: binding_revision,
+    };
     Ok(json!({
-        "ref":reference_token(&inspection.descriptor.reference)?,
-        "versionToken":Version::from_inspection(inspection).encode()?,
-        "name":inspection.descriptor.name,
-        "kind":kind_name(inspection.descriptor.kind),
-        "availability":availability(&inspection.availability),
-        "enabled":inspection.descriptor.enabled && inspection.binding_enabled && inspection.preference_enabled,
-        "healthy":inspection.descriptor.healthy,
-        "outcome":outcome,
+        "ref": reference_token(reference)?,
+        "versionToken": version.encode()?,
+        "name": name,
+        "kind": kind_name(kind),
+        "availability": availability(projects),
+        "enabled": enabled,
+        "healthy": healthy,
+        "outcome": outcome,
     }))
 }
 
@@ -480,7 +457,7 @@ pub(super) async fn create(
                     note: note_id.clone(),
                     parent: Some(parent),
                     class: DocClass::Skill,
-                    slug,
+                    slug: slug.clone(),
                     carrier,
                     folder_page: false,
                 },
@@ -537,7 +514,7 @@ pub(super) async fn create(
                 input: AbilityBindingUpdate {
                     ability: reference.clone(),
                     enabled: true,
-                    projects: plan.availability,
+                    projects: plan.availability.clone(),
                     expected: AbilityOverlayGuard::Authored(None),
                 },
             },
@@ -546,21 +523,16 @@ pub(super) async fn create(
         .map_err(|error| {
             super::super::note_tools::batch_operational_error(CREATE_LABEL, error, true)
         })?;
-    match bound_ability(call, &reference).await {
-        Ok(descriptor) => write_response(&descriptor, "created"),
-        Err(PortError::Domain(
-            DomainError::RevisionConflict { .. } | DomainError::ResourceNotFound,
-        )) => Ok(json!({
-            "ref": reference_token(&reference)?,
-            "name": args.name,
-            "kind": kind_name(kind),
-            "outcome": "created",
-        })),
-        Err(error) => Err(super::super::note_tools::post_commit_error(
-            CREATE_LABEL,
-            error,
-        )),
-    }
+    committed_response(
+        &reference,
+        ControlRevision::new(1)?,
+        &slug,
+        kind,
+        &plan.availability,
+        true,
+        true,
+        "created",
+    )
 }
 
 #[derive(Serialize, Deserialize)]
@@ -572,6 +544,8 @@ struct EditPlan {
     kind: Kind,
     slug: String,
     overlays: AbilityOverlayState,
+    initial_availability: AbilityProjects,
+    initial_healthy: bool,
     requested_skills: Option<Vec<AbilityRef>>,
     requested_availability: Option<AbilityProjects>,
     account_revision: ControlRevision,
@@ -679,6 +653,8 @@ async fn edit_plan(call: &ToolCallContext<'_>, args: &EditArgs) -> Result<EditPl
         kind: kind_value(descriptor.kind),
         slug: descriptor.name,
         overlays: inspection.overlays,
+        initial_availability: inspection.availability,
+        initial_healthy: descriptor.healthy,
         requested_skills,
         requested_availability,
         account_revision: ControlRevision::ZERO,
@@ -765,26 +741,22 @@ fn is_partial_step_error(error: &PortError) -> bool {
     )
 }
 
-async fn edit_result(
-    call: &ToolCallContext<'_>,
+fn edit_result(
     reference: &AbilityRef,
+    binding_revision: ControlRevision,
     steps: Vec<Value>,
     error: Option<&PortError>,
 ) -> Result<Value, PortError> {
-    let mut output = json!({
+    let version = Version {
+        package: reference.revision.clone(),
+        binding: binding_revision,
+    };
+    Ok(json!({
         "ref": reference_token(reference)?,
+        "versionToken": version.encode()?,
         "steps": steps,
         "outcome": if error.is_some() { "partial" } else { "updated" },
-    });
-    if let Ok(inspection) = call
-        .registry
-        .control
-        .inspect_ability(call.account(), reference.identity())
-        .await
-    {
-        output["versionToken"] = json!(Version::from_inspection(&inspection).encode()?);
-    }
-    Ok(output)
+    }))
 }
 
 pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<Value, PortError> {
@@ -980,7 +952,12 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
                 },
             );
         }
-        return edit_result(call, report_ref, steps, Some(&error)).await;
+        let partial_binding_rev = promotion
+            .as_ref()
+            .map_or(&plan.overlays, |settled| &settled.destination)
+            .binding_revision
+            .unwrap_or(ControlRevision::ZERO);
+        return edit_result(report_ref, partial_binding_rev, steps, Some(&error));
     }
     let mut applied_any = authored_changed || promotion.is_some();
     steps.push(change_step(
@@ -1005,6 +982,11 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
     let overlays = promotion
         .as_ref()
         .map_or(&plan.overlays, |settled| &settled.destination);
+    let mut committed_binding_rev = overlays.binding_revision.unwrap_or(ControlRevision::ZERO);
+    let mut committed_availability = promotion
+        .as_ref()
+        .and_then(|settled| settled.destination.availability.clone())
+        .unwrap_or_else(|| plan.initial_availability.clone());
     if let Some(availability) = plan.requested_availability {
         let result = if let Some(promotion) = &promotion
             && promotion.source.binding_revision != plan.overlays.binding_revision
@@ -1030,7 +1012,7 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
                         input: AbilityBindingUpdate {
                             ability: reference.clone(),
                             enabled: overlays.binding_enabled,
-                            projects: availability,
+                            projects: availability.clone(),
                             expected: AbilityOverlayGuard::Authored(overlays.binding_revision),
                         },
                     },
@@ -1040,6 +1022,13 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
         match result {
             Ok(_) => {
                 applied_any = true;
+                let next_rev = overlays
+                    .binding_revision
+                    .map_or(0, ControlRevision::get)
+                    .checked_add(1)
+                    .ok_or_else(|| invalid(ValidationReason::InvalidState))?;
+                committed_binding_rev = ControlRevision::new(next_rev)?;
+                committed_availability = availability;
                 steps.push(change_step("availability", "applied", None));
             }
             Err(error) => {
@@ -1048,13 +1037,14 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
                 }
                 steps.push(change_step("availability", "failed", Some(&error)));
                 steps.push(change_step("enabled", "skipped", None));
-                return edit_result(call, &reference, steps, Some(&error)).await;
+                return edit_result(&reference, committed_binding_rev, steps, Some(&error));
             }
         }
     } else {
         steps.push(change_step("availability", "skipped", None));
     }
 
+    let mut committed_preference_enabled = overlays.preference_enabled;
     let promotion_preference_conflict = promotion
         .as_ref()
         .filter(|settled| settled.source.preference_revision != plan.overlays.preference_revision)
@@ -1097,7 +1087,7 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
         .await;
         match result {
             Ok(_) => {
-                applied_any = true;
+                committed_preference_enabled = enabled;
                 steps.push(change_step("enabled", "applied", None));
             }
             Err(error) => {
@@ -1105,16 +1095,28 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
                     return Err(post_commit_step_error(EDIT_LABEL, error, applied_any));
                 }
                 steps.push(change_step("enabled", "failed", Some(&error)));
-                return edit_result(call, &reference, steps, Some(&error)).await;
+                return edit_result(&reference, committed_binding_rev, steps, Some(&error));
             }
         }
     } else {
         steps.push(change_step("enabled", "skipped", None));
     }
-    let descriptor = bound_ability(call, &reference)
-        .await
-        .map_err(|error| post_commit_ability_read_error(EDIT_LABEL, error, applied_any))?;
-    let mut result = write_response(&descriptor, "updated")?;
+    let committed_healthy = if authored_changed || promotion.is_some() {
+        true
+    } else {
+        plan.initial_healthy
+    };
+    let committed_enabled = overlays.binding_enabled && committed_preference_enabled;
+    let mut result = committed_response(
+        &reference,
+        committed_binding_rev,
+        &plan.slug,
+        AbilityKind::from(plan.kind),
+        &committed_availability,
+        committed_enabled,
+        committed_healthy,
+        "updated",
+    )?;
     result["steps"] = json!(steps);
     Ok(result)
 }

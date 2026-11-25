@@ -89,7 +89,7 @@ async fn admit_proposal_targets(
     match call.tool {
         ToolName::EditNote | ToolName::DeleteNote | ToolName::MoveNote | ToolName::RenameNote => {
             let note_id = reference(args, "ref")?;
-            let (scope, note) = corpus::locate_note(call, &note_id)
+            let (scope, note) = corpus::locate_note_preflight(call, &note_id)
                 .await
                 .map_err(collapse)?;
             corpus::admit_provider_note_read(call, &scope, &note)
@@ -109,7 +109,10 @@ async fn admit_proposal_targets(
             let folder = call
                 .registry
                 .catalog
-                .folder(call.account(), project.folder.clone())
+                .folder(
+                    call.account().with_preflight_taint(),
+                    project.folder.clone(),
+                )
                 .await
                 .map_err(collapse)?;
             corpus::admit_folder_write(
@@ -125,7 +128,7 @@ async fn admit_proposal_targets(
         }
         ToolName::Link => {
             let note_id = reference(args, "from")?;
-            let (scope, note) = corpus::locate_note(call, &note_id)
+            let (scope, note) = corpus::locate_note_preflight(call, &note_id)
                 .await
                 .map_err(collapse)?;
             corpus::admit_provider_note_read(call, &scope, &note)
@@ -200,9 +203,6 @@ pub(super) async fn prepare(
     args: Value,
 ) -> Result<Draft, PortError> {
     personal_source(call, binding).await?;
-    // Mark external-read taint before probing or planning via detached human
-    // authority so failed probes cannot remain untainted.
-    call.auth.taint().mark_external_read();
     let owner = call
         .registry
         .control
@@ -212,9 +212,12 @@ pub(super) async fn prepare(
         )
         .await?;
     let planning = call.detached_human(owner);
-    // Enforce live InAppProvider consent before reading any note content,
-    // titles, or running find/replace under detached human authority.
+    // Enforce live InAppProvider consent and bounds before marking external
+    // taint or reading any note content/titles under detached human authority.
     admit_proposal_targets(call, &planning, &args).await?;
+    // Mark external-read taint before probing or planning via detached human
+    // authority so failed probes cannot remain untainted.
+    call.auth.taint().mark_external_read();
     let action = match call.tool {
         ToolName::Link | ToolName::LinkMany => {
             ProposedAction::Links(organize::plan_links(&planning, call, call.tool, args).await?)
@@ -545,7 +548,7 @@ pub(super) async fn needs_proposal(
             } else {
                 "ref"
             };
-            let (scope, _) = corpus::locate_note(call, &reference(args, arg)?).await?;
+            let (scope, _) = corpus::locate_note_preflight(call, &reference(args, arg)?).await?;
             external(&scope.scope().space_id)
         }
         ToolName::LinkMany => {
@@ -556,7 +559,7 @@ pub(super) async fn needs_proposal(
                 let Ok(note) = reference(item, "from") else {
                     continue;
                 };
-                match corpus::locate_note(call, &note).await {
+                match corpus::locate_note_preflight(call, &note).await {
                     Ok((scope, _)) if external(&scope.scope().space_id) => return Ok(true),
                     Ok(_) => (),
                     Err(error) if corpus::hidden(&error) => (),

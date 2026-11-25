@@ -1070,6 +1070,7 @@ impl NextSlotRetry {
             self.last_clock = self.last_clock.max(latest);
             self.forward_cursor = latest;
             let latest_candidate = next(latest)?;
+            self.backward_state = (self.slot < latest).then_some((latest, latest_candidate));
             if !self.tried.contains(&latest_candidate) {
                 if let Some(ts) = latest_candidate {
                     self.forward_cursor = self.forward_cursor.max(ts);
@@ -1266,6 +1267,24 @@ mod tests {
             cand0,
             Some(Timestamp::parse("2026-03-05T10:01:00Z").unwrap()),
             "mid-loop backward NTP jump must reach 10:01:00 on step 0"
+        );
+
+        // Case 3: Mid-loop forward NTP overshoot (`latest > forward_cursor`).
+        // Clock starts at `slot` (10:00:00), Control is at 10:05:30 (expects 10:06:00),
+        // then NTP jumps forward to 10:08:30 on step 0; re-anchored `backward_state`
+        // must rewind into `(10:00:00, 10:08:30]` and reach 10:06:00 within retries.
+        let initial_slot = next(slot).unwrap();
+        let mut forward_jump = NextSlotRetry::new(slot, slot, slot, initial_slot);
+        let jumped = Timestamp::parse("2026-03-05T10:08:30Z").unwrap();
+        let mut forward_probed = Vec::new();
+        for step in 0..8 {
+            if let Some(cand) = forward_jump.next_candidate(jumped, step, &next).unwrap() {
+                forward_probed.push(cand);
+            }
+        }
+        assert!(
+            forward_probed.contains(&Some(Timestamp::parse("2026-03-05T10:06:00Z").unwrap())),
+            "mid-loop forward NTP overshoot must rewind across jumped interval to 10:06:00, got {forward_probed:?}"
         );
     }
 }

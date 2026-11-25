@@ -1523,7 +1523,7 @@ impl ClassEgressFence {
         auth: &EngineAuthContext,
         policy: &ProviderPolicy,
     ) -> DomainResult<()> {
-        auth.authorize_chat_read(current, project, tainted)?;
+        auth.can_view_chat(current, project, tainted)?;
         let permitted = match &policy.audience {
             ProviderAudience::Personal { consented } => {
                 *consented && current.kind == SpaceKind::Personal
@@ -1546,6 +1546,7 @@ impl ClassEgressFence {
                 ValidationReason::ProviderConsentRequired,
             ));
         }
+        auth.mark_chat_read_taint(current, tainted);
         Ok(())
     }
     fn check(document: &ClassifiedDocument, auth: &EngineAuthContext) -> DomainResult<()> {

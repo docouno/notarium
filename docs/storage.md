@@ -221,9 +221,10 @@ The writer checks explicit revision or absence predicates and replays its
 receipt only while the memory slot remains authorized.
 Published ability manifests expose up to 256 auxiliary names of at most 1024
 UTF-8 bytes each. Access to an exact package revision requires visibility at
-publication and at its current location. Resource reads check both locations
-again after fetching the content. Catalog lookups return metadata and keep
-branch taint unchanged.
+publication and at its current location, and preserves `promoted_from` origin
+for project-only consent checks after Space republishing. Resource reads check
+both locations again after fetching the content. Catalog lookups return
+metadata and keep branch taint unchanged.
 
 Upgrading the recognized version 1 manifest adds the receipt ledger and queued
 chat-input provenance in one transaction. Existing pending private inputs are

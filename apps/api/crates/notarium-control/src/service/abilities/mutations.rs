@@ -715,7 +715,7 @@ impl ControlService {
                     {
                         return Err(DomainError::ResourceNotFound.into());
                     }
-                    transfer_promotion_overlays(tx.inner_mut(), project, &key, &destination_key, &original.id).await?;
+                    let _ = transfer_promotion_overlays(tx.inner_mut(), project, &key, &destination_key, &original.id).await?;
                 }
                 let trail = Trail { source: source.reference.clone(), destination: destination.clone() };
                 let record = TargetRecord::from(AbilityPlacementTrailRow { source_placement: key.clone(), ability_id: input.source.id.to_string(), destination_placement: placement(&destination.placement)?, destination_id: destination.id.to_string(), manifest_ref: serde_json::to_string(&trail).map_err(|_| invalid(ValidationReason::InvalidState))?, created_at: self.clock.now_ms()? });
@@ -755,7 +755,32 @@ async fn read_overlay_state(
     ability: &AbilityId,
 ) -> Result<AbilityOverlayState, PortError> {
     let (binding, preference) = ability_control_state(tx, owner, key, ability).await?;
-    overlay_state(binding.as_ref(), preference.as_ref())
+    let mut state = overlay_state(binding.as_ref(), preference.as_ref())?;
+    let availability = match binding.as_ref().map(|row| row.mode.as_str()) {
+        None | Some("all-projects") => AbilityProjects::All,
+        Some("selected-projects") => {
+            let rows = rows!(
+                tx,
+                AbilityProjectBindingsRow,
+                fetch_all,
+                "SELECT * FROM ability_project_bindings WHERE placement=$1 AND ability_id=$2 ORDER BY target_space, project_id",
+                "SELECT * FROM v1_control.ability_project_bindings WHERE placement=$1 AND ability_id=$2 ORDER BY target_space, project_id";
+                key,
+                ability.as_str()
+            )?;
+            let mut projects = Vec::with_capacity(rows.len());
+            for row in rows {
+                projects.push(FolderRef {
+                    space_id: SpaceId::parse(&row.target_space)?,
+                    folder_id: FolderId::parse(&row.project_id)?,
+                });
+            }
+            AbilityProjects::Selected(projects)
+        }
+        Some(_) => return Err(invalid(ValidationReason::InvalidState)),
+    };
+    state.availability = Some(availability);
+    Ok(state)
 }
 
 /// Both placements share one exclusively locked Space. Preserve effective old
@@ -766,7 +791,7 @@ async fn transfer_promotion_overlays(
     source: &str,
     destination: &str,
     ability: &AbilityId,
-) -> Result<(), PortError> {
+) -> Result<AbilityProjects, PortError> {
     let bindings = rows!(tx,AbilityAvailabilityRow,fetch_all,
         "SELECT * FROM ability_availability WHERE ability_id=$1 AND placement IN ($2,$3)",
         "SELECT * FROM v1_control.ability_availability WHERE ability_id=$1 AND placement IN ($2,$3)";
@@ -836,5 +861,9 @@ async fn transfer_promotion_overlays(
         "UPDATE ability_preferences SET placement=$1 WHERE placement=$2 AND ability_id=$3",
         "UPDATE v1_control.ability_preferences SET placement=$1 WHERE placement=$2 AND ability_id=$3";
         destination,source,ability.as_str())?;
-    Ok(())
+    Ok(AbilityProjects::Selected(if admits_project {
+        vec![project.clone()]
+    } else {
+        Vec::new()
+    }))
 }

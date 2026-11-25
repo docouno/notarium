@@ -508,8 +508,9 @@ where their resources have attachments, locking those Spaces in order. All locks
 
 Every source Space needs the sender's personal attachment consent. Shared content
 also requires a currently approved Space or project attachment. Project-only
-approval checks each source's current canonical ancestry; a selected project is
-not evidence that unrelated content belongs to it. Shared disclosure excludes
+approval checks each source's current canonical ancestry (and `promoted_from`
+origin for Space abilities promoted from a project and republished at Space
+scope); a selected project is not evidence that unrelated content belongs to it. Shared disclosure excludes
 profiles, and encrypted notes never leave through a provider. Consent expiry
 limits the active request deadline. Without explicit resource/model selection,
 preference order is personal, project, then Space, keyed separately by

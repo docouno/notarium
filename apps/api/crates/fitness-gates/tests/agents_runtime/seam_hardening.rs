@@ -7840,6 +7840,7 @@ async fn promoted_ability_project_only_consent_boundary(
 struct CrossSpaceProbeSetup {
     local: LoopbackProvider,
     _listener: TcpListener,
+    space_write_id: SpaceId,
 }
 
 #[inline(never)]
@@ -8007,7 +8008,7 @@ async fn cross_space_taint_oracle_and_write_isolation_probes(
             "kind": "role",
             "name": "write-space-role",
             "description": "Special role in write space",
-            "instructions": "Instructions for write space.",
+            "instructions": "Instructions for write space role that intentionally exceed the minimum 100-byte activation token budget so budget_tokens=100 rejects cleanly.",
             "placement": { "home": "space", "space": space_write.slug },
         }),
     )
@@ -8144,8 +8145,40 @@ async fn cross_space_taint_oracle_and_write_isolation_probes(
     assert_eq!(missing_list.structured_content["items"], json!([]));
     assert!(missing_list.structured_content.get("folderPage").is_none());
     assert!(
+        missing_list.structured_content.get("total").is_none(),
+        "InAppProvider empty list_notes response must omit total (no empty-shape oracle): {}",
+        missing_list.structured_content
+    );
+    assert!(
         !missing_auth.taint().is_tainted(),
         "list_notes on missing cross-Space path must not flip BranchTaint"
+    );
+
+    // Invalid cursor on a consented cross-Space folder must reject before
+    // committing live folder metadata taint.
+    let stale_cursor_err = local
+        .registry
+        .call_tool(
+            make_ctx(&missing_acc, 3),
+            "list_notes",
+            json!({
+                "project": format!("{}/mem-proj", space_mem.slug),
+                "cursor": "notes_00000000000000000000000000000000",
+            }),
+        )
+        .await;
+    assert!(
+        matches!(
+            &stale_cursor_err,
+            Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
+                if diagnostic.reason == ValidationReason::CursorStale
+        ),
+        "stale cursor must return CursorStale, got {:?}",
+        stale_cursor_err.as_ref().err()
+    );
+    assert!(
+        !missing_auth.taint().is_tainted(),
+        "rejected stale cursor on cross-Space folder must not flip BranchTaint"
     );
 
     // Positive control: under ExternalMcp, `space_mem/mem-proj` genuinely has
@@ -8196,6 +8229,16 @@ async fn cross_space_taint_oracle_and_write_isolation_probes(
     assert!(
         mem_list.structured_content.get("incomplete").is_none(),
         "list_notes on AgentMemory-only Space must not emit incomplete for unconsented UserDocs"
+    );
+    assert!(
+        mem_list.structured_content.get("folderPage").is_none(),
+        "list_notes on AgentMemory-only Space must omit folderPage uniformly (no cover-note oracle): {}",
+        mem_list.structured_content
+    );
+    assert!(
+        mem_list.structured_content.get("total").is_none(),
+        "InAppProvider list_notes must omit total uniformly: {}",
+        mem_list.structured_content
     );
 
     // (2) Cross-space rejected write tools MUST return SpaceReadOnly without
@@ -8260,6 +8303,7 @@ async fn cross_space_taint_oracle_and_write_isolation_probes(
     CrossSpaceProbeSetup {
         local,
         _listener: listener,
+        space_write_id: space_write.history.space_id,
     }
 }
 
@@ -8269,7 +8313,11 @@ async fn cross_space_recent_and_ability_filter_taint_probes(
     personal: &SpaceContext,
     setup: CrossSpaceProbeSetup,
 ) {
-    let CrossSpaceProbeSetup { local, _listener } = setup;
+    let CrossSpaceProbeSetup {
+        local,
+        _listener,
+        space_write_id,
+    } = setup;
     let owner = fresh_owner(fixture).await;
     let pscope = personal.scope().clone();
     let make_run = |tag: u8| {
@@ -8316,16 +8364,38 @@ async fn cross_space_recent_and_ability_filter_taint_probes(
         !recent_auth.taint().is_tainted(),
         "recent_activity returning 0 cross-Space items must not flip BranchTaint"
     );
+    // Positive control for Probe 3: widening limit returns `space_write` item AND flips taint!
+    let recent_wide = local
+        .registry
+        .call_tool(
+            make_ctx(&recent_acc, 22),
+            "recent_activity",
+            json!({ "limit": 20 }),
+        )
+        .await
+        .unwrap();
+    let recent_wide_items = recent_wide.structured_content["items"].as_array().unwrap();
+    assert!(
+        recent_wide_items
+            .iter()
+            .any(|item| item["spaceId"] == json!(space_write_id)),
+        "recent_activity positive control must include space_write item: {recent_wide_items:?}"
+    );
+    assert!(
+        recent_auth.taint().is_tainted(),
+        "recent_activity delivering a cross-Space item MUST flip BranchTaint"
+    );
 
     // (4) list_abilities(q: "nonexistent-needle-xyz") must NOT flip BranchTaint
-    //     when cross-Space abilities fail the query filter!
+    //     when cross-Space abilities fail the query filter, while matching
+    //     `write-space-role` returns it AND flips BranchTaint (positive control).
     let (ab_auth, ab_acc) = make_run(5);
     let ab_res = local
         .registry
         .call_tool(
             make_ctx(&ab_acc, 21),
             "list_abilities",
-            json!({ "view": "runtime", "q": "nonexistent-needle-xyz" }),
+            json!({ "view": "runtime", "limit": 50, "q": "nonexistent-needle-xyz" }),
         )
         .await
         .unwrap();
@@ -8333,6 +8403,52 @@ async fn cross_space_recent_and_ability_filter_taint_probes(
     assert!(
         !ab_auth.taint().is_tainted(),
         "list_abilities with zero matching cross-Space items must not flip BranchTaint"
+    );
+    let ab_pos = local
+        .registry
+        .call_tool(
+            make_ctx(&ab_acc, 23),
+            "list_abilities",
+            json!({ "view": "runtime", "limit": 50, "q": "write-space-role" }),
+        )
+        .await
+        .unwrap();
+    let ab_pos_items = ab_pos.structured_content["items"].as_array().unwrap();
+    let write_role_ref = ab_pos_items
+        .iter()
+        .find(|item| item["name"] == "write-space-role")
+        .expect("list_abilities positive control must return cross-Space write-space-role")["ref"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        ab_auth.taint().is_tainted(),
+        "list_abilities delivering cross-Space ability MUST flip BranchTaint"
+    );
+
+    // (5) Budget-exceeded cross-Space use_role must reject with BudgetExceeded
+    //     WITHOUT flipping BranchTaint!
+    let (budget_auth, budget_acc) = make_run(6);
+    let budget_err = local
+        .registry
+        .call_tool(
+            make_ctx(&budget_acc, 24),
+            "use_role",
+            json!({ "role": write_role_ref, "budgetTokens": 100 }),
+        )
+        .await;
+    assert!(
+        matches!(
+            &budget_err,
+            Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
+                if diagnostic.reason == ValidationReason::BudgetExceeded
+        ),
+        "use_role over budgetTokens must fail with BudgetExceeded, got {:?}",
+        budget_err.as_ref().err()
+    );
+    assert!(
+        !budget_auth.taint().is_tainted(),
+        "budget-rejected cross-Space use_role must not flip BranchTaint"
     );
 }
 
@@ -8732,7 +8848,7 @@ async fn real_search_preflight_taint_limit_and_engine_probes(
     let pack_dropped = emb_registry
         .call_tool(
             McpInvocationContext {
-                account: limit_probe_acc,
+                account: limit_probe_acc.clone(),
                 target: EgressTarget::InAppProvider {
                     provider: chat_narrow_res.clone(),
                     model: chat_narrow_model.clone(),
@@ -8756,28 +8872,77 @@ async fn real_search_preflight_taint_limit_and_engine_probes(
         !limit_probe_auth.taint().is_tainted(),
         "recall hit dropped by maxPerSource packing must not flip BranchTaint"
     );
+    // Positive MCP recall control: widening maxPerSource returns `user_doc_note` AND flips BranchTaint.
+    let mcp_recall_pos = emb_registry
+        .call_tool(
+            McpInvocationContext {
+                account: limit_probe_acc,
+                target: EgressTarget::InAppProvider {
+                    provider: chat_narrow_res.clone(),
+                    model: chat_narrow_model.clone(),
+                    primary_project: None,
+                },
+                request_key: CommandKey::from_bytes([
+                    0x3C, 0x27, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3,
+                ]),
+            },
+            "recall",
+            json!({
+                "query": "quartz-userdoc-allowed-token",
+                "budgetTokens": 2000,
+                "maxPerSource": 500,
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(
+        serde_json::to_string(&mcp_recall_pos.structured_content)
+            .unwrap()
+            .contains(user_doc_note.as_str()),
+        "positive MCP recall control must return consented UserDoc hit from space_udoc: {}",
+        mcp_recall_pos.structured_content
+    );
+    assert!(
+        limit_probe_auth.taint().is_tainted(),
+        "positive MCP recall delivering cross-Space source MUST flip BranchTaint"
+    );
 
-    // 3. Direct real SearchEngine + ProjectionEngine preflight test: query
-    //    matches `user_doc_note` lexically, `acquire_snapshot_preflight` +
-    //    `NoteAdmission::select` runs, and recipient rejects all hits ->
-    //    0 hits AND BranchTaint MUST remain false!
+    // 3. Direct real SearchEngine + ProjectionEngine preflight test (un-detached
+    //    auth): zero-match non-recipient search, rejected recipient search, AND
+    //    max_per_source-packed-out direct recall_for MUST all keep BranchTaint false,
+    //    while positive admitted search_for & recall_for MUST return `user_doc_note`
+    //    AND flip BranchTaint == true!
+    let make_query = |text: &str| SearchQuery {
+        text: text.into(),
+        filter: notarium_core::query::FieldFilterAstV1 {
+            version: 1,
+            predicate: notarium_core::query::Predicate::All(vec![]),
+        },
+        classes: [DocClass::UserDoc].into(),
+        folder: None,
+        causal: CausalBasis::Await(Default::default()),
+        include_chats: false,
+        top_k: PageLimit::new(10).unwrap(),
+        model: None,
+    };
+    let non_recip_zero = search
+        .search(
+            SpaceContext::new(probe_auth.clone(), space_udoc.history.clone(), budget()).unwrap(),
+            make_query("nonexistent-quartz-miss-xyz"),
+        )
+        .await
+        .unwrap();
+    assert!(non_recip_zero.hits.is_empty());
+    assert!(
+        !probe_auth.taint().is_tainted(),
+        "direct non-recipient SearchEngine zero-hit query must not flip cross-Space BranchTaint"
+    );
+
     let reject_all = PreflightProbeRecipient { admit_all: false };
     let rejected = search
         .search_for(
             SpaceContext::new(probe_auth.clone(), space_udoc.history.clone(), budget()).unwrap(),
-            SearchQuery {
-                text: "quartz-userdoc-allowed-token".into(),
-                filter: notarium_core::query::FieldFilterAstV1 {
-                    version: 1,
-                    predicate: notarium_core::query::Predicate::All(vec![]),
-                },
-                classes: [DocClass::UserDoc].into(),
-                folder: None,
-                causal: CausalBasis::Await(Default::default()),
-                include_chats: false,
-                top_k: PageLimit::new(10).unwrap(),
-                model: None,
-            },
+            make_query("quartz-userdoc-allowed-token"),
             Some(&reject_all),
         )
         .await
@@ -8788,25 +8953,72 @@ async fn real_search_preflight_taint_limit_and_engine_probes(
         "real SearchEngine + ProjectionEngine preflight with rejected hits must not flip BranchTaint"
     );
 
-    // 3. Non-vacuity positive control: when recipient ADMITS the matching hit,
-    //    `hydrate` runs, returns `user_doc_note`, AND flips BranchTaint == true!
     let admit_all = PreflightProbeRecipient { admit_all: true };
+    let direct_recall_packed = search
+        .recall_for(
+            SpaceContext::new(probe_auth.clone(), space_udoc.history.clone(), budget()).unwrap(),
+            RecallQuery {
+                query: make_query("quartz-userdoc-allowed-token"),
+                graph_depth: 1,
+                token_budget: 200,
+                max_per_source: Some(1),
+            },
+            Some(&admit_all),
+        )
+        .await
+        .unwrap();
+    assert!(direct_recall_packed.hits.is_empty());
+    assert!(
+        !probe_auth.taint().is_tainted(),
+        "direct SearchEngine::recall_for packed out by max_per_source must not flip BranchTaint"
+    );
+
+    // Positive direct SearchEngine::recall_for control: sufficient max_per_source
+    // returns `user_doc_note` AND flips BranchTaint == true!
+    let direct_recall_ok = search
+        .recall_for(
+            SpaceContext::new(probe_auth.clone(), space_udoc.history.clone(), budget()).unwrap(),
+            RecallQuery {
+                query: make_query("quartz-userdoc-allowed-token"),
+                graph_depth: 1,
+                token_budget: 2000,
+                max_per_source: Some(500),
+            },
+            Some(&admit_all),
+        )
+        .await
+        .unwrap();
+    assert!(
+        direct_recall_ok
+            .hits
+            .iter()
+            .any(|hit| hit.card.document.provenance().reference().note_id == *user_doc_note),
+        "positive direct recall_for control must return the admitted UserDoc hit"
+    );
+    assert!(
+        probe_auth.taint().is_tainted(),
+        "positive direct recall_for delivering cross-Space hit MUST flip BranchTaint"
+    );
+
+    // Positive direct SearchEngine::search_for control on a fresh run auth.
+    let search_pos_auth = owner
+        .auth()
+        .for_agent_run(
+            AgentRunId::from_bytes([0x3C, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7]),
+            personal.scope().space_id.clone(),
+            ChatAudience::Personal,
+            owner.auth().spaces().clone(),
+        )
+        .unwrap();
     let admitted = search
         .search_for(
-            SpaceContext::new(probe_auth.clone(), space_udoc.history.clone(), budget()).unwrap(),
-            SearchQuery {
-                text: "quartz-userdoc-allowed-token".into(),
-                filter: notarium_core::query::FieldFilterAstV1 {
-                    version: 1,
-                    predicate: notarium_core::query::Predicate::All(vec![]),
-                },
-                classes: [DocClass::UserDoc].into(),
-                folder: None,
-                causal: CausalBasis::Await(Default::default()),
-                include_chats: false,
-                top_k: PageLimit::new(10).unwrap(),
-                model: None,
-            },
+            SpaceContext::new(
+                search_pos_auth.clone(),
+                space_udoc.history.clone(),
+                budget(),
+            )
+            .unwrap(),
+            make_query("quartz-userdoc-allowed-token"),
             Some(&admit_all),
         )
         .await
@@ -8819,7 +9031,7 @@ async fn real_search_preflight_taint_limit_and_engine_probes(
         "positive control must return the admitted UserDoc hit"
     );
     assert!(
-        probe_auth.taint().is_tainted(),
+        search_pos_auth.taint().is_tainted(),
         "positive control admitted cross-space hit MUST flip BranchTaint"
     );
 

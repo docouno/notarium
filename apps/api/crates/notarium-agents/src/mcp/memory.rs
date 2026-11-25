@@ -231,13 +231,18 @@ pub(super) async fn handle(
         ));
     }
     if let EgressTarget::InAppProvider { .. } = &call.target {
-        let scope = call.space(route.scope)?;
+        let scope = call
+            .space(route.scope)
+            .map_err(|error| super::note_tools::post_commit_error(LABEL, error))?;
         if let Err(error) = admit_receipt_metadata(call, scope, &target, &note, &committed).await {
-            tracing::debug!(code = error.code(), "memory receipt metadata unavailable");
-            return Ok(json!({
-                "outcome": committed.value.outcome,
-                "summaryUpdated": committed.value.summary_updated,
-            }));
+            if corpus::hidden(&error) {
+                tracing::debug!(code = error.code(), "memory receipt metadata unavailable");
+                return Ok(json!({
+                    "outcome": committed.value.outcome,
+                    "summaryUpdated": committed.value.summary_updated,
+                }));
+            }
+            return Err(super::note_tools::post_commit_error(LABEL, error));
         }
     }
     let result = committed.value;
