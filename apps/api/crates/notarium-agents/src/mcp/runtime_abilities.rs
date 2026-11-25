@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use notarium_core::{
     DomainError,
     auth::{PrincipalKind, SpaceLifecycle},
-    classes::{AbilityKind, ClassEgressFence, ProviderMessage},
+    classes::{AbilityKind, ClassEgressFence, DocClass, ProviderAudience, ProviderMessage},
     error::{PortError, ValidationReason},
     ids::{EpisodeId, FolderId, SpaceId},
     model::{AbilityResourceName, FolderRef, Lifecycle},
@@ -122,6 +122,11 @@ pub(super) async fn preflight_role(
     let _ = reader
         .load(role.clone(), Vec::new(), role_project, false)
         .await?;
+    if matches!(selection.policy.audience, ProviderAudience::Shared { .. })
+        && preflight_primary.auth().taint().is_tainted()
+    {
+        return Err(DomainError::CrossSpaceTainted.into());
+    }
     Ok(())
 }
 
@@ -342,6 +347,16 @@ impl<'a> Reader<'a> {
         };
         let mut source = self.source(&entry.space_id).await?;
         let project = ability_project(&descriptor.reference.placement, &entry.space_id, hint)?;
+        if matches!(
+            self.selection.policy.audience,
+            ProviderAudience::Shared { .. }
+        ) && source.scope().space_id != self.primary.scope().space_id
+        {
+            if omit_hidden {
+                return Ok(None);
+            }
+            return Err(DomainError::CrossSpaceTainted.into());
+        }
         let (pending_key, selection) = if source.scope().space_id == self.primary.scope().space_id {
             (None, self.selection.clone())
         } else {
@@ -371,6 +386,47 @@ impl<'a> Reader<'a> {
                     )
                     .await?;
                 check_selection(&source, self.selection, &chosen, project)?;
+                if let Some(chosen_proj) = &chosen.project
+                    && secondary_projects.iter().any(|existing| {
+                        existing.space_id == chosen_proj.space_id && existing != chosen_proj
+                    })
+                {
+                    // Provider dispatch collapses distinct projects in the same
+                    // secondary Space to Space-wide consent. Verify Space-wide
+                    // Skill consent before admitting a second project in it.
+                    let wide_probe = if omit_hidden {
+                        source.with_preflight_taint()
+                    } else {
+                        source.clone()
+                    };
+                    let wide_ok = match self
+                        .registry
+                        .control
+                        .select_provider(
+                            wide_probe,
+                            SelectProvider {
+                                kind: PreferenceModelKind::Completion,
+                                resource: Some(self.selection.provider.clone()),
+                                model: Some(self.selection.model.clone()),
+                                project: None,
+                            },
+                        )
+                        .await
+                    {
+                        Ok(wide) => {
+                            check_selection(&source, self.selection, &wide, None).is_ok()
+                                && wide.policy.allowed_classes.contains(&DocClass::Skill)
+                        }
+                        Err(error) if corpus::hidden(&error) => false,
+                        Err(error) => return Err(error),
+                    };
+                    if !wide_ok {
+                        if omit_hidden {
+                            return Ok(None);
+                        }
+                        return Err(DomainError::AccessDenied.into());
+                    }
+                }
                 if chosen.project.is_some()
                     && secondary_projects.len() >= MAX_PROVIDER_SECONDARY_PROJECTS
                 {

@@ -75,13 +75,24 @@ impl AgentRunSupervisor {
                                     let _ = self.dismiss(&run, &key).await;
                                 }
                             }
-                            if !self.inner.shutdown.is_cancelled() {
-                                let _ = self.settle_unpublished_claim(&run).await;
-                                let _ = self.refresh_current_head(&run, !own_reconciled).await;
+                            if !self.inner.shutdown.is_cancelled()
+                                && matches!(
+                                    self.settle_unpublished_claim(&run).await,
+                                    ClaimSettlement::Pending
+                                )
+                                && pending_stalls < 6
+                                && run.owner.check().is_ok()
+                            {
+                                pending_stalls += 1;
+                                drop(admission);
+                            } else {
+                                if !self.inner.shutdown.is_cancelled() {
+                                    let _ = self.refresh_current_head(&run, !own_reconciled).await;
+                                }
+                                self.finish_and_remove_run(&run, result.err().or(Some(error)));
+                                drop(admission);
+                                return;
                             }
-                            self.finish_and_remove_run(&run, result.err().or(Some(error)));
-                            drop(admission);
-                            return;
                         }
                         _ => {
                             if !self.inner.shutdown.is_cancelled() {

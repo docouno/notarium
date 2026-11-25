@@ -2,7 +2,10 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use notarium_core::{
     DomainError,
     auth::{ChatAudience, PrincipalKind},
-    classes::{AbilityKind, ClassEgressFence, ClassifiedAbilityResource, DocClass, ProviderOrigin},
+    classes::{
+        AbilityKind, ClassEgressFence, ClassifiedAbilityResource, DocClass, ProviderAudience,
+        ProviderOrigin,
+    },
     error::{PortError, ValidationReason},
     ids::*,
     model::{AbilityResourceName, FolderRef},
@@ -62,7 +65,10 @@ fn ability_sort_key(descriptor: &AbilityDescriptor) -> Result<AbilitySortKey, Po
 #[derive(Clone)]
 enum AbilityCursorInner {
     Control(String),
-    ProviderAfter(AbilitySortKey),
+    ProviderAfter {
+        key: AbilitySortKey,
+        control_cursor: Option<String>,
+    },
 }
 
 /// Keep ability pagination positions server-side so unconsented Space IDs and
@@ -1209,7 +1215,7 @@ async fn list(
     let next_inner = if external {
         let control_cursor = match inner {
             Some(AbilityCursorInner::Control(token)) => Some(token),
-            Some(AbilityCursorInner::ProviderAfter(_)) => {
+            Some(AbilityCursorInner::ProviderAfter { .. }) => {
                 return Err(invalid(ValidationReason::CursorStale));
             }
             None => None,
@@ -1273,12 +1279,15 @@ async fn list(
         }
         page.continuation.map(AbilityCursorInner::Control)
     } else {
-        let after_key = match inner {
-            Some(AbilityCursorInner::ProviderAfter(key)) => Some(key),
+        let (after_key, mut control_cursor) = match inner {
+            Some(AbilityCursorInner::ProviderAfter {
+                key,
+                control_cursor,
+            }) => (Some(key), control_cursor),
             Some(AbilityCursorInner::Control(_)) => {
                 return Err(invalid(ValidationReason::CursorStale));
             }
-            None => None,
+            None => (None, None),
         };
         // Narrow owned-space discovery to Skill-consented Spaces whenever space-level
         // consent governs visibility so unconsented Spaces never enter catalog paging.
@@ -1303,12 +1312,14 @@ async fn list(
         let use_provider_runtime_overlay = view == View::Runtime && any_project_only;
         let discover_account = AccountContext::new(discover_auth, call.budget());
         let cap = usize::from(limit);
-        let mut control_cursor = None;
         let mut last_key: Option<AbilitySortKey> = None;
+        let mut resume_cursor: Option<String> = None;
         let mut has_more = false;
+        let mut reached_end = false;
         let mut runtime_winner_cache: BTreeMap<String, Vec<AbilityRef>> = BTreeMap::new();
-        'scan: for _ in 0..MAX_PROVIDER_ABILITY_SCAN_PAGES {
-            let page = call
+        'scan: for page_idx in 0..MAX_PROVIDER_ABILITY_SCAN_PAGES {
+            let mut page_start_cursor = control_cursor.clone();
+            let page = match call
                 .registry
                 .control
                 .discover_abilities(
@@ -1316,7 +1327,7 @@ async fn list(
                     AbilityQuery {
                         page: ControlPageRequest::new(
                             PROVIDER_ABILITY_SCAN_PAGE_SIZE,
-                            control_cursor,
+                            control_cursor.clone(),
                         )?,
                         project: query_project.clone(),
                         kind: args.kind.map(Into::into),
@@ -1324,7 +1335,38 @@ async fn list(
                         authoring: view == View::Authoring || use_provider_runtime_overlay,
                     },
                 )
-                .await?;
+                .await
+            {
+                Ok(page) => page,
+                Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
+                    if page_idx == 0
+                        && control_cursor.is_some()
+                        && diagnostic.reason == ValidationReason::CursorStale =>
+                {
+                    // A concurrent change (including in an unconsented Space
+                    // under authoring discovery) can stale the inner catalog
+                    // cursor. Fall back to scanning from the start using `after_key`.
+                    control_cursor = None;
+                    page_start_cursor = None;
+                    call.registry
+                        .control
+                        .discover_abilities(
+                            discover_account.clone(),
+                            AbilityQuery {
+                                page: ControlPageRequest::new(
+                                    PROVIDER_ABILITY_SCAN_PAGE_SIZE,
+                                    None,
+                                )?,
+                                project: query_project.clone(),
+                                kind: args.kind.map(Into::into),
+                                name: None,
+                                authoring: view == View::Authoring || use_provider_runtime_overlay,
+                            },
+                        )
+                        .await?
+                }
+                Err(error) => return Err(error),
+            };
             for inspection in page.items {
                 let descriptor = &inspection.descriptor;
                 let key = ability_sort_key(descriptor)?;
@@ -1388,6 +1430,7 @@ async fn list(
                 }
                 if items.len() == cap {
                     has_more = true;
+                    resume_cursor = page_start_cursor;
                     break 'scan;
                 }
                 let enabled = if view == View::Runtime {
@@ -1403,12 +1446,27 @@ async fn list(
                 last_key = Some(key);
             }
             if page.continuation.is_none() {
+                reached_end = true;
                 break;
             }
             control_cursor = page.continuation;
         }
         if has_more {
-            last_key.map(AbilityCursorInner::ProviderAfter)
+            last_key.map(|key| AbilityCursorInner::ProviderAfter {
+                key,
+                control_cursor: resume_cursor,
+            })
+        } else if !reached_end {
+            // Never silently truncate unvisited abilities (including trailing
+            // System built-ins) when the per-call scan budget is exhausted.
+            if let Some(key) = last_key {
+                Some(AbilityCursorInner::ProviderAfter {
+                    key,
+                    control_cursor,
+                })
+            } else {
+                return Err(invalid(ValidationReason::BudgetExceeded));
+            }
         } else {
             None
         }
@@ -1739,6 +1797,7 @@ pub(crate) async fn bind_chat_role(
     // placements (including `project_only` / `promoted_from`) so unconsented
     // abilities neither shadow consented roles nor leak Disabled/Stale states
     // or durably bind a role unreachable to `runtime_abilities`.
+    let shared_primary = matches!(selection.policy.audience, ProviderAudience::Shared { .. });
     let mut allowed_selections: BTreeMap<SpaceId, ProviderSelection> = BTreeMap::new();
     for (space_id, grant) in run_auth.spaces() {
         if !grant.read_classes.contains(&DocClass::Skill) {
@@ -1748,6 +1807,11 @@ pub(crate) async fn bind_chat_role(
             if selection.policy.allowed_classes.contains(&DocClass::Skill) {
                 allowed_selections.insert(space_id.clone(), selection.clone());
             }
+            continue;
+        }
+        // Chats in a Shared Space cannot append replies once tainted by a
+        // cross-Space read, so never resolve or bind a role from another Space.
+        if shared_primary {
             continue;
         }
         let live = match registry

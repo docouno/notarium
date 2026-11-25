@@ -125,29 +125,33 @@ async fn route(
     call: &ToolCallContext<'_>,
     note: &NoteId,
     expected: Option<&RevisionId>,
-) -> Result<NoteRoute, PortError> {
-    route_inner(call, note, expected, false).await
+) -> Result<(NoteRoute, bool), PortError> {
+    route_inner(call, note, expected).await
 }
 
 async fn route_for_delete(
     call: &ToolCallContext<'_>,
     note: &NoteId,
 ) -> Result<NoteRoute, PortError> {
-    route_inner(call, note, None, true).await
+    route_inner(call, note, None).await.map(|(route, _)| route)
 }
 
 async fn route_inner(
     call: &ToolCallContext<'_>,
     note: &NoteId,
     expected: Option<&RevisionId>,
-    allow_trashed_replay: bool,
-) -> Result<NoteRoute, PortError> {
+) -> Result<(NoteRoute, bool), PortError> {
+    let mut replayed = true;
     let route: NoteRoute = call
-        .journal("note_route", || observe_note(call, note, expected))
+        .journal("note_route", || async {
+            replayed = false;
+            observe_note(call, note, expected).await
+        })
         .await?;
     if &route.note != note || expected.is_some_and(|revision| revision != &route.revision) {
         return Err(invalid(ValidationReason::SourceMismatch));
     }
+    let mut trashed_replay = false;
     if matches!(call.target, EgressTarget::InAppProvider { .. }) {
         if call
             .auth
@@ -159,7 +163,7 @@ async fn route_inner(
         let scope = call.space(route.scope.clone())?;
         match corpus::note_in_space(call, &scope, &route.note).await {
             Ok(catalog) => corpus::admit_note_write(call, &scope, &catalog).await?,
-            Err(PortError::Domain(DomainError::ResourceNotFound)) if allow_trashed_replay => {
+            Err(PortError::Domain(DomainError::ResourceNotFound)) if replayed => {
                 let observed = metadata_snapshot(
                     call,
                     &scope,
@@ -172,11 +176,29 @@ async fn route_inner(
                     return Err(DomainError::ResourceNotFound.into());
                 }
                 corpus::admit_note_metadata_write(call, &scope, &observed.metadata).await?;
+                trashed_replay = true;
             }
             Err(error) => return Err(error),
         }
+    } else if replayed {
+        let scope = call.space(route.scope.clone())?;
+        if let Err(PortError::Domain(DomainError::ResourceNotFound)) =
+            corpus::note_in_space(call, &scope, &route.note).await
+        {
+            let observed = metadata_snapshot(
+                call,
+                &scope,
+                &route.note,
+                None,
+                CausalBasis::Await(Default::default()),
+            )
+            .await?;
+            if observed.metadata.lifecycle() == Lifecycle::Trashed {
+                trashed_replay = true;
+            }
+        }
     }
-    Ok(route)
+    Ok((route, trashed_replay))
 }
 
 async fn snapshot(
@@ -615,7 +637,7 @@ async fn ensure_destination(
 async fn move_note(call: &mut ToolCallContext<'_>, input: MoveInput) -> Result<Value, PortError> {
     const LABEL: &str = "notarium.mcp.move-note.v1";
     let folder = clean_path(&input.to_folder)?;
-    let route = route(call, &input.target.note, None).await?;
+    let (route, _) = route(call, &input.target.note, None).await?;
     let (scope, before) = route_metadata_snapshot(call, &route).await?;
     let slug = note_slug(before.provenance.as_ref())?;
     let class = before.metadata.class();
@@ -728,7 +750,7 @@ fn generated_slug(title: &str, note: &NoteId) -> String {
 
 async fn rename(call: &mut ToolCallContext<'_>, input: RenameInput) -> Result<Value, PortError> {
     let title = validated_title(&input.title)?;
-    let route = route(call, &input.target.note, None).await?;
+    let (route, _) = route(call, &input.target.note, None).await?;
     let (scope, before) = route_metadata_snapshot(call, &route).await?;
     let metadata = before
         .provenance

@@ -76,10 +76,64 @@ impl ControlService {
             }
             let (revision,saved) = budget.run(async {
             let (owner,_) = self.manager(tx.inner_mut(),ctx.auth(),ctx.auth().principal()).await?;
-            if let Some(replay) = command.replay::<ScheduleId>(tx.inner_mut()).await? {return Ok(replay);}
-            expect_revision(&owner,command.identity.expected)?;
             let auth = self.revalidate(tx.inner_mut(),ctx.auth()).await?;
             let current = AccountContext::new(auth,budget.context(ctx.budget.request.clone()));
+            let locked_row = match &change {
+                Change::Create(input) => {
+                    ScheduleScope::from(&input.definition).check(current.auth())?;
+                    None
+                }
+                Change::Update(input) => {
+                    ScheduleScope::from(&input.definition).check(current.auth())?;
+                    // All current memberships were locked before this schedule.
+                    let row = schedule(tx.inner_mut(),&input.schedule,true).await?;
+                    if row.owner_id!=owner.user_id {return Err(DomainError::ResourceNotFound.into());}
+                    let prev_space = SpaceId::parse(&row.space_id)?;
+                    let prev_project = row
+                        .project_folder_id
+                        .as_deref()
+                        .map(|folder| {
+                            Ok::<_, PortError>(FolderRef {
+                                space_id: prev_space.clone(),
+                                folder_id: FolderId::parse(folder)?,
+                            })
+                        })
+                        .transpose()?;
+                    ScheduleScope {
+                        space: &prev_space,
+                        project: prev_project.as_ref(),
+                    }
+                    .check(current.auth())?;
+                    Some(row)
+                }
+                Change::Delete(input) => {
+                    // Deletion of one's known schedule remains possible after a
+                    // project or role disappears, without loading its content,
+                    // while still enforcing space role, write class, project_root,
+                    // and cross-space taint before replay or commit.
+                    let row = schedule(tx.inner_mut(),&input.schedule,true).await?;
+                    if row.owner_id!=owner.user_id {return Err(DomainError::ResourceNotFound.into());}
+                    let space = SpaceId::parse(&row.space_id)?;
+                    let project = row
+                        .project_folder_id
+                        .as_deref()
+                        .map(|folder| {
+                            Ok::<_, PortError>(FolderRef {
+                                space_id: space.clone(),
+                                folder_id: FolderId::parse(folder)?,
+                            })
+                        })
+                        .transpose()?;
+                    ScheduleScope {
+                        space: &space,
+                        project: project.as_ref(),
+                    }
+                    .check(current.auth())?;
+                    Some(row)
+                }
+            };
+            if let Some(replay) = command.replay::<ScheduleId>(tx.inner_mut()).await? {return Ok(replay);}
+            expect_revision(&owner,command.identity.expected)?;
             let now = self.clock.now_ms()?;
             let (id, revoke) = match change {
                 Change::Create(input) => {
@@ -122,8 +176,7 @@ impl ControlService {
                     (input.id,false)
                 }
                 Change::Update(input) => {
-                    // All current memberships were locked before this schedule.
-                    let row = schedule(tx.inner_mut(),&input.schedule,true).await?;
+                    let row = locked_row.expect("update pre-locked schedule");
                     if row.owner_id!=owner.user_id || row.deleted_at.is_some() {return Err(DomainError::ResourceNotFound.into());}
                     expect(&row,input.expected)?;
                     if row.space_id!=input.definition.space.as_str() {return Err(invalid(ValidationReason::ScopeMismatch));}
@@ -172,14 +225,9 @@ impl ControlService {
                     (input.schedule,true)
                 }
                 Change::Delete(input) => {
-                    let row = schedule(tx.inner_mut(),&input.schedule,true).await?;
+                    let row = locked_row.expect("delete pre-locked schedule");
                     if row.owner_id!=owner.user_id || row.deleted_at.is_some() {return Err(DomainError::ResourceNotFound.into());}
                     expect(&row,input.expected)?;
-                    // Deletion of one's known schedule remains possible after a
-                    // project or role disappears, without loading its content.
-                    let space = SpaceId::parse(&row.space_id)?;
-                    let grant = current.auth().spaces().get(&space).ok_or(DomainError::ResourceNotFound)?;
-                    if grant.role==SpaceRole::Viewer || !grant.write_classes.contains(&DocClass::AgentMemory) {return Err(access_denied());}
                     execute!(tx.inner_mut(),"UPDATE agent_schedules SET init_prompt='',deleted_at=$1,revision=$2,config_revision=$3,updated_at=$1 WHERE schedule_id=$4","UPDATE v1_control.agent_schedules SET init_prompt='',deleted_at=$1,revision=$2,config_revision=$3,updated_at=$1 WHERE schedule_id=$4";now,next(row.revision)?,next(row.config_revision)?,input.schedule.as_str())?;
                     (input.schedule,true)
                 }

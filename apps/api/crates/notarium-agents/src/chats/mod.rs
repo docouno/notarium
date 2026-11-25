@@ -532,6 +532,28 @@ impl AgentRunSupervisor {
                     run.clone(),
                 )
                 .await?;
+            if !service
+                .inner
+                .registry
+                .catalog()
+                .agent_run_has_head(remaining_budget(), scope.space_id.clone(), run.clone())
+                .await?
+            {
+                return Err(DomainError::ResourceNotFound.into());
+            }
+            // Re-check liveness after observing `agent_run_heads` so a foreign
+            // zero-edit Keeper that committed edit #1 in the window cannot be
+            // rolled back while still active.
+            service
+                .inner
+                .registry
+                .control()
+                .ensure_run_inactive(
+                    AccountContext::new(live_auth.clone(), remaining_budget()),
+                    scope.space_id.clone(),
+                    run.clone(),
+                )
+                .await?;
             let ctx = SpaceContext::new(live_auth.clone(), scope.clone(), remaining_budget())?;
             let ctx = service
                 .inner

@@ -520,9 +520,7 @@ pub(super) async fn create(
             },
         )
         .await
-        .map_err(|error| {
-            super::super::note_tools::batch_operational_error(CREATE_LABEL, error, true)
-        })?;
+        .map_err(|error| super::super::note_tools::post_commit_error(CREATE_LABEL, error))?;
     committed_response(
         &reference,
         ControlRevision::new(1)?,
@@ -545,10 +543,20 @@ struct EditPlan {
     overlays: AbilityOverlayState,
     initial_availability: AbilityProjects,
     initial_healthy: bool,
+    #[serde(default)]
+    initial_attached_skills: Vec<AbilityRef>,
+    #[serde(default)]
+    has_auxiliary_files: bool,
     requested_skills: Option<Vec<AbilityRef>>,
     requested_availability: Option<AbilityProjects>,
     account_revision: ControlRevision,
     promote: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PackageReplayOutcome {
+    revision: RevisionId,
+    authored_changed: bool,
 }
 
 fn kind_value(kind: AbilityKind) -> Kind {
@@ -653,6 +661,8 @@ async fn edit_plan(call: &ToolCallContext<'_>, args: &EditArgs) -> Result<EditPl
         overlays: inspection.overlays,
         initial_availability: inspection.availability,
         initial_healthy: descriptor.healthy,
+        initial_attached_skills: descriptor.attached_skills,
+        has_auxiliary_files: !descriptor.auxiliary_files.is_empty(),
         requested_skills,
         requested_availability,
         account_revision: ControlRevision::ZERO,
@@ -789,8 +799,12 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
         return Err(DomainError::CrossSpaceTainted.into());
     }
     load_episode(call, args.session.as_ref()).await?;
+    let mut plan_replayed = true;
     let plan: EditPlan = call
-        .journal("edit-ability-plan", || edit_plan(call, &args))
+        .journal("edit-ability-plan", || async {
+            plan_replayed = false;
+            edit_plan(call, &args).await
+        })
         .await?;
     let mut reference = plan.original.clone();
     let mut steps = Vec::new();
@@ -808,113 +822,184 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
         if !authored && !plan.promote {
             return Ok(());
         }
-        let original = original_package(call, &plan).await?;
-        resolved_slug = Some(original.name.clone());
-        let files = auxiliary_files(call, &plan, &original).await?;
-        let attachments = args
-            .attachments
-            .as_deref()
-            .zip(plan.requested_skills.as_deref())
-            .map(|(inputs, skills)| format_attachments(inputs, skills))
-            .transpose()?;
-        let skills = plan
-            .requested_skills
-            .clone()
-            .unwrap_or(original.attached_skills.clone());
-        if skills.iter().any(|skill| skill.id == plan.original.id) {
-            return Err(invalid(ValidationReason::DuplicateKey));
-        }
-        let mut note_revision = plan.previous_note.clone();
-        if authored {
-            let scope = call.space(plan.scope.clone())?;
-            let snapshot = call
-                .registry
-                .engine
-                .get_note(
-                    scope.clone(),
-                    read_note_request(plan.entrypoint.clone(), Some(note_revision.clone())),
-                )
-                .await?;
-            let source = ClassEgressFence::mcp_note(&snapshot.document, scope.auth())?;
-            let patch = authored_patch(source, &args, plan.kind.into(), attachments.as_deref())?;
-            authored_changed = !patch.edits.is_empty() || skills != original.attached_skills;
-            if !patch.edits.is_empty() {
-                let edited = call
+        let mut trashed_replay = false;
+        let (orig_slug, orig_attached_skills, files, already_published) =
+            match original_package(call, &plan).await {
+                Ok(original) => {
+                    let files = auxiliary_files(call, &plan, &original).await?;
+                    (original.name, original.attached_skills, files, None)
+                }
+                Err(PortError::Domain(DomainError::ResourceNotFound)) if plan_replayed => {
+                    let scope = call.space(plan.scope.clone())?;
+                    require_skill_write(scope.auth(), &plan.scope.space_id)?;
+                    let live = call
+                        .registry
+                        .engine
+                        .get_note_metadata(
+                            scope.clone(),
+                            GetNote {
+                                note: plan.entrypoint.clone(),
+                                revision: None,
+                                causal: CausalBasis::Await(Default::default()),
+                            },
+                        )
+                        .await?;
+                    if live.metadata.lifecycle() != notarium_core::model::Lifecycle::Trashed {
+                        return Err(DomainError::ResourceNotFound.into());
+                    }
+                    live.metadata.listing(scope.auth())?;
+                    let slug = original_slug(call, &plan).await?;
+                    let outcome = call
+                        .lookup_journal_with_key::<PackageReplayOutcome>(
+                            "edit-ability-package-outcome",
+                            &call.request_key,
+                            call.request_hash,
+                        )
+                        .await?;
+                    if outcome.is_none() && plan.has_auxiliary_files {
+                        return Err(DomainError::ResourceNotFound.into());
+                    }
+                    trashed_replay = true;
+                    (
+                        slug,
+                        plan.initial_attached_skills.clone(),
+                        Vec::new(),
+                        outcome,
+                    )
+                }
+                Err(error) => return Err(error),
+            };
+        resolved_slug = Some(orig_slug.clone());
+        if let Some(done) = already_published {
+            authored_changed = done.authored_changed;
+            reference.revision = done.revision;
+            published = authored_changed || plan.promote;
+        } else {
+            let attachments = args
+                .attachments
+                .as_deref()
+                .zip(plan.requested_skills.as_deref())
+                .map(|(inputs, skills)| format_attachments(inputs, skills))
+                .transpose()?;
+            let skills = plan
+                .requested_skills
+                .clone()
+                .unwrap_or(orig_attached_skills.clone());
+            if skills.iter().any(|skill| skill.id == plan.original.id) {
+                return Err(invalid(ValidationReason::DuplicateKey));
+            }
+            let mut note_revision = plan.previous_note.clone();
+            if authored {
+                let scope = call.space(plan.scope.clone())?;
+                let snapshot = call
                     .registry
                     .engine
-                    .edit_note(
+                    .get_note(
+                        scope.clone(),
+                        read_note_request(plan.entrypoint.clone(), Some(note_revision.clone())),
+                    )
+                    .await?;
+                let source = if trashed_replay {
+                    snapshot.document.explicit_read(scope.auth())?
+                } else {
+                    ClassEgressFence::mcp_note(&snapshot.document, scope.auth())?
+                };
+                let patch =
+                    authored_patch(source, &args, plan.kind.into(), attachments.as_deref())?;
+                authored_changed = !patch.edits.is_empty() || skills != orig_attached_skills;
+                if !patch.edits.is_empty() {
+                    let edited = call
+                        .registry
+                        .engine
+                        .edit_note(
+                            writer(call, &plan.scope).await?,
+                            Mutation {
+                                identity: call.command_identity(
+                                    &plan.scope,
+                                    "edit-ability-carrier",
+                                    0,
+                                ),
+                                preconditions: Preconditions {
+                                    revision: Some(note_revision),
+                                    ..Default::default()
+                                },
+                                input: EditNote {
+                                    note: plan.entrypoint.clone(),
+                                    plan: patch,
+                                },
+                            },
+                        )
+                        .await?;
+                    note_revision = edited.value.revision;
+                    carrier_edited = true;
+                }
+            }
+            if plan.promote {
+                phase = "home";
+                let parent = ability_folder(call, &plan.scope, None).await?;
+                folder_ensured = true;
+                let settled = call
+                    .registry
+                    .engine
+                    .move_note(
                         writer(call, &plan.scope).await?,
                         Mutation {
-                            identity: call.command_identity(&plan.scope, "edit-ability-carrier", 0),
+                            identity: call.command_identity(&plan.scope, "move-ability-carrier", 0),
                             preconditions: Preconditions {
-                                revision: Some(note_revision),
+                                revision: Some(note_revision.clone()),
                                 ..Default::default()
                             },
-                            input: EditNote {
+                            input: MoveNote {
                                 note: plan.entrypoint.clone(),
-                                plan: patch,
+                                parent: Some(parent),
+                                slug: orig_slug,
                             },
                         },
                     )
                     .await?;
-                note_revision = edited.value.revision;
-                carrier_edited = true;
+                note_revision = settled.value.revision;
+                carrier_moved = true;
             }
-        }
-        if plan.promote {
-            phase = "home";
-            let parent = ability_folder(call, &plan.scope, None).await?;
-            folder_ensured = true;
-            let settled = call
-                .registry
-                .engine
-                .move_note(
-                    writer(call, &plan.scope).await?,
-                    Mutation {
-                        identity: call.command_identity(&plan.scope, "move-ability-carrier", 0),
-                        preconditions: Preconditions {
-                            revision: Some(note_revision.clone()),
-                            ..Default::default()
+            if authored_changed || plan.promote {
+                let package = call
+                    .registry
+                    .engine
+                    .publish_ability_package(
+                        writer(call, &plan.scope).await?,
+                        Mutation {
+                            identity: call.command_identity(
+                                &plan.scope,
+                                "republish-ability-package",
+                                0,
+                            ),
+                            preconditions: Preconditions::default(),
+                            input: PublishAbilityPackage {
+                                ability: plan.original.id.clone(),
+                                kind: plan.kind.into(),
+                                entrypoint: plan.entrypoint.clone(),
+                                files,
+                                attached_skills: skills,
+                                expected_package_revision: Some(plan.original.revision.clone()),
+                                expected_entrypoint_revision: Some(note_revision),
+                                requires_explicit_binding: false,
+                            },
                         },
-                        input: MoveNote {
-                            note: plan.entrypoint.clone(),
-                            parent: Some(parent),
-                            slug: original.name.clone(),
+                    )
+                    .await?;
+                reference.revision = package.value.revision.clone();
+                published = true;
+                let _ = call
+                    .record_journal_with_key(
+                        "edit-ability-package-outcome",
+                        &call.request_key,
+                        call.request_hash,
+                        &PackageReplayOutcome {
+                            revision: package.value.revision,
+                            authored_changed,
                         },
-                    },
-                )
-                .await?;
-            note_revision = settled.value.revision;
-            carrier_moved = true;
-        }
-        if authored_changed || plan.promote {
-            let package = call
-                .registry
-                .engine
-                .publish_ability_package(
-                    writer(call, &plan.scope).await?,
-                    Mutation {
-                        identity: call.command_identity(
-                            &plan.scope,
-                            "republish-ability-package",
-                            0,
-                        ),
-                        preconditions: Preconditions::default(),
-                        input: PublishAbilityPackage {
-                            ability: plan.original.id.clone(),
-                            kind: plan.kind.into(),
-                            entrypoint: plan.entrypoint.clone(),
-                            files,
-                            attached_skills: skills,
-                            expected_package_revision: Some(plan.original.revision.clone()),
-                            expected_entrypoint_revision: Some(note_revision),
-                            requires_explicit_binding: false,
-                        },
-                    },
-                )
-                .await?;
-            reference.revision = package.value.revision;
-            published = true;
+                    )
+                    .await?;
+            }
         }
         if plan.promote {
             let destination = AbilityRef {
@@ -1113,6 +1198,7 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
         .await;
         match result {
             Ok(_) => {
+                applied_any = true;
                 committed_preference_enabled = enabled;
                 steps.push(change_step("enabled", "applied", None));
             }

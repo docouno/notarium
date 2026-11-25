@@ -354,9 +354,14 @@ pub(super) async fn edit_note(
 ) -> Result<Value, PortError> {
     let input: EditInput = decode(arguments)?;
     input.validate()?;
-    let route = route(call, &input.note, input.version_token.as_ref()).await?;
+    let (route, trashed_replay) = route(call, &input.note, input.version_token.as_ref()).await?;
     let (scope, observed) = route_snapshot(call, &route).await?;
-    let source = corpus::note_document(call, &scope, &observed.document).await?;
+    let source = if trashed_replay {
+        corpus::admit_note_metadata_write(call, &scope, &observed.document.metadata()).await?;
+        observed.document.explicit_read(scope.auth())?.to_owned()
+    } else {
+        corpus::note_document(call, &scope, &observed.document).await?
+    };
     let schema = if input.edits_view() {
         call.registry.engine.space_schema(scope.clone()).await?
     } else {

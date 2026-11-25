@@ -437,13 +437,100 @@ fn carrier_with_links(
     ))
 }
 
+async fn prepare_links_journaled(
+    call: &ToolCallContext<'_>,
+    scope: &SpaceContext,
+    draft: &PreparedDraft,
+) -> Result<Vec<PreparedLink>, PortError> {
+    if !draft.draft.links.iter().any(|link| link.to.is_some()) {
+        return prepare_links(call, None, scope, draft).await;
+    }
+    let mut replayed = true;
+    let targets: Vec<NoteId> = call
+        .journal_with_key(
+            "create_link_targets",
+            &draft.command.key,
+            draft.command.hash,
+            || async {
+                replayed = false;
+                let resolved = prepare_links(call, None, scope, draft).await?;
+                Ok(resolved
+                    .into_iter()
+                    .filter_map(|link| match link.target {
+                        LinkTarget::Note(note) => Some(note),
+                        LinkTarget::AuthoredName(_) | LinkTarget::Folder(_) => None,
+                    })
+                    .collect())
+            },
+        )
+        .await?;
+    let mut stable = targets.into_iter();
+    let mut links = Vec::with_capacity(draft.draft.links.len());
+    for link in &draft.draft.links {
+        let target = match (link.to.as_deref(), link.to_title.as_deref()) {
+            (Some(raw), None) => {
+                let expected = NoteId::parse(raw)?;
+                let note = stable
+                    .next()
+                    .ok_or_else(|| invalid(ValidationReason::SourceMismatch))?;
+                if note != expected {
+                    return Err(invalid(ValidationReason::SourceMismatch));
+                }
+                if replayed {
+                    match organize::resolve_target(call, None, scope, Some(raw), None).await {
+                        Ok((target, _)) => target,
+                        Err(PortError::Domain(DomainError::ResourceNotFound)) => {
+                            let observed = super::metadata_snapshot(
+                                call,
+                                scope,
+                                &note,
+                                None,
+                                notarium_core::receipt::CausalBasis::Await(Default::default()),
+                            )
+                            .await?;
+                            if observed.metadata.lifecycle() != Lifecycle::Trashed {
+                                return Err(DomainError::ResourceNotFound.into());
+                            }
+                            observed.metadata.listing(scope.auth())?;
+                            corpus::admit_note_metadata_write(call, scope, &observed.metadata)
+                                .await?;
+                            LinkTarget::Note(note)
+                        }
+                        Err(error) => return Err(error),
+                    }
+                } else {
+                    LinkTarget::Note(note)
+                }
+            }
+            (None, Some(title)) => {
+                let (target, _) =
+                    organize::resolve_target(call, None, scope, None, Some(title)).await?;
+                target
+            }
+            _ => return Err(invalid(ValidationReason::InvalidQuery)),
+        };
+        links.push(PreparedLink {
+            relation: link.relation.clone(),
+            target,
+        });
+    }
+    if stable.next().is_some() {
+        return Err(invalid(ValidationReason::SourceMismatch));
+    }
+    Ok(links)
+}
+
 async fn prepare_carrier(
     call: &ToolCallContext<'_>,
     provider: Option<&ToolCallContext<'_>>,
     scope: &SpaceContext,
     draft: &PreparedDraft,
 ) -> Result<String, PortError> {
-    let links = prepare_links(call, provider, scope, draft).await?;
+    let links = if provider.is_none() {
+        prepare_links_journaled(call, scope, draft).await?
+    } else {
+        prepare_links(call, provider, scope, draft).await?
+    };
     let (carrier, _) = carrier_with_links(&draft.carrier, link_lines(&links, &BTreeMap::new())?)?;
     Ok(carrier)
 }
@@ -560,7 +647,7 @@ async fn create_draft(
     let bytes = serde_json::to_vec(&raw).map_err(|_| invalid(ValidationReason::InvalidQuery))?;
     let hash = derive_digest("notarium.mcp.create-note-item-arguments.v1", &[&bytes]);
     let prepared = PreparedDraft::new(call, placement, decode(raw)?, false, index, Some(hash))?;
-    let links = prepare_links(call, None, &placement.read_scope, &prepared).await?;
+    let links = prepare_links_journaled(call, &placement.read_scope, &prepared).await?;
     let (carrier, link_block) =
         carrier_with_links(&prepared.carrier, link_lines(&links, &BTreeMap::new())?)?;
     let (committed, parent) =

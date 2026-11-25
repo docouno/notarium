@@ -466,16 +466,24 @@ impl ControlService {
                                 access_denied()
                             }
                         })?;
+                        if !grant.read_classes.contains(&DocClass::Skill)
+                            || grant.project_root.as_ref().is_some_and(|root| {
+                                !matches!(
+                                    &input.ability.placement,
+                                    AbilityPlacement::OwnedProject(folder)
+                                        if &folder.folder_id == root
+                                )
+                            })
+                        {
+                            return Err(if auth.human_management() {
+                                DomainError::ResourceNotFound.into()
+                            } else {
+                                access_denied()
+                            });
+                        }
                         if !auth.human_management()
                             && (grant.role == SpaceRole::Viewer
-                                || !grant.write_classes.contains(&DocClass::Skill)
-                                || grant.project_root.as_ref().is_some_and(|root| {
-                                    !matches!(
-                                        &input.ability.placement,
-                                        AbilityPlacement::OwnedProject(folder)
-                                            if &folder.folder_id == root
-                                    )
-                                }))
+                                || !grant.write_classes.contains(&DocClass::Skill))
                         {
                             return Err(access_denied());
                         }

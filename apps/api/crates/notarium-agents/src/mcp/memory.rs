@@ -260,7 +260,7 @@ pub(super) async fn handle(
             if corpus::hidden(&error) {
                 tracing::debug!(code = error.code(), "memory receipt metadata unavailable");
                 return Ok(json!({
-                    "outcome": committed.value.outcome,
+                    "outcome": "recorded",
                     "summaryUpdated": committed.value.summary_updated,
                 }));
             }

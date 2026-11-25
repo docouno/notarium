@@ -1,9 +1,15 @@
 //! Canonical-owned metadata consumed by the account and control services.
-const LIST_PROJECTS: &str = "SELECT folder_id, created_seq
+const LIST_PROJECTS_SQLITE: &str = "SELECT folder_id, created_seq
     FROM folder_heads
     WHERE space_id=$1 AND folder_id>$2 AND lifecycle_state='active' AND is_project=1
     AND ($3='' OR folder_id=$3)
     ORDER BY folder_id
+    LIMIT $4";
+const LIST_PROJECTS_PG: &str = "SELECT folder_id, created_seq
+    FROM folder_heads
+    WHERE space_id=$1 AND folder_id COLLATE \"C\" > $2 AND lifecycle_state='active' AND is_project=1
+    AND ($3='' OR folder_id=$3)
+    ORDER BY folder_id COLLATE \"C\"
     LIMIT $4";
 
 use crate::{
@@ -448,15 +454,28 @@ impl ControlCatalogPort for CanonicalStore {
                         .project_root
                         .as_ref()
                         .filter(|id| *id != &rec.root_folder_id);
-                    let mut rows: Vec<(String, i64)> = db!(
-                        read tx,
-                        sqlx::query_as(LIST_PROJECTS),
-                        fetch_all,
-                        rec.space.id.as_str(),
-                        &after,
-                        pin.map_or("", FolderId::as_str),
-                        i64::from(page.limit()) + 1
-                    )?;
+                    let mut rows: Vec<(String, i64)> = match tx {
+                        BackendConn::Sqlite(conn) => sqlx::query_as(LIST_PROJECTS_SQLITE)
+                            .bind(rec.space.id.as_str())
+                            .bind(&after)
+                            .bind(pin.map_or("", FolderId::as_str))
+                            .bind(i64::from(page.limit()) + 1)
+                            .fetch_all(&mut **conn)
+                            .await
+                            .map_err(|err| {
+                                crate::runtime::pg_read_error("canonical_catalog_query", err)
+                            })?,
+                        BackendConn::Postgres(conn) => sqlx::query_as(LIST_PROJECTS_PG)
+                            .bind(rec.space.id.as_str())
+                            .bind(&after)
+                            .bind(pin.map_or("", FolderId::as_str))
+                            .bind(i64::from(page.limit()) + 1)
+                            .fetch_all(&mut **conn)
+                            .await
+                            .map_err(|err| {
+                                crate::runtime::pg_read_error("canonical_catalog_query", err)
+                            })?,
+                    };
                     let next = if rows.len() > usize::from(page.limit()) {
                         rows.pop();
                         Some(encode_cursor(scope, rows.last().expect("nonempty page").1)?)
@@ -545,7 +564,7 @@ impl ControlCatalogPort for CanonicalStore {
                                  WHERE space_id = ANY($1)
                                    AND note_id = $2
                                    AND lifecycle_state = 'active'
-                                 ORDER BY space_id",
+                                 ORDER BY space_id COLLATE \"C\"",
                             )
                             .bind(&spaces)
                             .bind(note.as_str())

@@ -1435,6 +1435,29 @@ fn staged_taint_restrict_to_spaces_and_purged_carriers_preserve_invariants() {
         purged_doc.explicit_read(&clean_agent).unwrap_err(),
         DomainError::ResourceNotFound
     );
+    let mut bound_purged = ClassifiedDocument::from_canonical(
+        NoteRef {
+            space_id: s2.clone(),
+            note_id: NoteId::from_bytes([6; 16]),
+        },
+        RevisionId::from_bytes([6; 16]),
+        facts(2, DocClass::UserDoc),
+        Lifecycle::Active,
+        "historical active now purged".into(),
+        ContentDigest::from_bytes([6; 32]),
+    )
+    .unwrap();
+    bound_purged
+        .bind_current(facts(2, DocClass::UserDoc), Lifecycle::Purged)
+        .unwrap();
+    assert_eq!(
+        bound_purged.metadata().listing(&clean_agent).unwrap_err(),
+        DomainError::ResourceNotFound
+    );
+    assert_eq!(
+        bound_purged.explicit_read(&clean_agent).unwrap_err(),
+        DomainError::ResourceNotFound
+    );
     let mut ab_facts = facts(2, DocClass::Skill);
     ab_facts.ability_package = Some(AbilityId::from_bytes([5; 16]));
     let purged_ability = ClassifiedAbilityResource::from_canonical(

@@ -965,9 +965,24 @@ impl ProviderService {
         };
         let command = Command::new(request.identity, "set-provider-preference", &input)?;
         let auth = ctx.auth().clone();
+        let auth_check = auth.clone();
+        let catalog_check = catalog.clone();
         let clock = self.control.clock.clone();
         ctx.budget = budget.context(ctx.budget.request.clone());
-        self.mutate(ctx,command,move |tx,owner,now|Box::pin(async move {
+        self.mutate_authorized(
+            ctx,
+            command,
+            move |tx, _| {
+                Box::pin(async move {
+                    if let Some(catalog) = &catalog_check {
+                        super::super::spaces::admission(tx, &catalog.space.id, true).await?;
+                        check_member(tx, &auth_check, &catalog.space.id).await?;
+                        require_owner(tx, &auth_check, &catalog.space.id).await?;
+                    }
+                    Ok(())
+                })
+            },
+            move |tx,owner,now|Box::pin(async move {
             // A shared default is replaced across resource owners. Serialize
             // that scope before taking any provider configuration row locks.
             if let Some(catalog)=&catalog {

@@ -28,6 +28,13 @@ impl ScheduleScope<'_> {
         {
             return Err(invalid(ValidationReason::ScopeMismatch));
         }
+        if grant
+            .project_root
+            .as_ref()
+            .is_some_and(|root| self.project.map(|project| &project.folder_id) != Some(root))
+        {
+            return Err(access_denied());
+        }
         if grant.role == SpaceRole::Viewer
             || !grant.write_classes.contains(&DocClass::AgentMemory)
             || auth.taint().is_tainted()

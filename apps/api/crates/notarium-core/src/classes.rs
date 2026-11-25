@@ -119,6 +119,14 @@ impl DocumentFacts {
         auth.can_view_resource(&self.recorded)
     }
 
+    fn is_purged(&self, lifecycle: Lifecycle) -> bool {
+        lifecycle == Lifecycle::Purged
+            || self
+                .current
+                .as_deref()
+                .is_some_and(|(_, now)| *now == Lifecycle::Purged)
+    }
+
     fn check_egress(&self, lifecycle: Lifecycle) -> DomainResult<()> {
         if self
             .iter()
@@ -242,7 +250,7 @@ impl ClassifiedMetadata {
         self.facts.in_project(project)
     }
     pub fn listing(&self, auth: &EngineAuthContext) -> DomainResult<ListedDocument> {
-        if self.lifecycle == Lifecycle::Purged {
+        if self.facts.is_purged(self.lifecycle) {
             return Err(DomainError::ResourceNotFound);
         }
         self.facts.authorize(auth)?;
@@ -346,7 +354,7 @@ impl ClassifiedDocument {
         self.facts.in_project(project)
     }
     pub fn explicit_read<'a>(&'a self, auth: &EngineAuthContext) -> DomainResult<&'a str> {
-        if self.lifecycle == Lifecycle::Purged {
+        if self.facts.is_purged(self.lifecycle) {
             return Err(DomainError::ResourceNotFound);
         }
         self.facts.authorize(auth)?;

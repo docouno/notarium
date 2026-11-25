@@ -89,12 +89,22 @@ async fn authorize_confirmed_link(
     scope: &SpaceContext,
     plan: &LinkPlan,
 ) -> Result<DocClass, PortError> {
-    let source = corpus::note_in_space_preflight(call, scope, &plan.source).await?;
-    corpus::admit_note_write(call, scope, &source).await?;
-    scope
-        .auth()
-        .authorize_direct_write(&source.facts, &source.facts)?;
-    proposal_class(source.facts.class)?;
+    let source_class = match corpus::note_in_space_preflight(call, scope, &plan.source).await {
+        Ok(source) => {
+            corpus::admit_note_write(call, scope, &source).await?;
+            scope
+                .auth()
+                .authorize_direct_write(&source.facts, &source.facts)?;
+            proposal_class(source.facts.class)?;
+            source.facts.class
+        }
+        Err(PortError::Domain(DomainError::ResourceNotFound)) => {
+            let class = authorize_trashed_replay_source(call, scope, &plan.source).await?;
+            proposal_class(class)?;
+            class
+        }
+        Err(error) => return Err(error),
+    };
     if let Target::Stable { note, alias } = &plan.target {
         let expected_rev = alias.as_ref().map(|alias| alias.revision.clone());
         let found = call
@@ -129,7 +139,7 @@ async fn authorize_confirmed_link(
             }
         }
     }
-    Ok(source.facts.class)
+    Ok(source_class)
 }
 
 pub(in crate::mcp) async fn plan_links(
@@ -299,7 +309,7 @@ pub(in crate::mcp) async fn describe_links(
         };
         let checked = async {
             let scope = call.space(plan.scope.clone())?;
-            proposal_class(authorize(call, &scope, plan).await?)
+            proposal_class(authorize(call, &scope, plan, false).await?)
         }
         .await;
         match checked {

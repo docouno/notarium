@@ -204,9 +204,37 @@ impl ProviderService {
             ),
         )?;
         let auth = ctx.auth().clone();
+        let auth_check = auth.clone();
+        let target_check = input.target.clone();
+        let space_check = catalog.space.clone();
         let clock = self.control.clock.clone();
         ctx.budget = budget.context(ctx.budget.request.clone());
-        self.mutate(ctx,command,move |tx,owner,now|Box::pin(async move {
+        self.mutate_authorized(
+            ctx,
+            command,
+            move |tx, owner| {
+                Box::pin(async move {
+                    let activates = matches!(
+                        target_check,
+                        ProviderAttachmentTarget::Personal { .. }
+                    ) && space_check.kind == SpaceKind::Personal;
+                    if activates {
+                        admission(tx, &space_check.id, true).await?;
+                    } else {
+                        lock_space_read(tx, &space_check.id).await?;
+                    }
+                    check_member(tx, &auth_check, target_space(&target_check)).await?;
+                    if let ProviderAttachmentTarget::Personal {
+                        owner: target_owner,
+                        ..
+                    } = &target_check
+                    {
+                        owned(&owner.user_id, target_owner.as_str())?;
+                    }
+                    Ok(())
+                })
+            },
+            move |tx,owner,now|Box::pin(async move {
             if input.expires_at_ms.is_some_and(|expires| expires<=now || expires.saturating_sub(now)>365*24*60*60*1000) {return Err(invalid(ValidationReason::InvalidTimestamp));}
             let space=target_space(&input.target);
             let previous=before_attachment(tx, &input.target, &catalog.space, false, clock.as_ref()).await?;check_member(tx,&auth,space).await?;
@@ -266,9 +294,37 @@ impl ProviderService {
             ),
         )?;
         let auth = ctx.auth().clone();
+        let auth_check = auth.clone();
+        let target_check = target.clone();
+        let space_check = catalog.space.clone();
         let clock = self.control.clock.clone();
         ctx.budget = budget.context(ctx.budget.request.clone());
-        self.mutate(ctx,command,move |tx,owner,now|Box::pin(async move {
+        self.mutate_authorized(
+            ctx,
+            command,
+            move |tx, owner| {
+                Box::pin(async move {
+                    let activates = !matches!(
+                        target_check,
+                        ProviderAttachmentTarget::Personal { .. }
+                    ) && space_check.kind == SpaceKind::Shared;
+                    if activates {
+                        admission(tx, &space_check.id, true).await?;
+                    } else {
+                        lock_space_read(tx, &space_check.id).await?;
+                    }
+                    check_member(tx, &auth_check, target_space(&target_check)).await?;
+                    match &target_check {
+                        ProviderAttachmentTarget::Personal {
+                            owner: target_owner,
+                            ..
+                        } => owned(&owner.user_id, target_owner.as_str())?,
+                        _ => require_owner(tx, &auth_check, target_space(&target_check)).await?,
+                    }
+                    Ok(())
+                })
+            },
+            move |tx,owner,now|Box::pin(async move {
             let previous=before_attachment(tx, &target, &catalog.space, true, clock.as_ref()).await?;
             check_member(tx,&auth,target_space(&target)).await?;
             match &target {ProviderAttachmentTarget::Personal{owner:target_owner,..}=>owned(&owner.user_id,target_owner.as_str())?,_=>require_owner(tx,&auth,target_space(&target)).await?};
@@ -299,8 +355,33 @@ impl ProviderService {
             (&input.id, input.expected),
         )?;
         let auth = ctx.auth().clone();
+        let auth_check = auth.clone();
+        let target_check = target.clone();
+        let resource_id_check = observed.resource_id.clone();
         ctx.budget = budget.context(ctx.budget.request.clone());
-        self.mutate(ctx,command,move |tx,owner,_|Box::pin(async move {
+        self.mutate_authorized(
+            ctx,
+            command,
+            move |tx, owner| {
+                Box::pin(async move {
+                    lock_space_read(tx, target_space(&target_check)).await?;
+                    let resource = resource(tx, &resource_id_check).await?;
+                    if resource.owner_id != owner.user_id {
+                        match &target_check {
+                            ProviderAttachmentTarget::Personal {
+                                owner: target_owner,
+                                ..
+                            } => owned(&owner.user_id, target_owner.as_str())?,
+                            _ => {
+                                check_member(tx, &auth_check, target_space(&target_check)).await?;
+                                require_owner(tx, &auth_check, target_space(&target_check)).await?;
+                            }
+                        }
+                    }
+                    Ok(())
+                })
+            },
+            move |tx,owner,_|Box::pin(async move {
             let resource=resource(tx,&observed.resource_id).await?;
             if resource.owner_id!=owner.user_id {
                 match &target {ProviderAttachmentTarget::Personal{owner:target_owner,..}=>owned(&owner.user_id,target_owner.as_str())?,_=>require_owner(tx,&auth,target_space(&target)).await?};

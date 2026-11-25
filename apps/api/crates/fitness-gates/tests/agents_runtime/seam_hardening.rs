@@ -223,6 +223,8 @@ async fn exercise_seams(pg: bool) {
     .await;
     box_step(|| locate_ability_cap_and_legacy_mixed_case_id_pagination_parity(&fixture, &personal))
         .await;
+    box_step(|| schedule_provider_replay_shared_chat_and_post_trash_seams(&fixture, &personal))
+        .await;
 
     fixture.close().await;
 }
@@ -11062,7 +11064,7 @@ async fn runtime_skill_omission_project_only_shadowing_and_dedup_hygiene(
             ),
             (
                 29u8,
-                "secret-edit-ability-slug-r51",
+                "secret-edit-ability-slug",
                 json!({ "home": "project", "project": po_p2_handle }),
                 "SECRET-SLUG-HYGIENE-BODY",
             ),
@@ -11075,7 +11077,7 @@ async fn runtime_skill_omission_project_only_shadowing_and_dedup_hygiene(
                 json!({
                     "kind": "role",
                     "name": name,
-                    "description": "R51 seam role",
+                    "description": "Seam regression role",
                     "instructions": instructions,
                     "placement": placement,
                 }),
@@ -11108,7 +11110,7 @@ async fn runtime_skill_omission_project_only_shadowing_and_dedup_hygiene(
             &owner,
             [0xC1, 31, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 31],
             "start_session",
-            json!({ "session": { "name": "secret-episode-name-r51" } }),
+            json!({ "session": { "name": "secret-episode-name" } }),
         )
         .await
         .unwrap()
@@ -11457,7 +11459,30 @@ async fn runtime_skill_omission_project_only_shadowing_and_dedup_hygiene(
             )
             .await
             .unwrap();
-        supervisor
+        // Verify `use_role(role: "promo-shadow-role", project: "s_po/po-p1")` from a
+        // Personal-Space InAppProvider run bypasses the unconsented po_p2-promoted
+        // OwnedSpace(s_po) ability and activates the Personal fallback cleanly.
+        let used_fallback = local
+            .registry
+            .call_tool(
+                mk_ctx(15, None),
+                "use_role",
+                json!({ "role": "promo-shadow-role", "project": po_p1_handle }),
+            )
+            .await
+            .expect("use_role must bypass unconsented po_p2-promoted role and activate Personal fallback")
+            .structured_content;
+        assert!(
+            used_fallback["instructions"]
+                .as_str()
+                .unwrap()
+                .contains("PERSONAL-PROMO-FALLBACK-MARKER"),
+            "expected Personal fallback instructions, got {used_fallback}"
+        );
+        // On a Shared Space chat in `s_po/po-p1`, `bind_chat_role` must reject BOTH the
+        // unconsented po_p2-promoted role AND the cross-Space Personal role (which would
+        // taint the Shared Space chat and fail `append_chat` with CrossSpaceTainted).
+        let po_res = supervisor
             .start(
                 owner.clone(),
                 StartChatRun {
@@ -11467,23 +11492,15 @@ async fn runtime_skill_omission_project_only_shadowing_and_dedup_hygiene(
                     options: base_opts(Some("promo-shadow-role")),
                 },
             )
-            .await
-            .unwrap();
-        let (mut wire3, req3) = timeout(Duration::from_secs(15), read_request(&listener))
-        .await
-        .expect(
-            "bind_chat_role must bypass unconsented po_p2-promoted role and bind Personal fallback",
-        );
-        let req3_text = req3.to_string();
-        assert!(req3_text.contains("PERSONAL-PROMO-FALLBACK-MARKER"));
-        assert!(!req3_text.contains("PO-P2-PROMOTED-MARKER"));
-        send_ollama(
-            &mut wire3,
-            json!({"role": "assistant", "content": "Promo fallback ok."}),
-            "stop",
-        )
-        .await;
-        let _ = idle_leaf(fixture, &po_scope, &po_thread).await;
+            .await;
+        if let Ok(_run) = po_res {
+            let leaf = idle_leaf(fixture, &po_scope, &po_thread).await;
+            assert_eq!(
+                leaf.get(),
+                1,
+                "shared chat must not bind unconsented promoted role or cross-space personal role"
+            );
+        }
 
         // (3) UserDoc-only project s_b/b-udoc must NEVER leak unrelated Shared Space A's
         //     abilities or let Space A shadow Personal abilities in runtime or authoring views.
@@ -11516,13 +11533,22 @@ async fn runtime_skill_omission_project_only_shadowing_and_dedup_hygiene(
         }
         let _ = po_p2;
     }
+    let dedup_rows = fixture
+        .storage
+        .observer
+        .count("SELECT COUNT(*) FROM mcp_dedup WHERE operation IN ('edit_ability', 'use_role')")
+        .await;
+    assert!(
+        dedup_rows >= 2,
+        "expected mcp_dedup journal rows for edit_ability and use_role before negative leak check, got {dedup_rows}"
+    );
     let leaked_dedup = fixture
         .storage
         .observer
         .count(
             "SELECT COUNT(*) FROM mcp_dedup \
-             WHERE safe_result LIKE '%secret-edit-ability-slug-r51%' \
-                OR safe_result LIKE '%secret-episode-name-r51%'",
+             WHERE safe_result LIKE '%secret-edit-ability-slug%' \
+                OR safe_result LIKE '%secret-episode-name%'",
         )
         .await;
     assert_eq!(
@@ -12088,4 +12114,1228 @@ async fn locate_ability_cap_and_legacy_mixed_case_id_pagination_parity(
         seen_seed_threads.contains(&legacy_thread_id) && seen_seed_threads.contains(&v1_thread_id),
         "Seed pagination must yield both legacy and v1 ChatThreadIds in byte order: {seen_seed_threads:?}"
     );
+}
+
+#[inline(never)]
+async fn schedule_provider_replay_shared_chat_and_post_trash_seams(
+    fixture: &RuntimeFixture,
+    personal: &SpaceContext,
+) {
+    let owner = fresh_owner(fixture).await;
+    let actor = owner.auth().principal().clone();
+    let pscope = personal.scope().clone();
+    let acc_id = |sub: u8| {
+        let owner = owner.clone();
+        let actor = actor.clone();
+        async move {
+            let rev = fixture
+                .control
+                .account(owner, actor.clone())
+                .await
+                .unwrap()
+                .revision;
+            AccountCommandIdentity {
+                owner: actor.clone(),
+                actor,
+                expected: rev,
+                key: CommandKey::from_bytes([
+                    0xD1, sub, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, sub,
+                ]),
+                hash: ContentDigest::from_bytes([0xD1; 32]),
+            }
+        }
+    };
+
+    // Create two Shared Spaces `s1` (projects p1, p2, plus legacy mixed-case project)
+    // and `s2` (projects s2_p1, s2_p2 with project-only attachments, no Space attachment).
+    let s1 = fixture
+        .control
+        .create_space(
+            fresh_owner(fixture).await,
+            AccountMutation {
+                identity: acc_id(1).await,
+                input: CreateSpace {
+                    id: SpaceId::from_bytes([0xD1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+                    kind: SpaceKind::Shared,
+                    name: "Seam Hardening Shared One".into(),
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    let s2 = fixture
+        .control
+        .create_space(
+            fresh_owner(fixture).await,
+            AccountMutation {
+                identity: acc_id(2).await,
+                input: CreateSpace {
+                    id: SpaceId::from_bytes([0xD1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]),
+                    kind: SpaceKind::Shared,
+                    name: "Seam Hardening Shared Two".into(),
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    let owner = fresh_owner(fixture).await;
+    let s1_p1 = create_project_folder(
+        fixture,
+        &s1.history,
+        &actor,
+        FolderId::from_bytes([0xD1, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+        "seam-p1",
+    )
+    .await;
+    let s1_p2 = create_project_folder(
+        fixture,
+        &s1.history,
+        &actor,
+        FolderId::from_bytes([0xD1, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]),
+        "seam-p2",
+    )
+    .await;
+    let legacy_proj_id = FolderId::parse("ZZ0000000006").unwrap();
+    let _legacy_proj = create_project_folder(
+        fixture,
+        &s1.history,
+        &actor,
+        legacy_proj_id.clone(),
+        "seam-legacy-proj",
+    )
+    .await;
+    let s2_p1 = create_project_folder(
+        fixture,
+        &s2.history,
+        &actor,
+        FolderId::from_bytes([0xD1, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+        "s2-proj-a",
+    )
+    .await;
+    let s2_p2 = create_project_folder(
+        fixture,
+        &s2.history,
+        &actor,
+        FolderId::from_bytes([0xD1, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]),
+        "s2-proj-b",
+    )
+    .await;
+    let p_proj = create_project_folder(
+        fixture,
+        &pscope,
+        &actor,
+        FolderId::from_bytes([0xD1, 30, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+        "personal-replay-proj",
+    )
+    .await;
+
+    // (1) Legacy mixed-case project FolderId pagination parity (SQLite vs PG COLLATE "C").
+    let s1_sc = SpaceContext::new(owner.auth().clone(), s1.history.clone(), budget()).unwrap();
+    let mut proj_ids = Vec::new();
+    let mut proj_cursor: Option<String> = None;
+    for _ in 0..8 {
+        let page = fixture
+            .canonical
+            .projects(
+                s1_sc.clone(),
+                ControlPageRequest::new(1, proj_cursor).unwrap(),
+            )
+            .await
+            .unwrap();
+        for p in page.items {
+            proj_ids.push(p.folder.folder_id);
+        }
+        proj_cursor = page.continuation;
+        if proj_cursor.is_none() {
+            break;
+        }
+    }
+    assert_eq!(
+        proj_ids.first(),
+        Some(&legacy_proj_id),
+        "legacy mixed-case project ID must sort first in bytewise order: {proj_ids:?}"
+    );
+    assert!(proj_ids.contains(&s1_p1.folder_id) && proj_ids.contains(&s1_p2.folder_id));
+
+    // (2) Schedule mutation security: taint, project_root confinement on delete / pause_only,
+    //     and pre-replay authorization checks.
+    let s1_p2_handle = format!("{}/seam-p2", s1.slug);
+    let sched_role = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xD1, 40, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "create_ability",
+        json!({
+            "kind": "role",
+            "name": "sched-p2-role",
+            "description": "Schedule P2 role",
+            "instructions": "Run P2 tasks.",
+            "placement": { "home": "project", "project": s1_p2_handle },
+        }),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    let sched_role_ref = fixture
+        .control
+        .discover_abilities(
+            owner.clone(),
+            AbilityQuery {
+                page: ControlPageRequest::new(20, None).unwrap(),
+                project: Some(s1_p2.clone()),
+                kind: Some(AbilityKind::Role),
+                name: Some("sched-p2-role".into()),
+                authoring: true,
+            },
+        )
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .next()
+        .unwrap()
+        .descriptor
+        .reference;
+    let _ = sched_role;
+    let schedule_id = ScheduleId::from_bytes([0xD1, 41, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    let next_slot = Timestamp::parse("2028-01-02T03:00:00Z").unwrap();
+    let sched_def = ScheduleDefinition {
+        space: s1.history.space_id.clone(),
+        project: Some(s1_p2.clone()),
+        title: "P2 Schedule".into(),
+        init_prompt: "Check P2.".into(),
+        cron: "0 0 3 * * Sun *".into(),
+        timezone: "UTC".into(),
+        approved_role: sched_role_ref,
+        limits: RunLimits {
+            max_steps: 3,
+            max_tokens: 64_000,
+            timeout_ms: 15_000,
+        },
+    };
+    let create_sched_req = AccountMutation {
+        identity: acc_id(42).await,
+        input: CreateSchedule {
+            id: schedule_id.clone(),
+            definition: sched_def.clone(),
+            approved_skills: vec![],
+            next_slot,
+            paused: false,
+        },
+    };
+    let created_sched = fixture
+        .control
+        .create_schedule(owner.clone(), create_sched_req.clone())
+        .await
+        .unwrap();
+    let owner_p1_only =
+        AccountContext::new(owner.auth().restrict_to_project(&s1_p1).unwrap(), budget());
+    let owner_tainted = fresh_owner(fixture).await;
+    owner_tainted.auth().taint().mark_external_read();
+    // Narrowed P1 DirectHuman cannot pause-only update or delete P2 schedule, nor replay create.
+    assert!(matches!(
+        fixture
+            .control
+            .update_schedule(
+                owner_p1_only.clone(),
+                AccountMutation {
+                    identity: acc_id(43).await,
+                    input: UpdateSchedule {
+                        schedule: schedule_id.clone(),
+                        expected: created_sched.value.revision,
+                        definition: sched_def.clone(),
+                        approved_skills: None,
+                        next_slot: Some(next_slot),
+                        paused: true,
+                    },
+                },
+            )
+            .await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+    assert!(matches!(
+        fixture
+            .control
+            .delete_schedule(
+                owner_p1_only.clone(),
+                AccountMutation {
+                    identity: acc_id(44).await,
+                    input: DeleteSchedule {
+                        schedule: schedule_id.clone(),
+                        expected: created_sched.value.revision,
+                    },
+                },
+            )
+            .await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+    assert!(matches!(
+        fixture
+            .control
+            .create_schedule(owner_p1_only.clone(), create_sched_req.clone())
+            .await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+    // Tainted DirectHuman cannot delete or replay create.
+    assert!(matches!(
+        fixture
+            .control
+            .delete_schedule(
+                owner_tainted.clone(),
+                AccountMutation {
+                    identity: acc_id(45).await,
+                    input: DeleteSchedule {
+                        schedule: schedule_id.clone(),
+                        expected: created_sched.value.revision,
+                    },
+                },
+            )
+            .await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+    assert!(matches!(
+        fixture
+            .control
+            .create_schedule(owner_tainted.clone(), create_sched_req)
+            .await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+    // Authorized owner deletes schedule -> authorized replay succeeds, narrowed/tainted replay fails.
+    let del_req = AccountMutation {
+        identity: acc_id(46).await,
+        input: DeleteSchedule {
+            schedule: schedule_id.clone(),
+            expected: created_sched.value.revision,
+        },
+    };
+    let del_commit = fixture
+        .control
+        .delete_schedule(owner.clone(), del_req.clone())
+        .await
+        .unwrap();
+    let del_replay = fixture
+        .control
+        .delete_schedule(owner.clone(), del_req.clone())
+        .await
+        .unwrap();
+    assert_eq!(del_replay.revision, del_commit.revision);
+    assert!(matches!(
+        fixture
+            .control
+            .delete_schedule(owner_p1_only, del_req.clone())
+            .await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+    assert!(matches!(
+        fixture
+            .control
+            .delete_schedule(owner_tainted, del_req)
+            .await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+
+    // (3) ProviderService pre-replay authorization for Space-scoped attachments & preferences.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local = loopback_provider(fixture, &owner, &listener, 0x6B, true).await;
+    let consent_us = || {
+        ProviderDisclosureConsent::attest_checked(ProviderDisclosure {
+            classes: [DocClass::UserDoc, DocClass::Skill].into(),
+        })
+    };
+    let req_att = AccountMutation {
+        identity: acc_id(50).await,
+        input: RequestProviderAttachment {
+            id: RequestId::from_bytes([0x69, 50, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+            expected: None,
+            resource: local.resource.id.clone(),
+            resource_consent_epoch: local.resource.consent_epoch,
+            credential_consent_epoch: None,
+            target: ProviderAttachmentTarget::Space(s1.history.space_id.clone()),
+            consent: consent_us(),
+            expires_at_ms: None,
+        },
+    };
+    let att_res = local
+        .provider
+        .request_attachment(owner.clone(), req_att.clone())
+        .await
+        .unwrap()
+        .value;
+    let app_att = AccountMutation {
+        identity: acc_id(51).await,
+        input: ApproveProviderAttachment {
+            id: att_res.id.clone(),
+            expected: att_res.revision,
+            resource_consent_epoch: att_res.resource_consent_epoch,
+            credential_consent_epoch: att_res.credential_consent_epoch,
+            consent: consent_us(),
+        },
+    };
+    local
+        .provider
+        .approve_attachment(owner.clone(), app_att.clone())
+        .await
+        .unwrap();
+    let pref_req = AccountMutation {
+        identity: acc_id(52).await,
+        input: SetProviderPreference {
+            scope: ProviderPreferenceScope::Space(s1.history.space_id.clone()),
+            kind: PreferenceModelKind::Completion,
+            resource: local.resource.id.clone(),
+            model: local.model.clone(),
+        },
+    };
+    local
+        .provider
+        .set_preference(owner.clone(), pref_req.clone())
+        .await
+        .unwrap();
+    // Narrowed caller excluding s1 MUST fail AccessDenied before command.replay!
+    let owner_no_s1 = AccountContext::new(
+        owner
+            .auth()
+            .restrict_to_spaces(&[pscope.space_id.clone()].into()),
+        budget(),
+    );
+    assert!(matches!(
+        local
+            .provider
+            .request_attachment(owner_no_s1.clone(), req_att)
+            .await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+    assert!(matches!(
+        local
+            .provider
+            .approve_attachment(owner_no_s1.clone(), app_att)
+            .await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+    assert!(matches!(
+        local.provider.set_preference(owner_no_s1, pref_req).await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+
+    // Attach personal space with ONLY UserDoc+Skill (NO AgentMemory!) for (4) + (5) + (6),
+    // personal consent on s1, and project-only attachments on s2_p1 & s2_p2 (NO Space(s2)!).
+    for (sub, target) in [
+        (
+            53u8,
+            ProviderAttachmentTarget::Personal {
+                owner: actor.clone(),
+                space: pscope.space_id.clone(),
+            },
+        ),
+        (
+            54u8,
+            ProviderAttachmentTarget::Personal {
+                owner: actor.clone(),
+                space: s1.history.space_id.clone(),
+            },
+        ),
+        (55u8, ProviderAttachmentTarget::Project(s2_p1.clone())),
+        (56u8, ProviderAttachmentTarget::Project(s2_p2.clone())),
+        (
+            57u8,
+            ProviderAttachmentTarget::Personal {
+                owner: actor.clone(),
+                space: s2.history.space_id.clone(),
+            },
+        ),
+    ] {
+        let a = local
+            .provider
+            .request_attachment(
+                owner.clone(),
+                AccountMutation {
+                    identity: acc_id(sub).await,
+                    input: RequestProviderAttachment {
+                        id: RequestId::from_bytes([
+                            0x69, sub, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, sub,
+                        ]),
+                        expected: None,
+                        resource: local.resource.id.clone(),
+                        resource_consent_epoch: local.resource.consent_epoch,
+                        credential_consent_epoch: None,
+                        target,
+                        consent: consent_us(),
+                        expires_at_ms: None,
+                    },
+                },
+            )
+            .await
+            .unwrap()
+            .value;
+        if a.state != ProviderAttachmentState::Approved {
+            local
+                .provider
+                .approve_attachment(
+                    owner.clone(),
+                    AccountMutation {
+                        identity: acc_id(sub + 20).await,
+                        input: ApproveProviderAttachment {
+                            id: a.id,
+                            expected: a.revision,
+                            resource_consent_epoch: a.resource_consent_epoch,
+                            credential_consent_epoch: a.credential_consent_epoch,
+                            consent: consent_us(),
+                        },
+                    },
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    // (4) remember_about_user without AgentMemory consent must return identical static
+    //     outcome "recorded" on both first (create) and second (append) call.
+    let run_auth = owner
+        .auth()
+        .for_agent_run(
+            AgentRunId::from_bytes([0xD1, 90, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+            pscope.space_id.clone(),
+            ChatAudience::Personal,
+            owner.auth().spaces().clone(),
+        )
+        .unwrap();
+    let run_acc = AccountContext::new(run_auth, budget());
+    let mk_in_app = |tag: u8| McpInvocationContext {
+        account: run_acc.clone(),
+        target: EgressTarget::InAppProvider {
+            provider: local.resource.id.clone(),
+            model: local.model.clone(),
+            primary_project: None,
+        },
+        request_key: CommandKey::from_bytes([
+            0xD1, 91, tag, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, tag,
+        ]),
+    };
+    let mem_first = local
+        .registry
+        .call_tool(
+            mk_in_app(1),
+            "remember_about_user",
+            json!({ "category": "unconsented-cat", "observation": "first entry" }),
+        )
+        .await
+        .unwrap()
+        .structured_content;
+    let mem_second = local
+        .registry
+        .call_tool(
+            mk_in_app(2),
+            "remember_about_user",
+            json!({ "category": "unconsented-cat", "observation": "second entry" }),
+        )
+        .await
+        .unwrap()
+        .structured_content;
+    assert_eq!(mem_first["outcome"], "recorded");
+    assert_eq!(mem_second["outcome"], "recorded");
+    assert!(mem_first.get("noteId").is_none() && mem_second.get("noteId").is_none());
+
+    // (5) Shared Space Personal chat: cross-space Personal role rejected cleanly (no episode
+    //     poisoning); Shared role attaching a Personal skill omits it cleanly and completes turn.
+    //     Personal chat with role in s2/proj-a attaching skill in s2/proj-b (separate project_only
+    //     consents, no Space(s2) consent) omits s2/proj-b skill cleanly and completes turn.
+    let personal_only_role = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xD1, 100, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "create_ability",
+        json!({
+            "kind": "role",
+            "name": "personal-only-cross-role",
+            "description": "Personal role",
+            "instructions": "PERSONAL-ONLY-ROLE-BODY",
+            "placement": { "home": "personal" },
+        }),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    let _ = personal_only_role;
+    let personal_skill = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xD1, 101, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "create_ability",
+        json!({
+            "kind": "skill",
+            "name": "personal-attached-skill",
+            "description": "Personal skill",
+            "instructions": "PERSONAL-CROSS-SKILL-SECRET",
+            "placement": { "home": "personal" },
+        }),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    let _shared_role = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xD1, 102, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "create_ability",
+        json!({
+            "kind": "role",
+            "name": "shared-with-personal-skill",
+            "description": "Shared role with cross-space skill",
+            "instructions": "SHARED-ROLE-LOCAL-MARKER",
+            "placement": { "home": "space", "space": s1.slug },
+            "attachments": [{ "ref": personal_skill["ref"] }],
+        }),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    let s2_sc = SpaceContext::new(owner.auth().clone(), s2.history.clone(), budget()).unwrap();
+    let mut s2_skill_refs = Vec::new();
+    for (idx, (proj, slug, marker)) in [
+        (&s2_p1, "s2-proj-a-skill", "S2-PROJ-A-SKILL-MARKER"),
+        (&s2_p2, "s2-proj-b-skill", "S2-PROJ-B-CONFLICT-SECRET"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let sub = (idx + 1) as u8;
+        let note_id = NoteId::from_bytes([0xD1, 103, sub, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, sub]);
+        let ab_id =
+            AbilityId::from_bytes([0xD1, 103, sub, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, sub]);
+        let note_rev = fixture
+            .canonical
+            .create_note(
+                s2_sc.clone(),
+                Mutation {
+                    identity: CommandIdentity {
+                        scope: s2.history.clone(),
+                        actor: actor.clone(),
+                        key: CommandKey::from_bytes([
+                            0xD1, 103, sub, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, sub,
+                        ]),
+                        hash: ContentDigest::from_bytes([0xD1; 32]),
+                    },
+                    preconditions: Preconditions::default(),
+                    input: CreateNote {
+                        note: note_id.clone(),
+                        parent: Some(proj.folder_id.clone()),
+                        slug: slug.into(),
+                        class: DocClass::Skill,
+                        carrier: format!(
+                            "---\nname: {slug}\ndescription: {slug}\n---\n\n{marker}\n"
+                        ),
+                        folder_page: false,
+                    },
+                },
+            )
+            .await
+            .unwrap()
+            .value
+            .revision;
+        let pkg = fixture
+            .canonical
+            .publish_ability_package(
+                s2_sc.clone(),
+                Mutation {
+                    identity: CommandIdentity {
+                        scope: s2.history.clone(),
+                        actor: actor.clone(),
+                        key: CommandKey::from_bytes([
+                            0xD1, 103, sub, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, sub,
+                        ]),
+                        hash: ContentDigest::from_bytes([0xD1; 32]),
+                    },
+                    preconditions: Preconditions::default(),
+                    input: PublishAbilityPackage {
+                        ability: ab_id.clone(),
+                        kind: AbilityKind::Skill,
+                        entrypoint: note_id,
+                        files: vec![],
+                        attached_skills: vec![],
+                        expected_package_revision: None,
+                        expected_entrypoint_revision: Some(note_rev),
+                        requires_explicit_binding: false,
+                    },
+                },
+            )
+            .await
+            .unwrap()
+            .value;
+        s2_skill_refs.push(AbilityRef {
+            id: ab_id,
+            placement: AbilityPlacement::OwnedProject(proj.clone()),
+            revision: pkg.revision,
+        });
+    }
+    let p_two_note = NoteId::from_bytes([0xD1, 104, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    let p_two_ab = AbilityId::from_bytes([0xD1, 104, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+    let p_two_rev = fixture
+        .canonical
+        .create_note(
+            personal.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: pscope.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([
+                        0xD1, 104, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xD1; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: CreateNote {
+                    note: p_two_note.clone(),
+                    parent: None,
+                    slug: "personal-two-sec-role".into(),
+                    class: DocClass::Skill,
+                    carrier: "---\nname: personal-two-sec-role\ndescription: Two sec role\n---\n\nPERSONAL-TWO-SEC-ROLE-MARKER\n".into(),
+                    folder_page: false,
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value
+        .revision;
+    let _ = fixture
+        .canonical
+        .publish_ability_package(
+            personal.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: pscope.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([
+                        0xD1, 104, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xD1; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: PublishAbilityPackage {
+                    ability: p_two_ab,
+                    kind: AbilityKind::Role,
+                    entrypoint: p_two_note,
+                    files: vec![],
+                    attached_skills: s2_skill_refs,
+                    expected_package_revision: None,
+                    expected_entrypoint_revision: Some(p_two_rev),
+                    requires_explicit_binding: false,
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+    let shared_chat =
+        ChatThreadId::from_bytes([0xD1, 110, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    fixture
+        .canonical
+        .create_chat(
+            s1_sc.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: s1.history.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([
+                        0xD1, 110, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xD1; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: CreateChat {
+                    thread: shared_chat.clone(),
+                    kind: ChatThreadKind::Personal,
+                    owner: actor.clone(),
+                    project_folder: None,
+                    title: "Shared Personal Chat".into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let supervisor = AgentRunSupervisor::new_local(
+        local.registry.clone(),
+        fixture.revocations.clone(),
+        ExclusiveDataRoot::attest_open_writer(),
+    );
+    let base_opts = ChatRunOptions {
+        provider: Some(local.resource.id.clone()),
+        model: Some(local.model.clone()),
+        limits: RunLimits {
+            max_steps: 2,
+            max_tokens: 16_000,
+            timeout_ms: 15_000,
+        },
+        ..ChatRunOptions::default()
+    };
+    // Enqueue a human message first so start has a branch to run on.
+    fixture
+        .canonical
+        .append_chat(
+            s1_sc.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: s1.history.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([
+                        0xD1, 110, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xD1; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: AppendChat {
+                    thread: shared_chat.clone(),
+                    parent: ThreadEntrySeq::ZERO,
+                    kind: ChatEntryKind::Human,
+                    body: ChatInputBody::Text("Hi in shared space".into()),
+                    tool_calls: vec![],
+                    provenance: None,
+                    interruption: None,
+                    proposed_diff: None,
+                    proposed_effect: None,
+                    referenced_notes: vec![],
+                    tainted: false,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let mut bad_role_opts = base_opts.clone();
+    bad_role_opts.role = Some("personal-only-cross-role".into());
+    let started_bad = supervisor
+        .start(
+            owner.clone(),
+            StartChatRun {
+                scope: s1.history.clone(),
+                thread: shared_chat.clone(),
+                expected_leaf: ThreadEntrySeq::new(1).unwrap(),
+                options: bad_role_opts,
+            },
+        )
+        .await;
+    // Wait for run to fail fast without binding the cross-space personal role,
+    // OR reject synchronously.
+    if let Ok(_run) = started_bad {
+        let leaf = idle_leaf(fixture, &s1_sc, &shared_chat).await;
+        assert_eq!(
+            leaf.get(),
+            1,
+            "cross-space personal role must fail before append"
+        );
+    }
+    // Now start with `shared-with-personal-skill` -> must cleanly omit personal skill & succeed!
+    let mut good_shared_opts = base_opts.clone();
+    good_shared_opts.role = Some("shared-with-personal-skill".into());
+    let _started_good = supervisor
+        .start(
+            owner.clone(),
+            StartChatRun {
+                scope: s1.history.clone(),
+                thread: shared_chat.clone(),
+                expected_leaf: ThreadEntrySeq::new(1).unwrap(),
+                options: good_shared_opts,
+            },
+        )
+        .await
+        .unwrap();
+    let (mut wire1, prompt1) = timeout(Duration::from_secs(15), read_request(&listener))
+        .await
+        .expect("shared chat with local role and cross-space attached skill must reach provider");
+    let prompt1_text = prompt1.to_string();
+    assert!(
+        prompt1_text.contains("SHARED-ROLE-LOCAL-MARKER")
+            && !prompt1_text.contains("PERSONAL-CROSS-SKILL-SECRET"),
+        "shared chat must include local role and omit cross-space personal skill: {prompt1_text}"
+    );
+    send_ollama(
+        &mut wire1,
+        json!({"role": "assistant", "content": "Shared space turn succeeded."}),
+        "stop",
+    )
+    .await;
+    let shared_leaf = idle_leaf(fixture, &s1_sc, &shared_chat).await;
+    assert_eq!(
+        shared_leaf.get(),
+        2,
+        "shared space personal chat must append assistant reply without CrossSpaceTainted"
+    );
+
+    // Personal chat in personal space with a personal role attaching two skills in
+    // distinct project_only projects of s2 (s2/proj-a and s2/proj-b, no Space(s2) consent)
+    // must omit the conflicting second project_only skill and complete cleanly!
+    let p_chat = ChatThreadId::from_bytes([0xD1, 111, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    fixture
+        .canonical
+        .create_chat(
+            personal.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: pscope.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([
+                        0xD1, 111, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xD1; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: CreateChat {
+                    thread: p_chat.clone(),
+                    kind: ChatThreadKind::Personal,
+                    owner: actor.clone(),
+                    project_folder: None,
+                    title: "Secondary Two Project Only Chat".into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let mut s2_role_opts = base_opts.clone();
+    s2_role_opts.role = Some("personal-two-sec-role".into());
+    let sub_p = supervisor
+        .enqueue_input(
+            owner.clone(),
+            SubmitUserChatInput {
+                identity: CommandIdentity {
+                    scope: pscope.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([
+                        0xD1, 111, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xD1; 32]),
+                },
+                id: PendingInputId::from_bytes([
+                    0xD1, 111, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
+                ]),
+                thread: p_chat.clone(),
+                expected_leaf: ThreadEntrySeq::ZERO,
+                body: "Run with two project-only attachments in secondary space".into(),
+                mentions_agent: false,
+            },
+            s2_role_opts,
+        )
+        .await
+        .unwrap();
+    assert!(sub_p.run.is_some());
+    let (mut wire2, prompt2) = timeout(Duration::from_secs(15), read_request(&listener))
+        .await
+        .expect("personal chat must omit conflicting second project_only skill and reach provider");
+    let prompt2_text = prompt2.to_string();
+    assert!(
+        prompt2_text.contains("PERSONAL-TWO-SEC-ROLE-MARKER")
+            && prompt2_text.contains("S2-PROJ-A-SKILL-MARKER")
+            && !prompt2_text.contains("S2-PROJ-B-CONFLICT-SECRET"),
+        "must include role + s2/proj-a skill and omit conflicting s2/proj-b skill: {prompt2_text}"
+    );
+    send_ollama(
+        &mut wire2,
+        json!({"role": "assistant", "content": "Two project-only handled."}),
+        "stop",
+    )
+    .await;
+    let p_leaf = idle_leaf(fixture, personal, &p_chat).await;
+    assert_eq!(p_leaf.get(), 2);
+
+    // (6) Post-trash idempotent replays:
+    //     - link & link_many after trashing source + target
+    //     - create_note & create_notes after trashing linked target
+    //     - edit_ability (authored + promote) after trashing ability
+    //     - InAppProvider edit_note, move_note, rename_note after trashing note
+    let s1_p1_handle = format!("{}/seam-p1", s1.slug);
+    let mk_note = |tag: u8, title: &str| {
+        let registry = fixture.registry.clone();
+        let owner = owner.clone();
+        let proj = s1_p1_handle.clone();
+        let title = title.to_owned();
+        async move {
+            call_mcp(
+                &registry,
+                &owner,
+                [0xD1, 120, tag, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, tag],
+                "create_note",
+                json!({ "project": proj, "title": title, "body": format!("Body of {title}") }),
+            )
+            .await
+            .unwrap()
+            .structured_content
+        }
+    };
+    let n_src = mk_note(1, "Link Replay Src").await;
+    let n_tgt = mk_note(2, "Link Replay Tgt").await;
+    let n_bsrc = mk_note(3, "Batch Link Replay Src").await;
+    let n_btgt = mk_note(4, "Batch Link Replay Tgt").await;
+    let n_create_tgt = mk_note(5, "Create Link Replay Tgt").await;
+    // Commit link + link_many + create_note(with link) + create_notes(with link)
+    let link_key = [0xD1, 121, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    let link_args =
+        json!({ "from": n_src["noteId"], "to": n_tgt["noteId"], "relation": "related" });
+    let link_first = call_mcp(
+        &fixture.registry,
+        &owner,
+        link_key,
+        "link",
+        link_args.clone(),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    let lm_key = [0xD1, 121, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+    let lm_args = json!({
+        "links": [{ "from": n_bsrc["noteId"], "to": n_btgt["noteId"], "relation": "related" }]
+    });
+    let lm_first = call_mcp(
+        &fixture.registry,
+        &owner,
+        lm_key,
+        "link_many",
+        lm_args.clone(),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    let cn_key = [0xD1, 121, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3];
+    let cn_args = json!({
+        "project": s1_p1_handle,
+        "title": "Created With Link",
+        "body": "Links to target.",
+        "links": [{ "relation": "related", "to": n_create_tgt["noteId"] }]
+    });
+    let cn_first = call_mcp(
+        &fixture.registry,
+        &owner,
+        cn_key,
+        "create_note",
+        cn_args.clone(),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    let cns_key = [0xD1, 121, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4];
+    let cns_args = json!({
+        "project": s1_p1_handle,
+        "notes": [{
+            "title": "Batch Created With Link",
+            "body": "Batch links to target.",
+            "links": [{ "relation": "related", "to": n_create_tgt["noteId"] }]
+        }]
+    });
+    let cns_first = call_mcp(
+        &fixture.registry,
+        &owner,
+        cns_key,
+        "create_notes",
+        cns_args.clone(),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    // Trash source and target notes, then verify exact-key replays ALL succeed!
+    for (idx, nid) in [
+        &n_src["noteId"],
+        &n_tgt["noteId"],
+        &n_bsrc["noteId"],
+        &n_btgt["noteId"],
+        &n_create_tgt["noteId"],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        call_mcp(
+            &fixture.registry,
+            &owner,
+            [
+                0xD1, 122, idx as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, idx as u8,
+            ],
+            "delete_note",
+            json!({ "ref": nid }),
+        )
+        .await
+        .unwrap();
+    }
+    let link_replay = call_mcp(&fixture.registry, &owner, link_key, "link", link_args)
+        .await
+        .expect("post-trash link replay must succeed")
+        .structured_content;
+    assert_eq!(link_replay["noteId"], link_first["noteId"]);
+    assert_eq!(link_replay["versionToken"], link_first["versionToken"]);
+    let lm_replay = call_mcp(&fixture.registry, &owner, lm_key, "link_many", lm_args)
+        .await
+        .expect("post-trash link_many replay must succeed")
+        .structured_content;
+    assert_eq!(lm_replay["results"][0]["ok"], true);
+    assert_eq!(
+        lm_replay["results"][0]["versionToken"],
+        lm_first["results"][0]["versionToken"]
+    );
+    let cn_replay = call_mcp(&fixture.registry, &owner, cn_key, "create_note", cn_args)
+        .await
+        .expect("post-trash create_note replay with trashed link target must succeed")
+        .structured_content;
+    assert_eq!(cn_replay["noteId"], cn_first["noteId"]);
+    assert_eq!(cn_replay["versionToken"], cn_first["versionToken"]);
+    let cns_replay = call_mcp(&fixture.registry, &owner, cns_key, "create_notes", cns_args)
+        .await
+        .expect("post-trash create_notes replay with trashed link target must succeed")
+        .structured_content;
+    assert_eq!(cns_replay["results"][0]["ok"], true);
+    assert_eq!(
+        cns_replay["results"][0]["noteId"],
+        cns_first["results"][0]["noteId"]
+    );
+    assert_eq!(
+        cns_replay["results"][0]["versionToken"],
+        cns_first["results"][0]["versionToken"]
+    );
+
+    // edit_ability (authored + promote) post-trash replay:
+    let ab_created = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xD1, 123, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "create_ability",
+        json!({
+            "kind": "role",
+            "name": "authored-promote-replay",
+            "description": "Initial desc",
+            "instructions": "Initial instructions",
+            "placement": { "home": "project", "project": s1_p1_handle },
+        }),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    let ab_edit_key = [0xD1, 123, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+    let ab_edit_args = json!({
+        "ref": ab_created["ref"],
+        "versionToken": ab_created["versionToken"],
+        "description": "Updated desc",
+        "instructions": "Updated instructions",
+        "home": { "home": "space" },
+    });
+    let ab_edit_first = call_mcp(
+        &fixture.registry,
+        &owner,
+        ab_edit_key,
+        "edit_ability",
+        ab_edit_args.clone(),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xD1, 123, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3],
+        "delete_ability",
+        json!({ "ref": ab_edit_first["ref"] }),
+    )
+    .await
+    .unwrap();
+    let ab_edit_replay = call_mcp(
+        &fixture.registry,
+        &owner,
+        ab_edit_key,
+        "edit_ability",
+        ab_edit_args,
+    )
+    .await
+    .expect("post-trash authored+promote edit_ability replay must succeed")
+    .structured_content;
+    assert_eq!(ab_edit_replay["outcome"], "updated");
+    assert_eq!(ab_edit_replay["ref"], ab_edit_first["ref"]);
+    assert_eq!(
+        ab_edit_replay["versionToken"],
+        ab_edit_first["versionToken"]
+    );
+
+    // InAppProvider edit_note, move_note, rename_note post-trash replays:
+    let p_slug = fixture
+        .control
+        .list_spaces(owner.clone(), ControlPageRequest::new(50, None).unwrap())
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .find(|s| s.history.space_id == pscope.space_id)
+        .unwrap()
+        .slug;
+    let p_proj_handle = format!("{p_slug}/personal-replay-proj");
+    let _ = p_proj;
+    let in_app_note = local
+        .registry
+        .call_tool(
+            mk_in_app(10),
+            "create_note",
+            json!({
+                "project": p_proj_handle,
+                "title": "InApp Post Trash Note",
+                "body": "Original body line.",
+            }),
+        )
+        .await
+        .unwrap()
+        .structured_content;
+    let edit_args = json!({
+        "ref": in_app_note["noteId"],
+        "versionToken": in_app_note["versionToken"],
+        "operation": "append",
+        "content": "\nAppended line.",
+    });
+    let _edit_first = local
+        .registry
+        .call_tool(mk_in_app(11), "edit_note", edit_args.clone())
+        .await
+        .unwrap()
+        .structured_content;
+    let move_args = json!({
+        "ref": in_app_note["noteId"],
+        "toFolder": "personal-replay-proj/sub-moved",
+    });
+    let _move_first = local
+        .registry
+        .call_tool(mk_in_app(12), "move_note", move_args.clone())
+        .await
+        .unwrap()
+        .structured_content;
+    let rename_args = json!({
+        "ref": in_app_note["noteId"],
+        "title": "InApp Renamed Title",
+    });
+    let _rename_first = local
+        .registry
+        .call_tool(mk_in_app(13), "rename_note", rename_args.clone())
+        .await
+        .unwrap()
+        .structured_content;
+    // Trash note via owner MCP, then replay all 3 InAppProvider calls with exact keys!
+    call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xD1, 124, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "delete_note",
+        json!({ "ref": in_app_note["noteId"] }),
+    )
+    .await
+    .unwrap();
+    let edit_replay = local
+        .registry
+        .call_tool(mk_in_app(11), "edit_note", edit_args)
+        .await
+        .expect("InAppProvider post-trash edit_note replay must succeed")
+        .structured_content;
+    assert_eq!(edit_replay["outcome"], "edited");
+    let move_replay = local
+        .registry
+        .call_tool(mk_in_app(12), "move_note", move_args)
+        .await
+        .expect("InAppProvider post-trash move_note replay must succeed")
+        .structured_content;
+    assert_eq!(move_replay["outcome"], "moved");
+    let rename_replay = local
+        .registry
+        .call_tool(mk_in_app(13), "rename_note", rename_args)
+        .await
+        .expect("InAppProvider post-trash rename_note replay must succeed")
+        .structured_content;
+    assert_eq!(rename_replay["outcome"], "renamed");
 }

@@ -144,11 +144,35 @@ impl ProviderService {
             ) -> PortFuture<'tx, (T, Vec<RevocationSelector>)>
             + Send,
     {
+        self.mutate_authorized(ctx, command, |_, _| Box::pin(async { Ok(()) }), apply)
+            .await
+    }
+    async fn mutate_authorized<T, A, F>(
+        &self,
+        ctx: AccountContext,
+        command: Command,
+        authorize: A,
+        apply: F,
+    ) -> Result<ControlCommit<T>, PortError>
+    where
+        T: Serialize + DeserializeOwned + Send + 'static,
+        A: for<'tx> FnOnce(&'tx mut Transaction, &'tx UsersRow) -> PortFuture<'tx, ()> + Send,
+        F: for<'tx> FnOnce(
+                &'tx mut Transaction,
+                &'tx UsersRow,
+                i64,
+            ) -> PortFuture<'tx, (T, Vec<RevocationSelector>)>
+            + Send,
+    {
+        if ctx.auth().taint().is_tainted() {
+            return Err(notarium_core::DomainError::CrossSpaceTainted.into());
+        }
         command.require(ctx.auth().principal(), ctx.auth().principal())?;
         let budget = OperationBudget::new(ctx.budget.clone());
         let mut tx = self.control.store.write(budget.clone()).await?;
         let (revision, saved) = budget.run(async {
             let (_, owner) = self.control.manager(tx.inner_mut(), ctx.auth(), ctx.auth().principal()).await?;
+            authorize(tx.inner_mut(), &owner).await?;
             if let Some(replay) = command.replay::<T>(tx.inner_mut()).await? { return Ok(replay); }
             expect_revision(&owner, command.identity.expected)?;
             let now = self.control.clock.now_ms()?;

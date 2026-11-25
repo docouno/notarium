@@ -404,19 +404,99 @@ async fn plan_link_located(
     })
 }
 
+async fn authorize_trashed_replay_source(
+    call: &ToolCallContext<'_>,
+    scope: &SpaceContext,
+    note: &NoteId,
+) -> Result<DocClass, PortError> {
+    let observed = call
+        .registry
+        .engine
+        .get_note_metadata(
+            scope.clone(),
+            GetNote {
+                note: note.clone(),
+                revision: None,
+                causal: CausalBasis::Await(Default::default()),
+            },
+        )
+        .await?;
+    if observed.metadata.reference().space_id != scope.scope().space_id
+        || observed.metadata.reference().note_id != *note
+        || observed.metadata.lifecycle() != Lifecycle::Trashed
+        || observed.metadata.class() == DocClass::EncryptedNote
+    {
+        return Err(DomainError::ResourceNotFound.into());
+    }
+    observed.metadata.listing(scope.auth())?;
+    corpus::admit_note_metadata_write(call, scope, &observed.metadata).await?;
+    let class = observed.metadata.class();
+    let grant = scope
+        .auth()
+        .spaces()
+        .get(&scope.scope().space_id)
+        .ok_or(DomainError::ResourceNotFound)?;
+    if grant.role == notarium_core::auth::SpaceRole::Viewer || !grant.write_classes.contains(&class)
+    {
+        return Err(DomainError::SpaceReadOnly.into());
+    }
+    if scope.auth().taint().is_tainted() {
+        return Err(DomainError::CrossSpaceTainted.into());
+    }
+    Ok(class)
+}
+
 async fn authorize(
     call: &ToolCallContext<'_>,
     scope: &SpaceContext,
     plan: &LinkPlan,
+    allow_trashed_replay: bool,
 ) -> Result<DocClass, PortError> {
-    let source = corpus::note_in_space_preflight(call, scope, &plan.source).await?;
-    corpus::admit_note_write(call, scope, &source).await?;
-    scope
-        .auth()
-        .authorize_direct_write(&source.facts, &source.facts)?;
+    let source_class = match corpus::note_in_space_preflight(call, scope, &plan.source).await {
+        Ok(source) => {
+            corpus::admit_note_write(call, scope, &source).await?;
+            scope
+                .auth()
+                .authorize_direct_write(&source.facts, &source.facts)?;
+            source.facts.class
+        }
+        Err(PortError::Domain(DomainError::ResourceNotFound)) if allow_trashed_replay => {
+            authorize_trashed_replay_source(call, scope, &plan.source).await?
+        }
+        Err(error) => return Err(error),
+    };
     if let Target::Stable { note, alias } = &plan.target {
-        let target_note = corpus::note_in_space(call, scope, note).await?;
-        corpus::admit_provider_note_read(call, scope, &target_note).await?;
+        let mut target_trashed = false;
+        match corpus::note_in_space(call, scope, note).await {
+            Ok(target_note) => {
+                corpus::admit_provider_note_read(call, scope, &target_note).await?;
+            }
+            Err(PortError::Domain(DomainError::ResourceNotFound)) if allow_trashed_replay => {
+                let live = call
+                    .registry
+                    .engine
+                    .get_note_metadata(
+                        scope.clone(),
+                        GetNote {
+                            note: note.clone(),
+                            revision: None,
+                            causal: CausalBasis::Await(Default::default()),
+                        },
+                    )
+                    .await?;
+                if live.metadata.reference().space_id != scope.scope().space_id
+                    || live.metadata.reference().note_id != *note
+                    || live.metadata.lifecycle() != Lifecycle::Trashed
+                    || live.metadata.class() == DocClass::EncryptedNote
+                {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+                live.metadata.listing(scope.auth())?;
+                corpus::admit_note_metadata_write(call, scope, &live.metadata).await?;
+                target_trashed = true;
+            }
+            Err(error) => return Err(error),
+        }
         if let Some(alias) = alias {
             let current = metadata_snapshot(
                 call,
@@ -433,10 +513,15 @@ async fn authorize(
             if title != Some(alias.title.as_str()) {
                 return Err(invalid(ValidationReason::SourceMismatch));
             }
-            corpus::note_metadata_origin(call, scope, &current.metadata).await?;
+            if target_trashed {
+                current.metadata.listing(scope.auth())?;
+                corpus::admit_note_metadata_write(call, scope, &current.metadata).await?;
+            } else {
+                corpus::note_metadata_origin(call, scope, &current.metadata).await?;
+            }
         }
     }
-    Ok(source.facts.class)
+    Ok(source_class)
 }
 
 async fn hydrate_journaled(
@@ -567,8 +652,10 @@ async fn render(
 }
 
 async fn single(call: &mut ToolCallContext<'_>, input: LinkInput) -> Result<Value, PortError> {
+    let mut replayed = true;
     let journaled: JournaledLinkPlan = call
         .journal("link-route", || async {
+            replayed = false;
             let source = NoteId::parse(&input.source)?;
             let plan = plan_link(call, None, source, &input.edge, true).await?;
             Ok(plan.to_journaled())
@@ -576,7 +663,7 @@ async fn single(call: &mut ToolCallContext<'_>, input: LinkInput) -> Result<Valu
         .await?;
     let scope = call.space(journaled.scope.clone())?;
     let plan = hydrate_journaled(call, &scope, journaled, &input.edge).await?;
-    authorize(call, &scope, &plan).await?;
+    authorize(call, &scope, &plan, replayed).await?;
     let identity = call.command_identity(&plan.scope, "link", 0);
     let committed = call
         .registry
@@ -601,8 +688,10 @@ async fn many(call: &mut ToolCallContext<'_>, inputs: Vec<LinkInput>) -> Result<
         let ordinal = u16::try_from(index).map_err(|_| invalid(ValidationReason::InvalidLimit))?;
         let label = format!("link-route-{ordinal}");
         let planned = async {
+            let mut replayed = true;
             let journaled: JournaledLinkPlan = call
                 .journal(&label, || async {
+                    replayed = false;
                     let source = NoteId::parse(&input.source)?;
                     let plan = plan_link(call, None, source, &input.edge, false).await?;
                     Ok(plan.to_journaled())
@@ -610,7 +699,7 @@ async fn many(call: &mut ToolCallContext<'_>, inputs: Vec<LinkInput>) -> Result<
                 .await?;
             let scope = call.space(journaled.scope.clone())?;
             let plan = hydrate_journaled(call, &scope, journaled, &input.edge).await?;
-            authorize(call, &scope, &plan).await?;
+            authorize(call, &scope, &plan, replayed).await?;
             Ok::<_, PortError>(plan)
         }
         .await;

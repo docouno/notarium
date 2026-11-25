@@ -1942,6 +1942,36 @@ async fn account_preference_replay_enforces_live_placement_authority(pg: bool) {
         .await
         .unwrap();
     assert_eq!(sys_replayed.revision, sys_committed.revision);
+    // (2b) Narrowing a DirectHuman (`human_management == true`) by `project_root`
+    //      or stripping `DocClass::Skill` from `read_classes` MUST deny Account
+    //      preference replay before `command.replay`.
+    let other_proj = FolderRef {
+        space_id: s2.space.id.clone(),
+        folder_id: FolderId::from_bytes([0xEE; 16]),
+    };
+    let owner_project_narrowed = AccountContext::new(
+        owner_ctx.auth().restrict_to_project(&other_proj).unwrap(),
+        budget(),
+    );
+    assert!(matches!(
+        service
+            .set_ability_preference(owner_project_narrowed, s2_owner_req.clone())
+            .await,
+        Err(PortError::Domain(DomainError::ResourceNotFound))
+    ));
+    let owner_no_skill = AccountContext::new(
+        owner_ctx
+            .auth()
+            .restrict_read_classes(&s2.space.id, &[DocClass::UserDoc].into())
+            .unwrap(),
+        budget(),
+    );
+    assert!(matches!(
+        service
+            .set_ability_preference(owner_no_skill, s2_owner_req.clone())
+            .await,
+        Err(PortError::Domain(DomainError::ResourceNotFound))
+    ));
 
     // (3) A PAT with valid S2 write authority commits an S2 preference, then S2
     //     ability is trashed -> legitimate post-trash replay STILL succeeds.

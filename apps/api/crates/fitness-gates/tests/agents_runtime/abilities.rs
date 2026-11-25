@@ -830,18 +830,34 @@ async fn binding_replay_after_advance_and_trash(
         .await
         .expect("replaying availability edit after trash must return exact original receipt");
     assert_eq!(replayed_avail_trashed.structured_content, updated);
-    // Replaying an authored edit after trash must propagate ResourceNotFound
-    // instead of wrapping a zero-step failure as Ok(partial).
+    // Replaying an already-committed authored edit after trash must return the
+    // exact original committed receipt (matching availability/ControlPort replays),
+    // while a fresh authored edit against the trashed ability must return
+    // ResourceNotFound rather than wrapping a zero-step failure as Ok(partial).
     let replayed_authored_trashed = call(fixture, human, 0xe4, "edit_ability", r2_edit)
         .await
-        .err()
-        .expect("replaying authored edit after trash must return ResourceNotFound");
+        .expect("replaying committed authored edit after trash must return exact original receipt");
+    assert_eq!(replayed_authored_trashed.structured_content, r2);
+    let fresh_authored_trashed = call(
+        fixture,
+        human,
+        0xe8,
+        "edit_ability",
+        json!({
+            "ref": r2["ref"],
+            "versionToken": r2["versionToken"],
+            "instructions": "Fresh edit after trash",
+        }),
+    )
+    .await
+    .err()
+    .expect("fresh authored edit against trashed ability must return ResourceNotFound");
     assert!(
         matches!(
-            replayed_authored_trashed,
+            fresh_authored_trashed,
             PortError::Domain(DomainError::ResourceNotFound)
         ),
-        "{replayed_authored_trashed:?}"
+        "{fresh_authored_trashed:?}"
     );
 }
 
