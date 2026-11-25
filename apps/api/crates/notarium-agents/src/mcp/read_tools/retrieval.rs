@@ -133,7 +133,9 @@ pub(super) async fn retrieve(
         None
     };
     let mut remaining = budget;
-    let targets = targets(call, args.project.as_deref(), args.session.as_ref(), true).await?;
+    let resolved = targets(call, args.project.as_deref(), args.session.as_ref(), true).await?;
+    let targets = resolved.targets;
+    let targeted_project = resolved.targeted_project;
     let mut candidates = Vec::new();
     let mut truncated = false;
     let mut own_degradation = BTreeSet::new();
@@ -225,9 +227,9 @@ pub(super) async fn retrieve(
         } else {
             (None, None)
         };
-        if foreign_space && args.project.is_some() {
-            // Explicitly targeting a consented foreign project observes that
-            // Space even when the query returns zero hits.
+        if foreign_space && targeted_project {
+            // Targeting a consented foreign project (explicitly or via episode
+            // project_hint) observes that Space even when the query returns zero hits.
             call.auth.taint().mark_external_read();
         }
         let query = SearchQuery {

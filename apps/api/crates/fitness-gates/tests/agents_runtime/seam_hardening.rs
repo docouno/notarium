@@ -20836,6 +20836,10 @@ async fn oracle_and_link_many_seams(
             "recent_activity",
             json!({ "project": s2_p1_handle, "limit": 5 }),
         ),
+        (
+            "list_abilities",
+            json!({ "project": s2_p1_handle, "view": "authoring", "source": "system" }),
+        ),
     ]
     .into_iter()
     .enumerate()
@@ -20905,6 +20909,180 @@ async fn oracle_and_link_many_seams(
             "explicit foreign project {tool} must commit external_read taint even on 0 hits"
         );
     }
+
+    // Episode-bound foreign project_hint (args.project omitted) must also commit
+    // cross-space BranchTaint on 0-hit search, recall, and recent_activity.
+    let s2_sc_local =
+        SpaceContext::new(owner.auth().clone(), s2.history.clone(), budget()).unwrap();
+    let s2_p1 = fixture
+        .canonical
+        .project_by_slug(s2_sc_local, "h-s2-p1".into())
+        .await
+        .unwrap()
+        .folder;
+    let foreign_ep = match fixture
+        .control
+        .start_or_resume_episode(
+            owner.clone(),
+            AccountMutation {
+                identity: identity(fixture, owner, 91).await,
+                input: StartEpisode {
+                    selector: EpisodeSelector::New {
+                        requested: EpisodeId::parse("ses_ForHint00001").unwrap(),
+                        name: Some("foreign-hint-taint-ep".into()),
+                    },
+                    project_hint: Some(s2_p1.clone()),
+                    guard: EpisodeRevisionGuard::Account,
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value
+    {
+        EpisodeStartResult::New(ep) => ep.id,
+        other => panic!("expected New episode, got {other:?}"),
+    };
+    for (idx, (tool, args)) in [
+        (
+            "search",
+            json!({ "query": "zzz_unmatched_hint_999", "session": foreign_ep }),
+        ),
+        (
+            "recall",
+            json!({ "query": "zzz_unmatched_hint_999", "session": foreign_ep }),
+        ),
+        (
+            "recent_activity",
+            json!({ "session": foreign_ep, "limit": 5 }),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let run_auth = owner
+            .auth()
+            .for_agent_run(
+                AgentRunId::from_bytes([
+                    0xEA,
+                    2,
+                    1,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    1 + idx as u8,
+                ]),
+                pscope.space_id.clone(),
+                ChatAudience::Personal,
+                owner.auth().spaces().clone(),
+            )
+            .unwrap();
+        let _ = local
+            .registry
+            .call_tool(
+                McpInvocationContext {
+                    account: AccountContext::new(run_auth.clone(), budget()),
+                    target: EgressTarget::InAppProvider {
+                        provider: local.resource.id.clone(),
+                        model: local.model.clone(),
+                        primary_project: None,
+                    },
+                    request_key: CommandKey::from_bytes([
+                        0xEA,
+                        2,
+                        1,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        20 + idx as u8,
+                    ]),
+                },
+                tool,
+                args,
+            )
+            .await
+            .unwrap();
+        assert!(
+            run_auth.taint().is_tainted(),
+            "episode project_hint foreign {tool} must commit external_read taint even on 0 hits"
+        );
+    }
+
+    // CatalogDisclosure::Space for an excluded Space with dummy incarnation must
+    // collapse to ResourceNotFound (never HistoryIncarnationMismatch).
+    let personal_only_acc = AccountContext::new(
+        owner.auth().restrict_to_space(&pscope.space_id).unwrap(),
+        budget(),
+    );
+    let dummy_s2_scope = notarium_core::model::HistoryScope {
+        space_id: s2.history.space_id.clone(),
+        incarnation: notarium_core::ids::HistoryIncarnation::from_bytes([0xFE; 16]),
+    };
+    assert!(matches!(
+        fixture
+            .canonical
+            .disclosure(
+                personal_only_acc,
+                notarium_core::ports::CatalogDisclosure::Space(dummy_s2_scope),
+            )
+            .await,
+        Err(PortError::Domain(DomainError::ResourceNotFound))
+    ));
+
+    // ControlService::inspect_memory_target for foreign Space projects on an
+    // untainted AgentRun pinned to Personal Space must return SpaceReadOnly
+    // without touching catalog_project or flipping taint (both real & fake IDs).
+    let mem_probe_auth = owner
+        .auth()
+        .for_agent_run(
+            AgentRunId::from_bytes([0xEA, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+            pscope.space_id.clone(),
+            ChatAudience::Personal,
+            owner.auth().spaces().clone(),
+        )
+        .unwrap();
+    let mem_probe_acc = AccountContext::new(mem_probe_auth.clone(), budget());
+    for folder in [
+        s2_p1.clone(),
+        FolderRef {
+            space_id: s2.history.space_id.clone(),
+            folder_id: FolderId::from_bytes([0xFD; 16]),
+        },
+    ] {
+        assert!(matches!(
+            fixture
+                .control
+                .inspect_memory_target(
+                    mem_probe_acc.clone(),
+                    MemoryTarget::Project { folder },
+                    "probe".to_owned(),
+                )
+                .await,
+            Err(PortError::Domain(DomainError::SpaceReadOnly))
+        ));
+    }
+    assert!(
+        !mem_probe_auth.taint().is_tainted(),
+        "rejected foreign inspect_memory_target must not taint caller"
+    );
 
     // (2) link_many must not route to an approvalRequired proposal when foreign targets
     //     are read-only (Viewer) or non-proposal classes (Skill), preventing existence oracles.
@@ -21271,14 +21449,245 @@ async fn ability_pagination_and_trail_seams(
     )
     .await;
     assert!(
-        !matches!(
+        matches!(
             use_old_as_skill,
-            Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
-                if diagnostic.reason == ValidationReason::InvalidState
+            Err(PortError::Domain(DomainError::ResourceNotFound))
         ),
-        "use_skill on promoted+disabled Role token must reject wrong kind, got {:?}",
+        "use_skill on promoted+disabled Role token must reject wrong kind with ResourceNotFound, got {:?}",
         use_old_as_skill.err()
     );
+
+    // Promoted skill attached to a Role must still be followed and delivered by
+    // both get_ability and use_role after promotion from project to Space scope.
+    let s2_sc_trail =
+        SpaceContext::new(owner.auth().clone(), s2.history.clone(), budget()).unwrap();
+    let att_skill_note = NoteId::from_bytes([0xEA, 5, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xA1]);
+    let att_skill_id =
+        AbilityId::from_bytes([0xEA, 5, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xA2]);
+    let _ = fixture
+        .canonical
+        .create_note(
+            s2_sc_trail.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: s2.history.clone(),
+                    actor: owner.auth().principal().clone(),
+                    key: CommandKey::from_bytes([
+                        0xEA, 5, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xB1,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xB1; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: CreateNote {
+                    folder_page: false,
+                    note: att_skill_note.clone(),
+                    parent: Some(s2_p1.folder_id.clone()),
+                    slug: "promoted-attached-skill".into(),
+                    class: DocClass::Skill,
+                    carrier: "---\nclass: skill\ntitle: promoted-attached-skill\ndescription: Attached skill before promotion.\n---\nFollow this promoted skill.\n".into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let _ = fixture
+        .canonical
+        .publish_ability_package(
+            s2_sc_trail,
+            Mutation {
+                identity: CommandIdentity {
+                    scope: s2.history.clone(),
+                    actor: owner.auth().principal().clone(),
+                    key: CommandKey::from_bytes([
+                        0xEA, 5, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xB2,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xB2; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: PublishAbilityPackage {
+                    ability: att_skill_id.clone(),
+                    kind: AbilityKind::Skill,
+                    entrypoint: att_skill_note,
+                    files: vec![],
+                    attached_skills: vec![],
+                    expected_package_revision: None,
+                    expected_entrypoint_revision: None,
+                    requires_explicit_binding: false,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let listed_att = call_mcp(
+        &fixture.registry,
+        owner,
+        [0xEA, 5, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xB3],
+        "list_abilities",
+        json!({ "view": "authoring", "kind": "skill", "project": s2_p1_handle, "q": "promoted-attached-skill" }),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    let att_skill_ref = listed_att["items"][0]["ref"].as_str().unwrap().to_owned();
+    let att_skill_get = call_mcp(
+        &fixture.registry,
+        owner,
+        [0xEA, 5, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xB4],
+        "get_ability",
+        json!({ "ref": att_skill_ref }),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    let att_skill_ver = att_skill_get["versionToken"].as_str().unwrap().to_owned();
+    let att_role = call_mcp(
+        &fixture.registry,
+        owner,
+        [0xEA, 5, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
+        "create_ability",
+        json!({
+            "kind": "role",
+            "name": "role-with-promoted-skill",
+            "description": "Role attaching promoted skill.",
+            "instructions": "Use attached skill.\n",
+            "placement": { "home": "project", "project": s2_p1_handle },
+            "attachments": [{ "ref": att_skill_ref }],
+        }),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    let att_role_ref = att_role["ref"].as_str().unwrap().to_owned();
+    let _promoted_skill = call_mcp(
+        &fixture.registry,
+        owner,
+        [0xEA, 5, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3],
+        "edit_ability",
+        json!({
+            "ref": att_skill_ref,
+            "versionToken": att_skill_ver,
+            "home": { "home": "space" },
+            "enabled": true,
+        }),
+    )
+    .await
+    .unwrap();
+    let s2_p1_ep = match fixture
+        .control
+        .start_or_resume_episode(
+            owner.clone(),
+            AccountMutation {
+                identity: identity(fixture, owner, 92).await,
+                input: StartEpisode {
+                    selector: EpisodeSelector::New {
+                        requested: EpisodeId::parse("ses_PromSk000002").unwrap(),
+                        name: Some("promoted-skill-ep".into()),
+                    },
+                    project_hint: Some(s2_p1.clone()),
+                    guard: EpisodeRevisionGuard::Account,
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value
+    {
+        EpisodeStartResult::New(ep) => ep.id,
+        other => panic!("expected New episode, got {other:?}"),
+    };
+    let inspected_role = call_mcp(
+        &fixture.registry,
+        owner,
+        [0xEA, 5, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4],
+        "get_ability",
+        json!({ "ref": att_role_ref, "session": s2_p1_ep }),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    assert_eq!(
+        inspected_role["attachments"][0]["status"], "healthy",
+        "promoted attached skill must stay healthy via placement trail: {inspected_role:?}"
+    );
+    let activated_role = call_mcp(
+        &fixture.registry,
+        owner,
+        [0xEA, 5, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5],
+        "use_role",
+        json!({ "role": att_role_ref, "project": s2_p1_handle }),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    assert!(
+        activated_role["omittedSkills"]
+            .as_array()
+            .is_none_or(Vec::is_empty),
+        "promoted attached skill must not be omitted from use_role: {activated_role:?}"
+    );
+
+    // Cross-project list_child_folders staleness isolation: creating a folder
+    // in sibling project s2_p2 must not stale a cursor pinned to s2_p1.
+    for (tag, sub) in [(11u8, "p1-sub-a"), (12u8, "p1-sub-b")] {
+        let _ = call_mcp(
+            &fixture.registry,
+            owner,
+            [0xEA, 5, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, tag],
+            "create_note",
+            json!({
+                "project": s2_p1_handle,
+                "path": sub,
+                "title": sub,
+                "body": "Body\n",
+            }),
+        )
+        .await
+        .unwrap();
+    }
+    let s2_p1_sc = SpaceContext::new(
+        owner.auth().restrict_to_project(s2_p1).unwrap(),
+        s2.history.clone(),
+        budget(),
+    )
+    .unwrap();
+    let f_page1 = fixture
+        .canonical
+        .list_child_folders(
+            s2_p1_sc.clone(),
+            Some(s2_p1.folder_id.clone()),
+            None,
+            None,
+            PageLimit::new(1).unwrap(),
+        )
+        .await
+        .unwrap();
+    let f_next = f_page1.next.clone().expect("p1 has >= 2 child folders");
+    let _ = call_mcp(
+        &fixture.registry,
+        owner,
+        [0xEA, 5, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 13],
+        "create_note",
+        json!({
+            "project": s2_p2_handle,
+            "path": "sibling-p2-folder-mut",
+            "title": "Sibling P2 Folder",
+            "body": "Body\n",
+        }),
+    )
+    .await
+    .unwrap();
+    let f_page2 = fixture
+        .canonical
+        .list_child_folders(
+            s2_p1_sc,
+            Some(s2_p1.folder_id.clone()),
+            Some(f_next),
+            Some(f_page1.cut_seq),
+            PageLimit::new(1).unwrap(),
+        )
+        .await
+        .expect("sibling project folder write must not stale p1 list_child_folders cursor");
+    assert!(!f_page2.items.is_empty());
 }
 
 #[inline(never)]

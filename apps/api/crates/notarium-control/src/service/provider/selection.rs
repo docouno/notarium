@@ -960,21 +960,25 @@ impl ProviderService {
         let budget = OperationBudget::new(ctx.budget.clone());
         self.management(&ctx).await?;
         let input = request.input;
-        let catalog = match &input.scope {
+        let target_space = match &input.scope {
+            ProviderPreferenceScope::Personal => None,
+            ProviderPreferenceScope::Space(space) => Some(space.clone()),
+            ProviderPreferenceScope::Project(project) => Some(project.space_id.clone()),
+        };
+        let catalog_precheck = match &input.scope {
             ProviderPreferenceScope::Personal => None,
             ProviderPreferenceScope::Space(space) => Some(
                 self.target_catalog(&ctx, &ProviderAttachmentTarget::Space(space.clone()))
-                    .await?,
+                    .await,
             ),
             ProviderPreferenceScope::Project(project) => Some(
                 self.target_catalog(&ctx, &ProviderAttachmentTarget::Project(project.clone()))
-                    .await?,
+                    .await,
             ),
         };
         let command = Command::new(request.identity, "set-provider-preference", &input)?;
         let auth = ctx.auth().clone();
         let auth_check = auth.clone();
-        let catalog_check = catalog.clone();
         let clock = self.control.clock.clone();
         ctx.budget = budget.context(ctx.budget.request.clone());
         self.mutate_authorized(
@@ -982,15 +986,16 @@ impl ProviderService {
             command,
             move |tx, _| {
                 Box::pin(async move {
-                    if let Some(catalog) = &catalog_check {
-                        super::super::spaces::admission(tx, &catalog.space.id, true).await?;
-                        check_member(tx, &auth_check, &catalog.space.id).await?;
-                        require_owner(tx, &auth_check, &catalog.space.id).await?;
+                    if let Some(space_id) = &target_space {
+                        super::super::spaces::admission(tx, space_id, true).await?;
+                        check_member(tx, &auth_check, space_id).await?;
+                        require_owner(tx, &auth_check, space_id).await?;
                     }
                     Ok(())
                 })
             },
             move |tx,owner,now|Box::pin(async move {
+            let catalog = catalog_precheck.transpose()?;
             // A shared default is replaced across resource owners. Serialize
             // that scope before taking any provider configuration row locks.
             if let Some(catalog)=&catalog {

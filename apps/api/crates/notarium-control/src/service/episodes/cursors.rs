@@ -176,16 +176,20 @@ impl ControlService {
         {
             return Err(DomainError::ResourceNotFound.into());
         }
-        let catalog = budget
-            .run(
-                self.catalog_space(&current_pre, &delivered.scope.space_id),
-                CommitEffect::NotCommitted,
-            )
-            .await?;
-        catalog.history.check(&delivered.scope)?;
-        if delivered.after > catalog.last_seq {
-            return Err(invalid(ValidationReason::InvalidQuery));
+        let catalog_precheck: Result<(), PortError> = async {
+            let catalog = budget
+                .run(
+                    self.catalog_space(&current_pre, &delivered.scope.space_id),
+                    CommitEffect::NotCommitted,
+                )
+                .await?;
+            catalog.history.check(&delivered.scope)?;
+            if delivered.after > catalog.last_seq {
+                return Err(invalid(ValidationReason::InvalidQuery));
+            }
+            Ok(())
         }
+        .await;
         let keeper = self
             .precheck_keeper_catalog(ctx.auth(), &budget, &ctx.budget.request)
             .await?;
@@ -213,16 +217,20 @@ impl ControlService {
             {
                 return Err(DomainError::ResourceNotFound.into());
             }
-            if let AckOwner::Episode(id) = &request.input.owner {
+            let episode_row = if let AckOwner::Episode(id) = &request.input.owner {
                 let row = episode(tx.inner_mut(), auth.principal(), id).await?;
                 if !super::episode_project_admitted(&auth, super::stored_project_ref(&row)?.as_ref()) {
                     return Err(DomainError::ResourceNotFound.into());
                 }
-                if row.lifecycle == "closed" {
-                    return Err(invalid(ValidationReason::InvalidState));
-                }
-            }
+                Some(row)
+            } else {
+                None
+            };
             if let Some(replay) = command.replay::<SavedAck>(tx.inner_mut()).await? { return Ok(replay); }
+            catalog_precheck?;
+            if episode_row.as_ref().is_some_and(|row| row.lifecycle == "closed") {
+                return Err(invalid(ValidationReason::InvalidState));
+            }
             let owner = user(tx.inner_mut(), auth.principal().as_str()).await?;
             let space = delivered.scope.space_id.as_str();
             let existing = match &request.input.owner {

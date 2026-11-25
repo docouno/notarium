@@ -20,18 +20,24 @@ impl ReadTarget {
     }
 }
 
+pub(super) struct ReadTargets {
+    pub targets: Vec<ReadTarget>,
+    pub targeted_project: bool,
+}
+
 pub(super) async fn targets(
     call: &ToolCallContext<'_>,
     project: Option<&str>,
     episode: Option<&EpisodeId>,
     all_spaces: bool,
-) -> Result<Vec<ReadTarget>, PortError> {
+) -> Result<ReadTargets, PortError> {
     let target = session::selected_project(call, project, episode).await?;
     if let Some(project) = target {
         session::project_for_folder(call, &project).await?;
-        return Ok(vec![
-            one(call, &project.space_id, Some(project.clone())).await?,
-        ]);
+        return Ok(ReadTargets {
+            targets: vec![one(call, &project.space_id, Some(project.clone())).await?],
+            targeted_project: true,
+        });
     }
     if all_spaces {
         let in_app = matches!(call.target, EgressTarget::InAppProvider { .. });
@@ -136,7 +142,10 @@ pub(super) async fn targets(
                 Err(error) => return Err(error),
             }
         }
-        Ok(out)
+        Ok(ReadTargets {
+            targets: out,
+            targeted_project: false,
+        })
     } else {
         let id = if let Some(id) = call.auth.pinned_write_space() {
             Some(id.clone())
@@ -148,7 +157,10 @@ pub(super) async fn targets(
                 .personal_space
         };
         let Some(id) = id else {
-            return Ok(Vec::new());
+            return Ok(ReadTargets {
+                targets: Vec::new(),
+                targeted_project: false,
+            });
         };
         let project = call
             .auth
@@ -159,7 +171,10 @@ pub(super) async fn targets(
                 space_id: id.clone(),
                 folder_id: root.clone(),
             });
-        Ok(vec![one(call, &id, project).await?])
+        Ok(ReadTargets {
+            targets: vec![one(call, &id, project).await?],
+            targeted_project: false,
+        })
     }
 }
 

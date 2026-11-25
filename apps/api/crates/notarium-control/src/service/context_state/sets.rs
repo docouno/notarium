@@ -417,7 +417,7 @@ impl ControlService {
                 Vec::new()
             }
         };
-        let space_kinds = {
+        let space_kinds_precheck: Result<BTreeMap<SpaceId, SpaceKind>, PortError> = async {
             let current = self.current_account(&ctx, &budget).await?;
             let mut required = BTreeMap::from([(request.input.home.clone(), true)]);
             for note in &request.input.notes {
@@ -434,8 +434,9 @@ impl ControlService {
                     self.context_precheck_spaces(&current, &required),
                     CommitEffect::NotCommitted,
                 )
-                .await?
-        };
+                .await
+        }
+        .await;
         let mut tx = self.store.write(budget.clone()).await?;
         let (revision, current_ctx, saved_id) = budget.run(async {
             let owner = self.context_manager(tx.inner_mut(), &ctx).await?;
@@ -443,6 +444,7 @@ impl ControlService {
                 let auth = self.revalidate(tx.inner_mut(), ctx.auth()).await?;
                 return Ok((revision, AccountContext::new(auth, budget.context(ctx.budget.request.clone())), saved.value));
             }
+            let space_kinds = space_kinds_precheck?;
             expect_revision(&owner, command.identity.expected)?;
             let mut spaces = BTreeMap::from([(request.input.home.clone(), true)]);
             for row in &observed { spaces.insert(SpaceId::parse(&row.target_space)?, true); }
@@ -473,32 +475,36 @@ impl ControlService {
             Ok((revision, ctx.clone(), request.input.id.clone()))
         }, CommitEffect::NotCommitted).await?;
         budget.run(tx.commit(), CommitEffect::Unknown).await?;
-        let mut rtx = self.store.read(budget.clone()).await?;
-        let db_result = budget
-            .run(
-                async {
-                    let row = bundle(rtx.inner_mut(), &saved_id, false)
-                        .await?
-                        .ok_or(DomainError::ResourceNotFound)?;
-                    self.check_bundle_attachment_db(rtx.inner_mut(), &current_ctx, &row)
-                        .await?;
-                    Ok::<_, PortError>(row)
-                },
-                CommitEffect::Unknown,
-            )
-            .await;
-        budget.run(rtx.rollback(), CommitEffect::Unknown).await?;
-        let row = db_result?;
-        let value = budget
-            .run(
-                async {
-                    let mut cache = BTreeMap::new();
-                    self.context_bundle_info(&current_ctx, row, None, &mut cache)
-                        .await
-                },
-                CommitEffect::Unknown,
-            )
-            .await?;
+        let value = async {
+            let mut rtx = self.store.read(budget.clone()).await?;
+            let db_result = budget
+                .run(
+                    async {
+                        let row = bundle(rtx.inner_mut(), &saved_id, false)
+                            .await?
+                            .ok_or(DomainError::ResourceNotFound)?;
+                        self.check_bundle_attachment_db(rtx.inner_mut(), &current_ctx, &row)
+                            .await?;
+                        Ok::<_, PortError>(row)
+                    },
+                    CommitEffect::Unknown,
+                )
+                .await;
+            budget.run(rtx.rollback(), CommitEffect::Unknown).await?;
+            let row = db_result?;
+            budget
+                .run(
+                    async {
+                        let mut cache = BTreeMap::new();
+                        self.context_bundle_info(&current_ctx, row, None, &mut cache)
+                            .await
+                    },
+                    CommitEffect::Unknown,
+                )
+                .await
+        }
+        .await
+        .map_err(post_commit_context_set_read_error)?;
         Ok(ControlCommit { revision, value })
     }
     pub async fn delete_context_set(
@@ -572,5 +578,52 @@ impl ControlService {
             revision,
             value: (),
         })
+    }
+}
+
+fn post_commit_context_set_read_error(error: PortError) -> PortError {
+    let diagnostic = ContentDigest::from_bytes(
+        *blake3::hash(format!("context-set-post-commit-read:{}", error.code()).as_bytes())
+            .as_bytes(),
+    );
+    let make = || {
+        notarium_core::error::OperationalFailure::new(
+            diagnostic,
+            CommitEffect::Unknown,
+            notarium_core::error::RetryAdvice::RetrySameCommand,
+            true,
+        )
+        .expect("same-command retry has durable identity")
+    };
+    match error {
+        PortError::Cancelled(f)
+            if f.effect() == CommitEffect::Unknown
+                && f.retry() == notarium_core::error::RetryAdvice::RetrySameCommand =>
+        {
+            PortError::Cancelled(f)
+        }
+        PortError::DeadlineExceeded(f)
+            if f.effect() == CommitEffect::Unknown
+                && f.retry() == notarium_core::error::RetryAdvice::RetrySameCommand =>
+        {
+            PortError::DeadlineExceeded(f)
+        }
+        PortError::Unavailable(f)
+            if f.effect() == CommitEffect::Unknown
+                && f.retry() == notarium_core::error::RetryAdvice::RetrySameCommand =>
+        {
+            PortError::Unavailable(f)
+        }
+        PortError::Internal(f)
+            if f.effect() == CommitEffect::Unknown
+                && f.retry() == notarium_core::error::RetryAdvice::RetrySameCommand =>
+        {
+            PortError::Internal(f)
+        }
+        PortError::Cancelled(_) => PortError::Cancelled(make()),
+        PortError::DeadlineExceeded(_) => PortError::DeadlineExceeded(make()),
+        PortError::Unavailable(_) => PortError::Unavailable(make()),
+        PortError::Internal(_) => PortError::Internal(make()),
+        PortError::Domain(_) => PortError::Unavailable(make()),
     }
 }

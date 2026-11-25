@@ -429,6 +429,137 @@ async fn exercise(pg: bool) {
         result(resumed.value).acknowledgements[&personal].seq.get(),
         20
     );
+
+    // Space-narrowed replay of Started::Ambiguous must not disclose episodes
+    // from excluded Spaces, and acknowledge_delta replay must survive episode close.
+    let amb_space = service
+        .create_space(
+            ctx.clone(),
+            AccountMutation {
+                identity: identity(&service, &ctx, 44).await,
+                input: CreateSpace {
+                    id: SpaceId::from_bytes([0x7A; 16]),
+                    kind: SpaceKind::Shared,
+                    name: "Ambiguous Shared".into(),
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    let amb_ctx = AccountContext::new(
+        service
+            .resolve(evidence(AuthEvidenceKind::Session, token.expose()))
+            .await
+            .unwrap(),
+        budget(),
+    );
+    let amb_proj = FolderRef {
+        space_id: amb_space.space.id.clone(),
+        folder_id: FolderId::from_bytes([0x7B; 16]),
+    };
+    fixture.catalog.project_entries.lock().unwrap().insert(
+        (amb_space.space.id.clone(), amb_proj.folder_id.clone()),
+        ProjectInfo {
+            project_slug: "amb-proj".into(),
+            folder: amb_proj.clone(),
+            name: "Ambiguous Project".into(),
+        },
+    );
+    let e_personal = result(
+        service
+            .start_or_resume_episode(
+                amb_ctx.clone(),
+                AccountMutation {
+                    identity: identity(&service, &amb_ctx, 45).await,
+                    input: StartEpisode {
+                        selector: EpisodeSelector::New {
+                            requested: EpisodeId::parse("ses_AmbPers00001").unwrap(),
+                            name: Some("dup-name".into()),
+                        },
+                        project_hint: None,
+                        guard: EpisodeRevisionGuard::Account,
+                    },
+                },
+            )
+            .await
+            .unwrap()
+            .value,
+    );
+    let _e_shared = result(
+        service
+            .start_or_resume_episode(
+                amb_ctx.clone(),
+                AccountMutation {
+                    identity: identity(&service, &amb_ctx, 46).await,
+                    input: StartEpisode {
+                        selector: EpisodeSelector::New {
+                            requested: EpisodeId::parse("ses_AmbShar00002").unwrap(),
+                            name: Some("dup-name".into()),
+                        },
+                        project_hint: Some(amb_proj),
+                        guard: EpisodeRevisionGuard::Account,
+                    },
+                },
+            )
+            .await
+            .unwrap()
+            .value,
+    );
+    let amb_mutation = AccountMutation {
+        identity: identity(&service, &amb_ctx, 47).await,
+        input: StartEpisode {
+            selector: EpisodeSelector::Name("dup-name".into()),
+            project_hint: None,
+            guard: EpisodeRevisionGuard::Account,
+        },
+    };
+    let amb_res = service
+        .start_or_resume_episode(amb_ctx.clone(), amb_mutation.clone())
+        .await
+        .unwrap();
+    assert!(matches!(amb_res.value, EpisodeStartResult::Ambiguous(ref v) if v.len() == 2));
+    let personal_only_ctx = AccountContext::new(
+        amb_ctx.auth().restrict_to_space(&personal).unwrap(),
+        budget(),
+    );
+    not_found(
+        service
+            .start_or_resume_episode(personal_only_ctx, amb_mutation)
+            .await,
+    );
+
+    let ack_mut = AccountMutation {
+        identity: identity(&service, &amb_ctx, 48).await,
+        input: AcknowledgeDelta {
+            owner: AckOwner::Episode(e_personal.id.clone()),
+            delivered: ChangeCursor {
+                scope: fixture.catalog.entries.lock().unwrap()[&personal]
+                    .2
+                    .history
+                    .clone(),
+                after: SpaceSeq::new(5).unwrap(),
+            },
+        },
+    };
+    let ack_1 = service
+        .acknowledge_delta(amb_ctx.clone(), ack_mut.clone())
+        .await
+        .unwrap();
+    let _closed = update(
+        &service,
+        &amb_ctx,
+        &e_personal,
+        49,
+        EpisodeLifecycle::Closed,
+    )
+    .await;
+    let ack_2 = service
+        .acknowledge_delta(amb_ctx, ack_mut)
+        .await
+        .expect("acknowledge_delta replay must succeed after episode close");
+    assert_eq!(ack_2.value.seq, ack_1.value.seq);
+
     drop(service);
     fixture.close().await;
 }

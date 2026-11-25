@@ -31,7 +31,9 @@ pub(super) async fn recent(
 ) -> Result<Value, PortError> {
     let args: Args = decode(args)?;
     let limit = usize::from(PageLimit::new(args.limit.unwrap_or(20))?.get());
-    let targets = targets(call, args.project.as_deref(), args.session.as_ref(), true).await?;
+    let resolved = targets(call, args.project.as_deref(), args.session.as_ref(), true).await?;
+    let targets = resolved.targets;
+    let targeted_project = resolved.targeted_project;
     let external = matches!(call.target, EgressTarget::ExternalMcp);
     let mut candidates = Vec::new();
     let mut truncated = false;
@@ -75,9 +77,9 @@ pub(super) async fn recent(
                 Err(_) => continue,
             };
         }
-        if foreign_space && args.project.is_some() {
-            // Explicitly targeting a consented foreign project observes that
-            // Space even when its recent activity list is empty.
+        if foreign_space && targeted_project {
+            // Targeting a consented foreign project (explicitly or via episode
+            // project_hint) observes that Space even when its recent activity list is empty.
             call.auth.taint().mark_external_read();
         }
         if target.last_seq == SpaceSeq::ZERO {

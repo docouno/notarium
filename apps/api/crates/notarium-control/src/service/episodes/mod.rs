@@ -298,6 +298,10 @@ impl ControlService {
                 let mut choices = Vec::with_capacity(ids.len());
                 for id in ids {
                     let row = episode(tx, ctx.auth().principal(), &id).await?;
+                    if !episode_visible_to_narrowed(ctx.auth(), stored_project_ref(&row)?.as_ref())
+                    {
+                        return Err(DomainError::ResourceNotFound.into());
+                    }
                     choices.push(EpisodeChoice { id, name: row.name });
                 }
                 LoadedStartedDb::Ambiguous(choices)
@@ -379,7 +383,7 @@ impl ControlService {
             .precheck_keeper_catalog(ctx.auth(), &budget, &ctx.budget.request)
             .await?;
         let mut tx = self.store.write(budget.clone()).await?;
-        let (revision, current, started_value) = budget.run(async {
+        let (revision, current, started_value, replayed_loaded) = budget.run(async {
             let auth = self.revalidate_with_keeper(tx.inner_mut(), ctx.auth(), keeper.as_ref()).await?;
             if matches!(auth.kind(), PrincipalKind::Keeper(_) | PrincipalKind::AgentRun(_)) {
                 return Err(DomainError::AccessDenied.into());
@@ -390,7 +394,8 @@ impl ControlService {
             let current = AccountContext::new(auth, budget.context(ctx.budget.request.clone()));
             let owner = user(tx.inner_mut(), current.auth().principal().as_str()).await?;
             if let Some((revision, saved)) = command.replay::<Started>(tx.inner_mut()).await? {
-                return Ok((revision, current, saved.value));
+                let loaded = self.load_started_db(tx.inner_mut(), &current, saved.value).await?;
+                return Ok((revision, current, None, Some(loaded)));
             }
             if guard == EpisodeRevisionGuard::Account {
                 expect_revision(&owner, command.identity.expected)?;
@@ -443,7 +448,7 @@ impl ControlService {
                         let revision = bump_owner(tx.inner_mut(), &owner).await?;
                         let saved = SavedResult { value, events: vec![] };
                         command.save(tx.inner_mut(), revision, &saved, now).await?;
-                        return Ok((revision, current, saved.value));
+                        return Ok((revision, current, Some(saved.value), None));
                     }
                     (
                         admitted_rows.into_iter().next(),
@@ -496,19 +501,27 @@ impl ControlService {
             let revision = bump_owner(tx.inner_mut(), &owner).await?;
             let saved = SavedResult { value: started, events: vec![] };
             command.save(tx.inner_mut(), revision, &saved, now).await?;
-            Ok((revision, current, saved.value))
+            Ok((revision, current, Some(saved.value), None))
         }, CommitEffect::NotCommitted).await?;
         budget.run(tx.commit(), CommitEffect::Unknown).await?;
         let value = async {
-            let mut rtx = self.store.read(budget.clone()).await?;
-            let loaded = budget
-                .run(
-                    self.load_started_db(rtx.inner_mut(), &current, started_value),
-                    CommitEffect::Unknown,
-                )
-                .await;
-            budget.run(rtx.finish(), CommitEffect::Unknown).await?;
-            let value = match loaded? {
+            let loaded = match replayed_loaded {
+                Some(loaded) => loaded,
+                None => {
+                    let started_value =
+                        started_value.ok_or_else(|| invalid(ValidationReason::InvalidState))?;
+                    let mut rtx = self.store.read(budget.clone()).await?;
+                    let loaded = budget
+                        .run(
+                            self.load_started_db(rtx.inner_mut(), &current, started_value),
+                            CommitEffect::Unknown,
+                        )
+                        .await;
+                    budget.run(rtx.finish(), CommitEffect::Unknown).await?;
+                    loaded?
+                }
+            };
+            let value = match loaded {
                 LoadedStartedDb::New(ep) => EpisodeStartResult::New(
                     self.finish_episode_projection(&budget, CommitEffect::Unknown, &current, ep)
                         .await?,

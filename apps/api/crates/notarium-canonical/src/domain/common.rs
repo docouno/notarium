@@ -826,7 +826,7 @@ impl RoomFenceTable {
         )
     }
 
-    fn lock_for_consume(
+    pub(crate) fn lock_for_consume(
         &self,
         scope: &HistoryScope,
         note: &NoteId,

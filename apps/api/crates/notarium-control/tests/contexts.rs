@@ -897,6 +897,74 @@ async fn exercise_shared_consumer(
         page2.continuation.is_none(),
         "narrowed bootstrap_context must terminate after the sole allowed favorite"
     );
+
+    // Idempotent replay of set_favorite, put_context_set, and set_context_pin must
+    // still succeed after the referenced note becomes unavailable in the catalog.
+    let replay_note = note(fixture, &ctx_personal_space, 77, None);
+    let fav_mut = AccountMutation {
+        identity: identity(service, ctx, 36).await,
+        input: SetFavorite {
+            reference: FavoriteRef::Note(replay_note.clone()),
+            saved: true,
+            rank: 101,
+        },
+    };
+    service
+        .set_favorite(ctx.clone(), fav_mut.clone())
+        .await
+        .unwrap();
+    let set_mut = AccountMutation {
+        identity: identity(service, ctx, 37).await,
+        input: PutContextSet {
+            id: ContextSetId::from_bytes([64; 16]),
+            home: ctx_personal.clone(),
+            name: "Replay bundle".into(),
+            notes: vec![replay_note.clone()],
+            expected: None,
+        },
+    };
+    let set_1 = service
+        .put_context_set(ctx.clone(), set_mut.clone())
+        .await
+        .unwrap()
+        .value;
+    let p_rev = scope_revision(service, ctx, &ContextScope::Personal).await;
+    let pin_mut = AccountMutation {
+        identity: identity(service, ctx, 38).await,
+        input: SetContextPin {
+            scope: ContextScope::Personal,
+            expected: p_rev,
+            note: replay_note.clone(),
+            pinned: true,
+        },
+    };
+    let pin_1 = service
+        .set_context_pin(ctx.clone(), pin_mut.clone())
+        .await
+        .unwrap()
+        .value;
+    fixture
+        .catalog
+        .note_entries
+        .lock()
+        .unwrap()
+        .remove(&(replay_note.space_id.clone(), replay_note.note_id.clone()));
+    service
+        .set_favorite(ctx.clone(), fav_mut)
+        .await
+        .expect("set_favorite replay must survive target note deletion");
+    let set_2 = service
+        .put_context_set(ctx.clone(), set_mut)
+        .await
+        .expect("put_context_set replay must survive target note deletion")
+        .value;
+    assert_eq!(set_2.id, set_1.id);
+    let pin_2 = service
+        .set_context_pin(ctx.clone(), pin_mut)
+        .await
+        .expect("set_context_pin replay must survive target note deletion")
+        .value;
+    assert_eq!(pin_2.revision, pin_1.revision);
 }
 #[tokio::test]
 async fn sqlite_context_references_and_pagination() {

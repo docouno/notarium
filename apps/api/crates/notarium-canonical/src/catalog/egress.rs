@@ -733,6 +733,9 @@ pub(super) async fn metadata(
                         folder_content(tx, ctx.auth(), &space, reference, &mut ancestry).await
                     }
                     CatalogDisclosure::Space(scope) => {
+                        if !ctx.auth().spaces().contains_key(&scope.space_id) {
+                            return Err(DomainError::ResourceNotFound.into());
+                        }
                         let space = load_space_record(tx, &scope.space_id).await?;
                         space.scope.check(&scope)?;
                         space_content(ctx.auth(), &space)

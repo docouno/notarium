@@ -170,19 +170,46 @@ pub(super) async fn list_children(
                     if space.last_seq > cut {
                         let cut_i64 = i64::try_from(cut.get())
                             .map_err(|_| DomainError::validation(ValidationReason::InvalidLimit))?;
-                        let sql_changed =
-                            "SELECT 1 FROM folder_heads WHERE space_id=$1 AND updated_seq>$2 LIMIT 1";
+                        let mut watched_ids: Vec<String> = ancestry
+                            .ancestors
+                            .iter()
+                            .map(|id| id.as_str().to_owned())
+                            .collect();
+                        if !watched_ids.iter().any(|id| id == base.as_str()) {
+                            watched_ids.push(base.as_str().to_owned());
+                        }
                         let changed: Option<i32> = match tx {
-                            BackendConn::Sqlite(conn) => sqlx::query_scalar(sql_changed)
+                            BackendConn::Sqlite(conn) => {
+                                let watched_json = serde_json::to_string(&watched_ids).map_err(
+                                    |_| DomainError::validation(ValidationReason::InvalidState),
+                                )?;
+                                sqlx::query_scalar(
+                                    "SELECT 1 FROM folder_heads \
+                                     WHERE space_id=$1 AND updated_seq>$2 \
+                                       AND (parent_folder_id=$3 OR folder_id IN (SELECT value FROM json_each($4))) \
+                                     LIMIT 1",
+                                )
                                 .bind(scope.space_id.as_str())
                                 .bind(cut_i64)
+                                .bind(base.as_str())
+                                .bind(&watched_json)
                                 .fetch_optional(&mut **conn)
-                                .await,
-                            BackendConn::Postgres(conn) => sqlx::query_scalar(sql_changed)
+                                .await
+                            }
+                            BackendConn::Postgres(conn) => {
+                                sqlx::query_scalar(
+                                    "SELECT 1 FROM folder_heads \
+                                     WHERE space_id=$1 AND updated_seq>$2 \
+                                       AND (parent_folder_id=$3 OR folder_id = ANY($4)) \
+                                     LIMIT 1",
+                                )
                                 .bind(scope.space_id.as_str())
                                 .bind(cut_i64)
+                                .bind(base.as_str())
+                                .bind(&watched_ids)
                                 .fetch_optional(&mut **conn)
-                                .await,
+                                .await
+                            }
                         }
                         .map_err(|err| crate::runtime::pg_read_error("list_child_folders_cut", err))?;
                         if changed.is_some() {
@@ -628,6 +655,7 @@ pub(super) async fn ensure(
     }
     ctx.budget.remaining = deadline.remaining(&budget)?;
 
+    let executed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let intent = {
         let scope = space.scope.clone();
         let auth = ctx.auth().clone();
@@ -637,6 +665,7 @@ pub(super) async fn ensure(
         let move_source = confirmed
             .as_ref()
             .and_then(|step| step.destination()?.move_source.clone());
+        let executed_cl = std::sync::Arc::clone(&executed);
         PreparedWriteIntent {
             scope: space.scope.clone(),
             active_epoch: space.active_epoch,
@@ -646,6 +675,7 @@ pub(super) async fn ensure(
             required_semantic_cut: None,
             execute: Box::new(move |tx, item| {
                 Box::pin(async move {
+                    executed_cl.store(true, std::sync::atomic::Ordering::SeqCst);
                     let live = load_space_record(tx, &scope.space_id).await?;
                     live.scope.check(&scope)?;
                     if live.space.lifecycle != SpaceLifecycle::Active {
@@ -762,7 +792,20 @@ pub(super) async fn ensure(
         .submit::<StoredCommittedFolderRefV1>(store, &ctx.budget, intent)
         .await
     {
-        Ok(result) => Ok(result.into_committed().value),
+        Ok(result) => {
+            let reference = result.into_committed().value;
+            if !executed.load(std::sync::atomic::Ordering::SeqCst) {
+                ctx.budget.remaining = deadline.remaining(&budget)?;
+                return verify_ensured_folder(
+                    store,
+                    &ctx,
+                    confirmed.is_none().then_some(base),
+                    reference,
+                )
+                .await;
+            }
+            Ok(reference)
+        }
         Err(PortError::Domain(DomainError::PathConflict { .. })) => {
             ctx.budget.remaining = deadline.remaining(&budget)?;
             if let Some(step) = confirmed {

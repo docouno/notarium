@@ -170,10 +170,6 @@ impl ControlService {
                         user_read(rtx.inner_mut(), ctx.auth().principal().as_str()).await?;
                     self.live_human(rtx.inner_mut(), ctx.auth(), &current)
                         .await?;
-                    let space = admission(rtx.inner_mut(), &scope.space_id, false).await?;
-                    if !matches!(space.state.as_str(), "active" | "closing" | "archived") {
-                        return Err(access_denied());
-                    }
                     let member = rows!(
                         rtx.inner_mut(),
                         SpaceMembersRow,
@@ -186,6 +182,10 @@ impl ControlService {
                     .ok_or(DomainError::ResourceNotFound)?;
                     if member.role != "owner" || member.admission != "active" {
                         return Err(DomainError::ResourceNotFound.into());
+                    }
+                    let space = admission(rtx.inner_mut(), &scope.space_id, false).await?;
+                    if !matches!(space.state.as_str(), "active" | "closing" | "archived") {
+                        return Err(access_denied());
                     }
                     let (read_classes, write_classes) = if space.state == "active" {
                         let existing = ctx

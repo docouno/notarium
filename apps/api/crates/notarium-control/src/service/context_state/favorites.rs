@@ -50,20 +50,27 @@ impl ControlService {
         ctx.auth().authorize_human_management()?;
         require_unpinned_human(ctx.auth())?;
         let budget = OperationBudget::new(ctx.budget.clone());
-        if request.input.saved {
+        let visible_precheck = if request.input.saved {
             let current = self.current_account(&ctx, &budget).await?;
-            budget
-                .run(
-                    self.favorite_visible(&current, &request.input.reference),
-                    CommitEffect::NotCommitted,
-                )
-                .await?;
-        }
+            Some(
+                budget
+                    .run(
+                        self.favorite_visible(&current, &request.input.reference),
+                        CommitEffect::NotCommitted,
+                    )
+                    .await,
+            )
+        } else {
+            None
+        };
         let mut tx = self.store.write(budget.clone()).await?;
         let revision = budget.run(async {
             let auth = self.revalidate(tx.inner_mut(), ctx.auth()).await?;
             auth.authorize_human_management()?;
             if let Some((revision, _)) = command.replay::<()>(tx.inner_mut()).await? { return Ok(revision); }
+            if let Some(check) = visible_precheck {
+                check?;
+            }
             let owner = user(tx.inner_mut(), auth.principal().as_str()).await?;
             expect_revision(&owner, command.identity.expected)?;
             let (kind, space, entity) = match &request.input.reference {

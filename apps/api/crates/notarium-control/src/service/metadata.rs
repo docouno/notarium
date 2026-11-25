@@ -190,22 +190,26 @@ impl ControlService {
         let current = AccountContext::new(auth, budget.context(ctx.budget.request.clone()));
         let space = match target {
             MemoryTarget::User { .. } => personal.ok_or(DomainError::ResourceNotFound)?,
-            MemoryTarget::Project { folder } => {
-                budget
-                    .run(
-                        self.catalog_project(&current, folder),
-                        CommitEffect::NotCommitted,
-                    )
-                    .await?;
-                folder.space_id.clone()
-            }
+            MemoryTarget::Project { folder } => folder.space_id.clone(),
         };
         let grant = current
             .auth()
             .spaces()
             .get(&space)
             .ok_or(DomainError::ResourceNotFound)?;
+        if let MemoryTarget::Project { folder } = target
+            && grant
+                .project_root
+                .as_ref()
+                .is_some_and(|root| root != &folder.folder_id)
+        {
+            return Err(DomainError::ResourceNotFound.into());
+        }
         if (matches!(target, MemoryTarget::User { .. }) && grant.project_root.is_some())
+            || current
+                .auth()
+                .pinned_write_space()
+                .is_some_and(|pin| pin != &space)
             || grant.role == notarium_core::auth::SpaceRole::Viewer
             || !grant
                 .write_classes
@@ -213,6 +217,14 @@ impl ControlService {
             || current.auth().taint().is_tainted()
         {
             return Err(DomainError::SpaceReadOnly.into());
+        }
+        if let MemoryTarget::Project { folder } = target {
+            budget
+                .run(
+                    self.catalog_project(&current, folder),
+                    CommitEffect::NotCommitted,
+                )
+                .await?;
         }
         let catalog = budget
             .run(

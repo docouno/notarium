@@ -356,35 +356,22 @@ async fn inspect_followed_ability(
     account: &AccountContext,
     reference: &AbilityRef,
 ) -> Result<Option<notarium_core::ports::AbilityInspection>, PortError> {
+    let terminal = match registry
+        .control
+        .follow_ability(account.clone(), reference.clone())
+        .await
+    {
+        Ok(target) => target,
+        Err(error) if visible_error(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    };
     match registry
         .control
-        .inspect_ability(account.clone(), reference.identity())
+        .inspect_ability(account.clone(), terminal.identity())
         .await
     {
         Ok(inspection) => Ok(Some(inspection)),
-        Err(error) if visible_error(&error) => {
-            let terminal = match registry
-                .control
-                .follow_ability(account.clone(), reference.clone())
-                .await
-            {
-                Ok(target) => target,
-                Err(error) if visible_error(&error) => return Ok(None),
-                Err(error) => return Err(error),
-            };
-            if terminal.identity() == reference.identity() {
-                return Ok(None);
-            }
-            match registry
-                .control
-                .inspect_ability(account.clone(), terminal.identity())
-                .await
-            {
-                Ok(inspection) => Ok(Some(inspection)),
-                Err(error) if visible_error(&error) => Ok(None),
-                Err(error) => Err(error),
-            }
-        }
+        Err(error) if visible_error(&error) => Ok(None),
         Err(error) => Err(error),
     }
 }
@@ -1391,6 +1378,15 @@ async fn list(
     let query = args.q.as_deref().map(notarium_syntax::unicode::lookup_key);
     let mut items = Vec::new();
     let mut deferred_taints = Vec::new();
+    if let Some(proj) = &project
+        && call
+            .auth
+            .pinned_write_space()
+            .is_some_and(|pin| pin != &proj.space_id)
+    {
+        let proj_scope = session::space(call, &proj.space_id).await?;
+        deferred_taints.push(AbilityTaintCommit::ForeignProject { scope: proj_scope });
+    }
     let mut origin_records = Vec::new();
     let next_inner = if external {
         let control_cursor = match inner {
@@ -1916,18 +1912,14 @@ async fn current_skill(
     reference: &AbilityRef,
     project: Option<&FolderRef>,
 ) -> Result<Option<AbilityInspection>, PortError> {
-    let inspection = match call
-        .registry
-        .control
-        .inspect_ability(call.account(), reference.identity())
-        .await
-    {
-        Ok(inspection) if inspection.descriptor.kind == AbilityKind::Skill => inspection,
-        Ok(_) => return Ok(None),
-        Err(error) if visible_error(&error) => return Ok(None),
-        Err(error) => return Err(error),
+    let Some(mut inspection) =
+        inspect_followed_ability(call.registry, &call.account(), reference).await?
+    else {
+        return Ok(None);
     };
-    let mut inspection = inspection;
+    if inspection.descriptor.kind != AbilityKind::Skill {
+        return Ok(None);
+    }
     if !provider_ability_allowed(call, &inspection, project) {
         return Ok(None);
     }

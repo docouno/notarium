@@ -73,16 +73,25 @@ pub async fn interactive(
 
     let mut descriptors = Vec::with_capacity(role.attached_skills.len() + 1);
     for dependency in &role.attached_skills {
+        let terminal = match registry
+            .control
+            .follow_ability(reader.account(), dependency.clone())
+            .await
+        {
+            Ok(target) => target,
+            Err(error) if corpus::hidden(&error) => continue,
+            Err(error) => return Err(error),
+        };
         let inspection = match registry
             .control
-            .inspect_ability(reader.account(), dependency.identity())
+            .inspect_ability(reader.account(), terminal.identity())
             .await
         {
             Ok(inspection) => inspection,
             Err(error) if corpus::hidden(&error) => continue,
             Err(error) => return Err(error),
         };
-        if inspection.descriptor.reference.identity() != dependency.identity() {
+        if inspection.descriptor.reference.identity() != terminal.identity() {
             return Err(invalid(ValidationReason::SourceMismatch));
         }
         if !inspection.binding_enabled

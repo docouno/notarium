@@ -47,11 +47,9 @@ pub(super) async fn list(call: &mut ToolCallContext<'_>, args: Value) -> Result<
         .as_deref()
         .map(|raw| call.registry.note_cursors.open(call.auth.principal(), raw))
         .transpose()?;
-    let Some(target) = targets(call, args.project.as_deref(), args.session.as_ref(), false)
-        .await?
-        .into_iter()
-        .next()
-    else {
+    let resolved = targets(call, args.project.as_deref(), args.session.as_ref(), false).await?;
+    let targeted_project = resolved.targeted_project;
+    let Some(target) = resolved.targets.into_iter().next() else {
         if previous.is_some() {
             return Err(invalid(ValidationReason::CursorStale));
         }
@@ -128,9 +126,9 @@ pub(super) async fn list(call: &mut ToolCallContext<'_>, args: Value) -> Result<
     if let Some(previous) = &previous {
         scope.scope().check(&previous.scope)?;
     }
-    if foreign_space && args.project.is_some() {
-        // Explicitly querying a consented foreign project observes that Space
-        // even when the resulting listing is empty.
+    if foreign_space && targeted_project {
+        // Targeting a consented foreign project (explicitly or via episode
+        // project_hint) observes that Space even when the resulting listing is empty.
         call.auth.taint().mark_external_read();
     }
     let Some(folder) = directory(call, &target, &preflight_scope, &cleaned_path).await? else {

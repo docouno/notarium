@@ -331,8 +331,7 @@ impl ProviderService {
         let input = request.input;
         let budget = OperationBudget::new(ctx.budget.clone());
         self.management_scoped(&ctx).await?;
-        let catalog = self.target_catalog(&ctx, &input.target).await?;
-        disclosure(input.consent.disclosure(), catalog.space.kind)?;
+        let catalog_precheck = self.target_catalog(&ctx, &input.target).await;
         let command = Command::new(
             request.identity,
             "request-provider-attachment",
@@ -350,7 +349,10 @@ impl ProviderService {
         let auth = ctx.auth().clone();
         let auth_check = auth.clone();
         let target_check = input.target.clone();
-        let space_check = catalog.space.clone();
+        let activates_personal = matches!(target_check, ProviderAttachmentTarget::Personal { .. })
+            && catalog_precheck
+                .as_ref()
+                .is_ok_and(|c| c.space.kind == SpaceKind::Personal);
         let clock = self.control.clock.clone();
         ctx.budget = budget.context(ctx.budget.request.clone());
         self.mutate_authorized_scoped(
@@ -358,14 +360,11 @@ impl ProviderService {
             command,
             move |tx, owner| {
                 Box::pin(async move {
-                    let activates = matches!(
-                        target_check,
-                        ProviderAttachmentTarget::Personal { .. }
-                    ) && space_check.kind == SpaceKind::Personal;
-                    if activates {
-                        admission(tx, &space_check.id, true).await?;
+                    let space_id = target_space(&target_check);
+                    if activates_personal {
+                        admission(tx, space_id, true).await?;
                     } else {
-                        lock_space_read(tx, &space_check.id).await?;
+                        lock_space_read(tx, space_id).await?;
                     }
                     check_member_for_target(tx, &auth_check, &target_check).await?;
                     if let ProviderAttachmentTarget::Personal {
@@ -379,6 +378,8 @@ impl ProviderService {
                 })
             },
             move |tx,owner,now|Box::pin(async move {
+            let catalog = catalog_precheck?;
+            disclosure(input.consent.disclosure(), catalog.space.kind)?;
             if input.expires_at_ms.is_some_and(|expires| expires<=now || expires.saturating_sub(now)>365*24*60*60*1000) {return Err(invalid(ValidationReason::InvalidTimestamp));}
             let space=target_space(&input.target);
             let previous=before_attachment(tx, &input.target, &catalog.space, false, clock.as_ref()).await?;check_member_for_target(tx,&auth,&input.target).await?;
@@ -437,8 +438,7 @@ impl ProviderService {
             .observe_attachment_authorized(&ctx, &input.id, false)
             .await?;
         let target = attachment_target(&observed)?;
-        let catalog = self.target_catalog(&ctx, &target).await?;
-        disclosure(input.consent.disclosure(), catalog.space.kind)?;
+        let catalog_precheck = self.target_catalog(&ctx, &target).await;
         let command = Command::new(
             request.identity,
             "approve-provider-attachment",
@@ -453,7 +453,10 @@ impl ProviderService {
         let auth = ctx.auth().clone();
         let auth_check = auth.clone();
         let target_check = target.clone();
-        let space_check = catalog.space.clone();
+        let activates_shared = !matches!(target_check, ProviderAttachmentTarget::Personal { .. })
+            && catalog_precheck
+                .as_ref()
+                .is_ok_and(|c| c.space.kind == SpaceKind::Shared);
         let clock = self.control.clock.clone();
         ctx.budget = budget.context(ctx.budget.request.clone());
         self.mutate_authorized(
@@ -461,14 +464,11 @@ impl ProviderService {
             command,
             move |tx, owner| {
                 Box::pin(async move {
-                    let activates = !matches!(
-                        target_check,
-                        ProviderAttachmentTarget::Personal { .. }
-                    ) && space_check.kind == SpaceKind::Shared;
-                    if activates {
-                        admission(tx, &space_check.id, true).await?;
+                    let space_id = target_space(&target_check);
+                    if activates_shared {
+                        admission(tx, space_id, true).await?;
                     } else {
-                        lock_space_read(tx, &space_check.id).await?;
+                        lock_space_read(tx, space_id).await?;
                     }
                     check_member_for_target(tx, &auth_check, &target_check).await?;
                     match &target_check {
@@ -482,6 +482,8 @@ impl ProviderService {
                 })
             },
             move |tx,owner,now|Box::pin(async move {
+            let catalog = catalog_precheck?;
+            disclosure(input.consent.disclosure(), catalog.space.kind)?;
             let previous=before_attachment(tx, &target, &catalog.space, true, clock.as_ref()).await?;
             check_member_for_target(tx,&auth,&target).await?;
             match &target {ProviderAttachmentTarget::Personal{owner:target_owner,..}=>owned(&owner.user_id,target_owner.as_str())?,_=>require_owner(tx,&auth,target_space(&target)).await?};

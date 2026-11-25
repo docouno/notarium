@@ -79,7 +79,7 @@ impl ControlService {
         ctx.auth().authorize_human_management()?;
         require_unpinned_human(ctx.auth())?;
         let budget = OperationBudget::new(ctx.budget.clone());
-        let (pre_key, home, space_kinds) = {
+        let (pre_key, home, space_kinds_precheck) = {
             let (mut rtx, auth) = self
                 .open_revalidated_read(&budget, &ctx.budget.request, ctx.auth())
                 .await?;
@@ -117,40 +117,44 @@ impl ControlService {
             if let Some(home) = &home {
                 spaces.entry(home.clone()).or_insert(false);
             }
-            if let Change::Pin(note, true) = &change {
-                spaces.entry(note.space_id.clone()).or_insert(false);
+            let precheck: Result<BTreeMap<SpaceId, SpaceKind>, PortError> = async {
+                if let Change::Pin(note, true) = &change {
+                    spaces.entry(note.space_id.clone()).or_insert(false);
+                    budget
+                        .run(
+                            self.catalog_note(&current, note),
+                            CommitEffect::NotCommitted,
+                        )
+                        .await?;
+                }
                 budget
                     .run(
-                        self.catalog_note(&current, note),
+                        self.context_scope_read(&current, &scope, &key),
                         CommitEffect::NotCommitted,
                     )
                     .await?;
+                budget
+                    .run(
+                        self.context_precheck_spaces(&current, &spaces),
+                        CommitEffect::NotCommitted,
+                    )
+                    .await
             }
-            budget
-                .run(
-                    self.context_scope_read(&current, &scope, &key),
-                    CommitEffect::NotCommitted,
-                )
-                .await?;
-            let kinds = budget
-                .run(
-                    self.context_precheck_spaces(&current, &spaces),
-                    CommitEffect::NotCommitted,
-                )
-                .await?;
-            (key, home, kinds)
+            .await;
+            (key, home, precheck)
         };
         let mut tx = self.store.write(budget.clone()).await?;
         let (revision, saved) = budget.run(async {
             let owner = self.context_manager(tx.inner_mut(), &ctx).await?;
-            let key = scope_key(&owner, &scope)?;
-            if key != pre_key {
-                return Err(invalid(ValidationReason::CursorStale));
-            }
             if let Some(replay) = command.replay::<ContextScopeInfo>(tx.inner_mut()).await? {
                 let _ = self.revalidate(tx.inner_mut(), ctx.auth()).await?;
                 return Ok(replay);
             }
+            let key = scope_key(&owner, &scope)?;
+            if key != pre_key {
+                return Err(invalid(ValidationReason::CursorStale));
+            }
+            let space_kinds = space_kinds_precheck?;
             expect_revision(&owner, command.identity.expected)?;
             let mut spaces = BTreeMap::from([(key.space.clone(), true)]);
             if let Some(home) = &home { spaces.entry(home.clone()).or_insert(false); }

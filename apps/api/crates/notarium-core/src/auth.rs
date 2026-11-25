@@ -401,6 +401,7 @@ impl EngineAuthContext {
         };
         if effective_audience == ChatAudience::Shared {
             derived.spaces.retain(|space, _| space == &thread_space);
+            derived.spaces_narrowed = true;
             for grant in derived.spaces.values_mut() {
                 grant.read_classes.remove(&DocClass::Profile);
                 grant.write_classes.remove(&DocClass::Profile);
@@ -533,7 +534,7 @@ impl EngineAuthContext {
         }
         grant.project_root = Some(project.folder_id.clone());
         let spaces = BTreeMap::from([(project.space_id.clone(), grant)]);
-        let spaces_narrowed = self.spaces_narrowed || self.spaces.len() > 1;
+        let spaces_narrowed = true;
         let ability_write = self.ability_write && Self::has_writable_space(&spaces);
         Ok(Self {
             spaces,
@@ -1265,5 +1266,28 @@ mod keeper_narrowing_tests {
             &BTreeSet::from([allowed_ability])
         );
         assert!(intersected.keeper_log().is_none());
+    }
+
+    #[test]
+    fn shared_agent_run_and_single_space_project_pin_mark_spaces_narrowed() {
+        let (space, human) = sample_human();
+        assert!(!human.is_space_narrowed());
+
+        let shared = human
+            .for_agent_run(
+                AgentRunId::from_bytes([0x4A; 16]),
+                space.clone(),
+                ChatAudience::Shared,
+                human.spaces().clone(),
+            )
+            .expect("shared run");
+        assert!(shared.is_space_narrowed());
+
+        let project = FolderRef {
+            space_id: space,
+            folder_id: FolderId::from_bytes([0x4B; 16]),
+        };
+        let pinned = human.restrict_to_project(&project).expect("project pin");
+        assert!(pinned.is_space_narrowed());
     }
 }

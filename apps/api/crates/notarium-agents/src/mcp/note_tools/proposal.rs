@@ -747,24 +747,53 @@ pub(in crate::mcp) async fn apply_proposal(
         PreparedNoteAction::Edit { route, input } => {
             let (scope, identity) = step(&route.scope, "edit_note", 0)?;
             input.validate()?;
-            let before = snapshot(
-                owner,
-                &scope,
-                &route.note,
-                Some(route.revision.clone()),
-                CausalBasis::Await(Default::default()),
-            )
-            .await?;
-            if before.document.class() == DocClass::EncryptedNote {
-                return Err(DomainError::ResourceNotFound.into());
-            }
-            let original = before.document.explicit_read(scope.auth())?;
-            let schema = if input.edits_view() {
-                owner.registry.engine.space_schema(scope.clone()).await?
+            let plan = if input.edits_view() {
+                let owner_ref: &ToolCallContext<'_> = owner;
+                let scope_ref = &scope;
+                let route_ref = &route;
+                let input_ref = &input;
+                owner_ref
+                    .journal("confirmed-edit-note-view-plan", || async {
+                        let before = snapshot(
+                            owner_ref,
+                            scope_ref,
+                            &route_ref.note,
+                            Some(route_ref.revision.clone()),
+                            CausalBasis::Await(Default::default()),
+                        )
+                        .await?;
+                        if before.document.class() == DocClass::EncryptedNote {
+                            return Err(DomainError::ResourceNotFound.into());
+                        }
+                        let original = before.document.explicit_read(scope_ref.auth())?;
+                        let schema = owner_ref
+                            .registry
+                            .engine
+                            .space_schema(scope_ref.clone())
+                            .await?;
+                        input_ref.plan(original, before.document.class(), route_ref, &schema)
+                    })
+                    .await?
             } else {
-                std::collections::BTreeMap::new()
+                let before = snapshot(
+                    owner,
+                    &scope,
+                    &route.note,
+                    Some(route.revision.clone()),
+                    CausalBasis::Await(Default::default()),
+                )
+                .await?;
+                if before.document.class() == DocClass::EncryptedNote {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+                let original = before.document.explicit_read(scope.auth())?;
+                input.plan(
+                    original,
+                    before.document.class(),
+                    &route,
+                    &std::collections::BTreeMap::new(),
+                )?
             };
-            let plan = input.plan(original, before.document.class(), &route, &schema)?;
             let result = owner
                 .registry
                 .engine
