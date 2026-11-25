@@ -328,6 +328,11 @@ impl ControlPort for RejectingPorts {
             ctx: AccountContext,
             identity: AbilityIdentity,
         ) -> PortFuture<'_, AbilityInspection>;
+    fn follow_ability(
+            &self,
+            ctx: AccountContext,
+            reference: AbilityRef,
+        ) -> PortFuture<'_, AbilityRef>;
     fn update_ability_binding(
             &self,
             ctx: AccountContext,

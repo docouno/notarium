@@ -234,21 +234,26 @@ pub(super) async fn handle(
 ) -> Result<Value, PortError> {
     match name {
         ToolName::ListAbilities => {
-            let args: ListArgs = decode(args)?;
-            let episode = load_episode(call, args.session.as_ref()).await?;
-            let project = session::selected_project_for_episode(
-                call,
-                args.project.as_deref(),
-                episode.as_ref(),
-            )
-            .await?;
-            list(call, args, project).await
+            Box::pin(async move {
+                let args: ListArgs = decode(args)?;
+                let episode = load_episode(call, args.session.as_ref()).await?;
+                let project = session::selected_project_for_episode(
+                    call,
+                    args.project.as_deref(),
+                    episode.as_ref(),
+                )
+                .await?;
+                list(call, args, project).await
+            })
+            .await
         }
-        ToolName::GetAbility => get(call, decode(args)?).await,
-        ToolName::UseRole | ToolName::UseSkill => use_ability(call, name, decode(args)?).await,
-        ToolName::CreateAbility => author::create(call, decode(args)?).await,
-        ToolName::EditAbility => author::edit(call, decode(args)?).await,
-        ToolName::DeleteAbility => author::trash(call, decode(args)?).await,
+        ToolName::GetAbility => Box::pin(get(call, decode(args)?)).await,
+        ToolName::UseRole | ToolName::UseSkill => {
+            Box::pin(use_ability(call, name, decode(args)?)).await
+        }
+        ToolName::CreateAbility => Box::pin(author::create(call, decode(args)?)).await,
+        ToolName::EditAbility => Box::pin(author::edit(call, decode(args)?)).await,
+        ToolName::DeleteAbility => Box::pin(author::trash(call, decode(args)?)).await,
         _ => Err(invalid(ValidationReason::InvalidState)),
     }
 }
@@ -346,38 +351,53 @@ async fn raw_reference_for_account(
     Ok(visible)
 }
 
+async fn inspect_followed_ability(
+    registry: &ToolRegistry,
+    account: &AccountContext,
+    reference: &AbilityRef,
+) -> Result<Option<notarium_core::ports::AbilityInspection>, PortError> {
+    match registry
+        .control
+        .inspect_ability(account.clone(), reference.identity())
+        .await
+    {
+        Ok(inspection) => Ok(Some(inspection)),
+        Err(error) if visible_error(&error) => {
+            let terminal = match registry
+                .control
+                .follow_ability(account.clone(), reference.clone())
+                .await
+            {
+                Ok(target) => target,
+                Err(error) if visible_error(&error) => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            if terminal.identity() == reference.identity() {
+                return Ok(None);
+            }
+            match registry
+                .control
+                .inspect_ability(account.clone(), terminal.identity())
+                .await
+            {
+                Ok(inspection) => Ok(Some(inspection)),
+                Err(error) if visible_error(&error) => Ok(None),
+                Err(error) => Err(error),
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
 async fn exact_ability_matches_kind(
     registry: &ToolRegistry,
     account: &AccountContext,
     reference: &AbilityRef,
     expected_kind: AbilityKind,
 ) -> Result<bool, PortError> {
-    match registry
-        .control
-        .inspect_ability(account.clone(), reference.identity())
-        .await
-    {
-        Ok(inspection) => Ok(inspection.descriptor.kind == expected_kind),
-        Err(error) if visible_error(&error) => match &reference.placement {
-            AbilityPlacement::OwnedProject(folder) => {
-                let promoted = AbilityIdentity {
-                    id: reference.id.clone(),
-                    placement: AbilityPlacement::OwnedSpace(folder.space_id.clone()),
-                };
-                match registry
-                    .control
-                    .inspect_ability(account.clone(), promoted)
-                    .await
-                {
-                    Ok(inspection) => Ok(inspection.descriptor.kind == expected_kind),
-                    Err(error) if visible_error(&error) => Ok(false),
-                    Err(error) => Err(error),
-                }
-            }
-            _ => Ok(false),
-        },
-        Err(error) => Err(error),
-    }
+    Ok(inspect_followed_ability(registry, account, reference)
+        .await?
+        .is_some_and(|inspection| inspection.descriptor.kind == expected_kind))
 }
 
 async fn resolve_exact_for_kind(
@@ -2287,32 +2307,9 @@ pub async fn bind_chat_role(
                         && role_placement_matches_project(&descriptor.reference.placement, project)
                         && selection_admits_descriptor(selection, &allowed_selections, descriptor)
                 };
-                let admitted = match registry
-                    .control
-                    .inspect_ability(resolve_account.clone(), reference.identity())
-                    .await
-                {
-                    Ok(inspection) => check_descriptor(&inspection.descriptor),
-                    Err(error) if visible_error(&error) => match &reference.placement {
-                        AbilityPlacement::OwnedProject(folder) => {
-                            let promoted = AbilityIdentity {
-                                id: reference.id.clone(),
-                                placement: AbilityPlacement::OwnedSpace(folder.space_id.clone()),
-                            };
-                            match registry
-                                .control
-                                .inspect_ability(resolve_account.clone(), promoted)
-                                .await
-                            {
-                                Ok(inspection) => check_descriptor(&inspection.descriptor),
-                                Err(error) if visible_error(&error) => false,
-                                Err(error) => return Err(error),
-                            }
-                        }
-                        _ => false,
-                    },
-                    Err(error) => return Err(error),
-                };
+                let admitted = inspect_followed_ability(registry, &resolve_account, reference)
+                    .await?
+                    .is_some_and(|inspection| check_descriptor(&inspection.descriptor));
                 if !admitted {
                     return Err(DomainError::ResourceNotFound.into());
                 }

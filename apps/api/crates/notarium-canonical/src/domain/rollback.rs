@@ -1649,6 +1649,148 @@ pub(crate) fn build_rollback_direct_single_tx_exec(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn materialize_working_group(
+    group: &GroupKey,
+    kept_groups: &[(GroupKey, Vec<NoteId>)],
+    overlays: &HashMap<NoteId, crate::domain::board::OverlayRow>,
+    moved_targets_on_view: &BTreeSet<&NoteId>,
+    working_groups: &mut Vec<(GroupKey, Vec<ExistingRankedItem>)>,
+    neighbor_dirty: &mut BTreeMap<NoteId, (GroupKey, String, bool)>,
+) -> Result<usize, PortError> {
+    if let Some(idx) = working_groups.iter().position(|(gk, _)| gk == group) {
+        return Ok(idx);
+    }
+    let Some((_, kept_notes)) = kept_groups.iter().find(|(gk, _)| gk == group) else {
+        working_groups.push((group.clone(), Vec::new()));
+        return Ok(working_groups.len() - 1);
+    };
+    if kept_notes.is_empty() {
+        working_groups.push((group.clone(), Vec::new()));
+        return Ok(working_groups.len() - 1);
+    }
+    let all_unranked = kept_notes
+        .iter()
+        .all(|nid| overlays.get(nid).map(|o| &o.group) != Some(group));
+    let mut items = Vec::with_capacity(kept_notes.len());
+    if all_unranked {
+        let init = evenly_spaced_ranks(kept_notes.len())?;
+        for (nid, r) in kept_notes.iter().zip(init) {
+            if !moved_targets_on_view.contains(nid) {
+                neighbor_dirty.insert(nid.clone(), (group.clone(), r.clone(), false));
+            }
+            items.push(ExistingRankedItem {
+                note_id: nid.clone(),
+                rank: r,
+            });
+        }
+    } else {
+        let mut ranked_only: Vec<ExistingRankedItem> = kept_notes
+            .iter()
+            .filter_map(|nid| {
+                let o = overlays.get(nid)?;
+                if &o.group == group {
+                    Some(ExistingRankedItem {
+                        note_id: nid.clone(),
+                        rank: o.sort_rank_lexo.clone(),
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
+        ranked_only.sort_by(|a, b| a.rank.cmp(&b.rank).then_with(|| a.note_id.cmp(&b.note_id)));
+        items.extend(ranked_only);
+        for nid in kept_notes {
+            let in_grp = overlays
+                .get(nid)
+                .map(|o| &o.group == group)
+                .unwrap_or(false);
+            if !in_grp {
+                let tail = compute_rank_placement(&items, nid, items.len())?;
+                for (pn, pr) in tail.pma_neighbor_updates {
+                    if let Some(it) = items.iter_mut().find(|i| i.note_id == pn) {
+                        it.rank = pr.clone();
+                    }
+                    if !moved_targets_on_view.contains(&pn) {
+                        neighbor_dirty.insert(pn, (group.clone(), pr, true));
+                    }
+                }
+                if !moved_targets_on_view.contains(nid) {
+                    neighbor_dirty.insert(
+                        nid.clone(),
+                        (group.clone(), tail.target_rank.clone(), false),
+                    );
+                }
+                items.push(ExistingRankedItem {
+                    note_id: nid.clone(),
+                    rank: tail.target_rank,
+                });
+            }
+        }
+    }
+    working_groups.push((group.clone(), items));
+    Ok(working_groups.len() - 1)
+}
+
+async fn load_latest_prerun_rank_meta_tx(
+    tx: &mut BackendConn<'_>,
+    scope: &HistoryScope,
+    view: &ViewRef,
+    target: &NoteId,
+    run: &AgentRunId,
+    before_seq: SpaceSeq,
+) -> Result<Option<crate::codec::RankRevisionMetadata>, PortError> {
+    let key = super::board::rank_entity_key(&view.note, &view.key, target);
+    let before_i64 = before_seq.get() as i64;
+    let bytes_opt: Option<Vec<u8>> = match tx {
+        BackendConn::Sqlite(conn) => sqlx::query_scalar(
+            "SELECT metadata_msgpack FROM revisions
+             WHERE space_id = ?1 AND history_incarnation = ?2
+               AND entity_type = 'rank' AND entity_key = ?3
+               AND (agent_run_id IS NULL OR agent_run_id != ?4)
+               AND space_seq < ?5
+             ORDER BY space_seq DESC
+             LIMIT 1",
+        )
+        .bind(scope.space_id.as_str())
+        .bind(scope.incarnation.as_bytes().as_slice())
+        .bind(&key)
+        .bind(run.as_str())
+        .bind(before_i64)
+        .fetch_optional(&mut **conn)
+        .await
+        .map_err(|err| internal_not_committed("sqlite_prerun_rank_meta", err.to_string()))?,
+        BackendConn::Postgres(conn) => sqlx::query_scalar(
+            "SELECT metadata_msgpack FROM revisions
+             WHERE space_id = $1 AND history_incarnation = $2
+               AND entity_type = 'rank' AND entity_key = $3
+               AND (agent_run_id IS NULL OR agent_run_id != $4)
+               AND space_seq < $5
+             ORDER BY space_seq DESC
+             LIMIT 1",
+        )
+        .bind(scope.space_id.as_str())
+        .bind(scope.incarnation.as_bytes().as_slice())
+        .bind(&key)
+        .bind(run.as_str())
+        .bind(before_i64)
+        .fetch_optional(&mut **conn)
+        .await
+        .map_err(|err| crate::runtime::pg_read_error("pg_prerun_rank_meta", err))?,
+    };
+    let Some(bytes) = bytes_opt else {
+        return Ok(None);
+    };
+    match RevisionMetadataEnvelope::decode(&bytes)?.payload {
+        RevisionMetadataPayload::Rank(meta) => Ok(Some(meta)),
+        _ => Err(internal_not_committed(
+            "rollback_prerun_rank_meta_kind",
+            "rank revision metadata has unexpected payload variant",
+        )),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn build_rollback_execute_fn(
     scope_cl: HistoryScope,
     auth: notarium_core::auth::EngineAuthContext,
@@ -1780,6 +1922,9 @@ fn build_rollback_execute_fn(
                 let cur_schema_rev = current_schema.as_ref().map(|s| &s.schema_revision);
 
                 for view in &affected_views_set {
+                    if retired_note_ids.contains(&view.note) {
+                        continue;
+                    }
                     let view_facts = rb_facts
                         .views()
                         .get(view)
@@ -1827,8 +1972,9 @@ fn build_rollback_execute_fn(
                     }
 
                     // Build mutable working group lists excluding notes retired by this rollback
-                    // and reconciling non-moved eligible notes against `post_restore_membership`,
-                    // materializing initial ranks for any unranked surviving rows in each group.
+                    // and reconciling non-moved eligible notes against `post_restore_membership`.
+                    // Groups are materialized lazily only when a card is actually inserted into
+                    // them so untouched columns never acquire spurious overlays or rank revisions.
                     let moved_targets_on_view: BTreeSet<&NoteId> = run_moves_cl
                         .iter()
                         .filter(|bmh| {
@@ -1838,6 +1984,21 @@ fn build_rollback_execute_fn(
                         })
                         .map(|bmh| &bmh.target_note_id)
                         .collect();
+                    let mut earliest_bmh_for_target: HashMap<NoteId, (SpaceSeq, i32)> =
+                        HashMap::new();
+                    for bmh in &run_moves_cl {
+                        if &bmh.view == view
+                            && eligible_all_ids.contains(&bmh.target_note_id)
+                            && !retired_note_ids.contains(&bmh.target_note_id)
+                        {
+                            // `run_moves_cl` is ordered `(command_end_seq DESC, ordinal DESC)`,
+                            // so overwriting keeps the chronologically earliest move on `view`.
+                            earliest_bmh_for_target.insert(
+                                bmh.target_note_id.clone(),
+                                (bmh.command_end_seq, bmh.ordinal),
+                            );
+                        }
+                    }
                     let mut kept_groups: Vec<(GroupKey, Vec<NoteId>)> =
                         Vec::with_capacity(view_facts.groups.len());
                     for eg in &view_facts.groups {
@@ -1884,81 +2045,22 @@ fn build_rollback_execute_fn(
                     let mut neighbor_dirty: BTreeMap<NoteId, (GroupKey, String, bool)> =
                         BTreeMap::new();
 
-                    for (group, kept_notes) in kept_groups {
-                        if kept_notes.is_empty() {
-                            working_groups.push((group, Vec::new()));
-                            continue;
-                        }
-                        let all_unranked = kept_notes
-                            .iter()
-                            .all(|nid| overlays.get(nid).map(|o| &o.group) != Some(&group));
-                        let mut items = Vec::with_capacity(kept_notes.len());
-                        if all_unranked {
-                            let init = evenly_spaced_ranks(kept_notes.len())?;
-                            for (nid, r) in kept_notes.iter().zip(init) {
-                                if !moved_targets_on_view.contains(nid) {
-                                    neighbor_dirty
-                                        .insert(nid.clone(), (group.clone(), r.clone(), false));
-                                }
-                                items.push(ExistingRankedItem {
-                                    note_id: nid.clone(),
-                                    rank: r,
-                                });
-                            }
-                        } else {
-                            let mut ranked_only: Vec<ExistingRankedItem> = kept_notes
-                                .iter()
-                                .filter_map(|nid| {
-                                    let o = overlays.get(nid)?;
-                                    if o.group == group {
-                                        Some(ExistingRankedItem {
-                                            note_id: nid.clone(),
-                                            rank: o.sort_rank_lexo.clone(),
-                                        })
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .collect();
-                            ranked_only.sort_by(|a, b| {
-                                a.rank.cmp(&b.rank).then_with(|| a.note_id.cmp(&b.note_id))
-                            });
-                            items.extend(ranked_only);
-                            for nid in &kept_notes {
-                                let in_grp =
-                                    overlays.get(nid).map(|o| o.group == group).unwrap_or(false);
-                                if !in_grp {
-                                    let tail = compute_rank_placement(&items, nid, items.len())?;
-                                    for (pn, pr) in tail.pma_neighbor_updates {
-                                        if let Some(it) = items.iter_mut().find(|i| i.note_id == pn)
-                                        {
-                                            it.rank = pr.clone();
-                                        }
-                                        if !moved_targets_on_view.contains(&pn) {
-                                            neighbor_dirty.insert(pn, (group.clone(), pr, true));
-                                        }
-                                    }
-                                    if !moved_targets_on_view.contains(nid) {
-                                        neighbor_dirty.insert(
-                                            nid.clone(),
-                                            (group.clone(), tail.target_rank.clone(), false),
-                                        );
-                                    }
-                                    items.push(ExistingRankedItem {
-                                        note_id: nid.clone(),
-                                        rank: tail.target_rank,
-                                    });
-                                }
-                            }
-                        }
-                        working_groups.push((group, items));
+                    enum TargetSettlement {
+                        Ineligible,
+                        Replayed {
+                            group: GroupKey,
+                            rank: String,
+                            placement_revision: Option<RevisionId>,
+                        },
+                        ReconcilePreRun {
+                            expected_post: Option<GroupKey>,
+                            earliest_seq: SpaceSeq,
+                        },
                     }
 
                     // Replay run's board moves on `view` for non-retired eligible notes in DESC order!
-                    let mut target_final_state: BTreeMap<
-                        NoteId,
-                        Option<(GroupKey, String, Option<RevisionId>)>,
-                    > = BTreeMap::new();
+                    let mut target_final_state: BTreeMap<NoteId, TargetSettlement> =
+                        BTreeMap::new();
 
                     for bmh in &run_moves_cl {
                         if &bmh.view != view
@@ -1969,55 +2071,88 @@ fn build_rollback_execute_fn(
                         }
                         let target = &bmh.target_note_id;
 
-                        // Remove `target` from whichever working group it currently occupies.
+                        // Remove `target` from whichever group it currently occupies.
+                        for (_, notes) in &mut kept_groups {
+                            notes.retain(|nid| nid != target);
+                        }
                         for (_, g_items) in &mut working_groups {
                             g_items.retain(|it| &it.note_id != target);
                         }
 
+                        let expected_post = view_facts
+                            .post_restore_membership
+                            .get(target)
+                            .cloned()
+                            .unwrap_or(None);
+                        let is_earliest = earliest_bmh_for_target.get(target)
+                            == Some(&(bmh.command_end_seq, bmh.ordinal));
+                        let before_group = match &bmh.before_placement {
+                            StoredSemanticPlacementV1::Ineligible => None,
+                            StoredSemanticPlacementV1::InGroup { group, .. } => Some(group.clone()),
+                        };
+                        if is_earliest && before_group != expected_post {
+                            // An earlier in-run `edit_note` moved `target` between its pre-run
+                            // group and `before_group` before this first `move_board_card`.
+                            // Reconcile `target` directly against its pre-run rank history instead
+                            // of placing it into the transient intermediate group.
+                            target_final_state.insert(
+                                target.clone(),
+                                TargetSettlement::ReconcilePreRun {
+                                    expected_post,
+                                    earliest_seq: bmh.command_end_seq,
+                                },
+                            );
+                            continue;
+                        }
+
                         match &bmh.before_placement {
                             StoredSemanticPlacementV1::Ineligible => {
-                                target_final_state.insert(target.clone(), None);
+                                target_final_state
+                                    .insert(target.clone(), TargetSettlement::Ineligible);
                             }
                             StoredSemanticPlacementV1::InGroup {
                                 group,
                                 predecessor,
                                 successor,
                             } => {
-                                // Find or create `group` in `working_groups`.
-                                let g_idx =
-                                    match working_groups.iter().position(|(gk, _)| gk == group) {
-                                        Some(idx) => idx,
-                                        None => {
-                                            working_groups.push((group.clone(), Vec::new()));
-                                            working_groups.len() - 1
-                                        }
-                                    };
+                                let g_idx = materialize_working_group(
+                                    group,
+                                    &kept_groups,
+                                    &overlays,
+                                    &moved_targets_on_view,
+                                    &mut working_groups,
+                                    &mut neighbor_dirty,
+                                )?;
                                 let g_items = &mut working_groups[g_idx].1;
 
                                 let pred_pos = match predecessor {
-                                    Some(pred_id) => Some(
-                                        g_items
-                                            .iter()
-                                            .position(|it| &it.note_id == pred_id)
-                                            .ok_or_else(|| {
-                                                DomainError::validation(
+                                    Some(pred_id) => {
+                                        match g_items.iter().position(|it| &it.note_id == pred_id) {
+                                            Some(pos) => Some(pos),
+                                            None if eligible_all_ids.contains(pred_id) => None,
+                                            None => {
+                                                return Err(DomainError::validation(
                                                     ValidationReason::InvalidState,
                                                 )
-                                            })?,
-                                    ),
+                                                .into());
+                                            }
+                                        }
+                                    }
                                     None => None,
                                 };
                                 let succ_pos = match successor {
-                                    Some(succ_id) => Some(
-                                        g_items
-                                            .iter()
-                                            .position(|it| &it.note_id == succ_id)
-                                            .ok_or_else(|| {
-                                                DomainError::validation(
+                                    Some(succ_id) => {
+                                        match g_items.iter().position(|it| &it.note_id == succ_id) {
+                                            Some(pos) => Some(pos),
+                                            None if eligible_all_ids.contains(succ_id) => None,
+                                            None => {
+                                                return Err(DomainError::validation(
                                                     ValidationReason::InvalidState,
                                                 )
-                                            })?,
-                                    ),
+                                                .into());
+                                            }
+                                        }
+                                    }
                                     None => None,
                                 };
 
@@ -2027,12 +2162,38 @@ fn build_rollback_execute_fn(
                                     (Some(p), None) => p + 1,
                                     (Some(p), Some(s)) => {
                                         if p >= s {
-                                            return Err(DomainError::validation(
-                                                ValidationReason::InvalidState,
-                                            )
-                                            .into());
+                                            let pred_eligible = predecessor
+                                                .as_ref()
+                                                .is_some_and(|id| eligible_all_ids.contains(id));
+                                            let succ_eligible = successor
+                                                .as_ref()
+                                                .is_some_and(|id| eligible_all_ids.contains(id));
+                                            if !pred_eligible && !succ_eligible {
+                                                return Err(DomainError::validation(
+                                                    ValidationReason::InvalidState,
+                                                )
+                                                .into());
+                                            }
+                                            let pred_ranked =
+                                                predecessor.as_ref().is_some_and(|id| {
+                                                    overlays
+                                                        .get(id)
+                                                        .is_some_and(|o| &o.group == group)
+                                                });
+                                            let succ_ranked =
+                                                successor.as_ref().is_some_and(|id| {
+                                                    overlays
+                                                        .get(id)
+                                                        .is_some_and(|o| &o.group == group)
+                                                });
+                                            if pred_ranked && !succ_ranked {
+                                                p + 1
+                                            } else {
+                                                s
+                                            }
+                                        } else {
+                                            p + 1
                                         }
-                                        p + 1
                                     }
                                 };
 
@@ -2041,10 +2202,10 @@ fn build_rollback_execute_fn(
                                     if let Some(it) = g_items.iter_mut().find(|i| i.note_id == pn) {
                                         it.rank = pr.clone();
                                     }
-                                    if let Some(Some((_, tr_rank, _))) =
+                                    if let Some(TargetSettlement::Replayed { rank, .. }) =
                                         target_final_state.get_mut(&pn)
                                     {
-                                        *tr_rank = pr;
+                                        *rank = pr;
                                     } else if !moved_targets_on_view.contains(&pn) {
                                         neighbor_dirty.insert(pn, (group.clone(), pr, true));
                                     }
@@ -2058,25 +2219,33 @@ fn build_rollback_execute_fn(
                                 );
                                 target_final_state.insert(
                                     target.clone(),
-                                    Some((
-                                        group.clone(),
-                                        computed.target_rank,
-                                        bmh.before_placement_revision.clone(),
-                                    )),
+                                    TargetSettlement::Replayed {
+                                        group: group.clone(),
+                                        rank: computed.target_rank,
+                                        placement_revision: bmh.before_placement_revision.clone(),
+                                    },
                                 );
                             }
                         }
                     }
 
-                    // Verify final replayed membership for every replayed target matches `post_restore_membership`!
-                    for (target, final_opt) in target_final_state {
+                    // Settle final replayed/reconciled membership for every target on `view`.
+                    let mut view_target_restores: Vec<PlannedTargetRankRestore> = Vec::new();
+                    for (target, settlement) in target_final_state {
                         let expected_post = view_facts
                             .post_restore_membership
                             .get(&target)
                             .cloned()
                             .unwrap_or(None);
-                        match (final_opt, expected_post) {
-                            (None, None) => {
+                        match (settlement, expected_post) {
+                            (TargetSettlement::Ineligible, None)
+                            | (
+                                TargetSettlement::ReconcilePreRun {
+                                    expected_post: None,
+                                    ..
+                                },
+                                None,
+                            ) => {
                                 if overlays.contains_key(&target) {
                                     planned_overlay_deletes.push(PlannedOverlayDelete {
                                         view: view.clone(),
@@ -2084,14 +2253,111 @@ fn build_rollback_execute_fn(
                                     });
                                 }
                             }
-                            (Some((grp, rnk, prev_pl_rev)), Some(post_grp)) if grp == post_grp => {
-                                planned_target_restores.push(PlannedTargetRankRestore {
+                            (
+                                TargetSettlement::Replayed {
+                                    group: grp,
+                                    rank: rnk,
+                                    placement_revision: prev_pl_rev,
+                                },
+                                Some(post_grp),
+                            ) if grp == post_grp => {
+                                view_target_restores.push(PlannedTargetRankRestore {
                                     view: view.clone(),
                                     target_note: target,
                                     group: grp,
                                     rank: rnk,
                                     restored_placement_revision: prev_pl_rev,
                                 });
+                            }
+                            (
+                                TargetSettlement::ReconcilePreRun {
+                                    expected_post: Some(post_grp),
+                                    earliest_seq,
+                                },
+                                Some(expected_grp),
+                            ) if post_grp == expected_grp => {
+                                let prerun = load_latest_prerun_rank_meta_tx(
+                                    tx,
+                                    &scope_cl,
+                                    view,
+                                    &target,
+                                    &input.run,
+                                    earliest_seq,
+                                )
+                                .await?;
+                                if let Some(meta) = prerun
+                                    && !meta.removed
+                                    && meta.group_key == post_grp
+                                {
+                                    let g_idx = materialize_working_group(
+                                        &post_grp,
+                                        &kept_groups,
+                                        &overlays,
+                                        &moved_targets_on_view,
+                                        &mut working_groups,
+                                        &mut neighbor_dirty,
+                                    )?;
+                                    let g_items = &mut working_groups[g_idx].1;
+                                    let collides =
+                                        g_items.iter().any(|it| it.rank == meta.sort_rank_lexo);
+                                    let restored_rank = if !collides {
+                                        let pos = g_items
+                                            .iter()
+                                            .position(|it| it.rank > meta.sort_rank_lexo)
+                                            .unwrap_or(g_items.len());
+                                        g_items.insert(
+                                            pos,
+                                            ExistingRankedItem {
+                                                note_id: target.clone(),
+                                                rank: meta.sort_rank_lexo.clone(),
+                                            },
+                                        );
+                                        meta.sort_rank_lexo
+                                    } else {
+                                        let pos = g_items
+                                            .iter()
+                                            .position(|it| it.rank >= meta.sort_rank_lexo)
+                                            .unwrap_or(g_items.len());
+                                        let computed =
+                                            compute_rank_placement(g_items, &target, pos)?;
+                                        for (pn, pr) in computed.pma_neighbor_updates {
+                                            if let Some(it) =
+                                                g_items.iter_mut().find(|i| i.note_id == pn)
+                                            {
+                                                it.rank = pr.clone();
+                                            }
+                                            if let Some(tr) = view_target_restores
+                                                .iter_mut()
+                                                .find(|r| r.target_note == pn)
+                                            {
+                                                tr.rank = pr;
+                                            } else if !moved_targets_on_view.contains(&pn) {
+                                                neighbor_dirty
+                                                    .insert(pn, (post_grp.clone(), pr, true));
+                                            }
+                                        }
+                                        g_items.insert(
+                                            pos,
+                                            ExistingRankedItem {
+                                                note_id: target.clone(),
+                                                rank: computed.target_rank.clone(),
+                                            },
+                                        );
+                                        computed.target_rank
+                                    };
+                                    view_target_restores.push(PlannedTargetRankRestore {
+                                        view: view.clone(),
+                                        target_note: target,
+                                        group: post_grp,
+                                        rank: restored_rank,
+                                        restored_placement_revision: Some(meta.placement_revision),
+                                    });
+                                } else if overlays.contains_key(&target) {
+                                    planned_overlay_deletes.push(PlannedOverlayDelete {
+                                        view: view.clone(),
+                                        target_note: target,
+                                    });
+                                }
                             }
                             _ => {
                                 return Err(DomainError::validation(
@@ -2102,7 +2368,158 @@ fn build_rollback_execute_fn(
                         }
                     }
 
+                    // Reconcile non-moved eligible notes whose persisted overlay on `view`
+                    // no longer matches their restored membership (for example, an in-run
+                    // `edit_note` brought the note into a group where another card's move
+                    // materialized a neighbor overlay for it).
+                    let first_view_move_seq = run_moves_cl
+                        .iter()
+                        .filter(|bmh| &bmh.view == view)
+                        .map(|bmh| bmh.command_end_seq)
+                        .min()
+                        .unwrap_or(SpaceSeq::ZERO);
+                    let mut stale_non_moved: Vec<NoteId> = overlays
+                        .keys()
+                        .filter(|nid| {
+                            eligible_all_ids.contains(*nid)
+                                && !retired_note_ids.contains(*nid)
+                                && !moved_targets_on_view.contains(*nid)
+                        })
+                        .cloned()
+                        .collect();
+                    stale_non_moved.sort();
+                    for nid in stale_non_moved {
+                        let Some(ov) = overlays.get(&nid) else {
+                            continue;
+                        };
+                        let expected_post = view_facts
+                            .post_restore_membership
+                            .get(&nid)
+                            .cloned()
+                            .unwrap_or(None);
+                        if expected_post.as_ref() == Some(&ov.group) {
+                            continue;
+                        }
+                        match expected_post {
+                            None => {
+                                planned_overlay_deletes.push(PlannedOverlayDelete {
+                                    view: view.clone(),
+                                    target_note: nid,
+                                });
+                            }
+                            Some(post_grp) => {
+                                let already_neighbor_in_post =
+                                    view_target_restores.iter().any(|tr| tr.group == post_grp)
+                                        && neighbor_dirty
+                                            .get(&nid)
+                                            .is_some_and(|(grp, _, _)| grp == &post_grp);
+                                if already_neighbor_in_post {
+                                    continue;
+                                }
+                                let prerun = load_latest_prerun_rank_meta_tx(
+                                    tx,
+                                    &scope_cl,
+                                    view,
+                                    &nid,
+                                    &input.run,
+                                    first_view_move_seq,
+                                )
+                                .await?;
+                                if let Some(meta) = prerun
+                                    && !meta.removed
+                                    && meta.group_key == post_grp
+                                {
+                                    for (_, notes) in &mut kept_groups {
+                                        notes.retain(|id| id != &nid);
+                                    }
+                                    for (_, g_items) in &mut working_groups {
+                                        g_items.retain(|it| it.note_id != nid);
+                                    }
+                                    neighbor_dirty.remove(&nid);
+                                    let g_idx = materialize_working_group(
+                                        &post_grp,
+                                        &kept_groups,
+                                        &overlays,
+                                        &moved_targets_on_view,
+                                        &mut working_groups,
+                                        &mut neighbor_dirty,
+                                    )?;
+                                    let g_items = &mut working_groups[g_idx].1;
+                                    let collides =
+                                        g_items.iter().any(|it| it.rank == meta.sort_rank_lexo);
+                                    let restored_rank = if !collides {
+                                        let pos = g_items
+                                            .iter()
+                                            .position(|it| it.rank > meta.sort_rank_lexo)
+                                            .unwrap_or(g_items.len());
+                                        g_items.insert(
+                                            pos,
+                                            ExistingRankedItem {
+                                                note_id: nid.clone(),
+                                                rank: meta.sort_rank_lexo.clone(),
+                                            },
+                                        );
+                                        meta.sort_rank_lexo
+                                    } else {
+                                        let pos = g_items
+                                            .iter()
+                                            .position(|it| it.rank >= meta.sort_rank_lexo)
+                                            .unwrap_or(g_items.len());
+                                        let computed = compute_rank_placement(g_items, &nid, pos)?;
+                                        for (pn, pr) in computed.pma_neighbor_updates {
+                                            if let Some(it) =
+                                                g_items.iter_mut().find(|i| i.note_id == pn)
+                                            {
+                                                it.rank = pr.clone();
+                                            }
+                                            if let Some(tr) = view_target_restores
+                                                .iter_mut()
+                                                .find(|r| r.target_note == pn)
+                                            {
+                                                tr.rank = pr;
+                                            } else if !moved_targets_on_view.contains(&pn) {
+                                                neighbor_dirty
+                                                    .insert(pn, (post_grp.clone(), pr, true));
+                                            }
+                                        }
+                                        g_items.insert(
+                                            pos,
+                                            ExistingRankedItem {
+                                                note_id: nid.clone(),
+                                                rank: computed.target_rank.clone(),
+                                            },
+                                        );
+                                        computed.target_rank
+                                    };
+                                    view_target_restores.push(PlannedTargetRankRestore {
+                                        view: view.clone(),
+                                        target_note: nid,
+                                        group: post_grp,
+                                        rank: restored_rank,
+                                        restored_placement_revision: Some(meta.placement_revision),
+                                    });
+                                } else {
+                                    planned_overlay_deletes.push(PlannedOverlayDelete {
+                                        view: view.clone(),
+                                        target_note: nid,
+                                    });
+                                }
+                            }
+                        }
+                    }
+
+                    let mut touched_final_groups: Vec<GroupKey> = Vec::new();
+                    for tr in &view_target_restores {
+                        if !touched_final_groups.contains(&tr.group) {
+                            touched_final_groups.push(tr.group.clone());
+                        }
+                    }
+                    planned_target_restores.extend(view_target_restores);
+
                     for (nbr_id, (grp, rnk, is_pma)) in neighbor_dirty {
+                        if !touched_final_groups.contains(&grp) {
+                            continue;
+                        }
                         if eligible_all_ids.contains(&nbr_id)
                             && view_facts
                                 .post_restore_membership

@@ -1142,6 +1142,34 @@ impl ControlService {
             _ => Err(DomainError::ResourceNotFound.into()),
         }
     }
+    pub async fn follow_ability(
+        &self,
+        ctx: AccountContext,
+        reference: AbilityRef,
+    ) -> Result<AbilityRef, PortError> {
+        let budget = OperationBudget::new(ctx.budget.clone());
+        let (mut rtx, auth) = self
+            .open_revalidated_read(&budget, &ctx.budget.request, ctx.auth())
+            .await?;
+        let current = AccountContext::new(auth, budget.context(ctx.budget.request.clone()));
+        let followed = budget
+            .run(
+                self.follow_ability_chain_db(rtx.inner_mut(), &current, reference),
+                CommitEffect::NotCommitted,
+            )
+            .await;
+        budget.run(rtx.finish(), CommitEffect::NotCommitted).await?;
+        let (terminal, visited) = followed?;
+        for item in &visited {
+            budget
+                .run(
+                    self.ability_placement(&current, item),
+                    CommitEffect::NotCommitted,
+                )
+                .await?;
+        }
+        Ok(terminal)
+    }
     pub async fn inspect_ability(
         &self,
         ctx: AccountContext,

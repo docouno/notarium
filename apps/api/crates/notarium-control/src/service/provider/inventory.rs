@@ -33,7 +33,7 @@ pub(super) async fn resource_visible(
     owner: &str,
     row: &ProviderResourcesRow,
 ) -> Result<(), PortError> {
-    if row.owner_id == owner {
+    if row.owner_id == owner && !auth.is_space_narrowed() {
         return Ok(());
     }
     let spaces = rows!(

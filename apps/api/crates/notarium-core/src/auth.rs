@@ -371,6 +371,18 @@ impl EngineAuthContext {
         audience: ChatAudience,
         requested: BTreeMap<SpaceId, SpaceGrant>,
     ) -> DomainResult<Self> {
+        if matches!(self.kind, PrincipalKind::Keeper(_)) || self.keeper_log.is_some() {
+            return Err(DomainError::validation(ValidationReason::ScopeMismatch));
+        }
+        self.for_agent_run_inner(run, thread_space, audience, requested)
+    }
+    fn for_agent_run_inner(
+        &self,
+        run: AgentRunId,
+        thread_space: SpaceId,
+        audience: ChatAudience,
+        requested: BTreeMap<SpaceId, SpaceGrant>,
+    ) -> DomainResult<Self> {
         if self.keeper_log.is_some() {
             return Err(DomainError::validation(ValidationReason::ScopeMismatch));
         }
@@ -436,7 +448,7 @@ impl EngineAuthContext {
         grant
             .write_classes
             .retain(|class| *class == DocClass::AgentMemory);
-        let mut derived = self.for_agent_run(
+        let mut derived = self.for_agent_run_inner(
             run.clone(),
             space.clone(),
             ChatAudience::Personal,
@@ -460,7 +472,7 @@ impl EngineAuthContext {
         source: GrantId,
         requested: BTreeMap<SpaceId, SpaceGrant>,
     ) -> DomainResult<Self> {
-        if self.keeper_log.is_some() {
+        if matches!(self.kind, PrincipalKind::Keeper(_)) || self.keeper_log.is_some() {
             return Err(DomainError::validation(ValidationReason::ScopeMismatch));
         }
         if self.is_search_indexing() {
@@ -484,7 +496,7 @@ impl EngineAuthContext {
     }
     /// Personal access tokens are delegated credentials, never interactive humans.
     pub fn for_pat(&self, requested: BTreeMap<SpaceId, SpaceGrant>) -> DomainResult<Self> {
-        if self.keeper_log.is_some() {
+        if matches!(self.kind, PrincipalKind::Keeper(_)) || self.keeper_log.is_some() {
             return Err(DomainError::validation(ValidationReason::ScopeMismatch));
         }
         if self.is_search_indexing() {
@@ -701,7 +713,7 @@ impl EngineAuthContext {
             })
             .collect();
         let mut result = self.narrow(requested)?;
-        if self.keeper_log.is_some() {
+        if matches!(self.kind, PrincipalKind::Keeper(_)) || self.keeper_log.is_some() {
             result.readonly_abilities = self
                 .readonly_abilities
                 .intersection(&current.readonly_abilities)
@@ -1173,5 +1185,85 @@ impl EngineAuthContext {
             return Err(DomainError::validation(ValidationReason::ScopeMismatch));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod keeper_narrowing_tests {
+    use super::*;
+
+    fn sample_human() -> (SpaceId, EngineAuthContext) {
+        let space = SpaceId::from_bytes([0x41; 16]);
+        let spaces = BTreeMap::from([(
+            space.clone(),
+            SpaceGrant {
+                role: SpaceRole::Owner,
+                read_classes: DocClass::all(),
+                write_classes: DocClass::all(),
+                project_root: None,
+            },
+        )]);
+        let human = VerifiedHuman::attest(
+            PrincipalId::from_bytes([0x42; 16]),
+            GrantId::from_bytes([0x43; 16]),
+            spaces,
+            true,
+        )
+        .with_human_management(true)
+        .with_credential(AuthenticatedCredential::Session(AuthSessionId::from_bytes(
+            [0x48; 16],
+        )));
+        (space, EngineAuthContext::for_human(human))
+    }
+
+    #[test]
+    fn keeper_without_keeper_log_cannot_mint_sub_principals_and_preserves_readonly_abilities() {
+        let (space, human) = sample_human();
+        let allowed_ability = AbilityId::from_bytes([0x44; 16]);
+        let dropped_ability = AbilityId::from_bytes([0x49; 16]);
+        let run = AgentRunId::from_bytes([0x45; 16]);
+        let keeper = human
+            .for_keeper(
+                run.clone(),
+                space.clone(),
+                None,
+                BTreeSet::from([allowed_ability.clone(), dropped_ability]),
+            )
+            .expect("keeper context");
+        assert!(keeper.keeper_log().is_none());
+
+        assert!(matches!(
+            keeper.for_agent_run(
+                AgentRunId::from_bytes([0x46; 16]),
+                space.clone(),
+                ChatAudience::Personal,
+                keeper.spaces().clone(),
+            ),
+            Err(DomainError::ValidationFailed { diagnostic })
+                if diagnostic.reason == ValidationReason::ScopeMismatch
+        ));
+        assert!(matches!(
+            keeper.for_oauth(GrantId::from_bytes([0x47; 16]), keeper.spaces().clone()),
+            Err(DomainError::ValidationFailed { diagnostic })
+                if diagnostic.reason == ValidationReason::ScopeMismatch
+        ));
+        assert!(matches!(
+            keeper.for_pat(keeper.spaces().clone()),
+            Err(DomainError::ValidationFailed { diagnostic })
+                if diagnostic.reason == ValidationReason::ScopeMismatch
+        ));
+
+        let live_keeper = human
+            .for_keeper(run, space, None, BTreeSet::from([allowed_ability.clone()]))
+            .expect("live keeper context");
+        let intersected = keeper
+            .intersect_current(&live_keeper)
+            .expect("intersect keeper");
+        assert!(matches!(intersected.kind(), PrincipalKind::Keeper(_)));
+        assert_eq!(
+            intersected.readonly_abilities(),
+            &BTreeSet::from([allowed_ability])
+        );
+        assert!(intersected.keeper_log().is_none());
     }
 }

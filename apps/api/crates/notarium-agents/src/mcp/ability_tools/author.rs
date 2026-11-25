@@ -428,8 +428,10 @@ pub(super) async fn create(
     {
         return Err(invalid(ValidationReason::ScopeMismatch));
     }
+    let mut plan_replayed = true;
     let plan: CreatePlan = call
         .journal("create-ability-plan", || async {
+            plan_replayed = false;
             let home = new_home(call, &args.placement).await?;
             let skills = resolve_skills(call, attachments).await?;
             let availability =
@@ -443,11 +445,65 @@ pub(super) async fn create(
         })
         .await?;
     if let AbilityPlacement::OwnedProject(project) = &plan.home.placement {
-        session::project_for_folder(call, project).await?;
+        if !plan_replayed {
+            session::project_for_folder(call, project).await?;
+        } else {
+            let live_opt = match call
+                .registry
+                .catalog
+                .folder(call.account(), project.clone())
+                .await
+            {
+                Ok(folder) => Some(folder),
+                Err(PortError::Domain(DomainError::ResourceNotFound)) => None,
+                Err(error) => return Err(error),
+            };
+            if let Some(folder) = live_opt {
+                if folder.reference != *project
+                    || folder.lifecycle == notarium_core::model::Lifecycle::Purged
+                {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+            } else {
+                let trashed = call
+                    .registry
+                    .catalog
+                    .trashed_folder_ancestry(call.account(), project.clone())
+                    .await?;
+                if trashed.reference != *project {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+            }
+        }
     }
     let carrier = created_carrier(&args, kind, &format_attachments(attachments, &plan.skills)?)?;
     const CREATE_LABEL: &str = "notarium.mcp.create-ability.v1";
-    let parent = ability_folder(call, &plan.home.scope, plan.home.parent.clone()).await?;
+    let parent = if let Some(saved) = call
+        .lookup_journal_with_key::<FolderId>(
+            "create-ability-folder",
+            &call.request_key,
+            call.request_hash,
+        )
+        .await?
+    {
+        saved
+    } else {
+        let resolved = ability_folder(call, &plan.home.scope, plan.home.parent.clone())
+            .await
+            .map_err(|error| {
+                super::super::note_tools::batch_operational_error(CREATE_LABEL, error, false)
+            })?;
+        call.record_journal_with_key(
+            "create-ability-folder",
+            &call.request_key,
+            call.request_hash,
+            &resolved,
+        )
+        .await
+        .map_err(|error| {
+            super::super::note_tools::batch_operational_error(CREATE_LABEL, error, true)
+        })?
+    };
     let note_id = NoteId::from_bytes(stable_id(call, "ability-entrypoint-id"));
     let ability_id = AbilityId::from_bytes(stable_id(call, "ability-package-id"));
     let entrypoint = call

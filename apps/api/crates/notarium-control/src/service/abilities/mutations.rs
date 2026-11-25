@@ -371,6 +371,17 @@ impl ControlService {
         if ctx.auth().taint().is_tainted() {
             return Err(DomainError::CrossSpaceTainted.into());
         }
+        if matches!(input.ability.placement, AbilityPlacement::System)
+            && (!ctx.auth().human_management()
+                || ctx.auth().is_space_narrowed()
+                || ctx
+                    .auth()
+                    .spaces()
+                    .values()
+                    .any(|grant| grant.project_root.is_some()))
+        {
+            return Err(DomainError::AbilityWriteForbidden.into());
+        }
         let budget = OperationBudget::new(ctx.budget.clone());
         let current = self.current_account(&ctx, &budget).await?;
         let authoring = matches!(precondition, AbilityPreferenceGuard::Authored(_));
@@ -438,6 +449,7 @@ impl ControlService {
                 match &input.ability.placement {
                     AbilityPlacement::System => {
                         if !auth.human_management()
+                            || auth.is_space_narrowed()
                             || auth
                                 .spaces()
                                 .values()

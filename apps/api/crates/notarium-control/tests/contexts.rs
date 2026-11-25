@@ -781,6 +781,122 @@ async fn exercise_shared_consumer(
             .await
             .is_err()
     );
+    // Foreign-home vs missing ContextSetId update attempts must both return
+    // ResourceNotFound without exposing foreign revision or attachment state.
+    let other_personal_id = other.personal_space.clone().unwrap();
+    let other_personal_space = Space {
+        id: other_personal_id.clone(),
+        kind: SpaceKind::Personal,
+        lifecycle: SpaceLifecycle::Active,
+    };
+    let other_personal_note = note(fixture, &other_personal_space, 79, None);
+    let foreign_set = service
+        .put_context_set(
+            other_ctx.clone(),
+            AccountMutation {
+                identity: identity(service, &other_ctx, 31).await,
+                input: PutContextSet {
+                    id: ContextSetId::from_bytes([62; 16]),
+                    home: other_personal_id,
+                    name: "Foreign bundle".into(),
+                    notes: vec![other_personal_note],
+                    expected: None,
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    for (tag, probe_id) in [
+        (32u8, foreign_set.id.clone()),
+        (33u8, ContextSetId::from_bytes([63; 16])),
+    ] {
+        let err = service
+            .put_context_set(
+                ctx.clone(),
+                AccountMutation {
+                    identity: identity(service, ctx, tag).await,
+                    input: PutContextSet {
+                        id: probe_id,
+                        home: shared.space.id.clone(),
+                        name: "Probe".into(),
+                        notes: vec![a.clone()],
+                        expected: Some(ControlRevision::new(1).unwrap()),
+                    },
+                },
+            )
+            .await;
+        assert!(
+            matches!(err, Err(PortError::Domain(DomainError::ResourceNotFound))),
+            "put_context_set update probe must collapse to ResourceNotFound, got {err:?}"
+        );
+    }
+    // Space-narrowed bootstrap_context must exclude favorites from excluded
+    // Spaces before pagination so page offsets and counts do not leak them.
+    let ctx_personal = service
+        .account(ctx.clone(), ctx.auth().principal().clone())
+        .await
+        .unwrap()
+        .personal_space
+        .unwrap();
+    let ctx_personal_space = Space {
+        id: ctx_personal.clone(),
+        kind: SpaceKind::Personal,
+        lifecycle: SpaceLifecycle::Active,
+    };
+    let personal_fav_note = note(fixture, &ctx_personal_space, 78, None);
+    service
+        .set_favorite(
+            ctx.clone(),
+            AccountMutation {
+                identity: identity(service, ctx, 34).await,
+                input: SetFavorite {
+                    reference: FavoriteRef::Note(personal_fav_note.clone()),
+                    saved: true,
+                    rank: 100,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let ep_narrow = episode(service, ctx, None, 35).await;
+    let narrow_ctx = AccountContext::new(
+        ctx.auth().restrict_to_space(&ctx_personal).unwrap(),
+        budget(),
+    );
+    let page1 = service
+        .bootstrap_context(
+            narrow_ctx.clone(),
+            ep_narrow.clone(),
+            None,
+            ControlPageRequest::new(1, None).unwrap(),
+        )
+        .await
+        .unwrap();
+    // Position 1 is the `ContextScope::Personal` pin `c` (which points into
+    // excluded `shared`), so `page1` reports `unavailable == 1` and continues.
+    assert_eq!(page1.selection.unavailable, 1);
+    assert!(page1.selection.favorites.is_empty());
+    let page2 = service
+        .bootstrap_context(
+            narrow_ctx,
+            ep_narrow,
+            None,
+            ControlPageRequest::new(1, page1.continuation).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        page2.selection.favorites,
+        vec![personal_fav_note],
+        "excluded-Space favorites (ranks 6 & 7) must not consume page slots in narrowed bootstrap_context: {:?}",
+        page2.selection
+    );
+    assert_eq!(page2.selection.unavailable, 0);
+    assert!(
+        page2.continuation.is_none(),
+        "narrowed bootstrap_context must terminate after the sole allowed favorite"
+    );
 }
 #[tokio::test]
 async fn sqlite_context_references_and_pagination() {

@@ -631,14 +631,10 @@ pub(crate) async fn create_note_impl(
                 ctx.budget.remaining = deadline.remaining(&budget)?;
                 if let Ok(Ok(space_rec)) = deadline
                     .wait(&budget, || {
-                        authorize_create_placement(
-                            store,
-                            &ctx,
-                            request.input.parent.clone(),
-                            request.input.class,
-                        )
+                        store.read_space_fast_or_pool(&ctx.scope().space_id, Some(&budget))
                     })
                     .await
+                    && space_rec.scope.check(ctx.scope()).is_ok()
                 {
                     let created = v1_receipts::CreatedNote::from_input(
                         &request.input,
@@ -681,6 +677,59 @@ pub(crate) async fn create_note_impl(
 
     ctx.budget.remaining = deadline.remaining(&budget)?;
     let space_rec = deadline
+        .prepare(&budget, || {
+            store.read_space_fast_or_pool(&ctx.scope().space_id, Some(&budget))
+        })
+        .await?;
+    space_rec.scope.check(ctx.scope())?;
+
+    let created = v1_receipts::CreatedNote::from_input(
+        &request.input,
+        &space_rec.root_folder_id,
+        info.prepared_blob.digest,
+    );
+    let idemp = create_note_identity(
+        &ctx,
+        &request.identity,
+        &request.input,
+        &space_rec.root_folder_id,
+        info.prepared_blob.digest,
+    );
+    ctx.budget.remaining = deadline.remaining(&budget)?;
+    match deadline
+        .prepare(&budget, || {
+            try_replay_completed_receipt::<StoredCommittedNoteRevV1>(
+                store,
+                &space_rec.scope,
+                &idemp,
+                Some(&budget),
+            )
+        })
+        .await
+    {
+        Ok(Some(replayed)) => {
+            deadline.remaining(&budget)?;
+            return Ok(replayed.into_committed());
+        }
+        Err(PortError::Domain(DomainError::IdempotencyKeyReused))
+            if !idemp.has_confirmed_chat_step() =>
+        {
+            ctx.budget.remaining = deadline.remaining(&budget)?;
+            let legacy = v1_receipts::LegacyNoteCommand::Create(created);
+            let result = deadline
+                .wait(&budget, || {
+                    legacy.replay(store, &ctx, &request.identity, &idemp)
+                })
+                .await?;
+            deadline.remaining(&budget)?;
+            return result;
+        }
+        Err(err) => return Err(err),
+        Ok(None) => {}
+    }
+
+    ctx.budget.remaining = deadline.remaining(&budget)?;
+    let space_rec = deadline
         .wait(&budget, || {
             authorize_create_placement(
                 store,
@@ -700,19 +749,6 @@ pub(crate) async fn create_note_impl(
             )
         })
         .await??;
-
-    let created = v1_receipts::CreatedNote::from_input(
-        &request.input,
-        &space_rec.root_folder_id,
-        info.prepared_blob.digest,
-    );
-    let idemp = create_note_identity(
-        &ctx,
-        &request.identity,
-        &request.input,
-        &space_rec.root_folder_id,
-        info.prepared_blob.digest,
-    );
     let (intent, fast_plan) = if store.is_sqlite_local()
         && !request.input.folder_page
         && !idemp.requires_standard_writer()

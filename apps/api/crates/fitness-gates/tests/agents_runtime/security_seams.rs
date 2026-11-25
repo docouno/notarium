@@ -1807,7 +1807,44 @@ async fn exact_causal_graph_and_control_replay_seams(
             .unwrap(),
         budget(),
     );
-    for (tag, caller) in [(137u8, agent_run_ctx), (138u8, keeper_call_ctx)] {
+    let read_pat_rev = fixture
+        .control
+        .account(owner.clone(), owner.auth().principal().clone())
+        .await
+        .unwrap()
+        .revision;
+    let read_pat = fixture
+        .control
+        .create_pat(
+            owner.clone(),
+            CreatePat {
+                name: "heartbeat-read-pat".into(),
+                scope: BearerScope::Read,
+                ability_write: false,
+                selected_spaces: None,
+                expires_at_ms: None,
+                expected: read_pat_rev,
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    let read_pat_ctx = AccountContext::new(
+        fixture
+            .control
+            .resolve(support::evidence(
+                AuthEvidenceKind::Pat,
+                read_pat.token.expose(),
+            ))
+            .await
+            .unwrap(),
+        budget(),
+    );
+    for (tag, caller) in [
+        (137u8, agent_run_ctx),
+        (138u8, keeper_call_ctx),
+        (141u8, read_pat_ctx),
+    ] {
         fixture
             .control
             .begin_agent_call(

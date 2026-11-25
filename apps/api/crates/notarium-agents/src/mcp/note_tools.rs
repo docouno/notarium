@@ -42,12 +42,12 @@ pub(super) async fn handle(
     arguments: Value,
 ) -> Result<Value, PortError> {
     match tool {
-        ToolName::CreateNote => create::create_one(call, arguments).await,
-        ToolName::CreateNotes => create::create_many(call, arguments).await,
-        ToolName::EditNote => edit::edit_note(call, arguments).await,
-        ToolName::DeleteNote => delete(call, decode(arguments)?).await,
-        ToolName::MoveNote => move_note(call, decode(arguments)?).await,
-        ToolName::RenameNote => rename(call, decode(arguments)?).await,
+        ToolName::CreateNote => Box::pin(create::create_one(call, arguments)).await,
+        ToolName::CreateNotes => Box::pin(create::create_many(call, arguments)).await,
+        ToolName::EditNote => Box::pin(edit::edit_note(call, arguments)).await,
+        ToolName::DeleteNote => Box::pin(delete(call, decode(arguments)?)).await,
+        ToolName::MoveNote => Box::pin(move_note(call, decode(arguments)?)).await,
+        ToolName::RenameNote => Box::pin(rename(call, decode(arguments)?)).await,
         _ => Err(invalid(ValidationReason::InvalidQuery)),
     }
 }

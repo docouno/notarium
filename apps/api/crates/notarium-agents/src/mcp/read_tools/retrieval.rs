@@ -123,15 +123,28 @@ pub(super) async fn retrieve(
         .max_per_source
         .map_or(budget / 2, u32::from)
         .min(budget);
+    // Validate pure numeric limits before resolving any target Space so
+    // malformed requests never act as zero-taint project-slug oracles.
+    let top_k =
+        PageLimit::new(u16::try_from(limit).map_err(|_| invalid(ValidationReason::InvalidLimit))?)?;
+    let max_per_source = if recall {
+        Some(u16::try_from(source_budget).map_err(|_| invalid(ValidationReason::InvalidLimit))?)
+    } else {
+        None
+    };
     let mut remaining = budget;
     let targets = targets(call, args.project.as_deref(), args.session.as_ref(), true).await?;
     let mut candidates = Vec::new();
     let mut truncated = false;
-    let mut degradation = BTreeSet::new();
-    let top_k =
-        PageLimit::new(u16::try_from(limit).map_err(|_| invalid(ValidationReason::InvalidLimit))?)?;
+    let mut own_degradation = BTreeSet::new();
+    let mut foreign_degradation = BTreeSet::new();
     for (index, target) in targets.iter().enumerate() {
         let mut scope = call.space(target.scope.clone())?;
+        let foreign_space = !external
+            && scope
+                .auth()
+                .pinned_write_space()
+                .is_some_and(|pin| pin != &target.scope.space_id);
         // Scope remote query intent ids to this tool invocation so multi-step
         // chat/keeper runs sharing one run RequestId can issue repeated search
         // or recall calls without colliding on provider_call_log intent keys.
@@ -212,6 +225,11 @@ pub(super) async fn retrieve(
         } else {
             (None, None)
         };
+        if foreign_space && args.project.is_some() {
+            // Explicitly targeting a consented foreign project observes that
+            // Space even when the query returns zero hits.
+            call.auth.taint().mark_external_read();
+        }
         let query = SearchQuery {
             text: args.query.clone(),
             filter: unrestricted(),
@@ -249,10 +267,7 @@ pub(super) async fn retrieve(
                         query,
                         graph_depth: args.depth.unwrap_or(1),
                         token_budget: budget,
-                        max_per_source: Some(
-                            u16::try_from(source_budget)
-                                .map_err(|_| invalid(ValidationReason::InvalidLimit))?,
-                        ),
+                        max_per_source,
                     },
                     Some(&recipient),
                 )
@@ -270,7 +285,11 @@ pub(super) async fn retrieve(
         }
         truncated |= result.truncated;
         if let Some(reason) = result.degraded {
-            degradation.insert(degraded(reason));
+            if foreign_space {
+                foreign_degradation.insert(degraded(reason));
+            } else {
+                own_degradation.insert(degraded(reason));
+            }
         }
         for hit in result.hits {
             let metadata = hit.card.document.provenance();
@@ -413,6 +432,11 @@ pub(super) async fn retrieve(
         seen.insert(key);
         hits.push(reference.clone());
         output.push(item);
+    }
+
+    let mut degradation = own_degradation;
+    if call.auth.taint().is_tainted() {
+        degradation.extend(foreign_degradation);
     }
 
     let kind = if recall || (call.registry.vector_search && degradation.is_empty()) {

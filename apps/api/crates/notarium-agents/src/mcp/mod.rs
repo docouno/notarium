@@ -300,7 +300,7 @@ impl ToolRegistry {
         name: &str,
         args: Value,
     ) -> Result<McpToolResult, PortError> {
-        self.call(ctx, name, args, None).await
+        Box::pin(self.call(ctx, name, args, None)).await
     }
 
     /// A trusted Personal chat supervisor supplies the current branch and owner.
@@ -311,7 +311,7 @@ impl ToolRegistry {
         name: &str,
         args: Value,
     ) -> Result<McpToolResult, PortError> {
-        self.call(ctx, name, args, Some(binding)).await
+        Box::pin(self.call(ctx, name, args, Some(binding))).await
     }
 
     /// Apply an exact canonical proposal after an explicit interactive action.

@@ -229,6 +229,12 @@ pub(in crate::mcp) async fn plan_links(
             Err(error) => return Err(error),
         }
     }
+    if planned
+        .iter()
+        .all(|item| matches!(item, ProposalLink::Rejected { .. }))
+    {
+        return Err(DomainError::ResourceNotFound.into());
+    }
     Ok(planned)
 }
 

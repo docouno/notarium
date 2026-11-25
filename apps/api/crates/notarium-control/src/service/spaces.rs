@@ -477,17 +477,7 @@ impl ControlService {
         request: MembershipChange,
     ) -> Result<ControlCommit<MembershipResult>, PortError> {
         ctx.auth().authorize_human_management()?;
-        if ctx.auth().taint().is_tainted() {
-            return Err(DomainError::CrossSpaceTainted.into());
-        }
-        if ctx
-            .auth()
-            .spaces()
-            .values()
-            .any(|grant| grant.project_root.is_some())
-        {
-            return Err(access_denied());
-        }
+        require_unpinned_project(ctx.auth())?;
         let command = membership_command(ctx.auth(), ctx.scope(), &request)?;
         let budget = OperationBudget::new(ctx.budget.clone());
         let space = &ctx.scope().space_id;

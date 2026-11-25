@@ -18,6 +18,18 @@ impl<'a> From<&'a ScheduleDefinition> for ScheduleScope<'a> {
 
 impl ScheduleScope<'_> {
     pub(super) fn check(self, auth: &EngineAuthContext) -> Result<(), PortError> {
+        self.check_inner(auth, false)
+    }
+
+    pub(super) fn check_existing(self, auth: &EngineAuthContext) -> Result<(), PortError> {
+        self.check_inner(auth, true)
+    }
+
+    fn check_inner(
+        self,
+        auth: &EngineAuthContext,
+        hide_project_mismatch: bool,
+    ) -> Result<(), PortError> {
         let grant = auth
             .spaces()
             .get(self.space)
@@ -33,7 +45,11 @@ impl ScheduleScope<'_> {
             .as_ref()
             .is_some_and(|root| self.project.map(|project| &project.folder_id) != Some(root))
         {
-            return Err(access_denied());
+            return Err(if hide_project_mismatch {
+                DomainError::ResourceNotFound.into()
+            } else {
+                access_denied()
+            });
         }
         if grant.role == SpaceRole::Viewer || !grant.write_classes.contains(&DocClass::AgentMemory)
         {

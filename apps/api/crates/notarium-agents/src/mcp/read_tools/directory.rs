@@ -38,12 +38,21 @@ struct Args {
 pub(super) async fn list(call: &mut ToolCallContext<'_>, args: Value) -> Result<Value, PortError> {
     let args: Args = decode(args)?;
     let external = matches!(call.target, EgressTarget::ExternalMcp);
+    // Validate pure input syntax before resolving any target Space so invalid
+    // limits, paths, or cursors cannot become zero-taint project-slug oracles.
+    let limit = PageLimit::new(args.limit.unwrap_or(50))?;
+    let cleaned_path = note_tools::clean_path(args.path.as_deref().unwrap_or_default())?;
+    let previous = args
+        .cursor
+        .as_deref()
+        .map(|raw| call.registry.note_cursors.open(call.auth.principal(), raw))
+        .transpose()?;
     let Some(target) = targets(call, args.project.as_deref(), args.session.as_ref(), false)
         .await?
         .into_iter()
         .next()
     else {
-        if args.cursor.is_some() {
+        if previous.is_some() {
             return Err(invalid(ValidationReason::CursorStale));
         }
         return Ok(empty(external));
@@ -63,7 +72,7 @@ pub(super) async fn list(call: &mut ToolCallContext<'_>, args: Value) -> Result<
         let selection = match call.provider_selection(&scope, selection_project).await {
             Ok(selection) => selection,
             Err(error) if corpus::hidden(&error) => {
-                if args.cursor.is_some() {
+                if previous.is_some() {
                     return Err(invalid(ValidationReason::CursorStale));
                 }
                 return Ok(empty(external));
@@ -78,7 +87,7 @@ pub(super) async fn list(call: &mut ToolCallContext<'_>, args: Value) -> Result<
                     .as_ref()
                     .is_some_and(|existing| existing != required)
                 {
-                    if args.cursor.is_some() {
+                    if previous.is_some() {
                         return Err(invalid(ValidationReason::CursorStale));
                     }
                     return Ok(empty(external));
@@ -86,7 +95,7 @@ pub(super) async fn list(call: &mut ToolCallContext<'_>, args: Value) -> Result<
                 scope = match scope.restrict_to_project(required) {
                     Ok(narrowed) => narrowed,
                     Err(_) => {
-                        if args.cursor.is_some() {
+                        if previous.is_some() {
                             return Err(invalid(ValidationReason::CursorStale));
                         }
                         return Ok(empty(external));
@@ -99,7 +108,7 @@ pub(super) async fn list(call: &mut ToolCallContext<'_>, args: Value) -> Result<
         scope = match scope.restrict_to_project(project) {
             Ok(narrowed) => narrowed,
             Err(_) => {
-                if args.cursor.is_some() {
+                if previous.is_some() {
                     return Err(invalid(ValidationReason::CursorStale));
                 }
                 return Ok(empty(external));
@@ -116,17 +125,15 @@ pub(super) async fn list(call: &mut ToolCallContext<'_>, args: Value) -> Result<
             .auth()
             .pinned_write_space()
             .is_some_and(|pin| pin != &scope.scope().space_id);
-    let limit = PageLimit::new(args.limit.unwrap_or(50))?;
-    let previous = args
-        .cursor
-        .as_deref()
-        .map(|raw| call.registry.note_cursors.open(call.auth.principal(), raw))
-        .transpose()?;
     if let Some(previous) = &previous {
         scope.scope().check(&previous.scope)?;
     }
-    let Some(folder) = directory(call, &target, &preflight_scope, args.path.as_deref()).await?
-    else {
+    if foreign_space && args.project.is_some() {
+        // Explicitly querying a consented foreign project observes that Space
+        // even when the resulting listing is empty.
+        call.auth.taint().mark_external_read();
+    }
+    let Some(folder) = directory(call, &target, &preflight_scope, &cleaned_path).await? else {
         if foreign_space && args.path.is_some() {
             call.commit_external_read();
         }
@@ -380,12 +387,13 @@ async fn directory(
     call: &ToolCallContext<'_>,
     target: &ReadTarget,
     scope: &SpaceContext,
-    path: Option<&str>,
+    path: &str,
 ) -> Result<Option<FolderSnapshot>, PortError> {
-    let path = note_tools::clean_path(path.unwrap_or_default())?;
     let engine = &call.registry.engine;
     let Some(project) = &target.project else {
-        return engine.resolve_folder_path(scope.clone(), None, path).await;
+        return engine
+            .resolve_folder_path(scope.clone(), None, path.to_owned())
+            .await;
     };
     let base = Some(project.folder_id.clone());
     let Some(home) = engine
@@ -401,7 +409,7 @@ async fn directory(
     if path.is_empty() {
         return Ok(Some(home));
     }
-    if let Some(relative) = corpus::strip_folder_prefix(&path, &home.path) {
+    if let Some(relative) = corpus::strip_folder_prefix(path, &home.path) {
         return engine
             .resolve_folder_path(scope.clone(), base, relative)
             .await;
@@ -414,13 +422,15 @@ async fn directory(
         .get(&project.space_id)
         .is_some_and(|grant| grant.project_root.is_none())
         && let Some(folder) = engine
-            .resolve_folder_path(scope.clone(), None, path.clone())
+            .resolve_folder_path(scope.clone(), None, path.to_owned())
             .await?
         && folder.project.as_ref() == Some(&project.folder_id)
     {
         return Ok(Some(folder));
     }
-    engine.resolve_folder_path(scope.clone(), base, path).await
+    engine
+        .resolve_folder_path(scope.clone(), base, path.to_owned())
+        .await
 }
 
 async fn folder_page(

@@ -17,9 +17,11 @@ pub(super) async fn handle(
     args: Value,
 ) -> Result<Value, PortError> {
     match name {
-        ToolName::ListNotes => directory::list(call, args).await,
-        ToolName::RecentActivity => recent::recent(call, args).await,
-        ToolName::Search | ToolName::Recall => retrieval::retrieve(call, name, args).await,
+        ToolName::ListNotes => Box::pin(directory::list(call, args)).await,
+        ToolName::RecentActivity => Box::pin(recent::recent(call, args)).await,
+        ToolName::Search | ToolName::Recall => {
+            Box::pin(retrieval::retrieve(call, name, args)).await
+        }
         _ => Err(invalid(ValidationReason::InvalidQuery)),
     }
 }

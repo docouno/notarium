@@ -390,10 +390,33 @@ impl ControlService {
         let command = Command::new(request.identity, "put-context-set", &request.input)?;
         command.require(ctx.auth().principal(), ctx.auth().principal())?;
         ctx.auth().authorize_human_management()?;
+        require_unpinned_human(ctx.auth())?;
         let budget = OperationBudget::new(ctx.budget.clone());
-        let observed = self
-            .observe_context_attachments(&budget, &request.input.id)
-            .await?;
+        let observed = {
+            let same_home = budget
+                .run(
+                    async {
+                        read_rows!(
+                            &self.store.backend,
+                            (i64,),
+                            fetch_optional,
+                            "SELECT CAST(1 AS BIGINT) FROM context_sets WHERE set_id=$1 AND home_space=$2",
+                            "SELECT CAST(1 AS BIGINT) FROM v1_control.context_sets WHERE set_id=$1 AND home_space=$2";
+                            request.input.id.as_str(),
+                            request.input.home.as_str()
+                        )
+                    },
+                    CommitEffect::NotCommitted,
+                )
+                .await?
+                .is_some();
+            if same_home {
+                self.observe_context_attachments(&budget, &request.input.id)
+                    .await?
+            } else {
+                Vec::new()
+            }
+        };
         let space_kinds = {
             let current = self.current_account(&ctx, &budget).await?;
             let mut required = BTreeMap::from([(request.input.home.clone(), true)]);
@@ -428,6 +451,7 @@ impl ControlService {
             self.context_write_spaces(tx.inner_mut(), &ctx, &owner, &required, &spaces, &space_kinds).await?;
             let old = bundle(tx.inner_mut(), &request.input.id, true).await?;
             if old.as_ref().is_some_and(|row| row.home_space != request.input.home.as_str()) { return Err(DomainError::ResourceNotFound.into()); }
+            if old.is_none() && request.input.expected.is_some() { return Err(DomainError::ResourceNotFound.into()); }
             let actual = old.as_ref().map(|row| ControlRevision::new(row.revision as u64)).transpose()?;
             if actual != request.input.expected { return Err(DomainError::ControlRevisionConflict { current: actual.unwrap_or(ControlRevision::ZERO) }.into()); }
             let current_attachments = attachments(tx.inner_mut(), &request.input.id).await?;
@@ -488,9 +512,6 @@ impl ControlService {
         require_unpinned_human(ctx.auth())?;
         let budget = OperationBudget::new(ctx.budget.clone());
         let current = self.current_account(&ctx, &budget).await?;
-        let observed = self
-            .observe_context_attachments(&budget, &request.input.id)
-            .await?;
         let observed_home = budget.run(async { read_rows!(&self.store.backend,ContextSetsRow,fetch_optional,"SELECT * FROM context_sets WHERE set_id=$1","SELECT * FROM v1_control.context_sets WHERE set_id=$1";request.input.id.as_str()) }, CommitEffect::NotCommitted).await?;
         let observed_home = match observed_home {
             Some(home_row) => {
@@ -502,6 +523,12 @@ impl ControlService {
                 }
             }
             None => None,
+        };
+        let observed = if observed_home.is_some() {
+            self.observe_context_attachments(&budget, &request.input.id)
+                .await?
+        } else {
+            Vec::new()
         };
         let space_kinds = if let Some((_, home)) = &observed_home {
             budget

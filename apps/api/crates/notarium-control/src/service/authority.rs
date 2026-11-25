@@ -24,7 +24,7 @@ pub(super) fn denied() -> PortError {
 pub(super) fn access_denied() -> PortError {
     DomainError::AccessDenied.into()
 }
-pub(super) fn require_unpinned_human(auth: &EngineAuthContext) -> Result<(), PortError> {
+pub(super) fn require_unpinned_project(auth: &EngineAuthContext) -> Result<(), PortError> {
     if auth.pinned_write_space().is_some()
         || auth
             .spaces()
@@ -34,6 +34,12 @@ pub(super) fn require_unpinned_human(auth: &EngineAuthContext) -> Result<(), Por
         return Err(access_denied());
     }
     Ok(())
+}
+pub(super) fn require_unpinned_human(auth: &EngineAuthContext) -> Result<(), PortError> {
+    if auth.is_space_narrowed() {
+        return Err(access_denied());
+    }
+    require_unpinned_project(auth)
 }
 pub(super) fn account_info(row: &UsersRow) -> Result<AccountInfo, PortError> {
     Ok(AccountInfo {
@@ -125,6 +131,12 @@ pub(super) async fn mint_session(
         expires_at_ms: expires_at,
     })
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum ManagerScope {
+    Full,
+    AllowSpaceNarrowed,
+    TargetScoped,
+}
 impl ControlService {
     /// Account-wide management mutations require an untainted, unpinned
     /// interactive human with checked perimeter/CSRF attestation
@@ -136,7 +148,18 @@ impl ControlService {
         target: &'a PrincipalId,
     ) -> impl std::future::Future<Output = Result<(UsersRow, UsersRow), PortError>> + Send + 'a
     {
-        self.manager_impl(tx, auth, target, false)
+        self.manager_impl(tx, auth, target, ManagerScope::Full)
+    }
+    /// Credential-issuance management mutations (`create_pat`, OAuth approval)
+    /// that explicitly enforce `selected_spaces` against `is_space_narrowed()`.
+    pub(super) fn manager_allow_space_narrowed<'a>(
+        &'a self,
+        tx: &'a mut Transaction,
+        auth: &'a EngineAuthContext,
+        target: &'a PrincipalId,
+    ) -> impl std::future::Future<Output = Result<(UsersRow, UsersRow), PortError>> + Send + 'a
+    {
+        self.manager_impl(tx, auth, target, ManagerScope::AllowSpaceNarrowed)
     }
     /// Target-scoped management mutations where the caller explicitly enforces
     /// `grant.project_root` against the target project/space.
@@ -147,18 +170,20 @@ impl ControlService {
         target: &'a PrincipalId,
     ) -> impl std::future::Future<Output = Result<(UsersRow, UsersRow), PortError>> + Send + 'a
     {
-        self.manager_impl(tx, auth, target, true)
+        self.manager_impl(tx, auth, target, ManagerScope::TargetScoped)
     }
     pub(super) async fn manager_impl(
         &self,
         tx: &mut Transaction,
         auth: &EngineAuthContext,
         target: &PrincipalId,
-        allow_project_root: bool,
+        scope: ManagerScope,
     ) -> Result<(UsersRow, UsersRow), PortError> {
         auth.authorize_human_management()?;
-        if !allow_project_root {
-            require_unpinned_human(auth)?;
+        match scope {
+            ManagerScope::Full => require_unpinned_human(auth)?,
+            ManagerScope::AllowSpaceNarrowed => require_unpinned_project(auth)?,
+            ManagerScope::TargetScoped => {}
         }
         let actor_id = auth.principal().as_str();
         let target_id = target.as_str();
@@ -188,7 +213,19 @@ impl ControlService {
         target: &'a PrincipalId,
     ) -> impl std::future::Future<Output = Result<(UsersRow, UsersRow), PortError>> + Send + 'a
     {
-        self.manager_read_impl(tx, auth, target, false)
+        self.manager_read_impl(tx, auth, target, ManagerScope::Full)
+    }
+    /// Read-only credential-issuance inspection (`oauth::prepare`/`approve`)
+    /// where the caller explicitly enforces `selected_spaces` against
+    /// `is_space_narrowed()`.
+    pub(super) fn manager_read_allow_space_narrowed<'a>(
+        &'a self,
+        tx: &'a mut Transaction,
+        auth: &'a EngineAuthContext,
+        target: &'a PrincipalId,
+    ) -> impl std::future::Future<Output = Result<(UsersRow, UsersRow), PortError>> + Send + 'a
+    {
+        self.manager_read_impl(tx, auth, target, ManagerScope::AllowSpaceNarrowed)
     }
     /// Target-scoped read-only inspection for an interactive human where the
     /// caller explicitly enforces `grant.project_root` against the target.
@@ -199,20 +236,22 @@ impl ControlService {
         target: &'a PrincipalId,
     ) -> impl std::future::Future<Output = Result<(UsersRow, UsersRow), PortError>> + Send + 'a
     {
-        self.manager_read_impl(tx, auth, target, true)
+        self.manager_read_impl(tx, auth, target, ManagerScope::TargetScoped)
     }
     pub(super) async fn manager_read_impl(
         &self,
         tx: &mut Transaction,
         auth: &EngineAuthContext,
         target: &PrincipalId,
-        allow_project_root: bool,
+        scope: ManagerScope,
     ) -> Result<(UsersRow, UsersRow), PortError> {
         if auth.kind() != &PrincipalKind::DirectHuman {
             return Err(access_denied());
         }
-        if !allow_project_root {
-            require_unpinned_human(auth)?;
+        match scope {
+            ManagerScope::Full => require_unpinned_human(auth)?,
+            ManagerScope::AllowSpaceNarrowed => require_unpinned_project(auth)?,
+            ManagerScope::TargetScoped => {}
         }
         let actor_id = auth.principal().as_str();
         let target_id = target.as_str();

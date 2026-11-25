@@ -125,23 +125,57 @@ async fn project_placement(
     }
     let read_scope = call.space(project.scope.clone())?;
     let write_scope = read_scope.clone().restrict_to_project(&project.reference)?;
-    let folder = call
+    let live_opt = match call
         .registry
         .catalog
         .folder(call.account(), project.reference.clone())
-        .await?;
-    let lifecycle_hidden = if allow_trashed_replay {
-        folder.lifecycle == Lifecycle::Purged
-    } else {
-        folder.lifecycle != Lifecycle::Active
-    };
-    if folder.reference != project.reference
-        || folder.space.id != project.scope.space_id
-        || lifecycle_hidden
+        .await
     {
-        return Err(DomainError::ResourceNotFound.into());
-    }
-    let is_trashed_replay = allow_trashed_replay && folder.lifecycle == Lifecycle::Trashed;
+        Ok(folder) => Some(folder),
+        Err(PortError::Domain(DomainError::ResourceNotFound)) if allow_trashed_replay => None,
+        Err(error) => return Err(error),
+    };
+    let (space, ancestor_folders, write_locked, is_trashed_replay) = if let Some(folder) = live_opt
+    {
+        let lifecycle_hidden = if allow_trashed_replay {
+            folder.lifecycle == Lifecycle::Purged
+        } else {
+            folder.lifecycle != Lifecycle::Active
+        };
+        if folder.reference != project.reference
+            || folder.space.id != project.scope.space_id
+            || lifecycle_hidden
+        {
+            return Err(DomainError::ResourceNotFound.into());
+        }
+        let is_trashed_replay = allow_trashed_replay && folder.lifecycle == Lifecycle::Trashed;
+        (
+            folder.space,
+            folder.ancestor_folders,
+            folder.write_locked,
+            is_trashed_replay,
+        )
+    } else {
+        let trashed_account = notarium_core::ports::AccountContext::new(
+            read_scope.auth().with_preflight_taint(),
+            call.budget(),
+        );
+        let trashed = call
+            .registry
+            .catalog
+            .trashed_folder_ancestry(trashed_account, project.reference.clone())
+            .await?;
+        if trashed.reference != project.reference {
+            return Err(DomainError::ResourceNotFound.into());
+        }
+        let space = call
+            .registry
+            .catalog
+            .space(call.budget(), project.scope.space_id.clone())
+            .await?;
+        project.scope.check(&space.history)?;
+        (space.space, trashed.ancestors, false, true)
+    };
     if !is_trashed_replay {
         let live = call
             .registry
@@ -157,16 +191,16 @@ async fn project_placement(
         &read_scope,
         &project.reference,
         Some(project.reference.clone()),
-        &folder.ancestor_folders,
+        &ancestor_folders,
         DocClass::UserDoc,
     )
     .await?;
     let facts = ResourceFacts {
-        space: folder.space,
+        space,
         class: DocClass::UserDoc,
         project: Some(project.reference.folder_id.clone()),
-        ancestor_folders: folder.ancestor_folders,
-        folder_write_locked: folder.write_locked,
+        ancestor_folders,
+        folder_write_locked: write_locked,
         ability_package: None,
     };
     write_scope.auth().authorize_direct_write(&facts, &facts)?;

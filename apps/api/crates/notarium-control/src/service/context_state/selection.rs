@@ -33,12 +33,14 @@ struct ScopeItem {
     note_space: String,
     note_id: String,
 }
+#[allow(clippy::too_many_arguments)]
 async fn load_bootstrap_candidates(
     tx: &mut Transaction,
     owner_id: &str,
     project: &str,
     space: &str,
     personal: &str,
+    allowed_spaces: &BTreeMap<SpaceId, notarium_core::auth::SpaceGrant>,
     after: i64,
     page_limit: u16,
 ) -> Result<Vec<Candidate>, PortError> {
@@ -153,6 +155,13 @@ async fn load_bootstrap_candidates(
             fav_cursor = Some((last.rank, last.space_id.clone(), last.entity_id.clone()));
         }
         for fav in favs {
+            let fav_space = SpaceId::parse(&fav.space_id)?;
+            if allowed_spaces
+                .get(&fav_space)
+                .is_none_or(|grant| grant.read_classes.is_empty())
+            {
+                continue;
+            }
             if seen.insert((fav.space_id.clone(), fav.entity_id.clone())) {
                 deduped.push((fav.space_id, fav.entity_id, 1));
                 if deduped.len() >= needed {
@@ -389,6 +398,7 @@ impl ControlService {
                         &project,
                         space_str,
                         &personal,
+                        current.auth().spaces(),
                         after,
                         page.limit(),
                     )

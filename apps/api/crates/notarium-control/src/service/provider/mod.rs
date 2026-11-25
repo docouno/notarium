@@ -134,13 +134,18 @@ impl ProviderService {
     ) -> Result<(), PortError> {
         let budget = OperationBudget::new(ctx.budget.clone());
         let mut rtx = self.control.store.read(budget.clone()).await?;
+        let scope = if scoped {
+            ManagerScope::TargetScoped
+        } else {
+            ManagerScope::Full
+        };
         budget
             .run(
                 self.control.manager_read_impl(
                     rtx.inner_mut(),
                     ctx.auth(),
                     ctx.auth().principal(),
-                    scoped,
+                    scope,
                 ),
                 CommitEffect::NotCommitted,
             )
@@ -236,9 +241,14 @@ impl ProviderService {
         let budget = OperationBudget::new(ctx.budget.clone());
         let mut tx = self.control.store.write(budget.clone()).await?;
         let (revision, saved) = budget.run(async {
+            let scope = if scoped {
+                ManagerScope::TargetScoped
+            } else {
+                ManagerScope::Full
+            };
             let (_, owner) = self
                 .control
-                .manager_impl(tx.inner_mut(), ctx.auth(), ctx.auth().principal(), scoped)
+                .manager_impl(tx.inner_mut(), ctx.auth(), ctx.auth().principal(), scope)
                 .await?;
             authorize(tx.inner_mut(), &owner).await?;
             if let Some(replay) = command.replay::<T>(tx.inner_mut()).await? { return Ok(replay); }

@@ -103,7 +103,7 @@ impl ControlService {
                         space: &prev_space,
                         project: prev_project.as_ref(),
                     }
-                    .check(current.auth())?;
+                    .check_existing(current.auth())?;
                     Some(row)
                 }
                 Change::Delete(input) => {
@@ -128,7 +128,7 @@ impl ControlService {
                         space: &space,
                         project: project.as_ref(),
                     }
-                    .check(current.auth())?;
+                    .check_existing(current.auth())?;
                     Some(row)
                 }
             };

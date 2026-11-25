@@ -1380,3 +1380,176 @@ async fn sqlite_oidc_prevalidation_and_link_freshness() {
 async fn postgres_oidc_prevalidation_and_link_freshness() {
     oidc_prevalidation_and_link_freshness(true).await;
 }
+
+async fn oauth_narrowing_guards(pg: bool) {
+    let _serial = AUTH_TEST_LOCK.lock().await;
+    let mut f = Fixture::new(pg, "oauth_narrowing").await;
+    let (control, oauth, session) = service(&mut f).await;
+    let ctx = context(&control, session.token.expose()).await;
+    let personal = session.account.personal_space.clone().unwrap();
+    let owner_rev = control
+        .account(ctx.clone(), ctx.auth().principal().clone())
+        .await
+        .unwrap()
+        .revision;
+    let shared_id = SpaceId::from_bytes([0x64; 16]);
+    control
+        .create_space(
+            ctx.clone(),
+            AccountMutation {
+                identity: command(
+                    ctx.auth().principal(),
+                    ctx.auth().principal(),
+                    66,
+                    owner_rev,
+                ),
+                input: CreateSpace {
+                    id: shared_id.clone(),
+                    name: "Narrowing Shared".into(),
+                    kind: notarium_core::auth::SpaceKind::Shared,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let ctx = context(&control, session.token.expose()).await;
+    assert!(ctx.auth().spaces().contains_key(&personal));
+    assert!(ctx.auth().spaces().contains_key(&shared_id));
+
+    let client = oauth
+        .register_client(
+            budget(),
+            RegisterOAuthClient {
+                client_name: "Narrowing client".into(),
+                redirect_uris: vec!["http://127.0.0.1:54321/callback".into()],
+            },
+        )
+        .await
+        .unwrap();
+    let id = client.client_id.as_str();
+
+    // Class-narrowed DirectHuman must be denied prepare_authorization for both
+    // Some([personal]) and None selected_spaces.
+    let class_narrow_ctx = AccountContext::new(
+        ctx.auth()
+            .restrict_read_classes(
+                &personal,
+                &std::collections::BTreeSet::from([DocClass::UserDoc]),
+            )
+            .unwrap(),
+        budget(),
+    );
+    for selected_spaces in [Some(vec![personal.clone()]), None] {
+        let mut req = authorization(id, false);
+        req.selected_spaces = selected_spaces;
+        oauth_error(
+            oauth
+                .prepare_authorization(class_narrow_ctx.clone(), req)
+                .await,
+            OAuthErrorCode::AccessDenied,
+        );
+    }
+
+    // Class-narrowed DirectHuman must also be denied approve_authorization on an
+    // intent prepared with full authority (`selected_spaces: None`).
+    let unrestricted = || {
+        let mut req = authorization(id, false);
+        req.selected_spaces = None;
+        req
+    };
+    let full_prepared = oauth
+        .prepare_authorization(ctx.clone(), unrestricted())
+        .await
+        .unwrap();
+    oauth_error(
+        oauth
+            .approve_authorization(
+                class_narrow_ctx,
+                OAuthConsent::attest_checked(copy_intent(&full_prepared.intent), secret(BROWSER)),
+            )
+            .await,
+        OAuthErrorCode::AccessDenied,
+    );
+
+    // Space-narrowed DirectHuman (only personal) cannot prepare/approve
+    // selected_spaces: None or excluded shared_id, nor call list_grants/revoke_grant,
+    // while explicit selected_spaces: Some([personal]) remains allowed.
+    let space_narrow_ctx =
+        AccountContext::new(ctx.auth().restrict_to_space(&personal).unwrap(), budget());
+    oauth_error(
+        oauth
+            .prepare_authorization(space_narrow_ctx.clone(), unrestricted())
+            .await,
+        OAuthErrorCode::AccessDenied,
+    );
+    let mut excluded_req = authorization(id, false);
+    excluded_req.selected_spaces = Some(vec![shared_id]);
+    oauth_error(
+        oauth
+            .prepare_authorization(space_narrow_ctx.clone(), excluded_req)
+            .await,
+        OAuthErrorCode::AccessDenied,
+    );
+    oauth_error(
+        oauth
+            .approve_authorization(
+                space_narrow_ctx.clone(),
+                OAuthConsent::attest_checked(full_prepared.intent, secret(BROWSER)),
+            )
+            .await,
+        OAuthErrorCode::AccessDenied,
+    );
+    let mut allowed_req = authorization(id, false);
+    allowed_req.selected_spaces = Some(vec![personal.clone()]);
+    let narrowed_prepared = oauth
+        .prepare_authorization(space_narrow_ctx.clone(), allowed_req)
+        .await
+        .unwrap();
+    let approved = oauth
+        .approve_authorization(
+            space_narrow_ctx.clone(),
+            OAuthConsent::attest_checked(narrowed_prepared.intent, secret(BROWSER)),
+        )
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        oauth
+            .list_grants(
+                space_narrow_ctx.clone(),
+                ControlPageRequest::new(10, None).unwrap(),
+            )
+            .await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+    let rev = control
+        .account(ctx.clone(), ctx.auth().principal().clone())
+        .await
+        .unwrap()
+        .revision;
+    assert!(matches!(
+        oauth
+            .revoke_grant(
+                space_narrow_ctx,
+                AccountMutation {
+                    identity: command(ctx.auth().principal(), ctx.auth().principal(), 71, rev,),
+                    input: approved.grant,
+                },
+            )
+            .await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+
+    drop(oauth);
+    drop(control);
+    f.close().await;
+}
+
+#[tokio::test]
+async fn sqlite_oauth_narrowing_guards() {
+    oauth_narrowing_guards(false).await;
+}
+#[tokio::test]
+async fn postgres_oauth_narrowing_guards() {
+    oauth_narrowing_guards(true).await;
+}

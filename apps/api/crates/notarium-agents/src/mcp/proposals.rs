@@ -652,7 +652,29 @@ pub(super) async fn needs_proposal(
                     continue;
                 };
                 match corpus::locate_note_preflight(call, &note).await {
-                    Ok((scope, _)) if external(&scope.scope().space_id) => return Ok(true),
+                    Ok((scope, located)) if external(&scope.scope().space_id) => {
+                        match corpus::admit_provider_note_read(call, &scope, &located).await {
+                            Ok(_) => {
+                                let writable = matches!(
+                                    located.facts.class,
+                                    notarium_core::classes::DocClass::UserDoc
+                                        | notarium_core::classes::DocClass::AgentMemory
+                                ) && scope
+                                    .auth()
+                                    .spaces()
+                                    .get(&scope.scope().space_id)
+                                    .is_some_and(|grant| {
+                                        grant.role != notarium_core::auth::SpaceRole::Viewer
+                                            && grant.write_classes.contains(&located.facts.class)
+                                    });
+                                if writable {
+                                    return Ok(true);
+                                }
+                            }
+                            Err(error) if corpus::hidden(&error) => (),
+                            Err(error) => return Err(error),
+                        }
+                    }
                     Ok(_) => (),
                     Err(error) if corpus::hidden(&error) => (),
                     Err(error) => return Err(error),

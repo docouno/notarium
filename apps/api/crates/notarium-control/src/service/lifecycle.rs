@@ -52,7 +52,7 @@ impl ControlService {
             return Err(access_denied());
         }
         ctx.auth().authorize_human_management()?;
-        require_unpinned_human(ctx.auth())?;
+        require_unpinned_project(ctx.auth())?;
         let digest = ContentDigest::from_bytes(
             *blake3::hash(
                 &serde_json::to_vec(&(ctx.scope(), request.lifecycle))

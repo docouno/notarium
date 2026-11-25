@@ -19,9 +19,9 @@ pub(super) async fn handle(
 ) -> Result<Value, PortError> {
     match name {
         ToolName::MoveFolder | ToolName::RenameFolder | ToolName::RenameProject => {
-            folders::handle(call, name, args).await
+            Box::pin(folders::handle(call, name, args)).await
         }
-        ToolName::Link | ToolName::LinkMany => links::handle(call, name, args).await,
+        ToolName::Link | ToolName::LinkMany => Box::pin(links::handle(call, name, args)).await,
         _ => Err(DomainError::ResourceNotFound.into()),
     }
 }

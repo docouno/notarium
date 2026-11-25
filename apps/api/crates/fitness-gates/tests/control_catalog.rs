@@ -501,10 +501,24 @@ async fn exercise(pg: bool) {
         .abilities(pinned.clone(), query(None))
         .await
         .unwrap();
-    assert!(raw_first.items.is_empty());
+    assert_eq!(raw_first.items.len(), 1);
+    assert_eq!(
+        raw_first.items[0].reference.id,
+        AbilityId::from_bytes([9; 16])
+    );
     let token: serde_json::Value =
         serde_json::from_str(raw_first.continuation.as_ref().unwrap()).unwrap();
     assert!(token["after"][1].is_u64());
+    let raw_second = canonical
+        .abilities(pinned.clone(), query(raw_first.continuation))
+        .await
+        .unwrap();
+    assert_eq!(raw_second.items.len(), 1);
+    assert_eq!(
+        raw_second.items[0].reference.id,
+        AbilityId::from_bytes([10; 16])
+    );
+    assert!(raw_second.continuation.is_none());
     let mut cursor = None;
     let mut discovered = Vec::new();
     for _ in 0..3 {

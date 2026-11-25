@@ -1,8 +1,9 @@
 //! Origin-aware plans produced by syntax and verified by the applying owner.
 use crate::{ids::*, span::*, value::YamlValue};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CarrierSplice {
     pub origin: CarrierEditOrigin,
     pub bytes: CarrierByteSpan,
@@ -10,19 +11,19 @@ pub struct CarrierSplice {
     pub replacement: String,
     pub replacement_utf16_len: usize,
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum CarrierEditOrigin {
     Header,
     Body,
 }
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BodySplice {
     pub bytes: BodyByteSpan,
     pub utf16: BodyUtf16Span,
     pub replacement: String,
     pub replacement_utf16_len: usize,
 }
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CarrierPatchPlan {
     pub base_content_hash: ContentDigest,
     pub body_range: ByteSpan,

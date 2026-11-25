@@ -362,12 +362,26 @@ pub(super) async fn edit_note(
     } else {
         corpus::note_document(call, &scope, &observed.document).await?
     };
-    let schema = if input.edits_view() {
-        call.registry.engine.space_schema(scope.clone()).await?
+    let plan = if input.edits_view() {
+        let call_ref: &ToolCallContext<'_> = call;
+        let scope_ref = &scope;
+        let route_ref = &route;
+        let input_ref = &input;
+        let source_ref = source.as_str();
+        let class = observed.document.class();
+        call_ref
+            .journal("edit-note-view-plan", || async {
+                let schema = call_ref
+                    .registry
+                    .engine
+                    .space_schema(scope_ref.clone())
+                    .await?;
+                input_ref.plan(source_ref, class, route_ref, &schema)
+            })
+            .await?
     } else {
-        BTreeMap::new()
+        input.plan(&source, observed.document.class(), &route, &BTreeMap::new())?
     };
-    let plan = input.plan(&source, observed.document.class(), &route, &schema)?;
     let committed = call
         .registry
         .engine

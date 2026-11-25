@@ -135,7 +135,9 @@ async fn resolve_with_components(
                     };
                     parent = found.folder_id;
                 }
-                if_visible(snapshot(tx, &space, &auth, &mut folders, &parent, Some(&base)).await)
+                if_visible(
+                    snapshot(tx, &space, &auth, &mut folders, &parent, Some(&base), true).await,
+                )
             })
         })
         .await
@@ -449,10 +451,14 @@ async fn snapshot(
     folders: &mut FolderAncestryCache,
     id: &FolderId,
     base: Option<&FolderId>,
+    require_all_active: bool,
 ) -> Result<FolderSnapshot, PortError> {
     let ancestry = folders
-        .load_ancestry_tx(tx, &space.scope.space_id, id, true)
+        .load_ancestry_tx(tx, &space.scope.space_id, id, require_all_active)
         .await?;
+    if !require_all_active && ancestry.folder_lifecycle == Lifecycle::Purged {
+        return Err(DomainError::ResourceNotFound.into());
+    }
     if base.is_some_and(|base| !ancestry.ancestors.contains(base)) {
         return Err(DomainError::ResourceNotFound.into());
     }
@@ -807,6 +813,7 @@ async fn verify_ensured_folder(
                     &mut folders,
                     &reference.folder_id,
                     base.as_ref(),
+                    false,
                 )
                 .await?;
                 Ok(reference)

@@ -12528,8 +12528,19 @@ async fn schedule_provider_replay_shared_chat_and_post_trash_seams(
                 },
             )
             .await,
-        Err(PortError::Domain(DomainError::AccessDenied))
+        Err(PortError::Domain(DomainError::ResourceNotFound))
     ));
+    Box::pin(verify_out_of_project_schedule_update_not_found(
+        fixture,
+        &owner,
+        &owner_p1_only,
+        &schedule_id,
+        created_sched.value.revision,
+        &sched_def,
+        &s1_p1,
+        next_slot,
+    ))
+    .await;
     assert!(matches!(
         fixture
             .control
@@ -12585,7 +12596,7 @@ async fn schedule_provider_replay_shared_chat_and_post_trash_seams(
             .control
             .delete_schedule(owner_p1_only, del_req.clone())
             .await,
-        Err(PortError::Domain(DomainError::AccessDenied))
+        Err(PortError::Domain(DomainError::ResourceNotFound))
     ));
     assert!(matches!(
         fixture
@@ -12794,6 +12805,56 @@ async fn schedule_provider_replay_shared_chat_and_post_trash_seams(
     assert_eq!(mem_first["outcome"], "recorded");
     assert_eq!(mem_second["outcome"], "recorded");
     assert!(mem_first.get("noteId").is_none() && mem_second.get("noteId").is_none());
+
+    let _ = p_proj;
+    box_step(|| {
+        shared_chat_and_post_trash_seams(
+            fixture,
+            personal,
+            owner,
+            actor,
+            &pscope,
+            &listener,
+            &local,
+            &run_acc,
+            &s1,
+            s1_sc,
+            &s2,
+            s2_p1.clone(),
+            s2_p2.clone(),
+        )
+    })
+    .await;
+}
+
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+async fn shared_chat_and_post_trash_seams(
+    fixture: &RuntimeFixture,
+    personal: &SpaceContext,
+    owner: AccountContext,
+    actor: PrincipalId,
+    pscope: &HistoryScope,
+    listener: &TcpListener,
+    local: &LoopbackProvider,
+    run_acc: &AccountContext,
+    s1: &AccessibleSpace,
+    s1_sc: SpaceContext,
+    s2: &AccessibleSpace,
+    s2_p1: FolderRef,
+    s2_p2: FolderRef,
+) {
+    let mk_in_app = |tag: u8| McpInvocationContext {
+        account: run_acc.clone(),
+        target: EgressTarget::InAppProvider {
+            provider: local.resource.id.clone(),
+            model: local.model.clone(),
+            primary_project: None,
+        },
+        request_key: CommandKey::from_bytes([
+            0xD1, 91, tag, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, tag,
+        ]),
+    };
 
     // (5) Shared Space Personal chat: cross-space Personal role rejected cleanly (no episode
     //     poisoning); Shared role attaching a Personal skill omits it cleanly and completes turn.
@@ -13110,7 +13171,7 @@ async fn schedule_provider_replay_shared_chat_and_post_trash_seams(
         )
         .await
         .unwrap();
-    let (mut wire1, prompt1) = timeout(Duration::from_secs(15), read_request(&listener))
+    let (mut wire1, prompt1) = timeout(Duration::from_secs(15), read_request(listener))
         .await
         .expect("shared chat with local role and cross-space attached skill must reach provider");
     let prompt1_text = prompt1.to_string();
@@ -13188,7 +13249,7 @@ async fn schedule_provider_replay_shared_chat_and_post_trash_seams(
         .await
         .unwrap();
     assert!(sub_p.run.is_some());
-    let (mut wire2, prompt2) = timeout(Duration::from_secs(15), read_request(&listener))
+    let (mut wire2, prompt2) = timeout(Duration::from_secs(15), read_request(listener))
         .await
         .expect("personal chat must omit conflicting second project_only skill and reach provider");
     let prompt2_text = prompt2.to_string();
@@ -13431,7 +13492,6 @@ async fn schedule_provider_replay_shared_chat_and_post_trash_seams(
         .unwrap()
         .slug;
     let p_proj_handle = format!("{p_slug}/personal-replay-proj");
-    let _ = p_proj;
     let in_app_note = local
         .registry
         .call_tool(
@@ -19473,6 +19533,23 @@ async fn authority_cursors_oracles_and_trashed_ancestry_hardening(
         )
     })
     .await;
+    box_step(|| {
+        oracle_and_link_many_seams(
+            fixture,
+            local,
+            &owner,
+            &pscope,
+            s2,
+            &s2_hidden_note,
+            &oracle_thread,
+            prop_leaf,
+        )
+    })
+    .await;
+    box_step(|| ability_pagination_and_trail_seams(fixture, &owner, s2, s2_p1, s2_epoch, actor))
+        .await;
+    box_step(|| post_trash_and_view_replay_seams(fixture, &owner, &s2_sc, s2, s2_epoch, actor))
+        .await;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -19524,27 +19601,17 @@ async fn authority_and_cursor_edge_seams(
         );
     }
     let mgmt_s1_acc = AccountContext::new(mgmt_s1.auth().clone(), budget());
-    let mgmt_atts = local
-        .provider
-        .list_attachments(
-            mgmt_s1_acc.clone(),
-            local.resource.id.clone(),
-            ControlPageRequest::new(50, None).unwrap(),
-        )
-        .await
-        .unwrap();
-    assert!(
-        mgmt_atts.items.iter().all(|att| {
-            let target_space = match &att.target {
-                ProviderAttachmentTarget::Personal { space, .. }
-                | ProviderAttachmentTarget::Space(space) => space,
-                ProviderAttachmentTarget::Project(folder) => &folder.space_id,
-            };
-            target_space == &s1.history.space_id
-        }),
-        "space-narrowed list_attachments must filter out excluded-Space attachments: {:?}",
-        mgmt_atts.items
-    );
+    assert!(matches!(
+        local
+            .provider
+            .list_attachments(
+                mgmt_s1_acc.clone(),
+                local.resource.id.clone(),
+                ControlPageRequest::new(50, None).unwrap(),
+            )
+            .await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
     let s2_att_id = local
         .provider
         .list_attachments(
@@ -19570,7 +19637,66 @@ async fn authority_and_cursor_edge_seams(
             .provider
             .inspect_attachment(mgmt_s1_acc.clone(), s2_att_id)
             .await,
-        Err(PortError::Domain(DomainError::ResourceNotFound))
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+    assert!(matches!(
+        fixture
+            .control
+            .create_space(
+                mgmt_s1_acc.clone(),
+                AccountMutation {
+                    identity: identity(fixture, owner, 0x54).await,
+                    input: CreateSpace {
+                        id: SpaceId::from_bytes([
+                            0xE9, 7, 1, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
+                        ]),
+                        name: "Denied Narrowed Space".into(),
+                        kind: SpaceKind::Shared,
+                    },
+                },
+            )
+            .await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+    assert!(matches!(
+        fixture
+            .control
+            .set_favorite(
+                mgmt_s1_acc.clone(),
+                AccountMutation {
+                    identity: identity(fixture, owner, 0x52).await,
+                    input: SetFavorite {
+                        reference: FavoriteRef::Folder(s2_p1.clone()),
+                        saved: false,
+                        rank: 0,
+                    },
+                },
+            )
+            .await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+    assert!(matches!(
+        fixture
+            .control
+            .set_ability_preference(
+                mgmt_s1_acc.clone(),
+                AccountMutation {
+                    identity: identity(fixture, owner, 0x53).await,
+                    input: AbilityPreferenceChange {
+                        preference: AbilityPreferenceUpdate {
+                            ability: AbilityRef {
+                                id: AbilityId::from_bytes([0xE9; 16]),
+                                placement: AbilityPlacement::System,
+                                revision: RevisionId::from_bytes([0xE9; 16]),
+                            },
+                            enabled: false,
+                        },
+                        expected: AbilityPreferenceGuard::Authored(None),
+                    },
+                },
+            )
+            .await,
+        Err(PortError::Domain(DomainError::AbilityWriteForbidden))
     ));
     assert!(matches!(
         fixture
@@ -20481,4 +20607,958 @@ async fn shared_proposal_and_trashed_replay_edge_seams(
         Some(notarium_core::model::Lifecycle::Trashed),
         "ChangeRead::Seed must fold historical Trashed ancestor lifecycle at cutoff even after later restore"
     );
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn oracle_and_link_many_seams(
+    fixture: &RuntimeFixture,
+    local: &LoopbackProvider,
+    owner: &AccountContext,
+    pscope: &HistoryScope,
+    s2: &AccessibleSpace,
+    s2_hidden_note: &NoteId,
+    oracle_thread: &ChatThreadId,
+    prop_leaf: ThreadEntrySeq,
+) {
+    let s2_p1_handle = format!("{}/h-s2-p1", s2.slug);
+
+    // (1) Pure syntax validation precedes target resolution in list_notes/search/recent_activity,
+    //     and explicit foreign project queries commit BranchTaint even on 0-hit/empty responses.
+    let run_syn_auth = owner
+        .auth()
+        .for_agent_run(
+            AgentRunId::from_bytes([0xEA, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+            pscope.space_id.clone(),
+            ChatAudience::Personal,
+            owner.auth().spaces().clone(),
+        )
+        .unwrap();
+    for (idx, proj) in [s2_p1_handle.as_str(), "no-such-space/no-proj"]
+        .into_iter()
+        .enumerate()
+    {
+        let err = local
+            .registry
+            .call_tool(
+                McpInvocationContext {
+                    account: AccountContext::new(run_syn_auth.clone(), budget()),
+                    target: EgressTarget::InAppProvider {
+                        provider: local.resource.id.clone(),
+                        model: local.model.clone(),
+                        primary_project: None,
+                    },
+                    request_key: CommandKey::from_bytes([
+                        0xEA,
+                        1,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        10 + idx as u8,
+                    ]),
+                },
+                "list_notes",
+                json!({ "project": proj, "limit": 0 }),
+            )
+            .await;
+        assert!(
+            matches!(
+                err,
+                Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
+                    if matches!(
+                        diagnostic.reason,
+                        ValidationReason::InvalidLimit | ValidationReason::InvalidQuery
+                    )
+            ),
+            "list_notes limit=0 must fail validation before project resolution, got {:?}",
+            err.err()
+        );
+        let cur_err = local
+            .registry
+            .call_tool(
+                McpInvocationContext {
+                    account: AccountContext::new(run_syn_auth.clone(), budget()),
+                    target: EgressTarget::InAppProvider {
+                        provider: local.resource.id.clone(),
+                        model: local.model.clone(),
+                        primary_project: None,
+                    },
+                    request_key: CommandKey::from_bytes([
+                        0xEA,
+                        1,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        40 + idx as u8,
+                    ]),
+                },
+                "list_notes",
+                json!({ "project": proj, "cursor": "not-a-valid-cursor" }),
+            )
+            .await;
+        assert!(
+            matches!(
+                cur_err,
+                Err(PortError::Domain(DomainError::ValidationFailed { .. }))
+            ),
+            "list_notes malformed cursor must fail validation before project resolution, got {:?}",
+            cur_err.err()
+        );
+        let path_err = local
+            .registry
+            .call_tool(
+                McpInvocationContext {
+                    account: AccountContext::new(run_syn_auth.clone(), budget()),
+                    target: EgressTarget::InAppProvider {
+                        provider: local.resource.id.clone(),
+                        model: local.model.clone(),
+                        primary_project: None,
+                    },
+                    request_key: CommandKey::from_bytes([
+                        0xEA,
+                        1,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        20 + idx as u8,
+                    ]),
+                },
+                "list_notes",
+                json!({ "project": proj, "path": "../escape" }),
+            )
+            .await;
+        assert!(
+            matches!(
+                path_err,
+                Err(PortError::Domain(DomainError::ValidationFailed { .. }))
+            ),
+            "list_notes invalid path must fail before project resolution, got {:?}",
+            path_err.err()
+        );
+        let recent_err = local
+            .registry
+            .call_tool(
+                McpInvocationContext {
+                    account: AccountContext::new(run_syn_auth.clone(), budget()),
+                    target: EgressTarget::InAppProvider {
+                        provider: local.resource.id.clone(),
+                        model: local.model.clone(),
+                        primary_project: None,
+                    },
+                    request_key: CommandKey::from_bytes([
+                        0xEA,
+                        1,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        30 + idx as u8,
+                    ]),
+                },
+                "recent_activity",
+                json!({ "project": proj, "limit": 0 }),
+            )
+            .await;
+        assert!(
+            matches!(
+                recent_err,
+                Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
+                    if matches!(
+                        diagnostic.reason,
+                        ValidationReason::InvalidLimit | ValidationReason::InvalidQuery
+                    )
+            ),
+            "recent_activity limit=0 must fail validation before project resolution, got {:?}",
+            recent_err.err()
+        );
+    }
+    assert!(
+        !run_syn_auth.taint().is_tainted(),
+        "pure syntax rejections must not taint caller"
+    );
+
+    // Explicit foreign project queries commit external_read taint even on empty/0-hit results.
+    fixture.projections.install(ProjectionFixture {
+        view_owner: NoteRef {
+            space_id: s2.history.space_id.clone(),
+            note_id: s2_hidden_note.clone(),
+        },
+        notes: vec![s2_hidden_note.clone()],
+    });
+    for (idx, (tool, args)) in [
+        (
+            "list_notes",
+            json!({ "project": s2_p1_handle, "path": "nonexistent-empty-subdir" }),
+        ),
+        (
+            "search",
+            json!({ "project": s2_p1_handle, "query": "zzz_unmatched_query_999" }),
+        ),
+        (
+            "recent_activity",
+            json!({ "project": s2_p1_handle, "limit": 5 }),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let run_auth = owner
+            .auth()
+            .for_agent_run(
+                AgentRunId::from_bytes([
+                    0xEA,
+                    2,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    1 + idx as u8,
+                ]),
+                pscope.space_id.clone(),
+                ChatAudience::Personal,
+                owner.auth().spaces().clone(),
+            )
+            .unwrap();
+        let _ = local
+            .registry
+            .call_tool(
+                McpInvocationContext {
+                    account: AccountContext::new(run_auth.clone(), budget()),
+                    target: EgressTarget::InAppProvider {
+                        provider: local.resource.id.clone(),
+                        model: local.model.clone(),
+                        primary_project: None,
+                    },
+                    request_key: CommandKey::from_bytes([
+                        0xEA,
+                        2,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        20 + idx as u8,
+                    ]),
+                },
+                tool,
+                args,
+            )
+            .await
+            .unwrap();
+        assert!(
+            run_auth.taint().is_tainted(),
+            "explicit foreign project {tool} must commit external_read taint even on 0 hits"
+        );
+    }
+
+    // (2) link_many must not route to an approvalRequired proposal when foreign targets
+    //     are read-only (Viewer) or non-proposal classes (Skill), preventing existence oracles.
+    let mut viewer_spaces = owner.auth().spaces().clone();
+    if let Some(grant) = viewer_spaces.get_mut(&s2.history.space_id) {
+        grant.role = SpaceRole::Viewer;
+        grant.write_classes.clear();
+    }
+    let viewer_run_auth = owner
+        .auth()
+        .for_agent_run(
+            AgentRunId::from_bytes([0xEA, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+            pscope.space_id.clone(),
+            ChatAudience::Personal,
+            viewer_spaces,
+        )
+        .unwrap();
+    let lm_viewer = local
+        .registry
+        .call_personal_tool(
+            McpInvocationContext {
+                account: AccountContext::new(viewer_run_auth, budget()),
+                target: EgressTarget::InAppProvider {
+                    provider: local.resource.id.clone(),
+                    model: local.model.clone(),
+                    primary_project: None,
+                },
+                request_key: CommandKey::from_bytes([
+                    0xEA, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
+                ]),
+            },
+            PersonalToolInvocation {
+                source: pscope.clone(),
+                thread: oracle_thread.clone(),
+                leaf: prop_leaf,
+                owner: owner.clone(),
+            },
+            "link_many",
+            json!({
+                "links": [{
+                    "from": s2_hidden_note,
+                    "to": NoteId::from_bytes([0xEA; 16]),
+                    "relation": "relates",
+                }]
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(
+        lm_viewer.proposal().is_none(),
+        "link_many on Viewer foreign note must not mint approvalRequired proposal"
+    );
+    let skill_entry = fixture
+        .control
+        .discover_abilities(
+            owner.clone(),
+            AbilityQuery {
+                page: ControlPageRequest::new(10, None).unwrap(),
+                project: None,
+                kind: Some(AbilityKind::Skill),
+                name: Some("budget-taint-skill".into()),
+                authoring: true,
+            },
+        )
+        .await
+        .unwrap()
+        .items[0]
+        .descriptor
+        .entrypoint
+        .as_ref()
+        .unwrap()
+        .note_id
+        .clone();
+    let skill_lm_auth = owner
+        .auth()
+        .for_agent_run(
+            AgentRunId::from_bytes([0xEA, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3]),
+            pscope.space_id.clone(),
+            ChatAudience::Personal,
+            owner.auth().spaces().clone(),
+        )
+        .unwrap();
+    let lm_skill = local
+        .registry
+        .call_personal_tool(
+            McpInvocationContext {
+                account: AccountContext::new(skill_lm_auth, budget()),
+                target: EgressTarget::InAppProvider {
+                    provider: local.resource.id.clone(),
+                    model: local.model.clone(),
+                    primary_project: None,
+                },
+                request_key: CommandKey::from_bytes([
+                    0xEA, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4,
+                ]),
+            },
+            PersonalToolInvocation {
+                source: pscope.clone(),
+                thread: oracle_thread.clone(),
+                leaf: prop_leaf,
+                owner: owner.clone(),
+            },
+            "link_many",
+            json!({
+                "links": [{
+                    "from": skill_entry,
+                    "to": NoteId::from_bytes([0xEA; 16]),
+                    "relation": "relates",
+                }]
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(
+        lm_skill.proposal().is_none(),
+        "link_many on non-proposal Skill note must not mint approvalRequired proposal"
+    );
+}
+
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+async fn ability_pagination_and_trail_seams(
+    fixture: &RuntimeFixture,
+    owner: &AccountContext,
+    s2: &AccessibleSpace,
+    s2_p1: &FolderRef,
+    s2_epoch: notarium_core::ids::LeaseEpoch,
+    actor: &PrincipalId,
+) {
+    let s2_p1_handle = format!("{}/h-s2-p1", s2.slug);
+    // (3) Visibility-scoped ability pagination & cursor isolation for project-scoped humans & Keepers.
+    let s2_p2_id = FolderId::from_bytes([0xEA, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    fixture
+        .canonical
+        .create_folder(notarium_canonical::CreateFolderSpec {
+            scope: s2.history.clone(),
+            active_epoch: s2_epoch,
+            folder_id: s2_p2_id,
+            parent: None,
+            slug: "h-s2-p2".into(),
+            display_name: "H S2 P2".into(),
+            is_project: true,
+            project_slug: Some("h-s2-p2".into()),
+            actor: actor.clone(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+    let s2_p2_handle = format!("{}/h-s2-p2", s2.slug);
+    let _p1_role_a = call_mcp(
+        &fixture.registry,
+        owner,
+        [0xEA, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3],
+        "create_ability",
+        json!({
+            "kind": "role",
+            "name": "p1-page-a",
+            "description": "P1 role A",
+            "instructions": "Role A",
+            "placement": { "home": "project", "project": s2_p1_handle },
+        }),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    let p1_role_b = call_mcp(
+        &fixture.registry,
+        owner,
+        [0xEA, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4],
+        "create_ability",
+        json!({
+            "kind": "role",
+            "name": "p1-page-b",
+            "description": "P1 role B",
+            "instructions": "Role B",
+            "placement": { "home": "project", "project": s2_p1_handle },
+        }),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    let _p2_role_a = call_mcp(
+        &fixture.registry,
+        owner,
+        [0xEA, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5],
+        "create_ability",
+        json!({
+            "kind": "role",
+            "name": "p2-hidden-a",
+            "description": "P2 hidden role A",
+            "instructions": "Hidden A",
+            "placement": { "home": "project", "project": s2_p2_handle },
+        }),
+    )
+    .await
+    .unwrap();
+    let p1_scoped_acc = AccountContext::new(
+        owner
+            .auth()
+            .restrict_to_space(&s2.history.space_id)
+            .unwrap()
+            .restrict_to_project(s2_p1)
+            .unwrap(),
+        budget(),
+    );
+    let page1 = fixture
+        .canonical
+        .abilities(
+            p1_scoped_acc.clone(),
+            AbilityQuery {
+                project: Some(s2_p1.clone()),
+                kind: Some(AbilityKind::Role),
+                name: None,
+                authoring: true,
+                page: ControlPageRequest::new(1, None).unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(page1.items.len(), 1);
+    assert!(
+        page1.continuation.is_some(),
+        "project-scoped abilities page 1 must advance when >1 visible role exists"
+    );
+    // Mutating an ability in unrelated project s2_p2 must NOT stale s2_p1's cursor.
+    let _p2_role_b = call_mcp(
+        &fixture.registry,
+        owner,
+        [0xEA, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6],
+        "create_ability",
+        json!({
+            "kind": "role",
+            "name": "p2-hidden-b",
+            "description": "P2 hidden role B",
+            "instructions": "Hidden B",
+            "placement": { "home": "project", "project": s2_p2_handle },
+        }),
+    )
+    .await
+    .unwrap();
+    let page2 = fixture
+        .canonical
+        .abilities(
+            p1_scoped_acc,
+            AbilityQuery {
+                project: Some(s2_p1.clone()),
+                kind: Some(AbilityKind::Role),
+                name: None,
+                authoring: true,
+                page: ControlPageRequest::new(1, page1.continuation).unwrap(),
+            },
+        )
+        .await
+        .expect("mutation in unrelated project must not stale project-scoped ability cursor");
+    assert_eq!(page2.items.len(), 1);
+    assert_ne!(page1.items[0].reference.id, page2.items[0].reference.id);
+    // Keeper readonly_abilities pagination returns exact visible item with continuation: None.
+    let p1_a_ref = fixture
+        .control
+        .discover_abilities(
+            owner.clone(),
+            AbilityQuery {
+                page: ControlPageRequest::new(10, None).unwrap(),
+                project: Some(s2_p1.clone()),
+                kind: Some(AbilityKind::Role),
+                name: Some("p1-page-a".into()),
+                authoring: true,
+            },
+        )
+        .await
+        .unwrap()
+        .items[0]
+        .descriptor
+        .reference
+        .clone();
+    let keeper_acc = AccountContext::new(
+        owner
+            .auth()
+            .for_keeper(
+                AgentRunId::from_bytes([0xEA, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7]),
+                s2.history.space_id.clone(),
+                Some(s2_p1.folder_id.clone()),
+                BTreeSet::from([p1_a_ref.id.clone()]),
+            )
+            .unwrap(),
+        budget(),
+    );
+    let keeper_page = fixture
+        .canonical
+        .abilities(
+            keeper_acc,
+            AbilityQuery {
+                project: Some(s2_p1.clone()),
+                kind: None,
+                name: None,
+                authoring: false,
+                page: ControlPageRequest::new(1, None).unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(keeper_page.items.len(), 1);
+    assert_eq!(keeper_page.items[0].reference.id, p1_a_ref.id);
+    assert!(
+        keeper_page.continuation.is_none(),
+        "Keeper abilities page must not emit continuation for hidden abilities"
+    );
+
+    // (4) Placement trail following for Disabled/Stale exact ar1: tokens in use_role / use_skill.
+    let trail_old_token = p1_role_b["ref"].as_str().unwrap().to_owned();
+    let promoted = call_mcp(
+        &fixture.registry,
+        owner,
+        [0xEA, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "edit_ability",
+        json!({
+            "ref": trail_old_token,
+            "versionToken": p1_role_b["versionToken"],
+            "home": { "home": "space" },
+        }),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    let _disabled = call_mcp(
+        &fixture.registry,
+        owner,
+        [0xEA, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
+        "edit_ability",
+        json!({
+            "ref": promoted["ref"],
+            "versionToken": promoted["versionToken"],
+            "enabled": false,
+        }),
+    )
+    .await
+    .unwrap();
+    let use_old_role = call_mcp(
+        &fixture.registry,
+        owner,
+        [0xEA, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3],
+        "use_role",
+        json!({ "role": trail_old_token, "project": s2_p1_handle }),
+    )
+    .await;
+    assert!(
+        matches!(
+            use_old_role,
+            Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
+                if matches!(
+                    diagnostic.reason,
+                    ValidationReason::InvalidState | ValidationReason::SourceMismatch
+                )
+        ),
+        "use_role on promoted+disabled old ar1 token must follow trail, got {:?}",
+        use_old_role.err()
+    );
+    let use_old_as_skill = call_mcp(
+        &fixture.registry,
+        owner,
+        [0xEA, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4],
+        "use_skill",
+        json!({ "skill": trail_old_token, "project": s2_p1_handle }),
+    )
+    .await;
+    assert!(
+        !matches!(
+            use_old_as_skill,
+            Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
+                if diagnostic.reason == ValidationReason::InvalidState
+        ),
+        "use_skill on promoted+disabled Role token must reject wrong kind, got {:?}",
+        use_old_as_skill.err()
+    );
+}
+
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+async fn post_trash_and_view_replay_seams(
+    fixture: &RuntimeFixture,
+    owner: &AccountContext,
+    s2_sc: &SpaceContext,
+    s2: &AccessibleSpace,
+    s2_epoch: notarium_core::ids::LeaseEpoch,
+    actor: &PrincipalId,
+) {
+    // (5) Post-trash & post-rename idempotent replay for create_note, create_notes,
+    //     ensure_folder_path, create_ability, and view-edit edit_note.
+    let p_rep_id = FolderId::from_bytes([0xEA, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    let p_rep_ref = FolderRef {
+        space_id: s2.history.space_id.clone(),
+        folder_id: p_rep_id.clone(),
+    };
+    fixture
+        .canonical
+        .create_folder(notarium_canonical::CreateFolderSpec {
+            scope: s2.history.clone(),
+            active_epoch: s2_epoch,
+            folder_id: p_rep_id.clone(),
+            parent: None,
+            slug: "h-s2-replay".into(),
+            display_name: "H S2 Replay".into(),
+            is_project: true,
+            project_slug: Some("h-s2-replay".into()),
+            actor: actor.clone(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+    let p_rep_rev = fixture
+        .canonical
+        .resolve_folder_path(s2_sc.clone(), Some(p_rep_id.clone()), String::new())
+        .await
+        .unwrap()
+        .unwrap()
+        .revision;
+    let p_rep_handle = format!("{}/h-s2-replay", s2.slug);
+
+    // Direct ensure_folder_path replay on trashed folder.
+    let ensure_mut = Mutation {
+        identity: CommandIdentity {
+            scope: s2.history.clone(),
+            actor: actor.clone(),
+            key: CommandKey::from_bytes([0xEA, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3]),
+            hash: ContentDigest::from_bytes([0xEA; 32]),
+        },
+        preconditions: Preconditions::default(),
+        input: EnsureFolderPath {
+            base: Some(p_rep_id.clone()),
+            path: "ensured/nested".into(),
+        },
+    };
+    let ensured_1 = fixture
+        .canonical
+        .ensure_folder_path(s2_sc.clone(), ensure_mut.clone())
+        .await
+        .unwrap();
+
+    // MCP create_note + create_notes + create_ability in p_rep.
+    let cn_key = [0xEA, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4];
+    let cn_args = json!({
+        "project": p_rep_handle,
+        "path": "sub/leaf",
+        "title": "Post Trash Create Note",
+        "body": "Body",
+    });
+    let cn_1 = call_mcp(
+        &fixture.registry,
+        owner,
+        cn_key,
+        "create_note",
+        cn_args.clone(),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+
+    let cns_key = [0xEA, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5];
+    let cns_args = json!({
+        "project": p_rep_handle,
+        "notes": [{
+            "path": "batch-sub",
+            "title": "Post Trash Batch Note",
+            "body": "Batch body",
+        }],
+    });
+    let cns_1 = call_mcp(
+        &fixture.registry,
+        owner,
+        cns_key,
+        "create_notes",
+        cns_args.clone(),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+
+    let cab_key = [0xEA, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6];
+    let cab_args = json!({
+        "kind": "role",
+        "name": "replay-post-trash-role",
+        "description": "Replay role",
+        "instructions": "Replay instructions",
+        "placement": { "home": "project", "project": p_rep_handle },
+    });
+    let cab_1 = call_mcp(
+        &fixture.registry,
+        owner,
+        cab_key,
+        "create_ability",
+        cab_args.clone(),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+
+    // View-edit edit_note with a project-scoped human before trashing p_rep.
+    let view_key = ViewKey::from_bytes([0xEA; 16]);
+    let view_note_res = call_mcp(
+        &fixture.registry,
+        owner,
+        [0xEA, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7],
+        "create_note",
+        json!({
+            "project": p_rep_handle,
+            "title": "View Replay Note",
+            "body": format!("Intro.\n\n```nota\nid: {view_key}\ntype: table\n```\n"),
+        }),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    let view_note_id = view_note_res["noteId"].as_str().unwrap().to_owned();
+    let p_rep_scoped_acc = AccountContext::new(
+        owner
+            .auth()
+            .restrict_to_space(&s2.history.space_id)
+            .unwrap()
+            .restrict_to_project(&p_rep_ref)
+            .unwrap(),
+        budget(),
+    );
+    let view_edit_key = [0xEA, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8];
+    let view_edit_args = json!({
+        "ref": view_note_id,
+        "versionToken": view_note_res["versionToken"],
+        "view": {
+            "viewRef": format!("{view_note_id}:{view_key}"),
+            "common": { "set": { "title": "Updated Board View" } },
+        },
+    });
+    let view_edit_1 = call_mcp(
+        &fixture.registry,
+        &p_rep_scoped_acc,
+        view_edit_key,
+        "edit_note",
+        view_edit_args.clone(),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+
+    // Rename `.abilities` inside p_rep, then trash p_rep!
+    let _ = call_mcp(
+        &fixture.registry,
+        owner,
+        [0xEA, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9],
+        "rename_folder",
+        json!({
+            "project": p_rep_handle,
+            "folder": ".abilities",
+            "name": "renamed-abilities",
+        }),
+    )
+    .await
+    .unwrap();
+    fixture
+        .canonical
+        .set_folder_lifecycle(
+            &s2.history,
+            s2_epoch,
+            &p_rep_id,
+            &p_rep_rev,
+            notarium_core::model::Lifecycle::Trashed,
+            actor,
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Replay all five operations after rename + trash.
+    let ensured_2 = fixture
+        .canonical
+        .ensure_folder_path(s2_sc.clone(), ensure_mut)
+        .await
+        .expect("ensure_folder_path idempotent replay must succeed after folder trash");
+    assert_eq!(ensured_2, ensured_1);
+
+    let cn_2 = call_mcp(&fixture.registry, owner, cn_key, "create_note", cn_args)
+        .await
+        .expect("create_note idempotent replay must succeed after project trash")
+        .structured_content;
+    assert_eq!(cn_2["noteId"], cn_1["noteId"]);
+    assert_eq!(cn_2["versionToken"], cn_1["versionToken"]);
+
+    let cns_2 = call_mcp(&fixture.registry, owner, cns_key, "create_notes", cns_args)
+        .await
+        .expect("create_notes idempotent replay must succeed after project trash")
+        .structured_content;
+    assert_eq!(cns_2["results"][0]["noteId"], cns_1["results"][0]["noteId"]);
+
+    let cab_2 = call_mcp(
+        &fixture.registry,
+        owner,
+        cab_key,
+        "create_ability",
+        cab_args,
+    )
+    .await
+    .expect(
+        "create_ability idempotent replay must succeed after .abilities rename and project trash",
+    )
+    .structured_content;
+    assert_eq!(cab_2["ref"], cab_1["ref"]);
+
+    let view_edit_2 = call_mcp(
+        &fixture.registry,
+        &p_rep_scoped_acc,
+        view_edit_key,
+        "edit_note",
+        view_edit_args,
+    )
+    .await
+    .expect("project-scoped view edit_note replay must succeed after project trash")
+    .structured_content;
+    assert_eq!(view_edit_2["versionToken"], view_edit_1["versionToken"]);
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn verify_out_of_project_schedule_update_not_found(
+    fixture: &RuntimeFixture,
+    owner: &AccountContext,
+    owner_p1_only: &AccountContext,
+    schedule_id: &ScheduleId,
+    expected_rev: ControlRevision,
+    sched_def: &ScheduleDefinition,
+    s1_p1: &FolderRef,
+    next_slot: Timestamp,
+) {
+    let mut p1_def = sched_def.clone();
+    p1_def.project = Some(s1_p1.clone());
+    for (tag, target_sched) in [
+        (46u8, schedule_id.clone()),
+        (47u8, ScheduleId::from_bytes([0xE4; 16])),
+    ] {
+        assert!(matches!(
+            fixture
+                .control
+                .update_schedule(
+                    owner_p1_only.clone(),
+                    AccountMutation {
+                        identity: identity(fixture, owner, tag).await,
+                        input: UpdateSchedule {
+                            schedule: target_sched,
+                            expected: expected_rev,
+                            definition: p1_def.clone(),
+                            approved_skills: None,
+                            next_slot: Some(next_slot),
+                            paused: true,
+                        },
+                    },
+                )
+                .await,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ));
+    }
 }

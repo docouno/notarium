@@ -30,16 +30,18 @@ pub(super) async fn recent(
     args: Value,
 ) -> Result<Value, PortError> {
     let args: Args = decode(args)?;
-    let limit = usize::from(args.limit.unwrap_or(20));
+    let limit = usize::from(PageLimit::new(args.limit.unwrap_or(20))?.get());
     let targets = targets(call, args.project.as_deref(), args.session.as_ref(), true).await?;
     let external = matches!(call.target, EgressTarget::ExternalMcp);
     let mut candidates = Vec::new();
     let mut truncated = false;
     for (index, target) in targets.iter().enumerate() {
-        if target.last_seq == SpaceSeq::ZERO {
-            continue;
-        }
         let mut read_scope = call.space(target.scope.clone())?;
+        let foreign_space = !external
+            && read_scope
+                .auth()
+                .pinned_write_space()
+                .is_some_and(|pin| pin != &target.scope.space_id);
         if !external {
             let selection = match call
                 .provider_selection(&read_scope, target.project.clone())
@@ -72,6 +74,14 @@ pub(super) async fn recent(
                 Ok(narrowed) => narrowed,
                 Err(_) => continue,
             };
+        }
+        if foreign_space && args.project.is_some() {
+            // Explicitly targeting a consented foreign project observes that
+            // Space even when its recent activity list is empty.
+            call.auth.taint().mark_external_read();
+        }
+        if target.last_seq == SpaceSeq::ZERO {
+            continue;
         }
         let after = SpaceSeq::new(
             target

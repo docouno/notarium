@@ -186,6 +186,13 @@ impl ControlPort for ControlPlane {
     ) -> PortFuture<'_, AbilityInspection> {
         Box::pin(self.control.inspect_ability(ctx, identity))
     }
+    fn follow_ability(
+        &self,
+        ctx: AccountContext,
+        reference: AbilityRef,
+    ) -> PortFuture<'_, AbilityRef> {
+        Box::pin(self.control.follow_ability(ctx, reference))
+    }
     fn update_ability_binding(
         &self,
         ctx: AccountContext,

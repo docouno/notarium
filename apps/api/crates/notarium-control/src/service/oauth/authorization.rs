@@ -150,7 +150,11 @@ impl OAuthService {
                     async {
                         let (_, user) = self
                             .control
-                            .manager_read(pre_rtx.inner_mut(), ctx.auth(), ctx.auth().principal())
+                            .manager_read_allow_space_narrowed(
+                                pre_rtx.inner_mut(),
+                                ctx.auth(),
+                                ctx.auth().principal(),
+                            )
                             .await?;
                         self.check_spaces(
                             pre_rtx.inner_mut(),
@@ -184,7 +188,11 @@ impl OAuthService {
                 async {
                     let (_, user) = self
                         .control
-                        .manager_read(rtx.inner_mut(), ctx.auth(), ctx.auth().principal())
+                        .manager_read_allow_space_narrowed(
+                            rtx.inner_mut(),
+                            ctx.auth(),
+                            ctx.auth().principal(),
+                        )
                         .await?;
                     self.check_spaces(
                         rtx.inner_mut(),
@@ -249,7 +257,7 @@ impl OAuthService {
         consent: OAuthConsent,
     ) -> Result<IssuedAuthorizationCode, PortError> {
         ctx.auth().authorize_human_management()?;
-        require_unpinned_human(ctx.auth())?;
+        require_unpinned_project(ctx.auth())?;
         let (protected, browser) = consent.into_parts();
         let browser = validation::browser(browser.expose())?;
         let budget = OperationBudget::new(ctx.budget.clone());
@@ -257,7 +265,7 @@ impl OAuthService {
             let mut pre_rtx = self.control.store.read(budget.clone()).await?;
             budget
                 .run(
-                    self.control.manager_read(
+                    self.control.manager_read_allow_space_narrowed(
                         pre_rtx.inner_mut(),
                         ctx.auth(),
                         ctx.auth().principal(),
@@ -303,7 +311,7 @@ impl OAuthService {
         validation::matches_redirect(&clients::info(&client)?.redirect_uris, &intent.redirect)?;
         let mut tx = self.control.store.write(budget.clone()).await?;
         let result=budget.run(async {
-            let (_,user)=self.control.manager(tx.inner_mut(),ctx.auth(),&intent.user).await?;
+            let (_,user)=self.control.manager_allow_space_narrowed(tx.inner_mut(),ctx.auth(),&intent.user).await?;
             let now=self.control.clock.now_ms()?;
             if user.auth_version!=intent.auth_version || intent.expires<=now {return Err(invalid_grant());}
             self.check_spaces(tx.inner_mut(),&ctx,&user,intent.spaces.as_deref(),intent.scope.access,true).await?;

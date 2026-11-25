@@ -787,6 +787,26 @@ async fn offers(pg: bool) {
         .await
         .is_err()
     );
+    // Project-scoped humans must only see offers targeting their pinned project
+    // in `list_offers`, matching `list_offer_models` which rejects Space offers.
+    let editor_project_a = editor.clone().restrict_to_project(&project_a).unwrap();
+    let pinned_offers = port
+        .list_offers(
+            editor_project_a.clone(),
+            ProviderOfferQuery {
+                project: Some(project_a.clone()),
+                page: page(10, None),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(pinned_offers.items.len(), 1);
+    assert_eq!(pinned_offers.items[0].attachment.id, a.id);
+    assert!(matches!(
+        port.list_offer_models(editor_project_a, space_offer.id.clone(), page(10, None))
+            .await,
+        Err(PortError::Domain(DomainError::ResourceNotFound))
+    ));
 
     port.revoke_attachment(
         owner.clone(),

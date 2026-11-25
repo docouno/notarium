@@ -211,11 +211,23 @@ impl ProviderService {
                 .await?;
             let last = position(&query.page, &access)?;
             let project = query.project.as_ref().map(|project| project.folder_id.as_str());
+            let project_pinned = ctx
+                .auth()
+                .spaces()
+                .get(&ctx.scope().space_id)
+                .is_some_and(|grant| grant.project_root.is_some());
             let now = self.control.clock.now_ms()?;
-            let page = page_rows!(tx.inner_mut(), ProviderAttachmentsRow, TargetTable::ProviderAttachments, query.page.limit(),
-                "SELECT p.* FROM provider_attachments p JOIN provider_resources r ON r.id=p.resource_id JOIN users u ON u.user_id=r.owner_id LEFT JOIN credentials c ON c.id=r.credential_id WHERE p.target_space=$1 AND (p.target_kind='space' OR (p.target_kind='project' AND p.target_project=$2)) AND p.id>$3 AND p.state='approved' AND (p.expires_at IS NULL OR p.expires_at>$4) AND r.disabled_at IS NULL AND u.disabled_at IS NULL AND p.resource_epoch=r.consent_epoch AND ((r.credential_id IS NULL AND p.credential_epoch IS NULL) OR (c.kind='provider-header-v1' AND c.owner_id=r.owner_id AND c.disabled_at IS NULL AND p.credential_epoch=c.consent_epoch)) ORDER BY p.id LIMIT $5",
-                "SELECT p.* FROM v1_control.provider_attachments p JOIN v1_control.provider_resources r ON r.id=p.resource_id JOIN v1_control.users u ON u.user_id=r.owner_id LEFT JOIN v1_control.credentials c ON c.id=r.credential_id WHERE p.target_space=$1 AND (p.target_kind='space' OR (p.target_kind='project' AND p.target_project=$2)) AND p.id>$3 AND p.state='approved' AND (p.expires_at IS NULL OR p.expires_at>$4) AND r.disabled_at IS NULL AND u.disabled_at IS NULL AND p.resource_epoch=r.consent_epoch AND ((r.credential_id IS NULL AND p.credential_epoch IS NULL) OR (c.kind='provider-header-v1' AND c.owner_id=r.owner_id AND c.disabled_at IS NULL AND p.credential_epoch=c.consent_epoch)) ORDER BY p.id LIMIT $5";
-                ctx.scope().space_id.as_str(), project, &last, now, i64::from(query.page.limit())+1)?;
+            let page = if project_pinned {
+                page_rows!(tx.inner_mut(), ProviderAttachmentsRow, TargetTable::ProviderAttachments, query.page.limit(),
+                    "SELECT p.* FROM provider_attachments p JOIN provider_resources r ON r.id=p.resource_id JOIN users u ON u.user_id=r.owner_id LEFT JOIN credentials c ON c.id=r.credential_id WHERE p.target_space=$1 AND p.target_kind='project' AND p.target_project=$2 AND p.id>$3 AND p.state='approved' AND (p.expires_at IS NULL OR p.expires_at>$4) AND r.disabled_at IS NULL AND u.disabled_at IS NULL AND p.resource_epoch=r.consent_epoch AND ((r.credential_id IS NULL AND p.credential_epoch IS NULL) OR (c.kind='provider-header-v1' AND c.owner_id=r.owner_id AND c.disabled_at IS NULL AND p.credential_epoch=c.consent_epoch)) ORDER BY p.id LIMIT $5",
+                    "SELECT p.* FROM v1_control.provider_attachments p JOIN v1_control.provider_resources r ON r.id=p.resource_id JOIN v1_control.users u ON u.user_id=r.owner_id LEFT JOIN v1_control.credentials c ON c.id=r.credential_id WHERE p.target_space=$1 AND p.target_kind='project' AND p.target_project=$2 AND p.id>$3 AND p.state='approved' AND (p.expires_at IS NULL OR p.expires_at>$4) AND r.disabled_at IS NULL AND u.disabled_at IS NULL AND p.resource_epoch=r.consent_epoch AND ((r.credential_id IS NULL AND p.credential_epoch IS NULL) OR (c.kind='provider-header-v1' AND c.owner_id=r.owner_id AND c.disabled_at IS NULL AND p.credential_epoch=c.consent_epoch)) ORDER BY p.id LIMIT $5";
+                    ctx.scope().space_id.as_str(), project, &last, now, i64::from(query.page.limit())+1)?
+            } else {
+                page_rows!(tx.inner_mut(), ProviderAttachmentsRow, TargetTable::ProviderAttachments, query.page.limit(),
+                    "SELECT p.* FROM provider_attachments p JOIN provider_resources r ON r.id=p.resource_id JOIN users u ON u.user_id=r.owner_id LEFT JOIN credentials c ON c.id=r.credential_id WHERE p.target_space=$1 AND (p.target_kind='space' OR (p.target_kind='project' AND p.target_project=$2)) AND p.id>$3 AND p.state='approved' AND (p.expires_at IS NULL OR p.expires_at>$4) AND r.disabled_at IS NULL AND u.disabled_at IS NULL AND p.resource_epoch=r.consent_epoch AND ((r.credential_id IS NULL AND p.credential_epoch IS NULL) OR (c.kind='provider-header-v1' AND c.owner_id=r.owner_id AND c.disabled_at IS NULL AND p.credential_epoch=c.consent_epoch)) ORDER BY p.id LIMIT $5",
+                    "SELECT p.* FROM v1_control.provider_attachments p JOIN v1_control.provider_resources r ON r.id=p.resource_id JOIN v1_control.users u ON u.user_id=r.owner_id LEFT JOIN v1_control.credentials c ON c.id=r.credential_id WHERE p.target_space=$1 AND (p.target_kind='space' OR (p.target_kind='project' AND p.target_project=$2)) AND p.id>$3 AND p.state='approved' AND (p.expires_at IS NULL OR p.expires_at>$4) AND r.disabled_at IS NULL AND u.disabled_at IS NULL AND p.resource_epoch=r.consent_epoch AND ((r.credential_id IS NULL AND p.credential_epoch IS NULL) OR (c.kind='provider-header-v1' AND c.owner_id=r.owner_id AND c.disabled_at IS NULL AND p.credential_epoch=c.consent_epoch)) ORDER BY p.id LIMIT $5";
+                    ctx.scope().space_id.as_str(), project, &last, now, i64::from(query.page.limit())+1)?
+            };
             let last = page.rows.last().map(|row| row.id.clone());
             let mut items = Vec::with_capacity(page.rows.len());
             for row in &page.rows {

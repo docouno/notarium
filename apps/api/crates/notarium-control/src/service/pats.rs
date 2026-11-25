@@ -78,7 +78,11 @@ impl ControlService {
             .run(
                 async {
                     let (_, current) = self
-                        .manager(tx.inner_mut(), ctx.auth(), ctx.auth().principal())
+                        .manager_allow_space_narrowed(
+                            tx.inner_mut(),
+                            ctx.auth(),
+                            ctx.auth().principal(),
+                        )
                         .await?;
                     expect_revision(&current, request.expected)?;
                     let now = self.clock.now_ms()?;
