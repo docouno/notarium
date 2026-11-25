@@ -831,6 +831,12 @@ fn metadata_visibility_checks_do_not_taint_and_keeper_reads_only_pinned_project_
     );
     assert!(owner.human_management());
     assert!(owner.authorize_human_management().is_ok());
+    let tainted_owner = owner.with_staged_taint();
+    tainted_owner.taint().mark_external_read();
+    assert_eq!(
+        tainted_owner.authorize_human_management(),
+        Err(DomainError::CrossSpaceTainted)
+    );
     assert_eq!(
         owner.authorize_ability_mutation(),
         Err(DomainError::AbilityWriteForbidden)

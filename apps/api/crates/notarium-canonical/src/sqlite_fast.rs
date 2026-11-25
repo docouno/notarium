@@ -4320,14 +4320,20 @@ fn authorize_replay_targets_rusqlite(
         let note = match target {
             ReplayResource::WriteFolder(folder) => {
                 let folder = folder.as_ref().unwrap_or(&srec.root_folder_id);
-                let (facts, _) = build_resource_facts_rusqlite(
+                let (facts, ancestry) = build_resource_facts_rusqlite(
                     conn,
                     &srec.space,
                     folder,
                     crate::domain::folders::folder_mutation_class(auth, &srec.space.id)?,
                     None,
-                    true,
+                    false,
                 )?;
+                for anc in &ancestry.ancestors {
+                    let row = load_folder_head_row_rusqlite(conn, &srec.space.id, anc)?;
+                    if row.lifecycle == notarium_core::model::Lifecycle::Purged {
+                        return Err(DomainError::ResourceNotFound.into());
+                    }
+                }
                 auth.authorize_direct_write(&facts, &facts)?;
                 continue;
             }

@@ -462,7 +462,7 @@ async fn page(
     let data = match call
         .registry
         .engine
-        .read_changes(context.clone(), request)
+        .read_changes(context.with_preflight_taint(), request)
         .await
     {
         Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
@@ -472,7 +472,7 @@ async fn page(
             call.registry
                 .engine
                 .read_changes(
-                    context.clone(),
+                    context.with_preflight_taint(),
                     ChangeRead::Seed {
                         scope: window.baseline.scope.clone(),
                         cutoff: Some(window.cutoff),
@@ -532,6 +532,14 @@ async fn page(
                     }))
                 })
                 .collect();
+            if !items.is_empty()
+                && context
+                    .auth()
+                    .pinned_write_space()
+                    .is_some_and(|pin| pin != &window.baseline.scope.space_id)
+            {
+                context.auth().taint().mark_external_read();
+            }
             (json!({ "changes": items }), next, ack)
         }
         ChangeReadResult::Seed(seed) if reset || reading_seed => {

@@ -721,7 +721,10 @@ pub(in crate::mcp) async fn apply_proposal(
                 CausalBasis::Await(Default::default()),
             )
             .await?;
-            let original = ClassEgressFence::mcp_note(&before.document, scope.auth())?;
+            if before.document.class() == DocClass::EncryptedNote {
+                return Err(DomainError::ResourceNotFound.into());
+            }
+            let original = before.document.explicit_read(scope.auth())?;
             let schema = if input.edits_view() {
                 owner.registry.engine.space_schema(scope.clone()).await?
             } else {

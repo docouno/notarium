@@ -387,10 +387,10 @@ async fn run_concurrent_load_pool_isolation_and_untainted_metadata(pg: bool) {
             } else if i < 7 {
                 plane
                     .record_mcp_dedup(
-                        ctx,
+                        ctx.clone(),
                         McpDedupRecord {
                             key: McpDedupKey {
-                                actor: "agent-actor".into(),
+                                actor: ctx.auth().grant().to_string(),
                                 request_key: CommandKey::from_bytes([100 + i; 16]),
                                 request_hash: ContentDigest::from_bytes([100 + i; 32]),
                                 operation: "create_note".into(),
@@ -444,7 +444,7 @@ async fn run_concurrent_load_pool_isolation_and_untainted_metadata(pg: bool) {
         .lookup_mcp_dedup(
             ctx.clone(),
             McpDedupKey {
-                actor: "agent-actor".into(),
+                actor: ctx.auth().grant().to_string(),
                 request_key: CommandKey::from_bytes([102; 16]),
                 request_hash: ContentDigest::from_bytes([102; 32]),
                 operation: "create_note".into(),
@@ -592,11 +592,12 @@ async fn run_concurrent_load_pool_isolation_and_untainted_metadata(pg: bool) {
         let svc = control.clone();
         let c = ctx.clone();
         race_tasks.push(tokio::spawn(async move {
+            let actor = c.auth().grant().to_string();
             svc.record_mcp_dedup(
                 c,
                 McpDedupRecord {
                     key: McpDedupKey {
-                        actor: "mcp-client".into(),
+                        actor,
                         request_key: CommandKey::from_bytes([88; 16]),
                         request_hash: ContentDigest::from_bytes([89; 32]),
                         operation: "create_note".into(),

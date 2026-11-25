@@ -267,6 +267,9 @@ impl ControlService {
         let hit = budget
             .run(
                 async {
+                    if key.actor != expected_dedup_actor(&auth) {
+                        return Err(DomainError::AccessDenied.into());
+                    }
                     if auth.principal().as_str().len() + key.actor.len() + key.request_key.as_str().len()
                         > 2048
                     {
@@ -346,6 +349,14 @@ impl ControlService {
                         .await?;
                     if auth.taint().is_tainted() {
                         return Err(DomainError::CrossSpaceTainted.into());
+                    }
+                    if record.key.actor != expected_dedup_actor(&auth) {
+                        return Err(DomainError::AccessDenied.into());
+                    }
+                    if auth.bearer_scope() == Some(BearerScope::Read)
+                        && record.effect == AgentEffect::Write
+                    {
+                        return Err(DomainError::SpaceReadOnly.into());
                     }
                     let owner = auth.principal().as_str();
                     if owner.len() + record.key.actor.len() + record.key.request_key.as_str().len()
@@ -454,6 +465,13 @@ impl ControlService {
             .await?;
         budget.run(tx.commit(), CommitEffect::Unknown).await?;
         Ok(hit)
+    }
+}
+
+fn expected_dedup_actor(auth: &notarium_core::auth::EngineAuthContext) -> &str {
+    match auth.kind() {
+        PrincipalKind::AgentRun(run) | PrincipalKind::Keeper(run) => run.as_str(),
+        _ => auth.grant().as_str(),
     }
 }
 

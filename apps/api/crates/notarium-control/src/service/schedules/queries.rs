@@ -19,10 +19,30 @@ fn cursor(page: &ControlPageRequest, scope: ContentDigest) -> Result<Option<Curs
     Ok(cursor)
 }
 impl ControlService {
+    fn authorize_schedule_reader(
+        auth: &EngineAuthContext,
+        schedule_id: &str,
+    ) -> Result<(), PortError> {
+        match auth.kind() {
+            PrincipalKind::AgentRun(_) | PrincipalKind::SearchIndexing => {
+                Err(DomainError::ResourceNotFound.into())
+            }
+            PrincipalKind::Keeper(run) => match auth.credential() {
+                Some(AuthenticatedCredential::ScheduledRun {
+                    schedule,
+                    run: verified,
+                    ..
+                }) if verified == run && schedule.as_str() == schedule_id => Ok(()),
+                _ => Err(DomainError::ResourceNotFound.into()),
+            },
+            PrincipalKind::DirectHuman | PrincipalKind::Pat | PrincipalKind::OAuth { .. } => Ok(()),
+        }
+    }
     fn readable_schedule_in_space(
         ctx: &AccountContext,
         row: &AgentSchedulesRow,
     ) -> Result<AgentSchedule, PortError> {
+        Self::authorize_schedule_reader(ctx.auth(), &row.schedule_id)?;
         if row.owner_id != ctx.auth().principal().as_str() || row.deleted_at.is_some() {
             return Err(DomainError::ResourceNotFound.into());
         }
@@ -261,6 +281,7 @@ impl ControlService {
                 let check = budget
                     .run(
                         async {
+                            Self::authorize_schedule_reader(&auth, schedule_id.as_str())?;
                             let row = schedule_read(tx.inner_mut(), schedule_id).await?;
                             if row.owner_id != auth.principal().as_str() {
                                 return Err(DomainError::ResourceNotFound.into());

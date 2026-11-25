@@ -48,6 +48,7 @@ impl ControlService {
         let command = Command::new(request.identity, "set-favorite", &request.input)?;
         command.require(ctx.auth().principal(), ctx.auth().principal())?;
         ctx.auth().authorize_human_management()?;
+        require_unpinned_human(ctx.auth())?;
         let budget = OperationBudget::new(ctx.budget.clone());
         if request.input.saved {
             let current = self.current_account(&ctx, &budget).await?;

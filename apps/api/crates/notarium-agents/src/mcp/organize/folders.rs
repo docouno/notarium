@@ -50,12 +50,22 @@ struct FolderRoute {
     operation: FolderOperation,
     #[serde(default)]
     ancestor_revisions: Vec<(FolderId, RevisionId)>,
+    #[serde(default)]
+    project: Option<FolderId>,
+    #[serde(default)]
+    ancestors: Vec<FolderId>,
 }
 
 #[derive(Deserialize, Serialize)]
 enum FolderOperation {
     Unchanged,
-    Move { parent: FolderId },
+    Move {
+        parent: FolderId,
+        #[serde(default)]
+        parent_project: Option<FolderId>,
+        #[serde(default)]
+        parent_ancestors: Vec<FolderId>,
+    },
     Rename,
     RenameProject,
 }
@@ -103,6 +113,8 @@ impl FolderRoute {
             revision: source.revision,
             operation,
             ancestor_revisions,
+            project: source.project,
+            ancestors: source.ancestor_folders,
         })
     }
 }
@@ -318,7 +330,14 @@ async fn plan(
                     Some(&dest),
                 )
                 .await?;
-                (FolderOperation::Move { parent }, revs)
+                (
+                    FolderOperation::Move {
+                        parent,
+                        parent_project: dest.project,
+                        parent_ancestors: dest.ancestor_folders,
+                    },
+                    revs,
+                )
             };
             FolderRoute::new(source, operation, ancestor_revisions)
         }
@@ -471,24 +490,85 @@ async fn exact_folder_revision(
     Ok(change.revision)
 }
 
+async fn admit_trashed_replay_folder(
+    call: &ToolCallContext<'_>,
+    scope: &SpaceContext,
+    folder_id: &FolderId,
+    project: Option<&FolderId>,
+    ancestors: &[FolderId],
+) -> Result<(), PortError> {
+    let reference = FolderRef {
+        space_id: scope.scope().space_id.clone(),
+        folder_id: folder_id.clone(),
+    };
+    let project_ref = project.map(|id| FolderRef {
+        space_id: scope.scope().space_id.clone(),
+        folder_id: id.clone(),
+    });
+    corpus::admit_folder_write(
+        call,
+        scope,
+        &reference,
+        project_ref,
+        ancestors,
+        DocClass::UserDoc,
+    )
+    .await
+}
+
 pub(super) async fn handle(
     call: &mut ToolCallContext<'_>,
     name: ToolName,
     args: Value,
 ) -> Result<Value, PortError> {
     let parsed = parse_args(name, args)?;
-    let route = call.journal("folder-route", || plan(call, &parsed)).await?;
+    let mut replayed = true;
+    let route = call
+        .journal("folder-route", || async {
+            replayed = false;
+            plan(call, &parsed).await
+        })
+        .await?;
     let scope = call.space(route.scope.clone())?;
     let in_app = matches!(
         call.target,
         super::super::EgressTarget::InAppProvider { .. }
     );
     if in_app {
-        let source = snapshot_by_id(call, &scope, &route.folder).await?;
-        admit_folder_snapshot(call, &scope, &source).await?;
-        if let FolderOperation::Move { parent } = &route.operation {
-            let live_dest = snapshot_by_id(call, &scope, parent).await?;
-            admit_folder_snapshot(call, &scope, &live_dest).await?;
+        match snapshot_by_id(call, &scope, &route.folder).await {
+            Ok(source) => admit_folder_snapshot(call, &scope, &source).await?,
+            Err(PortError::Domain(DomainError::ResourceNotFound)) if replayed => {
+                admit_trashed_replay_folder(
+                    call,
+                    &scope,
+                    &route.folder,
+                    route.project.as_ref(),
+                    &route.ancestors,
+                )
+                .await?;
+            }
+            Err(error) => return Err(error),
+        }
+        if let FolderOperation::Move {
+            parent,
+            parent_project,
+            parent_ancestors,
+        } = &route.operation
+        {
+            match snapshot_by_id(call, &scope, parent).await {
+                Ok(live_dest) => admit_folder_snapshot(call, &scope, &live_dest).await?,
+                Err(PortError::Domain(DomainError::ResourceNotFound)) if replayed => {
+                    admit_trashed_replay_folder(
+                        call,
+                        &scope,
+                        parent,
+                        parent_project.as_ref(),
+                        parent_ancestors,
+                    )
+                    .await?;
+                }
+                Err(error) => return Err(error),
+            }
         }
     }
     let identity = call.command_identity(&route.scope, name.name(), 0);
@@ -503,7 +583,7 @@ pub(super) async fn handle(
         FolderOperation::Unchanged => None,
     };
     let committed = match (route.operation, parsed) {
-        (FolderOperation::Move { parent }, ParsedFolderArgs::Move(_)) => Some(
+        (FolderOperation::Move { parent, .. }, ParsedFolderArgs::Move(_)) => Some(
             call.registry
                 .engine
                 .move_folder(

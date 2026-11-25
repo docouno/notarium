@@ -1407,13 +1407,20 @@ async fn exact_causal_graph_and_control_replay_seams(
     personal: &SpaceContext,
 ) {
     // Tainted caller must be rejected on episode mutations.
+    assert!(
+        !fixture.human.auth().taint().is_tainted(),
+        "start_session on a clean human must not taint via discarded chat delta"
+    );
+    let tainted_owner_ctx = AccountContext::new(fixture.human.auth().with_staged_taint(), budget());
+    tainted_owner_ctx.auth().taint().mark_external_read();
+    let tainted_owner = &tainted_owner_ctx;
     let ep_id = EpisodeId::from_bytes([123; 16]);
     let tainted_ep = fixture
         .control
         .start_or_resume_episode(
-            fixture.human.clone(),
+            tainted_owner.clone(),
             AccountMutation {
-                identity: identity(fixture, &fixture.human, 123).await,
+                identity: identity(fixture, tainted_owner, 123).await,
                 input: StartEpisode {
                     selector: EpisodeSelector::New {
                         requested: ep_id.clone(),
@@ -1571,10 +1578,9 @@ async fn exact_causal_graph_and_control_replay_seams(
 
     // Tainted caller must be rejected on touch_episode, ability overlay mutations,
     // and overlay-only edit_ability before any control DB write or journal entry.
-    let tainted_owner = &fixture.human;
     assert!(
         tainted_owner.auth().taint().is_tainted(),
-        "fixture.human must be tainted at this stage"
+        "tainted_owner must be tainted at this stage"
     );
     let tainted_results = [
         fixture
@@ -1673,7 +1679,7 @@ async fn exact_causal_graph_and_control_replay_seams(
                 tainted_owner.clone(),
                 McpDedupRecord {
                     key: McpDedupKey {
-                        actor: tainted_owner.auth().principal().to_string(),
+                        actor: tainted_owner.auth().grant().to_string(),
                         request_key: CommandKey::from_bytes([134; 16]),
                         request_hash: ContentDigest::from_bytes([134; 32]),
                         operation: "invocation".into(),
@@ -1726,7 +1732,7 @@ async fn exact_causal_graph_and_control_replay_seams(
         .lookup_mcp_dedup(
             owner.clone(),
             McpDedupKey {
-                actor: tainted_owner.auth().principal().to_string(),
+                actor: owner.auth().grant().to_string(),
                 request_key: CommandKey::from_bytes([134; 16]),
                 request_hash: ContentDigest::from_bytes([134; 32]),
                 operation: "invocation".into(),

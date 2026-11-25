@@ -210,7 +210,6 @@ impl ProviderService {
         ctx: AccountContext,
         id: RequestId,
     ) -> Result<ProviderAttachmentReview, PortError> {
-        let observed = self.observe_attachment(&ctx, &id).await?;
         let budget = OperationBudget::new(ctx.budget.clone());
         let mut tx = self.control.store.read(budget.clone()).await?;
         let result = budget
@@ -220,24 +219,31 @@ impl ProviderService {
                         .control
                         .manager_read(tx.inner_mut(), ctx.auth(), ctx.auth().principal())
                         .await?;
-                    let space = SpaceId::parse(&observed.target_space)?;
-                    let resource = resource_read(tx.inner_mut(), &observed.resource_id).await?;
                     let row = attachment_read(tx.inner_mut(), id.as_str()).await?;
-                    if row.resource_id != resource.id
-                        || attachment_target(&row)? != attachment_target(&observed)?
-                    {
-                        return Err(DomainError::ResourceNotFound.into());
-                    }
+                    let space = SpaceId::parse(&row.target_space)?;
+                    let resource = resource_read(tx.inner_mut(), &row.resource_id).await?;
                     if resource.owner_id != owner.user_id {
-                        super::attachments::check_member(tx.inner_mut(), ctx.auth(), &space)
-                            .await?;
-                        if row.target_owner.as_deref() != Some(owner.user_id.as_str()) {
-                            super::super::spaces::require_owner_read(
-                                tx.inner_mut(),
-                                ctx.auth(),
-                                &space,
-                            )
-                            .await?;
+                        let admitted: Result<(), PortError> = async {
+                            super::attachments::check_member(tx.inner_mut(), ctx.auth(), &space)
+                                .await?;
+                            if row.target_owner.as_deref() != Some(owner.user_id.as_str()) {
+                                super::super::spaces::require_owner_read(
+                                    tx.inner_mut(),
+                                    ctx.auth(),
+                                    &space,
+                                )
+                                .await?;
+                            }
+                            Ok(())
+                        }
+                        .await;
+                        if let Err(err) = admitted {
+                            return Err(match err {
+                                PortError::Domain(DomainError::AccessDenied) => {
+                                    DomainError::ResourceNotFound.into()
+                                }
+                                other => other,
+                            });
                         }
                     }
                     let current_credential_consent_epoch = if let Some(id) = &resource.credential_id

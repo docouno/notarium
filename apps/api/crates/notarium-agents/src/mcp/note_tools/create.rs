@@ -480,6 +480,18 @@ async fn prepare_links_journaled(
                     match organize::resolve_target(call, None, scope, Some(raw), None).await {
                         Ok((target, _)) => target,
                         Err(PortError::Domain(DomainError::ResourceNotFound)) => {
+                            let created_meta = super::metadata_snapshot(
+                                call,
+                                scope,
+                                &draft.note,
+                                None,
+                                notarium_core::receipt::CausalBasis::Await(Default::default()),
+                            )
+                            .await?;
+                            if created_meta.metadata.lifecycle() == Lifecycle::Purged {
+                                return Err(DomainError::ResourceNotFound.into());
+                            }
+                            created_meta.metadata.listing(scope.auth())?;
                             let observed = super::metadata_snapshot(
                                 call,
                                 scope,

@@ -89,6 +89,39 @@ pub(super) async fn check_member(
     }
     Ok(())
 }
+pub(super) async fn check_member_for_target(
+    tx: &mut Transaction,
+    auth: &EngineAuthContext,
+    target: &ProviderAttachmentTarget,
+) -> Result<(), PortError> {
+    let space = target_space(target);
+    let grant = auth.spaces().get(space).ok_or(DomainError::AccessDenied)?;
+    match target {
+        ProviderAttachmentTarget::Personal { .. } | ProviderAttachmentTarget::Space(_) => {
+            if grant.project_root.is_some() {
+                return Err(DomainError::AccessDenied.into());
+            }
+        }
+        ProviderAttachmentTarget::Project(project) => {
+            if grant
+                .project_root
+                .as_ref()
+                .is_some_and(|root| root != &project.folder_id)
+            {
+                return Err(DomainError::AccessDenied.into());
+            }
+        }
+    }
+    let current = admission(tx, space, false).await?;
+    if current.state != "active" {
+        return Err(DomainError::AccessDenied.into());
+    }
+    let live=rows!(tx,(i64,),fetch_one,"SELECT count(*) FROM space_members WHERE space_id=$1 AND user_id=$2 AND admission='active'","SELECT count(*) FROM v1_control.space_members WHERE space_id=$1 AND user_id=$2 AND admission='active'";space.as_str(),auth.principal().as_str())?.0;
+    if live != 1 {
+        return Err(DomainError::AccessDenied.into());
+    }
+    Ok(())
+}
 pub(super) async fn epochs(
     tx: &mut Transaction,
     resource: &ProviderResourcesRow,
@@ -186,7 +219,7 @@ impl ProviderService {
     ) -> Result<ControlCommit<ProviderAttachmentInfo>, PortError> {
         let input = request.input;
         let budget = OperationBudget::new(ctx.budget.clone());
-        self.management(&ctx).await?;
+        self.management_scoped(&ctx).await?;
         let catalog = self.target_catalog(&ctx, &input.target).await?;
         disclosure(input.consent.disclosure(), catalog.space.kind)?;
         let command = Command::new(
@@ -209,7 +242,7 @@ impl ProviderService {
         let space_check = catalog.space.clone();
         let clock = self.control.clock.clone();
         ctx.budget = budget.context(ctx.budget.request.clone());
-        self.mutate_authorized(
+        self.mutate_authorized_scoped(
             ctx,
             command,
             move |tx, owner| {
@@ -223,7 +256,7 @@ impl ProviderService {
                     } else {
                         lock_space_read(tx, &space_check.id).await?;
                     }
-                    check_member(tx, &auth_check, target_space(&target_check)).await?;
+                    check_member_for_target(tx, &auth_check, &target_check).await?;
                     if let ProviderAttachmentTarget::Personal {
                         owner: target_owner,
                         ..
@@ -237,7 +270,7 @@ impl ProviderService {
             move |tx,owner,now|Box::pin(async move {
             if input.expires_at_ms.is_some_and(|expires| expires<=now || expires.saturating_sub(now)>365*24*60*60*1000) {return Err(invalid(ValidationReason::InvalidTimestamp));}
             let space=target_space(&input.target);
-            let previous=before_attachment(tx, &input.target, &catalog.space, false, clock.as_ref()).await?;check_member(tx,&auth,space).await?;
+            let previous=before_attachment(tx, &input.target, &catalog.space, false, clock.as_ref()).await?;check_member_for_target(tx,&auth,&input.target).await?;
             let resource=resource(tx,input.resource.as_str()).await?;let credential_epoch=epochs(tx,&resource).await?;
             if input.resource_consent_epoch!=resource.consent_epoch as u64 || input.credential_consent_epoch!=credential_epoch.map(|epoch|epoch as u64) {return Err(DomainError::AccessDenied.into());}
             let (kind,target_owner,target_project,state)=match &input.target {
@@ -313,7 +346,7 @@ impl ProviderService {
                     } else {
                         lock_space_read(tx, &space_check.id).await?;
                     }
-                    check_member(tx, &auth_check, target_space(&target_check)).await?;
+                    check_member_for_target(tx, &auth_check, &target_check).await?;
                     match &target_check {
                         ProviderAttachmentTarget::Personal {
                             owner: target_owner,
@@ -326,7 +359,7 @@ impl ProviderService {
             },
             move |tx,owner,now|Box::pin(async move {
             let previous=before_attachment(tx, &target, &catalog.space, true, clock.as_ref()).await?;
-            check_member(tx,&auth,target_space(&target)).await?;
+            check_member_for_target(tx,&auth,&target).await?;
             match &target {ProviderAttachmentTarget::Personal{owner:target_owner,..}=>owned(&owner.user_id,target_owner.as_str())?,_=>require_owner(tx,&auth,target_space(&target)).await?};
             let resource=resource(tx,&observed.resource_id).await?;let credential_epoch=epochs(tx,&resource).await?;
             let mut row=attachment(tx,input.id.as_str()).await?;revision(row.revision,input.expected)?;

@@ -24,6 +24,17 @@ pub(super) fn denied() -> PortError {
 pub(super) fn access_denied() -> PortError {
     DomainError::AccessDenied.into()
 }
+pub(super) fn require_unpinned_human(auth: &EngineAuthContext) -> Result<(), PortError> {
+    if auth.pinned_write_space().is_some()
+        || auth
+            .spaces()
+            .values()
+            .any(|grant| grant.project_root.is_some())
+    {
+        return Err(access_denied());
+    }
+    Ok(())
+}
 pub(super) fn account_info(row: &UsersRow) -> Result<AccountInfo, PortError> {
     Ok(AccountInfo {
         id: PrincipalId::parse(&row.user_id)?,
@@ -115,16 +126,40 @@ pub(super) async fn mint_session(
     })
 }
 impl ControlService {
-    /// All credential/account management mutations require an interactive human
-    /// with checked perimeter/CSRF attestation (`human_management`) and lock
-    /// involved user rows in lexical order.
-    pub(super) async fn manager(
+    /// Account-wide management mutations require an untainted, unpinned
+    /// interactive human with checked perimeter/CSRF attestation
+    /// (`human_management`) and lock involved user rows in lexical order.
+    pub(super) fn manager<'a>(
+        &'a self,
+        tx: &'a mut Transaction,
+        auth: &'a EngineAuthContext,
+        target: &'a PrincipalId,
+    ) -> impl std::future::Future<Output = Result<(UsersRow, UsersRow), PortError>> + Send + 'a
+    {
+        self.manager_impl(tx, auth, target, false)
+    }
+    /// Target-scoped management mutations where the caller explicitly enforces
+    /// `grant.project_root` against the target project/space.
+    pub(super) fn scoped_manager<'a>(
+        &'a self,
+        tx: &'a mut Transaction,
+        auth: &'a EngineAuthContext,
+        target: &'a PrincipalId,
+    ) -> impl std::future::Future<Output = Result<(UsersRow, UsersRow), PortError>> + Send + 'a
+    {
+        self.manager_impl(tx, auth, target, true)
+    }
+    pub(super) async fn manager_impl(
         &self,
         tx: &mut Transaction,
         auth: &EngineAuthContext,
         target: &PrincipalId,
+        allow_project_root: bool,
     ) -> Result<(UsersRow, UsersRow), PortError> {
         auth.authorize_human_management()?;
+        if !allow_project_root {
+            require_unpinned_human(auth)?;
+        }
         let actor_id = auth.principal().as_str();
         let target_id = target.as_str();
         let users = rows!(tx,UsersRow,fetch_all,
@@ -144,16 +179,40 @@ impl ControlService {
             .ok_or(DomainError::ResourceNotFound)?;
         Ok((actor.clone(), target.clone()))
     }
-    /// Read-only inspection for an interactive human (`DirectHuman`) without
-    /// requiring mutation CSRF attestation or acquiring row write locks.
-    pub(super) async fn manager_read(
+    /// Read-only inspection for an unpinned interactive human (`DirectHuman`)
+    /// without requiring mutation CSRF attestation or acquiring row write locks.
+    pub(super) fn manager_read<'a>(
+        &'a self,
+        tx: &'a mut Transaction,
+        auth: &'a EngineAuthContext,
+        target: &'a PrincipalId,
+    ) -> impl std::future::Future<Output = Result<(UsersRow, UsersRow), PortError>> + Send + 'a
+    {
+        self.manager_read_impl(tx, auth, target, false)
+    }
+    /// Target-scoped read-only inspection for an interactive human where the
+    /// caller explicitly enforces `grant.project_root` against the target.
+    pub(super) fn scoped_manager_read<'a>(
+        &'a self,
+        tx: &'a mut Transaction,
+        auth: &'a EngineAuthContext,
+        target: &'a PrincipalId,
+    ) -> impl std::future::Future<Output = Result<(UsersRow, UsersRow), PortError>> + Send + 'a
+    {
+        self.manager_read_impl(tx, auth, target, true)
+    }
+    pub(super) async fn manager_read_impl(
         &self,
         tx: &mut Transaction,
         auth: &EngineAuthContext,
         target: &PrincipalId,
+        allow_project_root: bool,
     ) -> Result<(UsersRow, UsersRow), PortError> {
         if auth.kind() != &PrincipalKind::DirectHuman {
             return Err(access_denied());
+        }
+        if !allow_project_root {
+            require_unpinned_human(auth)?;
         }
         let actor_id = auth.principal().as_str();
         let target_id = target.as_str();

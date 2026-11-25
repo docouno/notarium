@@ -1938,13 +1938,13 @@ async fn account_preference_replay_enforces_live_placement_authority(pg: bool) {
     ));
     // Positive control: Owner can still replay System preference.
     let sys_replayed = service
-        .set_ability_preference(owner_ctx.clone(), sys_req)
+        .set_ability_preference(owner_ctx.clone(), sys_req.clone())
         .await
         .unwrap();
     assert_eq!(sys_replayed.revision, sys_committed.revision);
     // (2b) Narrowing a DirectHuman (`human_management == true`) by `project_root`
     //      or stripping `DocClass::Skill` from `read_classes` MUST deny Account
-    //      preference replay before `command.replay`.
+    //      preference replay before `command.replay`, including `AbilityPlacement::System`.
     let other_proj = FolderRef {
         space_id: s2.space.id.clone(),
         folder_id: FolderId::from_bytes([0xEE; 16]),
@@ -1955,9 +1955,15 @@ async fn account_preference_replay_enforces_live_placement_authority(pg: bool) {
     );
     assert!(matches!(
         service
-            .set_ability_preference(owner_project_narrowed, s2_owner_req.clone())
+            .set_ability_preference(owner_project_narrowed.clone(), s2_owner_req.clone())
             .await,
         Err(PortError::Domain(DomainError::ResourceNotFound))
+    ));
+    assert!(matches!(
+        service
+            .set_ability_preference(owner_project_narrowed, sys_req.clone())
+            .await,
+        Err(PortError::Domain(DomainError::AbilityWriteForbidden))
     ));
     let owner_no_skill = AccountContext::new(
         owner_ctx
@@ -1971,6 +1977,18 @@ async fn account_preference_replay_enforces_live_placement_authority(pg: bool) {
             .set_ability_preference(owner_no_skill, s2_owner_req.clone())
             .await,
         Err(PortError::Domain(DomainError::ResourceNotFound))
+    ));
+    let owner_zero_spaces = AccountContext::new(
+        owner_ctx
+            .auth()
+            .restrict_to_spaces(&std::collections::BTreeSet::new()),
+        budget(),
+    );
+    assert!(matches!(
+        service
+            .set_ability_preference(owner_zero_spaces, sys_req)
+            .await,
+        Err(PortError::Domain(DomainError::AbilityWriteForbidden))
     ));
 
     // (3) A PAT with valid S2 write authority commits an S2 preference, then S2

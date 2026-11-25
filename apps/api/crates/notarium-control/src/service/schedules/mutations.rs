@@ -75,7 +75,7 @@ impl ControlService {
                 tx.hold_schedule_pin(pin);
             }
             let (revision,saved) = budget.run(async {
-            let (owner,_) = self.manager(tx.inner_mut(),ctx.auth(),ctx.auth().principal()).await?;
+            let (owner,_) = self.scoped_manager(tx.inner_mut(),ctx.auth(),ctx.auth().principal()).await?;
             let auth = self.revalidate(tx.inner_mut(),ctx.auth()).await?;
             let current = AccountContext::new(auth,budget.context(ctx.budget.request.clone()));
             let locked_row = match &change {

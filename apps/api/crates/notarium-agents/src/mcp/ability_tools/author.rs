@@ -856,9 +856,6 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
                             call.request_hash,
                         )
                         .await?;
-                    if outcome.is_none() && plan.has_auxiliary_files {
-                        return Err(DomainError::ResourceNotFound.into());
-                    }
                     trashed_replay = true;
                     (
                         slug,
@@ -936,8 +933,20 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
             }
             if plan.promote {
                 phase = "home";
-                let parent = ability_folder(call, &plan.scope, None).await?;
-                folder_ensured = true;
+                let parent = if trashed_replay {
+                    let scope = call.space(plan.scope.clone())?;
+                    call.registry
+                        .engine
+                        .resolve_folder_path(scope, None, ".abilities".to_owned())
+                        .await?
+                        .ok_or(DomainError::ResourceNotFound)?
+                        .reference
+                        .folder_id
+                } else {
+                    let folder = ability_folder(call, &plan.scope, None).await?;
+                    folder_ensured = true;
+                    folder
+                };
                 let settled = call
                     .registry
                     .engine
@@ -961,6 +970,9 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
                 carrier_moved = true;
             }
             if authored_changed || plan.promote {
+                if trashed_replay && plan.has_auxiliary_files {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
                 let package = call
                     .registry
                     .engine

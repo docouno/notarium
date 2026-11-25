@@ -115,42 +115,107 @@ impl ProviderService {
     }
     async fn management(&self, ctx: &AccountContext) -> Result<(), PortError> {
         ctx.auth().authorize_human_management()?;
-        self.management_read(ctx).await
+        self.management_read_impl(ctx, false).await
     }
-    async fn management_read(&self, ctx: &AccountContext) -> Result<(), PortError> {
+    async fn management_scoped(&self, ctx: &AccountContext) -> Result<(), PortError> {
+        ctx.auth().authorize_human_management()?;
+        self.management_read_impl(ctx, true).await
+    }
+    fn management_read_scoped<'a>(
+        &'a self,
+        ctx: &'a AccountContext,
+    ) -> impl std::future::Future<Output = Result<(), PortError>> + Send + 'a {
+        self.management_read_impl(ctx, true)
+    }
+    async fn management_read_impl(
+        &self,
+        ctx: &AccountContext,
+        scoped: bool,
+    ) -> Result<(), PortError> {
         let budget = OperationBudget::new(ctx.budget.clone());
         let mut rtx = self.control.store.read(budget.clone()).await?;
         budget
             .run(
-                self.control
-                    .manager_read(rtx.inner_mut(), ctx.auth(), ctx.auth().principal()),
+                self.control.manager_read_impl(
+                    rtx.inner_mut(),
+                    ctx.auth(),
+                    ctx.auth().principal(),
+                    scoped,
+                ),
                 CommitEffect::NotCommitted,
             )
             .await?;
         budget.run(rtx.rollback(), CommitEffect::NotCommitted).await
     }
-    async fn mutate<T, F>(
-        &self,
+    fn mutate<'a, T, F>(
+        &'a self,
         ctx: AccountContext,
         command: Command,
         apply: F,
-    ) -> Result<ControlCommit<T>, PortError>
+    ) -> impl std::future::Future<Output = Result<ControlCommit<T>, PortError>> + Send + 'a
     where
-        T: Serialize + DeserializeOwned + Send + 'static,
+        T: Serialize + DeserializeOwned + Send + Sync + 'static,
         F: for<'tx> FnOnce(
                 &'tx mut Transaction,
                 &'tx UsersRow,
                 i64,
             ) -> PortFuture<'tx, (T, Vec<RevocationSelector>)>
-            + Send,
+            + Send
+            + 'a,
     {
-        self.mutate_authorized(ctx, command, |_, _| Box::pin(async { Ok(()) }), apply)
-            .await
+        self.mutate_authorized_inner(
+            ctx,
+            command,
+            false,
+            |_, _| Box::pin(async { Ok(()) }),
+            apply,
+        )
     }
-    async fn mutate_authorized<T, A, F>(
+    fn mutate_authorized<'a, T, A, F>(
+        &'a self,
+        ctx: AccountContext,
+        command: Command,
+        authorize: A,
+        apply: F,
+    ) -> impl std::future::Future<Output = Result<ControlCommit<T>, PortError>> + Send + 'a
+    where
+        T: Serialize + DeserializeOwned + Send + Sync + 'static,
+        A: for<'tx> FnOnce(&'tx mut Transaction, &'tx UsersRow) -> PortFuture<'tx, ()> + Send + 'a,
+        F: for<'tx> FnOnce(
+                &'tx mut Transaction,
+                &'tx UsersRow,
+                i64,
+            ) -> PortFuture<'tx, (T, Vec<RevocationSelector>)>
+            + Send
+            + 'a,
+    {
+        self.mutate_authorized_inner(ctx, command, false, authorize, apply)
+    }
+    fn mutate_authorized_scoped<'a, T, A, F>(
+        &'a self,
+        ctx: AccountContext,
+        command: Command,
+        authorize: A,
+        apply: F,
+    ) -> impl std::future::Future<Output = Result<ControlCommit<T>, PortError>> + Send + 'a
+    where
+        T: Serialize + DeserializeOwned + Send + Sync + 'static,
+        A: for<'tx> FnOnce(&'tx mut Transaction, &'tx UsersRow) -> PortFuture<'tx, ()> + Send + 'a,
+        F: for<'tx> FnOnce(
+                &'tx mut Transaction,
+                &'tx UsersRow,
+                i64,
+            ) -> PortFuture<'tx, (T, Vec<RevocationSelector>)>
+            + Send
+            + 'a,
+    {
+        self.mutate_authorized_inner(ctx, command, true, authorize, apply)
+    }
+    async fn mutate_authorized_inner<T, A, F>(
         &self,
         ctx: AccountContext,
         command: Command,
+        scoped: bool,
         authorize: A,
         apply: F,
     ) -> Result<ControlCommit<T>, PortError>
@@ -171,7 +236,10 @@ impl ProviderService {
         let budget = OperationBudget::new(ctx.budget.clone());
         let mut tx = self.control.store.write(budget.clone()).await?;
         let (revision, saved) = budget.run(async {
-            let (_, owner) = self.control.manager(tx.inner_mut(), ctx.auth(), ctx.auth().principal()).await?;
+            let (_, owner) = self
+                .control
+                .manager_impl(tx.inner_mut(), ctx.auth(), ctx.auth().principal(), scoped)
+                .await?;
             authorize(tx.inner_mut(), &owner).await?;
             if let Some(replay) = command.replay::<T>(tx.inner_mut()).await? { return Ok(replay); }
             expect_revision(&owner, command.identity.expected)?;

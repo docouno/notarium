@@ -821,15 +821,19 @@ impl EngineAuthContext {
             && self.kind == PrincipalKind::DirectHuman
     }
     pub fn authorize_human_management(&self) -> DomainResult<()> {
-        if self.human_management() {
-            Ok(())
-        } else {
-            Err(DomainError::AccessDenied)
+        if !self.human_management() {
+            return Err(DomainError::AccessDenied);
         }
+        if self.taint.is_tainted() {
+            return Err(DomainError::CrossSpaceTainted);
+        }
+        Ok(())
     }
     /// Check trusted interactive input before re-reading its live credential.
     pub fn authorize_proposal_confirmation(&self) -> DomainResult<()> {
-        self.authorize_human_management()?;
+        if !self.human_management() {
+            return Err(DomainError::AccessDenied);
+        }
         if !matches!(
             self.credential(),
             Some(AuthenticatedCredential::Session(_) | AuthenticatedCredential::TrustedNone)

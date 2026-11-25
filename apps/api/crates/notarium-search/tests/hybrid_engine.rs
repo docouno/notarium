@@ -1505,6 +1505,7 @@ async fn chat_candidate_visibility(store: Arc<CanonicalStore>, root: DataRoot) {
     let folder = sample_folder_id(0x67);
     let project = sample_folder_id(0x68);
     let destination = sample_folder_id(0x69);
+    let other_project = sample_folder_id(0x6a);
     let lease = LeaseEpoch::new(1).unwrap();
     let space = store
         .create_space(CreateSpaceSpec {
@@ -1539,6 +1540,21 @@ async fn chat_candidate_visibility(store: Arc<CanonicalStore>, root: DataRoot) {
         .create_folder(CreateFolderSpec {
             scope: space.scope.clone(),
             active_epoch: lease,
+            folder_id: other_project.clone(),
+            parent: None,
+            slug: "other-project".to_owned(),
+            display_name: "Other Project".to_owned(),
+            is_project: true,
+            project_slug: Some("other-project".to_owned()),
+            actor: owner.clone(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+    store
+        .create_folder(CreateFolderSpec {
+            scope: space.scope.clone(),
+            active_epoch: lease,
             folder_id: destination.clone(),
             parent: None,
             slug: "destination".into(),
@@ -1548,6 +1564,16 @@ async fn chat_candidate_visibility(store: Arc<CanonicalStore>, root: DataRoot) {
             actor: owner.clone(),
             timestamp: None,
         })
+        .await
+        .unwrap();
+    let moved_note = sample_note_id(0x6a);
+    store
+        .commit_synthetic_note_batch_for_test(
+            &space.scope,
+            lease,
+            &owner,
+            vec![note(&moved_note, &destination, "Movable note", "moveterm")],
+        )
         .await
         .unwrap();
     let owner_ctx = context(&space.scope, &owner);
@@ -1562,7 +1588,7 @@ async fn chat_candidate_visibility(store: Arc<CanonicalStore>, root: DataRoot) {
         },
     );
     let shared = ChatThreadId::from_bytes([0x67; 16]);
-    let movable = ChatThreadId::from_bytes([0x6a; 16]);
+    let other_project_chat = ChatThreadId::from_bytes([0x6a; 16]);
     let log = ChatThreadId::from_bytes([0x6b; 16]);
     let run = AgentRunId::from_bytes([0x59; 16]);
     let keeper = EngineAuthContext::for_human(
@@ -1617,11 +1643,11 @@ async fn chat_candidate_visibility(store: Arc<CanonicalStore>, root: DataRoot) {
             "rankingterm rankingterm".to_owned(),
         ),
         (
-            movable.clone(),
+            other_project_chat.clone(),
             &owner_ctx,
             ChatThreadKind::SpaceGroup,
-            Some(destination.clone()),
-            "moveterm".to_owned(),
+            Some(other_project.clone()),
+            "otherprojectterm".to_owned(),
         ),
         (
             log.clone(),
@@ -1678,12 +1704,14 @@ async fn chat_candidate_visibility(store: Arc<CanonicalStore>, root: DataRoot) {
     }
     let mut view = View::new(space.scope.clone(), folder.clone());
     view.project(project.clone(), folder.clone());
+    view.project(other_project.clone(), folder.clone());
     view.folder(destination.clone(), folder);
+    view.index(moved_note.clone(), destination.clone());
     view.advance(last);
     let projection = Arc::new(Projection {
         store: store.clone(),
         snapshot: RwLock::new(view),
-        live: RwLock::new(BTreeSet::new()),
+        live: RwLock::new(BTreeSet::from([moved_note.clone()])),
     });
     let engine = SearchEngine::start(
         SearchConfig::new(root.clone(), VectorMode::Disabled),
@@ -1781,6 +1809,36 @@ async fn chat_candidate_visibility(store: Arc<CanonicalStore>, root: DataRoot) {
     );
     let viewer_results = engine.search(viewer.clone(), req.clone()).await.unwrap();
     assert_eq!(viewer_results.chat_hits[0].thread, shared);
+    let mut other_project_req = query("otherprojectterm");
+    other_project_req.include_chats = true;
+    other_project_req.folder = Some(project.clone());
+    assert!(
+        engine
+            .search(owner_ctx.clone(), other_project_req.clone())
+            .await
+            .unwrap()
+            .chat_hits
+            .is_empty()
+    );
+    other_project_req.folder = Some(other_project.clone());
+    assert_eq!(
+        engine
+            .search(owner_ctx.clone(), other_project_req.clone())
+            .await
+            .unwrap()
+            .chat_hits[0]
+            .thread,
+        other_project_chat
+    );
+    other_project_req.folder = None;
+    assert!(
+        engine
+            .search(viewer.clone(), other_project_req)
+            .await
+            .unwrap()
+            .chat_hits
+            .is_empty()
+    );
     let mut moved_request = query("moveterm");
     moved_request.include_chats = true;
     moved_request.folder = Some(project.clone());
@@ -1789,7 +1847,7 @@ async fn chat_candidate_visibility(store: Arc<CanonicalStore>, root: DataRoot) {
             .search(owner_ctx.clone(), moved_request.clone())
             .await
             .unwrap()
-            .chat_hits
+            .hits
             .is_empty()
     );
     let layout = SearchLayout::open(&root, space.scope.clone()).unwrap();
@@ -1821,14 +1879,22 @@ async fn chat_candidate_visibility(store: Arc<CanonicalStore>, root: DataRoot) {
         .search(owner_ctx, moved_request.clone())
         .await
         .unwrap();
-    assert_eq!(moved.chat_hits[0].thread, movable);
-    assert!(
+    assert_eq!(
+        moved.hits[0].card.document.provenance().reference().note_id,
+        moved_note
+    );
+    assert_eq!(
         engine
             .search(viewer.clone(), moved_request)
             .await
             .unwrap()
-            .chat_hits
-            .is_empty()
+            .hits[0]
+            .card
+            .document
+            .provenance()
+            .reference()
+            .note_id,
+        moved_note
     );
     assert_eq!(
         engine.search(viewer, req).await.unwrap().chat_hits[0].thread,

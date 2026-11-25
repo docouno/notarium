@@ -511,8 +511,10 @@ impl ControlService {
                 )
             }
             EpisodeMutation::BindRole(bind) => {
-                if matches!(ctx.auth().kind(), PrincipalKind::Keeper(_))
-                    || ctx.auth().chat_audience() == Some(ChatAudience::Shared)
+                if matches!(
+                    ctx.auth().kind(),
+                    PrincipalKind::AgentRun(_) | PrincipalKind::Keeper(_)
+                ) || ctx.auth().chat_audience() == Some(ChatAudience::Shared)
                     || ctx.auth().bearer_scope() == Some(BearerScope::Read)
                 {
                     return Err(DomainError::AccessDenied.into());
@@ -625,8 +627,10 @@ impl ControlService {
                     return Err(DomainError::CrossSpaceTainted.into());
                 }
             } else {
-                if matches!(auth.kind(), PrincipalKind::Keeper(_))
-                    || auth.chat_audience() == Some(ChatAudience::Shared)
+                if matches!(
+                    auth.kind(),
+                    PrincipalKind::AgentRun(_) | PrincipalKind::Keeper(_)
+                ) || auth.chat_audience() == Some(ChatAudience::Shared)
                     || auth.bearer_scope() == Some(BearerScope::Read)
                 {
                     return Err(DomainError::AccessDenied.into());

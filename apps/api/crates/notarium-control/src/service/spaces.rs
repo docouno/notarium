@@ -133,7 +133,7 @@ pub(super) async fn require_owner_read(
         || auth
             .spaces()
             .get(space)
-            .is_none_or(|grant| grant.role != SpaceRole::Owner)
+            .is_none_or(|grant| grant.role != SpaceRole::Owner || grant.project_root.is_some())
     {
         return Err(access_denied());
     }
@@ -158,6 +158,9 @@ impl ControlService {
         scope: notarium_core::model::HistoryScope,
     ) -> Result<SpaceContext, PortError> {
         ctx.auth().authorize_human_management()?;
+        if ctx.auth().taint().is_tainted() {
+            return Err(DomainError::CrossSpaceTainted.into());
+        }
         let budget = OperationBudget::new(ctx.budget.clone());
         let mut rtx = self.store.read(budget.clone()).await?;
         let auth = budget
@@ -184,19 +187,38 @@ impl ControlService {
                     if member.role != "owner" || member.admission != "active" {
                         return Err(access_denied());
                     }
+                    let (read_classes, write_classes) = if space.state == "active" {
+                        let existing = ctx
+                            .auth()
+                            .spaces()
+                            .get(&scope.space_id)
+                            .ok_or_else(access_denied)?;
+                        if existing.role != SpaceRole::Owner || existing.project_root.is_some() {
+                            return Err(access_denied());
+                        }
+                        (
+                            existing.read_classes.clone(),
+                            existing.write_classes.clone(),
+                        )
+                    } else {
+                        if ctx
+                            .auth()
+                            .spaces()
+                            .values()
+                            .any(|grant| grant.project_root.is_some())
+                        {
+                            return Err(access_denied());
+                        }
+                        (Default::default(), Default::default())
+                    };
                     let credential = ctx.auth().credential().cloned().ok_or_else(denied)?;
                     let mut spaces = std::collections::BTreeMap::new();
-                    let classes = if space.state == "active" {
-                        notarium_core::classes::DocClass::all()
-                    } else {
-                        Default::default()
-                    };
                     spaces.insert(
                         scope.space_id.clone(),
                         SpaceGrant {
                             role: SpaceRole::Owner,
-                            read_classes: classes.clone(),
-                            write_classes: classes,
+                            read_classes,
+                            write_classes,
                             project_root: None,
                         },
                     );
@@ -454,6 +476,17 @@ impl ControlService {
         request: MembershipChange,
     ) -> Result<ControlCommit<MembershipResult>, PortError> {
         ctx.auth().authorize_human_management()?;
+        if ctx.auth().taint().is_tainted() {
+            return Err(DomainError::CrossSpaceTainted.into());
+        }
+        if ctx
+            .auth()
+            .spaces()
+            .values()
+            .any(|grant| grant.project_root.is_some())
+        {
+            return Err(access_denied());
+        }
         let command = membership_command(ctx.auth(), ctx.scope(), &request)?;
         let budget = OperationBudget::new(ctx.budget.clone());
         let space = &ctx.scope().space_id;

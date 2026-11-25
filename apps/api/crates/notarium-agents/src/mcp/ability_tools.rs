@@ -792,27 +792,52 @@ struct AbilityBody {
 }
 
 #[derive(Clone, Debug)]
-struct AbilityTaintCommit {
-    scope: SpaceContext,
-    resource: ClassifiedAbilityResource,
-    selection: Option<ProviderSelection>,
+enum AbilityTaintCommit {
+    Resource {
+        scope: SpaceContext,
+        resource: Box<ClassifiedAbilityResource>,
+        selection: Option<Box<ProviderSelection>>,
+    },
+    ForeignProject {
+        scope: SpaceContext,
+    },
 }
 
 impl AbilityTaintCommit {
     fn would_taint_branch(&self) -> bool {
-        self.scope
+        let scope = match self {
+            Self::Resource { scope, .. } | Self::ForeignProject { scope } => scope,
+        };
+        scope
             .auth()
             .pinned_write_space()
-            .is_some_and(|pin| pin != &self.scope.scope().space_id)
+            .is_some_and(|pin| pin != &scope.scope().space_id)
     }
 
     fn commit(self) -> Result<(), PortError> {
-        match self.selection {
-            Some(selection) => {
-                ClassEgressFence::ability(self.resource, self.scope.auth(), &selection.policy)?;
+        match self {
+            Self::Resource {
+                scope,
+                resource,
+                selection: Some(selection),
+            } => {
+                ClassEgressFence::ability(*resource, scope.auth(), &selection.policy)?;
             }
-            None => {
-                ClassEgressFence::mcp_ability(&self.resource, self.scope.auth())?;
+            Self::Resource {
+                scope,
+                resource,
+                selection: None,
+            } => {
+                ClassEgressFence::mcp_ability(&resource, scope.auth())?;
+            }
+            Self::ForeignProject { scope } => {
+                if scope
+                    .auth()
+                    .pinned_write_space()
+                    .is_some_and(|pin| pin != &scope.scope().space_id)
+                {
+                    scope.auth().taint().mark_external_read();
+                }
             }
         }
         Ok(())
@@ -1020,19 +1045,19 @@ async fn read_owned_resource_inner(
                     ClassEgressFence::ability(body.clone(), &fence_auth, &selection.policy)?;
                 (
                     admitted.text().to_owned(),
-                    Some(AbilityTaintCommit {
+                    Some(AbilityTaintCommit::Resource {
                         scope,
-                        resource: body,
-                        selection: Some(selection),
+                        resource: Box::new(body),
+                        selection: Some(Box::new(selection)),
                     }),
                 )
             }
         }
         None => {
             let text = ClassEgressFence::mcp_ability(&body, &fence_auth)?.to_owned();
-            let deferred = (!commit_taint).then_some(AbilityTaintCommit {
+            let deferred = (!commit_taint).then_some(AbilityTaintCommit::Resource {
                 scope,
-                resource: body,
+                resource: Box::new(body),
                 selection: None,
             });
             (text, deferred)
@@ -1291,24 +1316,26 @@ async fn list(
         };
         // Narrow owned-space discovery to Skill-consented Spaces whenever space-level
         // consent governs visibility so unconsented Spaces never enter catalog paging.
-        let (discover_auth, query_project, any_project_only) = if args.source
-            == Some(Source::System)
-        {
-            (call.auth.restrict_to_spaces(&BTreeSet::new()), None, false)
-        } else if view == View::Runtime || project.is_some() {
-            let (allowed, any_project_only) = provider_skill_spaces(call, project.as_ref()).await?;
-            let query_project = project
-                .as_ref()
-                .filter(|p| allowed.contains(&p.space_id))
-                .cloned();
-            (
-                call.auth.restrict_to_spaces(&allowed),
-                query_project,
-                any_project_only,
-            )
-        } else {
-            (call.auth.clone(), None, false)
-        };
+        // For Runtime view, keep consented owned Spaces even when filtering by System
+        // so owned abilities shadowing built-in names still suppress shadowed System items.
+        let (discover_auth, query_project, any_project_only) =
+            if args.source == Some(Source::System) && view == View::Authoring {
+                (call.auth.restrict_to_spaces(&BTreeSet::new()), None, false)
+            } else if view == View::Runtime || project.is_some() {
+                let (allowed, any_project_only) =
+                    provider_skill_spaces(call, project.as_ref()).await?;
+                let query_project = project
+                    .as_ref()
+                    .filter(|p| allowed.contains(&p.space_id))
+                    .cloned();
+                (
+                    call.auth.restrict_to_spaces(&allowed),
+                    query_project,
+                    any_project_only,
+                )
+            } else {
+                (call.auth.clone(), None, false)
+            };
         let use_provider_runtime_overlay = view == View::Runtime && any_project_only;
         let discover_account = AccountContext::new(discover_auth, call.budget());
         let cap = usize::from(limit);
@@ -1861,32 +1888,41 @@ pub(crate) async fn bind_chat_role(
         primary.budget.clone(),
     );
     let resolve_project = project.filter(|p| allowed.contains(&p.space_id)).cloned();
+    let mut exact_ar1_ref: Option<AbilityRef> = None;
     let resolution = if selector.starts_with("ar1:") {
         let reference: AbilityRef = parse_token(selector, "ar1:", MAX_TOKEN_BYTES)?;
-        if !role_placement_matches_project(&reference.placement, project) {
-            return Err(DomainError::ResourceNotFound.into());
-        }
-        if reference.placement == AbilityPlacement::System {
-            if !selection.policy.allowed_classes.contains(&DocClass::Skill) {
-                return Err(DomainError::ResourceNotFound.into());
-            }
-        } else {
-            let inspection = match registry
-                .control
-                .inspect_ability(resolve_account.clone(), reference.identity())
-                .await
-            {
-                Ok(inspection) => inspection,
-                Err(error) if visible_error(&error) => {
+        match &reference.placement {
+            AbilityPlacement::System => {
+                if !selection.policy.allowed_classes.contains(&DocClass::Skill) {
                     return Err(DomainError::ResourceNotFound.into());
                 }
-                Err(error) => return Err(error),
-            };
-            if !selection_admits_descriptor(selection, &allowed_selections, &inspection.descriptor)
-            {
-                return Err(DomainError::ResourceNotFound.into());
+            }
+            AbilityPlacement::OwnedSpace(space) => {
+                let Some(sel) = allowed_selections.get(space) else {
+                    return Err(DomainError::ResourceNotFound.into());
+                };
+                if sel.project_only.is_some() {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+            }
+            AbilityPlacement::OwnedProject(folder) => {
+                let Some(sel) = allowed_selections.get(&folder.space_id) else {
+                    return Err(DomainError::ResourceNotFound.into());
+                };
+                if sel
+                    .project_only
+                    .as_ref()
+                    .is_some_and(|required| required != folder)
+                {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+            }
+            AbilityPlacement::OwnedPersonal(_) => {
+                // Personal placement resolves inside the personal Space; verify
+                // admission on the resolved descriptor below.
             }
         }
+        exact_ar1_ref = Some(reference.clone());
         registry
             .control
             .resolve_ability(
@@ -2004,7 +2040,7 @@ pub(crate) async fn bind_chat_role(
             registry
                 .control
                 .resolve_ability(
-                    resolve_account,
+                    resolve_account.clone(),
                     AbilitySelection::Exact {
                         reference,
                         project: resolve_project,
@@ -2020,12 +2056,47 @@ pub(crate) async fn bind_chat_role(
             if ability.kind == AbilityKind::Role
                 && ability.healthy
                 && ability.enabled
+                && role_placement_matches_project(&ability.reference.placement, project)
                 && selection_admits_descriptor(selection, &allowed_selections, &ability) =>
         {
             *ability
         }
-        AbilityResolution::Disabled => return Err(invalid(ValidationReason::InvalidState)),
-        AbilityResolution::Stale => return Err(invalid(ValidationReason::SourceMismatch)),
+        AbilityResolution::Disabled | AbilityResolution::Stale => {
+            if let Some(reference) = exact_ar1_ref.as_ref()
+                && reference.placement != AbilityPlacement::System
+                && (!role_placement_matches_project(&reference.placement, project)
+                    || allowed_selections
+                        .values()
+                        .any(|sel| sel.project_only.is_some()))
+            {
+                let admitted = match registry
+                    .control
+                    .inspect_ability(resolve_account.clone(), reference.identity())
+                    .await
+                {
+                    Ok(inspection) => {
+                        role_placement_matches_project(
+                            &inspection.descriptor.reference.placement,
+                            project,
+                        ) && selection_admits_descriptor(
+                            selection,
+                            &allowed_selections,
+                            &inspection.descriptor,
+                        )
+                    }
+                    Err(error) if visible_error(&error) => false,
+                    Err(error) => return Err(error),
+                };
+                if !admitted {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+            }
+            return match resolution {
+                AbilityResolution::Disabled => Err(invalid(ValidationReason::InvalidState)),
+                AbilityResolution::Stale => Err(invalid(ValidationReason::SourceMismatch)),
+                _ => unreachable!(),
+            };
+        }
         _ => return Err(DomainError::ResourceNotFound.into()),
     };
     // Preflight provider egress and ClassEgressFence before committing BindRole so
@@ -2093,16 +2164,34 @@ async fn use_ability(
     let project =
         session::selected_project_for_episode(call, args.project.as_deref(), episode.as_ref())
             .await?;
+    let foreign_project_taint = if let Some(proj) = &project
+        && call
+            .auth
+            .pinned_write_space()
+            .is_some_and(|pin| pin != &proj.space_id)
+    {
+        let proj_scope = session::space(call, &proj.space_id).await?;
+        Some(AbilityTaintCommit::ForeignProject { scope: proj_scope })
+    } else {
+        None
+    };
     let descriptor = resolve(call, &selector, kind, project.clone()).await?;
-    let (rendered, deferred_taints) = activation(
+    let (rendered, mut deferred_taints) = activation(
         call,
         &descriptor,
         project.as_ref(),
         args.budget_tokens.unwrap_or(DEFAULT_ACTIVATION_TOKENS),
     )
     .await?;
+    if let Some(taint) = foreign_project_taint {
+        deferred_taints.push(taint);
+    }
     if kind == AbilityKind::Role
         && let Some(episode) = episode.as_ref()
+        && !matches!(
+            call.auth.kind(),
+            PrincipalKind::AgentRun(_) | PrincipalKind::Keeper(_)
+        )
         && call.auth.chat_audience() != Some(ChatAudience::Shared)
     {
         if call.auth.taint().is_tainted()
@@ -2201,8 +2290,10 @@ async fn save_active_role(
     role: &AbilityRef,
     project: Option<FolderRef>,
 ) -> Result<(), PortError> {
-    if matches!(call.auth.kind(), PrincipalKind::Keeper(_))
-        || call.auth.chat_audience() == Some(ChatAudience::Shared)
+    if matches!(
+        call.auth.kind(),
+        PrincipalKind::AgentRun(_) | PrincipalKind::Keeper(_)
+    ) || call.auth.chat_audience() == Some(ChatAudience::Shared)
         || call.auth.bearer_scope() == Some(BearerScope::Read)
     {
         return Err(DomainError::AccessDenied.into());

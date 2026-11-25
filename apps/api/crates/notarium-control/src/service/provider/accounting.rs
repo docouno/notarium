@@ -476,11 +476,22 @@ impl ProviderService {
         ctx: AccountContext,
         id: RequestId,
     ) -> Result<ProviderCallStatus, PortError> {
+        if matches!(
+            ctx.auth().kind(),
+            notarium_core::auth::PrincipalKind::AgentRun(_)
+                | notarium_core::auth::PrincipalKind::Keeper(_)
+        ) {
+            return Err(DomainError::AccessDenied.into());
+        }
         let budget = OperationBudget::new(ctx.budget.clone());
         let (mut tx, auth) = self
             .control
             .open_revalidated_read(&budget, &ctx.budget.request, ctx.auth())
             .await?;
+        if let Err(err) = super::super::authority::require_unpinned_human(&auth) {
+            let _ = budget.run(tx.rollback(), CommitEffect::NotCommitted).await;
+            return Err(err);
+        }
         let status = budget
             .run(
                 async {

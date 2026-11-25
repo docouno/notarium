@@ -88,6 +88,7 @@ impl ControlService {
         ctx: &AccountContext,
     ) -> Result<UsersRow, PortError> {
         ctx.auth().authorize_human_management()?;
+        require_unpinned_human(ctx.auth())?;
         let owner = user(tx, ctx.auth().principal().as_str()).await?;
         self.live_human(tx, ctx.auth(), &owner).await?;
         Ok(owner)

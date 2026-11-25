@@ -68,6 +68,13 @@ impl ControlService {
         ctx: AccountContext,
         call: RequestId,
     ) -> Result<AgentCallInfo, PortError> {
+        if matches!(
+            ctx.auth().kind(),
+            PrincipalKind::AgentRun(_) | PrincipalKind::Keeper(_)
+        ) {
+            return Err(access_denied());
+        }
+        require_unpinned_human(ctx.auth())?;
         let budget = OperationBudget::new(ctx.budget.clone());
         let (mut tx, auth) = self
             .open_revalidated_read(&budget, &ctx.budget.request, ctx.auth())
@@ -91,6 +98,13 @@ impl ControlService {
         ctx: AccountContext,
         page: ControlPageRequest,
     ) -> Result<ControlPage<AgentCallInfo>, PortError> {
+        if matches!(
+            ctx.auth().kind(),
+            PrincipalKind::AgentRun(_) | PrincipalKind::Keeper(_)
+        ) {
+            return Err(access_denied());
+        }
+        require_unpinned_human(ctx.auth())?;
         let budget = OperationBudget::new(ctx.budget.clone());
         let (mut tx, auth) = self
             .open_revalidated_read(&budget, &ctx.budget.request, ctx.auth())

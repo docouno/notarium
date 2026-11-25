@@ -248,8 +248,21 @@ pub(super) async fn prepare(
     let planning = call.detached_human(owner);
     // Enforce live InAppProvider consent, destination bounds, and pure argument
     // validation before marking external taint or reading any note content/titles
-    // under detached human authority.
-    let probes_foreign_corpus = admit_proposal_targets(call, &planning, &args).await?;
+    // under detached human authority. If an existing consented foreign target
+    // fails write admission (`SpaceReadOnly` / `AbilityWriteForbidden`), commit
+    // external-read taint so existence/lock/role probes cannot stay untainted.
+    let probes_foreign_corpus = match admit_proposal_targets(call, &planning, &args).await {
+        Ok(probes) => probes,
+        Err(error) => {
+            if matches!(
+                error,
+                PortError::Domain(DomainError::SpaceReadOnly | DomainError::AbilityWriteForbidden)
+            ) {
+                call.commit_external_read();
+            }
+            return Err(error);
+        }
+    };
     if probes_foreign_corpus {
         // Mark permanent external-read taint before probing or planning via
         // detached human authority so failed content probes cannot stay untainted.

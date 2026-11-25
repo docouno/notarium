@@ -438,7 +438,16 @@ impl ControlService {
                 let owner = user(tx.inner_mut(), auth.principal().as_str()).await?;
                 match &input.ability.placement {
                     AbilityPlacement::System => {
-                        if !auth.human_management() {
+                        if !auth.human_management()
+                            || auth
+                                .spaces()
+                                .values()
+                                .any(|grant| grant.project_root.is_some())
+                            || !auth
+                                .spaces()
+                                .values()
+                                .any(|grant| grant.read_classes.contains(&DocClass::Skill))
+                        {
                             return Err(DomainError::AbilityWriteForbidden.into());
                         }
                     }

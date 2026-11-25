@@ -35,11 +35,12 @@ impl ScheduleScope<'_> {
         {
             return Err(access_denied());
         }
-        if grant.role == SpaceRole::Viewer
-            || !grant.write_classes.contains(&DocClass::AgentMemory)
-            || auth.taint().is_tainted()
+        if grant.role == SpaceRole::Viewer || !grant.write_classes.contains(&DocClass::AgentMemory)
         {
             return Err(access_denied());
+        }
+        if auth.taint().is_tainted() {
+            return Err(DomainError::CrossSpaceTainted.into());
         }
         Ok(())
     }

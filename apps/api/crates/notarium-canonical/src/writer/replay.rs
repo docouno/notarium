@@ -352,15 +352,21 @@ async fn authorize_resource(
     let note = match target {
         ReplayResource::WriteFolder(folder) => {
             let folder = folder.as_ref().unwrap_or(&srec.root_folder_id);
-            let (facts, _) = build_resource_facts_tx(
+            let (facts, ancestry) = build_resource_facts_tx(
                 tx,
                 &srec.space,
                 folder,
                 folder_mutation_class(auth, &srec.space.id)?,
                 None,
-                true,
+                false,
             )
             .await?;
+            for anc in &ancestry.ancestors {
+                let row = crate::runtime::load_folder_head_row(tx, &srec.space.id, anc).await?;
+                if row.lifecycle == notarium_core::model::Lifecycle::Purged {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+            }
             return Ok(auth.authorize_direct_write(&facts, &facts)?);
         }
         ReplayResource::ReadLinkFolder(folder, source) => {

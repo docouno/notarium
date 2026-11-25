@@ -417,6 +417,14 @@ pub(super) async fn policy(
     // Current-auth revalidation already holds shared Space admission. Policy
     // checks must not upgrade it after taking resource/credential locks.
     check_member(tx, auth, &space.id).await?;
+    if let Some(root) = auth
+        .spaces()
+        .get(&space.id)
+        .and_then(|grant| grant.project_root.as_ref())
+        && project.is_some_and(|p| &p.folder_id != root)
+    {
+        return Err(DomainError::AccessDenied.into());
+    }
     if space.lifecycle != SpaceLifecycle::Active {
         return Err(unavailable());
     }

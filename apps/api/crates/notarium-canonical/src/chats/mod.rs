@@ -2867,7 +2867,7 @@ async fn create_chat_impl(
 
                 if let Some(pf) = &input.project_folder {
                     let frow = load_folder_head_row(tx, &scope.space_id, pf).await?;
-                    if frow.lifecycle != Lifecycle::Active {
+                    if frow.lifecycle != Lifecycle::Active || frow.is_root || !frow.is_project {
                         return Err(DomainError::ResourceNotFound.into());
                     }
                 }

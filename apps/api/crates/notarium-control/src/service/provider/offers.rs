@@ -68,7 +68,7 @@ impl ProviderService {
             return Err(DomainError::ResourceNotFound.into());
         }
         let account = AccountContext::new(ctx.auth().clone(), ctx.budget.clone());
-        self.management_read(&account).await?;
+        self.management_read_scoped(&account).await?;
         let target = project.as_ref().map_or_else(
             || ProviderAttachmentTarget::Space(ctx.scope().space_id.clone()),
             |project| ProviderAttachmentTarget::Project(project.clone()),
@@ -82,18 +82,24 @@ impl ProviderService {
         &self,
         tx: &mut Transaction,
         ctx: &SpaceContext,
+        project: Option<&FolderRef>,
         filter: impl Serialize,
     ) -> Result<ContentDigest, PortError> {
         let (_, owner) = self
             .control
-            .manager_read(tx, ctx.auth(), ctx.auth().principal())
+            .scoped_manager_read(tx, ctx.auth(), ctx.auth().principal())
             .await?;
         let auth = self.control.revalidate_read(tx, ctx.auth()).await?;
         let grant = auth
             .spaces()
             .get(&ctx.scope().space_id)
             .ok_or(DomainError::ResourceNotFound)?;
-        if grant.read_classes.is_empty() {
+        if grant.read_classes.is_empty()
+            || grant
+                .project_root
+                .as_ref()
+                .is_some_and(|root| project.map(|p| &p.folder_id) != Some(root))
+        {
             return Err(DomainError::ResourceNotFound.into());
         }
         // Revalidation already holds shared membership and Space locks. A
@@ -195,7 +201,14 @@ impl ProviderService {
         let catalog = self.offer_catalog(&ctx, &query.project).await?;
         let mut tx = self.control.store.read(budget.clone()).await?;
         let result = budget.run(async {
-            let access = self.offer_access(tx.inner_mut(), &ctx, ("offers", &query.project)).await?;
+            let access = self
+                .offer_access(
+                    tx.inner_mut(),
+                    &ctx,
+                    query.project.as_ref(),
+                    ("offers", &query.project),
+                )
+                .await?;
             let last = position(&query.page, &access)?;
             let project = query.project.as_ref().map(|project| project.folder_id.as_str());
             let now = self.control.clock.now_ms()?;
@@ -227,7 +240,10 @@ impl ProviderService {
         let budget = OperationBudget::new(ctx.budget.clone());
         ctx.budget = budget.context(ctx.budget.request.clone());
         let account = AccountContext::new(ctx.auth().clone(), ctx.budget.clone());
-        self.management_read(&account).await?;
+        self.management_read_scoped(&account).await?;
+        if ctx.auth().spaces().get(&ctx.scope().space_id).is_none() {
+            return Err(DomainError::ResourceNotFound.into());
+        }
         let observed = self.observe_attachment(&account, &offer).await?;
         if observed.target_space != ctx.scope().space_id.as_str() {
             return Err(DomainError::ResourceNotFound.into());
@@ -239,10 +255,30 @@ impl ProviderService {
                 return Err(DomainError::ResourceNotFound.into());
             }
         };
+        if ctx
+            .auth()
+            .spaces()
+            .get(&ctx.scope().space_id)
+            .is_none_or(|grant| {
+                grant
+                    .project_root
+                    .as_ref()
+                    .is_some_and(|root| project.as_ref().map(|p| &p.folder_id) != Some(root))
+            })
+        {
+            return Err(DomainError::ResourceNotFound.into());
+        }
         let catalog = self.offer_catalog(&ctx, &project).await?;
         let mut tx = self.control.store.read(budget.clone()).await?;
         let result = budget.run(async {
-            let scope_access = self.offer_access(tx.inner_mut(), &ctx, ("offer-models", &project, &offer)).await?;
+            let scope_access = self
+                .offer_access(
+                    tx.inner_mut(),
+                    &ctx,
+                    project.as_ref(),
+                    ("offer-models", &project, &offer),
+                )
+                .await?;
             let row = rows!(tx.inner_mut(), ProviderAttachmentsRow, fetch_optional,
                 "SELECT * FROM provider_attachments WHERE id=$1",
                 "SELECT * FROM v1_control.provider_attachments WHERE id=$1"; offer.as_str())?
