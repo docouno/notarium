@@ -463,6 +463,88 @@ impl Destination {
     }
 }
 
+/// Validate pure note-tool proposal arguments and (for `MoveNote`) destination
+/// folder consent before marking cross-space `BranchTaint` or probing any note
+/// bodies under detached human authority. Returns `true` when planning will
+/// probe corpus note content/targets.
+pub(in crate::mcp) async fn preflight_proposal(
+    provider: &ToolCallContext<'_>,
+    owner: &ToolCallContext<'_>,
+    tool: ToolName,
+    args: &Value,
+) -> Result<bool, PortError> {
+    let collapse = |error: PortError| {
+        if corpus::hidden(&error) {
+            DomainError::ResourceNotFound.into()
+        } else {
+            error
+        }
+    };
+    match tool {
+        ToolName::CreateNote | ToolName::CreateNotes => {
+            create::proposal::preflight_input(tool, args)
+        }
+        ToolName::EditNote => {
+            let input: EditInput = decode(args.clone())?;
+            input.validate()?;
+            Ok(true)
+        }
+        ToolName::DeleteNote => {
+            let _: NoteInput = decode(args.clone())?;
+            Ok(true)
+        }
+        ToolName::RenameNote => {
+            let input: RenameInput = decode(args.clone())?;
+            let _ = validated_title(&input.title)?;
+            Ok(true)
+        }
+        ToolName::MoveNote => {
+            let input: MoveInput = decode(args.clone())?;
+            let raw_path = clean_path(&input.to_folder)?;
+            let (provider_scope, note) =
+                corpus::locate_note_preflight(provider, &input.target.note)
+                    .await
+                    .map_err(collapse)?;
+            corpus::admit_provider_note_read(provider, &provider_scope, &note)
+                .await
+                .map_err(collapse)?;
+            let owner_scope = owner.space(provider_scope.scope().clone())?;
+            let base = provider_scope
+                .auth()
+                .spaces()
+                .get(&provider_scope.scope().space_id)
+                .and_then(|grant| grant.project_root.clone());
+            let path = if let Some(base) = &base {
+                let root = folder_base(owner, &owner_scope, base).await?;
+                corpus::strip_folder_prefix(&raw_path, &root.path)
+                    .ok_or(DomainError::SpaceReadOnly)?
+            } else {
+                raw_path
+            };
+            let destination = resolve_destination(owner, &owner_scope, base, &path).await?;
+            let dest_project = folder_base(owner, &owner_scope, &destination.anchor.folder_id)
+                .await?
+                .project
+                .map(|folder_id| FolderRef {
+                    space_id: provider_scope.scope().space_id.clone(),
+                    folder_id,
+                });
+            corpus::admit_folder_write(
+                provider,
+                &provider_scope,
+                &destination.anchor,
+                dest_project,
+                &destination.ancestors,
+                note.facts.class,
+            )
+            .await
+            .map_err(collapse)?;
+            Ok(true)
+        }
+        _ => Err(invalid(ValidationReason::InvalidQuery)),
+    }
+}
+
 pub(in crate::mcp) async fn plan_proposal(
     owner: &ToolCallContext<'_>,
     provider: &ToolCallContext<'_>,

@@ -3623,7 +3623,7 @@ async fn role_cursor_and_schema_regressions(fixture: &RuntimeFixture, personal: 
         .registry
         .call_tool(
             McpInvocationContext {
-                account: AccountContext::new(unconsented_run_auth, budget()),
+                account: AccountContext::new(unconsented_run_auth.clone(), budget()),
                 target: EgressTarget::InAppProvider {
                     provider: unconsented.resource.id.clone(),
                     model: unconsented.model.clone(),
@@ -3645,9 +3645,54 @@ async fn role_cursor_and_schema_regressions(fixture: &RuntimeFixture, personal: 
             .is_empty(),
         "unconsented Space abilities must be filtered from provider page"
     );
-    let prov_cursor = provider_page.structured_content["nextCursor"]
+    assert!(
+        provider_page.structured_content["nextCursor"].is_null(),
+        "unconsented Space abilities must not emit a continuation oracle cursor: {}",
+        provider_page.structured_content
+    );
+    // Once Personal Skill disclosure is approved, InAppProvider emits an opaque
+    // server-side cursor that never leaks SpaceId and stays bound to InAppProvider.
+    approve_disclosure(
+        fixture,
+        &owner,
+        &unconsented,
+        197,
+        ProviderAttachmentTarget::Personal {
+            owner: owner.auth().principal().clone(),
+            space: personal.scope().space_id.clone(),
+        },
+        [DocClass::Skill].into(),
+    )
+    .await;
+    let consented_page = unconsented
+        .registry
+        .call_tool(
+            McpInvocationContext {
+                account: AccountContext::new(unconsented_run_auth, budget()),
+                target: EgressTarget::InAppProvider {
+                    provider: unconsented.resource.id.clone(),
+                    model: unconsented.model.clone(),
+                    primary_project: None,
+                },
+                request_key: CommandKey::from_bytes([
+                    0xE4, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 13,
+                ]),
+            },
+            "list_abilities",
+            json!({"view": "authoring", "limit": 1}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        consented_page.structured_content["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let prov_cursor = consented_page.structured_content["nextCursor"]
         .as_str()
-        .expect("authoring page over unconsented owned abilities must emit continuation");
+        .expect("consented authoring page with remaining abilities must emit opaque continuation");
     assert!(
         prov_cursor.starts_with("ac1:")
             && prov_cursor.len() == 36

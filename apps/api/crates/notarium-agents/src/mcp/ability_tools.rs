@@ -15,12 +15,14 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 
 use std::{
-    collections::VecDeque,
+    collections::{BTreeSet, VecDeque},
     sync::Mutex,
     time::{Duration, Instant},
 };
 
-use super::{EgressTarget, ToolCallContext, ToolName, ToolRegistry, decode, invalid, session};
+use super::{
+    EgressTarget, ToolCallContext, ToolName, ToolRegistry, corpus, decode, invalid, session,
+};
 use crate::abilities::read_system_ability;
 
 mod author;
@@ -33,6 +35,37 @@ const ABILITY_CURSOR_PREFIX: &str = "ac1:";
 const ABILITY_CURSOR_TTL: Duration = Duration::from_secs(15 * 60);
 const MAX_ABILITY_CURSORS: usize = 512;
 const MAX_ABILITY_CURSORS_PER_PRINCIPAL: usize = 64;
+const MAX_PROVIDER_ABILITY_SCAN_PAGES: usize = 64;
+const PROVIDER_ABILITY_SCAN_PAGE_SIZE: u16 = 100;
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct AbilitySortKey {
+    is_system: bool,
+    space: String,
+    id: String,
+}
+
+fn ability_sort_key(descriptor: &AbilityDescriptor) -> Result<AbilitySortKey, PortError> {
+    match (&descriptor.reference.placement, &descriptor.entrypoint) {
+        (AbilityPlacement::System, _) => Ok(AbilitySortKey {
+            is_system: true,
+            space: String::new(),
+            id: descriptor.reference.id.as_str().to_owned(),
+        }),
+        (_, Some(entry)) => Ok(AbilitySortKey {
+            is_system: false,
+            space: entry.space_id.as_str().to_owned(),
+            id: descriptor.reference.id.as_str().to_owned(),
+        }),
+        _ => Err(invalid(ValidationReason::InvalidState)),
+    }
+}
+
+#[derive(Clone)]
+enum AbilityCursorInner {
+    Control(String),
+    ProviderAfter(AbilitySortKey),
+}
 
 /// Keep ability pagination positions server-side so unconsented Space IDs and
 /// sequence numbers are never encoded into tokens returned to callers or models.
@@ -46,7 +79,7 @@ struct AbilityCursorEntry {
     principal: PrincipalId,
     opened: Instant,
     scope: ContentDigest,
-    inner: String,
+    inner: AbilityCursorInner,
 }
 
 impl AbilityCursors {
@@ -54,7 +87,7 @@ impl AbilityCursors {
         &self,
         principal: PrincipalId,
         scope: ContentDigest,
-        inner: String,
+        inner: AbilityCursorInner,
     ) -> Result<String, PortError> {
         let mut bytes = [0_u8; 16];
         getrandom::fill(&mut bytes).map_err(|_| invalid(ValidationReason::InvalidState))?;
@@ -97,7 +130,7 @@ impl AbilityCursors {
         principal: &PrincipalId,
         token: &str,
         expected_scope: &ContentDigest,
-    ) -> Result<String, PortError> {
+    ) -> Result<AbilityCursorInner, PortError> {
         let raw = token
             .strip_prefix(ABILITY_CURSOR_PREFIX)
             .ok_or_else(|| invalid(ValidationReason::InvalidId))?;
@@ -913,82 +946,197 @@ async fn list(
         )?),
         None => None,
     };
-    let page = call
-        .registry
-        .control
-        .discover_abilities(
-            call.account(),
-            AbilityQuery {
-                page: ControlPageRequest::new(limit, inner)?,
-                project: project.clone(),
-                kind: args.kind.map(Into::into),
-                name: None,
-                authoring: view == View::Authoring,
-            },
-        )
-        .await?;
+    let external = matches!(call.target, EgressTarget::ExternalMcp);
     let query = args.q.as_deref().map(notarium_syntax::unicode::lookup_key);
     let mut items = Vec::new();
-    for inspection in page.items {
-        let descriptor = &inspection.descriptor;
-        if args
-            .source
-            .is_some_and(|expected| source(&descriptor.reference) != expected)
-        {
-            continue;
-        }
-        if !provider_ability_allowed(call, &inspection, project.as_ref()) {
-            continue;
-        }
-        let external = matches!(call.target, EgressTarget::ExternalMcp);
-        let (description, origin_record, deferred_taint) = if external
-            && let Some(desc) = descriptor.description.as_ref()
-        {
-            (desc.clone(), None, None)
-        } else {
-            let body =
-                match read_body_inner(call, descriptor, project.as_ref(), query.is_none()).await {
+    let mut deferred_taints = Vec::new();
+    let mut origin_records = Vec::new();
+    let next_inner = if external {
+        let control_cursor = match inner {
+            Some(AbilityCursorInner::Control(token)) => Some(token),
+            Some(AbilityCursorInner::ProviderAfter(_)) => {
+                return Err(invalid(ValidationReason::CursorStale));
+            }
+            None => None,
+        };
+        let page = call
+            .registry
+            .control
+            .discover_abilities(
+                call.account(),
+                AbilityQuery {
+                    page: ControlPageRequest::new(limit, control_cursor)?,
+                    project: project.clone(),
+                    kind: args.kind.map(Into::into),
+                    name: None,
+                    authoring: view == View::Authoring,
+                },
+            )
+            .await?;
+        for inspection in page.items {
+            let descriptor = &inspection.descriptor;
+            if args
+                .source
+                .is_some_and(|expected| source(&descriptor.reference) != expected)
+            {
+                continue;
+            }
+            let (description, origin_record, deferred_taint) = if let Some(desc) =
+                descriptor.description.as_ref()
+            {
+                (desc.clone(), None, None)
+            } else {
+                let body = match read_body_inner(call, descriptor, project.as_ref(), false).await {
                     Ok(body) => body,
                     Err(error) if visible_error(&error) => continue,
                     Err(error) => return Err(error),
                 };
-            (
-                body.description,
-                Some((body.origin, body.project)),
-                body.deferred_taint,
-            )
-        };
-        if query.as_ref().is_some_and(|query| {
-            !notarium_syntax::unicode::lookup_key(&descriptor.name).contains(query)
-                && !notarium_syntax::unicode::lookup_key(&description).contains(query)
-        }) {
-            continue;
-        }
-        if let Some(commit) = deferred_taint {
-            match commit.commit() {
-                Ok(()) => (),
-                Err(error) if visible_error(&error) => continue,
-                Err(error) => return Err(error),
+                (
+                    body.description,
+                    Some((body.origin, body.project)),
+                    body.deferred_taint,
+                )
+            };
+            if query.as_ref().is_some_and(|query| {
+                !notarium_syntax::unicode::lookup_key(&descriptor.name).contains(query)
+                    && !notarium_syntax::unicode::lookup_key(&description).contains(query)
+            }) {
+                continue;
+            }
+            let enabled = if view == View::Runtime {
+                descriptor.enabled
+            } else {
+                inspection.binding_enabled && inspection.preference_enabled
+            };
+            items.push(summary(&inspection, &description, enabled, true)?);
+            if let Some(record) = origin_record {
+                origin_records.push(record);
+            }
+            if let Some(taint) = deferred_taint {
+                deferred_taints.push(taint);
             }
         }
-        let enabled = if view == View::Runtime {
-            descriptor.enabled
-        } else {
-            inspection.binding_enabled && inspection.preference_enabled
+        page.continuation.map(AbilityCursorInner::Control)
+    } else {
+        let after_key = match inner {
+            Some(AbilityCursorInner::ProviderAfter(key)) => Some(key),
+            Some(AbilityCursorInner::Control(_)) => {
+                return Err(invalid(ValidationReason::CursorStale));
+            }
+            None => None,
         };
-        items.push(summary(&inspection, &description, enabled, external)?);
-        if let Some((origin, proj)) = origin_record {
-            call.record_origin(origin, proj)?;
+        // Narrow owned-space discovery to Skill-consented Spaces whenever space-level
+        // consent governs visibility so unconsented Spaces never enter catalog paging.
+        let discover_auth = if args.source == Some(Source::System) {
+            call.auth.restrict_to_spaces(&BTreeSet::new())
+        } else if view == View::Runtime || project.is_some() {
+            let mut allowed = BTreeSet::new();
+            for (space_id, grant) in call.auth.spaces() {
+                if !grant.read_classes.contains(&DocClass::Skill) {
+                    continue;
+                }
+                let probe_project = project
+                    .as_ref()
+                    .filter(|p| &p.space_id == space_id)
+                    .cloned();
+                if corpus::space_admits_skill(call, space_id, probe_project).await? {
+                    allowed.insert(space_id.clone());
+                }
+            }
+            call.auth.restrict_to_spaces(&allowed)
+        } else {
+            call.auth.clone()
+        };
+        let discover_account = AccountContext::new(discover_auth, call.budget());
+        let cap = usize::from(limit);
+        let mut control_cursor = None;
+        let mut last_key: Option<AbilitySortKey> = None;
+        let mut has_more = false;
+        'scan: for _ in 0..MAX_PROVIDER_ABILITY_SCAN_PAGES {
+            let page = call
+                .registry
+                .control
+                .discover_abilities(
+                    discover_account.clone(),
+                    AbilityQuery {
+                        page: ControlPageRequest::new(
+                            PROVIDER_ABILITY_SCAN_PAGE_SIZE,
+                            control_cursor,
+                        )?,
+                        project: project.clone(),
+                        kind: args.kind.map(Into::into),
+                        name: None,
+                        authoring: view == View::Authoring,
+                    },
+                )
+                .await?;
+            for inspection in page.items {
+                let descriptor = &inspection.descriptor;
+                let key = ability_sort_key(descriptor)?;
+                if after_key.as_ref().is_some_and(|after| &key <= after) {
+                    continue;
+                }
+                if args
+                    .source
+                    .is_some_and(|expected| source(&descriptor.reference) != expected)
+                {
+                    continue;
+                }
+                if !provider_ability_allowed(call, &inspection, project.as_ref()) {
+                    continue;
+                }
+                let body = match read_body_inner(call, descriptor, project.as_ref(), false).await {
+                    Ok(body) => body,
+                    Err(error) if visible_error(&error) => continue,
+                    Err(error) => return Err(error),
+                };
+                if query.as_ref().is_some_and(|query| {
+                    !notarium_syntax::unicode::lookup_key(&descriptor.name).contains(query)
+                        && !notarium_syntax::unicode::lookup_key(&body.description).contains(query)
+                }) {
+                    continue;
+                }
+                if items.len() == cap {
+                    has_more = true;
+                    break 'scan;
+                }
+                let enabled = if view == View::Runtime {
+                    descriptor.enabled
+                } else {
+                    inspection.binding_enabled && inspection.preference_enabled
+                };
+                items.push(summary(&inspection, &body.description, enabled, false)?);
+                origin_records.push((body.origin, body.project));
+                if let Some(taint) = body.deferred_taint {
+                    deferred_taints.push(taint);
+                }
+                last_key = Some(key);
+            }
+            if page.continuation.is_none() {
+                break;
+            }
+            control_cursor = page.continuation;
         }
+        if has_more {
+            last_key.map(AbilityCursorInner::ProviderAfter)
+        } else {
+            None
+        }
+    };
+
+    for (origin, proj) in origin_records {
+        call.record_origin(origin, proj)?;
     }
-    let next = page
-        .continuation
+    let next = next_inner
         .map(|inner| {
             call.registry
                 .ability_cursors
                 .insert(call.auth.principal().clone(), scope, inner)
         })
         .transpose()?;
+    for commit in deferred_taints {
+        commit.commit()?;
+    }
     let filtered =
         args.kind.is_some() || args.source.is_some() || args.project.is_some() || args.q.is_some();
     let next_action = match &next {
@@ -1209,15 +1357,19 @@ async fn resolve(
 
 pub(crate) async fn bind_chat_role(
     registry: &ToolRegistry,
-    account: AccountContext,
+    owner_account: AccountContext,
+    run_account: AccountContext,
     episode_id: &EpisodeId,
     selector: &str,
     project: Option<&FolderRef>,
     run: &AgentRunId,
 ) -> Result<(), PortError> {
+    // Resolve the requested role inside the run's narrowed Space/Audience/Project
+    // authority so SpaceGroup threads neither collide with unrelated Spaces nor
+    // durably bind a role unreachable to `runtime_abilities::interactive`.
     let ability = match resolve_selector_for_account(
         registry,
-        &account,
+        &run_account,
         selector,
         AbilityKind::Role,
         project.cloned(),
@@ -1235,7 +1387,7 @@ pub(crate) async fn bind_chat_role(
     };
     let episode = registry
         .control
-        .get_episode(account.clone(), episode_id.clone())
+        .get_episode(owner_account.clone(), episode_id.clone())
         .await?;
     if episode.active_role.as_ref() == Some(&ability.reference)
         && episode.project_hint.as_ref() == project
@@ -1256,11 +1408,11 @@ pub(crate) async fn bind_chat_role(
         "notarium.chats.bind-role-input.v1",
         &[&serde_json::to_vec(&mutation).map_err(|_| invalid(ValidationReason::InvalidState))?],
     );
-    let principal = account.auth().principal().clone();
+    let principal = owner_account.auth().principal().clone();
     registry
         .control
         .update_episode(
-            account,
+            owner_account,
             AccountMutation {
                 identity: AccountCommandIdentity {
                     owner: principal.clone(),

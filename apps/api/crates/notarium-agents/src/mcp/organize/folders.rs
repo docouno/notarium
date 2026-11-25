@@ -48,6 +48,8 @@ struct FolderRoute {
     folder: FolderId,
     revision: RevisionId,
     operation: FolderOperation,
+    #[serde(default)]
+    ancestor_revisions: Vec<(FolderId, RevisionId)>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -87,7 +89,11 @@ fn parse_args(name: ToolName, args: Value) -> Result<ParsedFolderArgs, PortError
 }
 
 impl FolderRoute {
-    fn new(source: FolderSnapshot, operation: FolderOperation) -> Result<Self, PortError> {
+    fn new(
+        source: FolderSnapshot,
+        operation: FolderOperation,
+        ancestor_revisions: Vec<(FolderId, RevisionId)>,
+    ) -> Result<Self, PortError> {
         if source.parent.is_none() {
             return Err(invalid(ValidationReason::InvalidPathComponent));
         }
@@ -96,8 +102,61 @@ impl FolderRoute {
             folder: source.reference.folder_id,
             revision: source.revision,
             operation,
+            ancestor_revisions,
         })
     }
+}
+
+async fn capture_ancestor_revisions(
+    call: &ToolCallContext<'_>,
+    scope: &SpaceContext,
+    ancestors: &[FolderId],
+    self_id: &FolderId,
+    extra_parent: Option<&FolderSnapshot>,
+) -> Result<Vec<(FolderId, RevisionId)>, PortError> {
+    let mut revs = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    if let Some(parent) = extra_parent
+        && parent.reference.folder_id != *self_id
+        && seen.insert(parent.reference.folder_id.clone())
+    {
+        revs.push((parent.reference.folder_id.clone(), parent.revision.clone()));
+    }
+    for ancestor in ancestors {
+        if ancestor == self_id || !seen.insert(ancestor.clone()) {
+            continue;
+        }
+        let snap = snapshot_by_id(call, scope, ancestor).await?;
+        revs.push((ancestor.clone(), snap.revision));
+    }
+    Ok(revs)
+}
+
+async fn ancestors_unchanged(
+    call: &ToolCallContext<'_>,
+    scope: &SpaceContext,
+    current: &FolderSnapshot,
+    expected: &[(FolderId, RevisionId)],
+) -> Result<bool, PortError> {
+    let live_ancestors: std::collections::BTreeSet<&FolderId> = current
+        .ancestor_folders
+        .iter()
+        .filter(|id| *id != &current.reference.folder_id)
+        .collect();
+    if live_ancestors.len() != expected.len() {
+        return Ok(false);
+    }
+    for (ancestor_id, expected_rev) in expected {
+        if !live_ancestors.contains(ancestor_id) {
+            return Ok(false);
+        }
+        match snapshot_by_id(call, scope, ancestor_id).await {
+            Ok(snap) if &snap.revision == expected_rev => (),
+            Ok(_) | Err(PortError::Domain(DomainError::ResourceNotFound)) => return Ok(false),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(true)
 }
 
 struct FolderAddress {
@@ -239,25 +298,49 @@ async fn plan(
             admit_folder_snapshot(call, &address.scope, &source).await?;
             let dest = address.resolve(call, &args.to_folder).await?;
             admit_folder_snapshot(call, &address.scope, &dest).await?;
-            let parent = dest.reference.folder_id;
-            let operation = if source.parent.as_ref() == Some(&parent) {
-                FolderOperation::Unchanged
+            let parent = dest.reference.folder_id.clone();
+            let (operation, ancestor_revisions) = if source.parent.as_ref() == Some(&parent) {
+                let revs = capture_ancestor_revisions(
+                    call,
+                    &address.scope,
+                    &source.ancestor_folders,
+                    &source.reference.folder_id,
+                    None,
+                )
+                .await?;
+                (FolderOperation::Unchanged, revs)
             } else {
-                FolderOperation::Move { parent }
+                let revs = capture_ancestor_revisions(
+                    call,
+                    &address.scope,
+                    &dest.ancestor_folders,
+                    &source.reference.folder_id,
+                    Some(&dest),
+                )
+                .await?;
+                (FolderOperation::Move { parent }, revs)
             };
-            FolderRoute::new(source, operation)
+            FolderRoute::new(source, operation, ancestor_revisions)
         }
         ParsedFolderArgs::Rename(args) => {
             let address =
                 FolderAddress::open(call, args.project.as_deref(), args.session.as_ref()).await?;
             let source = address.resolve(call, &args.folder).await?;
             admit_folder_snapshot(call, &address.scope, &source).await?;
+            let ancestor_revisions = capture_ancestor_revisions(
+                call,
+                &address.scope,
+                &source.ancestor_folders,
+                &source.reference.folder_id,
+                None,
+            )
+            .await?;
             let operation = if same_name(&source, &args.name, &args.name) {
                 FolderOperation::Unchanged
             } else {
                 FolderOperation::Rename
             };
-            FolderRoute::new(source, operation)
+            FolderRoute::new(source, operation, ancestor_revisions)
         }
         ParsedFolderArgs::RenameProject(args) => {
             let project = session::resolve_project(call, &args.project).await?;
@@ -275,6 +358,14 @@ async fn plan(
             if display_name.trim().is_empty() || display_name.chars().any(char::is_control) {
                 return Err(invalid(ValidationReason::InvalidPathComponent));
             }
+            let ancestor_revisions = capture_ancestor_revisions(
+                call,
+                &scope,
+                &source.ancestor_folders,
+                &source.reference.folder_id,
+                None,
+            )
+            .await?;
             let operation = if project.project_slug == args.slug
                 && same_name(&source, &args.slug, display_name)
             {
@@ -282,7 +373,7 @@ async fn plan(
             } else {
                 FolderOperation::RenameProject
             };
-            FolderRoute::new(source, operation)
+            FolderRoute::new(source, operation, ancestor_revisions)
         }
     }
 }
@@ -507,7 +598,21 @@ pub(super) async fn handle(
             "versionToken": exact_rev,
         });
         if let Some(current) = snapshot {
-            if current.revision == exact_rev {
+            let stable_ancestors = if current.revision == exact_rev {
+                match ancestors_unchanged(call, &scope, &current, &route.ancestor_revisions).await {
+                    Ok(unchanged) => unchanged,
+                    Err(error) if in_app && corpus::hidden(&error) => {
+                        tracing::debug!(code = error.code(), "folder receipt metadata unavailable");
+                        return Ok(json!({"outcome": "applied"}));
+                    }
+                    Err(error) => {
+                        return Err(super::super::note_tools::post_commit_error(LABEL, error));
+                    }
+                }
+            } else {
+                false
+            };
+            if current.revision == exact_rev && stable_ancestors {
                 let proof = match corpus::folder_metadata(call, &scope, &current).await {
                     Ok(proof) => proof,
                     Err(error) if in_app && corpus::hidden(&error) => {
@@ -551,22 +656,26 @@ pub(super) async fn handle(
     }
     let current = snapshot_by_id(call, &scope, &folder).await?;
     check_noop(call, &scope, &current, &route.revision).await?;
+    let stable_ancestors =
+        ancestors_unchanged(call, &scope, &current, &route.ancestor_revisions).await?;
     let proof = corpus::folder_metadata(call, &scope, &current).await?;
     let mut result = json!({
         "outcome": "unchanged",
         "folderId": current.reference.folder_id,
-        "path": proof["path"],
         "versionToken": current.revision,
     });
-    if name == ToolName::RenameProject {
-        let space = proof["spaceSlug"]
-            .as_str()
-            .ok_or_else(|| invalid(ValidationReason::InvalidState))?;
-        let slug = proof["projectSlug"]
-            .as_str()
-            .ok_or_else(|| invalid(ValidationReason::InvalidState))?;
-        result["handle"] = Value::String(format!("{space}/{slug}"));
-        result["displayName"] = proof["name"].clone();
+    if stable_ancestors {
+        result["path"] = proof["path"].clone();
+        if name == ToolName::RenameProject {
+            let space = proof["spaceSlug"]
+                .as_str()
+                .ok_or_else(|| invalid(ValidationReason::InvalidState))?;
+            let slug = proof["projectSlug"]
+                .as_str()
+                .ok_or_else(|| invalid(ValidationReason::InvalidState))?;
+            result["handle"] = Value::String(format!("{space}/{slug}"));
+            result["displayName"] = proof["name"].clone();
+        }
     }
     Ok(result)
 }

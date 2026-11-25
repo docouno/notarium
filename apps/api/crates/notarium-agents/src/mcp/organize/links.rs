@@ -1,6 +1,8 @@
 mod proposal;
 
-pub(in super::super) use proposal::{ProposalLink, apply_links, describe_links, plan_links};
+pub(in super::super) use proposal::{
+    ProposalLink, apply_links, describe_links, plan_links, validate_link_proposal_input,
+};
 
 use std::collections::BTreeMap;
 

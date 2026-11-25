@@ -87,6 +87,41 @@ pub(in crate::mcp::note_tools) async fn describe(
     )
 }
 
+/// Validate create proposal input shape and envelope-size prebounds without
+/// touching canonical note content. Returns whether any draft declares links
+/// that will probe target notes during planning.
+pub(in crate::mcp::note_tools) fn preflight_input(
+    tool: ToolName,
+    args: &Value,
+) -> Result<bool, PortError> {
+    let max_body = notarium_core::ports::AppendChat::MAX_STRUCTURED_BODY_BYTES - 256;
+    match tool {
+        ToolName::CreateNote => {
+            let input: CreateInput = decode(args.clone())?;
+            if input.draft.body.len() > max_body {
+                return Err(invalid(ValidationReason::BudgetExceeded));
+            }
+            Ok(!input.draft.links.is_empty())
+        }
+        ToolName::CreateNotes => {
+            let input: BatchInput = decode(args.clone())?;
+            let mut total_body = 0usize;
+            let mut has_links = false;
+            for raw in input.notes {
+                if let Ok(draft) = decode::<super::NoteDraft>(raw) {
+                    total_body = total_body.saturating_add(draft.body.len());
+                    has_links |= !draft.links.is_empty();
+                }
+            }
+            if total_body > max_body {
+                return Err(invalid(ValidationReason::BudgetExceeded));
+            }
+            Ok(has_links)
+        }
+        _ => Err(invalid(ValidationReason::InvalidQuery)),
+    }
+}
+
 pub(in crate::mcp::note_tools) async fn prepare(
     owner: &ToolCallContext<'_>,
     provider: &ToolCallContext<'_>,

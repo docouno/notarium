@@ -37,6 +37,78 @@ fn proposal_class(class: DocClass) -> Result<(), PortError> {
     }
 }
 
+pub(in crate::mcp) fn validate_link_proposal_input(
+    name: ToolName,
+    args: &Value,
+) -> Result<(), PortError> {
+    match name {
+        ToolName::Link => {
+            let input: LinkInput = decode(args.clone())?;
+            let _ = NoteId::parse(&input.source)?;
+            Ok(())
+        }
+        ToolName::LinkMany => {
+            let input: LinkManyInput = decode(args.clone())?;
+            if input.links.is_empty() || input.links.len() > 100 {
+                return Err(invalid(ValidationReason::InvalidLimit));
+            }
+            Ok(())
+        }
+        _ => Err(DomainError::ResourceNotFound.into()),
+    }
+}
+
+/// Authorize a confirmed link step while letting canonical `engine.link`
+/// distinguish fresh commits against trashed targets (rejected) from
+/// exact-key idempotent replays after a previously linked target was trashed.
+async fn authorize_confirmed_link(
+    call: &ToolCallContext<'_>,
+    scope: &SpaceContext,
+    plan: &LinkPlan,
+) -> Result<DocClass, PortError> {
+    let source = corpus::note_in_space_preflight(call, scope, &plan.source).await?;
+    corpus::admit_note_write(call, scope, &source).await?;
+    scope
+        .auth()
+        .authorize_direct_write(&source.facts, &source.facts)?;
+    proposal_class(source.facts.class)?;
+    if let Target::Stable { note, alias } = &plan.target {
+        let expected_rev = alias.as_ref().map(|alias| alias.revision.clone());
+        let found = call
+            .registry
+            .engine
+            .get_note_metadata(
+                scope.clone(),
+                GetNote {
+                    note: note.clone(),
+                    revision: expected_rev.clone(),
+                    causal: CausalBasis::Exact(ReceiptSet::default()),
+                },
+            )
+            .await?;
+        if found.metadata.reference().space_id != scope.scope().space_id
+            || found.metadata.reference().note_id != *note
+            || expected_rev
+                .as_ref()
+                .is_some_and(|rev| found.metadata.revision() != rev)
+            || found.metadata.lifecycle() == Lifecycle::Purged
+            || found.metadata.class() == DocClass::EncryptedNote
+        {
+            return Err(DomainError::ResourceNotFound.into());
+        }
+        if let Some(alias) = alias {
+            let title = found
+                .provenance
+                .as_ref()
+                .map(|metadata| metadata.title.trim());
+            if title != Some(alias.title.as_str()) {
+                return Err(invalid(ValidationReason::SourceMismatch));
+            }
+        }
+    }
+    Ok(source.facts.class)
+}
+
 pub(in crate::mcp) async fn plan_links(
     call: &ToolCallContext<'_>,
     provider: &ToolCallContext<'_>,
@@ -266,7 +338,7 @@ pub(in crate::mcp) async fn apply_links(
         let source = (plan.scope.clone(), plan.source.clone());
         let attempt = async {
             let scope = call.space(plan.scope.clone())?;
-            proposal_class(authorize(call, &scope, plan).await?)?;
+            let _ = authorize_confirmed_link(call, &scope, plan).await?;
             let ordinal =
                 u16::try_from(index).map_err(|_| invalid(ValidationReason::InvalidLimit))?;
             let identity = step_identity(ordinal, &plan.scope)?;

@@ -19,7 +19,7 @@ pub use schema::{ToolAnnotations, ToolDescriptor};
 
 use notarium_core::{
     DomainError,
-    auth::{EngineAuthContext, PrincipalKind},
+    auth::{BranchTaint, EngineAuthContext, PrincipalKind},
     classes::ProviderOrigin,
     error::{CommitEffect, OperationalFailure, PortError, RetryAdvice, ValidationReason},
     ids::*,
@@ -392,9 +392,11 @@ impl ToolRegistry {
             EgressTarget::ExternalMcp => AgentTransport::Mcp,
             EgressTarget::InAppProvider { .. } => AgentTransport::Internal,
         };
+        let caller_taint = auth.taint().clone();
         let mut call = ToolCallContext {
             registry: self,
-            auth,
+            auth: auth.with_staged_taint(),
+            caller_taint: caller_taint.clone(),
             target: ctx.target,
             tool,
             request,
@@ -499,6 +501,9 @@ impl ToolRegistry {
             McpToolResult::new(tool, payload, display, std::mem::take(&mut call.provenance))
         }
         .await;
+        if result.is_ok() && call.auth.taint().is_tainted() {
+            caller_taint.mark_external_read();
+        }
 
         let (outcome, failure) = match &result {
             Ok(_) => (AgentOutcome::Succeeded, None),
@@ -583,6 +588,7 @@ fn command_actor(auth: &EngineAuthContext) -> &str {
 struct ToolCallContext<'a> {
     registry: &'a ToolRegistry,
     auth: EngineAuthContext,
+    caller_taint: BranchTaint,
     target: EgressTarget,
     tool: ToolName,
     request: RequestId,
@@ -596,10 +602,19 @@ struct ToolCallContext<'a> {
 }
 
 impl<'a> ToolCallContext<'a> {
+    /// Mark external-read taint on both the staged tool auth and the caller's
+    /// live `BranchTaint` before crossing an irreversible probe boundary.
+    pub(super) fn commit_external_read(&self) {
+        self.auth.taint().mark_external_read();
+        self.caller_taint.mark_external_read();
+    }
+
     fn detached_human(&self, auth: EngineAuthContext) -> ToolCallContext<'a> {
+        let caller_taint = auth.taint().clone();
         ToolCallContext {
             registry: self.registry,
             auth,
+            caller_taint,
             target: EgressTarget::ExternalMcp,
             tool: self.tool,
             request: self.request.clone(),
@@ -620,9 +635,11 @@ impl<'a> ToolCallContext<'a> {
         tool: ToolName,
         proposal: ContentDigest,
     ) -> Result<Self, PortError> {
+        let caller_taint = auth.taint().clone();
         Ok(Self {
             registry,
             auth,
+            caller_taint,
             tool,
             target: EgressTarget::ExternalMcp,
             request: budget.request,

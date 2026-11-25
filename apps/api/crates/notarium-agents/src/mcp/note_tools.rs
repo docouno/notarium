@@ -25,7 +25,8 @@ mod proposal;
 
 pub(super) use create::{batch_operational_error, post_commit_error};
 pub(super) use proposal::{
-    PreparedNoteAction, apply_proposal, describe_proposal, plan_proposal, preview_proposal,
+    PreparedNoteAction, apply_proposal, describe_proposal, plan_proposal, preflight_proposal,
+    preview_proposal,
 };
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -422,6 +423,92 @@ impl JournaledDestination {
 }
 
 #[allow(clippy::too_many_arguments)]
+async fn validate_destination(
+    call: &ToolCallContext<'_>,
+    scope: &SpaceContext,
+    class: DocClass,
+    ensured: JournaledDestination,
+    has_path: bool,
+) -> Result<(FolderRef, bool), PortError> {
+    const ERR_LABEL: &str = "notarium.mcp.folder-destination.v1";
+    let (destination, created) = ensured.into_parts(has_path);
+    if destination.space_id != scope.scope().space_id {
+        let mismatch = invalid(ValidationReason::ScopeMismatch);
+        return Err(if created {
+            post_commit_error(ERR_LABEL, mismatch)
+        } else {
+            mismatch
+        });
+    }
+    let live = call
+        .registry
+        .catalog
+        .folder(call.account(), destination.clone())
+        .await
+        .map_err(|error| {
+            if created {
+                post_commit_error(ERR_LABEL, error)
+            } else {
+                batch_operational_error(ERR_LABEL, error, false)
+            }
+        })?;
+    if live.reference != destination
+        || live.space.id != destination.space_id
+        || live.lifecycle != Lifecycle::Active
+    {
+        let not_found: PortError = DomainError::ResourceNotFound.into();
+        return Err(if created {
+            post_commit_error(ERR_LABEL, not_found)
+        } else {
+            not_found
+        });
+    }
+    scope
+        .auth()
+        .can_view_folder(&live.space, &destination.folder_id, &live.ancestor_folders)
+        .map_err(|error| {
+            let err: PortError = error.into();
+            if created {
+                post_commit_error(ERR_LABEL, err)
+            } else {
+                err
+            }
+        })?;
+    if matches!(call.target, EgressTarget::InAppProvider { .. }) {
+        let resolved = folder_base(call, scope, &destination.folder_id)
+            .await
+            .map_err(|error| {
+                if created {
+                    post_commit_error(ERR_LABEL, error)
+                } else {
+                    batch_operational_error(ERR_LABEL, error, false)
+                }
+            })?;
+        let project = resolved.project.map(|folder_id| FolderRef {
+            space_id: destination.space_id.clone(),
+            folder_id,
+        });
+        corpus::admit_folder_write(
+            call,
+            scope,
+            &destination,
+            project,
+            &live.ancestor_folders,
+            class,
+        )
+        .await
+        .map_err(|error| {
+            if created {
+                post_commit_error(ERR_LABEL, error)
+            } else {
+                batch_operational_error(ERR_LABEL, error, false)
+            }
+        })?;
+    }
+    Ok((destination, created))
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn ensure_destination(
     call: &ToolCallContext<'_>,
     scope: &SpaceContext,
@@ -519,81 +606,7 @@ async fn ensure_destination(
                 }
             })?
     };
-    let (destination, created) = ensured.into_parts(has_path);
-    if destination.space_id != scope.scope().space_id {
-        let mismatch = invalid(ValidationReason::ScopeMismatch);
-        return Err(if created {
-            post_commit_error(ERR_LABEL, mismatch)
-        } else {
-            mismatch
-        });
-    }
-    let live = call
-        .registry
-        .catalog
-        .folder(call.account(), destination.clone())
-        .await
-        .map_err(|error| {
-            if created {
-                post_commit_error(ERR_LABEL, error)
-            } else {
-                batch_operational_error(ERR_LABEL, error, false)
-            }
-        })?;
-    if live.reference != destination
-        || live.space.id != destination.space_id
-        || live.lifecycle != Lifecycle::Active
-    {
-        let not_found: PortError = DomainError::ResourceNotFound.into();
-        return Err(if created {
-            post_commit_error(ERR_LABEL, not_found)
-        } else {
-            not_found
-        });
-    }
-    scope
-        .auth()
-        .can_view_folder(&live.space, &destination.folder_id, &live.ancestor_folders)
-        .map_err(|error| {
-            let err: PortError = error.into();
-            if created {
-                post_commit_error(ERR_LABEL, err)
-            } else {
-                err
-            }
-        })?;
-    if matches!(call.target, EgressTarget::InAppProvider { .. }) {
-        let resolved = folder_base(call, scope, &destination.folder_id)
-            .await
-            .map_err(|error| {
-                if created {
-                    post_commit_error(ERR_LABEL, error)
-                } else {
-                    batch_operational_error(ERR_LABEL, error, false)
-                }
-            })?;
-        let project = resolved.project.map(|folder_id| FolderRef {
-            space_id: destination.space_id.clone(),
-            folder_id,
-        });
-        corpus::admit_folder_write(
-            call,
-            scope,
-            &destination,
-            project,
-            &live.ancestor_folders,
-            class,
-        )
-        .await
-        .map_err(|error| {
-            if created {
-                post_commit_error(ERR_LABEL, error)
-            } else {
-                batch_operational_error(ERR_LABEL, error, false)
-            }
-        })?;
-    }
-    Ok((destination, created))
+    validate_destination(call, scope, class, ensured, has_path).await
 }
 
 async fn move_note(call: &mut ToolCallContext<'_>, input: MoveInput) -> Result<Value, PortError> {
@@ -603,29 +616,42 @@ async fn move_note(call: &mut ToolCallContext<'_>, input: MoveInput) -> Result<V
     let (scope, before) = route_metadata_snapshot(call, &route).await?;
     let slug = note_slug(before.provenance.as_ref())?;
     let class = before.metadata.class();
-    let base = scope
-        .auth()
-        .spaces()
-        .get(&route.scope.space_id)
-        .and_then(|grant| grant.project_root.clone());
-    let path = if let Some(base) = &base {
-        let root = folder_base(call, &scope, base).await?;
-        corpus::strip_folder_prefix(&folder, &root.path).ok_or(DomainError::SpaceReadOnly)?
-    } else {
-        folder
-    };
     let identity = call.command_identity(&route.scope, "move_note", 0);
-    let (parent, created_folder) = ensure_destination(
-        call,
-        &scope,
-        base,
-        path,
-        class,
-        &identity,
-        "move_destination",
-        Some(&route),
-    )
-    .await?;
+    // Consult the journaled destination before stripping the live project path
+    // prefix so a project-scoped replay survives a subsequent project rename.
+    let (parent, created_folder) = if let Some(hit) = call
+        .lookup_journal_with_key::<JournaledDestination>(
+            "move_destination",
+            &identity.key,
+            identity.hash,
+        )
+        .await?
+    {
+        validate_destination(call, &scope, class, hit, !folder.is_empty()).await?
+    } else {
+        let base = scope
+            .auth()
+            .spaces()
+            .get(&route.scope.space_id)
+            .and_then(|grant| grant.project_root.clone());
+        let path = if let Some(base) = &base {
+            let root = folder_base(call, &scope, base).await?;
+            corpus::strip_folder_prefix(&folder, &root.path).ok_or(DomainError::SpaceReadOnly)?
+        } else {
+            folder
+        };
+        ensure_destination(
+            call,
+            &scope,
+            base,
+            path,
+            class,
+            &identity,
+            "move_destination",
+            Some(&route),
+        )
+        .await?
+    };
     let writer = call
         .corpus_writer(scope.clone())
         .await

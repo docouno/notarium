@@ -1291,9 +1291,38 @@ fn provider_policy_rejection_does_not_flip_cross_space_branch_taint() {
             sender_consented: true,
         },
     };
+    // Snapshot untainted clones before the positive chat control flips `auth`.
+    let meta_auth = auth.with_preflight_taint();
+    let doc_auth = auth.with_preflight_taint();
+    let ab_auth = auth.with_preflight_taint();
+
     assert!(ClassEgressFence::chat(chat_entry, &auth, &consented_chat).is_ok());
     assert!(
         auth.taint().is_tainted(),
         "admitted cross-space chat entry MUST flip BranchTaint"
     );
+
+    // Local positive controls for provider_note_metadata, provider, and ability:
+    // admitting each cross-space resource on a fresh untainted branch MUST flip BranchTaint.
+    let all_allowed = ProviderPolicy {
+        provider: ProviderResourceId::from_bytes([9; 16]),
+        allowed_classes: DocClass::all(),
+        audience: ProviderAudience::Shared {
+            space: s2.id.clone(),
+            attached: true,
+            space_consented: true,
+            sender_consented: true,
+        },
+    };
+    assert!(!meta_auth.taint().is_tainted());
+    assert!(ClassEgressFence::provider_note_metadata(&meta, &meta_auth, &all_allowed).is_ok());
+    assert!(meta_auth.taint().is_tainted());
+
+    assert!(!doc_auth.taint().is_tainted());
+    assert!(ClassEgressFence::provider(doc, &doc_auth, &all_allowed).is_ok());
+    assert!(doc_auth.taint().is_tainted());
+
+    assert!(!ab_auth.taint().is_tainted());
+    assert!(ClassEgressFence::ability(ability, &ab_auth, &all_allowed).is_ok());
+    assert!(ab_auth.taint().is_tainted());
 }

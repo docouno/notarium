@@ -450,6 +450,33 @@ pub(super) async fn edit_folder_cover_and_view(fixture: &RuntimeFixture, space: 
     .unwrap()
     .structured_content;
     assert_eq!(replayed_proj, renamed_proj);
+    // Replaying rename_folder after renaming its containing ancestor project
+    // must preserve the exact original versionToken and omit the mutated live path.
+    let replayed_rename_after_proj = call(
+        fixture,
+        account,
+        163,
+        "rename_folder",
+        json!({
+            "project":project,"folder":"archive/guides","name":"handbook",
+        }),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    assert_eq!(replayed_rename_after_proj["outcome"], "applied");
+    assert_eq!(
+        replayed_rename_after_proj["folderId"],
+        renamed_folder["folderId"]
+    );
+    assert_eq!(
+        replayed_rename_after_proj["versionToken"],
+        renamed_folder["versionToken"]
+    );
+    assert!(
+        replayed_rename_after_proj.get("path").is_none(),
+        "replaying rename_folder after an ancestor project rename must not leak the mutated ancestor path: {replayed_rename_after_proj}"
+    );
     let adjusted = call(
         fixture,
         account,

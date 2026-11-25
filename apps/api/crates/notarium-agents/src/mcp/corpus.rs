@@ -384,6 +384,43 @@ async fn admit_metadata(
     }
 }
 
+pub(super) async fn note_metadata_visible_preflight(
+    call: &ToolCallContext<'_>,
+    scope: &SpaceContext,
+    metadata: &ClassifiedMetadata,
+) -> Result<(), PortError> {
+    if let Some(selection) = note_policy(call, scope, metadata).await? {
+        let _ = ClassEgressFence::provider_note_metadata_preflight(
+            metadata,
+            scope.auth(),
+            &selection.policy,
+        )?;
+    } else {
+        let _ = ClassEgressFence::search_preflight(metadata.clone(), scope.auth())?;
+    }
+    Ok(())
+}
+
+pub(super) async fn space_admits_skill(
+    call: &ToolCallContext<'_>,
+    space_id: &SpaceId,
+    project: Option<FolderRef>,
+) -> Result<bool, PortError> {
+    let scope = match session::space(call, space_id).await {
+        Ok(scope) => scope,
+        Err(error) if hidden(&error) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let Some(selection) = (match select_source(call, &scope, project, Some(&call.policies)).await {
+        Ok(selection) => selection,
+        Err(error) if hidden(&error) => return Ok(false),
+        Err(error) => return Err(error),
+    }) else {
+        return Ok(true);
+    };
+    Ok(selection.policy.allowed_classes.contains(&DocClass::Skill))
+}
+
 pub(super) async fn note_metadata_origin(
     call: &ToolCallContext<'_>,
     scope: &SpaceContext,

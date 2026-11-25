@@ -722,6 +722,23 @@ async fn binding_replay_after_advance_and_trash(
         .await
         .unwrap();
     assert_eq!(direct_committed.value.reference, r1_ref);
+    let acc_pref_req = AccountMutation {
+        identity: runtime_ability_cases::identity(fixture, human, 0xf2).await,
+        input: AbilityPreferenceChange {
+            preference: AbilityPreferenceUpdate {
+                ability: r1_ref.clone(),
+                enabled: false,
+            },
+            expected: AbilityPreferenceGuard::Account,
+        },
+    };
+    let acc_pref_committed = fixture
+        .control
+        .set_ability_preference(human.clone(), acc_pref_req.clone())
+        .await
+        .unwrap();
+    assert_eq!(acc_pref_committed.value.ability, r1_ref);
+    assert!(!acc_pref_committed.value.enabled);
     // Advance package R1 -> R2.
     let current_view = call(
         fixture,
@@ -774,6 +791,41 @@ async fn binding_replay_after_advance_and_trash(
         .await
         .unwrap();
     assert_eq!(replayed_direct_trashed.value.reference, r1_ref);
+    let replayed_acc_pref_trashed = fixture
+        .control
+        .set_ability_preference(human.clone(), acc_pref_req)
+        .await
+        .unwrap();
+    assert_eq!(
+        replayed_acc_pref_trashed.revision,
+        acc_pref_committed.revision
+    );
+    assert_eq!(replayed_acc_pref_trashed.value.ability, r1_ref);
+    // Fresh Account-guarded binding/preference updates targeting a trashed/stale
+    // canonical ability must fail cleanly rather than committing orphaned rows.
+    let stale_acc_pref = fixture
+        .control
+        .set_ability_preference(
+            human.clone(),
+            AccountMutation {
+                identity: runtime_ability_cases::identity(fixture, human, 0xf3).await,
+                input: AbilityPreferenceChange {
+                    preference: AbilityPreferenceUpdate {
+                        ability: r1_ref.clone(),
+                        enabled: true,
+                    },
+                    expected: AbilityPreferenceGuard::Account,
+                },
+            },
+        )
+        .await;
+    assert!(
+        matches!(
+            stale_acc_pref,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ),
+        "fresh Account preference update against trashed ability must reject: {stale_acc_pref:?}"
+    );
     let replayed_avail_trashed = call(fixture, human, 0xe1, "edit_ability", avail_edit)
         .await
         .expect("replaying availability edit after trash must return exact original receipt");

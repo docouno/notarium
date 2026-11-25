@@ -268,12 +268,18 @@ async fn describe_view(
         page_incomplete |= page.rows.incomplete;
         for row in page.rows.items {
             let proof = row.card.document.provenance();
-            match corpus::note_metadata(call, ctx, proof).await {
-                Ok(()) => {
-                    if *remaining == 0 {
+            if *remaining == 0 {
+                match corpus::note_metadata_visible_preflight(call, ctx, proof).await {
+                    Ok(()) => {
                         rows_truncated = true;
                         break;
                     }
+                    Err(error) if corpus::hidden(&error) => continue,
+                    Err(error) => return Err(error),
+                }
+            }
+            match corpus::note_metadata(call, ctx, proof).await {
+                Ok(()) => {
                     rows.push(json!({
                         "id": proof.reference().note_id,
                         "title": row.card.title,

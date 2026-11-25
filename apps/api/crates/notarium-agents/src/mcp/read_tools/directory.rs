@@ -186,7 +186,7 @@ pub(super) async fn list(call: &mut ToolCallContext<'_>, args: Value) -> Result<
     let previous = args
         .cursor
         .as_deref()
-        .map(|raw| call.registry.note_cursors.open(raw))
+        .map(|raw| call.registry.note_cursors.open(call.auth.principal(), raw))
         .transpose()?;
     if let Some(previous) = &previous {
         scope.scope().check(&previous.scope)?;

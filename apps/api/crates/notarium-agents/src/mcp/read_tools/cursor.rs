@@ -82,7 +82,11 @@ impl NoteCursors {
         Ok(format!("{CURSOR_PREFIX}{id:032x}"))
     }
 
-    pub(super) fn open(&self, token: &str) -> Result<NoteContinuation, PortError> {
+    pub(super) fn open(
+        &self,
+        principal: &PrincipalId,
+        token: &str,
+    ) -> Result<NoteContinuation, PortError> {
         let stale = || invalid(ValidationReason::CursorStale);
         let key = token.strip_prefix(CURSOR_PREFIX).ok_or_else(stale)?;
         if key.len() != 32 {
@@ -92,7 +96,11 @@ impl NoteCursors {
         let entries = self.entries.lock().unwrap_or_else(|err| err.into_inner());
         entries
             .iter()
-            .find(|entry| entry.id == id && entry.opened.elapsed() < CURSOR_TTL)
+            .find(|entry| {
+                entry.id == id
+                    && &entry.principal == principal
+                    && entry.opened.elapsed() < CURSOR_TTL
+            })
             .map(|entry| entry.cursor.clone())
             .ok_or_else(stale)
     }
@@ -133,16 +141,18 @@ mod tests {
             .unwrap();
 
         assert!(!token.contains(child.as_str()));
-        assert!(cursors.open(&format!("{token}0")).is_err());
-        assert!(NoteCursors::default().open(&token).is_err());
+        assert!(cursors.open(&principal, &format!("{token}0")).is_err());
+        assert!(NoteCursors::default().open(&principal, &token).is_err());
         for _ in 0..2 {
-            let cursor = cursors.open(&token).unwrap();
+            let cursor = cursors.open(&principal, &token).unwrap();
             assert_eq!(cursor.folder, folder);
             assert_eq!(cursor.folders.as_ref(), Some(&child));
         }
 
-        // Per-principal quota prevents one noisy principal from evicting another.
+        // Per-principal quota prevents one noisy principal from evicting another,
+        // and cross-principal cursor lookups fail uniformly with CursorStale.
         let noisy = PrincipalId::from_bytes([10; 16]);
+        assert!(cursors.open(&noisy, &token).is_err());
         for _ in 0..(MAX_CURSORS_PER_PRINCIPAL * 2) {
             let _ = cursors
                 .insert(
@@ -159,6 +169,6 @@ mod tests {
                 )
                 .unwrap();
         }
-        assert!(cursors.open(&token).is_ok());
+        assert!(cursors.open(&principal, &token).is_ok());
     }
 }

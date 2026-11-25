@@ -1559,10 +1559,10 @@ impl ClassEgressFence {
         document.facts.allow_egress(document.lifecycle, auth)?;
         Ok(SearchMetadata(document))
     }
-    /// Untainted candidate metadata check used exclusively for recipient
-    /// preflight before hydration so rejected hits in unconsented Spaces or
-    /// Projects do not flip cross-space `BranchTaint`. Final hydration still
-    /// runs taint-marking `authorize_read` on every admitted hit.
+    /// Untainted candidate metadata check used for search preflight before
+    /// live-visibility filtering, hydration, and packing so rejected or
+    /// packed-out hits do not flip cross-space `BranchTaint`. Final result
+    /// admission commits taint via `search_metadata` only on surviving hits.
     pub fn search_preflight(
         document: ClassifiedMetadata,
         auth: &EngineAuthContext,

@@ -568,6 +568,32 @@ impl EngineAuthContext {
         }
     }
 
+    /// Clone this auth context with a detached `BranchTaint` initialized from
+    /// the caller's current taint state, preserving all grants and rights.
+    /// Tool boundaries use this to stage cross-space taint and commit it back
+    /// to the caller's `BranchTaint` only when a call succeeds or crosses an
+    /// irreversible probing boundary.
+    pub fn with_staged_taint(&self) -> Self {
+        let taint = BranchTaint::default();
+        if self.taint.is_tainted() {
+            taint.mark_external_read();
+        }
+        Self {
+            taint,
+            ..self.clone()
+        }
+    }
+
+    /// Narrow readable/writable spaces to the intersection with `allowed`.
+    pub fn restrict_to_spaces(&self, allowed: &BTreeSet<SpaceId>) -> Self {
+        let mut spaces = self.spaces.clone();
+        spaces.retain(|space_id, _| allowed.contains(space_id));
+        Self {
+            spaces,
+            ..self.clone()
+        }
+    }
+
     fn narrow(&self, requested: BTreeMap<SpaceId, SpaceGrant>) -> DomainResult<Self> {
         if self.proposal_read {
             return Err(DomainError::AccessDenied);

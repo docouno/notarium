@@ -241,7 +241,7 @@ impl ControlService {
                         .await?;
                 }
             }
-            let pin = if authoring {
+            let pin = if value.entrypoint.is_some() {
                 Some(
                     budget
                         .run(
@@ -391,7 +391,7 @@ impl ControlService {
             if value.reference != input.ability {
                 return Err(DomainError::ResourceNotFound.into());
             }
-            let pin = if authoring {
+            let pin = if value.entrypoint.is_some() {
                 Some(
                     budget
                         .run(
@@ -408,8 +408,7 @@ impl ControlService {
         .await;
         let (prechecked, mut pin) = match prechecked {
             Ok((value, pin)) => (Ok(value), pin),
-            Err(error) if authoring => (Err(error), None),
-            Err(error) => return Err(error),
+            Err(error) => (Err(error), None),
         };
         let mut tx = match self.store.write(budget.clone()).await {
             Ok(tx) => tx,
@@ -436,25 +435,28 @@ impl ControlService {
                 if !(auth.human_management() || auth.has_cap(Cap::AbilityWrite)) {
                     return Err(DomainError::AbilityWriteForbidden.into());
                 }
-                if !auth.human_management() {
-                    let entry = prechecked
-                        .as_ref()
-                        .ok()
-                        .and_then(|value| value.entrypoint.as_ref())
-                        .ok_or(DomainError::AbilityWriteForbidden)?;
-                    let grant = auth.spaces().get(&entry.space_id).ok_or_else(access_denied)?;
-                    if grant.role == SpaceRole::Viewer
-                        || !grant.write_classes.contains(&DocClass::Skill)
-                        || grant.project_root.as_ref().is_some_and(|root| !matches!(&input.ability.placement, AbilityPlacement::OwnedProject(folder) if &folder.folder_id == root))
-                    {
-                        return Err(access_denied());
-                    }
-                }
                 let owner = user(tx.inner_mut(), auth.principal().as_str()).await?;
                 (owner, AccountContext::new(auth, ctx.budget.clone()))
             };
             if let Some(replay) = command.replay::<AbilityPreferenceUpdate>(tx.inner_mut()).await? { return Ok(replay); }
             let value = prechecked?;
+            if !authoring && !live_ctx.auth().human_management() {
+                let entry = value
+                    .entrypoint
+                    .as_ref()
+                    .ok_or(DomainError::AbilityWriteForbidden)?;
+                let grant = live_ctx
+                    .auth()
+                    .spaces()
+                    .get(&entry.space_id)
+                    .ok_or_else(access_denied)?;
+                if grant.role == SpaceRole::Viewer
+                    || !grant.write_classes.contains(&DocClass::Skill)
+                    || grant.project_root.as_ref().is_some_and(|root| !matches!(&input.ability.placement, AbilityPlacement::OwnedProject(folder) if &folder.folder_id == root))
+                {
+                    return Err(access_denied());
+                }
+            }
             self.ensure_current_ability_mutation(tx.inner_mut(), &live_ctx, &value).await?;
             let key = placement(&input.ability.placement)?;
             let existing = ability_preference(tx.inner_mut(), live_ctx.auth().principal(), &key, &input.ability.id).await?;

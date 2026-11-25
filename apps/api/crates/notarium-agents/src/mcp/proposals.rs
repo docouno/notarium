@@ -78,7 +78,7 @@ async fn admit_proposal_targets(
     call: &ToolCallContext<'_>,
     planning: &ToolCallContext<'_>,
     args: &Value,
-) -> Result<(), PortError> {
+) -> Result<bool, PortError> {
     let collapse = |error: PortError| {
         if corpus::hidden(&error) {
             DomainError::ResourceNotFound.into()
@@ -95,6 +95,7 @@ async fn admit_proposal_targets(
             corpus::admit_provider_note_read(call, &scope, &note)
                 .await
                 .map_err(collapse)?;
+            note_tools::preflight_proposal(call, planning, call.tool, args).await
         }
         ToolName::CreateNote | ToolName::CreateNotes => {
             let handle = args["project"]
@@ -125,8 +126,10 @@ async fn admit_proposal_targets(
             )
             .await
             .map_err(collapse)?;
+            note_tools::preflight_proposal(call, planning, call.tool, args).await
         }
         ToolName::Link => {
+            organize::validate_link_proposal_input(call.tool, args)?;
             let note_id = reference(args, "from")?;
             let (scope, note) = corpus::locate_note_preflight(call, &note_id)
                 .await
@@ -134,16 +137,14 @@ async fn admit_proposal_targets(
             corpus::admit_provider_note_read(call, &scope, &note)
                 .await
                 .map_err(collapse)?;
+            Ok(true)
         }
         ToolName::LinkMany => {
-            let items = args["links"]
-                .as_array()
-                .ok_or_else(|| invalid(ValidationReason::InvalidQuery))?;
-            if items.is_empty() || items.len() > 100 {
-                return Err(invalid(ValidationReason::InvalidLimit));
-            }
+            organize::validate_link_proposal_input(call.tool, args)?;
+            Ok(true)
         }
         ToolName::RememberAboutUser => {
+            let _: MemoryArgs = super::decode(args.clone())?;
             let target = MemoryTarget::User {
                 owner: call.auth.principal().clone(),
             };
@@ -178,8 +179,10 @@ async fn admit_proposal_targets(
             corpus::admit_folder_boundary(call, &scope, &folder_ref, None, &[], required_class)
                 .await
                 .map_err(collapse)?;
+            Ok(true)
         }
         ToolName::RememberAboutProject => {
+            let _: MemoryArgs = super::decode(args.clone())?;
             let handle = args["project"]
                 .as_str()
                 .ok_or_else(|| invalid(ValidationReason::InvalidQuery))?;
@@ -190,10 +193,10 @@ async fn admit_proposal_targets(
             super::memory::admit_project_boundary(call, &project.folder, has_version_token)
                 .await
                 .map_err(collapse)?;
+            Ok(true)
         }
-        _ => return Err(invalid(ValidationReason::InvalidQuery)),
+        _ => Err(invalid(ValidationReason::InvalidQuery)),
     }
-    Ok(())
 }
 
 pub(super) async fn prepare(
@@ -212,12 +215,20 @@ pub(super) async fn prepare(
         )
         .await?;
     let planning = call.detached_human(owner);
-    // Enforce live InAppProvider consent and bounds before marking external
-    // taint or reading any note content/titles under detached human authority.
-    admit_proposal_targets(call, &planning, &args).await?;
-    // Mark external-read taint before probing or planning via detached human
-    // authority so failed probes cannot remain untainted.
-    call.auth.taint().mark_external_read();
+    // Enforce live InAppProvider consent, destination bounds, and pure argument
+    // validation before marking external taint or reading any note content/titles
+    // under detached human authority.
+    let probes_foreign_corpus = admit_proposal_targets(call, &planning, &args).await?;
+    if probes_foreign_corpus {
+        // Mark permanent external-read taint before probing or planning via
+        // detached human authority so failed content probes cannot stay untainted.
+        call.commit_external_read();
+    } else {
+        // Link-free create proposals do not probe note bodies; stage taint so
+        // pre-delivery proposal budget failures remain untainted while any
+        // emitted proposal commits external-read taint on return.
+        call.auth.taint().mark_external_read();
+    }
     let action = match call.tool {
         ToolName::Link | ToolName::LinkMany => {
             ProposedAction::Links(organize::plan_links(&planning, call, call.tool, args).await?)
