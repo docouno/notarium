@@ -13195,7 +13195,7 @@ async fn shared_chat_and_post_trash_seams(
 
     // Personal chat in personal space with a personal role attaching two skills in
     // distinct project_only projects of s2 (s2/proj-a and s2/proj-b, no Space(s2) consent)
-    // must omit the conflicting second project_only skill and complete cleanly!
+    // must admit BOTH explicitly consented project_only skills per-project and complete cleanly!
     let p_chat = ChatThreadId::from_bytes([0xD1, 111, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
     fixture
         .canonical
@@ -13251,13 +13251,13 @@ async fn shared_chat_and_post_trash_seams(
     assert!(sub_p.run.is_some());
     let (mut wire2, prompt2) = timeout(Duration::from_secs(15), read_request(listener))
         .await
-        .expect("personal chat must omit conflicting second project_only skill and reach provider");
+        .expect("personal chat must admit both consented project_only skills and reach provider");
     let prompt2_text = prompt2.to_string();
     assert!(
         prompt2_text.contains("PERSONAL-TWO-SEC-ROLE-MARKER")
             && prompt2_text.contains("S2-PROJ-A-SKILL-MARKER")
-            && !prompt2_text.contains("S2-PROJ-B-CONFLICT-SECRET"),
-        "must include role + s2/proj-a skill and omit conflicting s2/proj-b skill: {prompt2_text}"
+            && prompt2_text.contains("S2-PROJ-B-CONFLICT-SECRET"),
+        "must include role + both consented s2/proj-a and s2/proj-b skills: {prompt2_text}"
     );
     send_ollama(
         &mut wire2,
@@ -19579,14 +19579,23 @@ async fn authority_cursors_oracles_and_trashed_ancestry_hardening(
     })
     .await;
     box_step(|| {
-        round60_offer_and_selected_skill_seams(fixture, local, &owner, &pscope, &s2_sc, s2)
+        hardened_offer_and_selected_skill_seams(fixture, local, &owner, &pscope, &s2_sc, s2)
     })
     .await;
-    box_step(|| round60_removed_space_episode_seams(fixture, &owner, actor)).await;
-    box_step(|| round60_trashed_source_trail_seams(fixture, &s2_sc, s2, s2_p1, s2_epoch, actor))
+    box_step(|| hardened_removed_space_episode_seams(fixture, &owner, actor)).await;
+    box_step(|| hardened_trashed_source_trail_seams(fixture, &s2_sc, s2, s2_p1, s2_epoch, actor))
         .await;
-    box_step(|| round60_schedule_and_legacy_replay_seams(fixture, local, s2, actor)).await;
-    box_step(|| round60_prefix_strip_crash_replay_seams(fixture, s2, s2_epoch, actor)).await;
+    box_step(|| hardened_schedule_and_legacy_replay_seams(fixture, local, s2, actor)).await;
+    box_step(|| hardened_prefix_strip_crash_replay_seams(fixture, s2, s2_epoch, actor)).await;
+    box_step(|| {
+        hardened_multi_project_secondary_space_seams(fixture, &pscope, s1, s1_p1, s1_p2, actor)
+    })
+    .await;
+    box_step(|| hardened_retrieval_error_and_taint_oracle_seams(fixture, local, &pscope, s2)).await;
+    box_step(|| {
+        hardened_legacy_precheck_and_trail_write_seams(fixture, &s2_sc, s2, s2_epoch, actor)
+    })
+    .await;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -23357,7 +23366,7 @@ async fn folder_move_large_view_and_session_rotation_seams(
 
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
-async fn round60_offer_and_selected_skill_seams(
+async fn hardened_offer_and_selected_skill_seams(
     fixture: &RuntimeFixture,
     local: &LoopbackProvider,
     owner: &AccountContext,
@@ -23418,7 +23427,7 @@ async fn round60_offer_and_selected_skill_seams(
         "create_ability",
         json!({
             "kind": "skill",
-            "name": "r60-selected-space-skill",
+            "name": "h6a-selected-space-skill",
             "description": "Selected-project space skill.",
             "instructions": "Only valid in s2_p1.\n",
             "placement": { "home": "space", "space": s2.slug },
@@ -23471,7 +23480,7 @@ async fn round60_offer_and_selected_skill_seams(
                 ]),
             },
             "use_skill",
-            json!({ "skill": "r60-selected-space-skill", "project": s2_p1_handle }),
+            json!({ "skill": "h6a-selected-space-skill", "project": s2_p1_handle }),
         )
         .await;
     assert!(
@@ -23507,7 +23516,7 @@ async fn round60_offer_and_selected_skill_seams(
                 ]),
             },
             "use_skill",
-            json!({ "skill": "r60-selected-space-skill", "project": s2_p1_handle }),
+            json!({ "skill": "h6a-selected-space-skill", "project": s2_p1_handle }),
         )
         .await;
     assert!(
@@ -23521,7 +23530,7 @@ async fn round60_offer_and_selected_skill_seams(
 }
 
 #[inline(never)]
-async fn round60_removed_space_episode_seams(
+async fn hardened_removed_space_episode_seams(
     fixture: &mut RuntimeFixture,
     owner: &AccountContext,
     actor: &PrincipalId,
@@ -23561,7 +23570,7 @@ async fn round60_removed_space_episode_seams(
             AccountMutation {
                 identity: identity(fixture, &owner_fresh, 0xEC).await,
                 input: NewAccount {
-                    username: "bob_r60_ep_rm".into(),
+                    username: "bob_removed_space_ep".into(),
                     email: None,
                     display_name: "Bob RM".into(),
                 },
@@ -23614,7 +23623,7 @@ async fn round60_removed_space_episode_seams(
         "start_session",
         json!({
             "project": format!("{}/p-rm", s_rm.slug),
-            "session": { "name": "r60-removed-space-ep" },
+            "session": { "name": "h6a-removed-space-ep" },
         }),
     )
     .await
@@ -23669,7 +23678,7 @@ async fn round60_removed_space_episode_seams(
         [0xED, 13, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
         "start_session",
         json!({
-            "session": { "name": "r60-removed-space-ep" },
+            "session": { "name": "h6a-removed-space-ep" },
             "role": sys_role,
         }),
     )
@@ -23681,7 +23690,7 @@ async fn round60_removed_space_episode_seams(
 
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
-async fn round60_trashed_source_trail_seams(
+async fn hardened_trashed_source_trail_seams(
     fixture: &RuntimeFixture,
     s2_sc: &SpaceContext,
     s2: &AccessibleSpace,
@@ -23700,10 +23709,10 @@ async fn round60_trashed_source_trail_seams(
             active_epoch: s2_epoch,
             folder_id: p_src_id.clone(),
             parent: None,
-            slug: "r60-trail-src".into(),
-            display_name: "R60 Trail Src".into(),
+            slug: "h6a-trail-src".into(),
+            display_name: "Trail Source Project".into(),
             is_project: true,
-            project_slug: Some("r60-trail-src".into()),
+            project_slug: Some("h6a-trail-src".into()),
             actor: actor.clone(),
             timestamp: None,
         })
@@ -23716,7 +23725,7 @@ async fn round60_trashed_source_trail_seams(
         .unwrap()
         .unwrap()
         .revision;
-    let p_src_handle = format!("{}/r60-trail-src", s2.slug);
+    let p_src_handle = format!("{}/h6a-trail-src", s2.slug);
     let created_src = call_mcp(
         &fixture.registry,
         &owner_fresh,
@@ -23724,7 +23733,7 @@ async fn round60_trashed_source_trail_seams(
         "create_ability",
         json!({
             "kind": "role",
-            "name": "r60-promoted-trashed-src",
+            "name": "h6a-promoted-trashed-src",
             "description": "Promoted from trashed project.",
             "instructions": "Trail continuity body.\n",
             "placement": { "home": "project", "project": p_src_handle },
@@ -23746,7 +23755,7 @@ async fn round60_trashed_source_trail_seams(
                     folder_id: p_src_id.clone(),
                 }),
                 kind: Some(AbilityKind::Role),
-                name: Some("r60-promoted-trashed-src".into()),
+                name: Some("h6a-promoted-trashed-src".into()),
                 authoring: true,
             },
         )
@@ -23825,11 +23834,11 @@ async fn round60_trashed_source_trail_seams(
     .await
     .expect("MCP get_ability must follow promoted trail after historical source project is trashed")
     .structured_content;
-    assert_eq!(mcp_after_trash["name"], "r60-promoted-trashed-src");
+    assert_eq!(mcp_after_trash["name"], "h6a-promoted-trashed-src");
 }
 
 #[inline(never)]
-async fn round60_schedule_and_legacy_replay_seams(
+async fn hardened_schedule_and_legacy_replay_seams(
     fixture: &mut RuntimeFixture,
     local: &LoopbackProvider,
     s2: &AccessibleSpace,
@@ -23865,7 +23874,7 @@ async fn round60_schedule_and_legacy_replay_seams(
         })
         .expect("enabled system role for large schedule test")
         .descriptor;
-    let large_prompt = format!("SECRET-PROMPT-R60-{}", "\"".repeat(31_480));
+    let large_prompt = format!("SECRET-PROMPT-SCHED-{}", "\"".repeat(31_480));
     assert!(large_prompt.len() <= 32_768);
     let sched_id = ScheduleId::from_bytes([0xED, 15, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
     let next_slot = Timestamp::parse("2030-01-01T09:00:00Z").unwrap();
@@ -23874,7 +23883,7 @@ async fn round60_schedule_and_legacy_replay_seams(
         max_tokens: 64_000,
         timeout_ms: 15_000,
     };
-    let r60_id = |idx: u8, rev: ControlRevision| AccountCommandIdentity {
+    let sched_cmd_id = |idx: u8, rev: ControlRevision| AccountCommandIdentity {
         owner: owner.auth().principal().clone(),
         actor: owner.auth().principal().clone(),
         key: CommandKey::from_bytes([0xED, 15, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, idx]),
@@ -23888,13 +23897,13 @@ async fn round60_schedule_and_legacy_replay_seams(
         .unwrap()
         .revision;
     let create_sched_mut = AccountMutation {
-        identity: r60_id(1, rev0),
+        identity: sched_cmd_id(1, rev0),
         input: CreateSchedule {
             id: sched_id.clone(),
             definition: ScheduleDefinition {
                 space: s2.history.space_id.clone(),
                 project: None,
-                title: "SECRET-SCHED-TITLE-R60".into(),
+                title: "SECRET-SCHED-TITLE-HARD".into(),
                 init_prompt: large_prompt.clone(),
                 cron: "0 0 9 * * * *".into(),
                 timezone: "UTC".into(),
@@ -23920,16 +23929,16 @@ async fn round60_schedule_and_legacy_replay_seams(
     assert_eq!(replayed_sched.value.id, created_sched.value.id);
     assert_eq!(replayed_sched.value.definition.init_prompt, large_prompt);
 
-    let update_prompt = format!("SECRET-PROMPT-UPD-R60-{}", "\"".repeat(31_470));
+    let update_prompt = format!("SECRET-PROMPT-UPD-SCHED-{}", "\"".repeat(31_470));
     let update_sched_mut = AccountMutation {
-        identity: r60_id(2, created_sched.revision),
+        identity: sched_cmd_id(2, created_sched.revision),
         input: UpdateSchedule {
             schedule: sched_id.clone(),
             expected: created_sched.value.revision,
             definition: ScheduleDefinition {
                 space: s2.history.space_id.clone(),
                 project: None,
-                title: "SECRET-SCHED-TITLE-UPD-R60".into(),
+                title: "SECRET-SCHED-TITLE-UPD-HARD".into(),
                 init_prompt: update_prompt.clone(),
                 cron: "0 0 9 * * * *".into(),
                 timezone: "UTC".into(),
@@ -23953,10 +23962,10 @@ async fn round60_schedule_and_legacy_replay_seams(
         .observer
         .count(
             "SELECT COUNT(*) FROM control_commands \
-             WHERE safe_result LIKE '%SECRET-SCHED-TITLE-R60%' \
-                OR safe_result LIKE '%SECRET-SCHED-TITLE-UPD-R60%' \
-                OR safe_result LIKE '%SECRET-PROMPT-R60%' \
-                OR safe_result LIKE '%SECRET-PROMPT-UPD-R60%'",
+             WHERE safe_result LIKE '%SECRET-SCHED-TITLE-HARD%' \
+                OR safe_result LIKE '%SECRET-SCHED-TITLE-UPD-HARD%' \
+                OR safe_result LIKE '%SECRET-PROMPT-SCHED%' \
+                OR safe_result LIKE '%SECRET-PROMPT-UPD-SCHED%'",
         )
         .await;
     assert_eq!(
@@ -23971,7 +23980,7 @@ async fn round60_schedule_and_legacy_replay_seams(
         .observer
         .execute(
             "UPDATE control_commands \
-             SET safe_result = '{\"value\":\"' || (SELECT schedule_id FROM agent_schedules WHERE title='SECRET-SCHED-TITLE-UPD-R60' LIMIT 1) || '\",\"events\":[]}' \
+             SET safe_result = '{\"value\":\"' || (SELECT schedule_id FROM agent_schedules WHERE title='SECRET-SCHED-TITLE-UPD-HARD' LIMIT 1) || '\",\"events\":[]}' \
              WHERE target='create-schedule' \
                AND result_revision = (SELECT MAX(result_revision) FROM control_commands WHERE target='create-schedule')",
         )
@@ -23984,7 +23993,7 @@ async fn round60_schedule_and_legacy_replay_seams(
     assert_eq!(legacy_create_replay.value.id, sched_id);
 
     let delete_sched_mut = AccountMutation {
-        identity: r60_id(3, updated_sched.revision),
+        identity: sched_cmd_id(3, updated_sched.revision),
         input: DeleteSchedule {
             schedule: sched_id.clone(),
             expected: updated_sched.value.revision,
@@ -24000,7 +24009,7 @@ async fn round60_schedule_and_legacy_replay_seams(
         .observer
         .execute(
             "UPDATE control_commands \
-             SET safe_result = '{\"value\":\"' || (SELECT schedule_id FROM agent_schedules WHERE title='SECRET-SCHED-TITLE-UPD-R60' LIMIT 1) || '\",\"events\":[]}' \
+             SET safe_result = '{\"value\":\"' || (SELECT schedule_id FROM agent_schedules WHERE title='SECRET-SCHED-TITLE-UPD-HARD' LIMIT 1) || '\",\"events\":[]}' \
              WHERE target='delete-schedule' \
                AND result_revision = (SELECT MAX(result_revision) FROM control_commands WHERE target='delete-schedule')",
         )
@@ -24013,7 +24022,7 @@ async fn round60_schedule_and_legacy_replay_seams(
 
     let cs_id = ContextSetId::from_bytes([0xED, 15, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
     let cs_mut = AccountMutation {
-        identity: r60_id(4, del_commit.revision),
+        identity: sched_cmd_id(4, del_commit.revision),
         input: PutContextSet {
             id: cs_id.clone(),
             expected: None,
@@ -24049,7 +24058,7 @@ async fn round60_schedule_and_legacy_replay_seams(
         .create_resource(
             owner.clone(),
             AccountMutation {
-                identity: r60_id(5, cs_commit.revision),
+                identity: sched_cmd_id(5, cs_commit.revision),
                 input: ProviderResourceSpec {
                     id: ProviderResourceId::from_bytes([
                         0xED, 15, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
@@ -24072,7 +24081,7 @@ async fn round60_schedule_and_legacy_replay_seams(
         .request_attachment(
             owner.clone(),
             AccountMutation {
-                identity: r60_id(6, tmp_res_commit.revision),
+                identity: sched_cmd_id(6, tmp_res_commit.revision),
                 input: RequestProviderAttachment {
                     id: RequestId::from_bytes([0xED, 15, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]),
                     expected: None,
@@ -24094,7 +24103,7 @@ async fn round60_schedule_and_legacy_replay_seams(
         .unwrap();
     let tmp_att = tmp_att_commit.value;
     let revoke_mut = AccountMutation {
-        identity: r60_id(7, tmp_att_commit.revision),
+        identity: sched_cmd_id(7, tmp_att_commit.revision),
         input: RevokeProviderAttachment {
             id: tmp_att.id.clone(),
             expected: tmp_att.revision,
@@ -24123,7 +24132,7 @@ async fn round60_schedule_and_legacy_replay_seams(
 }
 
 #[inline(never)]
-async fn round60_prefix_strip_crash_replay_seams(
+async fn hardened_prefix_strip_crash_replay_seams(
     fixture: &mut RuntimeFixture,
     s2: &AccessibleSpace,
     s2_epoch: notarium_core::ids::LeaseEpoch,
@@ -24145,20 +24154,20 @@ async fn round60_prefix_strip_crash_replay_seams(
             active_epoch: s2_epoch,
             folder_id: p_ren_id.clone(),
             parent: None,
-            slug: "r60-alpha".into(),
-            display_name: "R60 Alpha".into(),
+            slug: "h6a-alpha".into(),
+            display_name: "Strip Replay Alpha".into(),
             is_project: true,
-            project_slug: Some("r60-alpha".into()),
+            project_slug: Some("h6a-alpha".into()),
             actor: actor.clone(),
             timestamp: None,
         })
         .await
         .unwrap();
-    let alpha_handle = format!("{}/r60-alpha", s2.slug);
+    let alpha_handle = format!("{}/h6a-alpha", s2.slug);
     let cn_key = [0xED, 16, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
     let cn_args = json!({
         "project": alpha_handle,
-        "path": "r60-alpha/docs-sub",
+        "path": "h6a-alpha/docs-sub",
         "title": "Prefix Strip Create Replay",
         "body": "Body.\n",
     });
@@ -24179,7 +24188,7 @@ async fn round60_prefix_strip_crash_replay_seams(
         .observer
         .execute("DELETE FROM mcp_dedup WHERE operation='create_note' AND safe_result LIKE '%\"folder\":%'")
         .await;
-    // Rename project `r60-alpha` -> `r60-beta`.
+    // Rename project `h6a-alpha` -> `h6a-beta`.
     let _ = call_mcp(
         &fixture.registry,
         owner,
@@ -24187,7 +24196,7 @@ async fn round60_prefix_strip_crash_replay_seams(
         "rename_project",
         json!({
             "project": alpha_handle,
-            "slug": "r60-beta",
+            "slug": "h6a-beta",
         }),
     )
     .await
@@ -24211,7 +24220,7 @@ async fn round60_prefix_strip_crash_replay_seams(
     let mv_key = [0xED, 16, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
     let mv_args = json!({
         "ref": cn_1["noteId"],
-        "toFolder": "r60-beta/moved-sub",
+        "toFolder": "h6a-beta/moved-sub",
     });
     let mv_1 = call_mcp(
         &fixture.registry,
@@ -24228,7 +24237,7 @@ async fn round60_prefix_strip_crash_replay_seams(
         .observer
         .execute("DELETE FROM mcp_dedup WHERE operation='move_note' AND safe_result LIKE '%\"folder\":%'")
         .await;
-    let beta_handle = format!("{}/r60-beta", s2.slug);
+    let beta_handle = format!("{}/h6a-beta", s2.slug);
     let _ = call_mcp(
         &fixture.registry,
         owner,
@@ -24236,7 +24245,7 @@ async fn round60_prefix_strip_crash_replay_seams(
         "rename_project",
         json!({
             "project": beta_handle,
-            "slug": "r60-gamma",
+            "slug": "h6a-gamma",
         }),
     )
     .await
@@ -24246,6 +24255,866 @@ async fn round60_prefix_strip_crash_replay_seams(
         .expect("project-pinned move_note must replay cleanly after move_destination loss and project rename")
         .structured_content;
     assert_eq!(mv_2["versionToken"], mv_1["versionToken"]);
+}
+
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+async fn hardened_multi_project_secondary_space_seams(
+    fixture: &RuntimeFixture,
+    pscope: &HistoryScope,
+    s1: &AccessibleSpace,
+    s1_p1: &FolderRef,
+    s1_p2: &FolderRef,
+    actor: &PrincipalId,
+) {
+    let owner = fresh_owner(fixture).await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let lp = loopback_provider(fixture, &owner, &listener, 0xEE, true).await;
+    // Approve personal + two separate project-only attachments in s1 (NO Space-wide s1 consent):
+    // s1_p1 consents [UserDoc], s1_p2 consents [UserDoc, AgentMemory].
+    approve_disclosure(
+        fixture,
+        &owner,
+        &lp,
+        0x71,
+        ProviderAttachmentTarget::Personal {
+            owner: actor.clone(),
+            space: pscope.space_id.clone(),
+        },
+        [DocClass::UserDoc, DocClass::AgentMemory].into(),
+    )
+    .await;
+    approve_disclosure(
+        fixture,
+        &owner,
+        &lp,
+        0x72,
+        ProviderAttachmentTarget::Personal {
+            owner: actor.clone(),
+            space: s1.history.space_id.clone(),
+        },
+        [DocClass::UserDoc, DocClass::AgentMemory].into(),
+    )
+    .await;
+    approve_disclosure(
+        fixture,
+        &owner,
+        &lp,
+        0x73,
+        ProviderAttachmentTarget::Project(s1_p1.clone()),
+        [DocClass::UserDoc].into(),
+    )
+    .await;
+    approve_disclosure(
+        fixture,
+        &owner,
+        &lp,
+        0x74,
+        ProviderAttachmentTarget::Project(s1_p2.clone()),
+        [DocClass::UserDoc, DocClass::AgentMemory].into(),
+    )
+    .await;
+    // Create unconsented third project s1_p3 in s1, plus test notes in s1_p1, s1_p2, s1_p3.
+    let s1_epoch = fixture
+        .canonical
+        .read_space(&s1.history.space_id)
+        .await
+        .unwrap()
+        .active_epoch;
+    let s1_p3_id = FolderId::from_bytes([0xEE, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3]);
+    fixture
+        .canonical
+        .create_folder(CreateFolderSpec {
+            scope: s1.history.clone(),
+            active_epoch: s1_epoch,
+            folder_id: s1_p3_id.clone(),
+            parent: None,
+            slug: "h6b-unconsented-p3".into(),
+            display_name: "Unconsented Secondary P3".into(),
+            is_project: true,
+            project_slug: Some("h6b-unconsented-p3".into()),
+            actor: actor.clone(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+    let s1_sc = SpaceContext::new(owner.auth().clone(), s1.history.clone(), budget()).unwrap();
+    let mk_note = |tag: u8, parent: FolderId, slug: &str, class: DocClass| {
+        let s1_sc = s1_sc.clone();
+        let hist = s1.history.clone();
+        let actor = actor.clone();
+        let slug = slug.to_owned();
+        async move {
+            let nid = NoteId::from_bytes([0xEE, 2, tag, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+            fixture
+                .canonical
+                .create_note(
+                    s1_sc,
+                    Mutation {
+                        identity: CommandIdentity {
+                            scope: hist,
+                            actor,
+                            key: CommandKey::from_bytes([
+                                0xEE, 2, tag, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
+                            ]),
+                            hash: ContentDigest::from_bytes([tag; 32]),
+                        },
+                        preconditions: Preconditions::default(),
+                        input: CreateNote {
+                            folder_page: false,
+                            note: nid.clone(),
+                            parent: Some(parent),
+                            slug,
+                            class,
+                            carrier: format!("---\ntitle: h6b-{tag}\n---\nBody {tag}.\n"),
+                        },
+                    },
+                )
+                .await
+                .unwrap();
+            nid
+        }
+    };
+    let n_p1 = mk_note(1, s1_p1.folder_id.clone(), "h6b-p1-doc", DocClass::UserDoc).await;
+    let n_p2 = mk_note(2, s1_p2.folder_id.clone(), "h6b-p2-doc", DocClass::UserDoc).await;
+    let n_p1_mem = mk_note(
+        3,
+        s1_p1.folder_id.clone(),
+        "h6b-p1-mem",
+        DocClass::AgentMemory,
+    )
+    .await;
+    let n_p3 = mk_note(4, s1_p3_id.clone(), "h6b-p3-doc", DocClass::UserDoc).await;
+
+    let run_auth = owner
+        .auth()
+        .for_agent_run(
+            AgentRunId::from_bytes([0xEE, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+            pscope.space_id.clone(),
+            ChatAudience::Personal,
+            owner.auth().spaces().clone(),
+        )
+        .unwrap();
+    let projects_res = lp
+        .registry
+        .call_tool(
+            McpInvocationContext {
+                account: AccountContext::new(run_auth.clone(), budget()),
+                target: EgressTarget::InAppProvider {
+                    provider: lp.resource.id.clone(),
+                    model: lp.model.clone(),
+                    primary_project: None,
+                },
+                request_key: CommandKey::from_bytes([
+                    0xEE, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
+                ]),
+            },
+            "get_my_projects",
+            json!({}),
+        )
+        .await
+        .unwrap();
+    let proj_ids: Vec<&str> = projects_res.structured_content["projects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|p| p["projectId"].as_str())
+        .collect();
+    assert!(proj_ids.contains(&s1_p1.folder_id.as_str()));
+    assert!(proj_ids.contains(&s1_p2.folder_id.as_str()));
+    assert!(!proj_ids.contains(&s1_p3_id.as_str()));
+    assert!(projects_res.provenance.projects.contains(s1_p1));
+    assert!(projects_res.provenance.projects.contains(s1_p2));
+
+    let primary_ctx = SpaceContext::new(run_auth.clone(), pscope.clone(), budget()).unwrap();
+    let primary_sel = lp
+        .provider
+        .select_provider(
+            primary_ctx.clone(),
+            SelectProvider {
+                kind: PreferenceModelKind::Completion,
+                resource: Some(lp.resource.id.clone()),
+                model: Some(lp.model.clone()),
+                project: None,
+            },
+        )
+        .await
+        .unwrap();
+    let s1_run_ctx = SpaceContext::new(run_auth.clone(), s1.history.clone(), budget()).unwrap();
+    let sel_p1 = lp
+        .provider
+        .select_provider(
+            s1_run_ctx.clone(),
+            SelectProvider {
+                kind: PreferenceModelKind::Completion,
+                resource: Some(lp.resource.id.clone()),
+                model: Some(lp.model.clone()),
+                project: Some(s1_p1.clone()),
+            },
+        )
+        .await
+        .unwrap();
+    let sel_p2 = lp
+        .provider
+        .select_provider(
+            s1_run_ctx.clone(),
+            SelectProvider {
+                kind: PreferenceModelKind::Completion,
+                resource: Some(lp.resource.id.clone()),
+                model: Some(lp.model.clone()),
+                project: Some(s1_p2.clone()),
+            },
+        )
+        .await
+        .unwrap();
+    let read_doc = |nid: &NoteId| {
+        let s1_run_ctx = s1_run_ctx.clone();
+        let nid = nid.clone();
+        async move {
+            fixture
+                .canonical
+                .get_note(
+                    s1_run_ctx,
+                    GetNote {
+                        note: nid,
+                        revision: None,
+                        causal: CausalBasis::Exact(notarium_core::receipt::ReceiptSet::default()),
+                    },
+                )
+                .await
+                .unwrap()
+                .document
+        }
+    };
+    let doc_p1 = read_doc(&n_p1).await;
+    let doc_p2 = read_doc(&n_p2).await;
+    let doc_p1_mem = read_doc(&n_p1_mem).await;
+    let doc_p3 = read_doc(&n_p3).await;
+    let msg_p1 = notarium_core::classes::ProviderMessage::Document(
+        notarium_core::classes::ClassEgressFence::provider(
+            doc_p1,
+            s1_run_ctx.auth(),
+            &sel_p1.policy,
+        )
+        .unwrap(),
+    );
+    let msg_p2 = notarium_core::classes::ProviderMessage::Document(
+        notarium_core::classes::ClassEgressFence::provider(
+            doc_p2,
+            s1_run_ctx.auth(),
+            &sel_p2.policy,
+        )
+        .unwrap(),
+    );
+    let sec_both = vec![s1_p1.clone(), s1_p2.clone()];
+
+    // Positive: combined dispatch across BOTH consented projects in secondary Space s1 succeeds.
+    let ok_req = CompletionRequest {
+        intent: CommandKey::from_bytes([0xEE, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+        selection: primary_sel.clone(),
+        secondary_projects: sec_both.clone(),
+        messages: vec![CompletionMessage {
+            role: CompletionRole::User,
+            instruction: None,
+            parts: vec![msg_p1, msg_p2],
+            tool_calls: vec![],
+            result_for: None,
+        }],
+        tools: vec![],
+        budget: CompletionBudget {
+            max_input_tokens: 4096,
+            max_output_tokens: 128,
+            max_tool_calls: 0,
+        },
+    };
+    let wire_task = tokio::spawn(async move {
+        let (mut wire, _prompt) = timeout(Duration::from_secs(15), read_request(&listener))
+            .await
+            .expect("multi-project secondary Space dispatch must reach provider");
+        send_ollama(
+            &mut wire,
+            json!({"role": "assistant", "content": "Multi-project ok."}),
+            "stop",
+        )
+        .await;
+        listener
+    });
+    let mut stream = lp
+        .provider
+        .complete(primary_ctx.clone(), ok_req)
+        .await
+        .expect("multi-project secondary Space completion must be admitted");
+    let mut got_done = false;
+    while let Some(ev) = stream.next().await.unwrap() {
+        got_done |= matches!(ev, CompletionEvent::Finished(CompletionFinish::Stop));
+    }
+    assert!(got_done);
+    let listener = wire_task.await.unwrap();
+
+    // Negative 1: AgentMemory note in s1_p1 (which only consented UserDoc) cannot borrow
+    // s1_p2's AgentMemory consent.
+    let msg_p1_mem = notarium_core::classes::ProviderMessage::Document(
+        notarium_core::classes::ClassEgressFence::provider(
+            doc_p1_mem,
+            s1_run_ctx.auth(),
+            &sel_p2.policy,
+        )
+        .unwrap(),
+    );
+    let mem_err = match lp
+        .provider
+        .complete(
+            primary_ctx.clone(),
+            CompletionRequest {
+                intent: CommandKey::from_bytes([0xEE, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]),
+                selection: primary_sel.clone(),
+                secondary_projects: sec_both.clone(),
+                messages: vec![CompletionMessage {
+                    role: CompletionRole::User,
+                    instruction: None,
+                    parts: vec![msg_p1_mem],
+                    tool_calls: vec![],
+                    result_for: None,
+                }],
+                tools: vec![],
+                budget: CompletionBudget {
+                    max_input_tokens: 4096,
+                    max_output_tokens: 128,
+                    max_tool_calls: 0,
+                },
+            },
+        )
+        .await
+    {
+        Ok(mut stream) => stream
+            .next()
+            .await
+            .expect_err("AgentMemory note in s1_p1 must not borrow s1_p2's AgentMemory consent"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(
+            mem_err,
+            PortError::Domain(DomainError::ValidationFailed { .. } | DomainError::AccessDenied)
+        ),
+        "AgentMemory note in s1_p1 must not borrow s1_p2's AgentMemory consent: {mem_err:?}"
+    );
+
+    // Negative 2: note in unconsented third project s1_p3 must fail closed with AccessDenied.
+    let msg_p3 = notarium_core::classes::ProviderMessage::Document(
+        notarium_core::classes::ClassEgressFence::provider(
+            doc_p3,
+            s1_run_ctx.auth(),
+            &sel_p1.policy,
+        )
+        .unwrap(),
+    );
+    let p3_err = match lp
+        .provider
+        .complete(
+            primary_ctx.clone(),
+            CompletionRequest {
+                intent: CommandKey::from_bytes([0xEE, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3]),
+                selection: primary_sel.clone(),
+                secondary_projects: sec_both.clone(),
+                messages: vec![CompletionMessage {
+                    role: CompletionRole::User,
+                    instruction: None,
+                    parts: vec![msg_p3],
+                    tool_calls: vec![],
+                    result_for: None,
+                }],
+                tools: vec![],
+                budget: CompletionBudget {
+                    max_input_tokens: 4096,
+                    max_output_tokens: 128,
+                    max_tool_calls: 0,
+                },
+            },
+        )
+        .await
+    {
+        Ok(mut stream) => stream
+            .next()
+            .await
+            .expect_err("note in unconsented s1_p3 must fail with AccessDenied"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(p3_err, PortError::Domain(DomainError::AccessDenied)),
+        "note in unconsented s1_p3 must fail with AccessDenied, got {p3_err:?}"
+    );
+
+    // Negative 3: Space-level metadata disclosure in s1 (no Space-wide consent) must fail closed.
+    let space_meta = fixture
+        .canonical
+        .disclosure(
+            AccountContext::new(run_auth.clone(), budget()),
+            CatalogDisclosure::Space(s1.history.clone()),
+        )
+        .await
+        .unwrap();
+    let msg_space = notarium_core::classes::ProviderMessage::Metadata(
+        notarium_core::classes::ClassEgressFence::provider_metadata(
+            space_meta,
+            s1_run_ctx.auth(),
+            &sel_p1.policy,
+        )
+        .unwrap(),
+    );
+    let space_err = match lp
+        .provider
+        .complete(
+            primary_ctx,
+            CompletionRequest {
+                intent: CommandKey::from_bytes([0xEE, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4]),
+                selection: primary_sel,
+                secondary_projects: sec_both,
+                messages: vec![CompletionMessage {
+                    role: CompletionRole::User,
+                    instruction: None,
+                    parts: vec![msg_space],
+                    tool_calls: vec![],
+                    result_for: None,
+                }],
+                tools: vec![],
+                budget: CompletionBudget {
+                    max_input_tokens: 4096,
+                    max_output_tokens: 128,
+                    max_tool_calls: 0,
+                },
+            },
+        )
+        .await
+    {
+        Ok(mut stream) => stream
+            .next()
+            .await
+            .expect_err("Space-level metadata must not pass under project-only secondary consents"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(space_err, PortError::Domain(DomainError::AccessDenied)),
+        "Space-level metadata must not pass under project-only secondary consents, got {space_err:?}"
+    );
+    assert!(
+        timeout(Duration::from_millis(80), listener.accept())
+            .await
+            .is_err(),
+        "denied secondary Space dispatches must never hit the provider socket"
+    );
+}
+
+#[inline(never)]
+async fn hardened_retrieval_error_and_taint_oracle_seams(
+    fixture: &RuntimeFixture,
+    local: &LoopbackProvider,
+    pscope: &HistoryScope,
+    s2: &AccessibleSpace,
+) {
+    let owner = fresh_owner(fixture).await;
+    let existing = format!("{}/h-s2-p1", s2.slug);
+    let nonexistent = format!("{}/no-such-h6b-project", s2.slug);
+    let long_query = "a".repeat(4097);
+    let probes = [
+        ("recall", json!({ "query": "probe", "depth": 4 })),
+        ("recall", json!({ "query": "probe", "budgetTokens": 0 })),
+        ("recall", json!({ "query": "probe", "budgetTokens": 1 })),
+        ("search", json!({ "query": long_query })),
+    ];
+    for (p_idx, (tool, base_args)) in probes.into_iter().enumerate() {
+        for (t_idx, proj) in [&existing, &nonexistent].into_iter().enumerate() {
+            let mut args = base_args.clone();
+            args["project"] = json!(proj);
+            let run_auth = owner
+                .auth()
+                .for_agent_run(
+                    AgentRunId::from_bytes([
+                        0xEF,
+                        1,
+                        p_idx as u8,
+                        t_idx as u8,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        1,
+                    ]),
+                    pscope.space_id.clone(),
+                    ChatAudience::Personal,
+                    owner.auth().spaces().clone(),
+                )
+                .unwrap();
+            let err = local
+                .registry
+                .call_tool(
+                    McpInvocationContext {
+                        account: AccountContext::new(run_auth.clone(), budget()),
+                        target: EgressTarget::InAppProvider {
+                            provider: local.resource.id.clone(),
+                            model: local.model.clone(),
+                            primary_project: None,
+                        },
+                        request_key: CommandKey::from_bytes([
+                            0xEF,
+                            1,
+                            p_idx as u8,
+                            t_idx as u8,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            2,
+                        ]),
+                    },
+                    tool,
+                    args,
+                )
+                .await;
+            assert!(
+                matches!(
+                    err,
+                    Err(PortError::Domain(DomainError::ValidationFailed { .. }))
+                ),
+                "{tool} invalid probe #{p_idx} for {proj} must fail ValidationFailed before target resolution, got {:?}",
+                err.err()
+            );
+            assert!(
+                !run_auth.taint().is_tainted(),
+                "{tool} pre-target validation error #{p_idx} must not flip taint"
+            );
+        }
+    }
+
+    // Post-crossing search query error (>64 clauses) against consented foreign project
+    // MUST commit staged BranchTaint onto caller_taint so errors cannot be a zero-taint oracle.
+    let over_clause_auth = owner
+        .auth()
+        .for_agent_run(
+            AgentRunId::from_bytes([0xEF, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+            pscope.space_id.clone(),
+            ChatAudience::Personal,
+            owner.auth().spaces().clone(),
+        )
+        .unwrap();
+    let over_clause_err = local
+        .registry
+        .call_tool(
+            McpInvocationContext {
+                account: AccountContext::new(over_clause_auth.clone(), budget()),
+                target: EgressTarget::InAppProvider {
+                    provider: local.resource.id.clone(),
+                    model: local.model.clone(),
+                    primary_project: None,
+                },
+                request_key: CommandKey::from_bytes([
+                    0xEF, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
+                ]),
+            },
+            "search",
+            json!({
+                "project": existing,
+                "query": "w ".repeat(65),
+            }),
+        )
+        .await;
+    assert!(
+        matches!(
+            over_clause_err,
+            Err(PortError::Domain(DomainError::ValidationFailed { .. }))
+        ),
+        "over-clause search query must fail ValidationFailed, got {:?}",
+        over_clause_err.err()
+    );
+    assert!(
+        over_clause_auth.taint().is_tainted(),
+        "post-crossing search ValidationFailed on foreign consented project MUST commit BranchTaint"
+    );
+}
+
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+async fn hardened_legacy_precheck_and_trail_write_seams(
+    fixture: &mut RuntimeFixture,
+    s2_sc: &SpaceContext,
+    s2: &AccessibleSpace,
+    s2_epoch: notarium_core::ids::LeaseEpoch,
+    actor: &PrincipalId,
+) {
+    let owner = fresh_owner(fixture).await;
+    // Part A: Pre-upgrade `DestinationPrecheck::Legacy(bool)` rows in `mcp_dedup` must replay
+    // `create_note` and project-pinned `move_note` with prefix stripping (never duplicating
+    // `alpha/alpha/sub` or failing `IdempotencyKeyReused`).
+    let p_leg_id = FolderId::from_bytes([0xEF, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    let p_leg_ref = FolderRef {
+        space_id: s2.history.space_id.clone(),
+        folder_id: p_leg_id.clone(),
+    };
+    fixture
+        .canonical
+        .create_folder(CreateFolderSpec {
+            scope: s2.history.clone(),
+            active_epoch: s2_epoch,
+            folder_id: p_leg_id.clone(),
+            parent: None,
+            slug: "h6b-legacy-alpha".into(),
+            display_name: "Legacy Precheck Alpha".into(),
+            is_project: true,
+            project_slug: Some("h6b-legacy-alpha".into()),
+            actor: actor.clone(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+    let leg_handle = format!("{}/h6b-legacy-alpha", s2.slug);
+    let cn_key = [0xEF, 3, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    let cn_args = json!({
+        "project": leg_handle,
+        "path": "h6b-legacy-alpha/leg-sub",
+        "title": "Legacy Precheck Create",
+        "body": "Body.\n",
+    });
+    let cn_1 = call_mcp(
+        &fixture.registry,
+        &owner,
+        cn_key,
+        "create_note",
+        cn_args.clone(),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    fixture
+        .storage
+        .observer
+        .execute("DELETE FROM mcp_dedup WHERE operation='create_note' AND safe_result LIKE '%\"folder\":%'")
+        .await;
+    fixture
+        .storage
+        .observer
+        .execute("UPDATE mcp_dedup SET safe_result='false' WHERE operation='create_note' AND safe_result LIKE '%\"stripped_segments\":%'")
+        .await;
+    let cn_2 = call_mcp(&fixture.registry, &owner, cn_key, "create_note", cn_args)
+        .await
+        .expect("legacy bare-bool create_destination_existed must replay create_note cleanly")
+        .structured_content;
+    assert_eq!(cn_2["noteId"], cn_1["noteId"]);
+    assert!(
+        fixture
+            .canonical
+            .resolve_folder_path(
+                s2_sc.clone(),
+                Some(p_leg_id.clone()),
+                "h6b-legacy-alpha/leg-sub".into(),
+            )
+            .await
+            .unwrap()
+            .is_none(),
+        "legacy precheck replay must not create duplicated h6b-legacy-alpha/h6b-legacy-alpha/leg-sub"
+    );
+
+    let pinned_acc = AccountContext::new(
+        owner
+            .auth()
+            .restrict_to_space(&s2.history.space_id)
+            .unwrap()
+            .restrict_to_project(&p_leg_ref)
+            .unwrap(),
+        budget(),
+    );
+    let mv_key = [0xEF, 3, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    let mv_args = json!({
+        "ref": cn_1["noteId"],
+        "toFolder": "h6b-legacy-alpha/leg-moved",
+    });
+    let mv_1 = call_mcp(
+        &fixture.registry,
+        &pinned_acc,
+        mv_key,
+        "move_note",
+        mv_args.clone(),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    fixture
+        .storage
+        .observer
+        .execute("DELETE FROM mcp_dedup WHERE operation='move_note' AND safe_result LIKE '%\"folder\":%'")
+        .await;
+    fixture
+        .storage
+        .observer
+        .execute("UPDATE mcp_dedup SET safe_result='false' WHERE operation='move_note' AND safe_result LIKE '%\"stripped_segments\":%'")
+        .await;
+    let mv_2 = call_mcp(&fixture.registry, &pinned_acc, mv_key, "move_note", mv_args)
+        .await
+        .expect("legacy bare-bool move_destination_existed must replay project-pinned move_note cleanly")
+        .structured_content;
+    assert_eq!(mv_2["versionToken"], mv_1["versionToken"]);
+
+    // Part B: `set_ability_trail` onto a chain whose intermediate historical hop lived in a
+    // now-trashed project must succeed (validating only the terminal target's live placement).
+    let p_hop_id = FolderId::from_bytes([0xEF, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    fixture
+        .canonical
+        .create_folder(CreateFolderSpec {
+            scope: s2.history.clone(),
+            active_epoch: s2_epoch,
+            folder_id: p_hop_id.clone(),
+            parent: None,
+            slug: "h6b-trail-hop-src".into(),
+            display_name: "Trail Hop Source".into(),
+            is_project: true,
+            project_slug: Some("h6b-trail-hop-src".into()),
+            actor: actor.clone(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+    let p_hop_rev = fixture
+        .canonical
+        .resolve_folder_path(s2_sc.clone(), Some(p_hop_id.clone()), String::new())
+        .await
+        .unwrap()
+        .unwrap()
+        .revision;
+    let hop_handle = format!("{}/h6b-trail-hop-src", s2.slug);
+    let hop_created = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xEF, 4, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "create_ability",
+        json!({
+            "kind": "role",
+            "name": "h6b-hop-role",
+            "description": "Promoted intermediate hop.",
+            "instructions": "Body.\n",
+            "placement": { "home": "project", "project": hop_handle },
+        }),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    let hop_old_ref = fixture
+        .control
+        .discover_abilities(
+            owner.clone(),
+            AbilityQuery {
+                page: ControlPageRequest::new(20, None).unwrap(),
+                project: Some(FolderRef {
+                    space_id: s2.history.space_id.clone(),
+                    folder_id: p_hop_id.clone(),
+                }),
+                kind: Some(AbilityKind::Role),
+                name: Some("h6b-hop-role".into()),
+                authoring: true,
+            },
+        )
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .next()
+        .unwrap()
+        .descriptor
+        .reference;
+    let _ = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xEF, 4, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
+        "edit_ability",
+        json!({
+            "ref": hop_created["ref"],
+            "versionToken": hop_created["versionToken"],
+            "home": { "home": "space" },
+            "availability": { "mode": "all-projects" },
+            "enabled": true,
+        }),
+    )
+    .await
+    .unwrap();
+    fixture
+        .canonical
+        .set_folder_lifecycle(
+            &s2.history,
+            s2_epoch,
+            &p_hop_id,
+            &p_hop_rev,
+            notarium_core::model::Lifecycle::Trashed,
+            actor,
+            None,
+        )
+        .await
+        .unwrap();
+    let front_created = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xEF, 4, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3],
+        "create_ability",
+        json!({
+            "kind": "role",
+            "name": "h6b-front-role",
+            "description": "Front trail role.",
+            "instructions": "Body.\n",
+            "placement": { "home": "project", "project": leg_handle },
+        }),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    let _ = front_created;
+    let front_ref = fixture
+        .control
+        .discover_abilities(
+            owner.clone(),
+            AbilityQuery {
+                page: ControlPageRequest::new(20, None).unwrap(),
+                project: Some(p_leg_ref),
+                kind: Some(AbilityKind::Role),
+                name: Some("h6b-front-role".into()),
+                authoring: true,
+            },
+        )
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .next()
+        .unwrap()
+        .descriptor
+        .reference;
+    fixture
+        .control
+        .set_ability_trail(
+            owner.clone(),
+            AccountMutation {
+                identity: identity(fixture, &owner, 0xF5).await,
+                input: AbilityTrailMutation::Set(AbilityTrailUpdate {
+                    source: front_ref,
+                    expected_destination: None,
+                    destination: Some(hop_old_ref),
+                }),
+            },
+        )
+        .await
+        .expect(
+            "set_ability_trail must succeed across a trashed historical intermediate project hop",
+        );
 }
 
 #[allow(clippy::too_many_arguments)]

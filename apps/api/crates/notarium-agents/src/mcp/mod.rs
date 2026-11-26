@@ -859,8 +859,21 @@ impl<'a> ToolCallContext<'a> {
         {
             return Err(invalid(ValidationReason::ScopeMismatch));
         }
+        let is_foreign_origin = |candidate: &ProviderOrigin| {
+            self.auth
+                .pinned_write_space()
+                .is_some_and(|pin| candidate.space_id().is_some_and(|space| space != pin))
+        };
+        let has_foreign = || {
+            self.auth.taint().is_tainted()
+                || is_foreign_origin(&origin)
+                || self.provenance.origins.iter().any(is_foreign_origin)
+        };
         if !self.provenance.origins.contains(&origin) {
             if self.provenance.origins.len() >= ChatProvenance::MAX_ORIGINS {
+                if has_foreign() {
+                    self.commit_external_read();
+                }
                 return Err(invalid(ValidationReason::BudgetExceeded));
             }
             self.provenance.origins.push(origin);
@@ -870,6 +883,7 @@ impl<'a> ToolCallContext<'a> {
             && !self.provenance.projects.contains(&project)
         {
             if self.provenance.projects.len() >= MAX_PROVIDER_SECONDARY_PROJECTS {
+                self.commit_external_read();
                 return Err(invalid(ValidationReason::BudgetExceeded));
             }
             self.provenance.projects.push(project);

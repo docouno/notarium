@@ -84,6 +84,7 @@ impl BoardMutationFactsProvider for ProjectionBoardPlanner {
                 cutoff,
                 [&intent.view],
                 [&intent.note],
+                &[],
                 &deadline,
             )
             .await?;
@@ -119,6 +120,7 @@ impl BoardMutationFactsProvider for ProjectionBoardPlanner {
                 request.cutoff,
                 request.views.iter(),
                 request.eligible_notes.iter().map(|note| &note.note),
+                &request.eligible_notes,
                 &deadline,
             )
             .await?;

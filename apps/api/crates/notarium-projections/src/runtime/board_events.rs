@@ -149,8 +149,14 @@ impl BoardSourceFacts {
         if self.requires_folder_grant && !full_folder {
             return None;
         }
+        let keeper_skill_scoped =
+            matches!(auth.kind(), notarium_core::auth::PrincipalKind::Keeper(_))
+                && self.source_classes.contains(&DocClass::Skill);
         Some(
-            if full_folder && self.source_classes.is_subset(&grant.read_classes) {
+            if full_folder
+                && self.source_classes.is_subset(&grant.read_classes)
+                && !keeper_skill_scoped
+            {
                 BoardAudience::Full
             } else {
                 BoardAudience::Scoped

@@ -37,6 +37,8 @@ pub(super) async fn exercise(store: &CanonicalStore, runtime: &ProjectorRuntime)
     reopened_feed_refreshes_the_published_command(store, runtime).await;
     first_change_racing_projection_subscription_is_delivered(store, runtime).await;
     purge_reseed_refreshes_only_after_readiness(store, runtime).await;
+    rollback_trashed_and_edited_board_view_through_real_planner(store, runtime).await;
+    keeper_readonly_abilities_isolation_on_changes_events_and_graph(store, runtime).await;
 }
 
 async fn ack_retry_delivers_the_published_change(
@@ -1446,4 +1448,537 @@ async fn create_view(
 
 fn view_carrier(key: &ViewKey, kind: &str, source: &str, body: &str) -> String {
     format!("```nota\nid: {key}\ntype: {kind}\nsource: {source}\n{body}```\n")
+}
+
+async fn rollback_trashed_and_edited_board_view_through_real_planner(
+    store: &CanonicalStore,
+    runtime: &ProjectorRuntime,
+) {
+    use notarium_core::{
+        model::Lifecycle,
+        ports::{DeleteDisposition, DeleteNote, GetNote, RankNeighbor},
+        receipt::ReceiptSet,
+    };
+
+    let (scope, owner) = open_space(store).await;
+    let engine = runtime.engine();
+
+    // Subcase A: Agent run moves a card on a pre-existing board view, then trashes that view.
+    // Real `ProjectionBoardPlanner` (`BoardCut::load`, `hydrate_candidates`, `evaluate_rollback`,
+    // and `check_live`) must restore the view and preserve pre-run card order.
+    let proj_a = folder(store, &owner, None, "rb-view-trash-proj", true)
+        .await
+        .unwrap();
+    let (v1, v1_rev) = create_view(
+        store,
+        &owner,
+        &proj_a,
+        "rb-trashed-board",
+        "board",
+        "{scope: project}",
+        "group_by: status\nfilter: {exists: status}\n",
+    )
+    .await;
+    let c1 = create_note(
+        store,
+        &owner,
+        Some(proj_a.clone()),
+        "rb-card-1",
+        "---\nstatus: todo\n---\n".into(),
+    )
+    .await;
+    let c2 = create_note(
+        store,
+        &owner,
+        Some(proj_a.clone()),
+        "rb-card-2",
+        "---\nstatus: todo\n---\n".into(),
+    )
+    .await;
+    sync(store, runtime, &scope).await;
+
+    let c1_moved_pre = store
+        .move_board_card(
+            owner.clone(),
+            mutation(
+                &owner,
+                MoveBoardCard {
+                    view: v1.clone(),
+                    note: c1.note.clone(),
+                    group: group("todo"),
+                    before: Some(RankNeighbor {
+                        note: c2.note.clone(),
+                        expected_rank: RankExpectation::Absent,
+                    }),
+                    after: None,
+                    fields: BTreeMap::new(),
+                    expected_note: c1.revision.clone(),
+                    expected_view: v1_rev.revision.clone(),
+                    expected_rank: RankExpectation::Absent,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    sync(store, runtime, &scope).await;
+
+    let run1 = AgentRunId::from_bytes(random_bytes());
+    let agent1 = super::agent(&owner, run1.clone(), ChatAudience::Personal);
+    store
+        .move_board_card(
+            agent1.clone(),
+            mutation(
+                &agent1,
+                MoveBoardCard {
+                    view: v1.clone(),
+                    note: c1.note.clone(),
+                    group: group("doing"),
+                    before: None,
+                    after: None,
+                    fields: BTreeMap::from([(
+                        "status".into(),
+                        Some(YamlValue::String("doing".into())),
+                    )]),
+                    expected_note: c1_moved_pre.value.revision.revision.clone(),
+                    expected_view: v1_rev.revision.clone(),
+                    expected_rank: RankExpectation::Existing(
+                        c1_moved_pre.value.rank_revision.clone(),
+                    ),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    store
+        .delete_note(
+            agent1.clone(),
+            mutation(
+                &agent1,
+                DeleteNote {
+                    note: v1_rev.note.clone(),
+                    disposition: DeleteDisposition::Trash,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    sync(store, runtime, &scope).await;
+
+    // Advance Space head past the projection cut with an unrelated note so
+    // `BoardCut::check_live` exercises its live-permit validation path as well.
+    let _unrelated = create_note(store, &owner, None, "rb-head-bump", "bump".into()).await;
+    let prep1 = store
+        .prepare_agent_run_rollback(owner.clone(), run1)
+        .await
+        .expect("prepare rollback must succeed through real planner on run-trashed view");
+    store
+        .rollback_agent_run(owner.clone(), mutation(&owner, prep1))
+        .await
+        .expect("rollback must succeed through real planner on run-trashed view");
+    sync(store, runtime, &scope).await;
+
+    let v1_after = store
+        .get_note(
+            owner.clone(),
+            GetNote {
+                note: v1_rev.note.clone(),
+                revision: None,
+                causal: CausalBasis::Exact(ReceiptSet::default()),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(v1_after.document.metadata().lifecycle(), Lifecycle::Active);
+    let v1_rows = query(&engine, owner.clone(), v1).await.unwrap();
+    let v1_ids: Vec<NoteId> = v1_rows
+        .rows
+        .items
+        .iter()
+        .map(|row| row.card.document.provenance().reference().note_id.clone())
+        .collect();
+    assert_eq!(v1_ids, vec![c1.note, c2.note]);
+
+    // Subcase B: Agent run moves a card on a pre-existing board view, then edits that view
+    // to narrow its filter so the card no longer matches the edited view. Real planner must
+    // hydrate candidates from the restored view definition and restore pre-run card order.
+    let proj_b = folder(store, &owner, None, "rb-view-edit-proj", true)
+        .await
+        .unwrap();
+    let v2_body = "group_by: status\nfilter: {exists: status}\n";
+    let (v2, v2_rev) = create_view(
+        store,
+        &owner,
+        &proj_b,
+        "rb-edited-board",
+        "board",
+        "{scope: project}",
+        v2_body,
+    )
+    .await;
+    let c3 = create_note(
+        store,
+        &owner,
+        Some(proj_b.clone()),
+        "rb-card-3",
+        "---\nstatus: todo\n---\n".into(),
+    )
+    .await;
+    let c4 = create_note(
+        store,
+        &owner,
+        Some(proj_b),
+        "rb-card-4",
+        "---\nstatus: todo\n---\n".into(),
+    )
+    .await;
+    sync(store, runtime, &scope).await;
+
+    let c3_moved_pre = store
+        .move_board_card(
+            owner.clone(),
+            mutation(
+                &owner,
+                MoveBoardCard {
+                    view: v2.clone(),
+                    note: c3.note.clone(),
+                    group: group("todo"),
+                    before: Some(RankNeighbor {
+                        note: c4.note.clone(),
+                        expected_rank: RankExpectation::Absent,
+                    }),
+                    after: None,
+                    fields: BTreeMap::new(),
+                    expected_note: c3.revision.clone(),
+                    expected_view: v2_rev.revision.clone(),
+                    expected_rank: RankExpectation::Absent,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    sync(store, runtime, &scope).await;
+
+    let run2 = AgentRunId::from_bytes(random_bytes());
+    let agent2 = super::agent(&owner, run2.clone(), ChatAudience::Personal);
+    store
+        .move_board_card(
+            agent2.clone(),
+            mutation(
+                &agent2,
+                MoveBoardCard {
+                    view: v2.clone(),
+                    note: c3.note.clone(),
+                    group: group("doing"),
+                    before: None,
+                    after: None,
+                    fields: BTreeMap::from([(
+                        "status".into(),
+                        Some(YamlValue::String("doing".into())),
+                    )]),
+                    expected_note: c3_moved_pre.value.revision.revision.clone(),
+                    expected_view: v2_rev.revision.clone(),
+                    expected_rank: RankExpectation::Existing(
+                        c3_moved_pre.value.rank_revision.clone(),
+                    ),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let old_v2 = view_carrier(&v2.key, "board", "{scope: project}", v2_body);
+    let narrowed_v2 = view_carrier(
+        &v2.key,
+        "board",
+        "{scope: project}",
+        "group_by: status\nfilter: {eq: [status, done]}\n",
+    );
+    let span = notarium_syntax::frontmatter::analyze(&old_v2, DocClass::UserDoc)
+        .unwrap()
+        .carrier
+        .body;
+    let plan = notarium_syntax::patch::plan(
+        &old_v2,
+        span,
+        vec![(CarrierEditOrigin::Body, span, narrowed_v2)],
+    )
+    .unwrap();
+    let mut edit_v2 = mutation(
+        &agent2,
+        EditNote {
+            note: v2_rev.note.clone(),
+            plan,
+        },
+    );
+    edit_v2.preconditions.revision = Some(v2_rev.revision);
+    store.edit_note(agent2, edit_v2).await.unwrap();
+    sync(store, runtime, &scope).await;
+
+    let prep2 = store
+        .prepare_agent_run_rollback(owner.clone(), run2)
+        .await
+        .expect("prepare rollback must succeed through real planner on run-edited view");
+    store
+        .rollback_agent_run(owner.clone(), mutation(&owner, prep2))
+        .await
+        .expect("rollback must succeed through real planner on run-edited view");
+    sync(store, runtime, &scope).await;
+
+    let v2_rows = query(&engine, owner, v2).await.unwrap();
+    let v2_ids: Vec<NoteId> = v2_rows
+        .rows
+        .items
+        .iter()
+        .map(|row| row.card.document.provenance().reference().note_id.clone())
+        .collect();
+    assert_eq!(v2_ids, vec![c3.note, c4.note]);
+}
+
+async fn keeper_readonly_abilities_isolation_on_changes_events_and_graph(
+    store: &CanonicalStore,
+    runtime: &ProjectorRuntime,
+) {
+    use notarium_core::ports::{DeleteDisposition, DeleteNote, EntityId, GraphQuery, GraphTier};
+
+    let (scope, owner) = open_space(store).await;
+    let proj = folder(store, &owner, None, "keeper-iso-proj", true)
+        .await
+        .unwrap();
+    let (skill_board, skill_board_rev) = create_view(
+        store,
+        &owner,
+        &proj,
+        "keeper-skill-board",
+        "board",
+        "{scope: space, classes: [user-doc, agent-memory, skill]}",
+        "group_by: status\nfilter: {exists: status}\n",
+    )
+    .await;
+    let mem_card = store
+        .create_note(
+            owner.clone(),
+            mutation(
+                &owner,
+                CreateNote {
+                    folder_page: false,
+                    note: NoteId::from_bytes(random_bytes()),
+                    parent: Some(proj.clone()),
+                    slug: "keeper-mem-card".into(),
+                    class: DocClass::AgentMemory,
+                    carrier: "---\nstatus: todo\n---\nMemory card.\n".into(),
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .value;
+    sync(store, runtime, &scope).await;
+
+    let skill_author_auth = notarium_core::auth::EngineAuthContext::for_human(
+        notarium_core::auth::VerifiedHuman::attest(
+            owner.auth().principal().clone(),
+            notarium_core::ids::GrantId::from_bytes(random_bytes()),
+            owner.auth().spaces().clone(),
+            true,
+        )
+        .with_human_management(true),
+    );
+    let skill_author = SpaceContext::new(skill_author_auth, scope.clone(), budget()).unwrap();
+    // Create one unapproved Skill note before `after` so its subsequent Purge row
+    // falls inside `after..=end` without an erased Create payload inside that window.
+    let unapproved_skill_purged = store
+        .create_note(
+            skill_author.clone(),
+            mutation(
+                &skill_author,
+                CreateNote {
+                    folder_page: false,
+                    note: NoteId::from_bytes(random_bytes()),
+                    parent: Some(proj.clone()),
+                    slug: "unapproved-purged-skill".into(),
+                    class: DocClass::Skill,
+                    carrier: "---\nstatus: todo\n---\nPurged secret skill.\n".into(),
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .value;
+    sync(store, runtime, &scope).await;
+
+    let keeper_auth = owner
+        .auth()
+        .for_keeper(
+            AgentRunId::from_bytes(random_bytes()),
+            scope.space_id.clone(),
+            None,
+            BTreeSet::new(),
+        )
+        .unwrap();
+    let keeper = SpaceContext::new(keeper_auth, scope.clone(), budget()).unwrap();
+    let after_seq = store.read_space(&scope.space_id).await.unwrap().last_seq;
+    let after = ChangeCursor {
+        scope: scope.clone(),
+        after: after_seq,
+    };
+    let engine = runtime.engine();
+    let bus = engine.event_bus();
+    let mut keeper_stream = bus.subscribe(keeper.clone(), after.clone()).await.unwrap();
+
+    // Create a live unapproved Skill note, purge the pre-existing unapproved Skill note,
+    // then create a visible UserDoc note.
+    let unapproved_skill_live = store
+        .create_note(
+            skill_author.clone(),
+            mutation(
+                &skill_author,
+                CreateNote {
+                    folder_page: false,
+                    note: NoteId::from_bytes(random_bytes()),
+                    parent: Some(proj.clone()),
+                    slug: "unapproved-secret-skill".into(),
+                    class: DocClass::Skill,
+                    carrier: "---\nstatus: todo\n---\nSecret skill body.\n".into(),
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .value;
+    store
+        .delete_note(
+            skill_author.clone(),
+            mutation(
+                &skill_author,
+                DeleteNote {
+                    note: unapproved_skill_purged.note.clone(),
+                    disposition: DeleteDisposition::Purge,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let visible_doc = create_note(
+        store,
+        &owner,
+        Some(proj),
+        "visible-keeper-doc",
+        "---\nstatus: todo\n---\nVisible.\n".into(),
+    )
+    .await;
+    sync(store, runtime, &scope).await;
+    let end = store.read_space(&scope.space_id).await.unwrap().last_seq;
+
+    // 1. Canonical change log must hide both Create and Purge of unapproved Skill notes.
+    let ChangeReadResult::Log(page) = store
+        .read_changes(
+            keeper.clone(),
+            ChangeRead::Log {
+                after,
+                through: end,
+                limit: PageLimit::new(64).unwrap(),
+            },
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("expected authorized change log for whole-space Keeper");
+    };
+    assert!(
+        page.changes
+            .iter()
+            .any(|c| c.entity == EntityId::Note(visible_doc.note.clone())),
+        "Keeper must still observe visible UserDoc change"
+    );
+    assert!(
+        !page.changes.iter().any(|c| {
+            c.entity == EntityId::Note(unapproved_skill_live.note.clone())
+                || c.entity == EntityId::Note(unapproved_skill_purged.note.clone())
+        }),
+        "whole-space Keeper must not observe unapproved Skill create or purge in read_changes"
+    );
+
+    // 2. Projection event stream must not deliver GraphSettled, full Board deltas for
+    //    Skill-including boards, or Changed events for unapproved Skill notes.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let event = keeper_stream.next().await.unwrap().unwrap();
+            match event.kind {
+                SpaceEventKind::GraphSettled { .. } => {
+                    panic!("whole-space Keeper must not receive Space-wide GraphSettled");
+                }
+                SpaceEventKind::Board(_) => {
+                    panic!("whole-space Keeper must not receive full Board delta for Skill-sourced board");
+                }
+                SpaceEventKind::Changed(change)
+                    if change.entity == EntityId::Note(unapproved_skill_live.note.clone())
+                        || change.entity == EntityId::Note(unapproved_skill_purged.note.clone()) =>
+                {
+                    panic!("whole-space Keeper must not observe unapproved Skill change event");
+                }
+                SpaceEventKind::Changed(change)
+                    if change.entity == EntityId::Note(visible_doc.note.clone()) =>
+                {
+                    break;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("whole-space Keeper still receives visible UserDoc event");
+
+    // 3. Superclusters graph tier must not bypass Keeper Skill isolation.
+    let graph_err = engine
+        .query_graph(
+            keeper.clone(),
+            GraphQuery {
+                tier: GraphTier::Superclusters,
+                filter: FieldFilterAstV1 {
+                    version: 1,
+                    predicate: Predicate::All(Vec::new()),
+                },
+                causal: None,
+            },
+        )
+        .await;
+    assert!(
+        matches!(
+            graph_err,
+            Err(PortError::Domain(
+                DomainError::ResourceNotFound | DomainError::AccessDenied
+            ))
+        ),
+        "whole-space Keeper must not bypass Skill isolation on Superclusters graph, got {graph_err:?}"
+    );
+
+    // 4. Board planner must not admit a Keeper onto a board sourcing DocClass::Skill.
+    let move_err = store
+        .move_board_card(
+            keeper.clone(),
+            mutation(
+                &keeper,
+                MoveBoardCard {
+                    view: skill_board,
+                    note: mem_card.note,
+                    group: group("doing"),
+                    before: None,
+                    after: None,
+                    fields: BTreeMap::from([(
+                        "status".into(),
+                        Some(YamlValue::String("doing".into())),
+                    )]),
+                    expected_note: mem_card.revision,
+                    expected_view: skill_board_rev.revision,
+                    expected_rank: RankExpectation::Absent,
+                },
+            ),
+        )
+        .await;
+    assert!(
+        matches!(
+            move_err,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ),
+        "Keeper must not plan moves on a board sourcing DocClass::Skill, got {move_err:?}"
+    );
 }

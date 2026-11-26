@@ -8,7 +8,7 @@ use crate::{
 };
 use notarium_core::{
     DomainError,
-    auth::EngineAuthContext,
+    auth::{EngineAuthContext, PrincipalKind},
     classes::DocClass,
     error::{PortError, ValidationReason},
     ids::{JobId, NoteId, RevisionId, SpaceSeq},
@@ -31,9 +31,10 @@ pub(crate) struct ChangeVisibility<'a> {
 
 impl<'a> ChangeVisibility<'a> {
     pub(crate) fn new(space: &'a SpaceRecord, auth: &'a EngineAuthContext) -> Self {
-        let all_notes_visible = auth.spaces().get(&space.space.id).is_some_and(|grant| {
-            grant.project_root.is_none() && grant.read_classes == DocClass::all()
-        });
+        let all_notes_visible = !matches!(auth.kind(), PrincipalKind::Keeper(_))
+            && auth.spaces().get(&space.space.id).is_some_and(|grant| {
+                grant.project_root.is_none() && grant.read_classes == DocClass::all()
+            });
         Self {
             space,
             auth,
@@ -154,6 +155,8 @@ impl<'a> ChangeVisibility<'a> {
                         .get(&space.id)
                         .ok_or(DomainError::ResourceNotFound)?;
                     if grant.project_root.is_some()
+                        || (matches!(self.auth.kind(), PrincipalKind::Keeper(_))
+                            && change.class == Some(DocClass::Skill))
                         || !change
                             .class
                             .is_some_and(|class| grant.read_classes.contains(&class))

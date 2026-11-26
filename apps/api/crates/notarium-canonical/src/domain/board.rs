@@ -2052,16 +2052,18 @@ pub(crate) async fn authorized_view_head(
 }
 
 /// Authorize visibility of a view note referenced in `board_move_history`
-/// during agent-run rollback without requiring `Lifecycle::Active`.
+/// during agent-run rollback without requiring `Lifecycle::Active` or active
+/// ancestor folders.
 ///
-/// Purged or purge-fenced views return `Ok(None)`; visible active or trashed
-/// views still enforce folder/class read authorization and return `Ok(Some(head))`.
+/// Purged or purge-fenced views (including views inside purged folders) return
+/// `Ok(None)`; visible active or trashed views still enforce folder/class read
+/// authorization and return `Ok(Some((head, effective_lifecycle)))`.
 pub(crate) async fn authorized_rollback_view_head_opt(
     tx: &mut BackendConn<'_>,
     space: &notarium_core::auth::Space,
     auth: &notarium_core::auth::EngineAuthContext,
     view: &NoteId,
-) -> Result<Option<super::common::NoteHeadRow>, PortError> {
+) -> Result<Option<(super::common::NoteHeadRow, Lifecycle)>, PortError> {
     if is_note_purge_fenced_tx(tx, &space.id, view.as_str()).await? {
         return Ok(None);
     }
@@ -2070,17 +2072,21 @@ pub(crate) async fn authorized_rollback_view_head_opt(
         Err(PortError::Domain(DomainError::ResourceNotFound)) => return Ok(None),
         Err(error) => return Err(error),
     };
-    let (facts, _) = build_resource_facts_tx(
+    let (facts, anc) = build_resource_facts_tx(
         tx,
         space,
         &head.parent_folder_id,
         head.doc_class,
         head.ability_id.clone(),
-        head.lifecycle == Lifecycle::Active,
+        false,
     )
     .await?;
+    let effective = super::common::combine_lifecycle(head.lifecycle, anc.folder_lifecycle);
+    if effective == Lifecycle::Purged {
+        return Ok(None);
+    }
     auth.authorize_read(&facts)?;
-    Ok(Some(head))
+    Ok(Some((head, effective)))
 }
 
 fn build_move_board_card_identity_spec(

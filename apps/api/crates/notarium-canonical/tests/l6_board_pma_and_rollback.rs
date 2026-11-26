@@ -5349,6 +5349,7 @@ async fn run_board_neighbor_order_and_trashed_view_suite(store: &CanonicalStore)
     let card_2a = NoteId::from_bytes([0x27; 16]);
     let card_2b = NoteId::from_bytes([0x28; 16]);
     let card_2c = NoteId::from_bytes([0x29; 16]);
+    let card_2d = NoteId::from_bytes([0x2A; 16]);
 
     let planner = CanonicalTestBoardPlanner::new(
         store.clone(),
@@ -5362,6 +5363,7 @@ async fn run_board_neighbor_order_and_trashed_view_suite(store: &CanonicalStore)
             card_2a.clone(),
             card_2b.clone(),
             card_2c.clone(),
+            card_2d.clone(),
         ],
     );
     store
@@ -5909,7 +5911,7 @@ async fn run_board_neighbor_order_and_trashed_view_suite(store: &CanonicalStore)
         .expect("rollback must restore pre-existing view trashed by run");
     let v4_after = store
         .get_note(
-            human_ctx,
+            human_ctx.clone(),
             GetNote {
                 note: v4_note,
                 revision: None,
@@ -5924,6 +5926,135 @@ async fn run_board_neighbor_order_and_trashed_view_suite(store: &CanonicalStore)
         .await
         .unwrap();
     assert_eq!(post_2c[&card_2c].group, g1);
+
+    // --- Trace 2D: Human trashes parent folder of board view `v5_note` (note head stays Active,
+    //     effective lifecycle becomes Trashed) -> prepare + rollback must still succeed ---
+    let active_epoch = store
+        .read_space(&scope.space_id)
+        .await
+        .unwrap()
+        .active_epoch;
+    let f_2d = FolderId::from_bytes([0x2D; 16]);
+    let (_, f_2d_rev, _) = store
+        .create_folder(notarium_canonical::CreateFolderSpec {
+            scope: scope.clone(),
+            active_epoch,
+            folder_id: f_2d.clone(),
+            parent: None,
+            slug: "view-parent-2d".to_owned(),
+            display_name: "View Parent 2D".to_owned(),
+            is_project: false,
+            project_slug: None,
+            actor: owner.clone(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+    let v5_note = sample_note_id(245);
+    let view_2d = ViewRef {
+        note: v5_note.clone(),
+        key: ViewKey::from_bytes([0x76; 16]),
+    };
+    let v5_created = store
+        .create_note(
+            human_ctx.clone(),
+            next_mutation(
+                &scope,
+                &owner,
+                CreateNote {
+                    folder_page: false,
+                    note: v5_note.clone(),
+                    parent: Some(f_2d.clone()),
+                    slug: "board-parent-trashed".to_owned(),
+                    class: DocClass::UserDoc,
+                    carrier: "---\ntitle: board-parent-trashed\nstatus: none\n---\nBody\n"
+                        .to_owned(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let card_2d_created = store
+        .create_note(
+            human_ctx.clone(),
+            next_mutation(
+                &scope,
+                &owner,
+                CreateNote {
+                    folder_page: false,
+                    note: card_2d.clone(),
+                    parent: None,
+                    slug: "card-2d".to_owned(),
+                    class: DocClass::UserDoc,
+                    carrier: "---\ntitle: card-2d\nstatus: todo\n---\nBody\n".to_owned(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let run_2d = sample_run_id(250);
+    let agent_2d = agent_run_ctx(&human_ctx, run_2d.clone());
+    store
+        .move_board_card(
+            agent_2d,
+            next_mutation(
+                &scope,
+                &owner,
+                MoveBoardCard {
+                    view: view_2d,
+                    note: card_2d.clone(),
+                    group: g2.clone(),
+                    before: None,
+                    after: None,
+                    fields: BTreeMap::from([(
+                        "status".to_owned(),
+                        Some(YamlValue::String("doing".to_owned())),
+                    )]),
+                    expected_note: card_2d_created.value.revision,
+                    expected_view: v5_created.value.revision,
+                    expected_rank: RankExpectation::Absent,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    store
+        .set_folder_lifecycle(
+            &scope,
+            active_epoch,
+            &f_2d,
+            &f_2d_rev,
+            Lifecycle::Trashed,
+            &owner,
+            None,
+        )
+        .await
+        .unwrap();
+    let prep_2d = store
+        .prepare_agent_run_rollback(human_ctx.clone(), run_2d)
+        .await
+        .expect("prepare rollback must succeed after human trashed view's parent folder");
+    store
+        .rollback_agent_run(human_ctx.clone(), next_mutation(&scope, &owner, prep_2d))
+        .await
+        .expect("rollback must succeed after human trashed view's parent folder");
+    let card_2d_after = store
+        .get_note(
+            human_ctx,
+            GetNote {
+                note: card_2d,
+                revision: None,
+                causal: CausalBasis::Exact(ReceiptSet::default()),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        card_2d_after.fields.get("status"),
+        Some(&FieldObservation::Ok(FieldValue::Scalar(
+            ScalarValue::String("todo".to_owned())
+        )))
+    );
     let _ = revs;
 }
 

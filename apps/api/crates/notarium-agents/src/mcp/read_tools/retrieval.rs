@@ -123,12 +123,23 @@ pub(super) async fn retrieve(
         .max_per_source
         .map_or(budget / 2, u32::from)
         .min(budget);
-    // Validate pure numeric limits before resolving any target Space so
+    // Validate pure query/numeric limits before resolving any target Space so
     // malformed requests never act as zero-taint project-slug oracles.
+    if args.query.len() > 4096 {
+        return Err(invalid(ValidationReason::InvalidQuery));
+    }
     let top_k =
         PageLimit::new(u16::try_from(limit).map_err(|_| invalid(ValidationReason::InvalidLimit))?)?;
     let max_per_source = if recall {
-        Some(u16::try_from(source_budget).map_err(|_| invalid(ValidationReason::InvalidLimit))?)
+        if args.depth.unwrap_or(1) > RecallQuery::MAX_GRAPH_DEPTH {
+            return Err(invalid(ValidationReason::InvalidLimit));
+        }
+        let source_cap =
+            u16::try_from(source_budget).map_err(|_| invalid(ValidationReason::InvalidLimit))?;
+        if !(1..=131_072).contains(&budget) || source_cap == 0 {
+            return Err(invalid(ValidationReason::TokenBudgetExceeded));
+        }
+        Some(source_cap)
     } else {
         None
     };
@@ -140,6 +151,7 @@ pub(super) async fn retrieve(
     let mut truncated = false;
     let mut own_degradation = BTreeSet::new();
     let mut foreign_degradation = BTreeSet::new();
+    let mut observed_foreign = false;
     for (index, target) in targets.iter().enumerate() {
         let mut scope = call.space(target.scope.clone())?;
         let foreign_space = !external
@@ -214,6 +226,7 @@ pub(super) async fn retrieve(
                 // Targeting a consented foreign project observes that Space even
                 // when class intersection leaves no searchable classes or zero hits.
                 call.auth.taint().mark_external_read();
+                observed_foreign = true;
             }
             if effective_classes.is_empty() {
                 continue;
@@ -236,7 +249,9 @@ pub(super) async fn retrieve(
             // Targeting a consented foreign project (explicitly or via episode
             // project_hint) observes that Space even when the query returns zero hits.
             call.auth.taint().mark_external_read();
+            observed_foreign = true;
         }
+        observed_foreign |= foreign_space;
         let query = SearchQuery {
             text: args.query.clone(),
             filter: unrestricted(),
@@ -278,16 +293,29 @@ pub(super) async fn retrieve(
                     },
                     Some(&recipient),
                 )
-                .await?
+                .await
         } else {
             let recipient = (!external).then_some(&recipient as &dyn SearchRecipient);
             call.registry
                 .engine
                 .search_for(query_scope.clone(), query, recipient)
-                .await?
-        };
-        target.scope.check(&result.cut.scope)?;
+                .await
+        }
+        .inspect_err(|_| {
+            if observed_foreign {
+                call.commit_external_read();
+            }
+        })?;
+        if let Err(error) = target.scope.check(&result.cut.scope) {
+            if observed_foreign {
+                call.commit_external_read();
+            }
+            return Err(error.into());
+        }
         if result.hits.len() > usize::from(top_k.get()) {
+            if observed_foreign {
+                call.commit_external_read();
+            }
             return Err(invalid(ValidationReason::InvalidState));
         }
         truncated |= result.truncated;

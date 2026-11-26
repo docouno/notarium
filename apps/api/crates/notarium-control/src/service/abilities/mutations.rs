@@ -624,9 +624,42 @@ impl ControlService {
         {
             let current = self.current_account(&ctx, &budget).await?;
             async {
+                let mut rtx = self.store.read(budget.clone()).await?;
+                let chain = budget
+                    .run(
+                        self.follow_ability_chain_db(
+                            rtx.inner_mut(),
+                            &current,
+                            destination.clone(),
+                        ),
+                        CommitEffect::NotCommitted,
+                    )
+                    .await?;
+                budget
+                    .run(rtx.rollback(), CommitEffect::NotCommitted)
+                    .await?;
+                budget
+                    .run(
+                        async {
+                            let terminal_id = chain.terminal.identity();
+                            for item in &chain.visited {
+                                if item == &terminal_id {
+                                    self.ability_placement(&current, item).await?;
+                                } else {
+                                    self.ability_trail_hop_space_active(&current, item).await?;
+                                }
+                            }
+                            Ok::<_, PortError>(())
+                        },
+                        CommitEffect::NotCommitted,
+                    )
+                    .await?;
+                if promotion && chain.terminal != *destination {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
                 let target = budget
                     .run(
-                        self.raw_ability(&current, destination.identity()),
+                        self.raw_ability(&current, chain.terminal.identity()),
                         CommitEffect::NotCommitted,
                     )
                     .await?;
@@ -665,31 +698,6 @@ impl ControlService {
                                 }
                                 _ => self.raw_ability(&current, original.identity()).await,
                             }
-                        },
-                        CommitEffect::NotCommitted,
-                    )
-                    .await?;
-                let mut rtx = self.store.read(budget.clone()).await?;
-                let chain = budget
-                    .run(
-                        self.follow_ability_chain_db(
-                            rtx.inner_mut(),
-                            &current,
-                            destination.clone(),
-                        ),
-                        CommitEffect::NotCommitted,
-                    )
-                    .await?;
-                budget
-                    .run(rtx.rollback(), CommitEffect::NotCommitted)
-                    .await?;
-                budget
-                    .run(
-                        async {
-                            for item in &chain.visited {
-                                self.ability_placement(&current, item).await?;
-                            }
-                            Ok::<_, PortError>(())
                         },
                         CommitEffect::NotCommitted,
                     )
@@ -749,6 +757,7 @@ impl ControlService {
             let owner = user(tx.inner_mut(), ctx.auth().principal().as_str()).await?;
             let mut references = vec![&input.source];
             if let Some(destination) = &input.destination { references.push(destination); }
+            if let Ok(Some((_, target))) = &prechecked { references.push(&target.reference); }
             let spaces = self.lock_ability_spaces(tx.inner_mut(), &ctx, &owner, &references).await?;
             if promotion {
                 if let Some((revision, saved)) = command.replay::<AbilityPromotionResult>(tx.inner_mut()).await? {
@@ -771,8 +780,14 @@ impl ControlService {
                 || previous.as_ref().is_some_and(|trail| trail.source != input.source) { return Err(invalid(ValidationReason::InvalidState)); }
             let value = if let Some(destination) = &input.destination {
                 let (source, target) = prechecked.as_ref().ok_or_else(|| invalid(ValidationReason::InvalidState))?;
-                if source.reference != input.source || target.reference != *destination || source.kind != target.kind { return Err(DomainError::ResourceNotFound.into()); }
                 let final_ref = self.follow_ability_db(tx.inner_mut(), &ctx, destination.clone()).await?;
+                if source.reference != input.source
+                    || target.reference != final_ref
+                    || (promotion && final_ref != *destination)
+                    || source.kind != target.kind
+                {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
                 if final_ref.identity() == source.reference.identity() { return Err(invalid(ValidationReason::InvalidState)); }
                 let source_state = if promotion {
                     Some(read_overlay_state(tx.inner_mut(), ctx.auth().principal(), &key, &source.reference.id).await?)
@@ -780,7 +795,7 @@ impl ControlService {
                     None
                 };
                 let destination_key = placement(&destination.placement)?;
-                if !self.promotion_is_committed(tx.inner_mut(), target.promoted_from.as_ref(), &destination.identity()).await? {
+                if !self.promotion_is_committed(tx.inner_mut(), target.promoted_from.as_ref(), &final_ref.identity()).await? {
                     let Some(original) = &target.promoted_from else { return Err(invalid(ValidationReason::InvalidState)); };
                     let AbilityPlacement::OwnedProject(project) = &original.placement else { return Err(invalid(ValidationReason::InvalidState)); };
                     if original != &source.reference

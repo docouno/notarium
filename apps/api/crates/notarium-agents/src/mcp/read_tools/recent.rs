@@ -114,7 +114,17 @@ pub(super) async fn recent(
                     limit: PageLimit::new(SPACE_WINDOW)?,
                 },
             )
-            .await?;
+            .await
+            .inspect_err(|error| {
+                if foreign_space
+                    && !matches!(
+                        error,
+                        PortError::Domain(notarium_core::DomainError::ResourceNotFound)
+                    )
+                {
+                    call.commit_external_read();
+                }
+            })?;
         let ChangeReadResult::Log(page) = page else {
             return Err(invalid(ValidationReason::InvalidState));
         };

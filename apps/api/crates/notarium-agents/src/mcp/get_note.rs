@@ -70,6 +70,14 @@ async fn read(call: &mut ToolCallContext<'_>, args: Value) -> Result<NoteOutput,
     let carrier = corpus::note_document(call, &ctx, &snapshot.document)
         .await
         .map_err(note_error)?;
+    if !matches!(call.target, EgressTarget::ExternalMcp)
+        && call
+            .auth
+            .pinned_write_space()
+            .is_some_and(|pin| pin != &ctx.scope().space_id)
+    {
+        call.commit_external_read();
+    }
     let header = frontmatter::analyze(&carrier, snapshot.document.class())?;
     let markdown = markdown::analyze(&carrier, header.carrier.body)?;
     let views = nota::analyze(&carrier, header.carrier.body, &note, &markdown, false)?.blocks;

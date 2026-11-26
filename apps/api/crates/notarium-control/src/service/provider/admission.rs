@@ -389,43 +389,92 @@ impl ProviderService {
                 return Err(DomainError::ResourceNotFound.into());
             }
         }
-        let mut project_by_space: BTreeMap<&SpaceId, Option<&FolderRef>> = BTreeMap::new();
-        for project in secondary_projects {
-            if !spaces.contains_key(&project.space_id)
-                || primary.is_some_and(|primary| primary.space.id == project.space_id)
+        let mut secondary_projects_by_space: BTreeMap<&SpaceId, Vec<&FolderRef>> = BTreeMap::new();
+        for sec_project in secondary_projects {
+            if !spaces.contains_key(&sec_project.space_id)
+                || primary.is_some_and(|primary| primary.space.id == sec_project.space_id)
             {
                 return Err(invalid(ValidationReason::SourceMismatch));
             }
-            project_by_space
-                .entry(&project.space_id)
-                .and_modify(|current| {
-                    if *current != Some(project) {
-                        // Distinct projects can be disclosed with Space-wide consent only.
-                        *current = None;
-                    }
-                })
-                .or_insert(Some(project));
+            let entry = secondary_projects_by_space
+                .entry(&sec_project.space_id)
+                .or_default();
+            if !entry.contains(&sec_project) {
+                entry.push(sec_project);
+            }
         }
-        if let Some(primary) = primary {
-            project_by_space.insert(&primary.space.id, project);
-        }
-        let mut policies: BTreeMap<SpaceId, PolicyAdmission> = BTreeMap::new();
+        let mut space_policies: BTreeMap<SpaceId, PolicyAdmission> = BTreeMap::new();
+        let mut secondary_project_policies: BTreeMap<(SpaceId, FolderId), PolicyAdmission> =
+            BTreeMap::new();
         let now = self.control.clock.now_ms()?;
         for space in spaces.values() {
-            policies.insert(
-                space.id.clone(),
-                selection::policy(
+            if primary.is_some_and(|p| p.space.id == space.id) {
+                space_policies.insert(
+                    space.id.clone(),
+                    selection::policy(
+                        tx,
+                        &auth,
+                        &resource,
+                        credential_epoch,
+                        space,
+                        project,
+                        now,
+                        true,
+                    )
+                    .await?,
+                );
+                continue;
+            }
+            let sec_projects = secondary_projects_by_space
+                .get(&space.id)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            match selection::policy(
+                tx,
+                &auth,
+                &resource,
+                credential_epoch,
+                space,
+                None,
+                now,
+                true,
+            )
+            .await
+            {
+                Ok(wide) => {
+                    space_policies.insert(space.id.clone(), wide);
+                }
+                Err(error)
+                    if !sec_projects.is_empty()
+                        && matches!(
+                            error,
+                            PortError::Domain(
+                                DomainError::ResourceNotFound
+                                    | DomainError::AccessDenied
+                                    | DomainError::Provider {
+                                        error: ProviderErrorCode::Unavailable
+                                    }
+                            )
+                        ) => {}
+                Err(error) => return Err(error),
+            }
+            for &sec_project in sec_projects {
+                let admitted = selection::policy(
                     tx,
                     &auth,
                     &resource,
                     credential_epoch,
                     space,
-                    project_by_space.get(&space.id).copied().flatten(),
+                    Some(sec_project),
                     now,
                     true,
                 )
-                .await?,
-            );
+                .await?;
+                secondary_project_policies.insert(
+                    (sec_project.space_id.clone(), sec_project.folder_id.clone()),
+                    admitted,
+                );
+            }
         }
         for input in embedding_inputs {
             let EmbeddingInput::Query(query) = input else {
@@ -433,7 +482,7 @@ impl ProviderService {
             };
             let primary = primary.ok_or_else(selection::unavailable)?;
             auth.authorize_remote_embedding_query(&primary.space.id)?;
-            let admitted = policies
+            let admitted = space_policies
                 .get(&primary.space.id)
                 .ok_or_else(selection::unavailable)?;
             let grant = auth
@@ -458,12 +507,44 @@ impl ProviderService {
                 return Err(invalid(ValidationReason::ClassEgressForbidden));
             }
         }
-        let policy_for = |source: &ProviderCurrentContent| {
+        let candidate_policies_for = |source: &ProviderCurrentContent,
+                                      part_opt: Option<&ProviderMessage>|
+         -> Result<Vec<&PolicyAdmission>, PortError> {
             let space = source
                 .space()
                 .or_else(|| primary.map(|value| &value.space))
                 .ok_or_else(selection::unavailable)?;
-            policies.get(&space.id).ok_or_else(selection::unavailable)
+            if primary.is_some_and(|p| p.space.id == space.id) {
+                return Ok(vec![
+                    space_policies
+                        .get(&space.id)
+                        .ok_or_else(selection::unavailable)?,
+                ]);
+            }
+            let mut candidates = Vec::new();
+            if !matches!(source, ProviderCurrentContent::Space { .. })
+                && let Some(sec_projects) = secondary_projects_by_space.get(&space.id)
+            {
+                for &proj in sec_projects {
+                    if source.in_project(proj)
+                        && part_opt.is_none_or(|part| part.in_project(proj))
+                        && let Some(admitted) = secondary_project_policies
+                            .get(&(proj.space_id.clone(), proj.folder_id.clone()))
+                    {
+                        candidates.push(admitted);
+                    }
+                }
+            }
+            if let Some(wide) = space_policies.get(&space.id) {
+                candidates.push(wide);
+            }
+            if candidates.is_empty() {
+                if secondary_projects_by_space.contains_key(&space.id) {
+                    return Err(DomainError::AccessDenied.into());
+                }
+                return Err(selection::unavailable());
+            }
+            Ok(candidates)
         };
         let mut used = BTreeSet::new();
         let mut checked_dependencies = BTreeSet::new();
@@ -474,51 +555,70 @@ impl ProviderService {
             let metadata = metadata
                 .get(&origin)
                 .ok_or_else(|| invalid(ValidationReason::SourceMismatch))?;
-            let admitted = policy_for(metadata)?;
-            if admitted
-                .project_only
-                .as_ref()
-                .or(indexing_project)
-                .is_some_and(|project| !part.in_project(project) || !metadata.in_project(project))
-            {
-                return Err(DomainError::AccessDenied.into());
-            }
-            if let ProviderCurrentContent::Ability {
-                reference,
-                provenance,
-                requires_explicit_binding,
-                ..
-            } = metadata
-            {
-                let identity = AbilityIdentity {
-                    id: reference.ability.clone(),
-                    placement: provenance.current.placement.clone(),
-                };
-                let ability_project = match &identity.placement {
-                    AbilityPlacement::OwnedProject(folder) => Some(folder),
-                    AbilityPlacement::OwnedSpace(space) => admitted
-                        .project_only
-                        .as_ref()
-                        .or(indexing_project)
-                        .or_else(|| project_by_space.get(space).copied().flatten()),
-                    AbilityPlacement::OwnedPersonal(_) | AbilityPlacement::System => {
-                        admitted.project_only.as_ref().or(project)
-                    }
-                };
-                if !self
-                    .control
-                    .ability_admitted_for_provider(
-                        tx,
-                        &identity,
-                        ability_project,
-                        *requires_explicit_binding,
-                    )
-                    .await?
+            let candidates = candidate_policies_for(metadata, Some(part))?;
+            let mut last_error: Option<PortError> = None;
+            let mut admitted_ok = false;
+            for admitted in candidates {
+                if admitted
+                    .project_only
+                    .as_ref()
+                    .or(indexing_project)
+                    .is_some_and(|project| {
+                        !part.in_project(project) || !metadata.in_project(project)
+                    })
                 {
-                    return Err(DomainError::ResourceNotFound.into());
+                    last_error = Some(DomainError::AccessDenied.into());
+                    continue;
+                }
+                if let ProviderCurrentContent::Ability {
+                    reference,
+                    provenance,
+                    requires_explicit_binding,
+                    ..
+                } = metadata
+                {
+                    let identity = AbilityIdentity {
+                        id: reference.ability.clone(),
+                        placement: provenance.current.placement.clone(),
+                    };
+                    let ability_project = match &identity.placement {
+                        AbilityPlacement::OwnedProject(folder) => Some(folder),
+                        AbilityPlacement::OwnedSpace(space) => admitted
+                            .project_only
+                            .as_ref()
+                            .or(indexing_project)
+                            .or_else(|| primary.filter(|p| &p.space.id == space).and(project)),
+                        AbilityPlacement::OwnedPersonal(_) | AbilityPlacement::System => {
+                            admitted.project_only.as_ref().or(project)
+                        }
+                    };
+                    if !self
+                        .control
+                        .ability_admitted_for_provider(
+                            tx,
+                            &identity,
+                            ability_project,
+                            *requires_explicit_binding,
+                        )
+                        .await?
+                    {
+                        last_error = Some(DomainError::ResourceNotFound.into());
+                        continue;
+                    }
+                }
+                match ClassEgressFence::revalidate(part, &auth, &admitted.policy, metadata) {
+                    Ok(()) => {
+                        admitted_ok = true;
+                        break;
+                    }
+                    Err(err) => {
+                        last_error = Some(err.into());
+                    }
                 }
             }
-            ClassEgressFence::revalidate(part, &auth, &admitted.policy, metadata)?;
+            if !admitted_ok {
+                return Err(last_error.unwrap_or_else(selection::unavailable));
+            }
             dependencies.push(*metadata);
         }
         while let Some(source) = dependencies.pop() {
@@ -538,50 +638,67 @@ impl ProviderService {
                 let dependency = metadata
                     .get(&key)
                     .ok_or_else(|| invalid(ValidationReason::SourceMismatch))?;
-                let admitted = policy_for(dependency)?;
-                if admitted
-                    .project_only
-                    .as_ref()
-                    .is_some_and(|project| !dependency.in_project(project))
-                {
-                    return Err(DomainError::AccessDenied.into());
-                }
-                if let ProviderCurrentContent::Ability {
-                    reference,
-                    provenance,
-                    requires_explicit_binding,
-                    ..
-                } = dependency
-                {
-                    let identity = AbilityIdentity {
-                        id: reference.ability.clone(),
-                        placement: provenance.current.placement.clone(),
-                    };
-                    let ability_project = match &identity.placement {
-                        AbilityPlacement::OwnedProject(folder) => Some(folder),
-                        AbilityPlacement::OwnedSpace(space) => admitted
-                            .project_only
-                            .as_ref()
-                            .or(indexing_project)
-                            .or_else(|| project_by_space.get(space).copied().flatten()),
-                        AbilityPlacement::OwnedPersonal(_) | AbilityPlacement::System => {
-                            admitted.project_only.as_ref().or(project)
-                        }
-                    };
-                    if !self
-                        .control
-                        .ability_admitted_for_provider(
-                            tx,
-                            &identity,
-                            ability_project,
-                            *requires_explicit_binding,
-                        )
-                        .await?
+                let candidates = candidate_policies_for(dependency, None)?;
+                let mut last_error: Option<PortError> = None;
+                let mut admitted_ok = false;
+                for admitted in candidates {
+                    if admitted
+                        .project_only
+                        .as_ref()
+                        .is_some_and(|project| !dependency.in_project(project))
                     {
-                        return Err(DomainError::ResourceNotFound.into());
+                        last_error = Some(DomainError::AccessDenied.into());
+                        continue;
+                    }
+                    if let ProviderCurrentContent::Ability {
+                        reference,
+                        provenance,
+                        requires_explicit_binding,
+                        ..
+                    } = dependency
+                    {
+                        let identity = AbilityIdentity {
+                            id: reference.ability.clone(),
+                            placement: provenance.current.placement.clone(),
+                        };
+                        let ability_project = match &identity.placement {
+                            AbilityPlacement::OwnedProject(folder) => Some(folder),
+                            AbilityPlacement::OwnedSpace(space) => admitted
+                                .project_only
+                                .as_ref()
+                                .or(indexing_project)
+                                .or_else(|| primary.filter(|p| &p.space.id == space).and(project)),
+                            AbilityPlacement::OwnedPersonal(_) | AbilityPlacement::System => {
+                                admitted.project_only.as_ref().or(project)
+                            }
+                        };
+                        if !self
+                            .control
+                            .ability_admitted_for_provider(
+                                tx,
+                                &identity,
+                                ability_project,
+                                *requires_explicit_binding,
+                            )
+                            .await?
+                        {
+                            last_error = Some(DomainError::ResourceNotFound.into());
+                            continue;
+                        }
+                    }
+                    match ClassEgressFence::revalidate_origin(&auth, &admitted.policy, dependency) {
+                        Ok(()) => {
+                            admitted_ok = true;
+                            break;
+                        }
+                        Err(err) => {
+                            last_error = Some(err.into());
+                        }
                     }
                 }
-                ClassEgressFence::revalidate_origin(&auth, &admitted.policy, dependency)?;
+                if !admitted_ok {
+                    return Err(last_error.unwrap_or_else(selection::unavailable));
+                }
                 if used.insert(key) {
                     dependencies.push(dependency);
                 }
@@ -660,23 +777,26 @@ impl ProviderService {
             auth.credential().ok_or(DomainError::AuthenticationFailed)?,
         )
         .await?;
+        let all_policies = || {
+            space_policies
+                .values()
+                .chain(secondary_project_policies.values())
+        };
         let (disclosed_classes, disclosed_project_only) = if query_only {
             (BTreeSet::new(), None)
         } else {
-            let classes: BTreeSet<DocClass> = policies
-                .values()
+            let classes: BTreeSet<DocClass> = all_policies()
                 .flat_map(|policy| policy.policy.allowed_classes.iter().copied())
                 .filter(|class| *class != DocClass::EncryptedNote)
                 .collect();
-            let mut projects = policies.values().map(|policy| policy.project_only.as_ref());
+            let mut projects = all_policies().map(|policy| policy.project_only.as_ref());
             let project_only = match projects.next().flatten() {
                 Some(first) if projects.all(|next| next == Some(first)) => Some(first.clone()),
                 _ => None,
             };
             (classes, project_only)
         };
-        let expires_at_ms = policies
-            .values()
+        let expires_at_ms = all_policies()
             .filter_map(|policy| policy.expires_at_ms)
             .chain(expires_at_ms)
             .min();

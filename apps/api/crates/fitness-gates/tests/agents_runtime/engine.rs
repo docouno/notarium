@@ -1178,6 +1178,9 @@ impl TestEngine {
         request: SearchQuery,
         recipient: Option<&dyn SearchRecipient>,
     ) -> Result<SearchResult, notarium_core::error::PortError> {
+        if request.text.split_whitespace().count() > 64 {
+            return Err(DomainError::validation(ValidationReason::InvalidQuery).into());
+        }
         let fixture = self.1.current(ctx).ok_or(DomainError::ResourceNotFound)?;
         let mut hits = Vec::new();
         let recipient = recipient.filter(|recipient| recipient.filters_notes());

@@ -3771,9 +3771,9 @@ async fn verify_run_and_entity_preconditions_tx(
         .map(|entry| &entry.view.note)
         .collect::<BTreeSet<_>>()
     {
-        if let Some(head) =
+        if let Some((_head, effective)) =
             super::board::authorized_rollback_view_head_opt(tx, space, auth, view).await?
-            && head.lifecycle == Lifecycle::Active
+            && effective == Lifecycle::Active
         {
             active_views.insert(view.clone());
         }

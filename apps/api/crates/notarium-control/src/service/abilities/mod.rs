@@ -615,7 +615,7 @@ impl ControlService {
     /// Verify a historical non-terminal trail hop's placement authority and
     /// active Space without requiring a promoted ability's former source
     /// project folder to still be un-trashed.
-    async fn ability_trail_hop_space_active(
+    pub(super) async fn ability_trail_hop_space_active(
         &self,
         ctx: &AccountContext,
         identity: &AbilityIdentity,

@@ -424,7 +424,10 @@ fn authorize_graph_entry(
 }
 
 fn has_full_plain_graph_access(ctx: &SpaceContext) -> bool {
-    use notarium_core::classes::DocClass;
+    use notarium_core::{auth::PrincipalKind, classes::DocClass};
+    if matches!(ctx.auth().kind(), PrincipalKind::Keeper(_)) {
+        return false;
+    }
     let Some(grant) = ctx.auth().spaces().get(&ctx.scope().space_id) else {
         return false;
     };

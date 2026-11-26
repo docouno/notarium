@@ -586,7 +586,11 @@ pub(super) async fn page(
                         Err(e) => return Err(e),
                     };
                     let mut cache = crate::domain::common::FolderAncestryCache::default();
-                    let version_digest = if !readonly.is_empty() {
+                    let version_digest = if matches!(
+                        ctx.auth().kind(),
+                        notarium_core::auth::PrincipalKind::Keeper(_)
+                    ) || !readonly.is_empty()
+                    {
                         let mut fingerprints = Vec::new();
                         for ability_id in readonly {
                             match descriptor_with_cache(

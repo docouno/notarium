@@ -470,12 +470,12 @@ impl DestinationPrecheck {
         }
     }
 
-    fn stripped_segments(self) -> u16 {
+    fn stored_stripped_segments(self) -> Option<u16> {
         match self {
             Self::WithStrip {
                 stripped_segments, ..
-            } => stripped_segments,
-            Self::Legacy(_) => 0,
+            } => Some(stripped_segments),
+            Self::Legacy(_) => None,
         }
     }
 }
@@ -484,6 +484,44 @@ enum DestinationPrefix<'a> {
     None,
     OptionalProjectPath(&'a str),
     RequiredProjectRoot,
+}
+
+async fn resolve_stripped_segments(
+    call: &ToolCallContext<'_>,
+    scope: &SpaceContext,
+    base: &Option<FolderId>,
+    raw_path: &str,
+    prefix: &DestinationPrefix<'_>,
+    allow_trashed_root: bool,
+) -> Result<u16, PortError> {
+    match prefix {
+        DestinationPrefix::None => Ok(0),
+        DestinationPrefix::OptionalProjectPath(project_path) => {
+            if !project_path.is_empty()
+                && corpus::strip_folder_prefix(raw_path, project_path).is_some()
+            {
+                segment_count(project_path)
+            } else {
+                Ok(0)
+            }
+        }
+        DestinationPrefix::RequiredProjectRoot => {
+            let root_id = base
+                .as_ref()
+                .ok_or_else(|| invalid(ValidationReason::InvalidState))?;
+            let root = match folder_base(call, scope, root_id).await {
+                Ok(root) => root,
+                Err(PortError::Domain(DomainError::ResourceNotFound)) if allow_trashed_root => {
+                    return Ok(0);
+                }
+                Err(error) => return Err(error),
+            };
+            if corpus::strip_folder_prefix(raw_path, &root.path).is_none() {
+                return Err(DomainError::SpaceReadOnly.into());
+            }
+            segment_count(&root.path)
+        }
+    }
 }
 
 fn segment_count(path: &str) -> Result<u16, PortError> {
@@ -698,29 +736,10 @@ async fn ensure_destination(
                     content_command.hash,
                     || async {
                         existed_replayed = false;
-                        let stripped_segments = match prefix {
-                            DestinationPrefix::None => 0,
-                            DestinationPrefix::OptionalProjectPath(project_path) => {
-                                if !project_path.is_empty()
-                                    && corpus::strip_folder_prefix(&raw_path, project_path)
-                                        .is_some()
-                                {
-                                    segment_count(project_path)?
-                                } else {
-                                    0
-                                }
-                            }
-                            DestinationPrefix::RequiredProjectRoot => {
-                                let root_id = base
-                                    .as_ref()
-                                    .ok_or_else(|| invalid(ValidationReason::InvalidState))?;
-                                let root = folder_base(call, scope, root_id).await?;
-                                if corpus::strip_folder_prefix(&raw_path, &root.path).is_none() {
-                                    return Err(DomainError::SpaceReadOnly.into());
-                                }
-                                segment_count(&root.path)?
-                            }
-                        };
+                        let stripped_segments = resolve_stripped_segments(
+                            call, scope, &base, &raw_path, &prefix, false,
+                        )
+                        .await?;
                         let path = strip_leading_segments(&raw_path, stripped_segments)?;
                         admit_destination_anchor(call, scope, &base, &path, class).await?;
                         if let Some(route) = expected_source {
@@ -758,7 +777,13 @@ async fn ensure_destination(
                 )
                 .await?;
             let existed = precheck.existed();
-            let path = strip_leading_segments(&raw_path, precheck.stripped_segments())?;
+            let stripped_segments = match precheck.stored_stripped_segments() {
+                Some(count) => count,
+                None => {
+                    resolve_stripped_segments(call, scope, &base, &raw_path, &prefix, true).await?
+                }
+            };
+            let path = strip_leading_segments(&raw_path, stripped_segments)?;
             let has_path = !path.is_empty();
             if existed_replayed {
                 admit_destination_anchor_for_replay(call, scope, &base, &path, class, true).await?;

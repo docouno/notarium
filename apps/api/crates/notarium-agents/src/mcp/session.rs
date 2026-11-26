@@ -231,36 +231,44 @@ async fn whoami(call: &mut ToolCallContext<'_>) -> Result<Value, PortError> {
     let external = matches!(call.target, EgressTarget::ExternalMcp);
     let mut spaces = Vec::new();
     let mut pending_taints = Vec::new();
-    for card in readable_spaces(call).await?.into_values() {
-        let space = card.space;
-        let slug = if external {
-            card.slug
-        } else {
-            let ctx = call.space(card.history)?;
-            let source = CatalogDisclosure::Space(ctx.scope().clone());
-            let Some((proof, taint)) = project_metadata(call, ctx, source, None).await? else {
-                continue;
+    let collected: Result<(), PortError> = async {
+        for card in readable_spaces(call).await?.into_values() {
+            let space = card.space;
+            let slug = if external {
+                card.slug
+            } else {
+                let ctx = call.space(card.history)?;
+                let source = CatalogDisclosure::Space(ctx.scope().clone());
+                let Some((proof, taint)) = project_metadata(call, ctx, source, None).await? else {
+                    continue;
+                };
+                if let Some(taint) = taint {
+                    pending_taints.push(taint);
+                }
+                required_text(&proof, "slug")?.to_owned()
             };
-            if let Some(taint) = taint {
-                pending_taints.push(taint);
-            }
-            required_text(&proof, "slug")?.to_owned()
-        };
-        let space_kind = match space.kind {
-            SpaceKind::Personal => "personal",
-            SpaceKind::Shared => "shared",
-        };
-        let role = match card.role {
-            SpaceRole::Owner => "owner",
-            SpaceRole::Editor => "editor",
-            SpaceRole::Viewer => "viewer",
-        };
-        spaces.push(json!({
-            "spaceId": space.id,
-            "slug": slug,
-            "kind": space_kind,
-            "role": role,
-        }));
+            let space_kind = match space.kind {
+                SpaceKind::Personal => "personal",
+                SpaceKind::Shared => "shared",
+            };
+            let role = match card.role {
+                SpaceRole::Owner => "owner",
+                SpaceRole::Editor => "editor",
+                SpaceRole::Viewer => "viewer",
+            };
+            spaces.push(json!({
+                "spaceId": space.id,
+                "slug": slug,
+                "kind": space_kind,
+                "role": role,
+            }));
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(error) = collected {
+        commit_pending_taints_on_error(call, pending_taints);
+        return Err(error);
     }
     for taint in pending_taints {
         taint.commit()?;
@@ -285,42 +293,50 @@ async fn projects(call: &mut ToolCallContext<'_>) -> Result<Value, PortError> {
     let external = matches!(call.target, EgressTarget::ExternalMcp);
     let mut items = Vec::new();
     let mut pending_taints = Vec::new();
-    for card in visible_projects(call).await? {
-        let Some(space) = spaces.get(&card.folder.space_id) else {
-            continue;
-        };
-        let (space_slug, slug, name) = if external {
-            (space.slug.clone(), card.project_slug, card.name)
-        } else {
-            let scope = call.space(space.history.clone())?;
-            let source = CatalogDisclosure::Folder(card.folder.clone());
-            let Some((proof, taint)) =
-                project_metadata(call, scope, source, Some(card.folder.clone())).await?
-            else {
+    let collected: Result<(), PortError> = async {
+        for card in visible_projects(call).await? {
+            let Some(space) = spaces.get(&card.folder.space_id) else {
                 continue;
             };
-            if let Some(taint) = taint {
-                pending_taints.push(taint);
-            }
-            (
-                required_text(&proof, "spaceSlug")?.to_owned(),
-                required_text(&proof, "projectSlug")?.to_owned(),
-                required_text(&proof, "name")?.to_owned(),
-            )
-        };
-        let handle = format!("{space_slug}/{slug}");
-        let item = json!({
-            "projectId": card.folder.folder_id,
-            "spaceId": card.folder.space_id,
-            "handle": handle,
-            "slug": slug,
-            "name": name,
-        });
-        items.push((handle, item));
+            let (space_slug, slug, name) = if external {
+                (space.slug.clone(), card.project_slug, card.name)
+            } else {
+                let scope = call.space(space.history.clone())?;
+                let source = CatalogDisclosure::Folder(card.folder.clone());
+                let Some((proof, taint)) =
+                    project_metadata(call, scope, source, Some(card.folder.clone())).await?
+                else {
+                    continue;
+                };
+                if let Some(taint) = taint {
+                    pending_taints.push(taint);
+                }
+                (
+                    required_text(&proof, "spaceSlug")?.to_owned(),
+                    required_text(&proof, "projectSlug")?.to_owned(),
+                    required_text(&proof, "name")?.to_owned(),
+                )
+            };
+            let handle = format!("{space_slug}/{slug}");
+            let item = json!({
+                "projectId": card.folder.folder_id,
+                "spaceId": card.folder.space_id,
+                "handle": handle,
+                "slug": slug,
+                "name": name,
+            });
+            items.push((handle, item));
+        }
+        items.sort_by(|left, right| left.0.cmp(&right.0));
+        if items.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+            return Err(invalid(ValidationReason::InvalidState));
+        }
+        Ok(())
     }
-    items.sort_by(|left, right| left.0.cmp(&right.0));
-    if items.windows(2).any(|pair| pair[0].0 == pair[1].0) {
-        return Err(invalid(ValidationReason::InvalidState));
+    .await;
+    if let Err(error) = collected {
+        commit_pending_taints_on_error(call, pending_taints);
+        return Err(error);
     }
     for taint in pending_taints {
         taint.commit()?;
@@ -345,6 +361,17 @@ impl PendingMetadataTaint {
     }
 }
 
+fn commit_pending_taints_on_error(call: &ToolCallContext<'_>, pending: Vec<PendingMetadataTaint>) {
+    let pinned = call.auth.pinned_write_space();
+    for taint in pending {
+        let foreign = pinned.is_some_and(|space| space != &taint.scope.scope().space_id);
+        let _ = taint.commit();
+        if foreign {
+            call.commit_external_read();
+        }
+    }
+}
+
 async fn project_metadata(
     call: &mut ToolCallContext<'_>,
     scope: SpaceContext,
@@ -352,6 +379,10 @@ async fn project_metadata(
     project: Option<FolderRef>,
 ) -> Result<Option<(Value, Option<PendingMetadataTaint>)>, PortError> {
     let auth = call.account();
+    let foreign_space = auth
+        .auth()
+        .pinned_write_space()
+        .is_some_and(|space| space != &scope.scope().space_id);
     let project = match &call.target {
         EgressTarget::InAppProvider {
             primary_project, ..
@@ -397,14 +428,38 @@ async fn project_metadata(
             return if corpus::hidden(&error) {
                 Ok(None)
             } else {
+                if foreign_space {
+                    call.commit_external_read();
+                }
                 Err(error)
             };
         }
-        call.record_origin(proof.current().origin(), selection.project_only)?;
+        if let Err(error) = call.record_origin(proof.current().origin(), selection.project_only) {
+            if foreign_space {
+                call.commit_external_read();
+            }
+            return Err(error);
+        }
         deferred_policy = Some(selection.policy);
     }
-    let text = ClassEgressFence::mcp_metadata(&proof, &preflight_auth)?;
-    let value = serde_json::from_str(text).map_err(|_| invalid(ValidationReason::InvalidState))?;
+    let text = match ClassEgressFence::mcp_metadata(&proof, &preflight_auth) {
+        Ok(text) => text,
+        Err(error) => {
+            if foreign_space {
+                call.commit_external_read();
+            }
+            return Err(error.into());
+        }
+    };
+    let value = match serde_json::from_str(text) {
+        Ok(value) => value,
+        Err(_) => {
+            if foreign_space {
+                call.commit_external_read();
+            }
+            return Err(invalid(ValidationReason::InvalidState));
+        }
+    };
     Ok(Some((
         value,
         Some(PendingMetadataTaint {

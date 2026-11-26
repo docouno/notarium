@@ -247,7 +247,9 @@ fn windows(
         };
         // Durable ledgers are per Space, so a restricted class or project view
         // cannot acknowledge content omitted from a future broader view.
-        let can_acknowledge = grant.project_root.is_none() && grant.read_classes == DocClass::all();
+        let can_acknowledge = !matches!(auth.kind(), notarium_core::auth::PrincipalKind::Keeper(_))
+            && grant.project_root.is_none()
+            && grant.read_classes == DocClass::all();
         windows.push(Window {
             baseline: ChangeCursor {
                 scope: item.history,

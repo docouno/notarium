@@ -1118,7 +1118,11 @@ async fn read_body_inner(
         commit_taint,
     )
     .await?;
-    let (description, instructions, attachments) = parse_body(&body.text)?;
+    let (description, instructions, attachments) = parse_body(&body.text).inspect_err(|_| {
+        if let Some(commit) = &body.deferred_taint {
+            commit_deferred_taints_on_error(call, std::slice::from_ref(commit));
+        }
+    })?;
     Ok(AbilityBody {
         description,
         instructions,

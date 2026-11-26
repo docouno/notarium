@@ -919,12 +919,17 @@ impl Eligible {
             .spaces()
             .get(&cut.scope.space_id)
             .ok_or(DomainError::ResourceNotFound)?;
+        let keeper_without_skills = matches!(
+            ctx.auth().kind(),
+            notarium_core::auth::PrincipalKind::Keeper(_)
+        ) && ctx.auth().readonly_abilities().is_empty();
         let classes: BTreeSet<_> = grant
             .read_classes
             .iter()
             .copied()
             .filter(|class| {
                 *class != DocClass::EncryptedNote
+                    && (!keeper_without_skills || *class != DocClass::Skill)
                     && (query.classes.is_empty() || query.classes.contains(class))
             })
             .collect();

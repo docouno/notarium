@@ -20,7 +20,7 @@ use notarium_core::{
     error::{Diagnostic, PortError, ValidationReason},
     ids::{AbilityId, ContentDigest, FolderId, NoteId, RevisionId, SpaceSeq},
     model::{HistoryScope, Lifecycle},
-    ports::{Cancellation, PageLimit, SpaceContext, ViewRef},
+    ports::{Cancellation, PageLimit, PlannedNoteRestoration, SpaceContext, ViewRef},
     query::{FieldObservation, FieldSchema, FieldValue},
     value::{Timestamp, YamlValue},
 };
@@ -35,7 +35,7 @@ use crate::{
     runtime::{ProjectionEngine, PublishedCut, records::effective_tags},
 };
 
-use super::board_plan;
+use super::{board_plan, board_plan_for_rollback};
 
 const MAX_REPLAY_EVENTS: u64 = 512;
 const BOARD_WAIT: Duration = Duration::from_millis(25);
@@ -97,12 +97,14 @@ struct ReplayedChanges {
 }
 
 impl BoardCut {
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn load<'a>(
         engine: &ProjectionEngine,
         ctx: &SpaceContext,
         requested: Option<SpaceSeq>,
         views: impl IntoIterator<Item = &'a ViewRef>,
         additional_notes: impl IntoIterator<Item = &'a NoteId>,
+        restorations: &[PlannedNoteRestoration],
         deadline: &PlannerDeadline,
     ) -> Result<Self, PortError> {
         let _ = engine.current_admission(engine.active_generation())?;
@@ -153,6 +155,7 @@ impl BoardCut {
                     &views,
                     &view_notes,
                     &additional,
+                    restorations,
                     deadline,
                 )
                 .await
@@ -192,6 +195,7 @@ impl BoardCut {
         views: &BTreeSet<ViewRef>,
         view_notes: &BTreeSet<&NoteId>,
         additional: &BTreeSet<NoteId>,
+        restorations: &[PlannedNoteRestoration],
         deadline: &PlannerDeadline,
     ) -> Result<(), PortError> {
         let projected = published.cut.projected_seq;
@@ -264,8 +268,16 @@ impl BoardCut {
         } else {
             ReplayedChanges::default()
         };
-        self.hydrate_candidates(engine, ctx, published, views, &replayed, deadline)
-            .await
+        self.hydrate_candidates(
+            engine,
+            ctx,
+            published,
+            views,
+            &replayed,
+            restorations,
+            deadline,
+        )
+        .await
     }
 
     async fn load_from_canonical(
@@ -376,6 +388,7 @@ impl BoardCut {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn hydrate_candidates(
         &mut self,
         engine: &ProjectionEngine,
@@ -383,6 +396,7 @@ impl BoardCut {
         published: &PublishedCut,
         views: &BTreeSet<ViewRef>,
         replayed: &ReplayedChanges,
+        restorations: &[notarium_core::ports::PlannedNoteRestoration],
         deadline: &PlannerDeadline,
     ) -> Result<(), PortError> {
         let index = deadline.wait(engine.open_index_async(published)).await?;
@@ -402,10 +416,20 @@ impl BoardCut {
                 universe.remove(dense);
             }
         }
+        let restored_by_note: BTreeMap<&NoteId, &notarium_core::ports::PlannedNoteRestoration> =
+            restorations
+                .iter()
+                .filter(|entry| entry.planned_lifecycle == Lifecycle::Active)
+                .map(|entry| (&entry.note, entry))
+                .collect();
         let mut candidates = croaring::Bitmap::new();
         for view in views {
             deadline.check()?;
-            let plan = board_plan(self, ctx, view)?;
+            let plan = if restorations.is_empty() {
+                board_plan(self, ctx, view)?
+            } else {
+                board_plan_for_rollback(self, ctx, view, restored_by_note.get(&view.note).copied())?
+            };
             let folder = plan
                 .source_folder
                 .as_ref()
@@ -742,6 +766,10 @@ impl BoardCut {
             .classes
             .iter()
             .all(|class| grant.read_classes.contains(class))
+            || (matches!(
+                ctx.auth().kind(),
+                notarium_core::auth::PrincipalKind::Keeper(_)
+            ) && source.classes.contains(&DocClass::Skill))
         {
             return Err(DomainError::ResourceNotFound.into());
         }
@@ -857,11 +885,19 @@ impl BoardCut {
                 .auth()
                 .authorize_folder_read(&facts.space, folder, &facts.ancestor_folders)?)
         };
+        let restorations: Vec<_> = restorations.into_iter().collect();
+        let restored_active_views: BTreeSet<&NoteId> = restorations
+            .iter()
+            .filter(|entry| entry.planned_lifecycle == Lifecycle::Active)
+            .map(|entry| &entry.note)
+            .collect();
         for folder in auth_folders {
             check_folder(folder)?;
         }
         for (view, groups) in views {
-            check_note(&view.note)?;
+            if !restored_active_views.contains(&view.note) {
+                check_note(&view.note)?;
+            }
             for row in groups.iter().flat_map(|group| &group.rows) {
                 check_note(&row.note)?;
             }
@@ -1676,6 +1712,7 @@ mod tests {
             Some(past_cutoff),
             [&view_ref],
             [&moved_id, &purged_id],
+            &[],
             &deadline,
         )
         .await
@@ -1776,6 +1813,7 @@ mod tests {
                 Some(past_cutoff),
                 [&view_ref],
                 std::iter::empty(),
+                &[],
                 &deadline,
             )
             .await,
