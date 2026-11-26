@@ -1077,6 +1077,10 @@ async fn live_room_and_disk_edits_converge_on_the_same_file() {
             compacted_through_update_seq: None,
         },
     ));
+    fixture
+        .store
+        .register_collab_interceptor(room.clone())
+        .unwrap();
     let worker = fixture.start_with_collaboration(Some(room));
     let state = ready(&mut worker.status(), |_| {
         fs::read_to_string(&file).is_ok_and(|text| text == expected)
