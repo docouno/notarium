@@ -795,6 +795,7 @@ async fn resolve_selector_for_call(
     }
     let mut winners: Vec<AbilityDescriptor> = Vec::new();
     let mut best_prec: Option<u8> = None;
+    let mut saw_local_candidate = false;
     for inspection in page.items {
         let descriptor = inspection.descriptor;
         let reference = &descriptor.reference;
@@ -803,6 +804,9 @@ async fn resolve_selector_for_call(
         }
         if !provider_placement_visible(call, &descriptor, project.as_ref()).await? {
             continue;
+        }
+        if !placement_is_foreign(call, &reference.placement, descriptor.entrypoint.as_ref()) {
+            saw_local_candidate = true;
         }
         let prec = reference.placement.precedence();
         match best_prec {
@@ -826,6 +830,19 @@ async fn resolve_selector_for_call(
         0 => AbilityResolution::Missing,
         1 => {
             let winner = winners.pop().expect("single winner");
+            if saw_local_candidate
+                && placement_is_foreign(
+                    call,
+                    &winner.reference.placement,
+                    winner.entrypoint.as_ref(),
+                )
+            {
+                // A foreign Space ability evicted a local/system candidate of the
+                // same name. Commit branch taint immediately so even a subsequent
+                // disabled/wrong-kind/unavailable collapse to ResourceNotFound
+                // cannot act as a zero-taint cross-space shadowing oracle.
+                call.commit_external_read();
+            }
             if winner.kind != kind {
                 AbilityResolution::WrongKind
             } else {
@@ -1177,7 +1194,22 @@ async fn read_owned_resource_inner(
     )
     .await?;
     let origin = body.origin();
-    let confined_project = selection.as_ref().and_then(|sel| sel.project_only.clone());
+    let confined_project = selection.as_ref().and_then(|sel| {
+        sel.project_only.clone().or_else(|| {
+            project
+                .as_ref()
+                .filter(|p| {
+                    call.auth
+                        .pinned_write_space()
+                        .is_some_and(|pin| pin != &p.space_id)
+                        && matches!(
+                            reference.placement,
+                            AbilityPlacement::OwnedSpace(_) | AbilityPlacement::OwnedPersonal(_)
+                        )
+                })
+                .cloned()
+        })
+    });
     if let Some(sel) = &selection
         && sel
             .project_only
@@ -1287,7 +1319,7 @@ fn summary(
         "kind": kind_name(descriptor.kind),
         "source": source(&descriptor.reference),
         "scope": descriptor.reference.placement,
-        "enabled": enabled && descriptor.enabled,
+        "enabled": enabled,
         "healthy": descriptor.healthy,
         "description": description,
     });
@@ -1325,12 +1357,28 @@ fn provider_ability_allowed(
         // would unconditionally fail revalidation on the next completion step.
         let dispatch_project = match &inspection.descriptor.reference.placement {
             AbilityPlacement::OwnedProject(folder) => Some(folder),
-            AbilityPlacement::OwnedPersonal(_) | AbilityPlacement::System => {
-                primary_project.as_ref()
+            AbilityPlacement::OwnedPersonal(_) => {
+                let entry_space = inspection
+                    .descriptor
+                    .entrypoint
+                    .as_ref()
+                    .map(|entry| &entry.space_id);
+                if entry_space == call.auth.pinned_write_space() {
+                    primary_project.as_ref()
+                } else {
+                    project.filter(|p| Some(&p.space_id) == entry_space)
+                }
             }
-            AbilityPlacement::OwnedSpace(space) => primary_project.as_ref().filter(|primary| {
-                &primary.space_id == space && call.auth.pinned_write_space() == Some(space)
-            }),
+            AbilityPlacement::System => primary_project.as_ref(),
+            AbilityPlacement::OwnedSpace(space) => {
+                if call.auth.pinned_write_space() == Some(space) {
+                    primary_project
+                        .as_ref()
+                        .filter(|primary| &primary.space_id == space)
+                } else {
+                    project.filter(|p| &p.space_id == space)
+                }
+            }
         };
         if !dispatch_project.is_some_and(|p| projects.contains(p)) {
             return false;

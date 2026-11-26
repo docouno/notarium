@@ -154,14 +154,22 @@ pub(super) async fn list(call: &mut ToolCallContext<'_>, args: Value) -> Result<
         // project_hint) observes that Space even when the resulting listing is empty.
         call.auth.taint().mark_external_read();
     }
-    let Some(folder) = directory(call, &target, &preflight_scope, &cleaned_path).await? else {
-        if foreign_space && (args.path.is_some() || (targeted_project && previous.is_some())) {
-            call.commit_external_read();
+    let has_previous = previous.is_some();
+    let folder = match directory(call, &target, &preflight_scope, &cleaned_path).await {
+        Ok(Some(folder)) => folder,
+        Ok(None) => {
+            if foreign_space && (args.path.is_some() || (targeted_project && has_previous)) {
+                call.commit_external_read();
+            }
+            if has_previous {
+                return Err(invalid(ValidationReason::CursorStale));
+            }
+            return Ok(empty(external));
         }
-        if previous.is_some() {
-            return Err(invalid(ValidationReason::CursorStale));
+        Err(error) => {
+            commit_post_target_err(call, foreign_space, targeted_project, has_previous, &error);
+            return Err(error);
         }
-        return Ok(empty(external));
     };
     let folder_project = folder
         .project
@@ -181,7 +189,7 @@ pub(super) async fn list(call: &mut ToolCallContext<'_>, args: Value) -> Result<
     .await
     {
         if corpus::hidden(&error) {
-            if previous.is_some() {
+            if has_previous {
                 if foreign_space && targeted_project {
                     call.commit_external_read();
                 }
@@ -189,6 +197,7 @@ pub(super) async fn list(call: &mut ToolCallContext<'_>, args: Value) -> Result<
             }
             return Ok(empty(external));
         }
+        commit_post_target_err(call, foreign_space, targeted_project, has_previous, &error);
         return Err(error);
     }
     if foreign_space && (!args.fields.is_empty() || args.path.is_some()) {
@@ -260,7 +269,10 @@ pub(super) async fn list(call: &mut ToolCallContext<'_>, args: Value) -> Result<
             }
             return Ok(empty(external));
         }
-        Err(error) => return Err(error),
+        Err(error) => {
+            commit_post_target_err(call, foreign_space, targeted_project, has_previous, &error);
+            return Err(error);
+        }
     };
 
     let request = if let Some(previous) = &previous {
@@ -292,14 +304,27 @@ pub(super) async fn list(call: &mut ToolCallContext<'_>, args: Value) -> Result<
         None
     };
     if allow_user_doc && let Some(request) = request {
-        let page = call
+        let page = match call
             .registry
             .engine
             .list_notes(preflight_scope.clone(), request)
-            .await?;
-        scope.scope().check(&page.children.scope)?;
+            .await
+        {
+            Ok(page) => page,
+            Err(error) => {
+                commit_post_target_err(call, foreign_space, targeted_project, has_previous, &error);
+                return Err(error);
+            }
+        };
+        if let Err(error) = scope.scope().check(&page.children.scope) {
+            let error: PortError = error.into();
+            commit_post_target_err(call, foreign_space, targeted_project, has_previous, &error);
+            return Err(error);
+        }
         if page.folder != folder.reference || page.children.items.len() > usize::from(limit.get()) {
-            return Err(invalid(ValidationReason::InvalidState));
+            let error = invalid(ValidationReason::InvalidState);
+            commit_post_target_err(call, foreign_space, targeted_project, has_previous, &error);
+            return Err(error);
         }
         if external {
             total = Some(page.total);
@@ -323,7 +348,16 @@ pub(super) async fn list(call: &mut ToolCallContext<'_>, args: Value) -> Result<
                     "viewType": card.view_type,
                 })),
                 Err(error) if corpus::hidden(&error) => (),
-                Err(error) => return Err(error),
+                Err(error) => {
+                    commit_post_target_err(
+                        call,
+                        foreign_space,
+                        targeted_project,
+                        has_previous,
+                        &error,
+                    );
+                    return Err(error);
+                }
             }
         }
     }
@@ -339,7 +373,7 @@ pub(super) async fn list(call: &mut ToolCallContext<'_>, args: Value) -> Result<
             Some(cursor) => (cursor.folders, cursor.folders_cut),
             None => (None, None),
         };
-        let page = call
+        let page = match call
             .registry
             .engine
             .list_child_folders(
@@ -349,14 +383,23 @@ pub(super) async fn list(call: &mut ToolCallContext<'_>, args: Value) -> Result<
                 at_seq,
                 limit,
             )
-            .await?;
+            .await
+        {
+            Ok(page) => page,
+            Err(error) => {
+                commit_post_target_err(call, foreign_space, targeted_project, has_previous, &error);
+                return Err(error);
+            }
+        };
         if page.items.len() > usize::from(limit.get())
             || page
                 .next
                 .as_ref()
                 .is_some_and(|next| after.as_ref().is_some_and(|after| next <= after))
         {
-            return Err(invalid(ValidationReason::InvalidState));
+            let error = invalid(ValidationReason::InvalidState);
+            commit_post_target_err(call, foreign_space, targeted_project, has_previous, &error);
+            return Err(error);
         }
         next_folders = page.next;
         folders_cut = next_folders.as_ref().map(|_| page.cut_seq);
@@ -364,10 +407,18 @@ pub(super) async fn list(call: &mut ToolCallContext<'_>, args: Value) -> Result<
             if child.history != folder.history
                 || child.parent.as_ref() != Some(&folder.reference.folder_id)
             {
-                return Err(invalid(ValidationReason::InvalidState));
+                let error = invalid(ValidationReason::InvalidState);
+                commit_post_target_err(call, foreign_space, targeted_project, has_previous, &error);
+                return Err(error);
             }
         }
-        folders = corpus::folder_metadata_batch(call, &scope, &page.items).await?;
+        folders = match corpus::folder_metadata_batch(call, &scope, &page.items).await {
+            Ok(folders) => folders,
+            Err(error) => {
+                commit_post_target_err(call, foreign_space, targeted_project, has_previous, &error);
+                return Err(error);
+            }
+        };
     }
     let mut output = json!({ "items": items, "folders": folders });
     if incomplete {
@@ -377,7 +428,7 @@ pub(super) async fn list(call: &mut ToolCallContext<'_>, args: Value) -> Result<
         output["total"] = json!(total);
     }
     if next_notes.is_some() || next_folders.is_some() {
-        let token = call.registry.note_cursors.insert(
+        let token = match call.registry.note_cursors.insert(
             call.auth.principal().clone(),
             NoteContinuation {
                 folder: folder.reference.clone(),
@@ -388,14 +439,32 @@ pub(super) async fn list(call: &mut ToolCallContext<'_>, args: Value) -> Result<
                 folders_cut,
                 total,
             },
-        )?;
+        ) {
+            Ok(token) => token,
+            Err(error) => {
+                commit_post_target_err(call, foreign_space, targeted_project, has_previous, &error);
+                return Err(error);
+            }
+        };
         output["nextCursor"] = json!(token);
     }
     let handle = if let Some(handle) = args.project {
         Some(handle)
     } else if external && folder.cover_note.is_none() {
         if let Some(project) = &target.project {
-            let source = session::project_for_folder(call, project).await?;
+            let source = match session::project_for_folder(call, project).await {
+                Ok(source) => source,
+                Err(error) => {
+                    commit_post_target_err(
+                        call,
+                        foreign_space,
+                        targeted_project,
+                        has_previous,
+                        &error,
+                    );
+                    return Err(error);
+                }
+            };
             Some(format!("{}/{}", target.slug, source.project_slug))
         } else {
             None
@@ -403,7 +472,7 @@ pub(super) async fn list(call: &mut ToolCallContext<'_>, args: Value) -> Result<
     } else {
         None
     };
-    if let Some(page) = folder_page(
+    let page = match folder_page(
         call,
         &scope,
         &preflight_scope,
@@ -412,11 +481,39 @@ pub(super) async fn list(call: &mut ToolCallContext<'_>, args: Value) -> Result<
         &folder_info,
         handle.as_deref(),
     )
-    .await?
+    .await
     {
+        Ok(page) => page,
+        Err(error) => {
+            commit_post_target_err(call, foreign_space, targeted_project, has_previous, &error);
+            return Err(error);
+        }
+    };
+    if let Some(page) = page {
         output["folderPage"] = page;
     }
     Ok(output)
+}
+
+fn commit_post_target_err(
+    call: &ToolCallContext<'_>,
+    foreign_space: bool,
+    targeted_project: bool,
+    has_previous: bool,
+    error: &PortError,
+) {
+    if foreign_space
+        && targeted_project
+        && !matches!(error, PortError::Domain(DomainError::ResourceNotFound))
+        && !(has_previous
+            && matches!(
+                error,
+                PortError::Domain(DomainError::ValidationFailed { diagnostic })
+                    if diagnostic.reason == ValidationReason::CursorStale
+            ))
+    {
+        call.commit_external_read();
+    }
 }
 
 async fn directory(

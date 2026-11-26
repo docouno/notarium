@@ -512,11 +512,41 @@ async fn resolve_stripped_segments(
             let root = match folder_base(call, scope, root_id).await {
                 Ok(root) => root,
                 Err(PortError::Domain(DomainError::ResourceNotFound)) if allow_trashed_root => {
+                    let root_ref = FolderRef {
+                        space_id: scope.scope().space_id.clone(),
+                        folder_id: root_id.clone(),
+                    };
+                    let trashed_account = notarium_core::ports::AccountContext::new(
+                        scope.auth().with_preflight_taint(),
+                        call.budget(),
+                    );
+                    if let Ok(trashed) = call
+                        .registry
+                        .catalog
+                        .trashed_folder_ancestry(trashed_account, root_ref)
+                        .await
+                    {
+                        // `ancestors` includes `root_id` through the Space root; the path
+                        // depth omits the Space root itself (at least 1 segment for a project).
+                        let depth = trashed.ancestors.len().saturating_sub(1).max(1);
+                        if let Ok(count) = u16::try_from(depth)
+                            && usize::from(count) <= usize::from(segment_count(raw_path)?)
+                        {
+                            return Ok(count);
+                        }
+                    }
                     return Ok(0);
                 }
                 Err(error) => return Err(error),
             };
             if corpus::strip_folder_prefix(raw_path, &root.path).is_none() {
+                if allow_trashed_root {
+                    let count = segment_count(&root.path)?;
+                    if count <= segment_count(raw_path)? {
+                        return Ok(count);
+                    }
+                    return Ok(0);
+                }
                 return Err(DomainError::SpaceReadOnly.into());
             }
             segment_count(&root.path)
@@ -777,37 +807,86 @@ async fn ensure_destination(
                 )
                 .await?;
             let existed = precheck.existed();
+            let escalate_unknown = existed_replayed && !existed;
+            let legacy_precheck = precheck.stored_stripped_segments().is_none();
             let stripped_segments = match precheck.stored_stripped_segments() {
                 Some(count) => count,
-                None => {
-                    resolve_stripped_segments(call, scope, &base, &raw_path, &prefix, true).await?
+                None => resolve_stripped_segments(call, scope, &base, &raw_path, &prefix, true)
+                    .await
+                    .map_err(|error| batch_operational_error(ERR_LABEL, error, escalate_unknown))?,
+            };
+            let mut path = strip_leading_segments(&raw_path, stripped_segments)?;
+            if existed_replayed {
+                admit_destination_anchor_for_replay(call, scope, &base, &path, class, true)
+                    .await
+                    .map_err(|error| batch_operational_error(ERR_LABEL, error, escalate_unknown))?;
+            }
+            let folder_key = derive_key(
+                "notarium.mcp.folder-destination.v1",
+                &[content_command.key.as_str().as_bytes(), label.as_bytes()],
+            );
+            let run_ensure = |candidate_path: String| {
+                let base = base.clone();
+                let folder_key = folder_key.clone();
+                async move {
+                    call.registry
+                        .engine
+                        .ensure_folder_path(
+                            call.corpus_writer(scope.clone()).await?,
+                            Mutation {
+                                identity: CommandIdentity {
+                                    scope: content_command.scope.clone(),
+                                    actor: content_command.actor.clone(),
+                                    key: folder_key,
+                                    hash: content_command.hash,
+                                },
+                                preconditions: Preconditions::default(),
+                                input: EnsureFolderPath {
+                                    base,
+                                    path: candidate_path,
+                                },
+                            },
+                        )
+                        .await
                 }
             };
-            let path = strip_leading_segments(&raw_path, stripped_segments)?;
+            let folder = match run_ensure(path.clone()).await {
+                Ok(folder) => folder,
+                Err(PortError::Domain(DomainError::IdempotencyKeyReused)) if legacy_precheck => {
+                    // `IdempotencyKeyReused` proves `folder_key` already committed under some
+                    // stripped path on attempt 1 before `DestinationPrecheck::WithStrip` existed.
+                    // Because `folder_key` is already committed, probing other strip counts can
+                    // only replay the exact committed hash and can never create new folders.
+                    let max_strip = segment_count(&raw_path)?;
+                    let mut recovered = None;
+                    for candidate_strip in 0..=max_strip {
+                        if candidate_strip == stripped_segments {
+                            continue;
+                        }
+                        let candidate_path = strip_leading_segments(&raw_path, candidate_strip)?;
+                        match run_ensure(candidate_path.clone()).await {
+                            Ok(folder) => {
+                                path = candidate_path;
+                                recovered = Some(folder);
+                                break;
+                            }
+                            Err(PortError::Domain(DomainError::IdempotencyKeyReused)) => continue,
+                            Err(error) => {
+                                return Err(batch_operational_error(
+                                    ERR_LABEL,
+                                    error,
+                                    escalate_unknown,
+                                ));
+                            }
+                        }
+                    }
+                    recovered.ok_or(DomainError::IdempotencyKeyReused)?
+                }
+                Err(error) => {
+                    return Err(batch_operational_error(ERR_LABEL, error, escalate_unknown));
+                }
+            };
             let has_path = !path.is_empty();
-            if existed_replayed {
-                admit_destination_anchor_for_replay(call, scope, &base, &path, class, true).await?;
-            }
-            let folder = call
-                .registry
-                .engine
-                .ensure_folder_path(
-                    call.corpus_writer(scope.clone()).await?,
-                    Mutation {
-                        identity: CommandIdentity {
-                            scope: content_command.scope.clone(),
-                            actor: content_command.actor.clone(),
-                            key: derive_key(
-                                "notarium.mcp.folder-destination.v1",
-                                &[content_command.key.as_str().as_bytes(), label.as_bytes()],
-                            ),
-                            hash: content_command.hash,
-                        },
-                        preconditions: Preconditions::default(),
-                        input: EnsureFolderPath { base, path },
-                    },
-                )
-                .await?;
             let plan = JournaledDestination::Detailed {
                 folder,
                 created: !existed,

@@ -2011,10 +2011,13 @@ fn build_rollback_execute_fn(
                     if retired_note_ids.contains(&view.note) {
                         continue;
                     }
-                    let view_facts = rb_facts
-                        .views()
-                        .get(view)
-                        .ok_or_else(|| DomainError::validation(ValidationReason::InvalidState))?;
+                    let Some(view_facts) = rb_facts.views().get(view) else {
+                        continue;
+                    };
+                    let view_restored = matches!(
+                        eligible_notes.get(&view.note),
+                        Some(CandidateAction::RestorePreExisting { .. })
+                    );
                     let view_head =
                         load_note_head_row_tx(tx, &scope_cl.space_id, &view.note).await?;
                     let view_restored_to_active = matches!(
@@ -2129,6 +2132,20 @@ fn build_rollback_execute_fn(
                             } else {
                                 kept_groups.push((post_grp.clone(), vec![nid.clone()]));
                             }
+                        }
+                    }
+                    for (grp, entry) in &mut kept_groups {
+                        if let Some((_, order)) = view_facts
+                            .post_restore_group_order
+                            .iter()
+                            .find(|(g, _)| g == grp)
+                        {
+                            let rank_pos: HashMap<&NoteId, usize> = order
+                                .iter()
+                                .enumerate()
+                                .map(|(idx, id)| (id, idx))
+                                .collect();
+                            entry.sort_by_key(|id| rank_pos.get(id).copied().unwrap_or(usize::MAX));
                         }
                     }
 
@@ -2383,7 +2400,11 @@ fn build_rollback_execute_fn(
                                     Some(pred_id) => {
                                         match g_items.iter().position(|it| &it.note_id == pred_id) {
                                             Some(pos) => Some(pos),
-                                            None if eligible_all_ids.contains(pred_id) => None,
+                                            None if eligible_all_ids.contains(pred_id)
+                                                || view_restored =>
+                                            {
+                                                None
+                                            }
                                             None => {
                                                 return Err(DomainError::validation(
                                                     ValidationReason::InvalidState,
@@ -2398,7 +2419,11 @@ fn build_rollback_execute_fn(
                                     Some(succ_id) => {
                                         match g_items.iter().position(|it| &it.note_id == succ_id) {
                                             Some(pos) => Some(pos),
-                                            None if eligible_all_ids.contains(succ_id) => None,
+                                            None if eligible_all_ids.contains(succ_id)
+                                                || view_restored =>
+                                            {
+                                                None
+                                            }
                                             None => {
                                                 return Err(DomainError::validation(
                                                     ValidationReason::InvalidState,
@@ -2422,7 +2447,7 @@ fn build_rollback_execute_fn(
                                             let succ_eligible = successor
                                                 .as_ref()
                                                 .is_some_and(|id| eligible_all_ids.contains(id));
-                                            if !pred_eligible && !succ_eligible {
+                                            if !pred_eligible && !succ_eligible && !view_restored {
                                                 return Err(DomainError::validation(
                                                     ValidationReason::InvalidState,
                                                 )
@@ -2597,6 +2622,44 @@ fn build_rollback_execute_fn(
                     }
 
                     preloaded_view_overlays.insert(view.clone(), overlays);
+                }
+            }
+
+            // Delete run-owned overlays on views that are inactive, human-trashed, or
+            // no longer valid board views after rollback so rolled-back agent ordering
+            // cannot survive or resurrect if a trashed view or ancestor folder is restored.
+            let inactive_or_retired_views: BTreeSet<ViewRef> = run_moves_cl
+                .iter()
+                .map(|bmh| &bmh.view)
+                .filter(|view| {
+                    !retired_note_ids.contains(&view.note)
+                        && rb_facts_opt
+                            .as_ref()
+                            .is_none_or(|facts| !facts.views().contains_key(*view))
+                })
+                .cloned()
+                .collect();
+            for view in &inactive_or_retired_views {
+                let overlays = load_view_overlays_tx(tx, &scope_cl.space_id, view).await?;
+                let touched_on_view: BTreeSet<&NoteId> = run_moves_cl
+                    .iter()
+                    .filter(|bmh| {
+                        &bmh.view == view
+                            && eligible_all_ids.contains(&bmh.target_note_id)
+                            && !retired_note_ids.contains(&bmh.target_note_id)
+                    })
+                    .map(|bmh| &bmh.target_note_id)
+                    .collect();
+                for nid in touched_on_view {
+                    if overlays
+                        .get(nid)
+                        .is_some_and(|ov| ov.placement_run_id.as_ref() == Some(&input.run))
+                    {
+                        planned_overlay_deletes.push(PlannedOverlayDelete {
+                            view: view.clone(),
+                            target_note: nid.clone(),
+                        });
+                    }
                 }
             }
 

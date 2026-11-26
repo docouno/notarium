@@ -2148,3 +2148,265 @@ async fn postgres_account_preference_replay_enforces_live_placement_authority() 
     ))
     .await;
 }
+
+async fn concurrent_ability_trail_cycle_and_revision_integrity(pg: bool) {
+    let _serial = AUTH_TEST_LOCK.lock().await;
+    let fixture = Fixture::new(pg, "abilities_trail_concurrency").await;
+    let service = fixture.service(AuthenticationMode::Password).await.unwrap();
+    let bootstrap = service
+        .bootstrap(
+            empty(),
+            budget(),
+            BootstrapAccount {
+                username: "owner".into(),
+                email: None,
+                display_name: "Owner".into(),
+                password: Some(SecretString::new("owner trail integrity pass".into())),
+            },
+        )
+        .await
+        .unwrap();
+    let owner_token = bootstrap.session.unwrap().token;
+    async fn resolve_with_ability_write(
+        service: &ControlService,
+        token: &SecretString,
+    ) -> AccountContext {
+        let mut ev = evidence(AuthEvidenceKind::Session, token.expose());
+        ev.evidence = ev.evidence.with_ability_write();
+        AccountContext::new(service.resolve(ev).await.unwrap(), budget())
+    }
+
+    let mut spaces = Vec::new();
+    for (idx, byte) in [91u8, 92, 93, 94].into_iter().enumerate() {
+        let owner_ctx = resolve_with_ability_write(&service, &owner_token).await;
+        let created = service
+            .create_space(
+                owner_ctx.clone(),
+                AccountMutation {
+                    identity: identity(&service, &owner_ctx, 10 + idx as u8).await,
+                    input: CreateSpace {
+                        id: SpaceId::from_bytes([byte; 16]),
+                        kind: SpaceKind::Shared,
+                        name: format!("TrailSpace{idx}"),
+                    },
+                },
+            )
+            .await
+            .unwrap()
+            .value;
+        spaces.push(created);
+    }
+
+    let owner_ctx = resolve_with_ability_write(&service, &owner_token).await;
+    let peer = service
+        .create_account(
+            owner_ctx.clone(),
+            AccountMutation {
+                identity: identity(&service, &owner_ctx, 20).await,
+                input: NewAccount {
+                    username: "peer-editor".into(),
+                    email: None,
+                    display_name: "Peer Editor".into(),
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    service
+        .change_password(
+            owner_ctx.clone(),
+            ChangePassword {
+                account: peer.id.clone(),
+                current: None,
+                replacement: SecretString::new("peer trail editor pass".into()),
+                expected: peer.revision,
+            },
+        )
+        .await
+        .unwrap();
+    let peer_token = service
+        .login(
+            budget(),
+            PasswordLogin {
+                identifier: "peer-editor".into(),
+                password: SecretString::new("peer trail editor pass".into()),
+            },
+        )
+        .await
+        .unwrap()
+        .token;
+    for (idx, sp) in spaces.iter().enumerate() {
+        let owner_ctx = resolve_with_ability_write(&service, &owner_token).await;
+        let sp_rev = service
+            .context_scope(owner_ctx.clone(), ContextScope::Space(sp.space.id.clone()))
+            .await
+            .unwrap()
+            .revision;
+        service
+            .change_membership(
+                SpaceContext::new(owner_ctx.auth().clone(), sp.history.clone(), budget()).unwrap(),
+                MembershipChange {
+                    command: CommandKey::from_bytes([30 + idx as u8; 16]),
+                    member: peer.id.clone(),
+                    role: Some(SpaceRole::Editor),
+                    expected: sp_rev,
+                },
+            )
+            .await
+            .unwrap();
+    }
+    let owner_ctx = resolve_with_ability_write(&service, &owner_token).await;
+    let peer_ctx = resolve_with_ability_write(&service, &peer_token).await;
+
+    let a_ref = add(
+        &fixture,
+        &spaces[0].space,
+        AbilityPlacement::OwnedSpace(spaces[0].space.id.clone()),
+        101,
+        "trail-node-a",
+        vec![],
+    );
+    let b_ref = add(
+        &fixture,
+        &spaces[1].space,
+        AbilityPlacement::OwnedSpace(spaces[1].space.id.clone()),
+        102,
+        "trail-node-b",
+        vec![],
+    );
+    let c_ref = add(
+        &fixture,
+        &spaces[2].space,
+        AbilityPlacement::OwnedSpace(spaces[2].space.id.clone()),
+        103,
+        "trail-node-c",
+        vec![],
+    );
+    let d_ref = add(
+        &fixture,
+        &spaces[3].space,
+        AbilityPlacement::OwnedSpace(spaces[3].space.id.clone()),
+        104,
+        "trail-node-d",
+        vec![],
+    );
+    let extra_ref = add(
+        &fixture,
+        &spaces[0].space,
+        AbilityPlacement::OwnedSpace(spaces[0].space.id.clone()),
+        105,
+        "trail-node-extra",
+        vec![],
+    );
+
+    // Install two disjoint hops: A -> B and C -> D.
+    service
+        .set_ability_trail(
+            owner_ctx.clone(),
+            AccountMutation {
+                identity: identity(&service, &owner_ctx, 40).await,
+                input: AbilityTrailMutation::Set(AbilityTrailUpdate {
+                    source: a_ref.clone(),
+                    expected_destination: None,
+                    destination: Some(b_ref.clone()),
+                }),
+            },
+        )
+        .await
+        .unwrap();
+    service
+        .set_ability_trail(
+            owner_ctx.clone(),
+            AccountMutation {
+                identity: identity(&service, &owner_ctx, 41).await,
+                input: AbilityTrailMutation::Set(AbilityTrailUpdate {
+                    source: c_ref.clone(),
+                    expected_destination: None,
+                    destination: Some(d_ref.clone()),
+                }),
+            },
+        )
+        .await
+        .unwrap();
+
+    // Multi-hop destination revision mismatch MUST fail ResourceNotFound.
+    let mut stale_a = a_ref.clone();
+    stale_a.revision = RevisionId::from_bytes([0xFE; 16]);
+    let mismatch_err = service
+        .set_ability_trail(
+            owner_ctx.clone(),
+            AccountMutation {
+                identity: identity(&service, &owner_ctx, 42).await,
+                input: AbilityTrailMutation::Set(AbilityTrailUpdate {
+                    source: extra_ref,
+                    expected_destination: None,
+                    destination: Some(stale_a),
+                }),
+            },
+        )
+        .await;
+    assert!(
+        matches!(
+            mismatch_err,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ),
+        "set_ability_trail onto a multi-hop chain with stale destination revision must fail ResourceNotFound, got {mismatch_err:?}"
+    );
+
+    // Concurrently attempt to splice B -> C (owner, spaces S2+S3) and D -> A (peer, spaces S4+S1).
+    // Disjoint user + space row locks would race under PG READ COMMITTED without trail serialization.
+    let splice_bc_id = identity(&service, &owner_ctx, 43).await;
+    let splice_da_id = identity(&service, &peer_ctx, 44).await;
+    let (res_bc, res_da) = tokio::join!(
+        service.set_ability_trail(
+            owner_ctx.clone(),
+            AccountMutation {
+                identity: splice_bc_id,
+                input: AbilityTrailMutation::Set(AbilityTrailUpdate {
+                    source: b_ref.clone(),
+                    expected_destination: None,
+                    destination: Some(c_ref.clone()),
+                }),
+            },
+        ),
+        service.set_ability_trail(
+            peer_ctx.clone(),
+            AccountMutation {
+                identity: splice_da_id,
+                input: AbilityTrailMutation::Set(AbilityTrailUpdate {
+                    source: d_ref.clone(),
+                    expected_destination: None,
+                    destination: Some(a_ref.clone()),
+                }),
+            },
+        ),
+    );
+    assert!(
+        !(res_bc.is_ok() && res_da.is_ok()),
+        "concurrent cross-space trail splices must never both commit a cycle: bc={res_bc:?}, da={res_da:?}"
+    );
+    assert!(
+        res_bc.is_ok() || res_da.is_ok(),
+        "one of the two concurrent trail splices must succeed: bc={res_bc:?}, da={res_da:?}"
+    );
+    // Every node's trail must resolve cleanly without a cycle.
+    for node in [&a_ref, &b_ref, &c_ref, &d_ref] {
+        service
+            .follow_ability(owner_ctx.clone(), node.clone())
+            .await
+            .expect("committed trail graph must remain strictly acyclic");
+    }
+
+    drop(service);
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn sqlite_concurrent_ability_trail_cycle_and_revision_integrity() {
+    Box::pin(concurrent_ability_trail_cycle_and_revision_integrity(false)).await;
+}
+#[tokio::test]
+async fn postgres_concurrent_ability_trail_cycle_and_revision_integrity() {
+    Box::pin(concurrent_ability_trail_cycle_and_revision_integrity(true)).await;
+}

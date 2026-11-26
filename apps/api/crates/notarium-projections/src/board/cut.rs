@@ -35,7 +35,7 @@ use crate::{
     runtime::{ProjectionEngine, PublishedCut, records::effective_tags},
 };
 
-use super::{board_plan, board_plan_for_rollback};
+use super::{RollbackBoardPlan, board_plan, board_plan_for_rollback};
 
 const MAX_REPLAY_EVENTS: u64 = 512;
 const BOARD_WAIT: Duration = Duration::from_millis(25);
@@ -428,7 +428,15 @@ impl BoardCut {
             let plan = if restorations.is_empty() {
                 board_plan(self, ctx, view)?
             } else {
-                board_plan_for_rollback(self, ctx, view, restored_by_note.get(&view.note).copied())?
+                match board_plan_for_rollback(
+                    self,
+                    ctx,
+                    view,
+                    restored_by_note.get(&view.note).copied(),
+                )? {
+                    RollbackBoardPlan::Board(plan) => *plan,
+                    RollbackBoardPlan::Retired => continue,
+                }
             };
             let folder = plan
                 .source_folder

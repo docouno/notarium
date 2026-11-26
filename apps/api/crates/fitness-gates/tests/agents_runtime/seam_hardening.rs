@@ -19596,6 +19596,12 @@ async fn authority_cursors_oracles_and_trashed_ancestry_hardening(
         hardened_legacy_precheck_and_trail_write_seams(fixture, &s2_sc, s2, s2_epoch, actor)
     })
     .await;
+    box_step(|| {
+        hardened_ability_dispatch_shadow_and_replay_seams(
+            fixture, local, &pscope, &s2_sc, s2, s2_p1, s2_epoch, actor,
+        )
+    })
+    .await;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -23491,7 +23497,52 @@ async fn hardened_offer_and_selected_skill_seams(
         "selected-projects OwnedSpace skill must not be admitted in a Space-level chat without primary_project, got {:?}",
         space_chat_use.err()
     );
-    // Personal chat in personal Space calling foreign OwnedSpace `selected-projects` skill.
+    // Authoring view without a `project` filter must report `enabled: true` for an enabled
+    // `selected-projects` ability (matching `get_ability`), while runtime view hides it.
+    let authoring_list = call_mcp(
+        &fixture.registry,
+        owner,
+        [0xED, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3],
+        "list_abilities",
+        json!({ "view": "authoring", "q": "h6a-selected-space-skill" }),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    let authoring_item = authoring_list["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["name"] == "h6a-selected-space-skill")
+        .expect("selected-projects skill must appear in authoring list without project filter");
+    assert_eq!(
+        authoring_item["enabled"],
+        json!(true),
+        "authoring list must report enabled=true for enabled selected-projects ability"
+    );
+    let runtime_list = call_mcp(
+        &fixture.registry,
+        owner,
+        [0xED, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4],
+        "list_abilities",
+        json!({ "view": "runtime", "q": "h6a-selected-space-skill" }),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    assert!(
+        runtime_list["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["name"] != "h6a-selected-space-skill"),
+        "runtime list without matching project must omit selected-projects ability"
+    );
+
+    // Personal chat in personal Space calling foreign OwnedSpace `selected-projects` skill:
+    // succeeds WITH matching `project: s2_p1_handle` (recording `s2_p1` in provenance so
+    // ProviderService::validate_dispatch admits it under Space-wide consent too!), and fails
+    // ResourceNotFound WITHOUT `project` or with a non-selected project.
     let pers_run_auth = owner
         .auth()
         .for_agent_run(
@@ -23505,7 +23556,7 @@ async fn hardened_offer_and_selected_skill_seams(
         .registry
         .call_tool(
             McpInvocationContext {
-                account: AccountContext::new(pers_run_auth, budget()),
+                account: AccountContext::new(pers_run_auth.clone(), budget()),
                 target: EgressTarget::InAppProvider {
                     provider: local.resource.id.clone(),
                     model: local.model.clone(),
@@ -23518,14 +23569,39 @@ async fn hardened_offer_and_selected_skill_seams(
             "use_skill",
             json!({ "skill": "h6a-selected-space-skill", "project": s2_p1_handle }),
         )
+        .await
+        .expect(
+            "foreign OwnedSpace selected-projects skill with matching project must be admitted in Personal chat",
+        );
+    assert!(
+        !pers_chat_use.provenance.projects.is_empty(),
+        "foreign OwnedSpace selected-projects skill must witness its scoped project in provenance"
+    );
+    let pers_chat_missing_proj = local
+        .registry
+        .call_tool(
+            McpInvocationContext {
+                account: AccountContext::new(pers_run_auth, budget()),
+                target: EgressTarget::InAppProvider {
+                    provider: local.resource.id.clone(),
+                    model: local.model.clone(),
+                    primary_project: None,
+                },
+                request_key: CommandKey::from_bytes([
+                    0xED, 12, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3,
+                ]),
+            },
+            "use_skill",
+            json!({ "skill": "h6a-selected-space-skill" }),
+        )
         .await;
     assert!(
         matches!(
-            pers_chat_use,
+            pers_chat_missing_proj,
             Err(PortError::Domain(DomainError::ResourceNotFound))
         ),
-        "foreign OwnedSpace selected-projects skill must not be admitted under Space-wide consent in Personal chat, got {:?}",
-        pers_chat_use.err()
+        "foreign OwnedSpace selected-projects skill without matching project must fail ResourceNotFound, got {:?}",
+        pers_chat_missing_proj.err()
     );
 }
 
@@ -25115,6 +25191,634 @@ async fn hardened_legacy_precheck_and_trail_write_seams(
         .expect(
             "set_ability_trail must succeed across a trashed historical intermediate project hop",
         );
+}
+
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+async fn hardened_ability_dispatch_shadow_and_replay_seams(
+    fixture: &mut RuntimeFixture,
+    local: &LoopbackProvider,
+    pscope: &HistoryScope,
+    s2_sc: &SpaceContext,
+    s2: &AccessibleSpace,
+    s2_p1: &FolderRef,
+    s2_epoch: notarium_core::ids::LeaseEpoch,
+    actor: &PrincipalId,
+) {
+    let owner = fresh_owner(fixture).await;
+    let s2_p1_handle = format!("{}/h-s2-p1", s2.slug);
+
+    // Part A: Cross-Space shadowing oracle in `use_role` — a disabled foreign `OwnedSpace(s2)`
+    // role shadowing a local `OwnedPersonal` role of the same name must fail ResourceNotFound
+    // AND commit BranchTaint onto `caller_taint`.
+    let _local_role = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xF0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "create_ability",
+        json!({
+            "kind": "role",
+            "name": "shadow-oracle-role",
+            "description": "Local personal role.",
+            "instructions": "Local personal instructions.\n",
+            "placement": { "home": "personal" },
+        }),
+    )
+    .await
+    .unwrap();
+    let foreign_role = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xF0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
+        "create_ability",
+        json!({
+            "kind": "role",
+            "name": "shadow-oracle-role",
+            "description": "Foreign space role (disabled).",
+            "instructions": "Foreign space instructions.\n",
+            "placement": { "home": "space", "space": s2.slug },
+        }),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    let _ = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xF0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3],
+        "edit_ability",
+        json!({
+            "ref": foreign_role["ref"],
+            "versionToken": foreign_role["versionToken"],
+            "enabled": false,
+        }),
+    )
+    .await
+    .unwrap();
+    let shadow_auth = owner
+        .auth()
+        .for_agent_run(
+            AgentRunId::from_bytes([0xF0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+            pscope.space_id.clone(),
+            ChatAudience::Personal,
+            owner.auth().spaces().clone(),
+        )
+        .unwrap();
+    let shadow_err = local
+        .registry
+        .call_tool(
+            McpInvocationContext {
+                account: AccountContext::new(shadow_auth.clone(), budget()),
+                target: EgressTarget::InAppProvider {
+                    provider: local.resource.id.clone(),
+                    model: local.model.clone(),
+                    primary_project: None,
+                },
+                request_key: CommandKey::from_bytes([
+                    0xF0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
+                ]),
+            },
+            "use_role",
+            json!({ "role": "shadow-oracle-role", "project": s2_p1_handle }),
+        )
+        .await;
+    assert!(
+        matches!(
+            shadow_err,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ),
+        "foreign disabled role shadowing local personal role must fail ResourceNotFound, got {:?}",
+        shadow_err.err()
+    );
+    assert!(
+        shadow_auth.taint().is_tainted(),
+        "shadowed local ability rejected by foreign candidate MUST commit BranchTaint"
+    );
+
+    // Part B: Promoted `OwnedSpace(s2)` `selected-projects` role dispatched via
+    // `ProviderService::complete` in a Personal chat under Space-wide consent on `s2`:
+    // succeeds WITH `secondary_projects: [s2_p1]` and fails `ResourceNotFound` without it.
+    let prom_role = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xF0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "create_ability",
+        json!({
+            "kind": "role",
+            "name": "space-wide-promoted-role",
+            "description": "Promoted role from s2_p1.",
+            "instructions": "Promoted role instructions.\n",
+            "placement": { "home": "project", "project": s2_p1_handle },
+        }),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    let _ = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xF0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
+        "edit_ability",
+        json!({
+            "ref": prom_role["ref"],
+            "versionToken": prom_role["versionToken"],
+            "home": { "home": "space" },
+        }),
+    )
+    .await
+    .unwrap();
+    let prom_desc = fixture
+        .control
+        .discover_abilities(
+            owner.clone(),
+            AbilityQuery {
+                page: ControlPageRequest::new(10, None).unwrap(),
+                project: Some(s2_p1.clone()),
+                kind: Some(AbilityKind::Role),
+                name: Some("space-wide-promoted-role".into()),
+                authoring: true,
+            },
+        )
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .next()
+        .unwrap()
+        .descriptor;
+    let disp_auth = owner
+        .auth()
+        .for_agent_run(
+            AgentRunId::from_bytes([0xF0, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+            pscope.space_id.clone(),
+            ChatAudience::Personal,
+            owner.auth().spaces().clone(),
+        )
+        .unwrap();
+    let pers_ctx = SpaceContext::new(disp_auth.clone(), pscope.clone(), budget()).unwrap();
+    let s2_disp_ctx = SpaceContext::new(disp_auth.clone(), s2.history.clone(), budget()).unwrap();
+    let pers_sel = local
+        .provider
+        .select_provider(
+            pers_ctx.clone(),
+            SelectProvider {
+                kind: PreferenceModelKind::Completion,
+                resource: Some(local.resource.id.clone()),
+                model: Some(local.model.clone()),
+                project: None,
+            },
+        )
+        .await
+        .unwrap();
+    let s2_sel = local
+        .provider
+        .select_provider(
+            s2_disp_ctx.clone(),
+            SelectProvider {
+                kind: PreferenceModelKind::Completion,
+                resource: Some(local.resource.id.clone()),
+                model: Some(local.model.clone()),
+                project: Some(s2_p1.clone()),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        s2_sel.project_only.is_none(),
+        "s2 must be under Space-wide consent to exercise matched secondary project propagation"
+    );
+    let prom_body = fixture
+        .canonical
+        .read_ability_resource(
+            s2_disp_ctx.clone(),
+            ReadAbilityResource {
+                ability: prom_desc.reference.id.clone(),
+                package_revision: prom_desc.reference.revision.clone(),
+                resource: notarium_core::model::AbilityResourceName::Entrypoint,
+            },
+        )
+        .await
+        .unwrap();
+    let prom_msg = notarium_core::classes::ProviderMessage::Ability(Box::new(
+        notarium_core::classes::ClassEgressFence::ability(
+            prom_body,
+            s2_disp_ctx.auth(),
+            &s2_sel.policy,
+        )
+        .unwrap(),
+    ));
+    let req_without_witness = CompletionRequest {
+        intent: CommandKey::from_bytes([0xF0, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+        selection: pers_sel.clone(),
+        secondary_projects: vec![],
+        messages: vec![CompletionMessage {
+            role: CompletionRole::User,
+            instruction: None,
+            parts: vec![prom_msg.clone()],
+            tool_calls: vec![],
+            result_for: None,
+        }],
+        tools: vec![],
+        budget: CompletionBudget {
+            max_input_tokens: 4096,
+            max_output_tokens: 128,
+            max_tool_calls: 0,
+        },
+    };
+    let denied_without = match local
+        .provider
+        .complete(pers_ctx.clone(), req_without_witness)
+        .await
+    {
+        Ok(mut stream) => stream.next().await,
+        Err(err) => Err(err),
+    };
+    assert!(
+        matches!(
+            denied_without,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ),
+        "promoted selected-projects role without secondary_projects witness must fail ResourceNotFound, got {denied_without:?}"
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let lp_widened = loopback_provider(fixture, &owner, &listener, 0x82, true).await;
+    approve_disclosure(
+        fixture,
+        &owner,
+        &lp_widened,
+        0x86,
+        ProviderAttachmentTarget::Personal {
+            owner: actor.clone(),
+            space: pscope.space_id.clone(),
+        },
+        [DocClass::UserDoc, DocClass::AgentMemory, DocClass::Skill].into(),
+    )
+    .await;
+    approve_disclosure(
+        fixture,
+        &owner,
+        &lp_widened,
+        0x87,
+        ProviderAttachmentTarget::Personal {
+            owner: actor.clone(),
+            space: s2.history.space_id.clone(),
+        },
+        [DocClass::UserDoc, DocClass::AgentMemory, DocClass::Skill].into(),
+    )
+    .await;
+    approve_disclosure(
+        fixture,
+        &owner,
+        &lp_widened,
+        0x88,
+        ProviderAttachmentTarget::Space(s2.history.space_id.clone()),
+        [DocClass::UserDoc, DocClass::AgentMemory, DocClass::Skill].into(),
+    )
+    .await;
+    let p_sel_w = lp_widened
+        .provider
+        .select_provider(
+            pers_ctx.clone(),
+            SelectProvider {
+                kind: PreferenceModelKind::Completion,
+                resource: Some(lp_widened.resource.id.clone()),
+                model: Some(lp_widened.model.clone()),
+                project: None,
+            },
+        )
+        .await
+        .unwrap();
+    let s2_sel_w = lp_widened
+        .provider
+        .select_provider(
+            s2_disp_ctx.clone(),
+            SelectProvider {
+                kind: PreferenceModelKind::Completion,
+                resource: Some(lp_widened.resource.id.clone()),
+                model: Some(lp_widened.model.clone()),
+                project: Some(s2_p1.clone()),
+            },
+        )
+        .await
+        .unwrap();
+    let prom_body_w = fixture
+        .canonical
+        .read_ability_resource(
+            s2_disp_ctx.clone(),
+            ReadAbilityResource {
+                ability: prom_desc.reference.id.clone(),
+                package_revision: prom_desc.reference.revision.clone(),
+                resource: notarium_core::model::AbilityResourceName::Entrypoint,
+            },
+        )
+        .await
+        .unwrap();
+    let prom_msg_w = notarium_core::classes::ProviderMessage::Ability(Box::new(
+        notarium_core::classes::ClassEgressFence::ability(
+            prom_body_w,
+            s2_disp_ctx.auth(),
+            &s2_sel_w.policy,
+        )
+        .unwrap(),
+    ));
+    let req_with_witness = CompletionRequest {
+        intent: CommandKey::from_bytes([0xF0, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]),
+        selection: p_sel_w,
+        secondary_projects: vec![s2_p1.clone()],
+        messages: vec![CompletionMessage {
+            role: CompletionRole::User,
+            instruction: None,
+            parts: vec![prom_msg_w],
+            tool_calls: vec![],
+            result_for: None,
+        }],
+        tools: vec![],
+        budget: CompletionBudget {
+            max_input_tokens: 4096,
+            max_output_tokens: 128,
+            max_tool_calls: 0,
+        },
+    };
+    let wire_task = tokio::spawn(async move {
+        let (mut wire, _prompt) = timeout(Duration::from_secs(15), read_request(&listener))
+            .await
+            .expect("promoted selected-projects role with secondary witness must reach provider");
+        send_ollama(
+            &mut wire,
+            json!({"role": "assistant", "content": "Promoted role admitted."}),
+            "stop",
+        )
+        .await;
+    });
+    let mut stream = lp_widened
+        .provider
+        .complete(pers_ctx, req_with_witness)
+        .await
+        .expect("promoted selected-projects role must succeed under Space-wide consent with secondary witness");
+    let mut done = false;
+    while let Some(ev) = stream.next().await.unwrap() {
+        done |= matches!(ev, CompletionEvent::Finished(CompletionFinish::Stop));
+    }
+    assert!(done);
+    wire_task.await.unwrap();
+
+    // Part C: Legacy bare-bool `DestinationPrecheck::Legacy(false)` replay survives BOTH
+    // project rename and project trash for `create_note` and project-pinned `move_note`.
+    let p_ren_id = FolderId::from_bytes([0xF0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    let p_ren_ref = FolderRef {
+        space_id: s2.history.space_id.clone(),
+        folder_id: p_ren_id.clone(),
+    };
+    fixture
+        .canonical
+        .create_folder(CreateFolderSpec {
+            scope: s2.history.clone(),
+            active_epoch: s2_epoch,
+            folder_id: p_ren_id.clone(),
+            parent: None,
+            slug: "leg-rename-orig".into(),
+            display_name: "Legacy Rename Orig".into(),
+            is_project: true,
+            project_slug: Some("leg-rename-orig".into()),
+            actor: actor.clone(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+    let ren_handle = format!("{}/leg-rename-orig", s2.slug);
+    let r_cn_key = [0xF0, 3, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    let r_cn_args = json!({
+        "project": ren_handle,
+        "path": "leg-rename-orig/sub-ren",
+        "title": "Legacy Rename Create",
+        "body": "Body.\n",
+    });
+    let r_cn_1 = call_mcp(
+        &fixture.registry,
+        &owner,
+        r_cn_key,
+        "create_note",
+        r_cn_args.clone(),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    let pinned_ren = AccountContext::new(
+        owner
+            .auth()
+            .restrict_to_space(&s2.history.space_id)
+            .unwrap()
+            .restrict_to_project(&p_ren_ref)
+            .unwrap(),
+        budget(),
+    );
+    let r_mv_key = [0xF0, 3, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    let r_mv_args = json!({
+        "ref": r_cn_1["noteId"],
+        "toFolder": "leg-rename-orig/moved-ren",
+    });
+    let r_mv_1 = call_mcp(
+        &fixture.registry,
+        &pinned_ren,
+        r_mv_key,
+        "move_note",
+        r_mv_args.clone(),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    // Rename the project slug from `leg-rename-orig` -> `leg-rename-new` and rewrite
+    // `mcp_dedup` rows to Legacy(false).
+    let _ = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xF0, 3, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "rename_project",
+        json!({
+            "project": ren_handle,
+            "slug": "leg-rename-new",
+        }),
+    )
+    .await
+    .unwrap();
+    fixture
+        .storage
+        .observer
+        .execute("DELETE FROM mcp_dedup WHERE operation IN ('create_note','move_note') AND safe_result LIKE '%\"folder\":%'")
+        .await;
+    fixture
+        .storage
+        .observer
+        .execute("UPDATE mcp_dedup SET safe_result='false' WHERE operation IN ('create_note','move_note') AND safe_result LIKE '%\"stripped_segments\":%'")
+        .await;
+    let r_cn_2 = call_mcp(
+        &fixture.registry,
+        &owner,
+        r_cn_key,
+        "create_note",
+        r_cn_args,
+    )
+    .await
+    .expect("legacy precheck replay of create_note must survive project rename")
+    .structured_content;
+    assert_eq!(r_cn_2["noteId"], r_cn_1["noteId"]);
+    let r_mv_2 = call_mcp(
+        &fixture.registry,
+        &pinned_ren,
+        r_mv_key,
+        "move_note",
+        r_mv_args.clone(),
+    )
+    .await
+    .expect("legacy precheck replay of project-pinned move_note must survive project rename")
+    .structured_content;
+    assert_eq!(r_mv_2["versionToken"], r_mv_1["versionToken"]);
+    // Now trash the renamed project and verify project-pinned move_note legacy replay STILL works.
+    let p_ren_rev2 = fixture
+        .canonical
+        .resolve_folder_path(s2_sc.clone(), Some(p_ren_id.clone()), String::new())
+        .await
+        .unwrap()
+        .unwrap()
+        .revision;
+    fixture
+        .canonical
+        .set_folder_lifecycle(
+            &s2.history,
+            s2_epoch,
+            &p_ren_id,
+            &p_ren_rev2,
+            notarium_core::model::Lifecycle::Trashed,
+            actor,
+            None,
+        )
+        .await
+        .unwrap();
+    let r_mv_3 = call_mcp(
+        &fixture.registry,
+        &pinned_ren,
+        r_mv_key,
+        "move_note",
+        r_mv_args,
+    )
+    .await
+    .expect("legacy precheck replay of project-pinned move_note must survive project trash")
+    .structured_content;
+    assert_eq!(r_mv_3["versionToken"], r_mv_1["versionToken"]);
+
+    // Part D: Retry of `create_ability` after `.abilities` folder was already created on
+    // attempt #1 must STILL escalate NotCommitted failure to CommitEffect::Unknown.
+    let p_unk_id = FolderId::from_bytes([0xF0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    fixture
+        .canonical
+        .create_folder(CreateFolderSpec {
+            scope: s2.history.clone(),
+            active_epoch: s2_epoch,
+            folder_id: p_unk_id,
+            parent: None,
+            slug: "retry-unknown-proj".into(),
+            display_name: "Retry Unknown Proj".into(),
+            is_project: true,
+            project_slug: Some("retry-unknown-proj".into()),
+            actor: actor.clone(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+    let unk_handle = format!("{}/retry-unknown-proj", s2.slug);
+    let unk_key = [0xF0, 4, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    let unk_args = json!({
+        "kind": "role",
+        "name": "retry-unknown-role",
+        "description": "Retry after folder creation.",
+        "instructions": "Body.\n",
+        "placement": { "home": "project", "project": unk_handle },
+    });
+    for attempt in 1..=2 {
+        fixture.projections.fail_next_create_note_not_committed();
+        let err = call_mcp(
+            &fixture.registry,
+            &owner,
+            unk_key,
+            "create_ability",
+            unk_args.clone(),
+        )
+        .await;
+        assert!(
+            matches!(
+                err,
+                Err(PortError::DeadlineExceeded(ref f))
+                    if f.effect() == CommitEffect::Unknown
+            ),
+            "create_ability attempt #{attempt} after folder creation must keep CommitEffect::Unknown, got {:?}",
+            err.err()
+        );
+    }
+
+    // Part E: `edit_ability` post-publish promotion replay (`already_published.is_some()`)
+    // reports `"home": "failed"` (never `"skipped"`) when `set_ability_trail` fails.
+    let prom_fail = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xF0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "create_ability",
+        json!({
+            "kind": "role",
+            "name": "post-publish-home-phase",
+            "description": "Tests post-publish phase on promotion retry.",
+            "instructions": "Body.\n",
+            "placement": { "home": "project", "project": s2_p1_handle },
+        }),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    let prom_key = [0xF0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+    let prom_args = json!({
+        "ref": prom_fail["ref"],
+        "versionToken": prom_fail["versionToken"],
+        "instructions": "Updated body for promote.\n",
+        "home": { "home": "space" },
+    });
+    let _ = call_mcp(
+        &fixture.registry,
+        &owner,
+        prom_key,
+        "edit_ability",
+        prom_args.clone(),
+    )
+    .await
+    .unwrap();
+    // Simulate a post-publish promotion retry where `edit-ability-package-outcome` was
+    // journaled (`already_published.is_some()` and `authored == true`), the trail adoption
+    // command had not committed, and a competing trail is now present (causing `set_ability_trail`
+    // to fail with InvalidState). `phase` must advance to `"home"` so `"home"` reports `"failed"`.
+    fixture
+        .storage
+        .observer
+        .execute("DELETE FROM control_commands WHERE target='adopt-authored-ability-promotion'")
+        .await;
+    let partial = call_mcp(
+        &fixture.registry,
+        &owner,
+        prom_key,
+        "edit_ability",
+        prom_args,
+    )
+    .await
+    .expect("post-publish promotion trail failure must return structured partial edit result")
+    .structured_content;
+    let home_step = partial["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|step| step["step"] == "home")
+        .expect("steps must include home");
+    assert_eq!(
+        home_step["outcome"],
+        json!("failed"),
+        "post-publish promotion retry failure must report home=failed (not skipped): {partial}"
+    );
 }
 
 #[allow(clippy::too_many_arguments)]

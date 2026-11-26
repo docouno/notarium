@@ -507,45 +507,48 @@ impl ProviderService {
                 return Err(invalid(ValidationReason::ClassEgressForbidden));
             }
         }
-        let candidate_policies_for = |source: &ProviderCurrentContent,
-                                      part_opt: Option<&ProviderMessage>|
-         -> Result<Vec<&PolicyAdmission>, PortError> {
-            let space = source
-                .space()
-                .or_else(|| primary.map(|value| &value.space))
-                .ok_or_else(selection::unavailable)?;
-            if primary.is_some_and(|p| p.space.id == space.id) {
-                return Ok(vec![
-                    space_policies
-                        .get(&space.id)
-                        .ok_or_else(selection::unavailable)?,
-                ]);
-            }
-            let mut candidates = Vec::new();
-            if !matches!(source, ProviderCurrentContent::Space { .. })
-                && let Some(sec_projects) = secondary_projects_by_space.get(&space.id)
-            {
-                for &proj in sec_projects {
-                    if source.in_project(proj)
-                        && part_opt.is_none_or(|part| part.in_project(proj))
-                        && let Some(admitted) = secondary_project_policies
+        let candidate_policies_for =
+            |source: &ProviderCurrentContent,
+             part_opt: Option<&ProviderMessage>|
+             -> Result<Vec<(&PolicyAdmission, Option<&FolderRef>)>, PortError> {
+                let space = source
+                    .space()
+                    .or_else(|| primary.map(|value| &value.space))
+                    .ok_or_else(selection::unavailable)?;
+                if primary.is_some_and(|p| p.space.id == space.id) {
+                    return Ok(vec![(
+                        space_policies
+                            .get(&space.id)
+                            .ok_or_else(selection::unavailable)?,
+                        project,
+                    )]);
+                }
+                let mut candidates = Vec::new();
+                if !matches!(source, ProviderCurrentContent::Space { .. })
+                    && let Some(sec_projects) = secondary_projects_by_space.get(&space.id)
+                {
+                    for &proj in sec_projects {
+                        if let Some(admitted) = secondary_project_policies
                             .get(&(proj.space_id.clone(), proj.folder_id.clone()))
-                    {
-                        candidates.push(admitted);
+                            && (admitted.project_only.is_none()
+                                || (source.in_project(proj)
+                                    && part_opt.is_none_or(|part| part.in_project(proj))))
+                        {
+                            candidates.push((admitted, Some(proj)));
+                        }
                     }
                 }
-            }
-            if let Some(wide) = space_policies.get(&space.id) {
-                candidates.push(wide);
-            }
-            if candidates.is_empty() {
-                if secondary_projects_by_space.contains_key(&space.id) {
-                    return Err(DomainError::AccessDenied.into());
+                if let Some(wide) = space_policies.get(&space.id) {
+                    candidates.push((wide, None));
                 }
-                return Err(selection::unavailable());
-            }
-            Ok(candidates)
-        };
+                if candidates.is_empty() {
+                    if secondary_projects_by_space.contains_key(&space.id) {
+                        return Err(DomainError::AccessDenied.into());
+                    }
+                    return Err(selection::unavailable());
+                }
+                Ok(candidates)
+            };
         let mut used = BTreeSet::new();
         let mut checked_dependencies = BTreeSet::new();
         let mut dependencies = Vec::new();
@@ -558,7 +561,7 @@ impl ProviderService {
             let candidates = candidate_policies_for(metadata, Some(part))?;
             let mut last_error: Option<PortError> = None;
             let mut admitted_ok = false;
-            for admitted in candidates {
+            for (admitted, matched_project) in candidates {
                 if admitted
                     .project_only
                     .as_ref()
@@ -583,13 +586,13 @@ impl ProviderService {
                     };
                     let ability_project = match &identity.placement {
                         AbilityPlacement::OwnedProject(folder) => Some(folder),
-                        AbilityPlacement::OwnedSpace(space) => admitted
+                        AbilityPlacement::OwnedSpace(_) => admitted
                             .project_only
                             .as_ref()
                             .or(indexing_project)
-                            .or_else(|| primary.filter(|p| &p.space.id == space).and(project)),
+                            .or(matched_project),
                         AbilityPlacement::OwnedPersonal(_) | AbilityPlacement::System => {
-                            admitted.project_only.as_ref().or(project)
+                            admitted.project_only.as_ref().or(matched_project)
                         }
                     };
                     if !self
@@ -641,7 +644,7 @@ impl ProviderService {
                 let candidates = candidate_policies_for(dependency, None)?;
                 let mut last_error: Option<PortError> = None;
                 let mut admitted_ok = false;
-                for admitted in candidates {
+                for (admitted, matched_project) in candidates {
                     if admitted
                         .project_only
                         .as_ref()
@@ -663,13 +666,13 @@ impl ProviderService {
                         };
                         let ability_project = match &identity.placement {
                             AbilityPlacement::OwnedProject(folder) => Some(folder),
-                            AbilityPlacement::OwnedSpace(space) => admitted
+                            AbilityPlacement::OwnedSpace(_) => admitted
                                 .project_only
                                 .as_ref()
                                 .or(indexing_project)
-                                .or_else(|| primary.filter(|p| &p.space.id == space).and(project)),
+                                .or(matched_project),
                             AbilityPlacement::OwnedPersonal(_) | AbilityPlacement::System => {
-                                admitted.project_only.as_ref().or(project)
+                                admitted.project_only.as_ref().or(matched_project)
                             }
                         };
                         if !self

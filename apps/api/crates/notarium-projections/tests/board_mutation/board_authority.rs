@@ -38,6 +38,7 @@ pub(super) async fn exercise(store: &CanonicalStore, runtime: &ProjectorRuntime)
     first_change_racing_projection_subscription_is_delivered(store, runtime).await;
     purge_reseed_refreshes_only_after_readiness(store, runtime).await;
     rollback_trashed_and_edited_board_view_through_real_planner(store, runtime).await;
+    rollback_retired_widened_unranked_and_trashed_board_views(store, runtime).await;
     keeper_readonly_abilities_isolation_on_changes_events_and_graph(store, runtime).await;
 }
 
@@ -1565,7 +1566,7 @@ async fn rollback_trashed_and_edited_board_view_through_real_planner(
     sync(store, runtime, &scope).await;
 
     // Advance Space head past the projection cut with an unrelated note so
-    // `BoardCut::check_live` exercises its live-permit validation path as well.
+    // `BoardCut::replay` catches the lagging projection up to the live head.
     let _unrelated = create_note(store, &owner, None, "rb-head-bump", "bump".into()).await;
     let prep1 = store
         .prepare_agent_run_rollback(owner.clone(), run1)
@@ -1690,7 +1691,7 @@ async fn rollback_trashed_and_edited_board_view_through_real_planner(
         &v2.key,
         "board",
         "{scope: project}",
-        "group_by: status\nfilter: {eq: [status, done]}\n",
+        "group_by: status\nfilter: {eq: {key: status, value: done}}\n",
     );
     let span = notarium_syntax::frontmatter::analyze(&old_v2, DocClass::UserDoc)
         .unwrap()
@@ -1731,6 +1732,683 @@ async fn rollback_trashed_and_edited_board_view_through_real_planner(
         .map(|row| row.card.document.provenance().reference().note_id.clone())
         .collect();
     assert_eq!(v2_ids, vec![c3.note, c4.note]);
+}
+
+async fn rollback_retired_widened_unranked_and_trashed_board_views(
+    store: &CanonicalStore,
+    runtime: &ProjectorRuntime,
+) {
+    use notarium_core::ports::{DeleteDisposition, DeleteNote, GetNote, RankNeighbor};
+    use notarium_core::receipt::ReceiptSet;
+
+    let (scope, owner) = open_space(store).await;
+    let engine = runtime.engine();
+
+    // Case 1: Agent run adds a board block `K` to a pre-existing active plain note `V`
+    // and moves a card on `(V, K)`. Rollback restores `V` without `K` and retires the overlay.
+    let proj1 = folder(store, &owner, None, "rb-added-block-proj", true)
+        .await
+        .unwrap();
+    let plain_carrier = "Plain pre-existing note.\n".to_owned();
+    let v_added = create_note(
+        store,
+        &owner,
+        Some(proj1.clone()),
+        "rb-plain-to-board",
+        plain_carrier.clone(),
+    )
+    .await;
+    let c_added = create_note(
+        store,
+        &owner,
+        Some(proj1.clone()),
+        "rb-added-card",
+        "---\nstatus: todo\n---\n".into(),
+    )
+    .await;
+    sync(store, runtime, &scope).await;
+
+    let run_add = AgentRunId::from_bytes(random_bytes());
+    let agent_add = super::agent(&owner, run_add.clone(), ChatAudience::Personal);
+    let added_key = ViewKey::from_bytes(random_bytes());
+    let added_body = "group_by: status\nfilter: {exists: status}\n";
+    let added_carrier = view_carrier(&added_key, "board", "{scope: project}", added_body);
+    let span = notarium_syntax::frontmatter::analyze(&plain_carrier, DocClass::UserDoc)
+        .unwrap()
+        .carrier
+        .body;
+    let plan = notarium_syntax::patch::plan(
+        &plain_carrier,
+        span,
+        vec![(CarrierEditOrigin::Body, span, added_carrier.clone())],
+    )
+    .unwrap();
+    let mut edit_add = mutation(
+        &agent_add,
+        EditNote {
+            note: v_added.note.clone(),
+            plan,
+        },
+    );
+    edit_add.preconditions.revision = Some(v_added.revision.clone());
+    let v_added_board = store
+        .edit_note(agent_add.clone(), edit_add)
+        .await
+        .unwrap()
+        .value;
+    sync(store, runtime, &scope).await;
+
+    let v_added_ref = ViewRef {
+        note: v_added.note.clone(),
+        key: added_key.clone(),
+    };
+    store
+        .move_board_card(
+            agent_add.clone(),
+            mutation(
+                &agent_add,
+                MoveBoardCard {
+                    view: v_added_ref.clone(),
+                    note: c_added.note.clone(),
+                    group: group("doing"),
+                    before: None,
+                    after: None,
+                    fields: BTreeMap::from([(
+                        "status".into(),
+                        Some(YamlValue::String("doing".into())),
+                    )]),
+                    expected_note: c_added.revision.clone(),
+                    expected_view: v_added_board.revision.clone(),
+                    expected_rank: RankExpectation::Absent,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    sync(store, runtime, &scope).await;
+
+    let prep_add = store
+        .prepare_agent_run_rollback(owner.clone(), run_add)
+        .await
+        .expect("prepare rollback must succeed when run-added board block is removed by restore");
+    store
+        .rollback_agent_run(owner.clone(), mutation(&owner, prep_add))
+        .await
+        .expect("rollback must succeed when run-added board block is removed by restore");
+    sync(store, runtime, &scope).await;
+    let v_added_after = store
+        .get_note(
+            owner.clone(),
+            GetNote {
+                note: v_added.note.clone(),
+                revision: None,
+                causal: CausalBasis::Exact(ReceiptSet::default()),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        v_added_after.document.explicit_read(owner.auth()).unwrap(),
+        plain_carrier
+    );
+
+    // Case 2: Human changes a pre-existing board block to `table` after an agent run
+    // moved a card on it. Rollback treats the retired board view cleanly and clears overlays.
+    let proj2 = folder(store, &owner, None, "rb-retired-view-proj", true)
+        .await
+        .unwrap();
+    let v2_body = "group_by: status\nfilter: {exists: status}\n";
+    let (v2, v2_rev) = create_view(
+        store,
+        &owner,
+        &proj2,
+        "rb-board-to-table",
+        "board",
+        "{scope: project}",
+        v2_body,
+    )
+    .await;
+    let c2 = create_note(
+        store,
+        &owner,
+        Some(proj2.clone()),
+        "rb-retired-card",
+        "---\nstatus: todo\n---\n".into(),
+    )
+    .await;
+    sync(store, runtime, &scope).await;
+
+    let run_ret = AgentRunId::from_bytes(random_bytes());
+    let agent_ret = super::agent(&owner, run_ret.clone(), ChatAudience::Personal);
+    store
+        .move_board_card(
+            agent_ret.clone(),
+            mutation(
+                &agent_ret,
+                MoveBoardCard {
+                    view: v2.clone(),
+                    note: c2.note.clone(),
+                    group: group("doing"),
+                    before: None,
+                    after: None,
+                    fields: BTreeMap::from([(
+                        "status".into(),
+                        Some(YamlValue::String("doing".into())),
+                    )]),
+                    expected_note: c2.revision.clone(),
+                    expected_view: v2_rev.revision.clone(),
+                    expected_rank: RankExpectation::Absent,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let old_v2 = view_carrier(&v2.key, "board", "{scope: project}", v2_body);
+    let table_v2 = view_carrier(
+        &v2.key,
+        "table",
+        "{scope: project}",
+        "filter: {exists: status}\n",
+    );
+    let span = notarium_syntax::frontmatter::analyze(&old_v2, DocClass::UserDoc)
+        .unwrap()
+        .carrier
+        .body;
+    let plan = notarium_syntax::patch::plan(
+        &old_v2,
+        span,
+        vec![(CarrierEditOrigin::Body, span, table_v2)],
+    )
+    .unwrap();
+    let mut edit_table = mutation(
+        &owner,
+        EditNote {
+            note: v2_rev.note.clone(),
+            plan,
+        },
+    );
+    edit_table.preconditions.revision = Some(v2_rev.revision);
+    store.edit_note(owner.clone(), edit_table).await.unwrap();
+    sync(store, runtime, &scope).await;
+
+    let prep_ret = store
+        .prepare_agent_run_rollback(owner.clone(), run_ret)
+        .await
+        .expect("prepare rollback must succeed when human converted board block to table");
+    store
+        .rollback_agent_run(owner.clone(), mutation(&owner, prep_ret))
+        .await
+        .expect("rollback must succeed when human converted board block to table");
+    sync(store, runtime, &scope).await;
+
+    // Case 3A: Agent widens a board filter to include an untouched card `X` ahead of `A`,
+    // then moves `A`. Rollback restores the narrower filter without failing InvalidState
+    // on `before_placement` citing `X`.
+    let proj3 = folder(store, &owner, None, "rb-widen-proj", true)
+        .await
+        .unwrap();
+    let narrow_body = "group_by: status\nfilter: {eq: {key: team, value: alpha}}\n";
+    let (v3, v3_rev) = create_view(
+        store,
+        &owner,
+        &proj3,
+        "rb-widen-board",
+        "board",
+        "{scope: project}",
+        narrow_body,
+    )
+    .await;
+    let card_x = create_note(
+        store,
+        &owner,
+        Some(proj3.clone()),
+        "a-untouched-beta",
+        "---\nteam: beta\nstatus: todo\n---\n".into(),
+    )
+    .await;
+    let card_a = create_note(
+        store,
+        &owner,
+        Some(proj3.clone()),
+        "z-alpha-card",
+        "---\nteam: alpha\nstatus: todo\n---\n".into(),
+    )
+    .await;
+    let _ = card_x;
+    sync(store, runtime, &scope).await;
+
+    let run_widen = AgentRunId::from_bytes(random_bytes());
+    let agent_widen = super::agent(&owner, run_widen.clone(), ChatAudience::Personal);
+    let old_v3 = view_carrier(&v3.key, "board", "{scope: project}", narrow_body);
+    let wide_v3 = view_carrier(
+        &v3.key,
+        "board",
+        "{scope: project}",
+        "group_by: status\nfilter: {exists: status}\n",
+    );
+    let span = notarium_syntax::frontmatter::analyze(&old_v3, DocClass::UserDoc)
+        .unwrap()
+        .carrier
+        .body;
+    let plan = notarium_syntax::patch::plan(
+        &old_v3,
+        span,
+        vec![(CarrierEditOrigin::Body, span, wide_v3)],
+    )
+    .unwrap();
+    let mut edit_wide = mutation(
+        &agent_widen,
+        EditNote {
+            note: v3_rev.note.clone(),
+            plan,
+        },
+    );
+    edit_wide.preconditions.revision = Some(v3_rev.revision);
+    let v3_wide_rev = store
+        .edit_note(agent_widen.clone(), edit_wide)
+        .await
+        .unwrap()
+        .value;
+    sync(store, runtime, &scope).await;
+
+    store
+        .move_board_card(
+            agent_widen.clone(),
+            mutation(
+                &agent_widen,
+                MoveBoardCard {
+                    view: v3.clone(),
+                    note: card_a.note.clone(),
+                    group: group("doing"),
+                    before: None,
+                    after: None,
+                    fields: BTreeMap::from([(
+                        "status".into(),
+                        Some(YamlValue::String("doing".into())),
+                    )]),
+                    expected_note: card_a.revision.clone(),
+                    expected_view: v3_wide_rev.revision,
+                    expected_rank: RankExpectation::Absent,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    sync(store, runtime, &scope).await;
+
+    let prep_widen = store
+        .prepare_agent_run_rollback(owner.clone(), run_widen)
+        .await
+        .expect("prepare rollback must succeed after run widened board filter");
+    store
+        .rollback_agent_run(owner.clone(), mutation(&owner, prep_widen))
+        .await
+        .expect("rollback must succeed after run widened board filter");
+    sync(store, runtime, &scope).await;
+    let v3_rows = query(&engine, owner.clone(), v3).await.unwrap();
+    let v3_ids: Vec<NoteId> = v3_rows
+        .rows
+        .items
+        .iter()
+        .map(|row| row.card.document.provenance().reference().note_id.clone())
+        .collect();
+    assert_eq!(v3_ids, vec![card_a.note]);
+
+    // Case 3B: Agent changes `group_by` from `status` to `priority` and moves two cards
+    // on the run's temporary `priority` columns. Rollback restores `status` cleanly.
+    let proj3b = folder(store, &owner, None, "rb-groupby-proj", true)
+        .await
+        .unwrap();
+    let status_body = "group_by: status\nfilter: {exists: status}\n";
+    let (v3b, v3b_rev) = create_view(
+        store,
+        &owner,
+        &proj3b,
+        "rb-groupby-board",
+        "board",
+        "{scope: project}",
+        status_body,
+    )
+    .await;
+    let gb_a = create_note(
+        store,
+        &owner,
+        Some(proj3b.clone()),
+        "gb-card-a",
+        "---\nstatus: todo\npriority: p1\n---\n".into(),
+    )
+    .await;
+    let gb_b = create_note(
+        store,
+        &owner,
+        Some(proj3b.clone()),
+        "gb-card-b",
+        "---\nstatus: todo\npriority: p1\n---\n".into(),
+    )
+    .await;
+    sync(store, runtime, &scope).await;
+
+    let run_gb = AgentRunId::from_bytes(random_bytes());
+    let agent_gb = super::agent(&owner, run_gb.clone(), ChatAudience::Personal);
+    let old_v3b = view_carrier(&v3b.key, "board", "{scope: project}", status_body);
+    let prio_v3b = view_carrier(
+        &v3b.key,
+        "board",
+        "{scope: project}",
+        "group_by: priority\nfilter: {exists: status}\n",
+    );
+    let span = notarium_syntax::frontmatter::analyze(&old_v3b, DocClass::UserDoc)
+        .unwrap()
+        .carrier
+        .body;
+    let plan = notarium_syntax::patch::plan(
+        &old_v3b,
+        span,
+        vec![(CarrierEditOrigin::Body, span, prio_v3b)],
+    )
+    .unwrap();
+    let mut edit_gb = mutation(
+        &agent_gb,
+        EditNote {
+            note: v3b_rev.note.clone(),
+            plan,
+        },
+    );
+    edit_gb.preconditions.revision = Some(v3b_rev.revision);
+    let v3b_prio_rev = store
+        .edit_note(agent_gb.clone(), edit_gb)
+        .await
+        .unwrap()
+        .value;
+    sync(store, runtime, &scope).await;
+
+    let gb_a_mv = store
+        .move_board_card(
+            agent_gb.clone(),
+            mutation(
+                &agent_gb,
+                MoveBoardCard {
+                    view: v3b.clone(),
+                    note: gb_a.note.clone(),
+                    group: group("p2"),
+                    before: None,
+                    after: None,
+                    fields: BTreeMap::from([(
+                        "priority".into(),
+                        Some(YamlValue::String("p2".into())),
+                    )]),
+                    expected_note: gb_a.revision.clone(),
+                    expected_view: v3b_prio_rev.revision.clone(),
+                    expected_rank: RankExpectation::Absent,
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .value;
+    store
+        .move_board_card(
+            agent_gb.clone(),
+            mutation(
+                &agent_gb,
+                MoveBoardCard {
+                    view: v3b.clone(),
+                    note: gb_b.note.clone(),
+                    group: group("p2"),
+                    before: Some(RankNeighbor {
+                        note: gb_a.note.clone(),
+                        expected_rank: RankExpectation::Existing(gb_a_mv.rank_revision),
+                    }),
+                    after: None,
+                    fields: BTreeMap::from([(
+                        "priority".into(),
+                        Some(YamlValue::String("p2".into())),
+                    )]),
+                    expected_note: gb_b.revision.clone(),
+                    expected_view: v3b_prio_rev.revision,
+                    expected_rank: RankExpectation::Absent,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    sync(store, runtime, &scope).await;
+
+    let prep_gb = store
+        .prepare_agent_run_rollback(owner.clone(), run_gb)
+        .await
+        .expect("prepare rollback must succeed after run changed group_by and moved cards");
+    store
+        .rollback_agent_run(owner.clone(), mutation(&owner, prep_gb))
+        .await
+        .expect("rollback must succeed after run changed group_by and moved cards");
+    sync(store, runtime, &scope).await;
+
+    // Case 4: Unranked board sorted by `title ASC`. Agent moves `Alpha` out of `todo`
+    // and edits `Beta` out of `todo` via `edit_note`. Rollback must restore `[Alpha, Beta, Gamma]`
+    // in exact view sort order (never `[Gamma, Alpha, Beta]`).
+    let proj4 = folder(store, &owner, None, "rb-unranked-sort-proj", true)
+        .await
+        .unwrap();
+    let sort_body = "group_by: status\nfilter: {exists: status}\nsort: [{field: title, type: string, direction: asc}]\n";
+    let (v4, v4_rev) = create_view(
+        store,
+        &owner,
+        &proj4,
+        "rb-sorted-board",
+        "board",
+        "{scope: project}",
+        sort_body,
+    )
+    .await;
+    // Choose NoteIds so NoteId order (`c_gamma < c_alpha < c_beta`) disagrees with `title ASC`.
+    let mk_sorted = |bytes: [u8; 16], slug: &str, title: &str| {
+        let owner = owner.clone();
+        let proj4 = proj4.clone();
+        let slug = slug.to_owned();
+        let carrier = format!("---\nstatus: todo\ntitle: {title}\n---\n");
+        async move {
+            store
+                .create_note(
+                    owner.clone(),
+                    mutation(
+                        &owner,
+                        CreateNote {
+                            folder_page: false,
+                            note: NoteId::from_bytes(bytes),
+                            parent: Some(proj4),
+                            slug,
+                            class: DocClass::UserDoc,
+                            carrier,
+                        },
+                    ),
+                )
+                .await
+                .unwrap()
+                .value
+        }
+    };
+    let s_gamma = mk_sorted([0x10; 16], "s-gamma", "Gamma").await;
+    let s_alpha = mk_sorted([0x20; 16], "s-alpha", "Alpha").await;
+    let s_beta = mk_sorted([0x30; 16], "s-beta", "Beta").await;
+    sync(store, runtime, &scope).await;
+
+    let run_sort = AgentRunId::from_bytes(random_bytes());
+    let agent_sort = super::agent(&owner, run_sort.clone(), ChatAudience::Personal);
+    store
+        .move_board_card(
+            agent_sort.clone(),
+            mutation(
+                &agent_sort,
+                MoveBoardCard {
+                    view: v4.clone(),
+                    note: s_alpha.note.clone(),
+                    group: group("doing"),
+                    before: None,
+                    after: None,
+                    fields: BTreeMap::from([(
+                        "status".into(),
+                        Some(YamlValue::String("doing".into())),
+                    )]),
+                    expected_note: s_alpha.revision.clone(),
+                    expected_view: v4_rev.revision.clone(),
+                    expected_rank: RankExpectation::Absent,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let old_beta = "---\nstatus: todo\ntitle: Beta\n---\n";
+    let new_beta = "---\nstatus: doing\ntitle: Beta\n---\n";
+    let analyzed = notarium_syntax::frontmatter::analyze(old_beta, DocClass::UserDoc).unwrap();
+    let header_span = analyzed.carrier.header.unwrap();
+    let plan = notarium_syntax::patch::plan(
+        old_beta,
+        analyzed.carrier.body,
+        vec![(CarrierEditOrigin::Header, header_span, new_beta.into())],
+    )
+    .unwrap();
+    let mut edit_beta = mutation(
+        &agent_sort,
+        EditNote {
+            note: s_beta.note.clone(),
+            plan,
+        },
+    );
+    edit_beta.preconditions.revision = Some(s_beta.revision);
+    store.edit_note(agent_sort, edit_beta).await.unwrap();
+    sync(store, runtime, &scope).await;
+
+    let prep_sort = store
+        .prepare_agent_run_rollback(owner.clone(), run_sort)
+        .await
+        .unwrap();
+    store
+        .rollback_agent_run(owner.clone(), mutation(&owner, prep_sort))
+        .await
+        .unwrap();
+    sync(store, runtime, &scope).await;
+    let v4_rows = query(&engine, owner.clone(), v4).await.unwrap();
+    let v4_ids: Vec<NoteId> = v4_rows
+        .rows
+        .items
+        .iter()
+        .map(|row| row.card.document.provenance().reference().note_id.clone())
+        .collect();
+    assert_eq!(
+        v4_ids,
+        vec![s_alpha.note, s_beta.note, s_gamma.note],
+        "unranked returning notes must be ordered by view sort descriptor (Alpha, Beta, Gamma)"
+    );
+
+    // Case 5: Human trashes board view `V` after agent reordered `B` ahead of `A`, rolls back
+    // the run, then restores `V` from trash. Run-owned overlay must have been cleared on rollback
+    // so restoring `V` never resurrects the rolled-back agent ordering.
+    let proj5 = folder(store, &owner, None, "rb-human-trash-view-proj", true)
+        .await
+        .unwrap();
+    let (v5, v5_rev) = create_view(
+        store,
+        &owner,
+        &proj5,
+        "rb-human-trashed-board",
+        "board",
+        "{scope: project}",
+        "group_by: status\nfilter: {exists: status}\nsort: [{field: title, type: string, direction: asc}]\n",
+    )
+    .await;
+    let t_a = create_note(
+        store,
+        &owner,
+        Some(proj5.clone()),
+        "t-a",
+        "---\nstatus: todo\ntitle: First\n---\n".into(),
+    )
+    .await;
+    let t_b = create_note(
+        store,
+        &owner,
+        Some(proj5),
+        "t-b",
+        "---\nstatus: todo\ntitle: Second\n---\n".into(),
+    )
+    .await;
+    sync(store, runtime, &scope).await;
+
+    let run_ht = AgentRunId::from_bytes(random_bytes());
+    let agent_ht = super::agent(&owner, run_ht.clone(), ChatAudience::Personal);
+    store
+        .move_board_card(
+            agent_ht.clone(),
+            mutation(
+                &agent_ht,
+                MoveBoardCard {
+                    view: v5.clone(),
+                    note: t_b.note.clone(),
+                    group: group("todo"),
+                    before: Some(RankNeighbor {
+                        note: t_a.note.clone(),
+                        expected_rank: RankExpectation::Absent,
+                    }),
+                    after: None,
+                    fields: BTreeMap::new(),
+                    expected_note: t_b.revision.clone(),
+                    expected_view: v5_rev.revision.clone(),
+                    expected_rank: RankExpectation::Absent,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    store
+        .delete_note(
+            owner.clone(),
+            mutation(
+                &owner,
+                DeleteNote {
+                    note: v5_rev.note.clone(),
+                    disposition: DeleteDisposition::Trash,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    sync(store, runtime, &scope).await;
+
+    let prep_ht = store
+        .prepare_agent_run_rollback(owner.clone(), run_ht)
+        .await
+        .expect("prepare rollback must succeed on human-trashed board view");
+    store
+        .rollback_agent_run(owner.clone(), mutation(&owner, prep_ht))
+        .await
+        .expect("rollback must succeed on human-trashed board view");
+    store
+        .delete_note(
+            owner.clone(),
+            mutation(
+                &owner,
+                DeleteNote {
+                    note: v5_rev.note.clone(),
+                    disposition: DeleteDisposition::Restore,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    sync(store, runtime, &scope).await;
+    let v5_rows = query(&engine, owner, v5).await.unwrap();
+    let v5_ids: Vec<NoteId> = v5_rows
+        .rows
+        .items
+        .iter()
+        .map(|row| row.card.document.provenance().reference().note_id.clone())
+        .collect();
+    assert_eq!(
+        v5_ids,
+        vec![t_a.note, t_b.note],
+        "restoring human-trashed board view after rollback must not resurrect run-owned rank overlay"
+    );
 }
 
 async fn keeper_readonly_abilities_isolation_on_changes_events_and_graph(
@@ -1824,7 +2502,9 @@ async fn keeper_readonly_abilities_isolation_on_changes_events_and_graph(
     let bus = engine.event_bus();
     let mut keeper_stream = bus.subscribe(keeper.clone(), after.clone()).await.unwrap();
 
-    // Create a live unapproved Skill note, purge the pre-existing unapproved Skill note,
+    // Create a live unapproved Skill note, move BOTH the unapproved Skill note and a
+    // visible AgentMemory card on `skill_board` while `keeper_stream` is open (exercising
+    // `keeper_skill_scoped` in `board_events`), purge the pre-existing unapproved Skill note,
     // then create a visible UserDoc note.
     let unapproved_skill_live = store
         .create_note(
@@ -1844,6 +2524,55 @@ async fn keeper_readonly_abilities_isolation_on_changes_events_and_graph(
         .await
         .unwrap()
         .value;
+    sync(store, runtime, &scope).await;
+    let _skill_moved = store
+        .move_board_card(
+            skill_author.clone(),
+            mutation(
+                &skill_author,
+                MoveBoardCard {
+                    view: skill_board.clone(),
+                    note: unapproved_skill_live.note.clone(),
+                    group: group("doing"),
+                    before: None,
+                    after: None,
+                    fields: BTreeMap::from([(
+                        "status".into(),
+                        Some(YamlValue::String("doing".into())),
+                    )]),
+                    expected_note: unapproved_skill_live.revision.clone(),
+                    expected_view: skill_board_rev.revision.clone(),
+                    expected_rank: RankExpectation::Absent,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let mem_card_moved = store
+        .move_board_card(
+            owner.clone(),
+            mutation(
+                &owner,
+                MoveBoardCard {
+                    view: skill_board.clone(),
+                    note: mem_card.note.clone(),
+                    group: group("doing"),
+                    before: None,
+                    after: None,
+                    fields: BTreeMap::from([(
+                        "status".into(),
+                        Some(YamlValue::String("doing".into())),
+                    )]),
+                    expected_note: mem_card.revision.clone(),
+                    expected_view: skill_board_rev.revision.clone(),
+                    expected_rank: RankExpectation::Absent,
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .value;
+    let mem_card = mem_card_moved.revision;
     store
         .delete_note(
             skill_author.clone(),
@@ -1898,7 +2627,9 @@ async fn keeper_readonly_abilities_isolation_on_changes_events_and_graph(
     );
 
     // 2. Projection event stream must not deliver GraphSettled, full Board deltas for
-    //    Skill-including boards, or Changed events for unapproved Skill notes.
+    //    Skill-including boards, or Changed events for unapproved Skill notes, while
+    //    converting the visible `mem_card` board move on `skill_board` into ResyncRequired.
+    let mut saw_resync = false;
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let event = keeper_stream.next().await.unwrap().unwrap();
@@ -1908,6 +2639,9 @@ async fn keeper_readonly_abilities_isolation_on_changes_events_and_graph(
                 }
                 SpaceEventKind::Board(_) => {
                     panic!("whole-space Keeper must not receive full Board delta for Skill-sourced board");
+                }
+                SpaceEventKind::ResyncRequired => {
+                    saw_resync = true;
                 }
                 SpaceEventKind::Changed(change)
                     if change.entity == EntityId::Note(unapproved_skill_live.note.clone())
@@ -1926,6 +2660,10 @@ async fn keeper_readonly_abilities_isolation_on_changes_events_and_graph(
     })
     .await
     .expect("whole-space Keeper still receives visible UserDoc event");
+    assert!(
+        saw_resync,
+        "moving mem_card on Skill-sourced board must emit ResyncRequired (never Board delta) to Keeper"
+    );
 
     // 3. Superclusters graph tier must not bypass Keeper Skill isolation.
     let graph_err = engine

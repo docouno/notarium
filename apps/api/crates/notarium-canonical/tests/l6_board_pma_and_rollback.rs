@@ -557,6 +557,7 @@ impl BoardMutationFactsProvider for CanonicalTestBoardPlanner {
                         group_field_kind: BoardGroupFieldKind::String,
                         groups,
                         post_restore_membership: post_restore_membership.clone(),
+                        post_restore_group_order: Vec::new(),
                     },
                 );
             }

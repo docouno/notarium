@@ -252,7 +252,11 @@ fn evaluate_rollback(
             .get(&view.note)
             .copied()
             .filter(|restoration| restoration.planned_lifecycle == Lifecycle::Active);
-        let plan = board_plan_for_rollback(cut, ctx, view, restored_view)?;
+        let RollbackBoardPlan::Board(plan) =
+            board_plan_for_rollback(cut, ctx, view, restored_view)?
+        else {
+            continue;
+        };
         if let Some(folder) =
             view_authorization_folder(&plan.descriptor.source, plan.source_folder.as_ref())
         {
@@ -260,11 +264,18 @@ fn evaluate_rollback(
         }
         let groups = plan.groups(cut, ctx, view, deadline)?;
         let mut post_restore_membership = BTreeMap::new();
+        let mut post_restore_entries = Vec::new();
         for restoration in &request.eligible_notes {
             deadline.check()?;
-            let membership = restored_membership(cut, ctx, &plan, restoration)?;
+            let restored = restored_membership(cut, ctx, &plan, restoration)?;
+            let membership = restored.as_ref().map(|(grp, _)| grp.clone());
+            if let Some((grp, sort_key)) = restored {
+                post_restore_entries.push((grp, restoration.note.clone(), sort_key));
+            }
             post_restore_membership.insert(restoration.note.clone(), membership);
         }
+        let post_restore_group_order =
+            plan.post_restore_group_order(cut, view, &groups, &post_restore_entries, deadline)?;
         views.insert(
             view.clone(),
             BoardViewRollbackFacts {
@@ -276,10 +287,16 @@ fn evaluate_rollback(
                 group_field_kind: plan.group_field_kind,
                 groups,
                 post_restore_membership,
+                post_restore_group_order,
             },
         );
     }
     Ok((views, auth_folders))
+}
+
+enum RollbackBoardPlan<'a> {
+    Board(Box<BoardPlan<'a>>),
+    Retired,
 }
 
 struct BoardPlan<'a> {
@@ -296,9 +313,49 @@ fn board_plan_for_rollback<'a>(
     ctx: &SpaceContext,
     view: &ViewRef,
     restored_view: Option<&PlannedNoteRestoration>,
-) -> Result<BoardPlan<'a>, PortError> {
+) -> Result<RollbackBoardPlan<'a>, PortError> {
     let Some(restoration) = restored_view else {
-        return board_plan(cut, ctx, view);
+        let note = cut.active_note(ctx, &view.note)?;
+        let fields = cut.schema_fields();
+        let compiled = compile_projected_views(&note.views, fields);
+        let descriptor = match compiled.get(&view.key) {
+            Ok(descriptor) => descriptor,
+            Err(DomainError::ResourceNotFound | DomainError::ValidationFailed { .. }) => {
+                return Ok(RollbackBoardPlan::Retired);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if descriptor.kind != ViewKind::Board {
+            return Ok(RollbackBoardPlan::Retired);
+        }
+        let Some(group_field) = descriptor.group_by.clone() else {
+            return Ok(RollbackBoardPlan::Retired);
+        };
+        let group_field_kind = match descriptor.board_group_kind(fields) {
+            Ok(kind) => kind,
+            Err(DomainError::ValidationFailed { .. }) => return Ok(RollbackBoardPlan::Retired),
+            Err(error) => return Err(error.into()),
+        };
+        let source_folder = match cut.resolve_source(&descriptor.source, &note.parent_folder) {
+            Ok(folder) => folder,
+            Err(PortError::Domain(DomainError::ResourceNotFound)) => {
+                return Ok(RollbackBoardPlan::Retired);
+            }
+            Err(error) => return Err(error),
+        };
+        cut.authorize_entry(
+            ctx,
+            view_authorization_folder(&descriptor.source, source_folder.as_ref()),
+        )?;
+        cut.authorize_board_source(ctx, &descriptor.source, source_folder.as_ref())?;
+        return Ok(RollbackBoardPlan::Board(Box::new(BoardPlan {
+            view_revision: note.revision.clone(),
+            descriptor: descriptor.clone(),
+            group_field,
+            group_field_kind,
+            fields,
+            source_folder,
+        })));
     };
     let current = cut
         .notes
@@ -313,10 +370,12 @@ fn board_plan_for_rollback<'a>(
         restoration.planned_class,
         restoration.planned_ability.clone(),
     )?;
-    let carrier = restoration
-        .planned_carrier
-        .as_deref()
-        .ok_or_else(|| DomainError::validation(ValidationReason::InvalidView))?;
+    if restoration.planned_class == DocClass::EncryptedNote {
+        return Ok(RollbackBoardPlan::Retired);
+    }
+    let Some(carrier) = restoration.planned_carrier.as_deref() else {
+        return Ok(RollbackBoardPlan::Retired);
+    };
     let views: Vec<ViewInput> = match extract(
         carrier,
         restoration.planned_class,
@@ -325,33 +384,49 @@ fn board_plan_for_rollback<'a>(
         None,
     )? {
         ExtractedDocDelta::Plain(doc) => doc.views.into_iter().map(ViewInput::from).collect(),
-        ExtractedDocDelta::Encrypted(_) => return Err(DomainError::ResourceNotFound.into()),
+        ExtractedDocDelta::Encrypted(_) => return Ok(RollbackBoardPlan::Retired),
     };
     let fields = cut.schema_fields();
     let compiled = compile_projected_views(&views, fields);
-    let descriptor = compiled.get(&view.key)?;
+    let descriptor = match compiled.get(&view.key) {
+        Ok(descriptor) => descriptor,
+        Err(DomainError::ResourceNotFound | DomainError::ValidationFailed { .. }) => {
+            return Ok(RollbackBoardPlan::Retired);
+        }
+        Err(error) => return Err(error.into()),
+    };
     if descriptor.kind != ViewKind::Board {
-        return Err(DomainError::validation(ValidationReason::InvalidView).into());
+        return Ok(RollbackBoardPlan::Retired);
     }
-    let group_field = descriptor
-        .group_by
-        .clone()
-        .ok_or_else(|| DomainError::validation(ValidationReason::InvalidView))?;
+    let Some(group_field) = descriptor.group_by.clone() else {
+        return Ok(RollbackBoardPlan::Retired);
+    };
+    let group_field_kind = match descriptor.board_group_kind(fields) {
+        Ok(kind) => kind,
+        Err(DomainError::ValidationFailed { .. }) => return Ok(RollbackBoardPlan::Retired),
+        Err(error) => return Err(error.into()),
+    };
     let source_folder =
-        cut.resolve_source(&descriptor.source, &restoration.planned_parent_folder)?;
+        match cut.resolve_source(&descriptor.source, &restoration.planned_parent_folder) {
+            Ok(folder) => folder,
+            Err(PortError::Domain(DomainError::ResourceNotFound)) => {
+                return Ok(RollbackBoardPlan::Retired);
+            }
+            Err(error) => return Err(error),
+        };
     cut.authorize_entry(
         ctx,
         view_authorization_folder(&descriptor.source, source_folder.as_ref()),
     )?;
     cut.authorize_board_source(ctx, &descriptor.source, source_folder.as_ref())?;
-    Ok(BoardPlan {
+    Ok(RollbackBoardPlan::Board(Box::new(BoardPlan {
         view_revision: restoration.current_revision.clone(),
         descriptor: descriptor.clone(),
         group_field,
-        group_field_kind: descriptor.board_group_kind(fields)?,
+        group_field_kind,
         fields,
         source_folder,
-    })
+    })))
 }
 
 fn board_plan<'a>(
@@ -504,6 +579,89 @@ impl BoardPlan<'_> {
         });
         Ok(groups)
     }
+
+    fn post_restore_group_order(
+        &self,
+        cut: &BoardCut,
+        view: &ViewRef,
+        groups: &[EvaluatedBoardGroup],
+        restored: &[(GroupKey, NoteId, notarium_core::query::SortTuple)],
+        deadline: &PlannerDeadline,
+    ) -> Result<Vec<(GroupKey, Vec<NoteId>)>, PortError> {
+        let restored_by_note: BTreeMap<&NoteId, (&GroupKey, &notarium_core::query::SortTuple)> =
+            restored
+                .iter()
+                .map(|(grp, note, order)| (note, (grp, order)))
+                .collect();
+        type GroupOrderEntry<'a> = (Option<&'a str>, notarium_core::query::SortTuple, NoteId);
+        let mut by_group: Vec<(GroupKey, Vec<GroupOrderEntry<'_>>)> = Vec::new();
+        for eg in groups {
+            deadline.check()?;
+            let (_, group_hex) = group_key_hex(&eg.group)?;
+            let entry = if let Some((_, existing)) =
+                by_group.iter_mut().find(|(grp, _)| grp == &eg.group)
+            {
+                existing
+            } else {
+                by_group.push((eg.group.clone(), Vec::new()));
+                &mut by_group.last_mut().expect("just pushed").1
+            };
+            for row in &eg.rows {
+                if let Some((restored_grp, _)) = restored_by_note.get(&row.note)
+                    && *restored_grp != &eg.group
+                {
+                    continue;
+                }
+                let Some(note) = cut.notes.get(&row.note) else {
+                    continue;
+                };
+                let overlay = cut.ranks.get(view).and_then(|ranks| ranks.get(&row.note));
+                let rank = overlay
+                    .filter(|rank| rank.group_hex == group_hex)
+                    .map(|rank| rank.rank.as_str());
+                let order = restored_by_note
+                    .get(&row.note)
+                    .map(|(_, order)| (*order).clone())
+                    .unwrap_or_else(|| {
+                        sort_tuple(
+                            &self.descriptor.sort,
+                            &row.note,
+                            note.updated_at,
+                            &note.fields,
+                        )
+                    });
+                entry.push((rank, order, row.note.clone()));
+            }
+        }
+        for (grp, note, order) in restored {
+            deadline.check()?;
+            let (_, group_hex) = group_key_hex(grp)?;
+            let entry = if let Some((_, existing)) = by_group.iter_mut().find(|(g, _)| g == grp) {
+                existing
+            } else {
+                by_group.push((grp.clone(), Vec::new()));
+                &mut by_group.last_mut().expect("just pushed").1
+            };
+            if entry.iter().any(|(_, _, id)| id == note) {
+                continue;
+            }
+            let overlay = cut.ranks.get(view).and_then(|ranks| ranks.get(note));
+            let rank = overlay
+                .filter(|rank| rank.group_hex == group_hex)
+                .map(|rank| rank.rank.as_str());
+            entry.push((rank, order.clone(), note.clone()));
+        }
+        let mut ordered = Vec::with_capacity(by_group.len());
+        for (grp, mut rows) in by_group {
+            deadline.check()?;
+            rows.sort_by(|left, right| {
+                compare_board_rows(&self.descriptor.sort, left.0, &left.1, right.0, &right.1)
+                    .expect("sort tuples are produced by the same validated descriptor")
+            });
+            ordered.push((grp, rows.into_iter().map(|(_, _, id)| id).collect()));
+        }
+        Ok(ordered)
+    }
 }
 
 fn proposed_raw_fields(
@@ -535,7 +693,7 @@ fn restored_membership(
     ctx: &SpaceContext,
     plan: &BoardPlan<'_>,
     restoration: &PlannedNoteRestoration,
-) -> Result<Option<GroupKey>, PortError> {
+) -> Result<Option<(GroupKey, notarium_core::query::SortTuple)>, PortError> {
     if restoration.planned_lifecycle != Lifecycle::Active
         || restoration.planned_class == DocClass::EncryptedNote
         || !cut.ancestry(&restoration.planned_parent_folder)?.active
@@ -586,15 +744,22 @@ fn restored_membership(
         &tags,
         &fields,
     )?;
-    if group.is_some() {
+    if let Some(group) = group {
         cut.authorize_placement(
             ctx,
             &restoration.planned_parent_folder,
             restoration.planned_class,
             restoration.planned_ability.clone(),
         )?;
+        let order = sort_tuple(
+            &plan.descriptor.sort,
+            &restoration.note,
+            current.updated_at,
+            &fields,
+        );
+        return Ok(Some((group, order)));
     }
-    Ok(group)
+    Ok(None)
 }
 
 fn semantic_placement(groups: &[EvaluatedBoardGroup], target: &NoteId) -> SemanticPlacement {

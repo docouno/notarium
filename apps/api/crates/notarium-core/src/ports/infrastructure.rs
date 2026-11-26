@@ -518,6 +518,9 @@ pub struct BoardViewRollbackFacts {
     pub groups: Vec<EvaluatedBoardGroup>,
     /// Post-restoration group membership for each eligible target (`None` = outside view).
     pub post_restore_membership: BTreeMap<NoteId, Option<GroupKey>>,
+    /// Post-restoration group ordering for active and returning eligible notes,
+    /// sorted by the board view's rank/sort descriptor.
+    pub post_restore_group_order: Vec<(GroupKey, Vec<NoteId>)>,
 }
 
 #[derive(Clone, Debug)]

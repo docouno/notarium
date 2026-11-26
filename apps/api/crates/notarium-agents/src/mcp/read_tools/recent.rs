@@ -37,6 +37,7 @@ pub(super) async fn recent(
     let external = matches!(call.target, EgressTarget::ExternalMcp);
     let mut candidates = Vec::new();
     let mut truncated = false;
+    let mut observed_foreign = false;
     for (index, target) in targets.iter().enumerate() {
         let mut read_scope = call.space(target.scope.clone())?;
         let foreign_space = !external
@@ -86,7 +87,9 @@ pub(super) async fn recent(
             // Targeting a consented foreign project (explicitly or via episode
             // project_hint) observes that Space even when its recent activity list is empty.
             call.auth.taint().mark_external_read();
+            observed_foreign = true;
         }
+        observed_foreign |= foreign_space;
         if target.last_seq == SpaceSeq::ZERO {
             continue;
         }
@@ -116,7 +119,7 @@ pub(super) async fn recent(
             )
             .await
             .inspect_err(|error| {
-                if foreign_space
+                if observed_foreign
                     && !matches!(
                         error,
                         PortError::Domain(notarium_core::DomainError::ResourceNotFound)
@@ -126,10 +129,21 @@ pub(super) async fn recent(
                 }
             })?;
         let ChangeReadResult::Log(page) = page else {
+            if observed_foreign {
+                call.commit_external_read();
+            }
             return Err(invalid(ValidationReason::InvalidState));
         };
-        target.scope.check(&page.next.scope)?;
+        if let Err(error) = target.scope.check(&page.next.scope) {
+            if observed_foreign {
+                call.commit_external_read();
+            }
+            return Err(error.into());
+        }
         if page.cutoff != target.last_seq || page.changes.len() > usize::from(SPACE_WINDOW) {
+            if observed_foreign {
+                call.commit_external_read();
+            }
             return Err(invalid(ValidationReason::InvalidState));
         }
         truncated |= after > SpaceSeq::ZERO || !page.complete;
@@ -170,6 +184,9 @@ pub(super) async fn recent(
             break;
         }
         let EntityId::Note(id) = change.entity else {
+            if observed_foreign {
+                call.commit_external_read();
+            }
             return Err(invalid(ValidationReason::InvalidState));
         };
         let target = &targets[index];
@@ -182,7 +199,12 @@ pub(super) async fn recent(
                 {
                     Ok(selection) => selection,
                     Err(error) if corpus::hidden(&error) => continue,
-                    Err(error) => return Err(error),
+                    Err(error) => {
+                        if observed_foreign {
+                            call.commit_external_read();
+                        }
+                        return Err(error);
+                    }
                 };
                 if let Some(sel) = selection {
                     if change
@@ -191,7 +213,13 @@ pub(super) async fn recent(
                     {
                         continue;
                     }
-                    scope = scope.restrict_read_classes(&sel.policy.allowed_classes)?;
+                    scope = scope
+                        .restrict_read_classes(&sel.policy.allowed_classes)
+                        .inspect_err(|_| {
+                            if observed_foreign {
+                                call.commit_external_read();
+                            }
+                        })?;
                     if scope
                         .auth()
                         .spaces()
@@ -233,18 +261,29 @@ pub(super) async fn recent(
             {
                 Ok(value) => value,
                 Err(error) if corpus::hidden(&error) => continue,
-                Err(error) => return Err(error),
+                Err(error) => {
+                    if observed_foreign {
+                        call.commit_external_read();
+                    }
+                    return Err(error);
+                }
             };
             let metadata = &snapshot.metadata;
             if metadata.reference().note_id != id || metadata.revision() != &change.revision {
+                if observed_foreign {
+                    call.commit_external_read();
+                }
                 return Err(invalid(ValidationReason::SourceMismatch));
             }
             if metadata.class() == DocClass::EncryptedNote {
                 continue;
             }
-            let facts = snapshot
-                .provenance
-                .ok_or_else(|| invalid(ValidationReason::SourceMismatch))?;
+            let Some(facts) = snapshot.provenance else {
+                if observed_foreign {
+                    call.commit_external_read();
+                }
+                return Err(invalid(ValidationReason::SourceMismatch));
+            };
             if target
                 .project
                 .as_ref()
@@ -255,7 +294,12 @@ pub(super) async fn recent(
             match corpus::note_metadata(call, &scope, metadata).await {
                 Ok(()) => (),
                 Err(error) if corpus::hidden(&error) => continue,
-                Err(error) => return Err(error),
+                Err(error) => {
+                    if observed_foreign {
+                        call.commit_external_read();
+                    }
+                    return Err(error);
+                }
             }
             facts
         };

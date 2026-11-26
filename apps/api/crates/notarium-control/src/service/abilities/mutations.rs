@@ -4,6 +4,8 @@ use crate::store::statements::execute;
 use notarium_core::auth::SpaceRole;
 use std::collections::BTreeSet;
 
+const ABILITY_TRAIL_LOCK: i64 = 0x4e54_5452_4149_4c31;
+
 impl ControlService {
     async fn ensure_current_ability_mutation(
         &self,
@@ -654,6 +656,9 @@ impl ControlService {
                         CommitEffect::NotCommitted,
                     )
                     .await?;
+                if chain.revision_mismatched {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
                 if promotion && chain.terminal != *destination {
                     return Err(DomainError::ResourceNotFound.into());
                 }
@@ -754,6 +759,13 @@ impl ControlService {
             tx.hold_schedule_pin(pin);
         }
         let (revision, value) = budget.run(async {
+            if let Transaction::Postgres(inner) = tx.inner_mut() {
+                sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                    .bind(ABILITY_TRAIL_LOCK)
+                    .execute(&mut **inner)
+                    .await
+                    .map_err(crate::error::database)?;
+            }
             let owner = user(tx.inner_mut(), ctx.auth().principal().as_str()).await?;
             let mut references = vec![&input.source];
             if let Some(destination) = &input.destination { references.push(destination); }
@@ -780,7 +792,11 @@ impl ControlService {
                 || previous.as_ref().is_some_and(|trail| trail.source != input.source) { return Err(invalid(ValidationReason::InvalidState)); }
             let value = if let Some(destination) = &input.destination {
                 let (source, target) = prechecked.as_ref().ok_or_else(|| invalid(ValidationReason::InvalidState))?;
-                let final_ref = self.follow_ability_db(tx.inner_mut(), &ctx, destination.clone()).await?;
+                let dest_chain = self.follow_ability_chain_db(tx.inner_mut(), &ctx, destination.clone()).await?;
+                if dest_chain.revision_mismatched {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+                let final_ref = dest_chain.terminal;
                 if source.reference != input.source
                     || target.reference != final_ref
                     || (promotion && final_ref != *destination)
@@ -811,8 +827,11 @@ impl ControlService {
                 record.validate()?;
                 execute!(tx.inner_mut(),"DELETE FROM ability_placement_trail WHERE source_placement=$1 AND ability_id=$2","DELETE FROM v1_control.ability_placement_trail WHERE source_placement=$1 AND ability_id=$2";&key,input.source.id.as_str())?;
                 record.insert(tx.inner_mut()).await?;
-                // Validate the newly installed chain, including its first hop.
-                self.follow_ability_db(tx.inner_mut(), &ctx, input.source.clone()).await?;
+                // Validate the newly installed chain, including its first hop and revision continuity.
+                let installed = self.follow_ability_chain_db(tx.inner_mut(), &ctx, input.source.clone()).await?;
+                if installed.revision_mismatched {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
                 if let Some(source) = source_state {
                     let destination = read_overlay_state(tx.inner_mut(), ctx.auth().principal(), &destination_key, &destination.id).await?;
                     Some(AbilityPromotionResult { source, destination })

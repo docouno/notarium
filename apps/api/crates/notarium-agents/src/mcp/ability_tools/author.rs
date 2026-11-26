@@ -943,6 +943,9 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
             authored_changed = done.authored_changed;
             reference.revision = done.revision;
             published = authored_changed || plan.promote;
+            if plan.promote {
+                phase = "home";
+            }
         } else {
             let attachments = args
                 .attachments
@@ -1393,12 +1396,14 @@ async fn ensure_ability_folder_journaled(
         return Ok(saved);
     }
     let existed_label = format!("{label}-existed");
+    let mut existed_replayed = true;
     let existed: bool = call
         .journal_with_key(
             &existed_label,
             &call.request_key,
             call.request_hash,
             || async {
+                existed_replayed = false;
                 Ok(call
                     .registry
                     .engine
@@ -1416,7 +1421,11 @@ async fn ensure_ability_folder_journaled(
             super::super::note_tools::batch_operational_error(err_label, error, false)
         })?;
     let folder = ability_folder(call, scope, parent).await.map_err(|error| {
-        super::super::note_tools::batch_operational_error(err_label, error, false)
+        super::super::note_tools::batch_operational_error(
+            err_label,
+            error,
+            existed_replayed && !existed,
+        )
     })?;
     let recorded = JournaledAbilityFolder {
         folder,
