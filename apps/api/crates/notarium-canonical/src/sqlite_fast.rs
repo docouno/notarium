@@ -6165,6 +6165,13 @@ impl SqliteSyncItemPlan for RollbackDirectSqliteFastPlan {
         // --- 1. Read-only preconditions & pure validation (zero SQL mutations) ---
         auth.authorize_space_write(&item_ctx.space)
             .map_err(|err| FastItemExecError::PreWrite(err.into()))?;
+        if has_rollback_board_history_rusqlite(conn, &scope_cl.space_id, run)
+            .map_err(FastItemExecError::PreWrite)?
+        {
+            return Err(FastItemExecError::PreWrite(
+                rollback_fallback_board_present_err(),
+            ));
+        }
         let active_chat_rows: Vec<(String, String, String, Option<String>)> = {
             let mut stmt = conn
                 .prepare_cached(
@@ -6352,13 +6359,6 @@ impl SqliteSyncItemPlan for RollbackDirectSqliteFastPlan {
             } else {
                 DomainError::ResourceNotFound.into()
             }));
-        }
-        if has_rollback_board_history_rusqlite(conn, &scope_cl.space_id, run)
-            .map_err(FastItemExecError::PreWrite)?
-        {
-            return Err(FastItemExecError::PreWrite(
-                rollback_fallback_board_present_err(),
-            ));
         }
 
         let mut heads_map = verify_run_and_entity_preconditions_note_only_rusqlite(
@@ -6566,6 +6566,11 @@ impl SqliteSyncItemPlan for RollbackDirectSqliteFastPlan {
                     require_active_folder,
                 )
                 .map_err(FastItemExecError::PreWrite)?;
+                if anc.folder_lifecycle == Lifecycle::Purged {
+                    return Err(FastItemExecError::PreWrite(
+                        DomainError::ResourceNotFound.into(),
+                    ));
+                }
                 auth.authorize_direct_write(&after, &after)
                     .map_err(|err| FastItemExecError::PreWrite(err.into()))?;
                 restored_ancestries.insert(nid.clone(), anc.is_root_child);

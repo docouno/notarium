@@ -2955,9 +2955,9 @@ async fn rollback_skipped_replay_and_oracle_views(
         "live active board order [c7, n7, h7] must stay intact when agent card is skipped"
     );
 
-    // Case 7B: Idempotent replay of committed rollbacks succeeds when (1) the rollback itself
-    // trashed a run-created board view (`rollback_agent_run`), and (2) the rolled-back note
-    // lives inside a trashed folder (`rollback_agent_run_by_id`).
+    // Case 7B: Idempotent replay of committed rollbacks: (1) succeeds when the rollback itself
+    // trashed a run-created board view (`rollback_agent_run`), and (2) `rollback_agent_run_by_id`
+    // enforces live active-folder visibility while the folder is trashed and replays once restored.
     let c7b = create_note(
         store,
         &owner,
@@ -3235,6 +3235,228 @@ async fn rollback_skipped_replay_and_oracle_views(
             "unauthorized P2 run rollback must authorize touched_set before checking expected_entities, got {probe_err:?}"
         );
     }
+    // Case 7D: Stale-group neighbor overlay materialization & rollback restoration/cleanup.
+    // Pre-run: human ranks `u_human` before `u_other` in `status=todo`, while `u_plain` is
+    // unranked in `status=doing`. Agent run changes `group_by` to `priority` and moves `m_agent`
+    // before `u_human` in `priority=p1`, replacing `u_human`'s stale `todo` overlay (non-NULL
+    // `parent_rev_id`) and materializing `u_plain` in `p1`. Rolling back the run must restore
+    // `u_human`'s pre-run `todo` human overlay (keeping `u_human` before `u_other`) and delete
+    // `u_plain`'s orphaned `p1` overlay.
+    let proj7d = folder(store, &owner, None, "rb-stale-nbr-proj", true)
+        .await
+        .unwrap();
+    let (v7d, v7d_rev) = create_view(
+        store,
+        &owner,
+        &proj7d,
+        "rb-stale-nbr-board",
+        "board",
+        "{scope: project}",
+        "group_by: status\nfilter: {exists: status}\n",
+    )
+    .await;
+    let u_human = create_note(
+        store,
+        &owner,
+        Some(proj7d.clone()),
+        "z-human-ranked",
+        "---\ntitle: Z-Human\nstatus: todo\npriority: p1\n---\n".into(),
+    )
+    .await;
+    let u_other = create_note(
+        store,
+        &owner,
+        Some(proj7d.clone()),
+        "a-other-todo",
+        "---\ntitle: A-Other\nstatus: todo\npriority: p1\n---\n".into(),
+    )
+    .await;
+    let u_plain = create_note(
+        store,
+        &owner,
+        Some(proj7d.clone()),
+        "b-plain-doing",
+        "---\ntitle: B-Plain\nstatus: doing\npriority: p1\n---\n".into(),
+    )
+    .await;
+    let m_agent = create_note(
+        store,
+        &owner,
+        Some(proj7d.clone()),
+        "m-agent-card",
+        "---\ntitle: M-Agent\nstatus: todo\npriority: p1\n---\n".into(),
+    )
+    .await;
+    sync(store, runtime, &scope).await;
+    // Human ranks `u_human` before `u_other` in `status=todo` (creating pre-run human overlays).
+    store
+        .move_board_card(
+            owner.clone(),
+            mutation(
+                &owner,
+                MoveBoardCard {
+                    view: v7d.clone(),
+                    note: u_human.note.clone(),
+                    group: group("todo"),
+                    before: Some(RankNeighbor {
+                        note: u_other.note.clone(),
+                        expected_rank: RankExpectation::Absent,
+                    }),
+                    after: None,
+                    fields: BTreeMap::new(),
+                    expected_note: u_human.revision.clone(),
+                    expected_view: v7d_rev.revision.clone(),
+                    expected_rank: RankExpectation::Absent,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    sync(store, runtime, &scope).await;
+    let pre_overlays_7d = store
+        .inspect_view_overlays_for_test(&scope.space_id, &v7d)
+        .await
+        .unwrap();
+    let u_human_pre_ov = pre_overlays_7d
+        .get(&u_human.note)
+        .expect("human move must create pre-run overlay for u_human")
+        .clone();
+    let m_agent_pre_ov = pre_overlays_7d
+        .get(&m_agent.note)
+        .expect("human move in todo must materialize m_agent neighbor overlay")
+        .clone();
+    assert!(!pre_overlays_7d.contains_key(&u_plain.note));
+
+    // Agent run changes `group_by: status` -> `group_by: priority`, then moves `m_agent` in `p1`.
+    let run7d = AgentRunId::from_bytes(random_bytes());
+    let agent7d = super::agent(&owner, run7d.clone(), ChatAudience::Personal);
+    let v7d_text = view_carrier(
+        &v7d.key,
+        "board",
+        "{scope: project}",
+        "group_by: status\nfilter: {exists: status}\n",
+    );
+    let v7d_edited_text = view_carrier(
+        &v7d.key,
+        "board",
+        "{scope: project}",
+        "group_by: priority\nfilter: {exists: status}\n",
+    );
+    let v7d_span = notarium_syntax::frontmatter::analyze(&v7d_text, DocClass::UserDoc)
+        .unwrap()
+        .carrier
+        .body;
+    let v7d_plan = notarium_syntax::patch::plan(
+        &v7d_text,
+        v7d_span,
+        vec![(CarrierEditOrigin::Body, v7d_span, v7d_edited_text)],
+    )
+    .unwrap();
+    let mut edit_v7d = mutation(
+        &agent7d,
+        EditNote {
+            note: v7d.note.clone(),
+            plan: v7d_plan,
+        },
+    );
+    edit_v7d.preconditions.revision = Some(v7d_rev.revision.clone());
+    let v7d_after_agent = store
+        .edit_note(agent7d.clone(), edit_v7d)
+        .await
+        .unwrap()
+        .value;
+    sync(store, runtime, &scope).await;
+    store
+        .move_board_card(
+            agent7d.clone(),
+            mutation(
+                &agent7d,
+                MoveBoardCard {
+                    view: v7d.clone(),
+                    note: m_agent.note.clone(),
+                    group: group("p1"),
+                    before: Some(RankNeighbor {
+                        note: u_human.note.clone(),
+                        expected_rank: RankExpectation::Existing(u_human_pre_ov.rank_rev_id),
+                    }),
+                    after: None,
+                    fields: BTreeMap::new(),
+                    expected_note: m_agent.revision.clone(),
+                    expected_view: v7d_after_agent.revision,
+                    expected_rank: RankExpectation::Existing(m_agent_pre_ov.rank_rev_id),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    sync(store, runtime, &scope).await;
+    let mid_overlays_7d = store
+        .inspect_view_overlays_for_test(&scope.space_id, &v7d)
+        .await
+        .unwrap();
+    assert_eq!(
+        mid_overlays_7d.get(&u_human.note).map(|o| &o.group),
+        Some(&group("p1"))
+    );
+    assert_eq!(
+        mid_overlays_7d.get(&u_plain.note).map(|o| &o.group),
+        Some(&group("p1"))
+    );
+    assert!(
+        mid_overlays_7d
+            .get(&u_human.note)
+            .is_some_and(|o| o.placement_run_id.is_none()),
+        "neighbor materialization replacing stale-group overlay must not inherit placement_run_id"
+    );
+
+    // Roll back `run7d`: `v7d` returns to `group_by: status`, `u_human` restores pre-run `todo`
+    // human overlay (staying before `u_other`), and `u_plain`'s orphaned `p1` overlay is deleted.
+    let prep7d = store
+        .prepare_agent_run_rollback(owner.clone(), run7d)
+        .await
+        .unwrap();
+    store
+        .rollback_agent_run(owner.clone(), mutation(&owner, prep7d))
+        .await
+        .unwrap();
+    sync(store, runtime, &scope).await;
+    let post_overlays_7d = store
+        .inspect_view_overlays_for_test(&scope.space_id, &v7d)
+        .await
+        .unwrap();
+    let u_human_post_ov = post_overlays_7d
+        .get(&u_human.note)
+        .expect("u_human must retain restored pre-run todo overlay after rollback");
+    assert_eq!(u_human_post_ov.group, group("todo"));
+    assert_eq!(
+        u_human_post_ov.placement_revision, u_human_pre_ov.placement_revision,
+        "u_human must restore its original pre-run human placement_revision"
+    );
+    assert!(
+        !post_overlays_7d.contains_key(&u_plain.note),
+        "u_plain orphaned run-materialized p1 overlay must be deleted on rollback"
+    );
+    let todo_ids_7d: Vec<NoteId> = query(&engine, owner.clone(), v7d)
+        .await
+        .unwrap()
+        .rows
+        .items
+        .into_iter()
+        .filter(|row| row.group == group("todo"))
+        .map(|row| row.card.document.provenance().reference().note_id.clone())
+        .collect();
+    let human_pos = todo_ids_7d
+        .iter()
+        .position(|id| id == &u_human.note)
+        .expect("u_human in todo");
+    let other_pos = todo_ids_7d
+        .iter()
+        .position(|id| id == &u_other.note)
+        .expect("u_other in todo");
+    assert!(
+        human_pos < other_pos,
+        "u_human must remain ordered before u_other in todo after rollback: {todo_ids_7d:?}"
+    );
     let _ = proj7b;
 }
 

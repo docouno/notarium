@@ -2226,6 +2226,65 @@ fn build_rollback_execute_fn(
                         }
                     }
 
+                    // Also classify untouched notes whose current overlay on `view` was
+                    // materialized solely by `input.run` (`placement_run_id IS NULL`) into a
+                    // group the note no longer occupies after rollback (e.g., after restoring
+                    // a run-edited `group_by` or narrowed filter): restore a matching pre-run
+                    // human overlay if one existed before `input.run` replaced it, otherwise
+                    // delete the orphaned overlay unless re-materialized as a neighbor.
+                    let mut stale_untouched: Vec<NoteId> = overlays
+                        .iter()
+                        .filter_map(|(nid, ov)| {
+                            (!retired_note_ids.contains(nid)
+                                && !eligible_all_ids.contains(nid)
+                                && ov.placement_run_id.is_none())
+                            .then_some(nid.clone())
+                        })
+                        .collect();
+                    stale_untouched.sort();
+                    for nid in stale_untouched {
+                        let Some(ov) = overlays.get(&nid) else {
+                            continue;
+                        };
+                        let current_group = view_facts
+                            .groups
+                            .iter()
+                            .find(|g| g.rows.iter().any(|r| r.note == nid))
+                            .map(|g| g.group.clone());
+                        if current_group.as_ref() == Some(&ov.group) {
+                            continue;
+                        }
+                        let Some(mat_seq) = run_materialized_overlay_seq_tx(
+                            tx,
+                            &scope_cl.space_id,
+                            &ov.placement_revision,
+                            &input.run,
+                        )
+                        .await?
+                        else {
+                            continue;
+                        };
+                        if let Some(post_grp) = current_group {
+                            let prerun = load_latest_prerun_rank_meta_tx(
+                                tx, &scope_cl, view, &nid, &input.run, mat_seq,
+                            )
+                            .await?;
+                            if let Some(meta) = prerun
+                                && !meta.removed
+                                && meta.group_key == post_grp
+                            {
+                                for (_, notes) in &mut kept_groups {
+                                    notes.retain(|id| id != &nid);
+                                }
+                                stale_prerun_restores.insert(nid, (post_grp, meta));
+                            } else {
+                                pending_stale_deletes.push(nid);
+                            }
+                        } else {
+                            pending_stale_deletes.push(nid);
+                        }
+                    }
+
                     let mut working_groups: Vec<(GroupKey, Vec<ExistingRankedItem>)> = Vec::new();
                     let mut neighbor_dirty: BTreeMap<NoteId, (GroupKey, String, bool)> =
                         BTreeMap::new();
@@ -2623,37 +2682,6 @@ fn build_rollback_execute_fn(
                             });
                         }
                     }
-                    // Also delete orphaned neighbor overlays on this active view that were
-                    // newly materialized solely by `input.run` into a group the untouched
-                    // card no longer belongs to after rollback (e.g. after restoring a
-                    // run-edited `group_by` or narrowed filter).
-                    for (nid, ov) in &overlays {
-                        if retired_note_ids.contains(nid)
-                            || eligible_all_ids.contains(nid)
-                            || materialized_neighbors.contains(nid)
-                            || ov.placement_run_id.is_some()
-                        {
-                            continue;
-                        }
-                        let matches_current_group = view_facts
-                            .groups
-                            .iter()
-                            .any(|g| g.group == ov.group && g.rows.iter().any(|r| &r.note == nid));
-                        if !matches_current_group
-                            && is_run_materialized_overlay_tx(
-                                tx,
-                                &scope_cl.space_id,
-                                &ov.placement_revision,
-                                &input.run,
-                            )
-                            .await?
-                        {
-                            planned_overlay_deletes.push(PlannedOverlayDelete {
-                                view: view.clone(),
-                                target_note: nid.clone(),
-                            });
-                        }
-                    }
 
                     preloaded_view_overlays.insert(view.clone(), overlays);
                 }
@@ -2699,14 +2727,15 @@ fn build_rollback_execute_fn(
                     } else if ov.placement_run_id.is_none() && view_has_rollback_effect {
                         // Also delete neighbor overlays newly materialized solely by `input.run`
                         // (which carry `placement_run_id = None` and whose `placement_revision`
-                        // is a root rank revision created by `input.run` with `parent_rev_id IS NULL`).
-                        is_run_materialized_overlay_tx(
+                        // is a rank revision written by `input.run`).
+                        run_materialized_overlay_seq_tx(
                             tx,
                             &scope_cl.space_id,
                             &ov.placement_revision,
                             &input.run,
                         )
                         .await?
+                        .is_some()
                     } else {
                         false
                     };
@@ -3293,17 +3322,17 @@ fn build_rollback_execute_fn(
 #[allow(clippy::type_complexity)]
 // The current head is authorized when verifying the run's expected entities. The
 // restored revision can name a different folder, document class, or ability.
-async fn is_run_materialized_overlay_tx(
+async fn run_materialized_overlay_seq_tx(
     tx: &mut BackendConn<'_>,
     space_id: &SpaceId,
     placement_revision: &RevisionId,
     run: &AgentRunId,
-) -> Result<bool, PortError> {
-    match tx {
-        BackendConn::Sqlite(conn) => Ok(sqlx::query_scalar::<_, i64>(
-            "SELECT 1 FROM revisions
+) -> Result<Option<SpaceSeq>, PortError> {
+    let seq_opt: Option<i64> = match tx {
+        BackendConn::Sqlite(conn) => sqlx::query_scalar::<_, i64>(
+            "SELECT space_seq FROM revisions
              WHERE space_id = ? AND rev_id = ?
-               AND agent_run_id = ? AND parent_rev_id IS NULL
+               AND entity_type = 'rank' AND agent_run_id = ?
              LIMIT 1",
         )
         .bind(space_id.as_str())
@@ -3313,12 +3342,11 @@ async fn is_run_materialized_overlay_tx(
         .await
         .map_err(|err| {
             internal_not_committed("sqlite_check_materialized_overlay", err.to_string())
-        })?
-        .is_some()),
-        BackendConn::Postgres(conn) => Ok(sqlx::query_scalar::<_, i32>(
-            "SELECT 1 FROM revisions
+        })?,
+        BackendConn::Postgres(conn) => sqlx::query_scalar::<_, i64>(
+            "SELECT space_seq FROM revisions
              WHERE space_id = $1 AND rev_id = $2
-               AND agent_run_id = $3 AND parent_rev_id IS NULL
+               AND entity_type = 'rank' AND agent_run_id = $3
              LIMIT 1",
         )
         .bind(space_id.as_str())
@@ -3326,9 +3354,18 @@ async fn is_run_materialized_overlay_tx(
         .bind(run.as_str())
         .fetch_optional(&mut **conn)
         .await
-        .map_err(|err| crate::runtime::pg_read_error("pg_check_materialized_overlay", err))?
-        .is_some()),
-    }
+        .map_err(|err| crate::runtime::pg_read_error("pg_check_materialized_overlay", err))?,
+    };
+    seq_opt
+        .map(|seq| {
+            u64::try_from(seq)
+                .ok()
+                .and_then(|v| SpaceSeq::new(v).ok())
+                .ok_or_else(|| {
+                    internal_not_committed("corrupt_materialized_overlay_seq", "invalid space_seq")
+                })
+        })
+        .transpose()
 }
 
 async fn authorize_rollback_destination_tx(
@@ -3348,6 +3385,9 @@ async fn authorize_rollback_destination_tx(
             meta.lifecycle == Lifecycle::Active,
         )
         .await?;
+    if anc.folder_lifecycle == Lifecycle::Purged {
+        return Err(DomainError::ResourceNotFound.into());
+    }
     auth.authorize_direct_write(&after, &after)?;
     Ok(anc)
 }
@@ -6951,6 +6991,12 @@ async fn execute_pg_fast_rollback_inner(
                 )
                 .await
             {
+                Ok((_, anc)) if anc.folder_lifecycle == Lifecycle::Purged => {
+                    return PgFastInnerResult::Failed {
+                        err: DomainError::ResourceNotFound.into(),
+                        effective_cut: Some(current_effective_cut),
+                    };
+                }
                 Ok((rf, _)) => rf,
                 Err(err) => {
                     return PgFastInnerResult::Failed {

@@ -152,207 +152,192 @@ pub(super) async fn retrieve(
     let mut own_degradation = BTreeSet::new();
     let mut foreign_degradation = BTreeSet::new();
     let mut observed_foreign = false;
-    for (index, target) in targets.iter().enumerate() {
-        let mut scope = call.space(target.scope.clone())?;
-        let foreign_space = !external
-            && scope
-                .auth()
-                .pinned_write_space()
-                .is_some_and(|pin| pin != &target.scope.space_id);
-        // Scope remote query intent ids to this tool invocation so multi-step
-        // chat/keeper runs sharing one run RequestId can issue repeated search
-        // or recall calls without colliding on provider_call_log intent keys.
-        let req_digest = derive_digest(
-            "notarium.mcp.retrieval.request.v1",
-            &[
-                call.request.as_str().as_bytes(),
-                call.request_key.as_str().as_bytes(),
-                if recall { b"recall" } else { b"search" },
-            ],
-        );
-        scope.budget.request = RequestId::from_bytes(
-            req_digest.as_bytes()[..16]
-                .try_into()
-                .expect("fixed digest"),
-        );
-        let mut effective_classes = classes.clone();
-        let mut effective_project = target.project.clone();
-        let (source_classes, source_project) = if let EgressTarget::InAppProvider {
-            primary_project,
-            ..
-        } = &call.target
-        {
-            let grant_readable: BTreeSet<DocClass> = scope
-                .auth()
-                .spaces()
-                .get(&target.scope.space_id)
-                .map(|grant| {
-                    grant
-                        .read_classes
-                        .iter()
-                        .copied()
-                        .filter(|class| *class != DocClass::EncryptedNote)
-                        .collect()
-                })
-                .unwrap_or_default();
-            let selection_project = target.project.clone().or_else(|| {
-                primary_project
-                    .as_ref()
-                    .filter(|project| project.space_id == target.scope.space_id)
-                    .cloned()
-            });
-            let selection = match call.provider_selection(&scope, selection_project).await {
-                Ok(Some(selection)) => selection,
-                Ok(None) => continue,
-                Err(error) if corpus::hidden(&error) => continue,
-                Err(error) => return Err(error),
-            };
-            let allowed: BTreeSet<DocClass> = selection
-                .policy
-                .allowed_classes
-                .into_iter()
-                .filter(|class| grant_readable.contains(class))
-                .collect();
-            effective_classes.retain(|class| allowed.contains(class));
-            if let Some(confined) = &selection.project_only {
-                if let Some(existing) = &effective_project
-                    && existing != confined
-                {
+    let outcome: Result<Value, PortError> = async {
+        for (index, target) in targets.iter().enumerate() {
+            let mut scope = call.space(target.scope.clone())?;
+            let foreign_space = !external
+                && scope
+                    .auth()
+                    .pinned_write_space()
+                    .is_some_and(|pin| pin != &target.scope.space_id);
+            // Scope remote query intent ids to this tool invocation so multi-step
+            // chat/keeper runs sharing one run RequestId can issue repeated search
+            // or recall calls without colliding on provider_call_log intent keys.
+            let req_digest = derive_digest(
+                "notarium.mcp.retrieval.request.v1",
+                &[
+                    call.request.as_str().as_bytes(),
+                    call.request_key.as_str().as_bytes(),
+                    if recall { b"recall" } else { b"search" },
+                ],
+            );
+            scope.budget.request = RequestId::from_bytes(
+                req_digest.as_bytes()[..16]
+                    .try_into()
+                    .expect("fixed digest"),
+            );
+            let mut effective_classes = classes.clone();
+            let mut effective_project = target.project.clone();
+            let (source_classes, source_project) = if let EgressTarget::InAppProvider {
+                primary_project,
+                ..
+            } = &call.target
+            {
+                let grant_readable: BTreeSet<DocClass> = scope
+                    .auth()
+                    .spaces()
+                    .get(&target.scope.space_id)
+                    .map(|grant| {
+                        grant
+                            .read_classes
+                            .iter()
+                            .copied()
+                            .filter(|class| *class != DocClass::EncryptedNote)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let selection_project = target.project.clone().or_else(|| {
+                    primary_project
+                        .as_ref()
+                        .filter(|project| project.space_id == target.scope.space_id)
+                        .cloned()
+                });
+                let selection = match call.provider_selection(&scope, selection_project).await {
+                    Ok(Some(selection)) => selection,
+                    Ok(None) => continue,
+                    Err(error) if corpus::hidden(&error) => continue,
+                    Err(error) => return Err(error),
+                };
+                let allowed: BTreeSet<DocClass> = selection
+                    .policy
+                    .allowed_classes
+                    .into_iter()
+                    .filter(|class| grant_readable.contains(class))
+                    .collect();
+                effective_classes.retain(|class| allowed.contains(class));
+                if let Some(confined) = &selection.project_only {
+                    if let Some(existing) = &effective_project
+                        && existing != confined
+                    {
+                        continue;
+                    }
+                    effective_project = Some(confined.clone());
+                }
+                if foreign_space && targeted_project {
+                    // Targeting a consented foreign project observes that Space even
+                    // when class intersection leaves no searchable classes or zero hits.
+                    call.auth.taint().mark_external_read();
+                    observed_foreign = true;
+                }
+                if effective_classes.is_empty() {
                     continue;
                 }
-                effective_project = Some(confined.clone());
-            }
-            if foreign_space && targeted_project {
-                // Targeting a consented foreign project observes that Space even
-                // when class intersection leaves no searchable classes or zero hits.
-                call.auth.taint().mark_external_read();
-                observed_foreign = true;
-            }
-            if effective_classes.is_empty() {
-                continue;
-            }
-            scope = match scope.restrict_read_classes(&effective_classes) {
-                Ok(narrowed) => narrowed,
-                Err(_) => continue,
-            };
-            if let Some(project) = &effective_project {
-                scope = match scope.restrict_to_project(project) {
+                scope = match scope.restrict_read_classes(&effective_classes) {
                     Ok(narrowed) => narrowed,
                     Err(_) => continue,
                 };
-            }
-            (Some(allowed), Some(selection.project_only))
-        } else {
-            (None, None)
-        };
-        if foreign_space && targeted_project {
-            // Targeting a consented foreign project (explicitly or via episode
-            // project_hint) observes that Space even when the query returns zero hits.
-            call.auth.taint().mark_external_read();
-            observed_foreign = true;
-        }
-        observed_foreign |= foreign_space;
-        let query = SearchQuery {
-            text: args.query.clone(),
-            filter: unrestricted(),
-            classes: effective_classes.clone(),
-            top_k,
-            model: None,
-            causal: target.causal(),
-            include_chats: false,
-            folder: effective_project
-                .as_ref()
-                .map(|project| project.folder_id.clone()),
-        };
-        // Keep candidate gathering untainted across Spaces so hits dropped by
-        // multi-space limit/budget packing never flip cross-space BranchTaint;
-        // every hit admitted into `output` below passes live `corpus::*` gates.
-        let query_scope = if external {
-            scope.clone()
-        } else {
-            scope.with_preflight_taint()
-        };
-        let recipient = Recipient {
-            call,
-            scope: &query_scope,
-            classes: &effective_classes,
-            project: effective_project.as_ref(),
-            source_classes,
-            source_project,
-        };
-        let result = if recall {
-            call.registry
-                .engine
-                .recall_for(
-                    query_scope.clone(),
-                    RecallQuery {
-                        query,
-                        graph_depth: args.depth.unwrap_or(1),
-                        token_budget: budget,
-                        max_per_source,
-                    },
-                    Some(&recipient),
-                )
-                .await
-        } else {
-            let recipient = (!external).then_some(&recipient as &dyn SearchRecipient);
-            call.registry
-                .engine
-                .search_for(query_scope.clone(), query, recipient)
-                .await
-        }
-        .inspect_err(|_| {
-            if observed_foreign {
-                call.commit_external_read();
-            }
-        })?;
-        if let Err(error) = target.scope.check(&result.cut.scope) {
-            if observed_foreign {
-                call.commit_external_read();
-            }
-            return Err(error.into());
-        }
-        if result.hits.len() > usize::from(top_k.get()) {
-            if observed_foreign {
-                call.commit_external_read();
-            }
-            return Err(invalid(ValidationReason::InvalidState));
-        }
-        truncated |= result.truncated;
-        if let Some(reason) = result.degraded {
-            if foreign_space {
-                foreign_degradation.insert(degraded(reason));
-            } else {
-                own_degradation.insert(degraded(reason));
-            }
-        }
-        for hit in result.hits {
-            let metadata = hit.card.document.provenance();
-            if metadata.reference().space_id != target.scope.space_id || !hit.score.is_finite() {
-                if observed_foreign {
-                    call.commit_external_read();
+                if let Some(project) = &effective_project {
+                    scope = match scope.restrict_to_project(project) {
+                        Ok(narrowed) => narrowed,
+                        Err(_) => continue,
+                    };
                 }
-                return Err(invalid(ValidationReason::SourceMismatch));
+                (Some(allowed), Some(selection.project_only))
+            } else {
+                (None, None)
+            };
+            if foreign_space && targeted_project {
+                // Targeting a consented foreign project (explicitly or via episode
+                // project_hint) observes that Space even when the query returns zero hits.
+                call.auth.taint().mark_external_read();
+                observed_foreign = true;
             }
-            if !matches_target(metadata, &classes, target.project.as_ref()) {
-                continue;
+            observed_foreign |= foreign_space;
+            let query = SearchQuery {
+                text: args.query.clone(),
+                filter: unrestricted(),
+                classes: effective_classes.clone(),
+                top_k,
+                model: None,
+                causal: target.causal(),
+                include_chats: false,
+                folder: effective_project
+                    .as_ref()
+                    .map(|project| project.folder_id.clone()),
+            };
+            // Keep candidate gathering untainted across Spaces so hits dropped by
+            // multi-space limit/budget packing never flip cross-space BranchTaint;
+            // every hit admitted into `output` below passes live `corpus::*` gates.
+            let query_scope = if external {
+                scope.clone()
+            } else {
+                scope.with_preflight_taint()
+            };
+            let recipient = Recipient {
+                call,
+                scope: &query_scope,
+                classes: &effective_classes,
+                project: effective_project.as_ref(),
+                source_classes,
+                source_project,
+            };
+            let result = if recall {
+                call.registry
+                    .engine
+                    .recall_for(
+                        query_scope.clone(),
+                        RecallQuery {
+                            query,
+                            graph_depth: args.depth.unwrap_or(1),
+                            token_budget: budget,
+                            max_per_source,
+                        },
+                        Some(&recipient),
+                    )
+                    .await
+            } else {
+                let recipient = (!external).then_some(&recipient as &dyn SearchRecipient);
+                call.registry
+                    .engine
+                    .search_for(query_scope.clone(), query, recipient)
+                    .await
+            }?;
+            target.scope.check(&result.cut.scope)?;
+            if result.hits.len() > usize::from(top_k.get()) {
+                return Err(invalid(ValidationReason::InvalidState));
             }
-            candidates.push(Candidate { index, hit });
+            truncated |= result.truncated;
+            if let Some(reason) = result.degraded {
+                if foreign_space {
+                    foreign_degradation.insert(degraded(reason));
+                } else {
+                    own_degradation.insert(degraded(reason));
+                }
+            }
+            for hit in result.hits {
+                let metadata = hit.card.document.provenance();
+                if metadata.reference().space_id != target.scope.space_id || !hit.score.is_finite()
+                {
+                    return Err(invalid(ValidationReason::SourceMismatch));
+                }
+                if !matches_target(metadata, &classes, target.project.as_ref()) {
+                    continue;
+                }
+                candidates.push(Candidate { index, hit });
+            }
+            if external && candidates.len() > MAX_CANDIDATES {
+                candidates.sort_by(rank);
+                candidates.truncate(MAX_CANDIDATES);
+                truncated = true;
+            }
         }
-        if external && candidates.len() > MAX_CANDIDATES {
-            candidates.sort_by(rank);
-            candidates.truncate(MAX_CANDIDATES);
-            truncated = true;
-        }
-    }
-    candidates.sort_by(rank);
-    let mut seen = BTreeSet::new();
-    let mut hits = Vec::new();
-    let mut output = Vec::new();
-    let mut combined = String::new();
-    let mut best = None;
+        candidates.sort_by(rank);
+        let mut seen = BTreeSet::new();
+        let mut hits = Vec::new();
+        let mut output = Vec::new();
+        let mut combined = String::new();
+        let mut best = None;
 
-    let finalize: Result<Value, PortError> = async {
         'candidates: for Candidate { index, hit } in candidates {
             if output.len() >= limit {
                 truncated = true;
@@ -517,7 +502,7 @@ pub(super) async fn retrieve(
         Ok(result)
     }
     .await;
-    finalize.inspect_err(|_| {
+    outcome.inspect_err(|_| {
         if observed_foreign {
             call.commit_external_read();
         }

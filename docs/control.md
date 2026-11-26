@@ -29,8 +29,11 @@ read-only pool; PostgreSQL separates a 6-connection write/export pool from a
 queue, and per-operation `SET LOCAL statement_timeout` and
 `idle_in_transaction_session_timeout`. SQL migrations
 reject unknown migration versions. Both dialects preserve the baseline
-migration `0001` and add bearer, schedule, and provider call-run index
-authority (`call_run` on `provider_call_log(run_id, call_id)`) in migration
+migration `0001` and add bearer, schedule, and lookup index authority
+(`schedule_expired_run` on `agent_schedule_runs(expires_at, run_id)`,
+`call_run` on `provider_call_log(run_id, call_id)`, and
+`ability_trail_destination` on
+`ability_placement_trail(destination_placement, destination_id)`) in migration
 `0002`. Existing bearers default to no ability-authoring opt-in. Existing
 schedules with unverified skill approvals require explicit review before a
 provider call.

@@ -595,8 +595,8 @@ impl ProviderService {
                                 detailed.resource_owner.to_string(),
                             ),
                             StoredRevokedAttachment::Legacy(()) => {
-                                let row = attachment(tx, replay_id.as_str()).await?;
-                                let res = resource(tx, &row.resource_id).await?;
+                                let row = attachment_read(tx, replay_id.as_str()).await?;
+                                let res = resource_read(tx, &row.resource_id).await?;
                                 (attachment_target(&row)?, res.owner_id)
                             }
                         };

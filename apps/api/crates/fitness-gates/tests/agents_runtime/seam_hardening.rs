@@ -26340,9 +26340,9 @@ async fn hardened_retry_legacy_and_recent_eviction_seams(
         "list_abilities(view: authoring) skipping unconsented Space s2 must not taint pinned Space"
     );
 
-    // Part I: Pre-lookup path syntax validation on `move_folder`/`rename_folder`,
-    // aligned 4096-byte `search` query validation, and `move_folder` subtree
-    // authorization for `write_locked`, `EncryptedNote`, and `Skill` descendants.
+    // Part I: Pre-lookup path syntax validation on `move_folder`/`rename_folder`/`create_note`,
+    // aligned 4096-byte `search`/`recall` schema validation, and `move_folder`/`rename_folder`/
+    // `rename_project` subtree authorization for `write_locked`, `EncryptedNote`, and `Skill` descendants.
     for (tag, tool, args) in [
         (
             1u8,
@@ -26353,6 +26353,11 @@ async fn hardened_retry_legacy_and_recent_eviction_seams(
             2u8,
             "rename_folder",
             json!({ "project": "no-such/proj", "folder": "bad/../seg", "name": "ok" }),
+        ),
+        (
+            3u8,
+            "create_note",
+            json!({ "project": "no-such/proj", "title": "Index", "body": "reserved generated slug" }),
         ),
     ] {
         let err = call_mcp(
@@ -26369,17 +26374,20 @@ async fn hardened_retry_legacy_and_recent_eviction_seams(
                 Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
                     if diagnostic.reason == ValidationReason::InvalidPathComponent
             ),
-            "{tool} must reject malformed folder path before project lookup, got {:?}",
+            "{tool} must reject malformed/reserved path before project lookup, got {:?}",
             err.err()
         );
     }
     let long_utf8_query = "é".repeat(2049); // 2049 chars, 4098 bytes > 4096
+    let exact_utf8_query = "é".repeat(2048); // 2048 chars, 4096 bytes == 4096
+    // Combine `search` with `class: "encrypted-note"` so `retrieval.rs:115` would return
+    // `ClassEgressForbidden`; receiving `InvalidQuery` proves `schema.rs` rejected >4096B first.
     let search_too_long = call_mcp(
         &fixture.registry,
         &owner,
-        [0xF0, 9, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        [0xF0, 9, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
         "search",
-        json!({ "query": long_utf8_query }),
+        json!({ "query": long_utf8_query, "class": "encrypted-note" }),
     )
     .await;
     assert!(
@@ -26388,8 +26396,60 @@ async fn hardened_retry_legacy_and_recent_eviction_seams(
             Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
                 if diagnostic.reason == ValidationReason::InvalidQuery
         ),
-        "search must reject >4096-byte UTF-8 query upfront in schema validation, got {:?}",
+        "search must reject >4096-byte UTF-8 query upfront in schema validation before handler class check, got {:?}",
         search_too_long.err()
+    );
+    let search_at_limit = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xF0, 9, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
+        "search",
+        json!({ "query": exact_utf8_query, "class": "encrypted-note" }),
+    )
+    .await;
+    assert!(
+        matches!(
+            search_at_limit,
+            Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
+                if diagnostic.reason == ValidationReason::ClassEgressForbidden
+        ),
+        "search must accept exact 4096-byte UTF-8 query in schema validation and reach handler check, got {:?}",
+        search_at_limit.err()
+    );
+    // Combine `recall` with missing `project: "no-such/proj"` so >4096B returns `InvalidQuery`
+    // before project lookup while exact 4096B passes schema validation and hits `ResourceNotFound`.
+    let recall_too_long = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xF0, 9, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "recall",
+        json!({ "query": long_utf8_query, "project": "no-such/proj" }),
+    )
+    .await;
+    assert!(
+        matches!(
+            recall_too_long,
+            Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
+                if diagnostic.reason == ValidationReason::InvalidQuery
+        ),
+        "recall must reject >4096-byte UTF-8 query upfront in schema validation before project lookup, got {:?}",
+        recall_too_long.err()
+    );
+    let recall_at_limit = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xF0, 9, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
+        "recall",
+        json!({ "query": exact_utf8_query, "project": "no-such/proj" }),
+    )
+    .await;
+    assert!(
+        matches!(
+            recall_at_limit,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ),
+        "recall must accept exact 4096-byte UTF-8 query in schema validation and reach project lookup, got {:?}",
+        recall_at_limit.err()
     );
 
     let mv_dest = FolderId::from_bytes([0xF0, 9, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
@@ -26397,12 +26457,14 @@ async fn hardened_retry_legacy_and_recent_eviction_seams(
     let mv_lock_child = FolderId::from_bytes([0xF0, 9, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3]);
     let mv_enc_parent = FolderId::from_bytes([0xF0, 9, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4]);
     let mv_skill_parent = FolderId::from_bytes([0xF0, 9, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5]);
+    let mv_ok_parent = FolderId::from_bytes([0xF0, 9, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6]);
     for (fid, parent, slug) in [
         (&mv_dest, s2_p1.folder_id.clone(), "mv-dest"),
         (&mv_lock_parent, s2_p1.folder_id.clone(), "mv-lock-parent"),
         (&mv_lock_child, mv_lock_parent.clone(), "mv-lock-child"),
         (&mv_enc_parent, s2_p1.folder_id.clone(), "mv-enc-parent"),
         (&mv_skill_parent, s2_p1.folder_id.clone(), "mv-skill-parent"),
+        (&mv_ok_parent, s2_p1.folder_id.clone(), "mv-ok-parent"),
     ] {
         fixture
             .canonical
@@ -26488,7 +26550,33 @@ async fn hardened_retry_legacy_and_recent_eviction_seams(
         )
         .await
         .unwrap();
-    // 1. Moving an unlocked parent of a write_locked child must fail SpaceReadOnly.
+    fixture
+        .canonical
+        .create_note(
+            s2_sc.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: s2.history.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([
+                        0xF0, 9, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xF9; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: CreateNote {
+                    folder_page: false,
+                    note: NoteId::from_bytes([0xF0, 9, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4]),
+                    parent: Some(mv_ok_parent.clone()),
+                    slug: "unlocked-doc".into(),
+                    class: DocClass::UserDoc,
+                    carrier: "---\ntitle: Unlocked Doc\n---\n# Unlocked\n".into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    // 1. Moving or renaming an unlocked parent of a write_locked child (or its project) fails SpaceReadOnly.
     let lock_mv = fixture
         .canonical
         .move_folder(
@@ -26504,7 +26592,7 @@ async fn hardened_retry_legacy_and_recent_eviction_seams(
                 },
                 preconditions: Preconditions::default(),
                 input: MoveFolder {
-                    folder: mv_lock_parent,
+                    folder: mv_lock_parent.clone(),
                     new_parent: Some(mv_dest.clone()),
                 },
             },
@@ -26514,7 +26602,61 @@ async fn hardened_retry_legacy_and_recent_eviction_seams(
         matches!(lock_mv, Err(PortError::Domain(DomainError::SpaceReadOnly))),
         "moving parent of write_locked descendant must fail SpaceReadOnly, got {lock_mv:?}"
     );
-    // 2. AgentRun (no EncryptedNote write class) moving folder containing EncryptedNote fails SpaceReadOnly.
+    let lock_ren = fixture
+        .canonical
+        .rename_folder(
+            s2_sc.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: s2.history.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([
+                        0xF0, 9, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xF8; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: RenameFolder {
+                    folder: mv_lock_parent,
+                    name: "mv-lock-parent-renamed".into(),
+                },
+            },
+        )
+        .await;
+    assert!(
+        matches!(lock_ren, Err(PortError::Domain(DomainError::SpaceReadOnly))),
+        "renaming parent of write_locked descendant must fail SpaceReadOnly, got {lock_ren:?}"
+    );
+    let lock_proj_ren = fixture
+        .canonical
+        .rename_project(
+            s2_sc.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: s2.history.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([
+                        0xF0, 9, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xF7; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: RenameProject {
+                    folder: s2_p1.folder_id.clone(),
+                    name: "s2-p1-renamed".into(),
+                    display_name: None,
+                },
+            },
+        )
+        .await;
+    assert!(
+        matches!(
+            lock_proj_ren,
+            Err(PortError::Domain(DomainError::SpaceReadOnly))
+        ),
+        "renaming project containing write_locked descendant must fail SpaceReadOnly, got {lock_proj_ren:?}"
+    );
+    // 2. AgentRun (no EncryptedNote write class) moving or renaming folder containing EncryptedNote fails SpaceReadOnly.
     let mut s2_agent_grants = owner.auth().spaces().clone();
     if let Some(g) = s2_agent_grants.get_mut(&s2.history.space_id) {
         g.read_classes.remove(&DocClass::EncryptedNote);
@@ -26545,7 +26687,7 @@ async fn hardened_retry_legacy_and_recent_eviction_seams(
                 },
                 preconditions: Preconditions::default(),
                 input: MoveFolder {
-                    folder: mv_enc_parent,
+                    folder: mv_enc_parent.clone(),
                     new_parent: Some(mv_dest.clone()),
                 },
             },
@@ -26555,11 +26697,36 @@ async fn hardened_retry_legacy_and_recent_eviction_seams(
         matches!(enc_mv, Err(PortError::Domain(DomainError::SpaceReadOnly))),
         "AgentRun moving folder containing EncryptedNote must fail SpaceReadOnly, got {enc_mv:?}"
     );
-    // 3. AgentRun (no AbilityWrite) moving folder containing Skill note within SAME project fails.
+    let enc_ren = fixture
+        .canonical
+        .rename_folder(
+            s2_agent_sc.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: s2.history.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([
+                        0xF0, 9, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xF6; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: RenameFolder {
+                    folder: mv_enc_parent,
+                    name: "mv-enc-parent-renamed".into(),
+                },
+            },
+        )
+        .await;
+    assert!(
+        matches!(enc_ren, Err(PortError::Domain(DomainError::SpaceReadOnly))),
+        "AgentRun renaming folder containing EncryptedNote must fail SpaceReadOnly, got {enc_ren:?}"
+    );
+    // 3. AgentRun (no AbilityWrite) moving or renaming folder containing Skill note fails AbilityWriteForbidden.
     let skill_mv = fixture
         .canonical
         .move_folder(
-            s2_agent_sc,
+            s2_agent_sc.clone(),
             Mutation {
                 identity: CommandIdentity {
                     scope: s2.history.clone(),
@@ -26571,8 +26738,8 @@ async fn hardened_retry_legacy_and_recent_eviction_seams(
                 },
                 preconditions: Preconditions::default(),
                 input: MoveFolder {
-                    folder: mv_skill_parent,
-                    new_parent: Some(mv_dest),
+                    folder: mv_skill_parent.clone(),
+                    new_parent: Some(mv_dest.clone()),
                 },
             },
         )
@@ -26580,12 +26747,83 @@ async fn hardened_retry_legacy_and_recent_eviction_seams(
     assert!(
         matches!(
             skill_mv,
-            Err(PortError::Domain(
-                DomainError::AbilityWriteForbidden | DomainError::SpaceReadOnly
-            ))
+            Err(PortError::Domain(DomainError::AbilityWriteForbidden))
         ),
-        "AgentRun moving folder containing Skill note within same project must fail, got {skill_mv:?}"
+        "AgentRun moving folder containing Skill note within same project must fail AbilityWriteForbidden, got {skill_mv:?}"
     );
+    let skill_ren = fixture
+        .canonical
+        .rename_folder(
+            s2_agent_sc.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: s2.history.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([
+                        0xF0, 9, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xF5; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: RenameFolder {
+                    folder: mv_skill_parent,
+                    name: "mv-skill-parent-renamed".into(),
+                },
+            },
+        )
+        .await;
+    assert!(
+        matches!(
+            skill_ren,
+            Err(PortError::Domain(DomainError::AbilityWriteForbidden))
+        ),
+        "AgentRun renaming folder containing Skill note must fail AbilityWriteForbidden, got {skill_ren:?}"
+    );
+    // 4. Positive control: AgentRun moving and renaming an unlocked UserDoc-only folder succeeds.
+    fixture
+        .canonical
+        .move_folder(
+            s2_agent_sc.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: s2.history.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([
+                        0xF0, 9, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xF4; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: MoveFolder {
+                    folder: mv_ok_parent.clone(),
+                    new_parent: Some(mv_dest),
+                },
+            },
+        )
+        .await
+        .expect("AgentRun moving unlocked UserDoc-only folder must succeed");
+    fixture
+        .canonical
+        .rename_folder(
+            s2_agent_sc,
+            Mutation {
+                identity: CommandIdentity {
+                    scope: s2.history.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([
+                        0xF0, 9, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xF3; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: RenameFolder {
+                    folder: mv_ok_parent,
+                    name: "mv-ok-parent-renamed".into(),
+                },
+            },
+        )
+        .await
+        .expect("AgentRun renaming unlocked UserDoc-only folder must succeed");
 }
 
 #[allow(clippy::too_many_arguments)]

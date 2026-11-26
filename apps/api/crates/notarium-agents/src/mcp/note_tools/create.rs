@@ -225,14 +225,19 @@ fn validate_draft_syntax(draft: &NoteDraft, folder_page: bool) -> Result<bool, P
         return Err(invalid(ValidationReason::InvalidPathComponent));
     }
     let title = draft_title(draft)?;
-    if !folder_page && let Some(raw) = &draft.file_name {
-        let name = raw.trim();
-        let name = name
-            .get(..name.len().saturating_sub(3))
-            .filter(|_| name.to_ascii_lowercase().ends_with(".md"))
-            .unwrap_or(name);
-        validate_component(name)?;
-        if lookup_key(name) == "index" {
+    if !folder_page {
+        let slug = if let Some(raw) = &draft.file_name {
+            let name = raw.trim();
+            let name = name
+                .get(..name.len().saturating_sub(3))
+                .filter(|_| name.to_ascii_lowercase().ends_with(".md"))
+                .unwrap_or(name);
+            validate_component(name)?;
+            name.to_owned()
+        } else {
+            generated_slug(&title, &NoteId::from_bytes([1; 16]))
+        };
+        if lookup_key(&slug) == "index" {
             return Err(invalid(ValidationReason::InvalidPathComponent));
         }
     }

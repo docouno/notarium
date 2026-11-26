@@ -1751,12 +1751,12 @@ impl CanonicalStore {
                         let nbr_rank_rev = new_revision_id()?;
                         let existing_ov = overlays.get(nbr_id);
                         let (pl_rev, pl_actor, pl_run) = match existing_ov {
-                            Some(ov) => (
+                            Some(ov) if ov.group == input.group => (
                                 ov.placement_revision.clone(),
                                 ov.placement_actor_id.clone(),
                                 ov.placement_run_id.clone(),
                             ),
-                            None => (nbr_rank_rev.clone(), auth.principal().clone(), None),
+                            _ => (nbr_rank_rev.clone(), auth.principal().clone(), None),
                         };
                         upsert_overlay_and_rank_revision_tx(
                             tx,
@@ -1814,9 +1814,15 @@ impl CanonicalStore {
                     let target_rank_rev = new_revision_id()?;
                     let target_placement_rev = new_revision_id()?;
                     let prior_target_ov = overlays.remove(&input.note);
-                    let before_placement_rev = prior_target_ov
-                        .as_ref()
-                        .map(|o| o.placement_revision.clone());
+                    let before_placement_rev = match facts_cl.before_placement() {
+                        notarium_core::ports::SemanticPlacement::InGroup { group, .. } => {
+                            prior_target_ov
+                                .as_ref()
+                                .filter(|o| &o.group == group)
+                                .map(|o| o.placement_revision.clone())
+                        }
+                        notarium_core::ports::SemanticPlacement::OutsideView => None,
+                    };
 
                     upsert_overlay_and_rank_revision_tx(
                         tx,

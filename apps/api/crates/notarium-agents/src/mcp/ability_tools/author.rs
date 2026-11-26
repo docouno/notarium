@@ -1028,6 +1028,17 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
                     folder_ensured = saved.created();
                     saved.folder()
                 } else if trashed_replay {
+                    if call
+                        .lookup_journal_with_key::<bool>(
+                            "edit-ability-promote-folder-existed",
+                            &call.request_key,
+                            call.request_hash,
+                        )
+                        .await?
+                        == Some(false)
+                    {
+                        folder_ensured = true;
+                    }
                     let scope = call.space(plan.scope.clone())?;
                     if let Some(found) = call
                         .registry

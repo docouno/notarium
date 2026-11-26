@@ -1,9 +1,9 @@
 WITH RECURSIVE moved_folders(folder_id) AS (
     SELECT folder_id FROM folder_heads WHERE space_id = $1 AND folder_id = $2
     UNION
-    SELECT child.folder_id FROM folder_heads AS child
-    JOIN moved_folders AS moved ON child.parent_folder_id = moved.folder_id
-    WHERE child.space_id = $1
+    SELECT child.folder_id FROM moved_folders AS moved
+    CROSS JOIN folder_heads AS child
+    WHERE child.space_id = $1 AND child.parent_folder_id = moved.folder_id
 ),
 moved_names(slug_fold) AS (
     SELECT DISTINCT package.slug_fold FROM ability_packages AS package
