@@ -976,13 +976,26 @@ async fn live_room_keeps_the_filename_until_its_pin_is_released() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_room_and_disk_edits_converge_on_the_same_file() {
+    room_and_disk_edits(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn saving_before_room_merge_publication_preserves_both_versions_after_restart() {
+    room_and_disk_edits(true).await;
+}
+
+async fn room_and_disk_edits(save_before_publication: bool) {
     use notarium_canonical::{OpenCollabSession, RoomCommandSettlement};
     use notarium_core::ports::{
         FilenamePin, InterceptedMutation, InterceptedOutcome, InterceptedPayload,
         InterceptionResult, LiveCollabInterceptor, PortFuture, RollbackReservation,
     };
 
-    struct Room(CanonicalStore, RoomCommandSettlement);
+    struct Room {
+        store: CanonicalStore,
+        settlement: RoomCommandSettlement,
+        late_save: Option<(PathBuf, String)>,
+    }
     impl LiveCollabInterceptor for Room {
         fn filename_pin(&self, _ctx: SpaceContext, _note: NoteId) -> PortFuture<'_, FilenamePin> {
             Box::pin(async { Ok(FilenamePin::Unpinned) })
@@ -998,17 +1011,23 @@ async fn live_room_and_disk_edits_converge_on_the_same_file() {
                 else {
                     panic!("the fixture only settles an external edit");
                 };
+                assert_eq!(observation.base_revision, self.settlement.expected_base_rev);
                 let result = self
-                    .0
+                    .store
                     .commit_intercepted_external_observation(
                         request.context,
                         request.identity,
                         request.preconditions,
                         observation,
-                        self.1.clone(),
+                        self.settlement.clone(),
                         vault_commit,
                     )
                     .await?;
+                // Model an editor save after the writer commits but before
+                // the vault can attempt to publish the merged carrier.
+                if let Some((file, text)) = &self.late_save {
+                    fs::write(file, text).unwrap();
+                }
                 Ok(InterceptionResult::Applied(Box::new(
                     InterceptedOutcome::ExternalObservation(result),
                 )))
@@ -1065,9 +1084,10 @@ async fn live_room_and_disk_edits_converge_on_the_same_file() {
     fs::write(&file, &disk_edit).unwrap();
     let merged = "---\nstatus: room edit\n---\n# Start\n\nDisk edit.\n";
     let expected = carrier::materialize(merged, DocClass::UserDoc, &note).unwrap();
-    let room = Arc::new(Room(
-        fixture.store.clone(),
-        RoomCommandSettlement {
+    let late_edit = disk_edit.replace("Disk edit.", "Later disk edit.");
+    let room = Arc::new(Room {
+        store: fixture.store.clone(),
+        settlement: RoomCommandSettlement {
             owner_id: active.owner_id.unwrap(),
             expected_lease: active.lease_epoch,
             expected_lineage: active.lineage_epoch,
@@ -1076,20 +1096,43 @@ async fn live_room_and_disk_edits_converge_on_the_same_file() {
             yrs_snapshot: b"vault checkpoint".to_vec(),
             compacted_through_update_seq: None,
         },
-    ));
+        late_save: save_before_publication.then(|| (file.clone(), late_edit.clone())),
+    });
     fixture
         .store
         .register_collab_interceptor(room.clone())
         .unwrap();
     let worker = fixture.start_with_collaboration(Some(room));
-    let state = ready(&mut worker.status(), |_| {
-        fs::read_to_string(&file).is_ok_and(|text| text == expected)
-    })
-    .await;
-    assert!(state.conflicts.is_empty());
+    if save_before_publication {
+        let diverged = |state: &VaultStatus| {
+            state.conflicts.iter().any(|issue| {
+                issue.path == "merged.md"
+                    && issue.reason == notarium_vault::ConflictReason::CanonicalDiverged
+            })
+        };
+        ready(&mut worker.status(), diverged).await;
+        worker.shutdown().await.unwrap();
+        let restarted = fixture.start();
+        ready(&mut restarted.status(), diverged).await;
+        assert_eq!(fs::read_to_string(&file).unwrap(), late_edit);
+        restarted.shutdown().await.unwrap();
+    } else {
+        let state = ready(&mut worker.status(), |_| {
+            fs::read_to_string(&file).is_ok_and(|text| text == expected)
+        })
+        .await;
+        assert!(state.conflicts.is_empty());
+        worker.shutdown().await.unwrap();
+    }
+    let canonical = fixture
+        .store
+        .read_vault_note(&ctx, &note)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(canonical.carrier, merged);
     assert_eq!(disk_id(&file), Some(note));
     assert_eq!(fs::read_dir(&fixture.root).unwrap().count(), 1);
-    worker.shutdown().await.unwrap();
     fixture.runtime.shutdown().await.unwrap();
 }
 

@@ -5629,8 +5629,14 @@ fn build_observation_intent(
                 }
 
                 if let Some((binding, mut observation)) = accepted_vault {
-                    observation.revision = new_rev.clone();
-                    observation.carrier_digest = digest;
+                    // A merged carrier that has not reached disk cannot be
+                    // the base of the next edit, move, or removal. Keep the
+                    // previous base and use the fresh file stamp for the
+                    // conditional publication of the merge.
+                    if digest == obs_input.observed_digest {
+                        observation.revision = new_rev.clone();
+                        observation.carrier_digest = digest;
+                    }
                     upsert_observation_tx(tx, &binding, &observation).await?;
                 }
                 let current_schema = load_current_space_schema_tx(tx, &scope_cl.space_id).await?;

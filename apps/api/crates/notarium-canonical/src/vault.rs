@@ -65,6 +65,8 @@ pub struct VaultPath {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct VaultObservation {
     pub note: NoteId,
+    /// Last canonical base known to the file. A pending room merge can leave
+    /// this at the prior revision while `file` records the accepted disk edit.
     pub revision: RevisionId,
     pub path: VaultPath,
     pub file: VaultFileStamp,

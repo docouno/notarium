@@ -1439,7 +1439,7 @@ async fn check_vault_observation_on_live_room(
 
     room.accept(
         &active,
-        observation.revision,
+        observation.revision.clone(),
         merged,
         b"vault checkpoint".to_vec(),
         None,
@@ -1471,11 +1471,11 @@ async fn check_vault_observation_on_live_room(
         .unwrap()
         .unwrap();
     assert_eq!(durable.file, observed);
-    assert_eq!(durable.revision, applied.value.revision);
-    assert_eq!(
-        durable.carrier_digest,
-        notarium_syntax::content_digest(merged)
-    );
+    assert_eq!(durable.revision, observation.revision);
+    assert_eq!(durable.carrier_digest, digest);
+    let current = store.read_vault_note(ctx, &note).await.unwrap().unwrap();
+    assert_eq!(current.note.revision, applied.value.revision);
+    assert_eq!(current.carrier, merged);
 }
 
 #[tokio::test]
