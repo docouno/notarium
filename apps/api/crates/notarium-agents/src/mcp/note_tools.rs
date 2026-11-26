@@ -115,7 +115,7 @@ pub(super) async fn observe_note(
     })
 }
 
-pub(super) fn authorize_note_write(
+pub(in crate::mcp) fn authorize_note_write(
     scope: &SpaceContext,
     facts: &ResourceFacts,
 ) -> Result<(), PortError> {

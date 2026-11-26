@@ -145,7 +145,7 @@ pub(super) async fn find_cover_folders(
     space_id: &notarium_core::ids::SpaceId,
     note: &NoteId,
 ) -> Result<Vec<FolderId>, PortError> {
-    let select = "SELECT folder_id FROM folder_heads WHERE space_id=$1 AND cover_note_id=$2 ORDER BY folder_id";
+    let select = "SELECT folder_id FROM folder_heads WHERE space_id=$1 AND cover_note_id=$2";
     let folders: Vec<String> = match tx {
         BackendConn::Sqlite(conn) => {
             sqlx::query_scalar(select)
@@ -163,10 +163,12 @@ pub(super) async fn find_cover_folders(
         }
     }
     .map_err(|err| internal_not_committed("find_purged_folder_cover", err.to_string()))?;
-    folders
+    let mut parsed: Vec<FolderId> = folders
         .into_iter()
         .map(|folder| FolderId::parse(&folder).map_err(Into::into))
-        .collect()
+        .collect::<Result<_, PortError>>()?;
+    parsed.sort();
+    Ok(parsed)
 }
 
 #[allow(clippy::too_many_arguments)]

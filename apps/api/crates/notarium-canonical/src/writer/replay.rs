@@ -28,6 +28,7 @@ pub(crate) enum ReplayResource {
     Create(NoteId, Option<FolderId>, DocClass),
     Move(NoteId, Option<FolderId>),
     WriteFolder(Option<FolderId>),
+    WriteFolderSubtree(FolderId),
     ReadLinkFolder(FolderId, NoteId),
 }
 
@@ -371,6 +372,32 @@ async fn authorize_resource(
                 }
             }
             return Ok(auth.authorize_direct_write(&facts, &facts)?);
+        }
+        ReplayResource::WriteFolderSubtree(folder) => {
+            let (facts, ancestry) = build_resource_facts_tx(
+                tx,
+                &srec.space,
+                folder,
+                folder_mutation_class(auth, &srec.space.id)?,
+                None,
+                false,
+            )
+            .await?;
+            for anc in &ancestry.ancestors {
+                let row = crate::runtime::load_folder_head_row(tx, &srec.space.id, anc).await?;
+                if row.lifecycle == notarium_core::model::Lifecycle::Purged {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+            }
+            auth.authorize_direct_write(&facts, &facts)?;
+            return crate::domain::folders::authorize_folder_subtree_tx(
+                tx,
+                &srec.space.id,
+                folder,
+                auth,
+                true,
+            )
+            .await;
         }
         ReplayResource::ReadLinkFolder(folder, source) => {
             let head =

@@ -323,6 +323,16 @@ pub(in super::super) async fn resolve_target(
         .link_parts())
 }
 
+pub(super) fn validate_single_link(source: &NoteId, edge: &LinkArgs) -> Result<(), PortError> {
+    validate_link_args(edge)?;
+    if let Some(to) = edge.to.as_deref()
+        && NoteId::parse(to)? == *source
+    {
+        return Err(invalid(ValidationReason::InvalidQuery));
+    }
+    Ok(())
+}
+
 /// Normalize a link without writing. Confirmation can request a source revision
 /// even when the live batch execution normally uses the canonical implicit base.
 pub(in super::super) async fn plan_link(
@@ -332,6 +342,7 @@ pub(in super::super) async fn plan_link(
     edge: &LinkArgs,
     observe_revision: bool,
 ) -> Result<LinkPlan, PortError> {
+    validate_single_link(&source, edge)?;
     let (scope, note) = if let Some(pin) = call.auth.pinned_write_space() {
         let scope = super::super::session::space(call, pin).await?;
         let note = corpus::note_in_space_preflight(call, &scope, &source).await?;
@@ -351,10 +362,9 @@ async fn plan_link_located(
     observe_revision: bool,
 ) -> Result<LinkPlan, PortError> {
     let source = note.reference.note_id.clone();
+    validate_single_link(&source, edge)?;
     corpus::admit_note_write(call, &scope, &note).await?;
-    scope
-        .auth()
-        .authorize_direct_write(&note.facts, &note.facts)?;
+    super::super::note_tools::authorize_note_write(&scope, &note.facts)?;
     let target = resolve(
         call,
         provider,
@@ -444,6 +454,9 @@ async fn authorize_trashed_replay_source(
     observed.metadata.listing(scope.auth())?;
     corpus::admit_note_metadata_write(call, scope, &observed.metadata).await?;
     let class = observed.metadata.class();
+    if class == DocClass::Skill {
+        return Err(DomainError::AbilityWriteForbidden.into());
+    }
     let grant = scope
         .auth()
         .spaces()
@@ -468,9 +481,7 @@ async fn authorize(
     let source_class = match corpus::note_in_space_preflight(call, scope, &plan.source).await {
         Ok(source) => {
             corpus::admit_note_write(call, scope, &source).await?;
-            scope
-                .auth()
-                .authorize_direct_write(&source.facts, &source.facts)?;
+            super::super::note_tools::authorize_note_write(scope, &source.facts)?;
             source.facts.class
         }
         Err(PortError::Domain(DomainError::ResourceNotFound)) if allow_trashed_replay => {

@@ -181,7 +181,7 @@ impl ControlService {
                         execute!(
                             tx.inner_mut(),
                             "UPDATE oauth_refresh_families SET revoked_at=$1,reason_code='expired' WHERE family_id=$2 AND revoked_at IS NULL AND NOT EXISTS(SELECT 1 FROM oauth_refresh_tokens t WHERE t.family_id=$2)",
-                            "UPDATE v1_control.oauth_refresh_families SET revoked_at=$1,reason_code='expired' WHERE family_id=$2 AND revoked_at IS NULL AND NOT EXISTS(SELECT 1 FROM v1_control.oauth_refresh_tokens t WHERE t.family_id=$2)";
+                            "UPDATE v1_control.oauth_refresh_families SET revoked_at=$1,reason_code='expired' WHERE family_id IN (SELECT f.family_id FROM v1_control.oauth_refresh_families f WHERE f.family_id=$2 AND f.revoked_at IS NULL AND NOT EXISTS(SELECT 1 FROM v1_control.oauth_refresh_tokens t WHERE t.family_id=f.family_id) FOR UPDATE OF f SKIP LOCKED)";
                             cutoff_7d, &fid
                         )?;
                     }

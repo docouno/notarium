@@ -31,9 +31,11 @@ queue, and per-operation `SET LOCAL statement_timeout` and
 reject unknown migration versions. Both dialects preserve the baseline
 migration `0001` and add bearer, schedule, and lookup index authority
 (`schedule_expired_run` on `agent_schedule_runs(expires_at, run_id)`,
-`call_run` on `provider_call_log(run_id, call_id)`, and
+`call_run` on `provider_call_log(run_id, call_id)`,
 `ability_trail_destination` on
-`ability_placement_trail(destination_placement, destination_id)`) in migration
+`ability_placement_trail(destination_placement, destination_id)`, and
+`ability_preference_placement` on
+`ability_preferences(placement, ability_id, owner_id)`) in migration
 `0002`. Existing bearers default to no ability-authoring opt-in. Existing
 schedules with unverified skill approvals require explicit review before a
 provider call.

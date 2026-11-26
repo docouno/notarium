@@ -26712,7 +26712,7 @@ async fn hardened_retry_legacy_and_recent_eviction_seams(
                 },
                 preconditions: Preconditions::default(),
                 input: RenameFolder {
-                    folder: mv_enc_parent,
+                    folder: mv_enc_parent.clone(),
                     name: "mv-enc-parent-renamed".into(),
                 },
             },
@@ -26766,7 +26766,7 @@ async fn hardened_retry_legacy_and_recent_eviction_seams(
                 },
                 preconditions: Preconditions::default(),
                 input: RenameFolder {
-                    folder: mv_skill_parent,
+                    folder: mv_skill_parent.clone(),
                     name: "mv-skill-parent-renamed".into(),
                 },
             },
@@ -26779,7 +26779,8 @@ async fn hardened_retry_legacy_and_recent_eviction_seams(
         ),
         "AgentRun renaming folder containing Skill note must fail AbilityWriteForbidden, got {skill_ren:?}"
     );
-    // 4. Positive control: AgentRun moving and renaming an unlocked UserDoc-only folder succeeds.
+    // 4. Positive control: AgentRun moving and renaming an unlocked UserDoc-only folder succeeds,
+    //    and WriteFolderSubtree replay rejects replaying that rename once a descendant lock appears.
     fixture
         .canonical
         .move_folder(
@@ -26802,28 +26803,257 @@ async fn hardened_retry_legacy_and_recent_eviction_seams(
         )
         .await
         .expect("AgentRun moving unlocked UserDoc-only folder must succeed");
+    let ok_rename_cmd = Mutation {
+        identity: CommandIdentity {
+            scope: s2.history.clone(),
+            actor: actor.clone(),
+            key: CommandKey::from_bytes([0xF0, 9, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]),
+            hash: ContentDigest::from_bytes([0xF3; 32]),
+        },
+        preconditions: Preconditions::default(),
+        input: RenameFolder {
+            folder: mv_ok_parent.clone(),
+            name: "mv-ok-parent-renamed".into(),
+        },
+    };
     fixture
         .canonical
-        .rename_folder(
-            s2_agent_sc,
+        .rename_folder(s2_agent_sc.clone(), ok_rename_cmd.clone())
+        .await
+        .expect("AgentRun renaming unlocked UserDoc-only folder must succeed");
+    let mv_ok_child = FolderId::from_bytes([0xF0, 9, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3]);
+    fixture
+        .canonical
+        .create_folder(CreateFolderSpec {
+            scope: s2.history.clone(),
+            active_epoch: s2_epoch,
+            folder_id: mv_ok_child.clone(),
+            parent: Some(mv_ok_parent.clone()),
+            slug: "mv-ok-child".into(),
+            display_name: "mv-ok-child".into(),
+            is_project: false,
+            project_slug: None,
+            actor: actor.clone(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+    fixture
+        .canonical
+        .set_folder_write_lock(s2_sc.clone(), mv_ok_child.clone(), true)
+        .await
+        .unwrap();
+    let replay_after_lock = fixture
+        .canonical
+        .rename_folder(s2_agent_sc.clone(), ok_rename_cmd)
+        .await;
+    assert!(
+        matches!(
+            replay_after_lock,
+            Err(PortError::Domain(DomainError::SpaceReadOnly))
+        ),
+        "replaying rename_folder after descendant write lock must fail SpaceReadOnly, got {replay_after_lock:?}"
+    );
+    // 5. set_folder_write_lock enforces strict-ancestor lock and subtree class/ability authority.
+    let lock_under_locked_parent = fixture
+        .canonical
+        .set_folder_write_lock(s2_sc.clone(), mv_ok_parent, true)
+        .await;
+    assert!(
+        matches!(
+            lock_under_locked_parent,
+            Err(PortError::Domain(DomainError::SpaceReadOnly))
+        ),
+        "locking folder with write-locked strict descendant must fail SpaceReadOnly, got {lock_under_locked_parent:?}"
+    );
+    fixture
+        .canonical
+        .set_folder_write_lock(s2_sc.clone(), mv_ok_child, false)
+        .await
+        .expect("unlocking locked leaf with unlocked strict ancestors/descendants must succeed");
+    let agent_lock_enc = fixture
+        .canonical
+        .set_folder_write_lock(s2_agent_sc.clone(), mv_enc_parent, true)
+        .await;
+    assert!(
+        matches!(
+            agent_lock_enc,
+            Err(PortError::Domain(DomainError::SpaceReadOnly))
+        ),
+        "AgentRun without EncryptedNote write class must not lock folder containing EncryptedNote, got {agent_lock_enc:?}"
+    );
+    let agent_lock_skill = fixture
+        .canonical
+        .set_folder_write_lock(s2_agent_sc, mv_skill_parent, true)
+        .await;
+    assert!(
+        matches!(
+            agent_lock_skill,
+            Err(PortError::Domain(DomainError::AbilityWriteForbidden))
+        ),
+        "AgentRun without AbilityWrite must not lock folder containing Skill note, got {agent_lock_skill:?}"
+    );
+    // 6. Pre-lookup validation on create_ability ("Index"), link syntax/self-link,
+    //    link rejection on published ability entrypoints, and rollback duplicate expectations.
+    let index_ability = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xF0, 9, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "create_ability",
+        json!({
+            "kind": "skill",
+            "name": "Index",
+            "description": "reserved slug",
+            "instructions": "should fail before folder creation",
+            "placement": { "home": "personal" }
+        }),
+    )
+    .await;
+    assert!(
+        matches!(
+            index_ability,
+            Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
+                if diagnostic.reason == ValidationReason::InvalidPathComponent
+        ),
+        "create_ability with name 'Index' must fail upfront with InvalidPathComponent, got {:?}",
+        index_ability.err()
+    );
+    let missing_note = NoteId::from_bytes([0xF0, 9, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+    for (tag, args) in [
+        (
+            2u8,
+            json!({ "from": missing_note, "relation": "bad:rel", "to": NoteId::from_bytes([0xF0, 9, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3]) }),
+        ),
+        (
+            3u8,
+            json!({ "from": missing_note, "relation": "rel", "to": missing_note }),
+        ),
+    ] {
+        let link_err = call_mcp(
+            &fixture.registry,
+            &owner,
+            [0xF0, 9, 11, tag, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+            "link",
+            args,
+        )
+        .await;
+        assert!(
+            matches!(
+                link_err,
+                Err(PortError::Domain(DomainError::ValidationFailed { .. }))
+            ),
+            "link with invalid relation or self-link must reject ValidationFailed before note lookup, got {:?}",
+            link_err.err()
+        );
+    }
+    let ab_created = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xF0, 9, 11, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "create_ability",
+        json!({
+            "kind": "skill",
+            "name": "link-guard-skill",
+            "description": "guarded ability",
+            "instructions": "must reject direct MCP link",
+            "placement": { "home": "personal" }
+        }),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    let ab_ref = ab_created["ref"].as_str().unwrap().to_owned();
+    let personal_sc = SpaceContext::new(owner.auth().clone(), pscope.clone(), budget()).unwrap();
+    let ab_folder = fixture
+        .canonical
+        .resolve_folder_path(personal_sc.clone(), None, ".abilities".to_owned())
+        .await
+        .unwrap()
+        .expect(".abilities folder must exist in personal space")
+        .reference
+        .folder_id;
+    let ab_entry_note = fixture
+        .canonical
+        .resolve_note_target(personal_sc, Some(ab_folder), "link-guard-skill".to_owned())
+        .await
+        .unwrap()
+        .expect("published ability entrypoint note must exist")
+        .note_id;
+    let link_ability_err = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xF0, 9, 11, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3],
+        "link",
+        json!({ "from": ab_entry_note, "relation": "references", "toTitle": "Some Note" }),
+    )
+    .await;
+    assert!(
+        matches!(
+            link_ability_err,
+            Err(PortError::Domain(DomainError::AbilityWriteForbidden))
+        ),
+        "direct MCP link against published ability entrypoint must fail AbilityWriteForbidden, got {:?}",
+        link_ability_err.err()
+    );
+    let ab_after = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xF0, 9, 11, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4],
+        "get_ability",
+        json!({ "ref": ab_ref }),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    assert_eq!(
+        ab_after["healthy"],
+        json!(true),
+        "rejected MCP link must leave published ability healthy: {ab_after}"
+    );
+    let dup_note = NoteId::from_bytes([0xF0, 9, 11, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    let dup_rev = RevisionId::from_bytes([0xF0, 9, 11, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+    let dup_rb_err = fixture
+        .canonical
+        .rollback_agent_run(
+            s2_sc.clone(),
             Mutation {
                 identity: CommandIdentity {
                     scope: s2.history.clone(),
                     actor: actor.clone(),
                     key: CommandKey::from_bytes([
-                        0xF0, 9, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
+                        0xF0, 9, 11, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3,
                     ]),
-                    hash: ContentDigest::from_bytes([0xF3; 32]),
+                    hash: ContentDigest::from_bytes([0xF2; 32]),
                 },
                 preconditions: Preconditions::default(),
-                input: RenameFolder {
-                    folder: mv_ok_parent,
-                    name: "mv-ok-parent-renamed".into(),
+                input: RollbackAgentRun {
+                    run: AgentRunId::from_bytes([
+                        0xF0, 9, 11, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4,
+                    ]),
+                    expected_run_revision: dup_rev.clone(),
+                    expected_entities: vec![
+                        NoteRevision {
+                            note: dup_note.clone(),
+                            revision: dup_rev.clone(),
+                        },
+                        NoteRevision {
+                            note: dup_note,
+                            revision: dup_rev,
+                        },
+                    ],
+                    associated_board_expectations: Vec::new(),
                 },
             },
         )
-        .await
-        .expect("AgentRun renaming unlocked UserDoc-only folder must succeed");
+        .await;
+    assert!(
+        matches!(
+            dup_rb_err,
+            Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
+                if diagnostic.reason == ValidationReason::InvalidState
+        ),
+        "duplicate expected_entities on nonexistent run must reject InvalidState before lookup, got {dup_rb_err:?}"
+    );
 }
 
 #[allow(clippy::too_many_arguments)]

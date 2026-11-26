@@ -332,9 +332,36 @@ macro_rules! upgrade {
                     .execute(&mut *conn)
                     .await
                     .map_err(|e| internal_not_committed("migration_v9_ability_slot_drop", e.to_string()))?;
+                if stringify!($variant) == "Postgres" {
+                    sqlx::query("DROP INDEX IF EXISTS idx_folder_heads_parent_lifecycle")
+                        .execute(&mut *conn)
+                        .await
+                        .map_err(|e| {
+                            internal_not_committed(
+                                "migration_v9_folder_parent_index_drop",
+                                e.to_string(),
+                            )
+                        })?;
+                    sqlx::query(sqlx::AssertSqlSafe(baseline_statement(
+                        $ddl,
+                        "CREATE INDEX IF NOT EXISTS idx_folder_heads_parent_lifecycle",
+                    )?))
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(|e| {
+                        internal_not_committed(
+                            "migration_v9_folder_parent_index_create",
+                            e.to_string(),
+                        )
+                    })?;
+                }
                 for prefix in [
                     "CREATE INDEX IF NOT EXISTS idx_chat_pending_inputs_consumed",
+                    "CREATE INDEX IF NOT EXISTS idx_chat_threads_active_run",
+                    "CREATE INDEX IF NOT EXISTS idx_chat_threads_keyset",
                     "CREATE INDEX IF NOT EXISTS idx_ability_packages_active_slug",
+                    "CREATE INDEX IF NOT EXISTS idx_ability_packages_keyset",
+                    "CREATE INDEX IF NOT EXISTS idx_note_heads_keyset",
                     "CREATE INDEX IF NOT EXISTS idx_spaces_personal_owner",
                     "CREATE INDEX IF NOT EXISTS idx_folder_heads_active_projects_id",
                     "CREATE INDEX IF NOT EXISTS idx_folder_heads_space_updated",

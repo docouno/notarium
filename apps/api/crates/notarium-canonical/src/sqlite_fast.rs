@@ -4345,6 +4345,37 @@ fn authorize_replay_targets_rusqlite(
                 auth.authorize_direct_write(&facts, &facts)?;
                 continue;
             }
+            ReplayResource::WriteFolderSubtree(folder) => {
+                let (facts, ancestry) = build_resource_facts_rusqlite(
+                    conn,
+                    &srec.space,
+                    folder,
+                    crate::domain::folders::folder_mutation_class(auth, &srec.space.id)?,
+                    None,
+                    false,
+                )?;
+                for anc in &ancestry.ancestors {
+                    let row = load_folder_head_row_rusqlite(conn, &srec.space.id, anc)?;
+                    if row.lifecycle == notarium_core::model::Lifecycle::Purged {
+                        return Err(DomainError::ResourceNotFound.into());
+                    }
+                }
+                auth.authorize_direct_write(&facts, &facts)?;
+                let mut stmt = conn
+                    .prepare_cached(crate::domain::folders::FOLDER_SUBTREE_AUTH_SQL_WITH_ROOT)
+                    .map_err(|err| {
+                        internal_not_committed("sqlite_replay_folder_subtree_auth", err.to_string())
+                    })?;
+                let mask: i64 = stmt
+                    .query_row(params![srec.space.id.as_str(), folder.as_str()], |row| {
+                        row.get(0)
+                    })
+                    .map_err(|err| {
+                        map_interrupt_or_internal(err, "sqlite_replay_folder_subtree_auth")
+                    })?;
+                crate::domain::folders::authorize_folder_subtree_mask(&srec.space.id, auth, mask)?;
+                continue;
+            }
             ReplayResource::ReadLinkFolder(folder, source) => {
                 let head = load_note_head_row_rusqlite(conn, &srec.space.id, source)?;
                 let (facts, ancestry) = build_resource_facts_rusqlite(
@@ -6163,6 +6194,24 @@ impl SqliteSyncItemPlan for RollbackDirectSqliteFastPlan {
         let (run, _) = self.target.parts();
 
         // --- 1. Read-only preconditions & pure validation (zero SQL mutations) ---
+        if let Some(input) = self.target.parts().1 {
+            let mut seen_notes = BTreeSet::new();
+            for entry in &input.expected_entities {
+                if !seen_notes.insert(&entry.note) {
+                    return Err(FastItemExecError::PreWrite(
+                        DomainError::validation(ValidationReason::InvalidState).into(),
+                    ));
+                }
+            }
+            let mut seen_board_targets = BTreeSet::new();
+            for entry in &input.associated_board_expectations {
+                if !seen_board_targets.insert((&entry.view, &entry.note)) {
+                    return Err(FastItemExecError::PreWrite(
+                        DomainError::validation(ValidationReason::InvalidState).into(),
+                    ));
+                }
+            }
+        }
         auth.authorize_space_write(&item_ctx.space)
             .map_err(|err| FastItemExecError::PreWrite(err.into()))?;
         if has_rollback_board_history_rusqlite(conn, &scope_cl.space_id, run)
@@ -6177,7 +6226,7 @@ impl SqliteSyncItemPlan for RollbackDirectSqliteFastPlan {
                 .prepare_cached(
                     "SELECT thread_id, kind, owner_id, project_folder_id
                      FROM chat_threads
-                     WHERE space_id = ?1 AND active_run_id = ?2",
+                     WHERE space_id = ?1 AND active_run_id IS NOT NULL AND active_run_id = ?2",
                 )
                 .map_err(|err| {
                     FastItemExecError::PreWrite(internal_not_committed(
@@ -7514,6 +7563,17 @@ fn verify_run_and_entity_preconditions_note_only_rusqlite(
     require_active_folders: bool,
 ) -> Result<BTreeMap<NoteId, NoteHeadRow>, PortError> {
     let (run, expected) = target.parts();
+    let expected_notes = if let Some(input) = expected {
+        let mut notes = BTreeSet::new();
+        for entry in &input.expected_entities {
+            if !notes.insert(&entry.note) {
+                return Err(DomainError::validation(ValidationReason::InvalidState).into());
+            }
+        }
+        Some(notes)
+    } else {
+        None
+    };
     auth.authorize_space_write(space)?;
     let run_row: Option<(Vec<u8>, String)> = {
         let mut stmt = conn
@@ -7543,18 +7603,6 @@ fn verify_run_and_entity_preconditions_note_only_rusqlite(
 
     let actual_run_rev = RevisionId::parse(&run_rev_raw)
         .map_err(|_| internal_not_committed("corrupt_run_rev", "invalid run_revision"))?;
-
-    let expected_notes = if let Some(input) = expected {
-        let mut notes = BTreeSet::new();
-        for entry in &input.expected_entities {
-            if !notes.insert(&entry.note) {
-                return Err(DomainError::validation(ValidationReason::InvalidState).into());
-            }
-        }
-        Some(notes)
-    } else {
-        None
-    };
 
     let mut touched_set: BTreeSet<NoteId> = BTreeSet::new();
     {

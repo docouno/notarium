@@ -419,6 +419,9 @@ pub(super) async fn create(
     let kind = AbilityKind::from(args.kind);
     let slug = unicode::lookup_key(&args.name);
     unicode::validate_component(&slug)?;
+    if slug == "index" {
+        return Err(invalid(ValidationReason::InvalidPathComponent));
+    }
     if slug.is_empty() || slug.len() > 128 || is_reserved_ability_name(&slug) {
         return Err(invalid(ValidationReason::InvalidQuery));
     }

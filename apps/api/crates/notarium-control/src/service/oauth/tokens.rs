@@ -180,7 +180,7 @@ impl OAuthService {
             let user=user(tx.inner_mut(),&observed_grant.user_id).await.map_err(|_|invalid_grant())?;
             let grant=consent(tx.inner_mut(),&observed_family.grant_id).await?;
             let family=lock_family(tx.inner_mut(),&observed.family_id).await?;
-            let current=rows!(tx.inner_mut(),OauthRefreshTokensRow,fetch_one,"SELECT * FROM oauth_refresh_tokens WHERE token_id=$1","SELECT * FROM v1_control.oauth_refresh_tokens WHERE token_id=$1 FOR UPDATE";id)?;
+            let current=rows!(tx.inner_mut(),OauthRefreshTokensRow,fetch_optional,"SELECT * FROM oauth_refresh_tokens WHERE token_id=$1","SELECT * FROM v1_control.oauth_refresh_tokens WHERE token_id=$1 FOR UPDATE";id)?.ok_or_else(invalid_grant)?;
             proof(&current.token_hash,&hash)?;
             let now=self.control.clock.now_ms()?;
             if current.client_id!=request.client_id || current.family_id!=family.family_id || current.expires_at<=now || current.revoked_at.is_some()

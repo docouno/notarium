@@ -2026,13 +2026,17 @@ fn spool_tables(schema_version: u32) -> impl Iterator<Item = TableSpec> + Clone 
                             "idx_receipt_exception_pointer",
                         ];
                     }
+                    "note_heads" => table.indexes = &table.indexes[..3],
                     "ability_packages" => {
                         table.indexes = &[
                             "uq_ability_packages_active_slug",
                             "idx_ability_packages_entrypoint",
                         ];
                     }
-                    "chat_threads" => table.columns = &table.columns[..18],
+                    "chat_threads" => {
+                        table.columns = &table.columns[..18];
+                        table.indexes = &table.indexes[..1];
+                    }
                     "chat_entries" => table.columns = &table.columns[..20],
                     "chat_pending_inputs" => table.indexes = &table.indexes[..2],
                     _ => {}

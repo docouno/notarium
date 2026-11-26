@@ -47,13 +47,7 @@ pub(in crate::mcp) fn authorize_link_source_owner(
 
 fn validate_single_link_input(input: &LinkInput) -> Result<(), PortError> {
     let source = NoteId::parse(&input.source)?;
-    validate_link_args(&input.edge)?;
-    if let Some(to) = input.edge.to.as_deref()
-        && NoteId::parse(to)? == source
-    {
-        return Err(invalid(ValidationReason::InvalidQuery));
-    }
-    Ok(())
+    super::validate_single_link(&source, &input.edge)
 }
 
 pub(in crate::mcp) fn is_valid_link_item(item: &Value) -> bool {
@@ -171,6 +165,7 @@ pub(in crate::mcp) async fn plan_links(
     for link in links {
         let attempted = async {
             let source = NoteId::parse(&link.source)?;
+            super::validate_single_link(&source, &link.edge)?;
             let collapse = |error: PortError| {
                 if corpus::hidden(&error) {
                     DomainError::ResourceNotFound.into()

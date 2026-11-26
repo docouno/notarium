@@ -383,6 +383,7 @@ BEGIN
                 | (CASE WHEN EXISTS(
                     SELECT 1 FROM chat_threads ct
                     WHERE ct.space_id = p_space_id
+                      AND ct.active_run_id IS NOT NULL
                       AND ct.active_run_id = p_run_id
                 ) THEN 1 ELSE 0 END)
             )::INT4 AS flags,
@@ -618,6 +619,7 @@ BEGIN
             ) OR EXISTS (
                 SELECT 1 FROM chat_threads
                 WHERE space_id = p_space_id
+                  AND active_run_id IS NOT NULL
                   AND active_run_id = p_run_id
             ) THEN 0::BIGINT
             ELSE COALESCE((
@@ -1048,7 +1050,7 @@ BEGIN
                   AND nh.visibility_mask >= 0
             ) = cardinality(p_all_nids)
             AND NOT EXISTS(SELECT 1 FROM command_receipts WHERE space_id = p_space_id AND history_incarnation = p_inc AND actor_id = p_actor_id AND idempotency_key = p_idemp_key)
-            AND NOT EXISTS(SELECT 1 FROM chat_threads WHERE space_id = p_space_id AND active_run_id = p_run_id)
+            AND NOT EXISTS(SELECT 1 FROM chat_threads WHERE space_id = p_space_id AND active_run_id IS NOT NULL AND active_run_id = p_run_id)
             AND NOT EXISTS(SELECT 1 FROM board_move_history WHERE space_id = p_space_id AND agent_run_id = p_run_id)
             AND NOT EXISTS(SELECT 1 FROM board_move_history WHERE space_id = p_space_id AND target_note_id = ANY(p_all_nids))
             AND NOT EXISTS(SELECT 1 FROM revision_purge_fences WHERE space_id = p_space_id AND note_id = ANY(p_all_nids))

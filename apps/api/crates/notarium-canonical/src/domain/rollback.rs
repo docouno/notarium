@@ -6,7 +6,7 @@ use notarium_core::{
     error::{Diagnostic, PortError, ValidationReason},
     ids::{
         AbilityId, AgentRunId, ContentDigest, FolderId, HistoryIncarnation, LeaseEpoch, NoteId,
-        RevisionId, SpaceId, SpaceSeq,
+        PrincipalId, RevisionId, SpaceId, SpaceSeq,
     },
     model::{HistoryScope, Lifecycle, PathTarget},
     ports::{
@@ -193,6 +193,24 @@ struct PlannedTargetRankRestore {
     group: GroupKey,
     rank: String,
     restored_placement_revision: Option<RevisionId>,
+    restored_placement_actor: Option<PrincipalId>,
+    restored_placement_run: Option<AgentRunId>,
+}
+
+fn validate_rollback_expectations_unique(input: &RollbackAgentRun) -> Result<(), PortError> {
+    let mut seen_notes = BTreeSet::new();
+    for entry in &input.expected_entities {
+        if !seen_notes.insert(&entry.note) {
+            return Err(DomainError::validation(ValidationReason::InvalidState).into());
+        }
+    }
+    let mut seen_board_targets = BTreeSet::new();
+    for entry in &input.associated_board_expectations {
+        if !seen_board_targets.insert((&entry.view, &entry.note)) {
+            return Err(DomainError::validation(ValidationReason::InvalidState).into());
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn rollback_fallback_board_present_err() -> PortError {
@@ -255,6 +273,7 @@ pub(crate) async fn rollback_agent_run_impl(
     let deadline = super::common::CommandDeadline::start(&ctx.budget, "rollback").at;
     validate_mutation_identity(&ctx, &request.identity)?;
     crate::domain::common::require_empty_preconditions(&request.preconditions)?;
+    validate_rollback_expectations_unique(&request.input)?;
     let idemp = fingerprint::current(&ctx, &request)?
         .with_policy(ctx.auth(), rollback_policy(&request.input));
 
@@ -954,8 +973,11 @@ pub(crate) fn build_rollback_direct_single_tx_exec(
 ) -> crate::writer::ItemExecuteFn {
     Box::new(move |tx, item_ctx| {
         Box::pin(async move {
-            auth.authorize_space_write(&item_ctx.space)?;
             let (run, expected) = target.parts();
+            if let Some(input) = expected {
+                validate_rollback_expectations_unique(input)?;
+            }
+            auth.authorize_space_write(&item_ctx.space)?;
             ensure_chat_run_not_active_tx(tx, &item_ctx.space, &auth, run).await?;
             let mut folder_cache = FolderAncestryCache::default();
             type RollbackStateProbe = (bool, bool, Option<bool>, bool, Option<(Vec<u8>, String)>);
@@ -1759,7 +1781,8 @@ fn materialize_working_group(
                     if !moved_targets_on_view.contains(&pn)
                         && !stale_prerun_restores.contains_key(&pn)
                     {
-                        neighbor_dirty.insert(pn, (group.clone(), pr, true));
+                        let is_pma = overlays.get(&pn).is_some_and(|o| &o.group == group);
+                        neighbor_dirty.insert(pn, (group.clone(), pr, is_pma));
                     }
                 }
                 items.insert(
@@ -1785,7 +1808,8 @@ fn materialize_working_group(
                     if !moved_targets_on_view.contains(&pn)
                         && !stale_prerun_restores.contains_key(&pn)
                     {
-                        neighbor_dirty.insert(pn, (group.clone(), pr, true));
+                        let is_pma = overlays.get(&pn).is_some_and(|o| &o.group == group);
+                        neighbor_dirty.insert(pn, (group.clone(), pr, is_pma));
                     }
                 }
                 if !moved_targets_on_view.contains(nid) && !stale_prerun_restores.contains_key(nid)
@@ -2198,7 +2222,22 @@ fn build_rollback_execute_fn(
                                 pending_stale_deletes.push(nid);
                             }
                             Some(post_grp) => {
-                                let prerun = if let Some(stale_before) = note_first_run_seq(&nid) {
+                                let mat_seq = if ov.placement_run_id.is_none() {
+                                    run_materialized_overlay_seq_tx(
+                                        tx,
+                                        &scope_cl.space_id,
+                                        &ov.placement_revision,
+                                        &input.run,
+                                    )
+                                    .await?
+                                } else {
+                                    None
+                                };
+                                let stale_before = match (note_first_run_seq(&nid), mat_seq) {
+                                    (Some(a), Some(b)) => Some(a.min(b)),
+                                    (a, b) => a.or(b),
+                                };
+                                let prerun = if let Some(stale_before) = stale_before {
                                     load_latest_prerun_rank_meta_tx(
                                         tx,
                                         &scope_cl,
@@ -2296,6 +2335,8 @@ fn build_rollback_execute_fn(
                             group: GroupKey,
                             rank: String,
                             placement_revision: Option<RevisionId>,
+                            placement_actor: Option<PrincipalId>,
+                            placement_run: Option<AgentRunId>,
                         },
                     }
 
@@ -2407,8 +2448,11 @@ fn build_rollback_execute_fn(
                                                 } else if !moved_targets_on_view.contains(&pn)
                                                     && !stale_prerun_restores.contains_key(&pn)
                                                 {
+                                                    let is_pma = overlays
+                                                        .get(&pn)
+                                                        .is_some_and(|o| o.group == post_grp);
                                                     neighbor_dirty
-                                                        .insert(pn, (post_grp.clone(), pr, true));
+                                                        .insert(pn, (post_grp.clone(), pr, is_pma));
                                                 }
                                             }
                                             g_items.insert(
@@ -2426,6 +2470,8 @@ fn build_rollback_execute_fn(
                                                 group: post_grp,
                                                 rank: restored_rank,
                                                 placement_revision: Some(meta.placement_revision),
+                                                placement_actor: Some(meta.placement_actor_id),
+                                                placement_run: meta.placement_run_id,
                                             },
                                         );
                                     } else {
@@ -2548,7 +2594,9 @@ fn build_rollback_execute_fn(
                                     } else if !moved_targets_on_view.contains(&pn)
                                         && !stale_prerun_restores.contains_key(&pn)
                                     {
-                                        neighbor_dirty.insert(pn, (group.clone(), pr, true));
+                                        let is_pma =
+                                            overlays.get(&pn).is_some_and(|o| &o.group == group);
+                                        neighbor_dirty.insert(pn, (group.clone(), pr, is_pma));
                                     }
                                 }
                                 g_items.insert(
@@ -2558,12 +2606,38 @@ fn build_rollback_execute_fn(
                                         rank: computed.target_rank.clone(),
                                     },
                                 );
+                                let (placement_actor, placement_run) = if let Some(ref pl_rev) =
+                                    bmh.before_placement_revision
+                                {
+                                    load_latest_prerun_rank_meta_tx(
+                                        tx,
+                                        &scope_cl,
+                                        view,
+                                        target,
+                                        &input.run,
+                                        bmh.command_end_seq,
+                                    )
+                                    .await?
+                                    .filter(|meta| {
+                                        !meta.removed && &meta.placement_revision == pl_rev
+                                    })
+                                    .map_or(
+                                        (None, None),
+                                        |meta| {
+                                            (Some(meta.placement_actor_id), meta.placement_run_id)
+                                        },
+                                    )
+                                } else {
+                                    (None, None)
+                                };
                                 target_final_state.insert(
                                     target.clone(),
                                     TargetSettlement::Replayed {
                                         group: group.clone(),
                                         rank: computed.target_rank,
                                         placement_revision: bmh.before_placement_revision.clone(),
+                                        placement_actor,
+                                        placement_run,
                                     },
                                 );
                             }
@@ -2594,6 +2668,8 @@ fn build_rollback_execute_fn(
                                     group: grp,
                                     rank: rnk,
                                     placement_revision: prev_pl_rev,
+                                    placement_actor: prev_pl_actor,
+                                    placement_run: prev_pl_run,
                                 },
                                 Some(post_grp),
                             ) if grp == post_grp => {
@@ -2603,6 +2679,8 @@ fn build_rollback_execute_fn(
                                     group: grp,
                                     rank: rnk,
                                     restored_placement_revision: prev_pl_rev,
+                                    restored_placement_actor: prev_pl_actor,
+                                    restored_placement_run: prev_pl_run,
                                 });
                             }
                             _ => {
@@ -2638,6 +2716,8 @@ fn build_rollback_execute_fn(
                             group: post_grp.clone(),
                             rank: settled_rank,
                             restored_placement_revision: Some(meta.placement_revision.clone()),
+                            restored_placement_actor: Some(meta.placement_actor_id.clone()),
+                            restored_placement_run: meta.placement_run_id.clone(),
                         });
                     }
 
@@ -3215,6 +3295,10 @@ fn build_rollback_execute_fn(
                     .and_then(|m| m.get(&tr.target_note));
                 owner_notes_for_receipt.insert(tr.view.note.clone());
 
+                let pl_actor = tr
+                    .restored_placement_actor
+                    .as_ref()
+                    .unwrap_or_else(|| auth.principal());
                 upsert_overlay_and_rank_revision_tx(
                     tx,
                     &scope_cl,
@@ -3225,8 +3309,8 @@ fn build_rollback_execute_fn(
                     &trev,
                     existing_ov.map(|o| &o.rank_rev_id),
                     &pl_rev,
-                    auth.principal(),
-                    None,
+                    pl_actor,
+                    tr.restored_placement_run.as_ref(),
                     auth.principal(),
                     None,
                     false,
@@ -3634,7 +3718,7 @@ async fn ensure_chat_run_not_active_tx(
         BackendConn::Sqlite(conn) => sqlx::query_as(
             "SELECT thread_id, kind, owner_id, project_folder_id
              FROM chat_threads
-             WHERE space_id = ? AND active_run_id = ?",
+             WHERE space_id = ? AND active_run_id IS NOT NULL AND active_run_id = ?",
         )
         .bind(space.id.as_str())
         .bind(run.as_str())
@@ -3644,7 +3728,7 @@ async fn ensure_chat_run_not_active_tx(
         BackendConn::Postgres(conn) => sqlx::query_as(
             "SELECT thread_id, kind, owner_id, project_folder_id
              FROM chat_threads
-             WHERE space_id = $1 AND active_run_id = $2",
+             WHERE space_id = $1 AND active_run_id IS NOT NULL AND active_run_id = $2",
         )
         .bind(space.id.as_str())
         .bind(run.as_str())

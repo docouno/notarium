@@ -24,3 +24,4 @@ CREATE INDEX schedule_expired_run ON v1_control.agent_schedule_runs(expires_at,r
     WHERE status IN ('claimed','running');
 CREATE INDEX call_run ON v1_control.provider_call_log(run_id,call_id);
 CREATE INDEX ability_trail_destination ON v1_control.ability_placement_trail(destination_placement,destination_id);
+CREATE INDEX ability_preference_placement ON v1_control.ability_preferences(placement,ability_id,owner_id);

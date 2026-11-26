@@ -161,6 +161,7 @@ pub const CANONICAL_TABLES: &[TableSpec] = &[
             "uq_note_heads_active_sibling",
             "idx_note_heads_parent_lifecycle",
             "idx_note_heads_created_seq",
+            "idx_note_heads_keyset",
         ],
     },
     TableSpec {
@@ -272,6 +273,7 @@ pub const CANONICAL_TABLES: &[TableSpec] = &[
         indexes: &[
             "idx_ability_packages_active_slug",
             "idx_ability_packages_entrypoint",
+            "idx_ability_packages_keyset",
         ],
     },
     TableSpec {
@@ -626,7 +628,11 @@ pub const CANONICAL_TABLES: &[TableSpec] = &[
             col("active_run_generation", Text, true),
             col("redaction_epoch", Int, false),
         ],
-        indexes: &["idx_chat_threads_created_seq"],
+        indexes: &[
+            "idx_chat_threads_created_seq",
+            "idx_chat_threads_keyset",
+            "idx_chat_threads_active_run",
+        ],
     },
     TableSpec {
         name: "chat_entries",

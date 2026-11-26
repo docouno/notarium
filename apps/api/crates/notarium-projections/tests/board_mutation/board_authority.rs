@@ -3236,11 +3236,14 @@ async fn rollback_skipped_replay_and_oracle_views(
         );
     }
     // Case 7D: Stale-group neighbor overlay materialization & rollback restoration/cleanup.
-    // Pre-run: human ranks `u_human` before `u_other` in `status=todo`, while `u_plain` is
-    // unranked in `status=doing`. Agent run changes `group_by` to `priority` and moves `m_agent`
-    // before `u_human` in `priority=p1`, replacing `u_human`'s stale `todo` overlay (non-NULL
-    // `parent_rev_id`) and materializing `u_plain` in `p1`. Rolling back the run must restore
-    // `u_human`'s pre-run `todo` human overlay (keeping `u_human` before `u_other`) and delete
+    // Pre-run: human ranks `u_human` before `u_other` in `status=todo`, prior agent run `prior_run`
+    // ranks `u_prior_run` after `u_human` in `status=todo` (`placement_run_id == Some(prior_run)`),
+    // and `u_plain` is unranked in `status=doing`. Agent run `run7d` changes `group_by` to
+    // `priority` and moves `m_agent` before `u_human` in `priority=p1`, replacing both `u_human`'s
+    // and `u_prior_run`'s stale `todo` overlays (non-NULL `parent_rev_id`, clearing `placement_run_id`
+    // to `None` and minting fresh `placement_revision`) and materializing `u_plain` in `p1`.
+    // Rolling back `run7d` must restore `u_human`'s pre-run human overlay, restore `u_prior_run`'s
+    // `placement_run_id == Some(prior_run)`, reconcile `m_agent` back to `todo`, and delete
     // `u_plain`'s orphaned `p1` overlay.
     let proj7d = folder(store, &owner, None, "rb-stale-nbr-proj", true)
         .await
@@ -3261,6 +3264,14 @@ async fn rollback_skipped_replay_and_oracle_views(
         Some(proj7d.clone()),
         "z-human-ranked",
         "---\ntitle: Z-Human\nstatus: todo\npriority: p1\n---\n".into(),
+    )
+    .await;
+    let u_prior_run = create_note(
+        store,
+        &owner,
+        Some(proj7d.clone()),
+        "p-prior-run-ranked",
+        "---\ntitle: P-PriorRun\nstatus: todo\npriority: p1\n---\n".into(),
     )
     .await;
     let u_other = create_note(
@@ -3313,6 +3324,45 @@ async fn rollback_skipped_replay_and_oracle_views(
         .await
         .unwrap();
     sync(store, runtime, &scope).await;
+    let after_human_7d = store
+        .inspect_view_overlays_for_test(&scope.space_id, &v7d)
+        .await
+        .unwrap();
+    let prior_run = AgentRunId::from_bytes(random_bytes());
+    let prior_agent = super::agent(&owner, prior_run.clone(), ChatAudience::Personal);
+    store
+        .move_board_card(
+            prior_agent.clone(),
+            mutation(
+                &prior_agent,
+                MoveBoardCard {
+                    view: v7d.clone(),
+                    note: u_prior_run.note.clone(),
+                    group: group("todo"),
+                    before: Some(RankNeighbor {
+                        note: u_other.note.clone(),
+                        expected_rank: RankExpectation::Existing(
+                            after_human_7d[&u_other.note].rank_rev_id.clone(),
+                        ),
+                    }),
+                    after: Some(RankNeighbor {
+                        note: u_human.note.clone(),
+                        expected_rank: RankExpectation::Existing(
+                            after_human_7d[&u_human.note].rank_rev_id.clone(),
+                        ),
+                    }),
+                    fields: BTreeMap::new(),
+                    expected_note: u_prior_run.revision.clone(),
+                    expected_view: v7d_rev.revision.clone(),
+                    expected_rank: RankExpectation::Existing(
+                        after_human_7d[&u_prior_run.note].rank_rev_id.clone(),
+                    ),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    sync(store, runtime, &scope).await;
     let pre_overlays_7d = store
         .inspect_view_overlays_for_test(&scope.space_id, &v7d)
         .await
@@ -3321,6 +3371,15 @@ async fn rollback_skipped_replay_and_oracle_views(
         .get(&u_human.note)
         .expect("human move must create pre-run overlay for u_human")
         .clone();
+    let u_prior_run_pre_ov = pre_overlays_7d
+        .get(&u_prior_run.note)
+        .expect("prior_run move must create pre-run overlay for u_prior_run")
+        .clone();
+    assert_eq!(
+        u_prior_run_pre_ov.placement_run_id.as_ref(),
+        Some(&prior_run),
+        "positive control: u_prior_run must carry Some(prior_run) before run7d"
+    );
     let m_agent_pre_ov = pre_overlays_7d
         .get(&m_agent.note)
         .expect("human move in todo must materialize m_agent neighbor overlay")
@@ -3398,19 +3457,33 @@ async fn rollback_skipped_replay_and_oracle_views(
         mid_overlays_7d.get(&u_human.note).map(|o| &o.group),
         Some(&group("p1"))
     );
+    assert_ne!(
+        mid_overlays_7d[&u_human.note].placement_revision, u_human_pre_ov.placement_revision,
+        "replacing stale-group overlay must mint fresh placement_revision for u_human"
+    );
+    assert_eq!(
+        mid_overlays_7d.get(&u_prior_run.note).map(|o| &o.group),
+        Some(&group("p1"))
+    );
+    assert_ne!(
+        mid_overlays_7d[&u_prior_run.note].placement_revision,
+        u_prior_run_pre_ov.placement_revision,
+        "replacing stale-group overlay must mint fresh placement_revision for u_prior_run"
+    );
+    assert!(
+        mid_overlays_7d[&u_prior_run.note]
+            .placement_run_id
+            .is_none(),
+        "neighbor materialization replacing prior_run's stale-group overlay must clear placement_run_id"
+    );
     assert_eq!(
         mid_overlays_7d.get(&u_plain.note).map(|o| &o.group),
         Some(&group("p1"))
     );
-    assert!(
-        mid_overlays_7d
-            .get(&u_human.note)
-            .is_some_and(|o| o.placement_run_id.is_none()),
-        "neighbor materialization replacing stale-group overlay must not inherit placement_run_id"
-    );
 
     // Roll back `run7d`: `v7d` returns to `group_by: status`, `u_human` restores pre-run `todo`
-    // human overlay (staying before `u_other`), and `u_plain`'s orphaned `p1` overlay is deleted.
+    // human overlay, `u_prior_run` restores `Some(prior_run)`, `m_agent` reconciles back to
+    // `todo`, and `u_plain`'s orphaned `p1` overlay is deleted.
     let prep7d = store
         .prepare_agent_run_rollback(owner.clone(), run7d)
         .await
@@ -3432,6 +3505,29 @@ async fn rollback_skipped_replay_and_oracle_views(
         u_human_post_ov.placement_revision, u_human_pre_ov.placement_revision,
         "u_human must restore its original pre-run human placement_revision"
     );
+    assert!(u_human_post_ov.placement_run_id.is_none());
+    let u_prior_run_post_ov = post_overlays_7d
+        .get(&u_prior_run.note)
+        .expect("u_prior_run must retain restored pre-run todo overlay after rollback");
+    assert_eq!(u_prior_run_post_ov.group, group("todo"));
+    assert_eq!(
+        u_prior_run_post_ov.placement_revision, u_prior_run_pre_ov.placement_revision,
+        "u_prior_run must restore its pre-run placement_revision"
+    );
+    assert_eq!(
+        u_prior_run_post_ov.placement_run_id.as_ref(),
+        Some(&prior_run),
+        "u_prior_run must preserve placement_run_id = Some(prior_run) across rollback restoration"
+    );
+    let m_agent_post_ov = post_overlays_7d
+        .get(&m_agent.note)
+        .expect("m_agent must reconcile back to its pre-run todo overlay after rollback");
+    assert_eq!(m_agent_post_ov.group, group("todo"));
+    assert_eq!(
+        m_agent_post_ov.placement_revision,
+        m_agent_pre_ov.placement_revision
+    );
+    assert!(m_agent_post_ov.placement_run_id.is_none());
     assert!(
         !post_overlays_7d.contains_key(&u_plain.note),
         "u_plain orphaned run-materialized p1 overlay must be deleted on rollback"
@@ -3449,13 +3545,17 @@ async fn rollback_skipped_replay_and_oracle_views(
         .iter()
         .position(|id| id == &u_human.note)
         .expect("u_human in todo");
+    let prior_pos = todo_ids_7d
+        .iter()
+        .position(|id| id == &u_prior_run.note)
+        .expect("u_prior_run in todo");
     let other_pos = todo_ids_7d
         .iter()
         .position(|id| id == &u_other.note)
         .expect("u_other in todo");
     assert!(
-        human_pos < other_pos,
-        "u_human must remain ordered before u_other in todo after rollback: {todo_ids_7d:?}"
+        human_pos < prior_pos && prior_pos < other_pos,
+        "todo order must remain [u_human, u_prior_run, u_other] after rollback: {todo_ids_7d:?}"
     );
     let _ = proj7b;
 }

@@ -594,13 +594,18 @@ same example against an isolated prefix.
   Startup reconciles abandoned holds and pending local artifacts.
   The offline `notarium_canonical::backup::decode_postgres_spool_v1_bounded`
   API verifies the trailer and recognizes the exact linear manifests for schemas 1 through 9.
-  Schema version 9 adds `chat_threads.redaction_epoch` for O(1) folded-proof invalidation,
+  Schema version 9 adds `chat_threads.{active_run_epoch, redaction_epoch}` for
+  run fencing and O(1) folded-proof invalidation,
   `chat_entries.{human_origin, body_format, provenance_json}` (with typed `effect_kind`
   inside the structured proposal JSON body), and secondary indexes for personal Space
   lookup (`idx_spaces_personal_owner`), receipt sequence scans
   (`idx_command_receipts_seq`), active project roots
-  (`idx_folder_heads_active_projects_id`), and incremental folder-change scans
-  (`idx_folder_heads_space_updated`).
+  (`idx_folder_heads_active_projects_id`), incremental folder-change scans
+  (`idx_folder_heads_space_updated`), active chat-run lookup
+  (`idx_chat_threads_active_run`), consumed pending chat inputs
+  (`idx_chat_pending_inputs_consumed`), and `COLLATE "C"`-aligned keyset paging
+  (`idx_note_heads_keyset`, `idx_ability_packages_keyset`, `idx_chat_threads_keyset`,
+  plus `COLLATE "C"` on `idx_folder_heads_parent_lifecycle`).
   It returns typed rows in the original table and column order within the
   caller's byte budget. To materialize a historical spool, create an empty
   target with `schema::POSTGRES_BASELINE_DDL`. Match the version and manifest

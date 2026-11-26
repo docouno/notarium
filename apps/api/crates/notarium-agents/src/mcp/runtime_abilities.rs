@@ -52,6 +52,9 @@ pub async fn interactive(
         || current
             .diagnostics
             .contains(&EpisodeDiagnostic::RoleUnavailable)
+        || current
+            .diagnostics
+            .contains(&EpisodeDiagnostic::ProjectUnavailable)
     {
         return Err(DomainError::ResourceNotFound.into());
     }

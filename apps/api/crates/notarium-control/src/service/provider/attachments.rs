@@ -442,11 +442,15 @@ impl ProviderService {
         let fresh_check = prechecked
             .as_ref()
             .map(|(_, target, catalog)| {
-                let activates_shared = !matches!(target, ProviderAttachmentTarget::Personal { .. })
-                    && catalog
+                let activates = match target {
+                    ProviderAttachmentTarget::Personal { .. } => catalog
                         .as_ref()
-                        .is_ok_and(|c| c.space.kind == SpaceKind::Shared);
-                (target.clone(), activates_shared)
+                        .is_ok_and(|c| c.space.kind == SpaceKind::Personal),
+                    _ => catalog
+                        .as_ref()
+                        .is_ok_and(|c| c.space.kind == SpaceKind::Shared),
+                };
+                (target.clone(), activates)
             })
             .map_err(Clone::clone);
         let clock = self.control.clock.clone();

@@ -84,14 +84,14 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_folder_heads_active_project
     WHERE lifecycle_state = 'active' AND is_project = 1 AND project_slug_fold IS NOT NULL;
 
 CREATE INDEX IF NOT EXISTS idx_folder_heads_parent_lifecycle
-    ON folder_heads (space_id, parent_folder_id, lifecycle_state, folder_id);
+    ON folder_heads (space_id, parent_folder_id, lifecycle_state, folder_id COLLATE "C");
 
 CREATE INDEX IF NOT EXISTS idx_folder_heads_cover
     ON folder_heads (space_id, cover_note_id)
     WHERE cover_note_id IS NOT NULL;
 
 CREATE INDEX IF NOT EXISTS idx_folder_heads_active_projects_id
-    ON folder_heads (space_id, folder_id)
+    ON folder_heads (space_id, folder_id COLLATE "C")
     WHERE lifecycle_state = 'active' AND is_project = 1;
 
 CREATE INDEX IF NOT EXISTS idx_folder_heads_space_updated
@@ -155,6 +155,9 @@ CREATE INDEX IF NOT EXISTS idx_note_heads_parent_lifecycle
 
 CREATE INDEX IF NOT EXISTS idx_note_heads_created_seq
     ON note_heads (space_id, created_seq, note_id);
+
+CREATE INDEX IF NOT EXISTS idx_note_heads_keyset
+    ON note_heads (space_id, note_id COLLATE "C", created_seq);
 
 CREATE TABLE IF NOT EXISTS note_aliases (
     space_id TEXT NOT NULL,
@@ -284,6 +287,10 @@ CREATE INDEX IF NOT EXISTS idx_ability_packages_active_slug
 
 CREATE INDEX IF NOT EXISTS idx_ability_packages_entrypoint
     ON ability_packages (space_id, entrypoint_note_id);
+
+CREATE INDEX IF NOT EXISTS idx_ability_packages_keyset
+    ON ability_packages (space_id, ability_id COLLATE "C")
+    WHERE lifecycle_state = 'active';
 
 CREATE TABLE IF NOT EXISTS view_rank_overlays (
     space_id TEXT NOT NULL,
@@ -640,6 +647,13 @@ CREATE TABLE IF NOT EXISTS chat_threads (
 
 CREATE INDEX IF NOT EXISTS idx_chat_threads_created_seq
     ON chat_threads (space_id, created_seq, thread_id);
+
+CREATE INDEX IF NOT EXISTS idx_chat_threads_keyset
+    ON chat_threads (space_id, thread_id COLLATE "C", created_seq);
+
+CREATE INDEX IF NOT EXISTS idx_chat_threads_active_run
+    ON chat_threads (space_id, active_run_id)
+    WHERE active_run_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS chat_entries (
     space_id TEXT NOT NULL,
