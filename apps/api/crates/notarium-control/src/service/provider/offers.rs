@@ -78,13 +78,20 @@ impl ProviderService {
         Ok(catalog)
     }
 
-    async fn offer_access(
+    async fn offer_caller_access(
         &self,
         tx: &mut Transaction,
         ctx: &SpaceContext,
-        project: Option<&FolderRef>,
-        filter: impl Serialize,
-    ) -> Result<ContentDigest, PortError> {
+    ) -> Result<
+        (
+            notarium_core::auth::EngineAuthContext,
+            notarium_core::auth::SpaceGrant,
+            i64,
+            i64,
+            i64,
+        ),
+        PortError,
+    > {
         let (_, owner) = self
             .control
             .scoped_manager_read(tx, ctx.auth(), ctx.auth().principal())
@@ -93,13 +100,9 @@ impl ProviderService {
         let grant = auth
             .spaces()
             .get(&ctx.scope().space_id)
-            .ok_or(DomainError::ResourceNotFound)?;
-        if grant.read_classes.is_empty()
-            || grant
-                .project_root
-                .as_ref()
-                .is_some_and(|root| project.map(|p| &p.folder_id) != Some(root))
-        {
+            .ok_or(DomainError::ResourceNotFound)?
+            .clone();
+        if grant.read_classes.is_empty() {
             return Err(DomainError::ResourceNotFound.into());
         }
         // Revalidation already holds shared membership and Space locks. A
@@ -114,13 +117,32 @@ impl ProviderService {
             ctx.scope().space_id.as_str(), auth.principal().as_str())?
         .ok_or(DomainError::ResourceNotFound)?
         .0;
+        Ok((auth, grant, owner.revision, space.revision, membership))
+    }
+
+    async fn offer_access(
+        &self,
+        tx: &mut Transaction,
+        ctx: &SpaceContext,
+        project: Option<&FolderRef>,
+        filter: impl Serialize,
+    ) -> Result<ContentDigest, PortError> {
+        let (auth, grant, owner_revision, space_revision, membership) =
+            self.offer_caller_access(tx, ctx).await?;
+        if grant
+            .project_root
+            .as_ref()
+            .is_some_and(|root| project.map(|p| &p.folder_id) != Some(root))
+        {
+            return Err(DomainError::ResourceNotFound.into());
+        }
         let bytes = serde_json::to_vec(&(
             "provider-offers-v1",
             auth.principal(),
             auth.grant(),
             ctx.scope(),
-            owner.revision,
-            space.revision,
+            owner_revision,
+            space_revision,
             membership,
             grant.role,
             &grant.read_classes,
@@ -287,50 +309,52 @@ impl ProviderService {
     ) -> Result<ControlPage<ProviderModelInfo>, PortError> {
         let budget = OperationBudget::new(ctx.budget.clone());
         ctx.budget = budget.context(ctx.budget.request.clone());
-        // Revalidate caller membership and confirm the offer is currently
-        // approved and active before checking live canonical history/project.
+        // Revalidate caller authentication, Space admission, and membership
+        // BEFORE querying `provider_attachments` so unauthorized or revoked
+        // callers cannot probe attachment IDs via ResourceNotFound vs AccessDenied.
         let mut pre_tx = self.control.store.read(budget.clone()).await?;
-        let pre_checked = budget
-            .run(
-                async {
-                    let row = rows!(
-                        pre_tx.inner_mut(),
-                        ProviderAttachmentsRow,
-                        fetch_optional,
-                        "SELECT * FROM provider_attachments WHERE id=$1",
-                        "SELECT * FROM v1_control.provider_attachments WHERE id=$1";
-                        offer.as_str()
-                    )?
-                    .ok_or(DomainError::ResourceNotFound)?;
-                    if row.target_space != ctx.scope().space_id.as_str() {
-                        return Err(DomainError::ResourceNotFound.into());
-                    }
-                    let project = match attachment_target(&row)? {
-                        ProviderAttachmentTarget::Space(_) => None,
-                        ProviderAttachmentTarget::Project(project) => Some(project),
-                        ProviderAttachmentTarget::Personal { .. } => {
+        let pre_checked =
+            budget
+                .run(
+                    async {
+                        let (_, grant, _, _, _) =
+                            self.offer_caller_access(pre_tx.inner_mut(), &ctx).await?;
+                        let row = rows!(
+                            pre_tx.inner_mut(),
+                            ProviderAttachmentsRow,
+                            fetch_optional,
+                            "SELECT * FROM provider_attachments WHERE id=$1",
+                            "SELECT * FROM v1_control.provider_attachments WHERE id=$1";
+                            offer.as_str()
+                        )?
+                        .ok_or(DomainError::ResourceNotFound)?;
+                        if row.target_space != ctx.scope().space_id.as_str() {
                             return Err(DomainError::ResourceNotFound.into());
                         }
-                    };
-                    self.offer_access(
-                        pre_tx.inner_mut(),
-                        &ctx,
-                        project.as_ref(),
-                        ("offer-models", &project, &offer),
-                    )
-                    .await?;
-                    if self
-                        .offered_review_without_kind(pre_tx.inner_mut(), &row)
-                        .await?
-                        .is_none()
-                    {
-                        return Err(DomainError::ResourceNotFound.into());
-                    }
-                    Ok::<_, PortError>((row, project))
-                },
-                CommitEffect::NotCommitted,
-            )
-            .await;
+                        let project = match attachment_target(&row)? {
+                            ProviderAttachmentTarget::Space(_) => None,
+                            ProviderAttachmentTarget::Project(project) => Some(project),
+                            ProviderAttachmentTarget::Personal { .. } => {
+                                return Err(DomainError::ResourceNotFound.into());
+                            }
+                        };
+                        if grant.project_root.as_ref().is_some_and(|root| {
+                            project.as_ref().map(|p| &p.folder_id) != Some(root)
+                        }) {
+                            return Err(DomainError::ResourceNotFound.into());
+                        }
+                        if self
+                            .offered_review_without_kind(pre_tx.inner_mut(), &row)
+                            .await?
+                            .is_none()
+                        {
+                            return Err(DomainError::ResourceNotFound.into());
+                        }
+                        Ok::<_, PortError>((row, project))
+                    },
+                    CommitEffect::NotCommitted,
+                )
+                .await;
         budget
             .run(pre_tx.rollback(), CommitEffect::NotCommitted)
             .await?;

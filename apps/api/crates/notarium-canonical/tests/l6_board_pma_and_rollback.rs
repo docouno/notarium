@@ -45,10 +45,10 @@ use notarium_core::{
     ports::{
         AssociatedBoardExpectation, BoardGroupFieldKind, BoardMoveFacts, BoardMoveFactsSpec,
         BoardMutationFactsProvider, BoardPlannerAuthority, BoardViewRollbackFacts, CallBudget,
-        Cancellation, CreateNote, EditNote, EvaluatedBoardGroup, EvaluatedBoardRow, GetNote,
-        GroupKey, MoveBoardCard, Mutation, NoteRevision, NoteWritePort, PortFuture, Preconditions,
-        RankExpectation, RankNeighbor, RenameNote, RollbackAgentRun, RollbackBoardFacts,
-        RollbackBoardFactsRequest, SemanticPlacement, SpaceContext, ViewRef,
+        Cancellation, CreateNote, DeleteDisposition, DeleteNote, EditNote, EvaluatedBoardGroup,
+        EvaluatedBoardRow, GetNote, GroupKey, MoveBoardCard, Mutation, NoteRevision, NoteWritePort,
+        PortFuture, Preconditions, RankExpectation, RankNeighbor, RenameNote, RollbackAgentRun,
+        RollbackBoardFacts, RollbackBoardFactsRequest, SemanticPlacement, SpaceContext, ViewRef,
     },
     query::{FieldObservation, FieldValue},
     receipt::{AwaitReason, CausalBasis, CommandIdentity, MutationEffect, ReceiptSet},
@@ -445,18 +445,26 @@ impl BoardMutationFactsProvider for CanonicalTestBoardPlanner {
 
             let mut views_map = BTreeMap::new();
             for view in request.views {
-                let view_snap = self
-                    .store
-                    .get_note(
-                        ctx.clone(),
-                        GetNote {
-                            note: view.note.clone(),
-                            revision: None,
-                            causal: CausalBasis::Exact(ReceiptSet::default()),
-                        },
-                    )
-                    .await?;
-                let view_rev = view_snap.document.metadata().revision().clone();
+                let view_rev = if let Some(planned) = request
+                    .eligible_notes
+                    .iter()
+                    .find(|p| p.note == view.note && p.planned_lifecycle == Lifecycle::Active)
+                {
+                    planned.current_revision.clone()
+                } else {
+                    let view_snap = self
+                        .store
+                        .get_note(
+                            ctx.clone(),
+                            GetNote {
+                                note: view.note.clone(),
+                                revision: None,
+                                causal: CausalBasis::Exact(ReceiptSet::default()),
+                            },
+                        )
+                        .await?;
+                    view_snap.document.metadata().revision().clone()
+                };
                 let overlays = self
                     .store
                     .inspect_view_overlays_for_test(&scope.space_id, &view)
@@ -5308,6 +5316,637 @@ async fn l6_rollback_board_per_note_prerun_and_skipped_moved_view_dual_dialect_p
         let cfg = fixtures.pg_s3_config(sample_installation_id(22), &schema, s3_cfg);
         let (store, runtime) = CanonicalRuntime::open(cfg).await.expect("open pg+s3");
         run_board_per_note_prerun_and_skipped_moved_view_suite(&store).await;
+        runtime.shutdown().await.expect("shutdown pg+s3");
+        fixtures.drop_pg_schema(&schema).await;
+    }
+}
+
+async fn run_board_neighbor_order_and_trashed_view_suite(store: &CanonicalStore) {
+    let owner = sample_principal_id(65);
+    let (scope, _root) = seed_space(
+        store,
+        sample_space_id(65),
+        sample_incarnation(65),
+        owner.clone(),
+    )
+    .await;
+    let human_ctx = owner_ctx(&scope, owner.clone());
+
+    let g1 = GroupKey::Value(ScalarValue::String("todo".to_owned()));
+    let g2 = GroupKey::Value(ScalarValue::String("doing".to_owned()));
+    let g3 = GroupKey::Value(ScalarValue::String("done".to_owned()));
+
+    let v1_note = sample_note_id(241);
+    let v2_note = sample_note_id(242);
+    let v3_note = sample_note_id(243);
+    let v4_note = sample_note_id(244);
+    let m_1a = NoteId::from_bytes([0x21; 16]);
+    let s_1a = NoteId::from_bytes([0x22; 16]);
+    let a_1a = NoteId::from_bytes([0x23; 16]);
+    let x_1a = NoteId::from_bytes([0x24; 16]);
+    let m_1b = NoteId::from_bytes([0x25; 16]);
+    let t_1b = NoteId::from_bytes([0x26; 16]);
+    let card_2a = NoteId::from_bytes([0x27; 16]);
+    let card_2b = NoteId::from_bytes([0x28; 16]);
+    let card_2c = NoteId::from_bytes([0x29; 16]);
+
+    let planner = CanonicalTestBoardPlanner::new(
+        store.clone(),
+        [
+            m_1a.clone(),
+            s_1a.clone(),
+            a_1a.clone(),
+            x_1a.clone(),
+            m_1b.clone(),
+            t_1b.clone(),
+            card_2a.clone(),
+            card_2b.clone(),
+            card_2c.clone(),
+        ],
+    );
+    store
+        .register_board_facts_provider(planner)
+        .expect("register planner");
+
+    let mut revs: BTreeMap<NoteId, RevisionId> = BTreeMap::new();
+    for (nid, slug, status) in [
+        (&v1_note, "board-1a", "none"),
+        (&v2_note, "board-1b", "none"),
+        (&v3_note, "board-human-trash", "none"),
+        (&v4_note, "board-run-trash", "none"),
+        (&m_1a, "m-1a", "todo"),
+        (&s_1a, "s-1a", "todo"),
+        (&a_1a, "a-1a", "todo"),
+        (&x_1a, "x-1a", "done"),
+        (&m_1b, "m-1b", "todo"),
+        (&t_1b, "t-1b", "todo"),
+        (&card_2a, "card-2a", "todo"),
+        (&card_2b, "card-2b", "todo"),
+        (&card_2c, "card-2c", "todo"),
+    ] {
+        let c = store
+            .create_note(
+                human_ctx.clone(),
+                next_mutation(
+                    &scope,
+                    &owner,
+                    CreateNote {
+                        folder_page: false,
+                        note: nid.clone(),
+                        parent: None,
+                        slug: slug.to_owned(),
+                        class: DocClass::UserDoc,
+                        carrier: format!("---\ntitle: {slug}\nstatus: {status}\n---\nBody\n"),
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        revs.insert(nid.clone(), c.value.revision);
+    }
+
+    let scope_ref = &scope;
+    let owner_ref = &owner;
+    let set_status = |ctx: SpaceContext, nid: NoteId, st: &'static str| async move {
+        let snap = store
+            .get_note(
+                ctx.clone(),
+                GetNote {
+                    note: nid.clone(),
+                    revision: None,
+                    causal: CausalBasis::Exact(ReceiptSet::default()),
+                },
+            )
+            .await
+            .unwrap();
+        let raw = snap.document.explicit_read(ctx.auth()).unwrap();
+        let plan = extract::finalize_document(
+            raw,
+            DocClass::UserDoc,
+            &nid,
+            &[FieldEdit::Set {
+                key: "status".to_owned(),
+                value: YamlValue::String(st.to_owned()),
+            }],
+        )
+        .unwrap();
+        store
+            .edit_note(
+                ctx,
+                next_mutation(scope_ref, owner_ref, EditNote { note: nid, plan }),
+            )
+            .await
+            .unwrap()
+            .value
+            .revision
+    };
+
+    let view_1a = ViewRef {
+        note: v1_note.clone(),
+        key: ViewKey::from_bytes([0x71; 16]),
+    };
+    let view_1b = ViewRef {
+        note: v2_note.clone(),
+        key: ViewKey::from_bytes([0x72; 16]),
+    };
+    let view_human_trash = ViewRef {
+        note: v3_note.clone(),
+        key: ViewKey::from_bytes([0x73; 16]),
+    };
+    let view_run_trash = ViewRef {
+        note: v4_note.clone(),
+        key: ViewKey::from_bytes([0x74; 16]),
+    };
+
+    // --- Trace 1A: Stale non-moved neighbor `s_1a` in `[m_1a, s_1a, a_1a]` ---
+    // Seed G1 on `view_1a` so order is strictly `[m_1a, s_1a, a_1a]`.
+    let r = store
+        .move_board_card(
+            human_ctx.clone(),
+            next_mutation(
+                &scope,
+                &owner,
+                MoveBoardCard {
+                    view: view_1a.clone(),
+                    note: m_1a.clone(),
+                    group: g1.clone(),
+                    before: Some(RankNeighbor {
+                        note: s_1a.clone(),
+                        expected_rank: RankExpectation::Absent,
+                    }),
+                    after: None,
+                    fields: BTreeMap::new(),
+                    expected_note: revs[&m_1a].clone(),
+                    expected_view: revs[&v1_note].clone(),
+                    expected_rank: RankExpectation::Absent,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    revs.insert(m_1a.clone(), r.value.revision.revision);
+    let pre_1a = store
+        .inspect_view_overlays_for_test(&scope.space_id, &view_1a)
+        .await
+        .unwrap();
+    assert!(pre_1a[&m_1a].sort_rank_lexo < pre_1a[&s_1a].sort_rank_lexo);
+    assert!(pre_1a[&s_1a].sort_rank_lexo < pre_1a[&a_1a].sort_rank_lexo);
+
+    let run_1a = sample_run_id(245);
+    let agent_1a = agent_run_ctx(&human_ctx, run_1a.clone());
+    // Move `m_1a` G1 -> G2 (recording successor `s_1a`), edit `s_1a` G1 -> G2, move `x_1a` -> G2.
+    let r = store
+        .move_board_card(
+            agent_1a.clone(),
+            next_mutation(
+                &scope,
+                &owner,
+                MoveBoardCard {
+                    view: view_1a.clone(),
+                    note: m_1a.clone(),
+                    group: g2.clone(),
+                    before: None,
+                    after: None,
+                    fields: BTreeMap::from([(
+                        "status".to_owned(),
+                        Some(YamlValue::String("doing".to_owned())),
+                    )]),
+                    expected_note: revs[&m_1a].clone(),
+                    expected_view: revs[&v1_note].clone(),
+                    expected_rank: RankExpectation::Existing(pre_1a[&m_1a].rank_rev_id.clone()),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    revs.insert(m_1a.clone(), r.value.revision.revision);
+    revs.insert(
+        s_1a.clone(),
+        set_status(agent_1a.clone(), s_1a.clone(), "doing").await,
+    );
+    let r = store
+        .move_board_card(
+            agent_1a,
+            next_mutation(
+                &scope,
+                &owner,
+                MoveBoardCard {
+                    view: view_1a.clone(),
+                    note: x_1a.clone(),
+                    group: g2.clone(),
+                    before: None,
+                    after: None,
+                    fields: BTreeMap::from([(
+                        "status".to_owned(),
+                        Some(YamlValue::String("doing".to_owned())),
+                    )]),
+                    expected_note: revs[&x_1a].clone(),
+                    expected_view: revs[&v1_note].clone(),
+                    expected_rank: RankExpectation::Absent,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    revs.insert(x_1a.clone(), r.value.revision.revision);
+    let mid_1a = store
+        .inspect_view_overlays_for_test(&scope.space_id, &view_1a)
+        .await
+        .unwrap();
+    assert_eq!(mid_1a[&s_1a].group, g2);
+
+    let prep_1a = store
+        .prepare_agent_run_rollback(human_ctx.clone(), run_1a)
+        .await
+        .unwrap();
+    store
+        .rollback_agent_run(human_ctx.clone(), next_mutation(&scope, &owner, prep_1a))
+        .await
+        .expect("Trace 1A rollback must succeed");
+    let post_1a = store
+        .inspect_view_overlays_for_test(&scope.space_id, &view_1a)
+        .await
+        .unwrap();
+    assert_eq!(post_1a[&m_1a].group, g1);
+    assert_eq!(post_1a[&s_1a].group, g1);
+    assert_eq!(post_1a[&a_1a].group, g1);
+    assert!(
+        post_1a[&m_1a].sort_rank_lexo < post_1a[&s_1a].sort_rank_lexo
+            && post_1a[&s_1a].sort_rank_lexo < post_1a[&a_1a].sort_rank_lexo,
+        "Trace 1A must preserve [m_1a, s_1a, a_1a] order, got m={}, s={}, a={}",
+        post_1a[&m_1a].sort_rank_lexo,
+        post_1a[&s_1a].sort_rank_lexo,
+        post_1a[&a_1a].sort_rank_lexo
+    );
+
+    // --- Trace 1B: `ReconcilePreRun` neighbor `t_1b` in `[m_1b, t_1b]` ---
+    let r = store
+        .move_board_card(
+            human_ctx.clone(),
+            next_mutation(
+                &scope,
+                &owner,
+                MoveBoardCard {
+                    view: view_1b.clone(),
+                    note: m_1b.clone(),
+                    group: g1.clone(),
+                    before: Some(RankNeighbor {
+                        note: t_1b.clone(),
+                        expected_rank: RankExpectation::Absent,
+                    }),
+                    after: None,
+                    fields: BTreeMap::new(),
+                    expected_note: revs[&m_1b].clone(),
+                    expected_view: revs[&v2_note].clone(),
+                    expected_rank: RankExpectation::Absent,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    revs.insert(m_1b.clone(), r.value.revision.revision);
+    let pre_1b = store
+        .inspect_view_overlays_for_test(&scope.space_id, &view_1b)
+        .await
+        .unwrap();
+    assert!(pre_1b[&m_1b].sort_rank_lexo < pre_1b[&t_1b].sort_rank_lexo);
+
+    let run_1b = sample_run_id(246);
+    let agent_1b = agent_run_ctx(&human_ctx, run_1b.clone());
+    // Move `m_1b` G1 -> G2 (recording successor `t_1b`), edit `t_1b` G1 -> G2, move `t_1b` G2 -> G3.
+    let r = store
+        .move_board_card(
+            agent_1b.clone(),
+            next_mutation(
+                &scope,
+                &owner,
+                MoveBoardCard {
+                    view: view_1b.clone(),
+                    note: m_1b.clone(),
+                    group: g2.clone(),
+                    before: None,
+                    after: None,
+                    fields: BTreeMap::from([(
+                        "status".to_owned(),
+                        Some(YamlValue::String("doing".to_owned())),
+                    )]),
+                    expected_note: revs[&m_1b].clone(),
+                    expected_view: revs[&v2_note].clone(),
+                    expected_rank: RankExpectation::Existing(pre_1b[&m_1b].rank_rev_id.clone()),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    revs.insert(m_1b.clone(), r.value.revision.revision);
+    revs.insert(
+        t_1b.clone(),
+        set_status(agent_1b.clone(), t_1b.clone(), "doing").await,
+    );
+    let r = store
+        .move_board_card(
+            agent_1b,
+            next_mutation(
+                &scope,
+                &owner,
+                MoveBoardCard {
+                    view: view_1b.clone(),
+                    note: t_1b.clone(),
+                    group: g3.clone(),
+                    before: None,
+                    after: None,
+                    fields: BTreeMap::from([(
+                        "status".to_owned(),
+                        Some(YamlValue::String("done".to_owned())),
+                    )]),
+                    expected_note: revs[&t_1b].clone(),
+                    expected_view: revs[&v2_note].clone(),
+                    expected_rank: RankExpectation::Existing(pre_1b[&t_1b].rank_rev_id.clone()),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    revs.insert(t_1b.clone(), r.value.revision.revision);
+    let prep_1b = store
+        .prepare_agent_run_rollback(human_ctx.clone(), run_1b)
+        .await
+        .unwrap();
+    store
+        .rollback_agent_run(human_ctx.clone(), next_mutation(&scope, &owner, prep_1b))
+        .await
+        .expect("Trace 1B rollback must succeed");
+    let post_1b = store
+        .inspect_view_overlays_for_test(&scope.space_id, &view_1b)
+        .await
+        .unwrap();
+    assert_eq!(post_1b[&m_1b].group, g1);
+    assert_eq!(post_1b[&t_1b].group, g1);
+    assert!(
+        post_1b[&m_1b].sort_rank_lexo < post_1b[&t_1b].sort_rank_lexo,
+        "Trace 1B must preserve [m_1b, t_1b] order, got m={}, t={}",
+        post_1b[&m_1b].sort_rank_lexo,
+        post_1b[&t_1b].sort_rank_lexo
+    );
+
+    // --- Trace 2A: Human trashes pre-existing view `v3_note` after run moved `card_2a` ---
+    let run_2a = sample_run_id(247);
+    let agent_2a = agent_run_ctx(&human_ctx, run_2a.clone());
+    let r = store
+        .move_board_card(
+            agent_2a,
+            next_mutation(
+                &scope,
+                &owner,
+                MoveBoardCard {
+                    view: view_human_trash.clone(),
+                    note: card_2a.clone(),
+                    group: g2.clone(),
+                    before: None,
+                    after: None,
+                    fields: BTreeMap::from([(
+                        "status".to_owned(),
+                        Some(YamlValue::String("doing".to_owned())),
+                    )]),
+                    expected_note: revs[&card_2a].clone(),
+                    expected_view: revs[&v3_note].clone(),
+                    expected_rank: RankExpectation::Absent,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    revs.insert(card_2a.clone(), r.value.revision.revision);
+    store
+        .delete_note(
+            human_ctx.clone(),
+            next_mutation(
+                &scope,
+                &owner,
+                DeleteNote {
+                    note: v3_note.clone(),
+                    disposition: DeleteDisposition::Trash,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let prep_2a = store
+        .prepare_agent_run_rollback(human_ctx.clone(), run_2a)
+        .await
+        .expect("prepare rollback must succeed after human trashed view note");
+    store
+        .rollback_agent_run(human_ctx.clone(), next_mutation(&scope, &owner, prep_2a))
+        .await
+        .expect("rollback must succeed after human trashed view note");
+    let card_2a_after = store
+        .get_note(
+            human_ctx.clone(),
+            GetNote {
+                note: card_2a.clone(),
+                revision: None,
+                causal: CausalBasis::Exact(ReceiptSet::default()),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        card_2a_after.fields.get("status"),
+        Some(&FieldObservation::Ok(FieldValue::Scalar(
+            ScalarValue::String("todo".to_owned())
+        )))
+    );
+
+    // --- Trace 2B: Run creates view `v_created`, moves `card_2b`, then trashes `v_created` ---
+    let run_2b = sample_run_id(248);
+    let agent_2b = agent_run_ctx(&human_ctx, run_2b.clone());
+    let v_created_note = sample_note_id(249);
+    let v_created = ViewRef {
+        note: v_created_note.clone(),
+        key: ViewKey::from_bytes([0x75; 16]),
+    };
+    let vc = store
+        .create_note(
+            agent_2b.clone(),
+            next_mutation(
+                &scope,
+                &owner,
+                CreateNote {
+                    folder_page: false,
+                    note: v_created_note.clone(),
+                    parent: None,
+                    slug: "run-created-board".to_owned(),
+                    class: DocClass::UserDoc,
+                    carrier: "---\ntitle: run-created-board\n---\n# Board\n".to_owned(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let r = store
+        .move_board_card(
+            agent_2b.clone(),
+            next_mutation(
+                &scope,
+                &owner,
+                MoveBoardCard {
+                    view: v_created.clone(),
+                    note: card_2b.clone(),
+                    group: g2.clone(),
+                    before: None,
+                    after: None,
+                    fields: BTreeMap::from([(
+                        "status".to_owned(),
+                        Some(YamlValue::String("doing".to_owned())),
+                    )]),
+                    expected_note: revs[&card_2b].clone(),
+                    expected_view: vc.value.revision.clone(),
+                    expected_rank: RankExpectation::Absent,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    revs.insert(card_2b.clone(), r.value.revision.revision);
+    store
+        .delete_note(
+            agent_2b,
+            next_mutation(
+                &scope,
+                &owner,
+                DeleteNote {
+                    note: v_created_note.clone(),
+                    disposition: DeleteDisposition::Trash,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let prep_2b = store
+        .prepare_agent_run_rollback(human_ctx.clone(), run_2b)
+        .await
+        .expect("prepare rollback must succeed when run trashed its own created view");
+    store
+        .rollback_agent_run(human_ctx.clone(), next_mutation(&scope, &owner, prep_2b))
+        .await
+        .expect("rollback must succeed when run trashed its own created view");
+
+    // --- Trace 2C: Run moves `card_2c` on pre-existing `v4_note`, then run trashes `v4_note` ---
+    let r = store
+        .move_board_card(
+            human_ctx.clone(),
+            next_mutation(
+                &scope,
+                &owner,
+                MoveBoardCard {
+                    view: view_run_trash.clone(),
+                    note: card_2c.clone(),
+                    group: g1.clone(),
+                    before: None,
+                    after: None,
+                    fields: BTreeMap::new(),
+                    expected_note: revs[&card_2c].clone(),
+                    expected_view: revs[&v4_note].clone(),
+                    expected_rank: RankExpectation::Absent,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    revs.insert(card_2c.clone(), r.value.revision.revision);
+    let pre_2c = store
+        .inspect_view_overlays_for_test(&scope.space_id, &view_run_trash)
+        .await
+        .unwrap();
+    let run_2c = sample_run_id(249);
+    let agent_2c = agent_run_ctx(&human_ctx, run_2c.clone());
+    let r = store
+        .move_board_card(
+            agent_2c.clone(),
+            next_mutation(
+                &scope,
+                &owner,
+                MoveBoardCard {
+                    view: view_run_trash.clone(),
+                    note: card_2c.clone(),
+                    group: g2.clone(),
+                    before: None,
+                    after: None,
+                    fields: BTreeMap::from([(
+                        "status".to_owned(),
+                        Some(YamlValue::String("doing".to_owned())),
+                    )]),
+                    expected_note: revs[&card_2c].clone(),
+                    expected_view: revs[&v4_note].clone(),
+                    expected_rank: RankExpectation::Existing(pre_2c[&card_2c].rank_rev_id.clone()),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    revs.insert(card_2c.clone(), r.value.revision.revision);
+    store
+        .delete_note(
+            agent_2c,
+            next_mutation(
+                &scope,
+                &owner,
+                DeleteNote {
+                    note: v4_note.clone(),
+                    disposition: DeleteDisposition::Trash,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let prep_2c = store
+        .prepare_agent_run_rollback(human_ctx.clone(), run_2c)
+        .await
+        .expect("prepare rollback must succeed when run trashed pre-existing view");
+    store
+        .rollback_agent_run(human_ctx.clone(), next_mutation(&scope, &owner, prep_2c))
+        .await
+        .expect("rollback must restore pre-existing view trashed by run");
+    let v4_after = store
+        .get_note(
+            human_ctx,
+            GetNote {
+                note: v4_note,
+                revision: None,
+                causal: CausalBasis::Exact(ReceiptSet::default()),
+            },
+        )
+        .await
+        .expect("v4_note must be restored to Active");
+    assert_eq!(v4_after.document.metadata().lifecycle(), Lifecycle::Active);
+    let post_2c = store
+        .inspect_view_overlays_for_test(&scope.space_id, &view_run_trash)
+        .await
+        .unwrap();
+    assert_eq!(post_2c[&card_2c].group, g1);
+    let _ = revs;
+}
+
+#[tokio::test]
+async fn l6_rollback_board_neighbor_order_and_trashed_view_dual_dialect_parity() {
+    {
+        let root = TempDataRoot::new("l6-nbr-view-sqlite");
+        let cfg = CanonicalConfig::local_default(sample_installation_id(23), root.data_root());
+        let (store, runtime) = CanonicalRuntime::open(cfg).await.expect("open sqlite");
+        run_board_neighbor_order_and_trashed_view_suite(&store).await;
+        runtime.shutdown().await.expect("shutdown sqlite");
+    }
+    {
+        let fixtures = StorageTestFixtures::load_required();
+        let schema = fixtures.fresh_pg_schema();
+        let bucket = fixtures.fresh_s3_bucket("l6nv");
+        let s3_cfg = fixtures.s3_config(&bucket, S3BucketModePolicy::DetectFromBucket);
+        admin_ensure_bucket(&s3_cfg, Some("Enabled"))
+            .await
+            .expect("ensure S3 bucket");
+        let cfg = fixtures.pg_s3_config(sample_installation_id(24), &schema, s3_cfg);
+        let (store, runtime) = CanonicalRuntime::open(cfg).await.expect("open pg+s3");
+        run_board_neighbor_order_and_trashed_view_suite(&store).await;
         runtime.shutdown().await.expect("shutdown pg+s3");
         fixtures.drop_pg_schema(&schema).await;
     }

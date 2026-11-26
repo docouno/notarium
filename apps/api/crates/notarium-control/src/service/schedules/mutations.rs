@@ -1,5 +1,35 @@
 use super::*;
 
+/// Maximum serialized request size hashed by `Command::new_with_limit` for
+/// schedule mutations. Valid `<= 32 KiB` UTF-8 `init_prompt` strings can
+/// expand up to 6x under JSON escaping (~196 KiB) plus up to 32 approved
+/// skills (~6 KiB); using a 256 KiB hashing cap preserves bit-for-bit
+/// `0001` BLAKE3 fingerprints while accepting every contract-valid prompt.
+const SCHEDULE_COMMAND_HASH_LIMIT: usize = 256 * 1024;
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SavedScheduleReceipt {
+    id: ScheduleId,
+    owner: PrincipalId,
+    approved_skills: Vec<AbilityRef>,
+    paused_reason: Option<SchedulePauseReason>,
+    revision: ControlRevision,
+    config_revision: ControlRevision,
+    next_slot: Option<Timestamp>,
+}
+
+/// Content-free schedule command receipt persisted in `control_commands.safe_result`
+/// (omitting private `title` and `init_prompt` so deletion erasure holds and
+/// `safe_result` stays well within the 64 KiB cap), with backwards-compatible
+/// decoding of pre-upgrade `0001` bare `ScheduleId` receipts.
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum StoredScheduleResult {
+    Receipt(Option<SavedScheduleReceipt>),
+    Legacy(ScheduleId),
+}
+
 enum Change {
     Create(CreateSchedule),
     Update(UpdateSchedule),
@@ -74,7 +104,7 @@ impl ControlService {
             if let Some(pin) = schedule_pin.take() {
                 tx.hold_schedule_pin(pin);
             }
-            let (revision,saved) = budget.run(async {
+            let (revision, committed_value, events) = budget.run(async {
             let (owner,_) = self.scoped_manager(tx.inner_mut(),ctx.auth(),ctx.auth().principal()).await?;
             let auth = self.revalidate(tx.inner_mut(),ctx.auth()).await?;
             let current = AccountContext::new(auth,budget.context(ctx.budget.request.clone()));
@@ -132,7 +162,55 @@ impl ControlService {
                     Some(row)
                 }
             };
-            if let Some(replay) = command.replay::<Option<AgentSchedule>>(tx.inner_mut()).await? {return Ok(replay);}
+            if let Some((revision, saved)) = command.replay::<StoredScheduleResult>(tx.inner_mut()).await? {
+                let replayed = match (saved.value, change) {
+                    (StoredScheduleResult::Receipt(Some(receipt)), Change::Create(input)) => {
+                        Some(AgentSchedule {
+                            id: receipt.id,
+                            owner: receipt.owner,
+                            definition: input.definition,
+                            approved_skills: receipt.approved_skills,
+                            paused_reason: receipt.paused_reason,
+                            revision: receipt.revision,
+                            config_revision: receipt.config_revision,
+                            next_slot: receipt.next_slot,
+                        })
+                    }
+                    (StoredScheduleResult::Receipt(Some(receipt)), Change::Update(input)) => {
+                        Some(AgentSchedule {
+                            id: receipt.id,
+                            owner: receipt.owner,
+                            definition: input.definition,
+                            approved_skills: receipt.approved_skills,
+                            paused_reason: receipt.paused_reason,
+                            revision: receipt.revision,
+                            config_revision: receipt.config_revision,
+                            next_slot: receipt.next_slot,
+                        })
+                    }
+                    (StoredScheduleResult::Receipt(None), Change::Delete(_))
+                    | (StoredScheduleResult::Legacy(_), Change::Delete(_)) => None,
+                    (StoredScheduleResult::Legacy(id), Change::Create(_)) => {
+                        let row = schedule(tx.inner_mut(), &id, false).await?;
+                        if row.owner_id != owner.user_id || row.deleted_at.is_some() {
+                            return Err(DomainError::ResourceNotFound.into());
+                        }
+                        Some(schedule_info(&row)?)
+                    }
+                    (StoredScheduleResult::Legacy(id), Change::Update(_)) => {
+                        let row = match locked_row {
+                            Some(row) if row.schedule_id == id.as_str() => row,
+                            _ => schedule(tx.inner_mut(), &id, false).await?,
+                        };
+                        if row.owner_id != owner.user_id || row.deleted_at.is_some() {
+                            return Err(DomainError::ResourceNotFound.into());
+                        }
+                        Some(schedule_info(&row)?)
+                    }
+                    _ => return Err(invalid(ValidationReason::InvalidState)),
+                };
+                return Ok((revision, replayed, saved.events));
+            }
             expect_revision(&owner,command.identity.expected)?;
             let now = self.clock.now_ms()?;
             let (id, committed_schedule, revoke) = match change {
@@ -264,17 +342,29 @@ impl ControlService {
             let mut events = Vec::new();
             if revoke {events.push(super::super::outbox::enqueue(tx.inner_mut(),RevocationSelector::Schedule(id.clone()),RevocationReason::PermissionChanged,revision,now).await?);}
             let revision = ControlRevision::new(revision as u64)?;
-            let saved = SavedResult {value:committed_schedule,events};
+            let saved_receipt = committed_schedule.as_ref().map(|info| SavedScheduleReceipt {
+                id: info.id.clone(),
+                owner: info.owner.clone(),
+                approved_skills: info.approved_skills.clone(),
+                paused_reason: info.paused_reason,
+                revision: info.revision,
+                config_revision: info.config_revision,
+                next_slot: info.next_slot,
+            });
+            let saved = SavedResult {
+                value: StoredScheduleResult::Receipt(saved_receipt),
+                events: events.clone(),
+            };
             command.save(tx.inner_mut(),revision,&saved,now).await?;
-            Ok((revision,saved))
+            Ok((revision,committed_schedule,events))
         },CommitEffect::NotCommitted).await?;
-            self.commit_revocations(tx, &budget, &saved.events).await?;
-            for event in &saved.events {
+            self.commit_revocations(tx, &budget, &events).await?;
+            for event in &events {
                 self.flush_event(&budget, event).await?;
             }
             Ok(ControlCommit {
                 revision,
-                value: saved.value,
+                value: committed_value,
             })
         })
     }
@@ -283,7 +373,12 @@ impl ControlService {
         ctx: AccountContext,
         request: AccountMutation<CreateSchedule>,
     ) -> Result<ControlCommit<AgentSchedule>, PortError> {
-        let command = Command::new(request.identity, "create-schedule", &request.input)?;
+        let command = Command::new_with_limit(
+            request.identity,
+            "create-schedule",
+            &request.input,
+            SCHEDULE_COMMAND_HASH_LIMIT,
+        )?;
         let commit = self
             .mutate_schedule(ctx, command, Change::Create(request.input))
             .await?;
@@ -299,7 +394,12 @@ impl ControlService {
         ctx: AccountContext,
         request: AccountMutation<UpdateSchedule>,
     ) -> Result<ControlCommit<AgentSchedule>, PortError> {
-        let command = Command::new(request.identity, "update-schedule", &request.input)?;
+        let command = Command::new_with_limit(
+            request.identity,
+            "update-schedule",
+            &request.input,
+            SCHEDULE_COMMAND_HASH_LIMIT,
+        )?;
         let commit = self
             .mutate_schedule(ctx, command, Change::Update(request.input))
             .await?;

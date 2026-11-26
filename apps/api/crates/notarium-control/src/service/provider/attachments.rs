@@ -576,24 +576,40 @@ impl ProviderService {
             .map(|(row, target)| (row.resource_id.clone(), target.clone()))
             .map_err(Clone::clone);
         ctx.budget = budget.context(ctx.budget.request.clone());
+        #[derive(serde::Serialize, serde::Deserialize)]
+        #[serde(untagged)]
+        enum StoredRevokedAttachment {
+            Detailed(RevokedAttachmentReplay),
+            Legacy(()),
+        }
+        let replay_id = input.id.clone();
         let commit = self
             .mutate_replay_authorized(
                 ctx,
                 command,
-                move |tx, owner, saved: &RevokedAttachmentReplay| {
+                move |tx, owner, saved: &StoredRevokedAttachment| {
                     Box::pin(async move {
-                        if saved.resource_owner.as_str() != owner.user_id {
-                            lock_space_read(tx, target_space(&saved.target)).await?;
-                            match &saved.target {
+                        let (target, resource_owner) = match saved {
+                            StoredRevokedAttachment::Detailed(detailed) => (
+                                detailed.target.clone(),
+                                detailed.resource_owner.to_string(),
+                            ),
+                            StoredRevokedAttachment::Legacy(()) => {
+                                let row = attachment(tx, replay_id.as_str()).await?;
+                                let res = resource(tx, &row.resource_id).await?;
+                                (attachment_target(&row)?, res.owner_id)
+                            }
+                        };
+                        if resource_owner != owner.user_id {
+                            lock_space_read(tx, target_space(&target)).await?;
+                            match &target {
                                 ProviderAttachmentTarget::Personal {
                                     owner: target_owner,
                                     ..
                                 } => owned(&owner.user_id, target_owner.as_str())?,
                                 _ => {
-                                    check_member(tx, &auth_replay, target_space(&saved.target))
-                                        .await?;
-                                    require_owner(tx, &auth_replay, target_space(&saved.target))
-                                        .await?;
+                                    check_member(tx, &auth_replay, target_space(&target)).await?;
+                                    require_owner(tx, &auth_replay, target_space(&target)).await?;
                                 }
                             }
                         }
@@ -642,10 +658,10 @@ impl ProviderService {
                         }
                         execute!(tx,"UPDATE provider_attachments SET state='revoked',revision=$1 WHERE id=$2","UPDATE v1_control.provider_attachments SET state='revoked',revision=$1 WHERE id=$2";next(row.revision)?,&row.id)?;
                         bump(tx, &resource).await?;
-                        let replay = RevokedAttachmentReplay {
+                        let replay = StoredRevokedAttachment::Detailed(RevokedAttachmentReplay {
                             target,
                             resource_owner: PrincipalId::parse(&resource.owner_id)?,
-                        };
+                        });
                         Ok((
                             replay,
                             vec![RevocationSelector::ProviderResource(

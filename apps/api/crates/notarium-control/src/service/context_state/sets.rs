@@ -439,30 +439,54 @@ impl ControlService {
         .await;
         #[derive(Clone, Serialize, Deserialize)]
         #[serde(deny_unknown_fields)]
-        struct SavedContextSet {
-            id: ContextSetId,
+        struct SavedContextSetMeta {
             owner: PrincipalId,
-            home: SpaceId,
-            name: String,
-            notes: Vec<NoteRef>,
             revision: ControlRevision,
         }
+        #[derive(Serialize, Deserialize)]
+        #[serde(untagged)]
+        enum StoredContextSetResult {
+            Meta(SavedContextSetMeta),
+            Legacy(ContextSetId),
+        }
         let mut tx = self.store.write(budget.clone()).await?;
-        let (revision, current_ctx, saved_set, replayed) = budget.run(async {
+        let (revision, current_ctx, saved_meta, replayed) = budget.run(async {
             let owner = self.context_manager(tx.inner_mut(), &ctx).await?;
-            if let Some((revision, saved)) = command.replay::<SavedContextSet>(tx.inner_mut()).await? {
+            if let Some((revision, saved)) = command.replay::<StoredContextSetResult>(tx.inner_mut()).await? {
                 let auth = self.revalidate(tx.inner_mut(), ctx.auth()).await?;
                 if auth
                     .spaces()
-                    .get(&saved.value.home)
+                    .get(&request.input.home)
                     .is_none_or(|grant| grant.read_classes.is_empty() || grant.project_root.is_some())
                 {
                     return Err(DomainError::ResourceNotFound.into());
                 }
+                let meta = match saved.value {
+                    StoredContextSetResult::Meta(meta) => meta,
+                    StoredContextSetResult::Legacy(id) => {
+                        let existing = bundle(tx.inner_mut(), &id, false).await?;
+                        if let Some(row) = existing {
+                            if row.home_space != request.input.home.as_str() {
+                                return Err(DomainError::ResourceNotFound.into());
+                            }
+                            SavedContextSetMeta {
+                                owner: PrincipalId::parse(&row.owner_id)?,
+                                revision: ControlRevision::new(row.revision as u64)?,
+                            }
+                        } else {
+                            SavedContextSetMeta {
+                                owner: PrincipalId::parse(&owner.user_id)?,
+                                revision: ControlRevision::new(next(
+                                    request.input.expected.map_or(0, |rev| rev.get() as i64),
+                                )? as u64)?,
+                            }
+                        }
+                    }
+                };
                 return Ok((
                     revision,
                     AccountContext::new(auth, budget.context(ctx.budget.request.clone())),
-                    saved.value,
+                    meta,
                     true,
                 ));
             }
@@ -493,35 +517,31 @@ impl ControlService {
                 record.insert_or_conflict(tx.inner_mut()).await?;
             } else { execute!(tx.inner_mut(),"UPDATE context_sets SET name=$1,note_refs=$2,revision=$3 WHERE set_id=$4","UPDATE v1_control.context_sets SET name=$1,note_refs=$2,revision=$3 WHERE set_id=$4";&row.name,&row.note_refs,row.revision,&row.set_id)?; }
             let revision = self.bump_context_spaces(tx.inner_mut(), &owner, &spaces).await?;
-            let committed = SavedContextSet {
-                id: request.input.id.clone(),
+            let meta = SavedContextSetMeta {
                 owner: PrincipalId::parse(&row.owner_id)?,
-                home: request.input.home.clone(),
-                name: request.input.name.clone(),
-                notes: request.input.notes.clone(),
                 revision: ControlRevision::new(row.revision as u64)?,
             };
-            command.save(tx.inner_mut(), revision, &SavedResult { value: committed.clone(), events: vec![] }, self.clock.now_ms()?).await?;
-            Ok((revision, ctx.clone(), committed, false))
+            command.save(tx.inner_mut(), revision, &SavedResult { value: StoredContextSetResult::Meta(meta.clone()), events: vec![] }, self.clock.now_ms()?).await?;
+            Ok((revision, ctx.clone(), meta, false))
         }, CommitEffect::NotCommitted).await?;
         budget.run(tx.commit(), CommitEffect::Unknown).await?;
         let value = if !replayed {
             ContextSetInfo {
-                id: saved_set.id,
-                owner: saved_set.owner,
-                home: saved_set.home,
-                name: saved_set.name,
-                notes: saved_set.notes,
+                id: request.input.id,
+                owner: saved_meta.owner,
+                home: request.input.home,
+                name: request.input.name,
+                notes: request.input.notes,
                 unavailable: 0,
-                revision: saved_set.revision,
+                revision: saved_meta.revision,
             }
         } else {
             budget
                 .run(
                     async {
-                        let mut visible = Vec::with_capacity(saved_set.notes.len());
+                        let mut visible = Vec::with_capacity(request.input.notes.len());
                         let mut unavailable = 0u16;
-                        for note in saved_set.notes {
+                        for note in request.input.notes {
                             match self.catalog_note(&current_ctx, &note).await {
                                 Ok(_) => visible.push(note),
                                 Err(error) if hidden(&error) => unavailable += 1,
@@ -529,13 +549,13 @@ impl ControlService {
                             }
                         }
                         Ok::<_, PortError>(ContextSetInfo {
-                            id: saved_set.id,
-                            owner: saved_set.owner,
-                            home: saved_set.home,
-                            name: saved_set.name,
+                            id: request.input.id,
+                            owner: saved_meta.owner,
+                            home: request.input.home,
+                            name: request.input.name,
                             notes: visible,
                             unavailable,
-                            revision: saved_set.revision,
+                            revision: saved_meta.revision,
                         })
                     },
                     CommitEffect::Unknown,

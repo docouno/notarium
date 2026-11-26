@@ -86,6 +86,7 @@ struct PreparedDraft {
     command: CommandIdentity,
     title: String,
     slug: String,
+    raw_path: String,
     relative_path: String,
     folder_page: bool,
     carrier: String,
@@ -283,8 +284,9 @@ impl PreparedDraft {
             }
             slug
         };
-        let path = clean_path(draft.path.as_deref().unwrap_or_default())?;
-        let relative_path = corpus::strip_folder_prefix(&path, &placement.path).unwrap_or(path);
+        let raw_path = clean_path(draft.path.as_deref().unwrap_or_default())?;
+        let relative_path = corpus::strip_folder_prefix(&raw_path, &placement.path)
+            .unwrap_or_else(|| raw_path.clone());
         let plan = finalize_document(
             &draft.body,
             DocClass::UserDoc,
@@ -297,6 +299,7 @@ impl PreparedDraft {
             command,
             title,
             slug,
+            raw_path,
             relative_path,
             folder_page,
             carrier,
@@ -613,7 +616,8 @@ async fn execute(
         call,
         &scope,
         Some(placement.project.reference.folder_id.clone()),
-        prepared.relative_path.clone(),
+        prepared.raw_path.clone(),
+        super::DestinationPrefix::OptionalProjectPath(&placement.path),
         DocClass::UserDoc,
         &prepared.command,
         "create_destination",

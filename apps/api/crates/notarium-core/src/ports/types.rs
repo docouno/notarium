@@ -1061,7 +1061,7 @@ pub struct GraphQuery {
 }
 impl GraphQuery {
     pub fn validate(&self) -> DomainResult<()> {
-        if matches!(self.tier,GraphTier::Neighborhood{hops,..} if !(1..=3).contains(&hops)) {
+        if matches!(self.tier,GraphTier::Neighborhood{hops,..} if !(1..=2).contains(&hops)) {
             return Err(DomainError::validation(ValidationReason::InvalidLimit));
         }
         Ok(())

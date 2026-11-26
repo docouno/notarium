@@ -1316,14 +1316,19 @@ fn provider_ability_allowed(
         if !project.is_some_and(|p| projects.contains(p)) {
             return false;
         }
-        if let Some(primary) = primary_project
-            && inspection
-                .descriptor
-                .entrypoint
-                .as_ref()
-                .is_some_and(|entry| entry.space_id == primary.space_id)
-            && !projects.contains(primary)
-        {
+        // Mirror `ProviderService::validate_dispatch` (`ability_project` rules)
+        // so MCP never admits an ability whose recorded `ProviderOrigin::Ability`
+        // would unconditionally fail revalidation on the next completion step.
+        let dispatch_project = match &inspection.descriptor.reference.placement {
+            AbilityPlacement::OwnedProject(folder) => Some(folder),
+            AbilityPlacement::OwnedPersonal(_) | AbilityPlacement::System => {
+                primary_project.as_ref()
+            }
+            AbilityPlacement::OwnedSpace(space) => primary_project.as_ref().filter(|primary| {
+                &primary.space_id == space && call.auth.pinned_write_space() == Some(space)
+            }),
+        };
+        if !dispatch_project.is_some_and(|p| projects.contains(p)) {
             return false;
         }
     }
@@ -1727,7 +1732,8 @@ async fn list(
     };
 
     for (origin, proj) in origin_records {
-        call.record_origin(origin, proj)?;
+        call.record_origin(origin, proj)
+            .inspect_err(|_| commit_deferred_taints_on_error(call, &deferred_taints))?;
     }
     let next = next_inner
         .map(|inner| {
@@ -1735,7 +1741,8 @@ async fn list(
                 .ability_cursors
                 .insert(call.auth.principal().clone(), scope, inner)
         })
-        .transpose()?;
+        .transpose()
+        .inspect_err(|_| commit_deferred_taints_on_error(call, &deferred_taints))?;
     for commit in deferred_taints {
         commit.commit()?;
     }

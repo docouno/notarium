@@ -453,6 +453,100 @@ impl JournaledDestination {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+enum DestinationPrecheck {
+    WithStrip {
+        existed: bool,
+        stripped_segments: u16,
+    },
+    Legacy(bool),
+}
+
+impl DestinationPrecheck {
+    fn existed(self) -> bool {
+        match self {
+            Self::WithStrip { existed, .. } | Self::Legacy(existed) => existed,
+        }
+    }
+
+    fn stripped_segments(self) -> u16 {
+        match self {
+            Self::WithStrip {
+                stripped_segments, ..
+            } => stripped_segments,
+            Self::Legacy(_) => 0,
+        }
+    }
+}
+
+enum DestinationPrefix<'a> {
+    None,
+    OptionalProjectPath(&'a str),
+    RequiredProjectRoot,
+}
+
+fn segment_count(path: &str) -> Result<u16, PortError> {
+    u16::try_from(path.split('/').filter(|seg| !seg.is_empty()).count())
+        .map_err(|_| invalid(ValidationReason::InvalidPathComponent))
+}
+
+fn strip_leading_segments(path: &str, count: u16) -> Result<String, PortError> {
+    if count == 0 {
+        return Ok(path.to_owned());
+    }
+    let segments: Vec<&str> = path.split('/').filter(|seg| !seg.is_empty()).collect();
+    let skip = usize::from(count);
+    if segments.len() < skip {
+        return Err(invalid(ValidationReason::InvalidState));
+    }
+    Ok(segments[skip..].join("/"))
+}
+
+async fn admit_destination_anchor_for_replay(
+    call: &ToolCallContext<'_>,
+    scope: &SpaceContext,
+    base: &Option<FolderId>,
+    path: &str,
+    class: DocClass,
+    allow_trashed_base: bool,
+) -> Result<(), PortError> {
+    match admit_destination_anchor(call, scope, base, path, class).await {
+        Ok(()) => Ok(()),
+        Err(PortError::Domain(DomainError::ResourceNotFound)) if allow_trashed_base => {
+            if matches!(call.target, EgressTarget::ExternalMcp) {
+                return Ok(());
+            }
+            let Some(base_id) = base else {
+                return Err(DomainError::ResourceNotFound.into());
+            };
+            let base_ref = FolderRef {
+                space_id: scope.scope().space_id.clone(),
+                folder_id: base_id.clone(),
+            };
+            let trashed_account = notarium_core::ports::AccountContext::new(
+                scope.auth().with_preflight_taint(),
+                call.budget(),
+            );
+            let trashed = call
+                .registry
+                .catalog
+                .trashed_folder_ancestry(trashed_account, base_ref.clone())
+                .await?;
+            if trashed.reference != base_ref {
+                return Err(DomainError::ResourceNotFound.into());
+            }
+            let project = trashed.project.map(|folder_id| FolderRef {
+                space_id: scope.scope().space_id.clone(),
+                folder_id,
+            });
+            corpus::admit_folder_write(call, scope, &base_ref, project, &trashed.ancestors, class)
+                .await
+        }
+        Err(error) => Err(error),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn validate_destination(
     call: &ToolCallContext<'_>,
@@ -571,101 +665,140 @@ async fn ensure_destination(
     call: &ToolCallContext<'_>,
     scope: &SpaceContext,
     base: Option<FolderId>,
-    path: String,
+    raw_path: String,
+    prefix: DestinationPrefix<'_>,
     class: DocClass,
     content_command: &CommandIdentity,
     label: &str,
     expected_source: Option<&NoteRoute>,
 ) -> Result<(FolderRef, bool), PortError> {
     const ERR_LABEL: &str = "notarium.mcp.folder-destination.v1";
-    let has_path = !path.is_empty();
-    let (ensured, allow_trashed_replay): (JournaledDestination, bool) = if let Some(hit) = call
-        .lookup_journal_with_key::<JournaledDestination>(
-            label,
-            &content_command.key,
-            content_command.hash,
-        )
-        .await?
-    {
-        (hit, true)
-    } else {
-        admit_destination_anchor(call, scope, &base, &path, class).await?;
-        // Persist the pre-existence check before calling `ensure_folder_path`
-        // so a dedup failure after folder creation cannot lose `created: true`
-        // on retry or falsely report `NotCommitted`.
-        let existed_label = format!("{label}_existed");
-        let existed: bool = call
-            .journal_with_key(
-                &existed_label,
+    let (ensured, has_path, allow_trashed_replay): (JournaledDestination, bool, bool) =
+        if let Some(hit) = call
+            .lookup_journal_with_key::<JournaledDestination>(
+                label,
                 &content_command.key,
                 content_command.hash,
-                || async {
-                    if let Some(route) = expected_source {
-                        let live = metadata_snapshot(
-                            call,
-                            scope,
-                            &route.note,
-                            None,
-                            CausalBasis::Await(Default::default()),
-                        )
-                        .await?;
-                        if live.metadata.lifecycle() != Lifecycle::Active {
-                            return Err(DomainError::ResourceNotFound.into());
-                        }
-                        if live.metadata.revision() != &route.revision {
-                            return Err(DomainError::RevisionConflict {
-                                current: live.metadata.revision().clone(),
-                                lineage: None,
+            )
+            .await?
+        {
+            (hit, !raw_path.is_empty(), true)
+        } else {
+            // Persist both the pre-existence check and the leading-segment
+            // strip count before calling `ensure_folder_path` so a dedup
+            // failure after folder creation survives project renames/trash
+            // without storing user folder names in `control.mcp_dedup` or
+            // losing `created: true` on retry.
+            let existed_label = format!("{label}_existed");
+            let mut existed_replayed = true;
+            let precheck: DestinationPrecheck = call
+                .journal_with_key(
+                    &existed_label,
+                    &content_command.key,
+                    content_command.hash,
+                    || async {
+                        existed_replayed = false;
+                        let stripped_segments = match prefix {
+                            DestinationPrefix::None => 0,
+                            DestinationPrefix::OptionalProjectPath(project_path) => {
+                                if !project_path.is_empty()
+                                    && corpus::strip_folder_prefix(&raw_path, project_path)
+                                        .is_some()
+                                {
+                                    segment_count(project_path)?
+                                } else {
+                                    0
+                                }
                             }
-                            .into());
+                            DestinationPrefix::RequiredProjectRoot => {
+                                let root_id = base
+                                    .as_ref()
+                                    .ok_or_else(|| invalid(ValidationReason::InvalidState))?;
+                                let root = folder_base(call, scope, root_id).await?;
+                                if corpus::strip_folder_prefix(&raw_path, &root.path).is_none() {
+                                    return Err(DomainError::SpaceReadOnly.into());
+                                }
+                                segment_count(&root.path)?
+                            }
+                        };
+                        let path = strip_leading_segments(&raw_path, stripped_segments)?;
+                        admit_destination_anchor(call, scope, &base, &path, class).await?;
+                        if let Some(route) = expected_source {
+                            let live = metadata_snapshot(
+                                call,
+                                scope,
+                                &route.note,
+                                None,
+                                CausalBasis::Await(Default::default()),
+                            )
+                            .await?;
+                            if live.metadata.lifecycle() != Lifecycle::Active {
+                                return Err(DomainError::ResourceNotFound.into());
+                            }
+                            if live.metadata.revision() != &route.revision {
+                                return Err(DomainError::RevisionConflict {
+                                    current: live.metadata.revision().clone(),
+                                    lineage: None,
+                                }
+                                .into());
+                            }
                         }
-                    }
-                    Ok(!has_path
-                        || call
-                            .registry
-                            .engine
-                            .resolve_folder_path(scope.clone(), base.clone(), path.clone())
-                            .await?
-                            .is_some())
-                },
-            )
-            .await?;
-        let folder = call
-            .registry
-            .engine
-            .ensure_folder_path(
-                call.corpus_writer(scope.clone()).await?,
-                Mutation {
-                    identity: CommandIdentity {
-                        scope: content_command.scope.clone(),
-                        actor: content_command.actor.clone(),
-                        key: derive_key(
-                            "notarium.mcp.folder-destination.v1",
-                            &[content_command.key.as_str().as_bytes(), label.as_bytes()],
-                        ),
-                        hash: content_command.hash,
+                        let existed = path.is_empty()
+                            || call
+                                .registry
+                                .engine
+                                .resolve_folder_path(scope.clone(), base.clone(), path)
+                                .await?
+                                .is_some();
+                        Ok(DestinationPrecheck::WithStrip {
+                            existed,
+                            stripped_segments,
+                        })
                     },
-                    preconditions: Preconditions::default(),
-                    input: EnsureFolderPath { base, path },
-                },
-            )
-            .await?;
-        let plan = JournaledDestination::Detailed {
-            folder,
-            created: !existed,
+                )
+                .await?;
+            let existed = precheck.existed();
+            let path = strip_leading_segments(&raw_path, precheck.stripped_segments())?;
+            let has_path = !path.is_empty();
+            if existed_replayed {
+                admit_destination_anchor_for_replay(call, scope, &base, &path, class, true).await?;
+            }
+            let folder = call
+                .registry
+                .engine
+                .ensure_folder_path(
+                    call.corpus_writer(scope.clone()).await?,
+                    Mutation {
+                        identity: CommandIdentity {
+                            scope: content_command.scope.clone(),
+                            actor: content_command.actor.clone(),
+                            key: derive_key(
+                                "notarium.mcp.folder-destination.v1",
+                                &[content_command.key.as_str().as_bytes(), label.as_bytes()],
+                            ),
+                            hash: content_command.hash,
+                        },
+                        preconditions: Preconditions::default(),
+                        input: EnsureFolderPath { base, path },
+                    },
+                )
+                .await?;
+            let plan = JournaledDestination::Detailed {
+                folder,
+                created: !existed,
+            };
+            let recorded = call
+                .record_journal_with_key(label, &content_command.key, content_command.hash, &plan)
+                .await
+                .map_err(|error| {
+                    if !existed {
+                        post_commit_error(ERR_LABEL, error)
+                    } else {
+                        batch_operational_error(ERR_LABEL, error, false)
+                    }
+                })?;
+            (recorded, has_path, existed_replayed)
         };
-        let recorded = call
-            .record_journal_with_key(label, &content_command.key, content_command.hash, &plan)
-            .await
-            .map_err(|error| {
-                if !existed {
-                    post_commit_error(ERR_LABEL, error)
-                } else {
-                    batch_operational_error(ERR_LABEL, error, false)
-                }
-            })?;
-        (recorded, false)
-    };
     validate_destination(call, scope, class, ensured, has_path, allow_trashed_replay).await
 }
 
@@ -677,8 +810,8 @@ async fn move_note(call: &mut ToolCallContext<'_>, input: MoveInput) -> Result<V
     let slug = note_slug(before.provenance.as_ref())?;
     let class = before.metadata.class();
     let identity = call.command_identity(&route.scope, "move_note", 0);
-    // Consult the journaled destination before stripping the live project path
-    // prefix so a project-scoped replay survives a subsequent project rename.
+    // Consult the journaled destination and precheck before stripping the live
+    // project path prefix so a project-scoped replay survives project rename/trash.
     let (parent, created_folder) = if let Some(hit) = call
         .lookup_journal_with_key::<JournaledDestination>(
             "move_destination",
@@ -694,17 +827,17 @@ async fn move_note(call: &mut ToolCallContext<'_>, input: MoveInput) -> Result<V
             .spaces()
             .get(&route.scope.space_id)
             .and_then(|grant| grant.project_root.clone());
-        let path = if let Some(base) = &base {
-            let root = folder_base(call, &scope, base).await?;
-            corpus::strip_folder_prefix(&folder, &root.path).ok_or(DomainError::SpaceReadOnly)?
+        let prefix = if base.is_some() {
+            DestinationPrefix::RequiredProjectRoot
         } else {
-            folder
+            DestinationPrefix::None
         };
         ensure_destination(
             call,
             &scope,
             base,
-            path,
+            folder,
+            prefix,
             class,
             &identity,
             "move_destination",

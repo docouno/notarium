@@ -1193,7 +1193,7 @@ fn cluster_identity_survives_membership_changes_and_selects_a_typed_lens() {
     assert!(
         query(GraphTier::Neighborhood {
             note: note(1),
-            hops: 4
+            hops: 3
         })
         .validate()
         .is_err()

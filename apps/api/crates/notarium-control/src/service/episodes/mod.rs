@@ -581,7 +581,7 @@ impl ControlService {
                             scanned = scanned.saturating_add(1);
                             after = row.episode_id.clone();
                             let project = stored_project_ref(&row)?;
-                            if !episode_visible_to_narrowed(current.auth(), project.as_ref()) {
+                            if !episode_project_admitted(current.auth(), project.as_ref()) {
                                 continue;
                             }
                             admitted.push(project);

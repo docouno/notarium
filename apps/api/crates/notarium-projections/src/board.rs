@@ -27,7 +27,7 @@ use notarium_core::{
 use notarium_syntax::extract::{ExtractedDocDelta, extract};
 
 use crate::{
-    nota::{NotaDescriptor, ViewKind, compile_projected_views},
+    nota::{NotaDescriptor, ViewInput, ViewKind, compile_projected_views},
     query::{
         compare_board_rows, compare_group_keys, group_key, sort_tuple, source_matches,
         view_authorization_folder,
@@ -239,9 +239,18 @@ fn evaluate_rollback(
 > {
     let mut views = BTreeMap::new();
     let mut auth_folders = BTreeSet::new();
+    let restored_by_note: BTreeMap<&NoteId, &PlannedNoteRestoration> = request
+        .eligible_notes
+        .iter()
+        .map(|entry| (&entry.note, entry))
+        .collect();
     for view in &request.views {
         deadline.check()?;
-        let plan = board_plan(cut, ctx, view)?;
+        let restored_view = restored_by_note
+            .get(&view.note)
+            .copied()
+            .filter(|restoration| restoration.planned_lifecycle == Lifecycle::Active);
+        let plan = board_plan_for_rollback(cut, ctx, view, restored_view)?;
         if let Some(folder) =
             view_authorization_folder(&plan.descriptor.source, plan.source_folder.as_ref())
         {
@@ -278,6 +287,69 @@ struct BoardPlan<'a> {
     group_field_kind: BoardGroupFieldKind,
     fields: &'a BTreeMap<String, FieldSchema>,
     source_folder: Option<FolderId>,
+}
+
+fn board_plan_for_rollback<'a>(
+    cut: &'a BoardCut,
+    ctx: &SpaceContext,
+    view: &ViewRef,
+    restored_view: Option<&PlannedNoteRestoration>,
+) -> Result<BoardPlan<'a>, PortError> {
+    let Some(restoration) = restored_view else {
+        return board_plan(cut, ctx, view);
+    };
+    let current = cut
+        .notes
+        .get(&view.note)
+        .ok_or(DomainError::ResourceNotFound)?;
+    if current.revision != restoration.current_revision {
+        return Err(DomainError::validation(ValidationReason::CursorStale).into());
+    }
+    cut.authorize_placement(
+        ctx,
+        &restoration.planned_parent_folder,
+        restoration.planned_class,
+        restoration.planned_ability.clone(),
+    )?;
+    let carrier = restoration
+        .planned_carrier
+        .as_deref()
+        .ok_or_else(|| DomainError::validation(ValidationReason::InvalidView))?;
+    let views: Vec<ViewInput> = match extract(
+        carrier,
+        restoration.planned_class,
+        &restoration.note,
+        "",
+        None,
+    )? {
+        ExtractedDocDelta::Plain(doc) => doc.views.into_iter().map(ViewInput::from).collect(),
+        ExtractedDocDelta::Encrypted(_) => return Err(DomainError::ResourceNotFound.into()),
+    };
+    let fields = cut.schema_fields();
+    let compiled = compile_projected_views(&views, fields);
+    let descriptor = compiled.get(&view.key)?;
+    if descriptor.kind != ViewKind::Board {
+        return Err(DomainError::validation(ValidationReason::InvalidView).into());
+    }
+    let group_field = descriptor
+        .group_by
+        .clone()
+        .ok_or_else(|| DomainError::validation(ValidationReason::InvalidView))?;
+    let source_folder =
+        cut.resolve_source(&descriptor.source, &restoration.planned_parent_folder)?;
+    cut.authorize_entry(
+        ctx,
+        view_authorization_folder(&descriptor.source, source_folder.as_ref()),
+    )?;
+    cut.authorize_board_source(ctx, &descriptor.source, source_folder.as_ref())?;
+    Ok(BoardPlan {
+        view_revision: restoration.current_revision.clone(),
+        descriptor: descriptor.clone(),
+        group_field,
+        group_field_kind: descriptor.board_group_kind(fields)?,
+        fields,
+        source_folder,
+    })
 }
 
 fn board_plan<'a>(

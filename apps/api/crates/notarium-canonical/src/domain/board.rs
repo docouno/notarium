@@ -2051,6 +2051,38 @@ pub(crate) async fn authorized_view_head(
     Ok(head)
 }
 
+/// Authorize visibility of a view note referenced in `board_move_history`
+/// during agent-run rollback without requiring `Lifecycle::Active`.
+///
+/// Purged or purge-fenced views return `Ok(None)`; visible active or trashed
+/// views still enforce folder/class read authorization and return `Ok(Some(head))`.
+pub(crate) async fn authorized_rollback_view_head_opt(
+    tx: &mut BackendConn<'_>,
+    space: &notarium_core::auth::Space,
+    auth: &notarium_core::auth::EngineAuthContext,
+    view: &NoteId,
+) -> Result<Option<super::common::NoteHeadRow>, PortError> {
+    if is_note_purge_fenced_tx(tx, &space.id, view.as_str()).await? {
+        return Ok(None);
+    }
+    let head = match load_note_head_row_tx(tx, &space.id, view).await {
+        Ok(head) => head,
+        Err(PortError::Domain(DomainError::ResourceNotFound)) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let (facts, _) = build_resource_facts_tx(
+        tx,
+        space,
+        &head.parent_folder_id,
+        head.doc_class,
+        head.ability_id.clone(),
+        head.lifecycle == Lifecycle::Active,
+    )
+    .await?;
+    auth.authorize_read(&facts)?;
+    Ok(Some(head))
+}
+
 fn build_move_board_card_identity_spec(
     ctx: &SpaceContext,
     request: &Mutation<MoveBoardCard>,

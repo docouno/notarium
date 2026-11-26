@@ -612,6 +612,43 @@ impl ControlService {
             AbilityPlacement::System => Ok(()),
         }
     }
+    /// Verify a historical non-terminal trail hop's placement authority and
+    /// active Space without requiring a promoted ability's former source
+    /// project folder to still be un-trashed.
+    async fn ability_trail_hop_space_active(
+        &self,
+        ctx: &AccountContext,
+        identity: &AbilityIdentity,
+    ) -> Result<(), PortError> {
+        let personal_space = match &identity.placement {
+            AbilityPlacement::OwnedPersonal(owner) => {
+                if owner != ctx.auth().principal() {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+                self.personal_space_id_for_owner(owner).await?
+            }
+            _ => None,
+        };
+        authorize_ability_placement_auth(
+            ctx.auth(),
+            &identity.placement,
+            &identity.id,
+            personal_space.as_ref(),
+        )?;
+        match &identity.placement {
+            AbilityPlacement::OwnedPersonal(_) => {
+                let space = personal_space
+                    .as_ref()
+                    .ok_or(DomainError::ResourceNotFound)?;
+                self.catalog_space(ctx, space).await.map(|_| ())
+            }
+            AbilityPlacement::OwnedSpace(space) => self.catalog_space(ctx, space).await.map(|_| ()),
+            AbilityPlacement::OwnedProject(project) => {
+                self.catalog_space(ctx, &project.space_id).await.map(|_| ())
+            }
+            AbilityPlacement::System => Ok(()),
+        }
+    }
     async fn prefetch_projects(
         &self,
         ctx: &AccountContext,
@@ -1103,8 +1140,14 @@ impl ControlService {
                                     }
                                     Err(error) => return Err(error),
                                 };
+                                let terminal_id = chain.terminal.identity();
                                 for item in &chain.visited {
-                                    match self.ability_placement(&current, item).await {
+                                    let check = if item == &terminal_id {
+                                        self.ability_placement(&current, item).await
+                                    } else {
+                                        self.ability_trail_hop_space_active(&current, item).await
+                                    };
+                                    match check {
                                         Ok(()) => (),
                                         Err(error) if hidden(&error) => {
                                             return Ok(Err(AbilityResolution::OutOfScope));
@@ -1324,13 +1367,23 @@ impl ControlService {
             .await;
         budget.run(rtx.finish(), CommitEffect::NotCommitted).await?;
         let chain = followed?;
+        let terminal_id = chain.terminal.identity();
         for item in &chain.visited {
-            budget
-                .run(
-                    self.ability_placement(&current, item),
-                    CommitEffect::NotCommitted,
-                )
-                .await?;
+            if item == &terminal_id {
+                budget
+                    .run(
+                        self.ability_placement(&current, item),
+                        CommitEffect::NotCommitted,
+                    )
+                    .await?;
+            } else {
+                budget
+                    .run(
+                        self.ability_trail_hop_space_active(&current, item),
+                        CommitEffect::NotCommitted,
+                    )
+                    .await?;
+            }
         }
         Ok(chain.terminal)
     }
