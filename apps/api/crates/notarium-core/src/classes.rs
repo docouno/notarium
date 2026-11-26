@@ -1001,11 +1001,20 @@ impl ClassEgressFence {
     }
 }
 
+/// External vault identity is a routing hint reserved to the vault adapter.
+pub const VAULT_IDENTITY_FIELD: &str = "notarium-id";
+
 /// Structured field edits never authorize changes to identity, class or routing.
 pub fn authorize_field_key(key: &str) -> DomainResult<()> {
     if matches!(
         key,
-        "id" | "class" | "space_id" | "folder_id" | "revision_id" | "ability_id" | "__proto__"
+        "id" | "class"
+            | "space_id"
+            | "folder_id"
+            | "revision_id"
+            | "ability_id"
+            | "__proto__"
+            | VAULT_IDENTITY_FIELD
     ) {
         Err(DomainError::validation(ValidationReason::ProtectedField))
     } else {

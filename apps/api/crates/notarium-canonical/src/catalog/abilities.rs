@@ -16,6 +16,42 @@ const LIST_PACKAGES: &str = "SELECT ability_id, created_seq
 use super::*;
 use crate::codec::{AbilityRevisionMetadata, RevisionMetadataEnvelope, RevisionMetadataPayload};
 
+impl CanonicalStore {
+    /// The current immutable manifest for a vault's explicitly bound owned package.
+    /// The caller still needs to read each resource with its revision and digest.
+    pub async fn read_vault_ability_manifest(
+        &self,
+        ctx: &SpaceContext,
+        binding: &AbilityIdentity,
+    ) -> Result<AbilityPackageRevision, PortError> {
+        let budget = ctx.budget.clone();
+        let ctx = ctx.clone();
+        let binding = binding.clone();
+        self.with_read_tx_budget(Some(&budget), move |tx| {
+            Box::pin(async move {
+                let space = load_space_record(tx, &ctx.scope().space_id).await?;
+                ctx.check_current(&space.scope)?;
+                if binding.placement == AbilityPlacement::System {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+                let package = resolve(tx, ctx.auth(), &space, &binding.id, None).await?;
+                if package.reference.identity() != binding
+                    || package.metadata.lifecycle != Lifecycle::Active
+                {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+                ctx.auth().authorize_read(&package.facts)?;
+                Ok(AbilityPackageRevision {
+                    ability: binding.id,
+                    revision: package.reference.revision,
+                    manifest: package.metadata.resources,
+                })
+            })
+        })
+        .await
+    }
+}
+
 struct ResolvedAbility {
     reference: AbilityRef,
     entrypoint: NoteRef,

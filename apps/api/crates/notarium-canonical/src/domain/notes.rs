@@ -62,6 +62,7 @@ use crate::{
         read_immutable_revision_tx, validate_snapshot_cutoff_tx,
     },
     sql_exec::BackendConn,
+    vault::{VaultWrite, upsert_observation_tx},
     writer::{BatchEventDraft, ItemCommitArtifacts, PreparedWriteIntent},
 };
 
@@ -590,14 +591,26 @@ async fn authorize_create_placement(
 
 pub(crate) async fn create_note_impl(
     store: &CanonicalStore,
+    ctx: SpaceContext,
+    request: Mutation<CreateNote>,
+) -> Result<Committed<NoteRevision>, PortError> {
+    create_note_with_vault(store, ctx, request, None).await
+}
+
+pub(crate) async fn create_note_with_vault(
+    store: &CanonicalStore,
     mut ctx: SpaceContext,
     request: Mutation<CreateNote>,
+    vault: Option<VaultWrite>,
 ) -> Result<Committed<NoteRevision>, PortError> {
     let budget = ctx.budget.clone();
     let deadline = super::common::CommandDeadline::start(&budget, "create_note");
     let active_op_guard = store.enter_write_op(&ctx.scope().space_id)?;
     validate_mutation_identity(&ctx, &request.identity)?;
     crate::domain::common::require_empty_preconditions(&request.preconditions)?;
+    if let Some(vault) = &vault {
+        vault.require_current_binding(store, &ctx).await?;
+    }
     let slug_fold = normalize_slug_key(&request.input.slug)?;
     if request.input.class == DocClass::Skill {
         ctx.auth().authorize_ability_mutation()?;
@@ -638,14 +651,19 @@ pub(crate) async fn create_note_impl(
         &space_rec.root_folder_id,
         info.prepared_blob.digest,
     );
-    let idemp = create_note_identity(
+    let digest = info.prepared_blob.digest;
+    let mut idemp = create_note_identity(
         &ctx,
         &request.identity,
         &request.input,
         &space_rec.root_folder_id,
         info.prepared_blob.digest,
     );
-    let (intent, fast_plan) = if store.is_sqlite_local() {
+    if let Some(vault) = &vault {
+        vault.fingerprint(&mut idemp)?;
+    }
+    let legacy_replay = vault.is_none();
+    let (mut intent, fast_plan) = if store.is_sqlite_local() && legacy_replay {
         let (intent, plan) = crate::sqlite_fast::build_create_note_fast_intent(
             &space_rec.scope,
             space_rec.active_epoch,
@@ -672,6 +690,9 @@ pub(crate) async fn create_note_impl(
             None,
         )
     };
+    if let Some(vault) = vault {
+        intent = vault.wrap(ctx.clone(), intent, Some(digest));
+    }
     ctx.budget.remaining = deadline.remaining(&budget)?;
     match store
         .submit_write_command_until::<StoredCommittedNoteRevV1>(
@@ -684,7 +705,7 @@ pub(crate) async fn create_note_impl(
         )
         .await
     {
-        Err(PortError::Domain(DomainError::IdempotencyKeyReused)) => {
+        Err(PortError::Domain(DomainError::IdempotencyKeyReused)) if legacy_replay => {
             ctx.budget.remaining = deadline.remaining(&budget)?;
             let legacy = v1_receipts::LegacyNoteCommand::Create(created);
             let result = deadline
@@ -1808,12 +1829,24 @@ pub(crate) async fn delete_note_impl(
     ctx: SpaceContext,
     request: Mutation<DeleteNote>,
 ) -> Result<Committed<NoteRevision>, PortError> {
+    delete_note_with_vault(store, ctx, request, None).await
+}
+
+pub(crate) async fn delete_note_with_vault(
+    store: &CanonicalStore,
+    ctx: SpaceContext,
+    request: Mutation<DeleteNote>,
+    vault: Option<VaultWrite>,
+) -> Result<Committed<NoteRevision>, PortError> {
     let deadline = crate::domain::common::CommandDeadline::start(&ctx.budget, "delete_note");
     if request.input.disposition == DeleteDisposition::Purge {
         return crate::domain::purge::purge_note_impl(store, ctx, request).await;
     }
 
     validate_mutation_identity(&ctx, &request.identity)?;
+    if let Some(vault) = &vault {
+        vault.require_current_binding(store, &ctx).await?;
+    }
     let space_rec = deadline
         .prepare(&ctx.budget, || {
             store.read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
@@ -1827,11 +1860,14 @@ pub(crate) async fn delete_note_impl(
         DeleteDisposition::Purge => unreachable!(),
     };
     let fp = format!("{disp_tag}={}", request.input.note.as_str());
-    let idemp = derive_command_identity_spec(&request.identity, disp_tag, fp.as_bytes())
+    let mut idemp = derive_command_identity_spec(&request.identity, disp_tag, fp.as_bytes())
         .with_preconditions(&request.preconditions, "note", request.input.note.as_str())
         .for_note(ctx.auth(), &request.input.note);
 
-    let intent = build_trash_or_restore_intent(
+    if let Some(vault) = &vault {
+        vault.fingerprint(&mut idemp)?;
+    }
+    let mut intent = build_trash_or_restore_intent(
         store,
         &space_rec.scope,
         space_rec.active_epoch,
@@ -1840,6 +1876,9 @@ pub(crate) async fn delete_note_impl(
         request.preconditions,
         request.input,
     );
+    if let Some(vault) = vault {
+        intent = vault.wrap(ctx.clone(), intent, None);
+    }
 
     let stored: StoredCommittedNoteRevV1 = deadline.submit(store, &ctx.budget, intent).await?;
     Ok(stored.into_committed())
@@ -2256,19 +2295,34 @@ async fn check_move_pin(
 
 pub(crate) async fn move_note_impl(
     store: &CanonicalStore,
+    ctx: SpaceContext,
+    request: Mutation<MoveNote>,
+) -> Result<Committed<NoteRevision>, PortError> {
+    move_note_with_vault(store, ctx, request, None).await
+}
+
+pub(crate) async fn move_note_with_vault(
+    store: &CanonicalStore,
     mut ctx: SpaceContext,
     request: Mutation<MoveNote>,
+    vault: Option<VaultWrite>,
 ) -> Result<Committed<NoteRevision>, PortError> {
     let deadline = super::common::CommandDeadline::start(&ctx.budget, "move_note");
     validate_mutation_identity(&ctx, &request.identity)?;
+    if let Some(vault) = &vault {
+        vault.require_current_binding(store, &ctx).await?;
+    }
     let new_slug_fold = normalize_slug_key(&request.input.slug)?;
 
-    let idemp = move_note_identity(
+    let mut idemp = move_note_identity(
         &ctx,
         &request.identity,
         &request.input,
         &request.preconditions,
     );
+    if let Some(vault) = &vault {
+        vault.fingerprint(&mut idemp)?;
+    }
 
     let (space_rec, pin) = if let Some(interceptor) = store.inner.collab_interceptor.get() {
         if let Some(replayed) = deadline
@@ -2312,7 +2366,7 @@ pub(crate) async fn move_note_impl(
         (space, MovePin::Checked)
     };
 
-    let intent = build_move_note_intent(
+    let mut intent = build_move_note_intent(
         &space_rec.scope,
         space_rec.active_epoch,
         Some(idemp),
@@ -2322,6 +2376,9 @@ pub(crate) async fn move_note_impl(
         new_slug_fold,
         Ok(pin),
     );
+    if let Some(vault) = vault {
+        intent = vault.wrap(ctx.clone(), intent, None);
+    }
 
     ctx.budget.remaining = deadline.remaining(&ctx.budget)?;
     let stored: StoredCommittedNoteRevV1 = deadline.submit(store, &ctx.budget, intent).await?;
@@ -4832,7 +4889,8 @@ async fn current_observation_head(
 fn external_observation_identity(
     ctx: &SpaceContext,
     request: &Mutation<ExternalObservation>,
-) -> crate::writer::CommandIdentitySpec {
+    vault_commit: Option<&notarium_core::ports::VaultObservationCommit>,
+) -> Result<crate::writer::CommandIdentitySpec, PortError> {
     let mut fp = blake3::Hasher::new();
     fp.update(request.input.note.as_str().as_bytes());
     fp.update(&[0]);
@@ -4841,14 +4899,18 @@ fn external_observation_identity(
     fp.update(request.input.base_revision.as_str().as_bytes());
     fp.update(&[0]);
     fp.update(request.input.disk_identity.as_bytes());
-    derive_command_identity_spec(
+    if let Some(commit) = vault_commit {
+        fp.update(b"vault-observation-commit");
+        fp.update(&CanonicalStore::encode_command_outcome(commit)?);
+    }
+    Ok(derive_command_identity_spec(
         &request.identity,
         "accept_external_observation",
         fp.finalize().as_bytes(),
     )
     .with_preconditions(&request.preconditions, "note", request.input.note.as_str())
     .with_known_base(&request.input.base_revision)
-    .for_note(ctx.auth(), &request.input.note)
+    .for_note(ctx.auth(), &request.input.note))
 }
 
 fn external_observation_result(outcome: StoredExternalObsOutcomeV1) -> ExternalObservationResult {
@@ -4916,6 +4978,7 @@ impl CanonicalStore {
         preconditions: Preconditions,
         input: ExternalObservation,
         settlement: RoomCommandSettlement,
+        vault_commit: Option<notarium_core::ports::VaultObservationCommit>,
     ) -> Result<ExternalObservationResult, PortError> {
         let deadline = CommandDeadline::start(&ctx.budget, "observation_room");
         let active_op = self.enter_write_op(&ctx.scope().space_id)?;
@@ -4925,7 +4988,7 @@ impl CanonicalStore {
             input,
         };
         validate_mutation_identity(&ctx, &request.identity)?;
-        let idemp = external_observation_identity(&ctx, &request);
+        let idemp = external_observation_identity(&ctx, &request, vault_commit.as_ref())?;
         if let Some(replayed) =
             replay_external_observation(self, &ctx, deadline, &request.input, &idemp).await?
         {
@@ -4969,6 +5032,7 @@ impl CanonicalStore {
             observed_bytes,
             verified_plan,
             Some(CarrierRoomWrite::Accepted(work.transition)),
+            vault_commit,
         );
         match self
             .submit_write_command_until::<StoredExternalObsOutcomeV1>(
@@ -4989,14 +5053,29 @@ impl CanonicalStore {
 
 pub(crate) async fn accept_external_observation_impl(
     store: &CanonicalStore,
+    ctx: SpaceContext,
+    request: Mutation<ExternalObservation>,
+) -> Result<ExternalObservationResult, PortError> {
+    accept_external_observation_with_vault(store, ctx, request, None).await
+}
+
+pub(crate) async fn accept_external_observation_with_vault(
+    store: &CanonicalStore,
     mut ctx: SpaceContext,
     request: Mutation<ExternalObservation>,
+    vault: Option<(VaultWrite, notarium_core::ports::VaultObservationCommit)>,
 ) -> Result<ExternalObservationResult, PortError> {
     let deadline =
         super::common::CommandDeadline::start(&ctx.budget, "accept_external_observation");
     let budget = ctx.budget.clone();
     validate_mutation_identity(&ctx, &request.identity)?;
-    let idemp = external_observation_identity(&ctx, &request);
+    if let Some((vault, _)) = &vault {
+        deadline
+            .prepare(&budget, || vault.require_current_binding(store, &ctx))
+            .await?;
+    }
+    let vault_commit = vault.as_ref().map(|(_, commit)| commit.clone());
+    let idemp = external_observation_identity(&ctx, &request, vault_commit.as_ref())?;
 
     if let Some(replayed) =
         replay_external_observation(store, &ctx, deadline, &request.input, &idemp).await?
@@ -5004,6 +5083,11 @@ pub(crate) async fn accept_external_observation_impl(
         return Ok(replayed);
     }
 
+    if let Some((vault, _)) = &vault {
+        deadline
+            .prepare(&budget, || vault.require_current_observation(store, &ctx))
+            .await?;
+    }
     let current = current_observation_head(store, &mut ctx, &request, &deadline).await;
     let (space_rec, base_head) = match current {
         Ok(head) => head,
@@ -5177,7 +5261,10 @@ pub(crate) async fn accept_external_observation_impl(
                     identity: request.identity.clone(),
                     preconditions: request.preconditions.clone(),
                     payload: InterceptedPayload::ExternalObservation {
-                        observation: request.input.clone(), body: body_plan, header: header_mut,
+                        observation: request.input.clone(),
+                        body: body_plan,
+                        header: header_mut,
+                        vault_commit: vault_commit.clone(),
                     },
                 }) => result?,
                 () = budget.cancellation.cancelled() => return Err(unknown()),
@@ -5264,6 +5351,7 @@ pub(crate) async fn accept_external_observation_impl(
         new_carrier.len() as u64,
         verified_plan,
         reservation_opt,
+        vault_commit,
     );
     ctx.budget.remaining = deadline.remaining(&budget)?;
     match deadline
@@ -5287,6 +5375,7 @@ fn build_observation_intent(
     observed_bytes: u64,
     verified_plan: Option<ContentDigest>,
     reservation_opt: Option<CarrierRoomWrite>,
+    vault_commit: Option<notarium_core::ports::VaultObservationCommit>,
 ) -> PreparedWriteIntent {
     let scope_cl = space_rec.scope.clone();
     let staged_bytes = ticket.compressed_size;
@@ -5297,6 +5386,7 @@ fn build_observation_intent(
         input: obs_input,
     } = request;
     let room_store = store.clone();
+    let vault_commit = vault_commit.map(|commit| (ctx.clone(), commit));
 
     PreparedWriteIntent {
         scope: scope_cl.clone(),
@@ -5308,6 +5398,20 @@ fn build_observation_intent(
         execute: Box::new(move |tx, item_ctx| {
             Box::pin(async move {
                 let live_space = load_space_record(tx, &scope_cl.space_id).await?;
+                let accepted_vault = if let Some((ctx, commit)) = &vault_commit {
+                    Some(
+                        VaultWrite::prepare_observation_commit(
+                            tx,
+                            ctx,
+                            &live_space,
+                            &obs_input,
+                            commit,
+                        )
+                        .await?,
+                    )
+                } else {
+                    None
+                };
                 let head = load_note_head_row_tx(tx, &scope_cl.space_id, &obs_input.note).await?;
                 if head.lifecycle != Lifecycle::Active {
                     return Err(DomainError::ResourceNotFound.into());
@@ -5382,11 +5486,13 @@ fn build_observation_intent(
                     seq,
                 )
                 .await?;
-                let rel_path = if anc.folder_path.is_empty() {
-                    format!("{}.md", head.slug)
-                } else {
-                    format!("{}/{}.md", anc.folder_path, head.slug)
-                };
+                let legacy_path = accepted_vault.is_none().then(|| {
+                    if anc.folder_path.is_empty() {
+                        format!("{}.md", head.slug)
+                    } else {
+                        format!("{}/{}.md", anc.folder_path, head.slug)
+                    }
+                });
 
                 match tx {
                     BackendConn::Sqlite(conn) => {
@@ -5412,45 +5518,47 @@ fn build_observation_intent(
                         .await
                         .map_err(|err| internal_not_committed("sqlite_obs_head", err.to_string()))?;
 
-                        sqlx::query(
-                            "INSERT INTO materialized_observations (
-                                space_id, note_id, rel_path, inode, mtime_ns, byte_size,
-                                blake3_hash, disk_identity, observed_revision, applied_seq
-                             ) VALUES (?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?)
-                             ON CONFLICT (space_id, note_id, rel_path) DO UPDATE SET
-                                byte_size = excluded.byte_size,
-                                blake3_hash = excluded.blake3_hash,
-                                disk_identity = excluded.disk_identity,
-                                observed_revision = excluded.observed_revision,
-                                applied_seq = excluded.applied_seq",
-                        )
-                        .bind(scope_cl.space_id.as_str())
-                        .bind(obs_input.note.as_str())
-                        .bind(&rel_path)
-                        .bind(observed_bytes as i64)
-                        .bind(obs_input.observed_digest.as_bytes().as_slice())
-                        .bind(obs_input.disk_identity.as_bytes().as_slice())
-                        .bind(new_rev.as_str())
-                        .bind(seq_i64)
-                        .execute(&mut **conn)
-                        .await
-                        .map_err(|err| {
-                            internal_not_committed("sqlite_obs_upsert", err.to_string())
-                        })?;
+                        if let Some(rel_path) = &legacy_path {
+                            sqlx::query(
+                                "INSERT INTO materialized_observations (
+                                    space_id, note_id, rel_path, inode, mtime_ns, byte_size,
+                                    blake3_hash, disk_identity, observed_revision, applied_seq
+                                 ) VALUES (?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?)
+                                 ON CONFLICT (space_id, note_id, rel_path) DO UPDATE SET
+                                    byte_size = excluded.byte_size,
+                                    blake3_hash = excluded.blake3_hash,
+                                    disk_identity = excluded.disk_identity,
+                                    observed_revision = excluded.observed_revision,
+                                    applied_seq = excluded.applied_seq",
+                            )
+                            .bind(scope_cl.space_id.as_str())
+                            .bind(obs_input.note.as_str())
+                            .bind(rel_path)
+                            .bind(observed_bytes as i64)
+                            .bind(obs_input.observed_digest.as_bytes().as_slice())
+                            .bind(obs_input.disk_identity.as_bytes().as_slice())
+                            .bind(new_rev.as_str())
+                            .bind(seq_i64)
+                            .execute(&mut **conn)
+                            .await
+                            .map_err(|err| {
+                                internal_not_committed("sqlite_obs_upsert", err.to_string())
+                            })?;
 
-                        sqlx::query(
-                            "INSERT OR IGNORE INTO payload_owners (
-                                space_id, payload_kind, payload_id, note_id
-                             ) VALUES (?, 'materialized_observation', ?, ?)",
-                        )
-                        .bind(scope_cl.space_id.as_str())
-                        .bind(&rel_path)
-                        .bind(obs_input.note.as_str())
-                        .execute(&mut **conn)
-                        .await
-                        .map_err(|err| {
-                            internal_not_committed("sqlite_obs_owner", err.to_string())
-                        })?;
+                            sqlx::query(
+                                "INSERT OR IGNORE INTO payload_owners (
+                                    space_id, payload_kind, payload_id, note_id
+                                 ) VALUES (?, 'materialized_observation', ?, ?)",
+                            )
+                            .bind(scope_cl.space_id.as_str())
+                            .bind(rel_path)
+                            .bind(obs_input.note.as_str())
+                            .execute(&mut **conn)
+                            .await
+                            .map_err(|err| {
+                                internal_not_committed("sqlite_obs_owner", err.to_string())
+                            })?;
+                        }
                     }
                     BackendConn::Postgres(conn) => {
                         sqlx::query(
@@ -5475,45 +5583,62 @@ fn build_observation_intent(
                         .await
                         .map_err(|err| internal_not_committed("pg_obs_head", err.to_string()))?;
 
-                        sqlx::query(
-                            "INSERT INTO materialized_observations (
-                                space_id, note_id, rel_path, inode, mtime_ns, byte_size,
-                                blake3_hash, disk_identity, observed_revision, applied_seq
-                             ) VALUES ($1, $2, $3, NULL, NULL, $4, $5, $6, $7, $8)
-                             ON CONFLICT (space_id, note_id, rel_path) DO UPDATE SET
-                                byte_size = EXCLUDED.byte_size,
-                                blake3_hash = EXCLUDED.blake3_hash,
-                                disk_identity = EXCLUDED.disk_identity,
-                                observed_revision = EXCLUDED.observed_revision,
-                                applied_seq = EXCLUDED.applied_seq",
-                        )
-                        .bind(scope_cl.space_id.as_str())
-                        .bind(obs_input.note.as_str())
-                        .bind(&rel_path)
-                        .bind(observed_bytes as i64)
-                        .bind(obs_input.observed_digest.as_bytes().as_slice())
-                        .bind(obs_input.disk_identity.as_bytes().as_slice())
-                        .bind(new_rev.as_str())
-                        .bind(seq_i64)
-                        .execute(&mut **conn)
-                        .await
-                        .map_err(|err| internal_not_committed("pg_obs_upsert", err.to_string()))?;
+                        if let Some(rel_path) = &legacy_path {
+                            sqlx::query(
+                                "INSERT INTO materialized_observations (
+                                    space_id, note_id, rel_path, inode, mtime_ns, byte_size,
+                                    blake3_hash, disk_identity, observed_revision, applied_seq
+                                 ) VALUES ($1, $2, $3, NULL, NULL, $4, $5, $6, $7, $8)
+                                 ON CONFLICT (space_id, note_id, rel_path) DO UPDATE SET
+                                    byte_size = EXCLUDED.byte_size,
+                                    blake3_hash = EXCLUDED.blake3_hash,
+                                    disk_identity = EXCLUDED.disk_identity,
+                                    observed_revision = EXCLUDED.observed_revision,
+                                    applied_seq = EXCLUDED.applied_seq",
+                            )
+                            .bind(scope_cl.space_id.as_str())
+                            .bind(obs_input.note.as_str())
+                            .bind(rel_path)
+                            .bind(observed_bytes as i64)
+                            .bind(obs_input.observed_digest.as_bytes().as_slice())
+                            .bind(obs_input.disk_identity.as_bytes().as_slice())
+                            .bind(new_rev.as_str())
+                            .bind(seq_i64)
+                            .execute(&mut **conn)
+                            .await
+                            .map_err(|err| {
+                                internal_not_committed("pg_obs_upsert", err.to_string())
+                            })?;
 
-                        sqlx::query(
-                            "INSERT INTO payload_owners (
-                                space_id, payload_kind, payload_id, note_id
-                             ) VALUES ($1, 'materialized_observation', $2, $3)
-                             ON CONFLICT DO NOTHING",
-                        )
-                        .bind(scope_cl.space_id.as_str())
-                        .bind(&rel_path)
-                        .bind(obs_input.note.as_str())
-                        .execute(&mut **conn)
-                        .await
-                        .map_err(|err| internal_not_committed("pg_obs_owner", err.to_string()))?;
+                            sqlx::query(
+                                "INSERT INTO payload_owners (
+                                    space_id, payload_kind, payload_id, note_id
+                                 ) VALUES ($1, 'materialized_observation', $2, $3)
+                                 ON CONFLICT DO NOTHING",
+                            )
+                            .bind(scope_cl.space_id.as_str())
+                            .bind(rel_path)
+                            .bind(obs_input.note.as_str())
+                            .execute(&mut **conn)
+                            .await
+                            .map_err(|err| {
+                                internal_not_committed("pg_obs_owner", err.to_string())
+                            })?;
+                        }
                     }
                 }
 
+                if let Some((binding, mut observation)) = accepted_vault {
+                    // A merged carrier that has not reached disk cannot be
+                    // the base of the next edit, move, or removal. Keep the
+                    // previous base and use the fresh file stamp for the
+                    // conditional publication of the merge.
+                    if digest == obs_input.observed_digest {
+                        observation.revision = new_rev.clone();
+                        observation.carrier_digest = digest;
+                    }
+                    upsert_observation_tx(tx, &binding, &observation).await?;
+                }
                 let current_schema = load_current_space_schema_tx(tx, &scope_cl.space_id).await?;
                 let eval_fields = if head.doc_class == DocClass::EncryptedNote {
                     BTreeMap::new()

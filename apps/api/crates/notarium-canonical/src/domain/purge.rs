@@ -892,7 +892,7 @@ pub(crate) async fn mint_and_purge_impl(
                     &scope,
                     item_ctx.active_epoch,
                     &old_head,
-                    Some(&input.new_note),
+                    Some((&input.new_note, &new_note_rev)),
                     &tombstone_rev,
                     purge_seq,
                     &purge_id,
@@ -1280,7 +1280,7 @@ async fn execute_sql_erasure_for_old_note_tx(
     scope: &HistoryScope,
     active_epoch: LeaseEpoch,
     old_head: &crate::domain::common::NoteHeadRow,
-    successor_note_id: Option<&NoteId>,
+    successor: Option<(&NoteId, &RevisionId)>,
     tombstone_rev_id: &RevisionId,
     purge_seq: SpaceSeq,
     purge_id: &str,
@@ -1292,7 +1292,10 @@ async fn execute_sql_erasure_for_old_note_tx(
     let pseq_i64 = purge_seq.get() as i64;
     let old_lc_str = crate::codec::lifecycle_to_db(old_head.lifecycle);
     let old_id_str = old_head.note_id.as_str();
-    let succ_str = successor_note_id.map(NoteId::as_str);
+    let succ_str = successor.map(|(note, _)| note.as_str());
+
+    crate::vault::handoff_purged_note_tx(tx, scope, &old_head.note_id, successor, purge_seq)
+        .await?;
 
     // 1. Permanent `revision_purge_fences` row!
     match tx {

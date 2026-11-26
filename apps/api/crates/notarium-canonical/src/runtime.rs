@@ -671,9 +671,16 @@ impl CanonicalRuntime {
     }
 
     fn start_shutdown(self) -> tokio::task::JoinHandle<Result<(), PortError>> {
+        self.start_shutdown_mode(false)
+    }
+
+    fn start_shutdown_mode(
+        self,
+        truncate_sqlite_wal: bool,
+    ) -> tokio::task::JoinHandle<Result<(), PortError>> {
         self.inner.backup_shutdown.cancel();
         let executor = self.inner.backup_executor.clone();
-        executor.spawn(Box::pin(self.drain_shutdown()))
+        executor.spawn(Box::pin(self.drain_shutdown(truncate_sqlite_wal)))
     }
 
     pub async fn shutdown(self) -> Result<(), PortError> {
@@ -682,7 +689,16 @@ impl CanonicalRuntime {
             .map_err(|error| internal_not_committed("canonical_shutdown_join", error.to_string()))?
     }
 
-    async fn drain_shutdown(self) -> Result<(), PortError> {
+    /// Close the local runtime and confirm that the SQLite WAL was truncated.
+    /// Call after the host has stopped intake and persisted its final checkpoints.
+    /// The runtime releases its connections and ownership even if truncation fails.
+    pub async fn shutdown_with_wal_truncate(self) -> Result<(), PortError> {
+        self.start_shutdown_mode(true)
+            .await
+            .map_err(|error| internal_not_committed("canonical_shutdown_join", error.to_string()))?
+    }
+
+    async fn drain_shutdown(self, truncate_sqlite_wal: bool) -> Result<(), PortError> {
         self.inner.live_visibility.close_and_drain().await;
         // Closing a backup phase can schedule a final join or artifact cleanup.
         // Admission already closed when shutdown was requested.
@@ -709,6 +725,7 @@ impl CanonicalRuntime {
             wal.shutdown().await;
         }
         self.inner.shutting_down.store(true, Ordering::SeqCst);
+        let mut result = Ok(());
         match &self.inner.sql {
             SqlDriverState::Sqlite {
                 writer,
@@ -721,12 +738,46 @@ impl CanonicalRuntime {
                 let mut guard = writer.lock().await;
                 if let Some(mut pair) = guard.take() {
                     if let Some(rconn) = pair.rusqlite_conn.take() {
-                        let _ = tokio::task::spawn_blocking(move || {
-                            let _ = rconn.close();
+                        let closed = tokio::task::spawn_blocking(move || {
+                            rconn.close().map_err(|(_, error)| error.to_string())
                         })
                         .await;
+                        if truncate_sqlite_wal {
+                            result = closed
+                                .map_err(|error| {
+                                    internal_not_committed(
+                                        "canonical_shutdown_sqlite_close",
+                                        error.to_string(),
+                                    )
+                                })
+                                .and_then(|closed| {
+                                    closed.map_err(|error| {
+                                        internal_not_committed(
+                                            "canonical_shutdown_sqlite_close",
+                                            error,
+                                        )
+                                    })
+                                });
+                        }
                     }
-                    let _ = pair.sqlx_conn.close().await;
+                    if truncate_sqlite_wal {
+                        let checkpoint = crate::wal::truncate_drained_wal(&mut pair).await;
+                        result = result.and(checkpoint);
+                    }
+                    let closed = pair.sqlx_conn.close().await;
+                    if truncate_sqlite_wal {
+                        result = result.and(closed.map_err(|error| {
+                            internal_not_committed(
+                                "canonical_shutdown_sqlite_close",
+                                error.to_string(),
+                            )
+                        }));
+                    }
+                } else if truncate_sqlite_wal {
+                    result = Err(internal_not_committed(
+                        "canonical_shutdown_sqlite_writer_missing",
+                        "SQLite writer unavailable for final WAL checkpoint",
+                    ));
                 }
             }
             SqlDriverState::Postgres {
@@ -746,6 +797,12 @@ impl CanonicalRuntime {
                 drop(cached_w);
                 drop(cached_r);
                 pool.close().await;
+                if truncate_sqlite_wal {
+                    result = Err(internal_not_committed(
+                        "canonical_shutdown_not_sqlite",
+                        "final WAL checkpoint requires SQLite",
+                    ));
+                }
             }
         }
         let mut locks = self.inner.owner_locks.lock().await;
@@ -753,7 +810,7 @@ impl CanonicalRuntime {
         if let BlobBackendDriver::Local(local) = &self.inner.blobs {
             local.clear_cached_dirs();
         }
-        Ok(())
+        result
     }
 }
 

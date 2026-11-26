@@ -111,6 +111,10 @@ cron = "0.15"
 chrono-tz = "0.10"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 
+libc = "0.2"
+tempfile = "3"
+windows-sys = "0.61"
+
 [profile.dev]
 debug = "line-tables-only"
 

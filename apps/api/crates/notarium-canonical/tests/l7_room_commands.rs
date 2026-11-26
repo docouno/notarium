@@ -324,6 +324,7 @@ async fn canonical_room_command_settlement(store: &CanonicalStore) -> Observatio
                 yrs_snapshot: vec![2, 0],
                 ..settlement.clone()
             },
+            None,
         )
         .await
         .unwrap()

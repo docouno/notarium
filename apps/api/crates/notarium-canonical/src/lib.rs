@@ -26,6 +26,7 @@ pub mod runtime;
 pub mod schema;
 pub(crate) mod sql_exec;
 pub(crate) mod sqlite_fast;
+pub mod vault;
 pub mod wal;
 pub mod writer;
 

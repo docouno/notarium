@@ -326,6 +326,31 @@ pub(crate) async fn read_cancelled(budget: Option<&CallBudget>) -> PortError {
     cancelled_not_committed("sqlite_read_cancelled", "ordinary SQLite read cancelled")
 }
 
+/// The owner calls this with both writer and reader admission closed and all
+/// other connections drained. A successful SQLite TRUNCATE reports zero frames.
+pub(crate) async fn truncate_drained_wal(
+    writer: &mut crate::sqlite_fast::SqliteWriterPair,
+) -> Result<(), PortError> {
+    let checkpoint_error = |error: sqlx::Error| {
+        internal_not_committed("canonical_shutdown_wal_checkpoint", error.to_string())
+    };
+    sqlx::query("PRAGMA busy_timeout = 250")
+        .execute(&mut writer.sqlx_conn)
+        .await
+        .map_err(checkpoint_error)?;
+    let status: (i64, i64, i64) = sqlx::query_as("PRAGMA main.wal_checkpoint(TRUNCATE)")
+        .fetch_one(&mut writer.sqlx_conn)
+        .await
+        .map_err(checkpoint_error)?;
+    if status != (0, 0, 0) {
+        return Err(internal_not_committed(
+            "canonical_shutdown_wal_incomplete",
+            format!("final WAL checkpoint did not truncate: {status:?}"),
+        ));
+    }
+    Ok(())
+}
+
 pub fn sqlite_wal_path_for(db_path: &Path) -> PathBuf {
     let mut s = db_path.as_os_str().to_os_string();
     s.push("-wal");
@@ -1923,6 +1948,57 @@ mod tests {
             .await
             .unwrap();
         next.shutdown().await.unwrap();
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn final_truncate_reports_a_pinned_external_reader_and_releases_ownership() {
+        use crate::CreateSpaceSpec;
+        use notarium_core::{
+            auth::SpaceKind,
+            ids::{FolderId, HistoryIncarnation, LeaseEpoch, PrincipalId, SpaceId, SpaceSeq},
+        };
+
+        let (store, runtime, path) = lifecycle_fixture().await;
+        let id = SpaceId::from_bytes([17; 16]);
+        store
+            .create_space(CreateSpaceSpec {
+                space_id: id.clone(),
+                incarnation: HistoryIncarnation::from_bytes([18; 16]),
+                root_folder_id: FolderId::from_bytes([19; 16]),
+                slug: "checkpoint-test".into(),
+                kind: SpaceKind::Personal,
+                owner: PrincipalId::from_bytes([20; 16]),
+                active_epoch: LeaseEpoch::new(1).unwrap(),
+                initial_last_seq: SpaceSeq::ZERO,
+                created_at: None,
+            })
+            .await
+            .unwrap();
+        let db = DataRoot::new(&path).canonical();
+        assert!(fs::metadata(sqlite_wal_path_for(&db)).unwrap().len() > 0);
+        let external = crate::dialect::sqlite::open_rusqlite_readonly_connection(&db).unwrap();
+        external.execute_batch("BEGIN").unwrap();
+        let slug: String = external
+            .query_row(
+                "SELECT slug FROM spaces WHERE space_id = ?1",
+                [id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(slug, "checkpoint-test");
+
+        let error = runtime.shutdown_with_wal_truncate().await.unwrap_err();
+        assert!(matches!(error, PortError::Internal(_)));
+        assert!(store.inner.owner_locks.lock().await.is_empty());
+        external.execute_batch("ROLLBACK").unwrap();
+        drop(external);
+
+        let (reopened, runtime) = CanonicalRuntime::open(store.inner.config.clone())
+            .await
+            .unwrap();
+        assert_eq!(reopened.get_space(&id).await.unwrap().slug, slug);
+        runtime.shutdown_with_wal_truncate().await.unwrap();
         fs::remove_dir_all(path).unwrap();
     }
 }

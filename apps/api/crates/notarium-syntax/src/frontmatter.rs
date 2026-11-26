@@ -5,8 +5,9 @@ use crate::{
 };
 use notarium_core::{
     DomainError, DomainResult,
-    classes::{DocClass, authorize_field_key},
+    classes::{DocClass, VAULT_IDENTITY_FIELD, authorize_field_key},
     error::ValidationReason,
+    ids::NoteId,
     patch::{CarrierEditOrigin, CarrierPatchPlan},
     span::ByteSpan,
     value::YamlValue,
@@ -453,14 +454,16 @@ pub fn analyze(source: &str, expected: DocClass) -> DomainResult<HeaderAnalysis>
     })
 }
 fn check_class(value: Option<&YamlValue>, expected: DocClass) -> DomainResult<()> {
-    let declared = match value {
-        None => {
-            return if expected == DocClass::EncryptedNote {
-                Err(failure(ValidationReason::ClassMismatch))
-            } else {
-                Ok(())
-            };
-        }
+    match declared_class(value)? {
+        Some(declared) if declared == expected => Ok(()),
+        None if expected != DocClass::EncryptedNote => Ok(()),
+        _ => Err(failure(ValidationReason::ClassMismatch)),
+    }
+}
+
+fn declared_class(value: Option<&YamlValue>) -> DomainResult<Option<DocClass>> {
+    Ok(Some(match value {
+        None => return Ok(None),
         Some(YamlValue::String(name)) => match name.as_str() {
             "user-doc" => DocClass::UserDoc,
             "encrypted-note" => DocClass::EncryptedNote,
@@ -470,12 +473,133 @@ fn check_class(value: Option<&YamlValue>, expected: DocClass) -> DomainResult<()
             _ => return Err(failure(ValidationReason::ClassMismatch)),
         },
         _ => return Err(failure(ValidationReason::AmbiguousClass)),
-    };
-    if declared == expected {
-        Ok(())
-    } else {
-        Err(failure(ValidationReason::ClassMismatch))
+    }))
+}
+
+fn vault_class(class: DocClass) -> DomainResult<DocClass> {
+    match class {
+        DocClass::UserDoc | DocClass::EncryptedNote => Ok(class),
+        _ => Err(failure(ValidationReason::ClassMismatch)),
     }
+}
+
+/// Read the asserted identity of an untrusted file. It carries no authority
+/// until an authenticated vault reconciler validates the current binding.
+pub fn read_vault_identity(source: &str) -> DomainResult<(DocClass, Option<NoteId>)> {
+    crate::unicode::validate_content(source)?;
+    let carrier = Carrier::scan(source)?;
+    let Some(range) = carrier.yaml else {
+        return Ok((DocClass::UserDoc, None));
+    };
+    let fields = match yaml::parse(range.slice(source)?)? {
+        YamlValue::Null => return Ok((DocClass::UserDoc, None)),
+        YamlValue::Mapping(fields) => fields,
+        _ => return Err(failure(ValidationReason::FmNotWritable)),
+    };
+    let class = vault_class(declared_class(fields.get("class"))?.unwrap_or(DocClass::UserDoc))?;
+    let identity = match fields.get(VAULT_IDENTITY_FIELD) {
+        Some(YamlValue::String(value)) => Some(NoteId::parse(value)?),
+        Some(_) => return Err(failure(ValidationReason::InvalidId)),
+        None => None,
+    };
+    Ok((class, identity))
+}
+
+/// Update the filesystem identity only. All unrelated source bytes are reused.
+pub fn patch_vault_identity(
+    source: &str,
+    class: DocClass,
+    note: &NoteId,
+) -> DomainResult<CarrierPatchPlan> {
+    patch_frontmatter_impl(
+        source,
+        vault_class(class)?,
+        &[FieldEdit::Set {
+            key: VAULT_IDENTITY_FIELD.into(),
+            value: YamlValue::String(note.as_str().into()),
+        }],
+        true,
+    )
+}
+
+/// A bound edit uses the on-disk identity for routing. Restore the dedicated
+/// field to its previous canonical value without rewriting other fields.
+pub fn restore_vault_identity(
+    source: &str,
+    canonical: &str,
+    class: DocClass,
+    note: &NoteId,
+) -> DomainResult<String> {
+    let class = vault_class(class)?;
+    let canonical_header = analyze(canonical, class)?;
+    let observed_header = analyze(source, class)?;
+    if canonical_header.fields.as_ref().is_some_and(|fields| {
+        fields.get(VAULT_IDENTITY_FIELD) != Some(&YamlValue::String(note.as_str().into()))
+    }) {
+        // Reuse the exact canonical header when the editor kept the projected
+        // header, including a header that exists only to carry the disk ID.
+        let plan = patch_vault_identity(canonical, class, note)?;
+        let projected = patch::apply(canonical, &plan)?;
+        let projected_header = Carrier::scan(&projected)?;
+        if projected[..projected_header.body.start()]
+            == source[..observed_header.carrier.body.start()]
+        {
+            let mut restored = canonical[..canonical_header.carrier.body.start()].to_owned();
+            restored.push_str(observed_header.carrier.body.slice(source)?);
+            if class == DocClass::EncryptedNote {
+                crate::encrypted::validate(&restored)?;
+            }
+            return Ok(restored);
+        }
+    }
+    let canonical_fields = canonical_header
+        .fields
+        .as_ref()
+        .ok_or_else(|| failure(ValidationReason::FmNotWritable))?;
+    rewrite_vault_identity(
+        source,
+        class,
+        canonical_fields.get(VAULT_IDENTITY_FIELD),
+        canonical_header.carrier.header.is_none(),
+    )
+}
+
+/// The writer receives the claimed identity separately from the imported data.
+pub fn strip_vault_identity(source: &str, class: DocClass) -> DomainResult<String> {
+    rewrite_vault_identity(source, vault_class(class)?, None, true)
+}
+
+fn rewrite_vault_identity(
+    source: &str,
+    class: DocClass,
+    value: Option<&YamlValue>,
+    drop_empty_header: bool,
+) -> DomainResult<String> {
+    let edit = match value {
+        Some(value) => FieldEdit::Set {
+            key: VAULT_IDENTITY_FIELD.into(),
+            value: value.clone(),
+        },
+        None => FieldEdit::Unset {
+            key: VAULT_IDENTITY_FIELD.into(),
+        },
+    };
+    let plan = patch_frontmatter_impl(source, class, &[edit], true)?;
+    if plan.edits.is_empty() {
+        return Ok(source.to_owned());
+    }
+    let changed = patch::apply(source, &plan)?;
+    if drop_empty_header {
+        let carrier = Carrier::scan(&changed)?;
+        if let Some(yaml) = carrier.yaml
+            && yaml.slice(&changed)?.trim().is_empty()
+        {
+            let mut headerless = changed[..carrier.bom_end].to_owned();
+            headerless.push_str(carrier.body.slice(&changed)?);
+            return Ok(headerless);
+        }
+    }
+    Ok(changed)
 }
 
 /// Used for frontmatter and closed nota mappings. Returns original-source coordinates.
@@ -673,6 +797,15 @@ pub fn patch_frontmatter(
     expected: DocClass,
     edits: &[FieldEdit],
 ) -> DomainResult<CarrierPatchPlan> {
+    patch_frontmatter_impl(source, expected, edits, false)
+}
+
+fn patch_frontmatter_impl(
+    source: &str,
+    expected: DocClass,
+    edits: &[FieldEdit],
+    vault_identity: bool,
+) -> DomainResult<CarrierPatchPlan> {
     if expected == DocClass::EncryptedNote {
         crate::encrypted::validate(source)?;
     }
@@ -681,7 +814,9 @@ pub fn patch_frontmatter(
         return Err(failure(ValidationReason::FmNotWritable));
     }
     for edit in edits {
-        authorize_field_key(edit.key())?;
+        if !vault_identity || edit.key() != VAULT_IDENTITY_FIELD {
+            authorize_field_key(edit.key())?;
+        }
     }
     let carrier = analysis.carrier;
     let splices = if let Some(range) = carrier.yaml {

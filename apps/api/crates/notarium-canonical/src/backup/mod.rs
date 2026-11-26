@@ -2006,7 +2006,7 @@ async fn sleep_async_interruptible(
 #[cfg(test)]
 #[test]
 fn historical_spool_shapes_match_their_published_manifests() {
-    for version in [6, 7] {
+    for version in [6, 7, 8] {
         let observed = checksum_tables(version, spool_tables(version));
         assert!(crate::schema::migrate::recognized_predecessor(
             i64::from(version),
@@ -2020,6 +2020,9 @@ fn spool_tables(schema_version: u32) -> impl Iterator<Item = TableSpec> + Clone 
         .iter()
         .copied()
         .filter_map(move |mut table| {
+            if schema_version < 9 && table.name.starts_with("vault_") {
+                return None;
+            }
             if schema_version == 7 && table.name == "chat_entry_note_refs" {
                 table.columns = &table.columns[..6];
                 table.indexes = &["idx_chat_entry_note_refs_target"];
@@ -2153,7 +2156,7 @@ pub fn decode_postgres_spool_v1_bounded(
     let expected_tables = spool_tables(schema_version);
     let expected_checksum = match schema_version {
         CANONICAL_SCHEMA_VERSION => manifest_checksum(),
-        1..=7 => {
+        1..=8 => {
             let digest = checksum_tables(schema_version, expected_tables.clone());
             if !crate::schema::migrate::recognized_predecessor(
                 i64::from(schema_version),
@@ -3939,6 +3942,8 @@ async fn apply_restore_cursor_tx(
     let new_inc = target.scope.incarnation.as_bytes().as_slice();
 
     let mut rebound_retirements = false;
+    // Vault bindings keep their physical identity and original incarnation.
+    // They require reconciliation or explicit rebinding after this rotation.
     let history_scoped_tables = [
         "revisions",
         "revision_purge_fences",

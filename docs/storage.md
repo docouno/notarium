@@ -105,7 +105,7 @@ recovers writes under its exclusive DataRoot owner lock.
 ## Dual-dialect schema and history model
 
 Both SQL dialects materialize the same ordinary B-tree tables in schema
-version `8` and verify live database catalogs (`sqlite_master` / `pg_catalog`)
+version `9` and verify live database catalogs (`sqlite_master` / `pg_catalog`)
 against a shared typed manifest checksum (`schema_meta`) on every startup.
 Unknown newer schema versions, mismatched manifest checksums or unfinished
 migration states fail closed.
@@ -151,6 +151,35 @@ and resulting Space identity, history and cutoff, including after restart.
 The caller can replay a pending control operation after losing the canonical
 response. Reusing the key with a different payload is rejected. Rebinding a
 Space's history invalidates receipts issued for its earlier incarnation.
+
+Schema version 9 adds private Desktop binding generations, path-indexed
+observations, and durable purge handoffs. The writer checks the current
+history, binding, canonical revision, and observed path while accepting a
+filesystem mutation. A purge records its pending filesystem work in the same
+transaction as the permanent purge fence. A restored history invalidates the
+authority of old path stamps. Older observations without a verified disk
+identity are discarded during migration and reconstructed by reconciliation.
+
+The materializer publishes new files exclusively and uses an atomic namespace
+operation for replacements. The chosen Markdown vault and private data root
+remain separate. A displaced file with uncertain ownership or stability stays
+available for recovery without holding the live path open. On Linux and macOS,
+the adapter parks it in private recovery when the roots support an atomic
+same-volume move. Existing-file replacement on Windows requires a volume that
+passes the transaction probe. A matching Windows capture can be retired on the
+source volume through a verified handle that excludes writers. When an earlier
+shared capture can no longer be found at its exact path, the vault retains its
+recovery record and reports the capture without a confirmed location. On macOS,
+an atomic exchange publishes the replacement while the private archive
+retains the displaced inode. Ordinary replacements report retained captures in
+vault status. Conversions return
+`CleanupPending` while that inode remains. The archive writes no plaintext
+copy. `Complete` requires safe retirement of the displaced inode.
+
+If an inaccessible subtree prevents native watch coverage, the synchronizer
+can poll the accessible paths until it restores the native watch. Inferred
+Trash and ordinary purge acknowledgement wait for a complete inventory with
+native notifications. Imports and publications at accessible paths continue.
 
 Schema version 6 orders the existing retirement index by status and then Space.
 Both the installation-wide and per-Space pending checks can seek directly to
@@ -548,7 +577,7 @@ same example against an isolated prefix.
   volume, where lookup checks file size and BLAKE3 before returning the path.
   Startup reconciles abandoned holds and pending local artifacts.
   The offline `notarium_canonical::backup::decode_postgres_spool_v1_bounded`
-  API verifies the trailer and recognizes the exact manifests for schemas 1 through 8.
+  API verifies the trailer and recognizes the exact manifests for schemas 1 through 9.
   It returns typed rows in the original table and column order within the
   caller's byte budget. To materialize a historical spool, create an empty
   target with `schema::POSTGRES_BASELINE_DDL`. For version 7, apply
@@ -560,6 +589,8 @@ same example against an isolated prefix.
   For versions 1 and 2, drop
   `collab_checkpoints` and `backup_holds.owner_generation`. For version 1,
   also drop `account_catalog_receipts` and `chat_pending_inputs.ext_space_tainted`.
+  For versions 1 through 8, drop `vault_handoffs`, `vault_observations`, and
+  `vault_bindings` in that order.
   For versions 1 through 4, drop `idx_receipt_exception_pointer` and
   `idx_payload_owners_job`, and restore the `payload_owners` primary key to
   `(space_id, payload_kind, payload_id, note_id)`.
@@ -571,8 +602,8 @@ same example against an isolated prefix.
   temporary table, then inserts the full set in one statement so foreign keys
   can resolve parents that appear later in the archive.
   Opening the target with the original installation ID applies the remaining
-  migrations through version 8. The canonical L4 backup suite exercises this
-  procedure with archives from all seven predecessor versions.
+  migrations through the current schema. The canonical backup suite exercises
+  this procedure with archives from the historical formats.
   Before serving the restored database, call `restore_cursors` with each
   original cutoff and a fresh history incarnation. The same transaction
   rotates the writer epoch and fences active rooms, retaining their snapshots,

@@ -562,6 +562,22 @@ pub trait BoardMutationFactsProvider: Send + Sync {
     ) -> PortFuture<'a, RollbackBoardFacts>;
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct VaultFileStamp {
+    pub identity: ContentDigest,
+    pub size: u64,
+    pub mtime_seconds: i64,
+    pub mtime_nanos: u32,
+    pub digest: ContentDigest,
+}
+
+/// File evidence provided by the vault and forwarded to the canonical writer.
+#[derive(Clone, Debug, Serialize)]
+pub struct VaultObservationCommit {
+    pub prior: ContentDigest,
+    pub observed: VaultFileStamp,
+}
+
 #[derive(Clone, Debug)]
 pub enum InterceptedPayload {
     EditNote {
@@ -578,6 +594,7 @@ pub enum InterceptedPayload {
         observation: ExternalObservation,
         body: BodyPatchPlan,
         header: HeaderMutation,
+        vault_commit: Option<VaultObservationCommit>,
     },
 }
 #[derive(Clone, Debug)]

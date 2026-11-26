@@ -3096,12 +3096,28 @@ dependencies = [
 name = "notarium-vault"
 version = "1.0.0-dev.0"
 dependencies = [
- "age",
+ "axum",
+ "base64 0.22.1",
+ "blake3",
+ "cap-fs-ext",
  "cap-std",
+ "getrandom 0.4.3",
+ "libc",
  "notarium-canonical",
  "notarium-core",
  "notarium-syntax",
  "notify",
+ "rustix",
+ "serde",
+ "serde_json",
+ "subtle",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tower",
+ "tracing",
+ "windows-sys 0.61.2",
+ "zeroize",
 ]
 
 [[package]]

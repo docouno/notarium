@@ -1,73 +1,75 @@
-import { app, BrowserWindow, ipcMain, net, protocol } from 'electron';
+import { app, BrowserWindow, ipcMain, protocol, session } from 'electron';
 import type { IpcMainInvokeEvent } from 'electron';
-import { realpath, stat } from 'node:fs/promises';
-import { join, resolve, sep } from 'node:path';
-import { pathToFileURL } from 'node:url';
-import { requestGreeting } from './api.js';
-import { isTrustedRendererURL } from './renderer-url.js';
+import { join, resolve } from 'node:path';
+import type { DesktopCapabilities } from '../bridge.js';
+import { requestGreeting } from '../greeting.js';
+import { parseComposeTarget } from './api.js';
+import {
+  contentSecurityPolicy,
+  createMainFrameGuard,
+  installRendererAccess,
+  registerRendererProtocol,
+} from './renderer-session.js';
+import { selectRenderer, isTrustedRendererURL } from './renderer-url.js';
+import { launchSidecar, sidecarExecutable, type SidecarChild } from './sidecar-child.js';
 
 protocol.registerSchemesAsPrivileged([
   {
     scheme: 'app',
-    privileges: { standard: true, secure: true, supportFetchAPI: true, corsEnabled: true },
+    privileges: {
+      standard: true,
+      secure: true,
+      supportFetchAPI: true,
+      corsEnabled: true,
+      stream: true,
+    },
   },
 ]);
-const rendererRoot = resolve(import.meta.dirname, '../renderer');
-const development =
-  !app.isPackaged && process.env.ELECTRON_RENDERER_URL
-    ? new URL(process.env.ELECTRON_RENDERER_URL)
-    : undefined;
-if (
-  development &&
-  (development.protocol !== 'http:' ||
-    !['localhost', '127.0.0.1', '[::1]'].includes(development.hostname) ||
-    development.username ||
-    development.password)
-) {
-  throw new Error('Development requires a local HTTP renderer origin.');
-}
-const rendererURL = development?.href ?? 'app://local/index.html';
-const apiTarget = process.env.DEVKIT_API_TARGET;
 
-function inside(root: string, file: string): boolean {
-  return file === root || file.startsWith(root + sep);
+let sidecar: SidecarChild | undefined;
+let quitting = false;
+let shutdownComplete = false;
+
+function exitWithError(error: unknown): void {
+  console.error(error instanceof Error ? error.message : 'Desktop initialization failed.');
+  shutdownComplete = true;
+  app.exit(1);
 }
 
 async function createWindow(): Promise<void> {
-  const root = await realpath(rendererRoot);
-  protocol.handle('app', async (request) => {
-    const url = new URL(request.url);
-    if (
-      url.protocol !== 'app:' ||
-      url.hostname !== 'local' ||
-      url.port ||
-      url.username ||
-      url.password
-    ) {
-      return new Response('Forbidden', { status: 403 });
-    }
-    if (request.method !== 'GET' && request.method !== 'HEAD') {
-      return new Response('Method not allowed', { status: 405 });
-    }
-    try {
-      const relative = decodeURIComponent(url.pathname === '/' ? '/index.html' : url.pathname);
-      const file = resolve(root, '.' + relative);
-      if (!inside(root, file)) {
-        return new Response('Forbidden', { status: 403 });
-      }
-      const actual = await realpath(file);
-      if (!inside(root, actual) || !(await stat(actual)).isFile()) {
-        return new Response('Forbidden', { status: 403 });
-      }
-      return net.fetch(pathToFileURL(actual).href);
-    } catch {
-      return new Response('Not found', { status: 404 });
-    }
-  });
+  const target = parseComposeTarget(process.env.DEVKIT_API_TARGET);
+  const {
+    url: rendererURL,
+    development,
+    nativeOrigin,
+  } = selectRenderer(app.isPackaged, process.env.ELECTRON_RENDERER_URL, target !== undefined);
+  const appSession = session.fromPartition('notarium-desktop', { cache: false });
+  await appSession.setProxy({ mode: 'direct' });
+  let endpoint: string | undefined;
+  if (!target) {
+    const executable = sidecarExecutable({
+      packaged: app.isPackaged,
+      resourcesPath: process.resourcesPath,
+      appPath: app.getAppPath(),
+      platform: process.platform,
+      profile: process.env.NOTARIUM_SIDECAR_PROFILE ?? 'debug',
+    });
+    sidecar = launchSidecar(executable, nativeOrigin);
+    endpoint = await sidecar.ready;
+  }
+
+  const policy = contentSecurityPolicy(development, endpoint);
+  if (!development) {
+    await registerRendererProtocol(appSession, resolve(import.meta.dirname, '../renderer'), policy);
+  }
+  if (quitting) {
+    return;
+  }
   const window = new BrowserWindow({
     width: 1000,
     height: 760,
     webPreferences: {
+      session: appSession,
       preload: join(import.meta.dirname, '../preload/index.cjs'),
       sandbox: true,
       contextIsolation: true,
@@ -75,44 +77,75 @@ async function createWindow(): Promise<void> {
       webSecurity: true,
     },
   });
+  const contents = window.webContents;
+  const trustedMainFrame = createMainFrameGuard(contents, rendererURL);
+  installRendererAccess(appSession, {
+    contents,
+    trustedMainFrame,
+    rendererURL,
+    development,
+    endpoint,
+    sidecar,
+    policy,
+  });
+
   function assertSender(event: IpcMainInvokeEvent): void {
-    if (
-      event.sender !== window.webContents ||
-      event.senderFrame !== window.webContents.mainFrame ||
-      !isTrustedRendererURL(event.senderFrame.url, rendererURL)
-    ) {
+    if (event.sender !== contents || !trustedMainFrame(event.senderFrame)) {
       throw new Error('Untrusted renderer.');
     }
   }
-  ipcMain.handle('desktop:capabilities', (event) => {
+  ipcMain.handle('desktop:capabilities', (event): DesktopCapabilities => {
     assertSender(event);
-    return { apiEnabled: Boolean(apiTarget) };
+    const connection = sidecar?.connection();
+    return connection
+      ? { apiEnabled: true, sidecarEndpoint: connection.endpoint }
+      : { apiEnabled: target !== undefined };
   });
   ipcMain.handle('desktop:greet', (event, name: unknown) => {
     assertSender(event);
-    if (!apiTarget) {
-      throw new Error('No API is configured.');
+    if (!target) {
+      throw new Error('The Compose API is not configured.');
     }
-    return requestGreeting(apiTarget, name);
+    return requestGreeting(target, name);
   });
-  window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
-  window.webContents.on('will-navigate', (event, url) => {
-    if (!isTrustedRendererURL(url, rendererURL)) {
+  contents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  contents.on('will-frame-navigate', (event) => {
+    if (!event.isMainFrame || !isTrustedRendererURL(event.url, rendererURL)) {
       event.preventDefault();
     }
   });
-  window.webContents.session.setPermissionRequestHandler((_contents, _permission, callback) =>
-    callback(false),
-  );
-  window.webContents.session.setPermissionCheckHandler(() => false);
+  contents.on('will-redirect', (event) => event.preventDefault());
+  contents.on('will-attach-webview', (event) => event.preventDefault());
   await window.loadURL(rendererURL);
 }
+
+app.on('before-quit', (event) => {
+  if (shutdownComplete || !sidecar) {
+    return;
+  }
+  event.preventDefault();
+  if (quitting) {
+    return;
+  }
+  quitting = true;
+  sidecar.stop().then(({ code, signal }) => {
+    if (code !== 0) {
+      exitWithError(new Error(`Sidecar shutdown ended with ${signal ?? `exit code ${code}`}.`));
+      return;
+    }
+    shutdownComplete = true;
+    app.quit();
+  }, exitWithError);
+});
 
 app
   .whenReady()
   .then(createWindow)
   .catch((error: unknown) => {
-    console.error(error);
-    app.exit(1);
+    if (quitting) {
+      return;
+    }
+    const cleanup = sidecar?.stop() ?? Promise.resolve();
+    cleanup.then(() => exitWithError(error), exitWithError);
   });
 app.on('window-all-closed', () => app.quit());
