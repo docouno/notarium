@@ -5,14 +5,17 @@ use super::{
 use notarium_core::{
     classes::DocClass,
     error::{PortError, ValidationReason},
-    ids::{EpisodeId, SpaceSeq},
-    model::FolderRef,
-    ports::{Change, ChangeKind, ChangeRead, ChangeReadResult, EntityId, GetNote, PageLimit},
+    ids::{EpisodeId, NoteId, SpaceSeq},
+    model::{FolderRef, Lifecycle},
+    ports::{
+        Change, ChangeKind, ChangeRead, ChangeReadResult, EntityId, GetNote, PageLimit,
+        SpaceContext,
+    },
     receipt::{CausalBasis, ChangeCursor},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 const SPACE_WINDOW: u16 = 200;
 const MAX_CANDIDATES: usize = 200;
@@ -36,6 +39,7 @@ pub(super) async fn recent(
     let targeted_project = resolved.targeted_project;
     let external = matches!(call.target, EgressTarget::ExternalMcp);
     let mut candidates = Vec::new();
+    let mut prepared_scopes: Vec<Option<SpaceContext>> = vec![None; targets.len()];
     let mut truncated = false;
     let mut observed_foreign = false;
     for (index, target) in targets.iter().enumerate() {
@@ -93,6 +97,7 @@ pub(super) async fn recent(
         if target.last_seq == SpaceSeq::ZERO {
             continue;
         }
+        prepared_scopes[index] = Some(read_scope.clone());
         let after = SpaceSeq::new(
             target
                 .last_seq
@@ -171,13 +176,35 @@ pub(super) async fn recent(
         }
         if candidates.len() > MAX_CANDIDATES {
             candidates.sort_by(rank);
-            candidates.truncate(MAX_CANDIDATES);
+            if let Some(pin) = (!external)
+                .then(|| call.auth.pinned_write_space())
+                .flatten()
+            {
+                // Preserve pinned-Space candidates past the global cap so skipped
+                // foreign candidates (e.g. trashed notes) can neither wipe out local
+                // results nor create a zero-taint eviction oracle.
+                let tail = candidates.split_off(MAX_CANDIDATES);
+                let local_in_head = candidates
+                    .iter()
+                    .filter(|c| &targets[c.index].scope.space_id == pin)
+                    .count();
+                let extra_cap = MAX_CANDIDATES.saturating_sub(local_in_head);
+                let mut local_tail: Vec<Candidate> = tail
+                    .into_iter()
+                    .filter(|c| &targets[c.index].scope.space_id == pin)
+                    .collect();
+                local_tail.truncate(extra_cap);
+                candidates.extend(local_tail);
+            } else {
+                candidates.truncate(MAX_CANDIDATES);
+            }
             truncated = true;
         }
     }
     candidates.sort_by(rank);
     let mut items = Vec::new();
     let mut handles = BTreeMap::<_, Option<String>>::new();
+    let mut inactive_notes = BTreeSet::<(usize, NoteId)>::new();
     for Candidate { index, change } in candidates {
         if items.len() == limit {
             truncated = true;
@@ -189,59 +216,25 @@ pub(super) async fn recent(
             }
             return Err(invalid(ValidationReason::InvalidState));
         };
+        if inactive_notes.contains(&(index, id.clone())) {
+            continue;
+        }
         let target = &targets[index];
+        let Some(base_scope) = prepared_scopes[index].as_ref() else {
+            continue;
+        };
+        if change.class.is_some_and(|class| {
+            !base_scope
+                .auth()
+                .spaces()
+                .get(&target.scope.space_id)
+                .is_some_and(|grant| grant.read_classes.contains(&class))
+        }) {
+            continue;
+        }
         let facts = {
-            let mut scope = call.space(target.scope.clone())?;
-            if !external {
-                let selection = match call
-                    .provider_selection(&scope, target.project.clone())
-                    .await
-                {
-                    Ok(selection) => selection,
-                    Err(error) if corpus::hidden(&error) => continue,
-                    Err(error) => {
-                        if observed_foreign {
-                            call.commit_external_read();
-                        }
-                        return Err(error);
-                    }
-                };
-                if let Some(sel) = selection {
-                    if change
-                        .class
-                        .is_some_and(|class| !sel.policy.allowed_classes.contains(&class))
-                    {
-                        continue;
-                    }
-                    scope = scope
-                        .restrict_read_classes(&sel.policy.allowed_classes)
-                        .inspect_err(|_| {
-                            if observed_foreign {
-                                call.commit_external_read();
-                            }
-                        })?;
-                    if scope
-                        .auth()
-                        .spaces()
-                        .get(&target.scope.space_id)
-                        .is_none_or(|grant| grant.read_classes.is_empty())
-                    {
-                        continue;
-                    }
-                    if let Some(required) = sel.project_only {
-                        scope = match scope.restrict_to_project(&required) {
-                            Ok(narrowed) => narrowed,
-                            Err(_) => continue,
-                        };
-                    }
-                }
-            }
-            if let Some(project) = &target.project {
-                scope = match scope.restrict_to_project(project) {
-                    Ok(narrowed) => narrowed,
-                    Err(_) => continue,
-                };
-            }
+            let mut scope = base_scope.clone();
+            scope.budget = call.budget();
             let snapshot = match call
                 .registry
                 .engine
@@ -274,6 +267,12 @@ pub(super) async fn recent(
                     call.commit_external_read();
                 }
                 return Err(invalid(ValidationReason::SourceMismatch));
+            }
+            if metadata.current_lifecycle() != Lifecycle::Active
+                || metadata.current_class() == DocClass::EncryptedNote
+            {
+                inactive_notes.insert((index, id));
+                continue;
             }
             if metadata.class() == DocClass::EncryptedNote {
                 continue;

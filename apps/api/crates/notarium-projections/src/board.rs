@@ -85,6 +85,7 @@ impl BoardMutationFactsProvider for ProjectionBoardPlanner {
                 [&intent.view],
                 [&intent.note],
                 &[],
+                false,
                 &deadline,
             )
             .await?;
@@ -121,6 +122,7 @@ impl BoardMutationFactsProvider for ProjectionBoardPlanner {
                 request.views.iter(),
                 request.eligible_notes.iter().map(|note| &note.note),
                 &request.eligible_notes,
+                true,
                 &deadline,
             )
             .await?;
@@ -248,10 +250,7 @@ fn evaluate_rollback(
         .collect();
     for view in &request.views {
         deadline.check()?;
-        let restored_view = restored_by_note
-            .get(&view.note)
-            .copied()
-            .filter(|restoration| restoration.planned_lifecycle == Lifecycle::Active);
+        let restored_view = restored_by_note.get(&view.note).copied();
         let RollbackBoardPlan::Board(plan) =
             board_plan_for_rollback(cut, ctx, view, restored_view)?
         else {
@@ -314,80 +313,78 @@ fn board_plan_for_rollback<'a>(
     view: &ViewRef,
     restored_view: Option<&PlannedNoteRestoration>,
 ) -> Result<RollbackBoardPlan<'a>, PortError> {
-    let Some(restoration) = restored_view else {
-        let note = cut.active_note(ctx, &view.note)?;
-        let fields = cut.schema_fields();
-        let compiled = compile_projected_views(&note.views, fields);
-        let descriptor = match compiled.get(&view.key) {
-            Ok(descriptor) => descriptor,
-            Err(DomainError::ResourceNotFound | DomainError::ValidationFailed { .. }) => {
+    let (view_revision, parent_folder, views_owned, views_slice): (
+        RevisionId,
+        &FolderId,
+        Vec<ViewInput>,
+        Option<&[ViewInput]>,
+    ) = match restored_view {
+        None => {
+            let note = cut
+                .notes
+                .get(&view.note)
+                .ok_or(DomainError::ResourceNotFound)?;
+            let active_ancestry = cut.authorize_note_allowing_inactive(ctx, note)?;
+            if note.lifecycle != Lifecycle::Active
+                || !active_ancestry
+                || note.class == DocClass::EncryptedNote
+            {
                 return Ok(RollbackBoardPlan::Retired);
             }
-            Err(error) => return Err(error.into()),
-        };
-        if descriptor.kind != ViewKind::Board {
-            return Ok(RollbackBoardPlan::Retired);
+            (
+                note.revision.clone(),
+                &note.parent_folder,
+                Vec::new(),
+                Some(note.views.as_slice()),
+            )
         }
-        let Some(group_field) = descriptor.group_by.clone() else {
-            return Ok(RollbackBoardPlan::Retired);
-        };
-        let group_field_kind = match descriptor.board_group_kind(fields) {
-            Ok(kind) => kind,
-            Err(DomainError::ValidationFailed { .. }) => return Ok(RollbackBoardPlan::Retired),
-            Err(error) => return Err(error.into()),
-        };
-        let source_folder = match cut.resolve_source(&descriptor.source, &note.parent_folder) {
-            Ok(folder) => folder,
-            Err(PortError::Domain(DomainError::ResourceNotFound)) => {
+        Some(restoration) => {
+            let current = cut
+                .notes
+                .get(&view.note)
+                .ok_or(DomainError::ResourceNotFound)?;
+            if current.revision != restoration.current_revision {
+                return Err(DomainError::validation(ValidationReason::CursorStale).into());
+            }
+            if restoration.planned_lifecycle != Lifecycle::Active {
+                let _ = cut.authorize_note_allowing_inactive(ctx, current)?;
                 return Ok(RollbackBoardPlan::Retired);
             }
-            Err(error) => return Err(error),
-        };
-        cut.authorize_entry(
-            ctx,
-            view_authorization_folder(&descriptor.source, source_folder.as_ref()),
-        )?;
-        cut.authorize_board_source(ctx, &descriptor.source, source_folder.as_ref())?;
-        return Ok(RollbackBoardPlan::Board(Box::new(BoardPlan {
-            view_revision: note.revision.clone(),
-            descriptor: descriptor.clone(),
-            group_field,
-            group_field_kind,
-            fields,
-            source_folder,
-        })));
+            cut.authorize_placement(
+                ctx,
+                &restoration.planned_parent_folder,
+                restoration.planned_class,
+                restoration.planned_ability.clone(),
+            )?;
+            if restoration.planned_class == DocClass::EncryptedNote {
+                return Ok(RollbackBoardPlan::Retired);
+            }
+            let Some(carrier) = restoration.planned_carrier.as_deref() else {
+                return Ok(RollbackBoardPlan::Retired);
+            };
+            let extracted: Vec<ViewInput> = match extract(
+                carrier,
+                restoration.planned_class,
+                &restoration.note,
+                "",
+                None,
+            )? {
+                ExtractedDocDelta::Plain(doc) => {
+                    doc.views.into_iter().map(ViewInput::from).collect()
+                }
+                ExtractedDocDelta::Encrypted(_) => return Ok(RollbackBoardPlan::Retired),
+            };
+            (
+                restoration.current_revision.clone(),
+                &restoration.planned_parent_folder,
+                extracted,
+                None,
+            )
+        }
     };
-    let current = cut
-        .notes
-        .get(&view.note)
-        .ok_or(DomainError::ResourceNotFound)?;
-    if current.revision != restoration.current_revision {
-        return Err(DomainError::validation(ValidationReason::CursorStale).into());
-    }
-    cut.authorize_placement(
-        ctx,
-        &restoration.planned_parent_folder,
-        restoration.planned_class,
-        restoration.planned_ability.clone(),
-    )?;
-    if restoration.planned_class == DocClass::EncryptedNote {
-        return Ok(RollbackBoardPlan::Retired);
-    }
-    let Some(carrier) = restoration.planned_carrier.as_deref() else {
-        return Ok(RollbackBoardPlan::Retired);
-    };
-    let views: Vec<ViewInput> = match extract(
-        carrier,
-        restoration.planned_class,
-        &restoration.note,
-        "",
-        None,
-    )? {
-        ExtractedDocDelta::Plain(doc) => doc.views.into_iter().map(ViewInput::from).collect(),
-        ExtractedDocDelta::Encrypted(_) => return Ok(RollbackBoardPlan::Retired),
-    };
+
     let fields = cut.schema_fields();
-    let compiled = compile_projected_views(&views, fields);
+    let compiled = compile_projected_views(views_slice.unwrap_or(&views_owned), fields);
     let descriptor = match compiled.get(&view.key) {
         Ok(descriptor) => descriptor,
         Err(DomainError::ResourceNotFound | DomainError::ValidationFailed { .. }) => {
@@ -406,21 +403,62 @@ fn board_plan_for_rollback<'a>(
         Err(DomainError::ValidationFailed { .. }) => return Ok(RollbackBoardPlan::Retired),
         Err(error) => return Err(error.into()),
     };
-    let source_folder =
-        match cut.resolve_source(&descriptor.source, &restoration.planned_parent_folder) {
-            Ok(folder) => folder,
+
+    // Statically authorize declared source classes and unqualified Space scope
+    // BEFORE resolving the source folder so missing/trashed targets can never
+    // bypass class/Keeper checks or leak cross-project folder existence.
+    cut.authorize_board_source_static(ctx, &descriptor.source)?;
+    let project_root = ctx
+        .auth()
+        .spaces()
+        .get(&cut.scope.space_id)
+        .and_then(|grant| grant.project_root.as_ref());
+
+    let source_folder = match cut.resolve_source(&descriptor.source, parent_folder) {
+        Ok(Some(folder)) => match cut.ancestry(&folder) {
+            Ok(ancestry) => {
+                cut.authorize_folder_allowing_inactive(ctx, &folder, &ancestry)?;
+                if !ancestry.active {
+                    return Ok(RollbackBoardPlan::Retired);
+                }
+                Some(folder)
+            }
             Err(PortError::Domain(DomainError::ResourceNotFound)) => {
+                if project_root.is_some() {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
                 return Ok(RollbackBoardPlan::Retired);
             }
             Err(error) => return Err(error),
-        };
-    cut.authorize_entry(
-        ctx,
-        view_authorization_folder(&descriptor.source, source_folder.as_ref()),
-    )?;
-    cut.authorize_board_source(ctx, &descriptor.source, source_folder.as_ref())?;
+        },
+        Ok(None) => {
+            cut.authorize_entry(ctx, view_authorization_folder(&descriptor.source, None))?;
+            cut.authorize_board_source(ctx, &descriptor.source, None)?;
+            None
+        }
+        Err(PortError::Domain(DomainError::ResourceNotFound)) => {
+            if let Some(root) = project_root {
+                match &descriptor.source.folder {
+                    Some(crate::nota::SourceFolder::Path(raw_path))
+                        if cut.path_within_project_root(root, raw_path) =>
+                    {
+                        return Ok(RollbackBoardPlan::Retired);
+                    }
+                    None => {
+                        // `scope: project` outside any project; note placement was
+                        // already authorized under `root`.
+                        return Ok(RollbackBoardPlan::Retired);
+                    }
+                    _ => return Err(DomainError::ResourceNotFound.into()),
+                }
+            }
+            return Ok(RollbackBoardPlan::Retired);
+        }
+        Err(error) => return Err(error),
+    };
+
     Ok(RollbackBoardPlan::Board(Box::new(BoardPlan {
-        view_revision: restoration.current_revision.clone(),
+        view_revision,
         descriptor: descriptor.clone(),
         group_field,
         group_field_kind,

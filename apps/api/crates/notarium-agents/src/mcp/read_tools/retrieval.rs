@@ -338,7 +338,28 @@ pub(super) async fn retrieve(
         }
         if candidates.len() > MAX_CANDIDATES {
             candidates.sort_by(rank);
-            candidates.truncate(MAX_CANDIDATES);
+            if let Some(pin) = (!external)
+                .then(|| call.auth.pinned_write_space())
+                .flatten()
+            {
+                // Preserve pinned-Space candidates past the global cap so skipped
+                // foreign hits (e.g. over-budget recall chunks) can never evict local
+                // hits without marking taint.
+                let tail = candidates.split_off(MAX_CANDIDATES);
+                let local_in_head = candidates
+                    .iter()
+                    .filter(|c| &targets[c.index].scope.space_id == pin)
+                    .count();
+                let extra_cap = MAX_CANDIDATES.saturating_sub(local_in_head);
+                let mut local_tail: Vec<Candidate> = tail
+                    .into_iter()
+                    .filter(|c| &targets[c.index].scope.space_id == pin)
+                    .collect();
+                local_tail.truncate(extra_cap);
+                candidates.extend(local_tail);
+            } else {
+                candidates.truncate(MAX_CANDIDATES);
+            }
             truncated = true;
         }
     }

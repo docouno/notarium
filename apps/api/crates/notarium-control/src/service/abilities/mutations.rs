@@ -805,6 +805,11 @@ impl ControlService {
                     return Err(DomainError::ResourceNotFound.into());
                 }
                 if final_ref.identity() == source.reference.identity() { return Err(invalid(ValidationReason::InvalidState)); }
+                let outgoing_hops = dest_chain.visited.len().saturating_sub(1);
+                let incoming_hops = max_incoming_trail_depth_db(tx.inner_mut(), &key, input.source.id.as_str()).await?;
+                if incoming_hops.saturating_add(1).saturating_add(outgoing_hops) > 16 {
+                    return Err(invalid(ValidationReason::InvalidState));
+                }
                 let source_state = if promotion {
                     Some(read_overlay_state(tx.inner_mut(), ctx.auth().principal(), &key, &source.reference.id).await?)
                 } else {
@@ -854,6 +859,42 @@ impl ControlService {
         budget.run(tx.commit(), CommitEffect::Unknown).await?;
         Ok(ControlCommit { revision, value })
     }
+}
+
+async fn max_incoming_trail_depth_db(
+    tx: &mut Transaction,
+    target_placement: &str,
+    target_id: &str,
+) -> Result<usize, PortError> {
+    let mut visited = BTreeSet::new();
+    visited.insert((target_placement.to_owned(), target_id.to_owned()));
+    let mut queue = std::collections::VecDeque::new();
+    queue.push_back((target_placement.to_owned(), target_id.to_owned(), 0usize));
+    let mut max_depth = 0usize;
+    while let Some((dst_pl, dst_id, depth)) = queue.pop_front() {
+        let parents = rows!(
+            tx,
+            (String, String),
+            fetch_all,
+            "SELECT source_placement, ability_id FROM ability_placement_trail WHERE destination_placement=$1 AND destination_id=$2",
+            "SELECT source_placement, ability_id FROM v1_control.ability_placement_trail WHERE destination_placement=$1 AND destination_id=$2";
+            &dst_pl,
+            &dst_id
+        )?;
+        for (src_pl, src_id) in parents {
+            let next_depth = depth + 1;
+            if next_depth > 16 {
+                return Ok(next_depth);
+            }
+            if next_depth > max_depth {
+                max_depth = next_depth;
+            }
+            if visited.insert((src_pl.clone(), src_id.clone())) {
+                queue.push_back((src_pl, src_id, next_depth));
+            }
+        }
+    }
+    Ok(max_depth)
 }
 
 async fn read_overlay_state(

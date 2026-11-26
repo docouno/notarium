@@ -105,6 +105,7 @@ impl BoardCut {
         views: impl IntoIterator<Item = &'a ViewRef>,
         additional_notes: impl IntoIterator<Item = &'a NoteId>,
         restorations: &[PlannedNoteRestoration],
+        for_rollback: bool,
         deadline: &PlannerDeadline,
     ) -> Result<Self, PortError> {
         let _ = engine.current_admission(engine.active_generation())?;
@@ -156,6 +157,7 @@ impl BoardCut {
                     &view_notes,
                     &additional,
                     restorations,
+                    for_rollback,
                     deadline,
                 )
                 .await
@@ -196,6 +198,7 @@ impl BoardCut {
         view_notes: &BTreeSet<&NoteId>,
         additional: &BTreeSet<NoteId>,
         restorations: &[PlannedNoteRestoration],
+        for_rollback: bool,
         deadline: &PlannerDeadline,
     ) -> Result<(), PortError> {
         let projected = published.cut.projected_seq;
@@ -275,6 +278,7 @@ impl BoardCut {
             views,
             &replayed,
             restorations,
+            for_rollback,
             deadline,
         )
         .await
@@ -397,6 +401,7 @@ impl BoardCut {
         views: &BTreeSet<ViewRef>,
         replayed: &ReplayedChanges,
         restorations: &[notarium_core::ports::PlannedNoteRestoration],
+        for_rollback: bool,
         deadline: &PlannerDeadline,
     ) -> Result<(), PortError> {
         let index = deadline.wait(engine.open_index_async(published)).await?;
@@ -419,13 +424,12 @@ impl BoardCut {
         let restored_by_note: BTreeMap<&NoteId, &notarium_core::ports::PlannedNoteRestoration> =
             restorations
                 .iter()
-                .filter(|entry| entry.planned_lifecycle == Lifecycle::Active)
                 .map(|entry| (&entry.note, entry))
                 .collect();
         let mut candidates = croaring::Bitmap::new();
         for view in views {
             deadline.check()?;
-            let plan = if restorations.is_empty() {
+            let plan = if !for_rollback {
                 board_plan(self, ctx, view)?
             } else {
                 match board_plan_for_rollback(
@@ -759,11 +763,10 @@ impl BoardCut {
             .authorize_folder_read(&self.space, entry, &ancestry.ids)?)
     }
 
-    pub(super) fn authorize_board_source(
+    pub(super) fn authorize_board_source_static(
         &self,
         ctx: &SpaceContext,
         source: &ViewSource,
-        source_folder: Option<&FolderId>,
     ) -> Result<(), PortError> {
         let grant = ctx
             .auth()
@@ -781,6 +784,111 @@ impl BoardCut {
         {
             return Err(DomainError::ResourceNotFound.into());
         }
+        if grant.project_root.is_some()
+            && source.scope == SourceScope::Space
+            && source.folder.is_none()
+        {
+            return Err(DomainError::ResourceNotFound.into());
+        }
+        Ok(())
+    }
+
+    pub(super) fn authorize_folder_allowing_inactive(
+        &self,
+        ctx: &SpaceContext,
+        folder: &FolderId,
+        ancestry: &Ancestry,
+    ) -> Result<(), PortError> {
+        let grant = ctx
+            .auth()
+            .spaces()
+            .get(&self.scope.space_id)
+            .ok_or(DomainError::ResourceNotFound)?;
+        if let Some(project_root) = grant.project_root.as_ref()
+            && !ancestry.ids.contains(project_root)
+        {
+            return Err(DomainError::ResourceNotFound.into());
+        }
+        ctx.auth()
+            .authorize_folder_read(&self.space, folder, &ancestry.ids)
+            .map_err(|_| DomainError::ResourceNotFound.into())
+    }
+
+    pub(super) fn path_within_project_root(&self, project_root: &FolderId, raw_path: &str) -> bool {
+        let Ok(ancestry) = self.ancestry(project_root) else {
+            return false;
+        };
+        if !ancestry.active {
+            return false;
+        }
+        let mut root_segments = Vec::new();
+        for id in ancestry.ids.iter().rev() {
+            if id == &self.root {
+                continue;
+            }
+            let Some(folder) = self.folders.get(id) else {
+                return false;
+            };
+            root_segments.push(folder.slug_fold.as_str());
+        }
+        let trimmed = raw_path.trim().trim_matches('/');
+        if trimmed.is_empty() || root_segments.is_empty() {
+            return false;
+        }
+        let target_segments: Vec<String> = trimmed
+            .split('/')
+            .filter(|seg| !seg.is_empty())
+            .map(notarium_syntax::unicode::lookup_key)
+            .collect();
+        target_segments.len() >= root_segments.len()
+            && root_segments
+                .iter()
+                .zip(target_segments.iter())
+                .all(|(root_seg, target_seg)| *root_seg == target_seg.as_str())
+    }
+
+    pub(super) fn authorize_placement_allowing_inactive(
+        &self,
+        ctx: &SpaceContext,
+        parent: &FolderId,
+        class: DocClass,
+        ability: Option<AbilityId>,
+    ) -> Result<bool, PortError> {
+        let ancestry = self.ancestry(parent)?;
+        let active = ancestry.active;
+        ctx.auth()
+            .authorize_read(&ResourceFacts {
+                space: self.space.clone(),
+                class,
+                project: ancestry
+                    .ids
+                    .iter()
+                    .find(|id| {
+                        self.folders
+                            .get(*id)
+                            .is_some_and(|folder| folder.is_project)
+                    })
+                    .cloned(),
+                ancestor_folders: ancestry.ids,
+                folder_write_locked: ancestry.locked,
+                ability_package: ability,
+            })
+            .map_err(|_| DomainError::ResourceNotFound)?;
+        Ok(active)
+    }
+
+    pub(super) fn authorize_board_source(
+        &self,
+        ctx: &SpaceContext,
+        source: &ViewSource,
+        source_folder: Option<&FolderId>,
+    ) -> Result<(), PortError> {
+        self.authorize_board_source_static(ctx, source)?;
+        let grant = ctx
+            .auth()
+            .spaces()
+            .get(&self.scope.space_id)
+            .ok_or(DomainError::ResourceNotFound)?;
         if let Some(project_root) = grant.project_root.as_ref() {
             let Some(folder) = source_folder else {
                 return Err(DomainError::ResourceNotFound.into());
@@ -822,6 +930,19 @@ impl BoardCut {
                 ability_package: ability,
             })
             .map_err(|_| DomainError::ResourceNotFound.into())
+    }
+
+    pub(super) fn authorize_note_allowing_inactive(
+        &self,
+        ctx: &SpaceContext,
+        note: &BoardNote,
+    ) -> Result<bool, PortError> {
+        self.authorize_placement_allowing_inactive(
+            ctx,
+            &note.parent_folder,
+            note.class,
+            note.ability.clone(),
+        )
     }
 
     pub(super) fn authorize_note(
@@ -1721,6 +1842,7 @@ mod tests {
             [&view_ref],
             [&moved_id, &purged_id],
             &[],
+            false,
             &deadline,
         )
         .await
@@ -1822,6 +1944,7 @@ mod tests {
                 [&view_ref],
                 std::iter::empty(),
                 &[],
+                false,
                 &deadline,
             )
             .await,

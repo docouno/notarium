@@ -1,9 +1,11 @@
 //! Authority for log metadata and bounded overlay versions at one command boundary.
-use super::common::FolderAncestryCache;
+use super::common::{FolderAncestryCache, NoteHeadRow, combine_lifecycle};
 use crate::{
     CanonicalStore, SpaceRecord,
     codec::{RevisionMetadataEnvelope, RevisionMetadataPayload},
-    runtime::{load_space_record, read_immutable_revision_tx, require_command_end_tx},
+    runtime::{
+        StoredRevisionRecord, load_space_record, read_immutable_revision_tx, require_command_end_tx,
+    },
     sql_exec::BackendConn,
 };
 use notarium_core::{
@@ -12,10 +14,24 @@ use notarium_core::{
     classes::DocClass,
     error::{PortError, ValidationReason},
     ids::{JobId, NoteId, RevisionId, SpaceSeq},
-    ports::{Change, ChangeKind, ContentJobKind, EntityId, MaintenanceContext, SpaceContext},
+    model::Lifecycle,
+    ports::{
+        Change, ChangeKind, ContentJobKind, EntityId, MaintenanceContext, NoteProvenance,
+        SpaceContext,
+    },
     receipt::{AwaitReason, MutationEffect},
 };
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    sync::Arc,
+};
+
+pub(crate) struct ChangePagePreload {
+    pub(crate) folder_cuts: Vec<i64>,
+    pub(crate) preloaded_notes: HashSet<NoteId>,
+    pub(crate) fenced_notes: HashSet<NoteId>,
+    pub(crate) note_heads: Option<BTreeMap<NoteId, NoteHeadRow>>,
+}
 
 pub(crate) struct ChangeVisibility<'a> {
     space: &'a SpaceRecord,
@@ -23,6 +39,11 @@ pub(crate) struct ChangeVisibility<'a> {
     live: FolderAncestryCache,
     historical: FolderAncestryCache,
     cut: SpaceSeq,
+    folder_cuts: Option<Vec<i64>>,
+    historical_epoch: Option<usize>,
+    preloaded_notes: Option<HashSet<NoteId>>,
+    fenced_notes: Option<HashSet<NoteId>>,
+    preloaded_heads: Option<BTreeMap<NoteId, NoteHeadRow>>,
     all_notes_visible: bool,
     live_notes: HashMap<NoteId, bool>,
     jobs: HashMap<JobId, Option<Arc<[NoteId]>>>,
@@ -42,9 +63,169 @@ impl<'a> ChangeVisibility<'a> {
             live: Default::default(),
             historical: Default::default(),
             cut: SpaceSeq::ZERO,
+            folder_cuts: None,
+            historical_epoch: None,
+            preloaded_notes: None,
+            fenced_notes: None,
+            preloaded_heads: None,
             live_notes: HashMap::new(),
             jobs: HashMap::new(),
             visible_versions: HashMap::new(),
+        }
+    }
+
+    pub(crate) fn with_preload(mut self, preload: ChangePagePreload) -> Self {
+        self.folder_cuts = Some(preload.folder_cuts);
+        self.preloaded_notes = Some(preload.preloaded_notes);
+        self.fenced_notes = Some(preload.fenced_notes);
+        self.preloaded_heads = preload.note_heads;
+        self
+    }
+
+    pub(crate) fn all_notes_visible(&self) -> bool {
+        self.all_notes_visible
+    }
+
+    fn is_preloaded_fenced(&self, note: &NoteId) -> Option<bool> {
+        let notes = self.preloaded_notes.as_ref()?;
+        if !notes.contains(note) {
+            return None;
+        }
+        Some(
+            self.fenced_notes
+                .as_ref()
+                .is_some_and(|set| set.contains(note)),
+        )
+    }
+
+    async fn live_note_visible(
+        &mut self,
+        tx: &mut BackendConn<'_>,
+        note: &NoteId,
+    ) -> Result<bool, PortError> {
+        if let Some(&allowed) = self.live_notes.get(note) {
+            return Ok(allowed);
+        }
+        let allowed = if self
+            .preloaded_notes
+            .as_ref()
+            .is_some_and(|notes| notes.contains(note))
+            && self.preloaded_heads.is_some()
+        {
+            if self
+                .fenced_notes
+                .as_ref()
+                .is_some_and(|set| set.contains(note))
+            {
+                false
+            } else if let Some(head) = self
+                .preloaded_heads
+                .as_ref()
+                .and_then(|heads| heads.get(note))
+                .cloned()
+            {
+                if head.lifecycle == Lifecycle::Purged {
+                    false
+                } else {
+                    let (facts, anc) = self
+                        .live
+                        .build_resource_facts_tx(
+                            tx,
+                            &self.space.space,
+                            &head.parent_folder_id,
+                            head.doc_class,
+                            head.ability_id,
+                            false,
+                        )
+                        .await?;
+                    let effective = combine_lifecycle(head.lifecycle, anc.folder_lifecycle);
+                    effective != Lifecycle::Purged && self.auth.can_view_resource(&facts).is_ok()
+                }
+            } else {
+                false
+            }
+        } else {
+            self.live
+                .live_note_facts(tx, &self.space.space, note, false)
+                .await?
+                .is_some_and(|(facts, _)| self.auth.can_view_resource(&facts).is_ok())
+        };
+        self.live_notes.insert(note.clone(), allowed);
+        Ok(allowed)
+    }
+
+    async fn note_version_inner(
+        &mut self,
+        tx: &mut BackendConn<'_>,
+        note: &NoteId,
+        preloaded_rev: Option<&StoredRevisionRecord>,
+        want_provenance: bool,
+    ) -> Result<(Option<RevisionId>, Option<NoteProvenance>), PortError> {
+        if !want_provenance && let Some(known) = self.visible_versions.get(note) {
+            return Ok((known.clone(), None));
+        }
+        let result: Result<(RevisionId, Option<NoteProvenance>), PortError> = async {
+            if !self.live_note_visible(tx, note).await? {
+                return Err(DomainError::ResourceNotFound.into());
+            }
+            let owned_rev;
+            let revision = if let Some(hit) = preloaded_rev
+                && self.is_preloaded_fenced(note) == Some(false)
+                && hit.visibility_seq == self.cut
+                && hit.space_seq == self.cut
+            {
+                hit
+            } else if self.is_preloaded_fenced(note) == Some(true) {
+                return Err(DomainError::ResourceNotFound.into());
+            } else {
+                owned_rev = read_immutable_revision_tx(
+                    tx,
+                    &self.space.scope,
+                    "note",
+                    note.as_str(),
+                    self.cut,
+                )
+                .await?
+                .ok_or(DomainError::ResourceNotFound)?;
+                &owned_rev
+            };
+            let RevisionMetadataPayload::Note(meta) = &revision.metadata.payload else {
+                return Err(DomainError::validation(ValidationReason::InvalidState).into());
+            };
+            let (facts, ancestry) = self
+                .historical
+                .build_resource_facts_tx(
+                    tx,
+                    &self.space.space,
+                    &meta.parent_folder_id,
+                    meta.doc_class,
+                    meta.ability_id.clone(),
+                    false,
+                )
+                .await?;
+            self.auth.authorize_read(&facts)?;
+            let provenance = want_provenance.then(|| {
+                ancestry.note_provenance(
+                    note,
+                    &meta.slug,
+                    meta.title.clone(),
+                    revision.actor_id.clone(),
+                    revision.created_at,
+                )
+            });
+            Ok((revision.revision_id.clone(), provenance))
+        }
+        .await;
+        match admitted(result)? {
+            Some((rev_id, provenance)) => {
+                self.visible_versions
+                    .insert(note.clone(), Some(rev_id.clone()));
+                Ok((Some(rev_id), provenance))
+            }
+            None => {
+                self.visible_versions.insert(note.clone(), None);
+                Ok((None, None))
+            }
         }
     }
 
@@ -53,50 +234,7 @@ impl<'a> ChangeVisibility<'a> {
         tx: &mut BackendConn<'_>,
         note: &NoteId,
     ) -> Result<Option<RevisionId>, PortError> {
-        if let Some(known) = self.visible_versions.get(note) {
-            return Ok(known.clone());
-        }
-        let result = async {
-            let current = match self.live_notes.get(note) {
-                Some(&allowed) => allowed,
-                None => {
-                    let allowed = self
-                        .live
-                        .live_note_facts(tx, &self.space.space, note, false)
-                        .await?
-                        .is_some_and(|(facts, _)| self.auth.can_view_resource(&facts).is_ok());
-                    self.live_notes.insert(note.clone(), allowed);
-                    allowed
-                }
-            };
-            if !current {
-                return Err(DomainError::ResourceNotFound.into());
-            }
-            let revision =
-                read_immutable_revision_tx(tx, &self.space.scope, "note", note.as_str(), self.cut)
-                    .await?
-                    .ok_or(DomainError::ResourceNotFound)?;
-            let RevisionMetadataPayload::Note(meta) = revision.metadata.payload else {
-                return Err(DomainError::validation(ValidationReason::InvalidState).into());
-            };
-            let (facts, _) = self
-                .historical
-                .build_resource_facts_tx(
-                    tx,
-                    &self.space.space,
-                    &meta.parent_folder_id,
-                    meta.doc_class,
-                    meta.ability_id,
-                    false,
-                )
-                .await?;
-            self.auth.authorize_read(&facts)?;
-            Ok(revision.revision_id)
-        }
-        .await;
-        let visible = admitted(result)?;
-        self.visible_versions.insert(note.clone(), visible.clone());
-        Ok(visible)
+        Ok(self.note_version_inner(tx, note, None, false).await?.0)
     }
 
     async fn authorize_job(
@@ -134,14 +272,39 @@ impl<'a> ChangeVisibility<'a> {
         tx: &mut BackendConn<'_>,
         change: &mut Change,
     ) -> Result<bool, PortError> {
+        self.filter_page_change(tx, change, None, false).await
+    }
+
+    pub(crate) async fn filter_page_change(
+        &mut self,
+        tx: &mut BackendConn<'_>,
+        change: &mut Change,
+        preloaded_rev: Option<&StoredRevisionRecord>,
+        with_provenance: bool,
+    ) -> Result<bool, PortError> {
         let cut = change.command_range.last_seq;
         if self.cut != cut {
+            let prev_cut = self.cut;
             self.cut = cut;
             self.visible_versions.clear();
-            self.historical = FolderAncestryCache::at_cut(&self.space.scope, cut);
+            let keep_historical = self.folder_cuts.as_ref().is_some_and(|cuts| {
+                let epoch = cuts.partition_point(|&v| v <= cut.get() as i64);
+                let can_keep = cut >= prev_cut && self.historical_epoch == Some(epoch);
+                if !can_keep {
+                    self.historical_epoch = Some(epoch);
+                }
+                can_keep
+            });
+            if !keep_historical {
+                self.historical = FolderAncestryCache::at_cut(&self.space.scope, cut);
+            }
         }
         let record = self.space;
         let space = &record.space;
+        let want_note_provenance = with_provenance
+            && change.lifecycle != Lifecycle::Purged
+            && change.class != Some(DocClass::EncryptedNote);
+        let mut computed_provenance: Option<NoteProvenance> = None;
         let allowed: Result<(), PortError> = async {
             match &change.entity {
                 EntityId::Note(_) if self.all_notes_visible => {
@@ -167,11 +330,13 @@ impl<'a> ChangeVisibility<'a> {
                         .authorize_folder_read(space, &record.root_folder_id, &[])?;
                 }
                 EntityId::Note(note) => {
-                    let version = self
-                        .note_version(tx, note)
-                        .await?
-                        .ok_or(DomainError::ResourceNotFound)?;
-                    if change.kind == ChangeKind::Move && version != change.revision {
+                    let (version, provenance) = self
+                        .note_version_inner(tx, note, preloaded_rev, want_note_provenance)
+                        .await?;
+                    let version = version.ok_or(DomainError::ResourceNotFound)?;
+                    if version == change.revision {
+                        computed_provenance = provenance;
+                    } else if change.kind == ChangeKind::Move {
                         // Physical Board moves publish rank revisions owned by both the card and its View.
                         let raw = super::notes::load_revision_metadata_opt_tx(
                             tx,
@@ -260,6 +425,59 @@ impl<'a> ChangeVisibility<'a> {
         .await;
         if admitted(allowed)?.is_none() {
             return Ok(false);
+        }
+        if want_note_provenance && let EntityId::Note(note) = &change.entity {
+            if let Some(provenance) = computed_provenance {
+                change.provenance = Some(provenance);
+            } else if self.all_notes_visible {
+                let owned_rev;
+                let revision = if let Some(hit) = preloaded_rev
+                    && self.is_preloaded_fenced(note) == Some(false)
+                    && hit.visibility_seq == cut
+                    && hit.space_seq == cut
+                {
+                    Some(hit)
+                } else if self.is_preloaded_fenced(note) == Some(true) {
+                    return Ok(false);
+                } else {
+                    match read_immutable_revision_tx(
+                        tx,
+                        &self.space.scope,
+                        "note",
+                        note.as_str(),
+                        cut,
+                    )
+                    .await
+                    {
+                        Err(PortError::Domain(DomainError::ResourceNotFound)) => return Ok(false),
+                        result => {
+                            owned_rev = result?;
+                            owned_rev.as_ref()
+                        }
+                    }
+                };
+                if let Some(revision) = revision
+                    && revision.revision_id == change.revision
+                    && let RevisionMetadataPayload::Note(meta) = &revision.metadata.payload
+                {
+                    let ancestry = self
+                        .historical
+                        .load_ancestry_tx(
+                            tx,
+                            &self.space.scope.space_id,
+                            &meta.parent_folder_id,
+                            false,
+                        )
+                        .await?;
+                    change.provenance = Some(ancestry.note_provenance(
+                        note,
+                        &meta.slug,
+                        meta.title.clone(),
+                        revision.actor_id.clone(),
+                        revision.created_at,
+                    ));
+                }
+            }
         }
         // An overlay describes the complete command. A scoped subscriber cannot
         // apply just the visible rows. Fall back to its projection watermark.

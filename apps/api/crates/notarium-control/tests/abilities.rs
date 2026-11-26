@@ -2398,6 +2398,71 @@ async fn concurrent_ability_trail_cycle_and_revision_integrity(pg: bool) {
             .expect("committed trail graph must remain strictly acyclic");
     }
 
+    // Appending a 17th hop onto an existing 16-hop chain must be rejected so no
+    // committed chain can ever exceed the 16-hop follow cap.
+    let mut chain_nodes = Vec::with_capacity(18);
+    for idx in 0u8..18 {
+        chain_nodes.push(add(
+            &fixture,
+            &spaces[0].space,
+            AbilityPlacement::OwnedSpace(spaces[0].space.id.clone()),
+            120 + idx,
+            &format!("trail-hop-{idx}"),
+            vec![],
+        ));
+    }
+    for idx in 0..16 {
+        service
+            .set_ability_trail(
+                owner_ctx.clone(),
+                AccountMutation {
+                    identity: identity(&service, &owner_ctx, 60 + idx as u8).await,
+                    input: AbilityTrailMutation::Set(AbilityTrailUpdate {
+                        source: chain_nodes[idx].clone(),
+                        expected_destination: None,
+                        destination: Some(chain_nodes[idx + 1].clone()),
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        service
+            .follow_ability(owner_ctx.clone(), chain_nodes[0].clone())
+            .await
+            .unwrap(),
+        chain_nodes[16]
+    );
+    let over_depth = service
+        .set_ability_trail(
+            owner_ctx.clone(),
+            AccountMutation {
+                identity: identity(&service, &owner_ctx, 80).await,
+                input: AbilityTrailMutation::Set(AbilityTrailUpdate {
+                    source: chain_nodes[16].clone(),
+                    expected_destination: None,
+                    destination: Some(chain_nodes[17].clone()),
+                }),
+            },
+        )
+        .await;
+    assert!(
+        matches!(
+            over_depth,
+            Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
+                if diagnostic.reason == ValidationReason::InvalidState
+        ),
+        "appending a 17th hop onto a 16-hop chain must fail InvalidState, got {over_depth:?}"
+    );
+    assert_eq!(
+        service
+            .follow_ability(owner_ctx.clone(), chain_nodes[0].clone())
+            .await
+            .unwrap(),
+        chain_nodes[16]
+    );
+
     drop(service);
     fixture.close().await;
 }

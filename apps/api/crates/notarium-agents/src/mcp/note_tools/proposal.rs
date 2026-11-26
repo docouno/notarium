@@ -432,11 +432,28 @@ impl Destination {
         {
             return Ok(hit);
         }
+        const CONFIRMED_DEST_LABEL: &str = "notarium.confirmed-destination.v1";
+        let mut attempted_replayed = true;
+        let _: bool = call
+            .journal_with_key(
+                "confirmed_destination_attempted",
+                &identity.key,
+                identity.hash,
+                || async {
+                    attempted_replayed = false;
+                    Ok(true)
+                },
+            )
+            .await
+            .map_err(|error| super::batch_operational_error(CONFIRMED_DEST_LABEL, error, false))?;
         // Record the resolved identity for replay even when a sibling step
         // created the whole suffix. The subsequent note write rechecks it.
         let scope = call
             .fence_confirmed_effect(self.bind(scope, expected_source)?)
-            .await?;
+            .await
+            .map_err(|error| {
+                super::batch_operational_error(CONFIRMED_DEST_LABEL, error, attempted_replayed)
+            })?;
         let folder = call
             .registry
             .engine
@@ -451,7 +468,10 @@ impl Destination {
                     },
                 },
             )
-            .await?;
+            .await
+            .map_err(|error| {
+                super::batch_operational_error(CONFIRMED_DEST_LABEL, error, attempted_replayed)
+            })?;
         call.record_journal_with_key(
             "confirmed_destination",
             &identity.key,
@@ -459,7 +479,7 @@ impl Destination {
             &folder,
         )
         .await
-        .map_err(|error| super::post_commit_error("notarium.confirmed-destination.v1", error))
+        .map_err(|error| super::post_commit_error(CONFIRMED_DEST_LABEL, error))
     }
 }
 

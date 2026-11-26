@@ -2620,6 +2620,37 @@ fn build_rollback_execute_fn(
                             });
                         }
                     }
+                    // Also delete orphaned neighbor overlays on this active view that were
+                    // newly materialized solely by `input.run` into a group the untouched
+                    // card no longer belongs to after rollback (e.g. after restoring a
+                    // run-edited `group_by` or narrowed filter).
+                    for (nid, ov) in &overlays {
+                        if retired_note_ids.contains(nid)
+                            || eligible_all_ids.contains(nid)
+                            || materialized_neighbors.contains(nid)
+                            || ov.placement_run_id.is_some()
+                        {
+                            continue;
+                        }
+                        let matches_current_group = view_facts
+                            .groups
+                            .iter()
+                            .any(|g| g.group == ov.group && g.rows.iter().any(|r| &r.note == nid));
+                        if !matches_current_group
+                            && is_run_materialized_overlay_tx(
+                                tx,
+                                &scope_cl.space_id,
+                                &ov.placement_revision,
+                                &input.run,
+                            )
+                            .await?
+                        {
+                            planned_overlay_deletes.push(PlannedOverlayDelete {
+                                view: view.clone(),
+                                target_note: nid.clone(),
+                            });
+                        }
+                    }
 
                     preloaded_view_overlays.insert(view.clone(), overlays);
                 }
@@ -2650,11 +2681,27 @@ fn build_rollback_execute_fn(
                     })
                     .map(|bmh| &bmh.target_note_id)
                     .collect();
-                for nid in touched_on_view {
-                    if overlays
-                        .get(nid)
-                        .is_some_and(|ov| ov.placement_run_id.as_ref() == Some(&input.run))
-                    {
+                for (nid, ov) in &overlays {
+                    if retired_note_ids.contains(nid) {
+                        continue;
+                    }
+                    let delete_overlay = if ov.placement_run_id.as_ref() == Some(&input.run) {
+                        touched_on_view.contains(nid)
+                    } else if ov.placement_run_id.is_none() {
+                        // Also delete neighbor overlays newly materialized solely by `input.run`
+                        // (which carry `placement_run_id = None` and whose `placement_revision`
+                        // is a root rank revision created by `input.run` with `parent_rev_id IS NULL`).
+                        is_run_materialized_overlay_tx(
+                            tx,
+                            &scope_cl.space_id,
+                            &ov.placement_revision,
+                            &input.run,
+                        )
+                        .await?
+                    } else {
+                        false
+                    };
+                    if delete_overlay {
                         planned_overlay_deletes.push(PlannedOverlayDelete {
                             view: view.clone(),
                             target_note: nid.clone(),
@@ -3237,6 +3284,44 @@ fn build_rollback_execute_fn(
 #[allow(clippy::type_complexity)]
 // The current head is authorized when verifying the run's expected entities. The
 // restored revision can name a different folder, document class, or ability.
+async fn is_run_materialized_overlay_tx(
+    tx: &mut BackendConn<'_>,
+    space_id: &SpaceId,
+    placement_revision: &RevisionId,
+    run: &AgentRunId,
+) -> Result<bool, PortError> {
+    match tx {
+        BackendConn::Sqlite(conn) => Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT 1 FROM revisions
+             WHERE space_id = ? AND rev_id = ?
+               AND agent_run_id = ? AND parent_rev_id IS NULL
+             LIMIT 1",
+        )
+        .bind(space_id.as_str())
+        .bind(placement_revision.as_str())
+        .bind(run.as_str())
+        .fetch_optional(&mut **conn)
+        .await
+        .map_err(|err| {
+            internal_not_committed("sqlite_check_materialized_overlay", err.to_string())
+        })?
+        .is_some()),
+        BackendConn::Postgres(conn) => Ok(sqlx::query_scalar::<_, i32>(
+            "SELECT 1 FROM revisions
+             WHERE space_id = $1 AND rev_id = $2
+               AND agent_run_id = $3 AND parent_rev_id IS NULL
+             LIMIT 1",
+        )
+        .bind(space_id.as_str())
+        .bind(placement_revision.as_str())
+        .bind(run.as_str())
+        .fetch_optional(&mut **conn)
+        .await
+        .map_err(|err| internal_not_committed("pg_check_materialized_overlay", err.to_string()))?
+        .is_some()),
+    }
+}
+
 async fn authorize_rollback_destination_tx(
     tx: &mut BackendConn<'_>,
     cache: &mut FolderAncestryCache,

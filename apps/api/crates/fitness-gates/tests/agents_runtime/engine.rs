@@ -126,6 +126,7 @@ pub struct ProjectionFixtures {
     lose_note_create_acks: Mutex<usize>,
     fail_nth_create_note_not_committed: Mutex<Option<usize>>,
     fail_next_move_note_not_committed: Mutex<bool>,
+    fail_next_ensure_folder_path_not_committed: Mutex<bool>,
     fail_nth_link_many_not_committed: Mutex<Option<usize>>,
     lose_chat_append_acks: Mutex<usize>,
     before_chat_consume: Mutex<Option<MutationPause>>,
@@ -256,6 +257,14 @@ impl ProjectionFixtures {
         *self.fail_next_move_note_not_committed.lock().unwrap() = true;
     }
 
+    /// Fail the next `ensure_folder_path` call with `DeadlineExceeded(NotCommitted)`.
+    pub fn fail_next_ensure_folder_path_not_committed(&self) {
+        *self
+            .fail_next_ensure_folder_path_not_committed
+            .lock()
+            .unwrap() = true;
+    }
+
     /// Fail the 1-based `nth` `link_many` call with `DeadlineExceeded(NotCommitted)`.
     pub fn fail_nth_link_many_not_committed(&self, nth: usize) {
         assert!(nth >= 1);
@@ -344,7 +353,6 @@ macro_rules! canonical_port {
 }
 
 canonical_port!(NoteWritePort;
-    ensure_folder_path(Mutation<EnsureFolderPath>) -> FolderRef,
     delete_note(Mutation<DeleteNote>) -> Committed<NoteRevision>,
     mint_and_purge(Mutation<MintAndPurge>) -> Committed<MintAndPurgeResult>,
     rename_note(Mutation<RenameNote>) -> Committed<NoteRevision>,
@@ -435,6 +443,27 @@ canonical_port!(NoteWritePort;
                 ));
             }
             Ok(committed)
+        })
+    }
+
+    fn ensure_folder_path(
+        &self,
+        ctx: SpaceContext,
+        request: Mutation<EnsureFolderPath>,
+    ) -> PortFuture<'_, FolderRef> {
+        Box::pin(async move {
+            if std::mem::take(&mut *self.1.fail_next_ensure_folder_path_not_committed.lock().unwrap()) {
+                return Err(PortError::DeadlineExceeded(
+                    OperationalFailure::new(
+                        ContentDigest::from_bytes([175; 32]),
+                        CommitEffect::NotCommitted,
+                        RetryAdvice::Never,
+                        false,
+                    )
+                    .unwrap(),
+                ));
+            }
+            self.0.ensure_folder_path(ctx, request).await
         })
     }
 

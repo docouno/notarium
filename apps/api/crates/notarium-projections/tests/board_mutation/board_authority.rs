@@ -2054,8 +2054,11 @@ async fn rollback_retired_widened_unranked_and_trashed_board_views(
         .collect();
     assert_eq!(v3_ids, vec![card_a.note]);
 
-    // Case 3B: Agent changes `group_by` from `status` to `priority` and moves two cards
-    // on the run's temporary `priority` columns. Rollback restores `status` cleanly.
+    // Case 3B: Agent changes `group_by` from `status` to `priority` and moves `gb_a` twice
+    // (`p1 -> p2` adjacent to untouched `gb_u`, then `p2 -> p3`) so the non-earliest move's
+    // `before_placement` references non-eligible `gb_u` in temporary group `"p2"`.
+    // Rollback must tolerate missing non-eligible neighbors on `view_restored` views,
+    // restore `group_by: status` + `priority: p1`, and clear temporary overlays.
     let proj3b = folder(store, &owner, None, "rb-groupby-proj", true)
         .await
         .unwrap();
@@ -2078,12 +2081,12 @@ async fn rollback_retired_widened_unranked_and_trashed_board_views(
         "---\nstatus: todo\npriority: p1\n---\n".into(),
     )
     .await;
-    let gb_b = create_note(
+    let gb_u = create_note(
         store,
         &owner,
         Some(proj3b.clone()),
-        "gb-card-b",
-        "---\nstatus: todo\npriority: p1\n---\n".into(),
+        "gb-card-u",
+        "---\nstatus: todo\npriority: p2\n---\n".into(),
     )
     .await;
     sync(store, runtime, &scope).await;
@@ -2122,7 +2125,7 @@ async fn rollback_retired_widened_unranked_and_trashed_board_views(
         .value;
     sync(store, runtime, &scope).await;
 
-    let gb_a_mv = store
+    let gb_a_mv1 = store
         .move_board_card(
             agent_gb.clone(),
             mutation(
@@ -2131,7 +2134,10 @@ async fn rollback_retired_widened_unranked_and_trashed_board_views(
                     view: v3b.clone(),
                     note: gb_a.note.clone(),
                     group: group("p2"),
-                    before: None,
+                    before: Some(RankNeighbor {
+                        note: gb_u.note.clone(),
+                        expected_rank: RankExpectation::Absent,
+                    }),
                     after: None,
                     fields: BTreeMap::from([(
                         "priority".into(),
@@ -2153,20 +2159,17 @@ async fn rollback_retired_widened_unranked_and_trashed_board_views(
                 &agent_gb,
                 MoveBoardCard {
                     view: v3b.clone(),
-                    note: gb_b.note.clone(),
-                    group: group("p2"),
-                    before: Some(RankNeighbor {
-                        note: gb_a.note.clone(),
-                        expected_rank: RankExpectation::Existing(gb_a_mv.rank_revision),
-                    }),
+                    note: gb_a.note.clone(),
+                    group: group("p3"),
+                    before: None,
                     after: None,
                     fields: BTreeMap::from([(
                         "priority".into(),
-                        Some(YamlValue::String("p2".into())),
+                        Some(YamlValue::String("p3".into())),
                     )]),
-                    expected_note: gb_b.revision.clone(),
+                    expected_note: gb_a_mv1.revision.revision,
                     expected_view: v3b_prio_rev.revision,
-                    expected_rank: RankExpectation::Absent,
+                    expected_rank: RankExpectation::Existing(gb_a_mv1.rank_revision),
                 },
             ),
         )
@@ -2183,6 +2186,41 @@ async fn rollback_retired_widened_unranked_and_trashed_board_views(
         .await
         .expect("rollback must succeed after run changed group_by and moved cards");
     sync(store, runtime, &scope).await;
+    let gb_a_after = store
+        .get_note(
+            owner.clone(),
+            GetNote {
+                note: gb_a.note.clone(),
+                revision: None,
+                causal: CausalBasis::Exact(ReceiptSet::default()),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        gb_a_after
+            .document
+            .explicit_read(owner.auth())
+            .unwrap()
+            .contains("priority: p1"),
+        "rollback must restore gb_a priority back to p1"
+    );
+    let v3b_rows = query(&engine, owner.clone(), v3b.clone()).await.unwrap();
+    let v3b_ids: BTreeSet<NoteId> = v3b_rows
+        .rows
+        .items
+        .iter()
+        .map(|row| row.card.document.provenance().reference().note_id.clone())
+        .collect();
+    assert_eq!(v3b_ids, BTreeSet::from([gb_a.note, gb_u.note]));
+    let v3b_overlays = store
+        .inspect_view_overlays_for_test(&scope.space_id, &v3b)
+        .await
+        .unwrap();
+    assert!(
+        v3b_overlays.is_empty(),
+        "rollback must clear temporary priority-column overlays on v3b, found {v3b_overlays:?}"
+    );
 
     // Case 4: Unranked board sorted by `title ASC`. Agent moves `Alpha` out of `todo`
     // and edits `Beta` out of `todo` via `edit_note`. Rollback must restore `[Alpha, Beta, Gamma]`
@@ -2301,9 +2339,10 @@ async fn rollback_retired_widened_unranked_and_trashed_board_views(
         "unranked returning notes must be ordered by view sort descriptor (Alpha, Beta, Gamma)"
     );
 
-    // Case 5: Human trashes board view `V` after agent reordered `B` ahead of `A`, rolls back
-    // the run, then restores `V` from trash. Run-owned overlay must have been cleared on rollback
-    // so restoring `V` never resurrects the rolled-back agent ordering.
+    // Case 5: Human trashes board view `V` after agent moved `First` AFTER `Second`
+    // (newly materializing a neighbor overlay on `Second` with `placement_run_id = None`),
+    // rolls back the run, then restores `V` from trash. Both the moved-target overlay AND
+    // the run-materialized neighbor overlay must be deleted so restoring `V` renders `[First, Second]`.
     let proj5 = folder(store, &owner, None, "rb-human-trash-view-proj", true)
         .await
         .unwrap();
@@ -2344,15 +2383,15 @@ async fn rollback_retired_widened_unranked_and_trashed_board_views(
                 &agent_ht,
                 MoveBoardCard {
                     view: v5.clone(),
-                    note: t_b.note.clone(),
+                    note: t_a.note.clone(),
                     group: group("todo"),
-                    before: Some(RankNeighbor {
-                        note: t_a.note.clone(),
+                    before: None,
+                    after: Some(RankNeighbor {
+                        note: t_b.note.clone(),
                         expected_rank: RankExpectation::Absent,
                     }),
-                    after: None,
                     fields: BTreeMap::new(),
-                    expected_note: t_b.revision.clone(),
+                    expected_note: t_a.revision.clone(),
                     expected_view: v5_rev.revision.clone(),
                     expected_rank: RankExpectation::Absent,
                 },
@@ -2383,6 +2422,14 @@ async fn rollback_retired_widened_unranked_and_trashed_board_views(
         .rollback_agent_run(owner.clone(), mutation(&owner, prep_ht))
         .await
         .expect("rollback must succeed on human-trashed board view");
+    let v5_overlays = store
+        .inspect_view_overlays_for_test(&scope.space_id, &v5)
+        .await
+        .unwrap();
+    assert!(
+        v5_overlays.is_empty(),
+        "rollback of human-trashed view must delete both run-owned and run-materialized neighbor overlays, found {v5_overlays:?}"
+    );
     store
         .delete_note(
             owner.clone(),
@@ -2397,7 +2444,7 @@ async fn rollback_retired_widened_unranked_and_trashed_board_views(
         .await
         .unwrap();
     sync(store, runtime, &scope).await;
-    let v5_rows = query(&engine, owner, v5).await.unwrap();
+    let v5_rows = query(&engine, owner.clone(), v5).await.unwrap();
     let v5_ids: Vec<NoteId> = v5_rows
         .rows
         .items
@@ -2407,8 +2454,330 @@ async fn rollback_retired_widened_unranked_and_trashed_board_views(
     assert_eq!(
         v5_ids,
         vec![t_a.note, t_b.note],
-        "restoring human-trashed board view after rollback must not resurrect run-owned rank overlay"
+        "restoring human-trashed board view after rollback must not resurrect run-materialized ordering"
     );
+
+    // Case 6: SourceFolder::Id trashed -> retired on rollback; static class authorization and
+    // cross-project folder-existence anti-oracle MUST still fail closed before retiring.
+    let proj6a = folder(store, &owner, None, "rb-srcid-proj-a", true)
+        .await
+        .unwrap();
+    let proj6b = folder(store, &owner, None, "rb-srcid-proj-b", true)
+        .await
+        .unwrap();
+    let src_id_sub = folder(store, &owner, Some(proj6a.clone()), "src-id-sub", false)
+        .await
+        .unwrap();
+    let v6_init_body = "group_by: status\nfilter: {exists: status}\n";
+    let (v6_id, v6_id_rev) = create_view(
+        store,
+        &owner,
+        &proj6a,
+        "rb-source-id-board",
+        "board",
+        "{scope: project}",
+        v6_init_body,
+    )
+    .await;
+    let c6 = create_note(
+        store,
+        &owner,
+        Some(proj6a.clone()),
+        "rb-srcid-card",
+        "---\nstatus: todo\n---\n".into(),
+    )
+    .await;
+    sync(store, runtime, &scope).await;
+
+    let run_srcid = AgentRunId::from_bytes(random_bytes());
+    let agent_srcid = super::agent(&owner, run_srcid.clone(), ChatAudience::Personal);
+    store
+        .move_board_card(
+            agent_srcid.clone(),
+            mutation(
+                &agent_srcid,
+                MoveBoardCard {
+                    view: v6_id.clone(),
+                    note: c6.note.clone(),
+                    group: group("doing"),
+                    before: None,
+                    after: None,
+                    fields: BTreeMap::from([(
+                        "status".into(),
+                        Some(YamlValue::String("doing".into())),
+                    )]),
+                    expected_note: c6.revision.clone(),
+                    expected_view: v6_id_rev.revision.clone(),
+                    expected_rank: RankExpectation::Absent,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let old_v6 = view_carrier(&v6_id.key, "board", "{scope: project}", v6_init_body);
+    let new_v6 = view_carrier(
+        &v6_id.key,
+        "board",
+        &format!("{{scope: folder, folder: \"{src_id_sub}\"}}"),
+        v6_init_body,
+    );
+    let span = notarium_syntax::frontmatter::analyze(&old_v6, DocClass::UserDoc)
+        .unwrap()
+        .carrier
+        .body;
+    let plan =
+        notarium_syntax::patch::plan(&old_v6, span, vec![(CarrierEditOrigin::Body, span, new_v6)])
+            .unwrap();
+    let mut edit_v6 = mutation(
+        &owner,
+        EditNote {
+            note: v6_id_rev.note.clone(),
+            plan,
+        },
+    );
+    edit_v6.preconditions.revision = Some(v6_id_rev.revision);
+    store.edit_note(owner.clone(), edit_v6).await.unwrap();
+    let space_epoch = store
+        .read_space(&scope.space_id)
+        .await
+        .unwrap()
+        .active_epoch;
+    let sub_rev = store
+        .resolve_folder_path(owner.clone(), Some(src_id_sub.clone()), String::new())
+        .await
+        .unwrap()
+        .unwrap()
+        .revision;
+    store
+        .set_folder_lifecycle(
+            &scope,
+            space_epoch,
+            &src_id_sub,
+            &sub_rev,
+            notarium_core::model::Lifecycle::Trashed,
+            owner.auth().principal(),
+            None,
+        )
+        .await
+        .unwrap();
+    sync(store, runtime, &scope).await;
+
+    let prep_srcid = store
+        .prepare_agent_run_rollback(owner.clone(), run_srcid)
+        .await
+        .expect("prepare rollback must succeed when SourceFolder::Id is trashed");
+    store
+        .rollback_agent_run(owner.clone(), mutation(&owner, prep_srcid))
+        .await
+        .expect("rollback must retire board view whose SourceFolder::Id is trashed");
+    let v6_overlays = store
+        .inspect_view_overlays_for_test(&scope.space_id, &v6_id)
+        .await
+        .unwrap();
+    assert!(
+        v6_overlays.is_empty(),
+        "retiring trashed SourceFolder::Id board must clear run overlay"
+    );
+
+    // Anti-oracle & static class auth (differential: fails for constrained actor, succeeds for owner):
+    // Both boards and cards stay active inside `proj6a` (`UserDoc`); only the board's declared
+    // source is edited by the owner after the run to point to a missing folder with either an
+    // unauthorized class (`profile`) or a path outside `proj6a` (`rb-srcid-proj-b/missing-secret`).
+    let _ = proj6b;
+    let init_body = "group_by: status\nfilter: {exists: status}\n";
+    let (v6_cls, v6_cls_rev) = create_view(
+        store,
+        &owner,
+        &proj6a,
+        "rb-missing-class-board",
+        "board",
+        "{scope: project}",
+        init_body,
+    )
+    .await;
+    let c6_cls = create_note(
+        store,
+        &owner,
+        Some(proj6a.clone()),
+        "rb-cls-card",
+        "---\nstatus: todo\n---\n".into(),
+    )
+    .await;
+    let (v6_xproj, v6_xproj_rev) = create_view(
+        store,
+        &owner,
+        &proj6a,
+        "rb-cross-project-missing-board",
+        "board",
+        "{scope: project}",
+        init_body,
+    )
+    .await;
+    let c6_xproj = create_note(
+        store,
+        &owner,
+        Some(proj6a.clone()),
+        "rb-xproj-card",
+        "---\nstatus: todo\n---\n".into(),
+    )
+    .await;
+    sync(store, runtime, &scope).await;
+
+    let run_cls = AgentRunId::from_bytes(random_bytes());
+    let agent_cls = super::agent(&owner, run_cls.clone(), ChatAudience::Personal);
+    store
+        .move_board_card(
+            agent_cls.clone(),
+            mutation(
+                &agent_cls,
+                MoveBoardCard {
+                    view: v6_cls.clone(),
+                    note: c6_cls.note,
+                    group: group("doing"),
+                    before: None,
+                    after: None,
+                    fields: BTreeMap::from([(
+                        "status".into(),
+                        Some(YamlValue::String("doing".into())),
+                    )]),
+                    expected_note: c6_cls.revision,
+                    expected_view: v6_cls_rev.revision.clone(),
+                    expected_rank: RankExpectation::Absent,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+
+    let run_xproj = AgentRunId::from_bytes(random_bytes());
+    let agent_xproj = super::agent(&owner, run_xproj.clone(), ChatAudience::Personal);
+    store
+        .move_board_card(
+            agent_xproj.clone(),
+            mutation(
+                &agent_xproj,
+                MoveBoardCard {
+                    view: v6_xproj.clone(),
+                    note: c6_xproj.note,
+                    group: group("doing"),
+                    before: None,
+                    after: None,
+                    fields: BTreeMap::from([(
+                        "status".into(),
+                        Some(YamlValue::String("doing".into())),
+                    )]),
+                    expected_note: c6_xproj.revision,
+                    expected_view: v6_xproj_rev.revision.clone(),
+                    expected_rank: RankExpectation::Absent,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+
+    for (view_ref, view_rev, new_source) in [
+        (
+            &v6_cls,
+            &v6_cls_rev,
+            "{scope: folder, folder: \"rb-srcid-proj-a/no-such-folder\", classes: [user-doc, profile]}",
+        ),
+        (
+            &v6_xproj,
+            &v6_xproj_rev,
+            "{scope: folder, folder: \"rb-srcid-proj-b/missing-secret\"}",
+        ),
+    ] {
+        let old_text = view_carrier(&view_ref.key, "board", "{scope: project}", init_body);
+        let new_text = view_carrier(&view_ref.key, "board", new_source, init_body);
+        let span = notarium_syntax::frontmatter::analyze(&old_text, DocClass::UserDoc)
+            .unwrap()
+            .carrier
+            .body;
+        let plan = notarium_syntax::patch::plan(
+            &old_text,
+            span,
+            vec![(CarrierEditOrigin::Body, span, new_text)],
+        )
+        .unwrap();
+        let mut edit = mutation(
+            &owner,
+            EditNote {
+                note: view_rev.note.clone(),
+                plan,
+            },
+        );
+        edit.preconditions.revision = Some(view_rev.revision.clone());
+        store.edit_note(owner.clone(), edit).await.unwrap();
+    }
+    sync(store, runtime, &scope).await;
+
+    let no_profile = SpaceContext::new(
+        owner
+            .auth()
+            .restrict_read_classes(&scope.space_id, &BTreeSet::from([DocClass::UserDoc]))
+            .unwrap(),
+        scope.clone(),
+        budget(),
+    )
+    .unwrap();
+    let prep_cls = store
+        .prepare_agent_run_rollback(owner.clone(), run_cls.clone())
+        .await
+        .unwrap();
+    let cls_err = store
+        .rollback_agent_run(no_profile.clone(), mutation(&no_profile, prep_cls))
+        .await;
+    assert!(
+        matches!(
+            cls_err,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ),
+        "missing folder must NOT bypass unauthorized class check into Retired, got {cls_err:?}"
+    );
+    // Differential positive check: owner with full read classes retires the missing-folder view cleanly.
+    let prep_cls_ok = store
+        .prepare_agent_run_rollback(owner.clone(), run_cls)
+        .await
+        .unwrap();
+    store
+        .rollback_agent_run(owner.clone(), mutation(&owner, prep_cls_ok))
+        .await
+        .expect("authorized owner must cleanly retire missing-folder view on rollback");
+
+    let pinned_6a = SpaceContext::new(
+        owner
+            .auth()
+            .restrict_to_project(&notarium_core::model::FolderRef {
+                space_id: scope.space_id.clone(),
+                folder_id: proj6a,
+            })
+            .unwrap(),
+        scope.clone(),
+        budget(),
+    )
+    .unwrap();
+    let prep_xproj = store
+        .prepare_agent_run_rollback(owner.clone(), run_xproj.clone())
+        .await
+        .unwrap();
+    let xproj_err = store
+        .rollback_agent_run(pinned_6a.clone(), mutation(&pinned_6a, prep_xproj))
+        .await;
+    assert!(
+        matches!(
+            xproj_err,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ),
+        "missing folder outside project_root must fail closed ResourceNotFound (no cross-project oracle), got {xproj_err:?}"
+    );
+    let prep_xproj_ok = store
+        .prepare_agent_run_rollback(owner.clone(), run_xproj)
+        .await
+        .unwrap();
+    store
+        .rollback_agent_run(owner.clone(), mutation(&owner, prep_xproj_ok))
+        .await
+        .expect("unpinned owner must cleanly retire missing-folder cross-project view on rollback");
 }
 
 async fn keeper_readonly_abilities_isolation_on_changes_events_and_graph(

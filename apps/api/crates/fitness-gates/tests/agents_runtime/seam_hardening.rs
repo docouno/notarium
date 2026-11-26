@@ -19602,6 +19602,12 @@ async fn authority_cursors_oracles_and_trashed_ancestry_hardening(
         )
     })
     .await;
+    box_step(|| {
+        hardened_retry_legacy_and_recent_eviction_seams(
+            fixture, local, &pscope, &s2_sc, s2, s2_p1, s2_epoch, actor,
+        )
+    })
+    .await;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -25706,55 +25712,6 @@ async fn hardened_ability_dispatch_shadow_and_replay_seams(
     .structured_content;
     assert_eq!(r_mv_3["versionToken"], r_mv_1["versionToken"]);
 
-    // Part D: Retry of `create_ability` after `.abilities` folder was already created on
-    // attempt #1 must STILL escalate NotCommitted failure to CommitEffect::Unknown.
-    let p_unk_id = FolderId::from_bytes([0xF0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
-    fixture
-        .canonical
-        .create_folder(CreateFolderSpec {
-            scope: s2.history.clone(),
-            active_epoch: s2_epoch,
-            folder_id: p_unk_id,
-            parent: None,
-            slug: "retry-unknown-proj".into(),
-            display_name: "Retry Unknown Proj".into(),
-            is_project: true,
-            project_slug: Some("retry-unknown-proj".into()),
-            actor: actor.clone(),
-            timestamp: None,
-        })
-        .await
-        .unwrap();
-    let unk_handle = format!("{}/retry-unknown-proj", s2.slug);
-    let unk_key = [0xF0, 4, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
-    let unk_args = json!({
-        "kind": "role",
-        "name": "retry-unknown-role",
-        "description": "Retry after folder creation.",
-        "instructions": "Body.\n",
-        "placement": { "home": "project", "project": unk_handle },
-    });
-    for attempt in 1..=2 {
-        fixture.projections.fail_next_create_note_not_committed();
-        let err = call_mcp(
-            &fixture.registry,
-            &owner,
-            unk_key,
-            "create_ability",
-            unk_args.clone(),
-        )
-        .await;
-        assert!(
-            matches!(
-                err,
-                Err(PortError::DeadlineExceeded(ref f))
-                    if f.effect() == CommitEffect::Unknown
-            ),
-            "create_ability attempt #{attempt} after folder creation must keep CommitEffect::Unknown, got {:?}",
-            err.err()
-        );
-    }
-
     // Part E: `edit_ability` post-publish promotion replay (`already_published.is_some()`)
     // reports `"home": "failed"` (never `"skipped"`) when `set_ability_trail` fails.
     let prom_fail = call_mcp(
@@ -25818,6 +25775,474 @@ async fn hardened_ability_dispatch_shadow_and_replay_seams(
         home_step["outcome"],
         json!("failed"),
         "post-publish promotion retry failure must report home=failed (not skipped): {partial}"
+    );
+}
+
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+async fn hardened_retry_legacy_and_recent_eviction_seams(
+    fixture: &mut RuntimeFixture,
+    local: &LoopbackProvider,
+    pscope: &HistoryScope,
+    s2_sc: &SpaceContext,
+    s2: &AccessibleSpace,
+    s2_p1: &FolderRef,
+    s2_epoch: notarium_core::ids::LeaseEpoch,
+    actor: &PrincipalId,
+) {
+    let owner = fresh_owner(fixture).await;
+
+    // Part D: Non-vacuous retry escalation across `existed_replayed && !existed` for BOTH
+    // `ensure_ability_folder_journaled` (`create_ability`) and `ensure_destination` (`create_note`):
+    // attempt #1 creates the folder and records `*-existed = false`; we then delete ONLY the
+    // saved folder-plan row (simulating crash between folder commit and plan journaling) and
+    // arm `fail_next_ensure_folder_path_not_committed()` so attempt #2 genuinely traverses
+    // `existed_replayed && !existed` and escalates `NotCommitted` -> `CommitEffect::Unknown`.
+    let p_unk_id = FolderId::from_bytes([0xF0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    fixture
+        .canonical
+        .create_folder(CreateFolderSpec {
+            scope: s2.history.clone(),
+            active_epoch: s2_epoch,
+            folder_id: p_unk_id,
+            parent: None,
+            slug: "retry-unknown-proj".into(),
+            display_name: "Retry Unknown Proj".into(),
+            is_project: true,
+            project_slug: Some("retry-unknown-proj".into()),
+            actor: actor.clone(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+    let unk_handle = format!("{}/retry-unknown-proj", s2.slug);
+    let unk_key = [0xF0, 4, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    let unk_args = json!({
+        "kind": "role",
+        "name": "retry-unknown-role",
+        "description": "Retry after folder creation.",
+        "instructions": "Body.\n",
+        "placement": { "home": "project", "project": unk_handle },
+    });
+    fixture.projections.fail_next_create_note_not_committed();
+    let err1 = call_mcp(
+        &fixture.registry,
+        &owner,
+        unk_key,
+        "create_ability",
+        unk_args.clone(),
+    )
+    .await;
+    assert!(
+        matches!(
+            err1,
+            Err(PortError::DeadlineExceeded(ref f))
+                if f.effect() == CommitEffect::Unknown
+        ),
+        "create_ability attempt #1 after folder creation must return CommitEffect::Unknown, got {:?}",
+        err1.err()
+    );
+    fixture
+        .storage
+        .observer
+        .execute("DELETE FROM mcp_dedup WHERE operation='create_ability' AND safe_result LIKE '%\"created\":true%'")
+        .await;
+    fixture
+        .projections
+        .fail_next_ensure_folder_path_not_committed();
+    let err2 = call_mcp(
+        &fixture.registry,
+        &owner,
+        unk_key,
+        "create_ability",
+        unk_args,
+    )
+    .await;
+    assert!(
+        matches!(
+            err2,
+            Err(PortError::DeadlineExceeded(ref f))
+                if f.effect() == CommitEffect::Unknown
+        ),
+        "create_ability attempt #2 traversing existed_replayed && !existed must escalate ensure_folder_path NotCommitted to CommitEffect::Unknown, got {:?}",
+        err2.err()
+    );
+
+    let cn_unk_key = [0xF0, 4, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    let cn_unk_args = json!({
+        "project": unk_handle,
+        "path": "fresh-retry-sub",
+        "title": "Retry Unknown Note",
+        "body": "Body.\n",
+    });
+    fixture.projections.fail_next_create_note_not_committed();
+    let cn_err1 = call_mcp(
+        &fixture.registry,
+        &owner,
+        cn_unk_key,
+        "create_note",
+        cn_unk_args.clone(),
+    )
+    .await;
+    assert!(matches!(
+        cn_err1,
+        Err(PortError::DeadlineExceeded(ref f)) if f.effect() == CommitEffect::Unknown
+    ));
+    fixture
+        .storage
+        .observer
+        .execute("DELETE FROM mcp_dedup WHERE operation='create_note' AND safe_result LIKE '%\"folder\":%'")
+        .await;
+    fixture
+        .projections
+        .fail_next_ensure_folder_path_not_committed();
+    let cn_err2 = call_mcp(
+        &fixture.registry,
+        &owner,
+        cn_unk_key,
+        "create_note",
+        cn_unk_args,
+    )
+    .await;
+    assert!(
+        matches!(
+            cn_err2,
+            Err(PortError::DeadlineExceeded(ref f))
+                if f.effect() == CommitEffect::Unknown
+        ),
+        "create_note attempt #2 traversing existed_replayed && !existed must escalate ensure_folder_path NotCommitted to CommitEffect::Unknown, got {:?}",
+        cn_err2.err()
+    );
+
+    // Part F: `DestinationPrecheck::Legacy(true)` replay on an existing subfolder after
+    // `rename_project` must strip the old project slug via `folder_aliases` instead of
+    // creating a duplicated `<new>/<old>/existing-sub` directory.
+    let p_ex_id = FolderId::from_bytes([0xF0, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    let p_ex_sub = FolderId::from_bytes([0xF0, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+    fixture
+        .canonical
+        .create_folder(CreateFolderSpec {
+            scope: s2.history.clone(),
+            active_epoch: s2_epoch,
+            folder_id: p_ex_id.clone(),
+            parent: None,
+            slug: "leg-ex-orig".into(),
+            display_name: "Legacy Existing Orig".into(),
+            is_project: true,
+            project_slug: Some("leg-ex-orig".into()),
+            actor: actor.clone(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+    fixture
+        .canonical
+        .create_folder(CreateFolderSpec {
+            scope: s2.history.clone(),
+            active_epoch: s2_epoch,
+            folder_id: p_ex_sub.clone(),
+            parent: Some(p_ex_id.clone()),
+            slug: "existing-sub".into(),
+            display_name: "Existing Sub".into(),
+            is_project: false,
+            project_slug: None,
+            actor: actor.clone(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+    let ex_handle = format!("{}/leg-ex-orig", s2.slug);
+    let ex_key = [0xF0, 6, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    let ex_args = json!({
+        "project": ex_handle,
+        "path": "leg-ex-orig/existing-sub",
+        "title": "Legacy Existing Replay",
+        "body": "Body.\n",
+    });
+    // Fail create_note on attempt #1 so `create_destination_existed` is recorded (`existed = true`),
+    // then rewrite it to bare-bool `true` (`Legacy(true)`), drop `create_destination`, rename the
+    // project, and replay!
+    fixture.projections.fail_next_create_note_not_committed();
+    let _ = call_mcp(
+        &fixture.registry,
+        &owner,
+        ex_key,
+        "create_note",
+        ex_args.clone(),
+    )
+    .await;
+    fixture
+        .storage
+        .observer
+        .execute("DELETE FROM mcp_dedup WHERE operation='create_note' AND safe_result LIKE '%\"folder\":%'")
+        .await;
+    fixture
+        .storage
+        .observer
+        .execute("UPDATE mcp_dedup SET safe_result='true' WHERE operation='create_note' AND safe_result LIKE '%\"existed\":true%'")
+        .await;
+    let _ = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xF0, 6, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "rename_project",
+        json!({ "project": ex_handle, "slug": "leg-ex-new" }),
+    )
+    .await
+    .unwrap();
+    let ex_res = call_mcp(&fixture.registry, &owner, ex_key, "create_note", ex_args)
+        .await
+        .expect("Legacy(true) replay after project rename must succeed")
+        .structured_content;
+    assert!(ex_res["noteId"].as_str().is_some());
+    assert!(
+        fixture
+            .canonical
+            .resolve_folder_path(
+                s2_sc.clone(),
+                Some(p_ex_id),
+                "leg-ex-orig/existing-sub".into(),
+            )
+            .await
+            .unwrap()
+            .is_none(),
+        "Legacy(true) replay after project rename must not create duplicated leg-ex-orig/existing-sub folder"
+    );
+
+    // Part G: Cross-space `MAX_CANDIDATES` eviction protection in `recent_activity`:
+    // 200 trashed-note revisions in consented foreign `s2` newer than an active note in
+    // pinned `pscope` must neither evict the local active note nor flip taint.
+    let p_sc = SpaceContext::new(owner.auth().clone(), pscope.clone(), budget()).unwrap();
+    let local_note = fixture
+        .canonical
+        .create_note(
+            p_sc,
+            Mutation {
+                identity: CommandIdentity {
+                    scope: pscope.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([
+                        0xF0, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xF6; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: CreateNote {
+                    folder_page: false,
+                    note: NoteId::from_bytes([0xF0, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]),
+                    parent: None,
+                    slug: "pinned-space-recent-survivor".into(),
+                    class: DocClass::UserDoc,
+                    carrier:
+                        "# Pinned Space Recent Survivor\nMust survive foreign trashed flood.\n"
+                            .into(),
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    let local_note_id = local_note.note.to_string();
+    // Advance wall clock slightly so all 200 foreign trashed revisions have strictly newer timestamps.
+    fixture
+        .storage
+        .clock
+        .0
+        .fetch_add(10_000, std::sync::atomic::Ordering::SeqCst);
+    let flood_note = fixture
+        .canonical
+        .create_note(
+            s2_sc.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: s2.history.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([
+                        0xF0, 7, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xF7; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: CreateNote {
+                    folder_page: false,
+                    note: NoteId::from_bytes([0xF0, 7, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]),
+                    parent: Some(s2_p1.folder_id.clone()),
+                    slug: "recent-trashed-flood".into(),
+                    class: DocClass::UserDoc,
+                    carrier: "flood-0".into(),
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    let mut prev_text = "flood-0".to_owned();
+    let mut prev_rev = flood_note.revision;
+    for i in 1u16..=200 {
+        let next_text = format!("flood-{i}");
+        let span = notarium_syntax::frontmatter::analyze(&prev_text, DocClass::UserDoc)
+            .unwrap()
+            .carrier
+            .body;
+        let plan = notarium_syntax::patch::plan(
+            &prev_text,
+            span,
+            vec![(
+                notarium_core::patch::CarrierEditOrigin::Body,
+                span,
+                next_text.clone(),
+            )],
+        )
+        .unwrap();
+        let mut key_bytes = [0xF0, 7, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        key_bytes[14..16].copy_from_slice(&i.to_be_bytes());
+        let edited = fixture
+            .canonical
+            .edit_note(
+                s2_sc.clone(),
+                Mutation {
+                    identity: CommandIdentity {
+                        scope: s2.history.clone(),
+                        actor: actor.clone(),
+                        key: CommandKey::from_bytes(key_bytes),
+                        hash: ContentDigest::from_bytes([0xF8; 32]),
+                    },
+                    preconditions: Preconditions {
+                        revision: Some(prev_rev),
+                        ..Preconditions::default()
+                    },
+                    input: EditNote {
+                        note: flood_note.note.clone(),
+                        plan,
+                    },
+                },
+            )
+            .await
+            .unwrap()
+            .value;
+        prev_text = next_text;
+        prev_rev = edited.revision;
+    }
+    fixture
+        .canonical
+        .delete_note(
+            s2_sc.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: s2.history.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([
+                        0xF0, 7, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xF9; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: DeleteNote {
+                    note: flood_note.note,
+                    disposition: DeleteDisposition::Trash,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let recent_auth = owner
+        .auth()
+        .for_agent_run(
+            AgentRunId::from_bytes([0xF0, 7, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+            pscope.space_id.clone(),
+            ChatAudience::Personal,
+            owner.auth().spaces().clone(),
+        )
+        .unwrap();
+    let recent_res = local
+        .registry
+        .call_tool(
+            McpInvocationContext {
+                account: AccountContext::new(recent_auth.clone(), budget()),
+                target: EgressTarget::InAppProvider {
+                    provider: local.resource.id.clone(),
+                    model: local.model.clone(),
+                    primary_project: None,
+                },
+                request_key: CommandKey::from_bytes([
+                    0xF0, 7, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
+                ]),
+            },
+            "recent_activity",
+            json!({ "limit": 20 }),
+        )
+        .await
+        .unwrap()
+        .structured_content;
+    assert!(
+        recent_res["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["noteId"].as_str() == Some(local_note_id.as_str())),
+        "200 trashed foreign revisions must not evict pinned-Space active note from recent_activity: {recent_res}"
+    );
+    assert!(
+        !recent_auth.taint().is_tainted(),
+        "skipped foreign trashed revisions must not falsely taint untainted local recent_activity"
+    );
+
+    // Part H: `list_abilities(view: "authoring")` under `InAppProvider` with `project: None`
+    // must restrict discovery to consented Spaces only (excluding unconsented `s2` without
+    // scanning or leaking its abilities and without tainting the pinned Space).
+    let auth_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let lp_local_only = loopback_provider(fixture, &owner, &auth_listener, 0x20, true).await;
+    approve_disclosure(
+        fixture,
+        &owner,
+        &lp_local_only,
+        0x22,
+        ProviderAttachmentTarget::Personal {
+            owner: actor.clone(),
+            space: pscope.space_id.clone(),
+        },
+        [DocClass::UserDoc, DocClass::AgentMemory, DocClass::Skill].into(),
+    )
+    .await;
+    let authoring_auth = owner
+        .auth()
+        .for_agent_run(
+            AgentRunId::from_bytes([0xF0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+            pscope.space_id.clone(),
+            ChatAudience::Personal,
+            owner.auth().spaces().clone(),
+        )
+        .unwrap();
+    let authoring_list = lp_local_only
+        .registry
+        .call_tool(
+            McpInvocationContext {
+                account: AccountContext::new(authoring_auth.clone(), budget()),
+                target: EgressTarget::InAppProvider {
+                    provider: lp_local_only.resource.id.clone(),
+                    model: lp_local_only.model.clone(),
+                    primary_project: None,
+                },
+                request_key: CommandKey::from_bytes([
+                    0xF0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
+                ]),
+            },
+            "list_abilities",
+            json!({ "view": "authoring", "limit": 50 }),
+        )
+        .await
+        .unwrap()
+        .structured_content;
+    let items = authoring_list["items"].as_array().unwrap();
+    assert!(
+        items
+            .iter()
+            .all(|item| item["placement"]["spaceId"].as_str() != Some(s2.history.space_id.as_str())),
+        "unconsented foreign Space s2 must be excluded from list_abilities(view: authoring): {authoring_list}"
+    );
+    assert!(
+        !authoring_auth.taint().is_tainted(),
+        "list_abilities(view: authoring) skipping unconsented Space s2 must not taint pinned Space"
     );
 }
 

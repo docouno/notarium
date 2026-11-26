@@ -3638,7 +3638,34 @@ pub(crate) async fn read_immutable_revision_tx(
         return Ok(None);
     };
 
-    let revision_id = RevisionId::parse(&rev_raw)
+    Ok(Some(decode_stored_revision_row(
+        &rev_raw,
+        s_seq_raw,
+        v_seq_raw,
+        digest_opt,
+        &meta_bytes,
+        &actor_raw,
+        run_opt.as_deref(),
+        restored_opt.as_deref(),
+        sec,
+        nsec,
+    )?))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_stored_revision_row(
+    rev_raw: &str,
+    s_seq_raw: i64,
+    v_seq_raw: i64,
+    digest_opt: Option<Vec<u8>>,
+    meta_bytes: &[u8],
+    actor_raw: &str,
+    run_opt: Option<&str>,
+    restored_opt: Option<&str>,
+    sec: i64,
+    nsec: i32,
+) -> Result<StoredRevisionRecord, PortError> {
+    let revision_id = RevisionId::parse(rev_raw)
         .map_err(|_| internal_not_committed("corrupt_rev_id", "invalid rev_id"))?;
     let space_seq = i64_to_space_seq(s_seq_raw)?;
     let visibility_seq = i64_to_space_seq(v_seq_raw)?;
@@ -3651,25 +3678,25 @@ pub(crate) async fn read_immutable_revision_tx(
         }
         None => None,
     };
-    let metadata = RevisionMetadataEnvelope::decode(&meta_bytes)?;
-    let actor_id = PrincipalId::parse(&actor_raw)
+    let metadata = RevisionMetadataEnvelope::decode(meta_bytes)?;
+    let actor_id = PrincipalId::parse(actor_raw)
         .map_err(|_| internal_not_committed("corrupt_rev_actor", "invalid actor_id"))?;
     let agent_run_id = match run_opt {
         Some(s) => Some(
-            AgentRunId::parse(&s)
+            AgentRunId::parse(s)
                 .map_err(|_| internal_not_committed("corrupt_rev_run", "invalid agent_run_id"))?,
         ),
         None => None,
     };
     let restored_from_rev_id = match restored_opt {
-        Some(s) => Some(RevisionId::parse(&s).map_err(|_| {
+        Some(s) => Some(RevisionId::parse(s).map_err(|_| {
             internal_not_committed("corrupt_restored_rev", "invalid restored_from_rev_id")
         })?),
         None => None,
     };
     let created_at = decode_timestamp_parts(sec, nsec)?;
 
-    Ok(Some(StoredRevisionRecord {
+    Ok(StoredRevisionRecord {
         revision_id,
         space_seq,
         visibility_seq,
@@ -3679,7 +3706,7 @@ pub(crate) async fn read_immutable_revision_tx(
         agent_run_id,
         restored_from_rev_id,
         created_at,
-    }))
+    })
 }
 
 #[cfg(test)]

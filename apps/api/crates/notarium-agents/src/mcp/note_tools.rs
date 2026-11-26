@@ -501,6 +501,26 @@ async fn resolve_stripped_segments(
                 && corpus::strip_folder_prefix(raw_path, project_path).is_some()
             {
                 segment_count(project_path)
+            } else if allow_trashed_root
+                && let Some(base_id) = base.as_ref()
+                && let Some(first_seg) = raw_path
+                    .trim_matches('/')
+                    .split('/')
+                    .next()
+                    .filter(|seg| !seg.is_empty())
+            {
+                // Legacy pre-`WithStrip` replay after project rename: check whether
+                // the leading segment resolves via `folder_aliases` to `base_id`.
+                match call
+                    .registry
+                    .catalog
+                    .project_by_slug(scope.with_preflight_taint(), first_seg.to_owned())
+                    .await
+                {
+                    Ok(found) if &found.folder.folder_id == base_id => Ok(1),
+                    Ok(_) | Err(PortError::Domain(DomainError::ResourceNotFound)) => Ok(0),
+                    Err(error) => Err(error),
+                }
             } else {
                 Ok(0)
             }
@@ -520,22 +540,26 @@ async fn resolve_stripped_segments(
                         scope.auth().with_preflight_taint(),
                         call.budget(),
                     );
-                    if let Ok(trashed) = call
+                    match call
                         .registry
                         .catalog
                         .trashed_folder_ancestry(trashed_account, root_ref)
                         .await
                     {
-                        // `ancestors` includes `root_id` through the Space root; the path
-                        // depth omits the Space root itself (at least 1 segment for a project).
-                        let depth = trashed.ancestors.len().saturating_sub(1).max(1);
-                        if let Ok(count) = u16::try_from(depth)
-                            && usize::from(count) <= usize::from(segment_count(raw_path)?)
-                        {
-                            return Ok(count);
+                        Ok(trashed) => {
+                            // `ancestors` includes `root_id` through the Space root; the path
+                            // depth omits the Space root itself (at least 1 segment for a project).
+                            let depth = trashed.ancestors.len().saturating_sub(1).max(1);
+                            if let Ok(count) = u16::try_from(depth)
+                                && usize::from(count) <= usize::from(segment_count(raw_path)?)
+                            {
+                                return Ok(count);
+                            }
+                            return Ok(0);
                         }
+                        Err(PortError::Domain(DomainError::ResourceNotFound)) => return Ok(0),
+                        Err(error) => return Err(error),
                     }
-                    return Ok(0);
                 }
                 Err(error) => return Err(error),
             };
@@ -642,7 +666,10 @@ async fn validate_destination(
         }
     };
     let map_replay_err = |error: PortError| {
-        if allow_trashed_replay && matches!(error, PortError::Domain(_)) {
+        if allow_trashed_replay
+            && matches!(error, PortError::Domain(_))
+            && !matches!(error, PortError::Domain(DomainError::RateLimited { .. }))
+        {
             error
         } else {
             map_err(error)

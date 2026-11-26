@@ -235,6 +235,12 @@ impl ClassifiedMetadata {
     pub fn current_class(&self) -> DocClass {
         self.facts.current().class
     }
+    pub fn current_lifecycle(&self) -> Lifecycle {
+        self.facts
+            .current
+            .as_deref()
+            .map_or(self.lifecycle, |(_, lc)| *lc)
+    }
     /// The nearest project in the current facts bound by the canonical reader.
     pub fn current_project(&self) -> Option<FolderRef> {
         self.facts

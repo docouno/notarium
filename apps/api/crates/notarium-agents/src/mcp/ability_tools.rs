@@ -512,6 +512,54 @@ async fn provider_skill_spaces(
     Ok((allowed, any_project_only))
 }
 
+async fn provider_authoring_skill_spaces(
+    call: &ToolCallContext<'_>,
+) -> Result<BTreeSet<SpaceId>, PortError> {
+    let mut allowed = BTreeSet::new();
+    for (space_id, grant) in call.auth.spaces() {
+        if !grant.read_classes.contains(&DocClass::Skill) {
+            continue;
+        }
+        if corpus::skill_selection(call, space_id, None)
+            .await?
+            .is_some()
+        {
+            allowed.insert(space_id.clone());
+            continue;
+        }
+        let scope = match session::space(call, space_id).await {
+            Ok(scope) => scope,
+            Err(error) if visible_error(&error) => continue,
+            Err(error) => return Err(error),
+        };
+        let mut continuation = None;
+        'projects: loop {
+            let page = call
+                .registry
+                .catalog
+                .projects(
+                    scope.with_preflight_taint(),
+                    ControlPageRequest::new(100, continuation)?,
+                )
+                .await?;
+            for item in page.items {
+                if corpus::skill_selection(call, space_id, Some(item.folder))
+                    .await?
+                    .is_some()
+                {
+                    allowed.insert(space_id.clone());
+                    break 'projects;
+                }
+            }
+            match page.continuation {
+                Some(next) => continuation = Some(next),
+                None => break,
+            }
+        }
+    }
+    Ok(allowed)
+}
+
 struct RuntimeWinners {
     active: Vec<AbilityRef>,
     any_foreign_winner: bool,
@@ -1572,7 +1620,17 @@ async fn list(
                     has_foreign,
                 )
             } else {
-                (call.auth.clone(), None, false, false)
+                let allowed = provider_authoring_skill_spaces(call).await?;
+                let has_foreign = call
+                    .auth
+                    .pinned_write_space()
+                    .is_some_and(|pin| allowed.iter().any(|space| space != pin));
+                (
+                    call.auth.restrict_to_spaces(&allowed),
+                    None,
+                    false,
+                    has_foreign,
+                )
             };
         let use_provider_runtime_overlay =
             view == View::Runtime && (any_project_only || has_foreign_consented_space);
@@ -1770,12 +1828,21 @@ async fn list(
             // Never silently truncate unvisited abilities (including trailing
             // System built-ins) when the per-call scan budget is exhausted.
             if let Some(key) = last_key {
+                if has_foreign_consented_space {
+                    deferred_taints.push(AbilityTaintCommit::ForeignBranch {
+                        taint: call.auth.taint().clone(),
+                    });
+                }
                 Some(AbilityCursorInner::ProviderAfter {
                     key,
                     control_cursor,
                 })
             } else {
-                commit_deferred_taints_on_error(call, &deferred_taints);
+                if has_foreign_consented_space {
+                    call.commit_external_read();
+                } else {
+                    commit_deferred_taints_on_error(call, &deferred_taints);
+                }
                 return Err(invalid(ValidationReason::BudgetExceeded));
             }
         } else {

@@ -1434,7 +1434,11 @@ async fn ensure_ability_folder_journaled(
     call.record_journal_with_key(label, &call.request_key, call.request_hash, &recorded)
         .await
         .map_err(|error| {
-            super::super::note_tools::batch_operational_error(err_label, error, recorded.created)
+            if recorded.created {
+                post_commit_ability_error(err_label, error)
+            } else {
+                super::super::note_tools::batch_operational_error(err_label, error, false)
+            }
         })
 }
 
