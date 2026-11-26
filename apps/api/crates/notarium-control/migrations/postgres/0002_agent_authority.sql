@@ -23,3 +23,4 @@ CREATE INDEX schedule_due ON v1_control.agent_schedules(next_slot_utc_ms,schedul
 CREATE INDEX schedule_expired_run ON v1_control.agent_schedule_runs(expires_at,run_id)
     WHERE status IN ('claimed','running');
 CREATE INDEX call_run ON v1_control.provider_call_log(run_id,call_id);
+CREATE INDEX ability_trail_destination ON v1_control.ability_placement_trail(destination_placement,destination_id);

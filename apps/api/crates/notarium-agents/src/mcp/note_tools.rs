@@ -834,6 +834,7 @@ async fn ensure_destination(
                 )
                 .await?;
             let existed = precheck.existed();
+            let mut folder_created = !existed;
             let escalate_unknown = existed_replayed && !existed;
             let legacy_precheck = precheck.stored_stripped_segments().is_none();
             let stripped_segments = match precheck.stored_stripped_segments() {
@@ -884,6 +885,7 @@ async fn ensure_destination(
                     // stripped path on attempt 1 before `DestinationPrecheck::WithStrip` existed.
                     // Because `folder_key` is already committed, probing other strip counts can
                     // only replay the exact committed hash and can never create new folders.
+                    folder_created = true;
                     let max_strip = segment_count(&raw_path)?;
                     let mut recovered = None;
                     for candidate_strip in 0..=max_strip {
@@ -899,11 +901,7 @@ async fn ensure_destination(
                             }
                             Err(PortError::Domain(DomainError::IdempotencyKeyReused)) => continue,
                             Err(error) => {
-                                return Err(batch_operational_error(
-                                    ERR_LABEL,
-                                    error,
-                                    escalate_unknown,
-                                ));
+                                return Err(batch_operational_error(ERR_LABEL, error, true));
                             }
                         }
                     }
@@ -916,13 +914,13 @@ async fn ensure_destination(
             let has_path = !path.is_empty();
             let plan = JournaledDestination::Detailed {
                 folder,
-                created: !existed,
+                created: folder_created,
             };
             let recorded = call
                 .record_journal_with_key(label, &content_command.key, content_command.hash, &plan)
                 .await
                 .map_err(|error| {
-                    if !existed {
+                    if folder_created {
                         post_commit_error(ERR_LABEL, error)
                     } else {
                         batch_operational_error(ERR_LABEL, error, false)

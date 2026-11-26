@@ -136,6 +136,7 @@ pub(crate) async fn move_folder_impl(
                     ability_package: None,
                 };
                 auth.authorize_direct_write(&before_facts, &after_facts)?;
+                authorize_moved_subtree_tx(tx, &scope.space_id, &input.folder, &auth).await?;
 
                 if folder_row.is_root {
                     return Err(DomainError::validation(ValidationReason::InvalidState).into());
@@ -1616,6 +1617,96 @@ pub(crate) async fn is_note_live_readable_tx(
         return Ok(false);
     };
     Ok(auth.authorize_read(&facts).is_ok())
+}
+
+async fn authorize_moved_subtree_tx(
+    tx: &mut BackendConn<'_>,
+    space_id: &notarium_core::ids::SpaceId,
+    root_of_move: &FolderId,
+    auth: &notarium_core::auth::EngineAuthContext,
+) -> Result<(), PortError> {
+    const SQL: &str = "WITH RECURSIVE subtree(folder_id) AS (
+        SELECT folder_id FROM folder_heads
+        WHERE space_id = $1 AND folder_id = $2
+        UNION
+        SELECT child.folder_id FROM folder_heads AS child
+        JOIN subtree AS parent ON child.parent_folder_id = parent.folder_id
+        WHERE child.space_id = $1 AND child.lifecycle_state != 'purged'
+    ),
+    notes AS (
+        SELECT nh.doc_class, nh.ability_id
+        FROM note_heads AS nh
+        JOIN subtree AS s ON s.folder_id = nh.parent_folder_id
+        WHERE nh.space_id = $1 AND nh.lifecycle_state != 'purged'
+    )
+    SELECT CAST(
+        (CASE WHEN EXISTS (
+            SELECT 1 FROM folder_heads AS fh
+            JOIN subtree AS s ON s.folder_id = fh.folder_id
+            WHERE fh.space_id = $1
+              AND fh.lifecycle_state = 'active'
+              AND fh.write_lock_json IS NOT NULL
+        ) THEN 1 ELSE 0 END)
+        + (CASE WHEN EXISTS (
+            SELECT 1 FROM notes WHERE doc_class = 'skill' OR ability_id IS NOT NULL
+        ) THEN 2 ELSE 0 END)
+        + (CASE WHEN EXISTS (
+            SELECT 1 FROM notes WHERE doc_class = 'user-doc'
+        ) THEN 4 ELSE 0 END)
+        + (CASE WHEN EXISTS (
+            SELECT 1 FROM notes WHERE doc_class = 'agent-memory'
+        ) THEN 8 ELSE 0 END)
+        + (CASE WHEN EXISTS (
+            SELECT 1 FROM notes WHERE doc_class = 'skill'
+        ) THEN 16 ELSE 0 END)
+        + (CASE WHEN EXISTS (
+            SELECT 1 FROM notes WHERE doc_class = 'encrypted-note'
+        ) THEN 32 ELSE 0 END)
+        + (CASE WHEN EXISTS (
+            SELECT 1 FROM notes WHERE doc_class = 'profile'
+        ) THEN 64 ELSE 0 END)
+        + (CASE WHEN EXISTS (
+            SELECT 1 FROM notes
+            WHERE doc_class NOT IN ('user-doc', 'agent-memory', 'skill', 'encrypted-note', 'profile')
+        ) THEN 128 ELSE 0 END)
+    AS BIGINT)";
+
+    let mask: i64 = match tx {
+        BackendConn::Sqlite(conn) => sqlx::query_scalar(SQL)
+            .bind(space_id.as_str())
+            .bind(root_of_move.as_str())
+            .fetch_one(&mut **conn)
+            .await
+            .map_err(|err| internal_not_committed("sqlite_move_subtree_auth", err.to_string()))?,
+        BackendConn::Postgres(conn) => sqlx::query_scalar(SQL)
+            .bind(space_id.as_str())
+            .bind(root_of_move.as_str())
+            .fetch_one(&mut **conn)
+            .await
+            .map_err(|err| crate::runtime::pg_read_error("pg_move_subtree_auth", err))?,
+    };
+    if (mask & 1) != 0 || (mask & 128) != 0 {
+        return Err(DomainError::SpaceReadOnly.into());
+    }
+    let grant = auth
+        .spaces()
+        .get(space_id)
+        .ok_or(DomainError::ResourceNotFound)?;
+    for (bit, class) in [
+        (4_i64, DocClass::UserDoc),
+        (8_i64, DocClass::AgentMemory),
+        (16_i64, DocClass::Skill),
+        (32_i64, DocClass::EncryptedNote),
+        (64_i64, DocClass::Profile),
+    ] {
+        if (mask & bit) != 0 && !grant.write_classes.contains(&class) {
+            return Err(DomainError::SpaceReadOnly.into());
+        }
+    }
+    if (mask & 2) != 0 {
+        auth.authorize_ability_mutation()?;
+    }
+    Ok(())
 }
 
 async fn subtree_reaches_depth_tx(

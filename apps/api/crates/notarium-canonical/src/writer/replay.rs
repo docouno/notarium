@@ -24,6 +24,7 @@ pub(crate) enum ReplayResource {
     Write(NoteId),
     Read(NoteId),
     View(NoteId),
+    RollbackView(NoteId),
     Create(NoteId, Option<FolderId>, DocClass),
     Move(NoteId, Option<FolderId>),
     WriteFolder(Option<FolderId>),
@@ -246,7 +247,7 @@ impl CommandIdentitySpec {
         }
         for (note, is_view) in notes {
             let target = if is_view {
-                ReplayResource::View(note)
+                ReplayResource::RollbackView(note)
             } else {
                 ReplayResource::Read(note)
             };
@@ -268,6 +269,8 @@ impl CommandIdentitySpec {
         srec.scope.check(scope)?;
         match policy {
             ReplayPolicy::RollbackRun(run) => {
+                // `rollback_agent_run_by_id` replay intentionally enforces live active-folder
+                // visibility on the run's current sources (see `rollback_receipts`).
                 crate::domain::rollback::prepare_rollback_sources_tx(
                     tx,
                     &srec,
@@ -384,6 +387,16 @@ async fn authorize_resource(
             return crate::domain::board::authorized_view_head(tx, &srec.space, auth, note)
                 .await
                 .map(|_| ());
+        }
+        ReplayResource::RollbackView(note) => {
+            return crate::domain::board::authorized_rollback_view_head_opt(
+                tx,
+                &srec.space,
+                auth,
+                note,
+            )
+            .await
+            .map(|_| ());
         }
         ReplayResource::Read(note)
         | ReplayResource::Write(note)

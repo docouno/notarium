@@ -486,8 +486,8 @@ pub(super) async fn create(
         CREATE_LABEL,
     )
     .await?;
-    let parent = ensured_parent.folder;
-    let folder_created = ensured_parent.created;
+    let parent = ensured_parent.folder();
+    let folder_created = ensured_parent.created();
     let note_id = NoteId::from_bytes(stable_id(call, "ability-entrypoint-id"));
     let ability_id = AbilityId::from_bytes(stable_id(call, "ability-package-id"));
     let entrypoint = call
@@ -856,6 +856,14 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
     if call.auth.taint().is_tainted() {
         return Err(DomainError::CrossSpaceTainted.into());
     }
+    let authored =
+        args.description.is_some() || args.instructions.is_some() || args.attachments.is_some();
+    if let Some(token) = &args.version_token {
+        let _ = Version::decode(token)?;
+    }
+    if authored && args.version_token.is_none() {
+        return Err(invalid(ValidationReason::InvalidQuery));
+    }
     load_episode(call, args.session.as_ref()).await?;
     let mut plan_replayed = true;
     let plan: EditPlan = call
@@ -866,8 +874,6 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
         .await?;
     let mut reference = plan.original.clone();
     let mut steps = Vec::new();
-    let authored =
-        args.description.is_some() || args.instructions.is_some() || args.attachments.is_some();
     let mut authored_changed = false;
     let mut folder_ensured = false;
     let mut carrier_edited = false;
@@ -1019,8 +1025,8 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
                     None
                 };
                 let parent = if let Some(saved) = journaled_parent {
-                    folder_ensured = saved.created;
-                    saved.folder
+                    folder_ensured = saved.created();
+                    saved.folder()
                 } else if trashed_replay {
                     let scope = call.space(plan.scope.clone())?;
                     if let Some(found) = call
@@ -1044,8 +1050,8 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
                         "notarium.mcp.edit-ability.v1",
                     )
                     .await?;
-                    folder_ensured = ensured.created;
-                    ensured.folder
+                    folder_ensured = ensured.created();
+                    ensured.folder()
                 };
                 let settled = call
                     .registry
@@ -1372,10 +1378,25 @@ struct TrashPlan {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct JournaledAbilityFolder {
-    folder: FolderId,
-    created: bool,
+#[serde(untagged)]
+enum JournaledAbilityFolder {
+    Detailed { folder: FolderId, created: bool },
+    Legacy(FolderId),
+}
+
+impl JournaledAbilityFolder {
+    fn folder(&self) -> FolderId {
+        match self {
+            Self::Detailed { folder, .. } | Self::Legacy(folder) => folder.clone(),
+        }
+    }
+
+    fn created(&self) -> bool {
+        match self {
+            Self::Detailed { created, .. } => *created,
+            Self::Legacy(_) => true,
+        }
+    }
 }
 
 async fn ensure_ability_folder_journaled(
@@ -1427,14 +1448,14 @@ async fn ensure_ability_folder_journaled(
             existed_replayed && !existed,
         )
     })?;
-    let recorded = JournaledAbilityFolder {
+    let recorded = JournaledAbilityFolder::Detailed {
         folder,
         created: !existed,
     };
     call.record_journal_with_key(label, &call.request_key, call.request_hash, &recorded)
         .await
         .map_err(|error| {
-            if recorded.created {
+            if recorded.created() {
                 post_commit_ability_error(err_label, error)
             } else {
                 super::super::note_tools::batch_operational_error(err_label, error, false)

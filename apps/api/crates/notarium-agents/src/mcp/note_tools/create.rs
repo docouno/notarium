@@ -686,6 +686,7 @@ pub(super) async fn create_one(
     raw: Value,
 ) -> Result<Value, PortError> {
     let input: CreateInput = decode(raw)?;
+    let _ = validate_draft_syntax(&input.draft, input.folder_page)?;
     let placement = placement(call, &input.project).await?;
     let prepared = PreparedDraft::new(call, &placement, input.draft, input.folder_page, 0, None)?;
     let carrier = prepare_carrier(call, None, &placement.read_scope, &prepared).await?;

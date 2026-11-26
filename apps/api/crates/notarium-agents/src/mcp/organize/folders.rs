@@ -80,11 +80,37 @@ enum ParsedFolderArgs {
     RenameProject(RenameProjectArgs),
 }
 
+fn validate_folder_path(raw: &str, allow_empty: bool) -> Result<(), PortError> {
+    let trimmed = raw.trim_start_matches('/');
+    if trimmed.is_empty() {
+        return if allow_empty {
+            Ok(())
+        } else {
+            Err(invalid(ValidationReason::InvalidPathComponent))
+        };
+    }
+    let mut depth = 0usize;
+    for segment in trimmed.split('/') {
+        depth += 1;
+        if depth > 256 {
+            return Err(invalid(ValidationReason::InvalidPathComponent));
+        }
+        validate_component(segment)?;
+    }
+    Ok(())
+}
+
 fn parse_args(name: ToolName, args: Value) -> Result<ParsedFolderArgs, PortError> {
     match name {
-        ToolName::MoveFolder => Ok(ParsedFolderArgs::Move(decode(args)?)),
+        ToolName::MoveFolder => {
+            let args: MoveArgs = decode(args)?;
+            validate_folder_path(&args.folder, false)?;
+            validate_folder_path(&args.to_folder, true)?;
+            Ok(ParsedFolderArgs::Move(args))
+        }
         ToolName::RenameFolder => {
             let args: RenameArgs = decode(args)?;
+            validate_folder_path(&args.folder, false)?;
             validate_component(&args.name)?;
             Ok(ParsedFolderArgs::Rename(args))
         }

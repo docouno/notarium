@@ -1557,7 +1557,9 @@ impl CanonicalStore {
                         neighbor_final_ranks.insert(nid, (r, was_already_overlay));
                     }
                     for (nid, r) in placement.pma_neighbor_updates {
-                        neighbor_final_ranks.insert(nid, (r, true));
+                        let was_already_overlay =
+                            overlays.get(&nid).is_some_and(|o| o.group == input.group);
+                        neighbor_final_ranks.insert(nid, (r, was_already_overlay));
                     }
 
                     let predecessor = if insert_index == 0 {

@@ -37,9 +37,16 @@ pub(super) async fn exercise(store: &CanonicalStore, runtime: &ProjectorRuntime)
     reopened_feed_refreshes_the_published_command(store, runtime).await;
     first_change_racing_projection_subscription_is_delivered(store, runtime).await;
     purge_reseed_refreshes_only_after_readiness(store, runtime).await;
-    rollback_trashed_and_edited_board_view_through_real_planner(store, runtime).await;
-    rollback_retired_widened_unranked_and_trashed_board_views(store, runtime).await;
-    keeper_readonly_abilities_isolation_on_changes_events_and_graph(store, runtime).await;
+    Box::pin(rollback_trashed_and_edited_board_view_through_real_planner(
+        store, runtime,
+    ))
+    .await;
+    Box::pin(rollback_retired_widened_unranked_and_trashed_board_views(
+        store, runtime,
+    ))
+    .await;
+    Box::pin(rollback_skipped_replay_and_oracle_views(store, runtime)).await;
+    Box::pin(keeper_readonly_abilities_isolation_on_changes_events_and_graph(store, runtime)).await;
 }
 
 async fn ack_retry_delivers_the_published_change(
@@ -2778,6 +2785,457 @@ async fn rollback_retired_widened_unranked_and_trashed_board_views(
         .rollback_agent_run(owner.clone(), mutation(&owner, prep_xproj_ok))
         .await
         .expect("unpinned owner must cleanly retire missing-folder cross-project view on rollback");
+}
+
+#[inline(never)]
+async fn rollback_skipped_replay_and_oracle_views(
+    store: &CanonicalStore,
+    runtime: &ProjectorRuntime,
+) {
+    use notarium_core::ports::RankNeighbor;
+
+    let (scope, owner) = open_space(store).await;
+    let engine = runtime.engine();
+
+    // Case 7A: Active board view whose agent-moved target is skipped (`skipped_manual_edits`)
+    // must NOT be misclassified into `inactive_or_retired_views` and must preserve the
+    // untouched neighbor's overlay and live board ordering `[c7, n7, h7]`.
+    let proj7a = folder(store, &owner, None, "rb-skip-active-proj-a", true)
+        .await
+        .unwrap();
+    let proj7b = folder(store, &owner, None, "rb-skip-active-proj-b", true)
+        .await
+        .unwrap();
+    let (v7a, v7a_rev) = create_view(
+        store,
+        &owner,
+        &proj7a,
+        "rb-skip-active-board",
+        "board",
+        "{scope: project}",
+        "group_by: status\nfilter: {exists: status}\nsort: [{field: title, type: string, direction: asc}]\n",
+    )
+    .await;
+    let c7 = create_note(
+        store,
+        &owner,
+        Some(proj7a.clone()),
+        "z-agent-card",
+        "---\ntitle: Zebra\nstatus: todo\n---\n".into(),
+    )
+    .await;
+    let n7 = create_note(
+        store,
+        &owner,
+        Some(proj7a.clone()),
+        "a-neighbor-card",
+        "---\ntitle: Alpha\nstatus: todo\n---\n".into(),
+    )
+    .await;
+    sync(store, runtime, &scope).await;
+
+    let run7a = AgentRunId::from_bytes(random_bytes());
+    let agent7a = super::agent(&owner, run7a.clone(), ChatAudience::Personal);
+    let c7_moved = store
+        .move_board_card(
+            agent7a.clone(),
+            mutation(
+                &agent7a,
+                MoveBoardCard {
+                    view: v7a.clone(),
+                    note: c7.note.clone(),
+                    group: group("todo"),
+                    before: Some(RankNeighbor {
+                        note: n7.note.clone(),
+                        expected_rank: RankExpectation::Absent,
+                    }),
+                    after: None,
+                    fields: BTreeMap::new(),
+                    expected_note: c7.revision.clone(),
+                    expected_view: v7a_rev.revision.clone(),
+                    expected_rank: RankExpectation::Absent,
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .value;
+    sync(store, runtime, &scope).await;
+    let n7_ov_before = store
+        .inspect_view_overlays_for_test(&scope.space_id, &v7a)
+        .await
+        .unwrap()
+        .get(&n7.note)
+        .expect("agent move before unranked n7 must materialize n7 overlay")
+        .clone();
+    // Human creates h7, edits c7 (making c7 skipped during rollback), and drags h7 after n7 -> [c7, n7, h7].
+    let h7 = create_note(
+        store,
+        &owner,
+        Some(proj7a.clone()),
+        "m-human-card",
+        "---\ntitle: Middle\nstatus: todo\n---\n".into(),
+    )
+    .await;
+    sync(store, runtime, &scope).await;
+    let c7_text = "---\ntitle: Zebra\nstatus: todo\n---\n";
+    let c7_span = notarium_syntax::frontmatter::analyze(c7_text, DocClass::UserDoc)
+        .unwrap()
+        .carrier
+        .body;
+    let c7_plan = notarium_syntax::patch::plan(
+        c7_text,
+        c7_span,
+        vec![(CarrierEditOrigin::Body, c7_span, "Human edit.\n".into())],
+    )
+    .unwrap();
+    let mut edit_c7 = mutation(
+        &owner,
+        EditNote {
+            note: c7.note.clone(),
+            plan: c7_plan,
+        },
+    );
+    edit_c7.preconditions.revision = Some(c7_moved.revision.revision);
+    store.edit_note(owner.clone(), edit_c7).await.unwrap();
+    store
+        .move_board_card(
+            owner.clone(),
+            mutation(
+                &owner,
+                MoveBoardCard {
+                    view: v7a.clone(),
+                    note: h7.note.clone(),
+                    group: group("todo"),
+                    before: None,
+                    after: Some(RankNeighbor {
+                        note: n7.note.clone(),
+                        expected_rank: RankExpectation::Existing(n7_ov_before.rank_rev_id),
+                    }),
+                    fields: BTreeMap::new(),
+                    expected_note: h7.revision.clone(),
+                    expected_view: v7a_rev.revision.clone(),
+                    expected_rank: RankExpectation::Absent,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    sync(store, runtime, &scope).await;
+    let prep7a = store
+        .prepare_agent_run_rollback(owner.clone(), run7a)
+        .await
+        .unwrap();
+    let rb7a = store
+        .rollback_agent_run(owner.clone(), mutation(&owner, prep7a))
+        .await
+        .unwrap()
+        .value;
+    assert_eq!(rb7a.skipped_manual_edits, vec![c7.note.clone()]);
+    sync(store, runtime, &scope).await;
+    let v7a_overlays = store
+        .inspect_view_overlays_for_test(&scope.space_id, &v7a)
+        .await
+        .unwrap();
+    assert!(
+        v7a_overlays.contains_key(&n7.note),
+        "skipped active view rollback must NOT delete untouched neighbor n7 overlay"
+    );
+    let v7a_ids: Vec<NoteId> = query(&engine, owner.clone(), v7a)
+        .await
+        .unwrap()
+        .rows
+        .items
+        .into_iter()
+        .map(|row| row.card.document.provenance().reference().note_id.clone())
+        .collect();
+    assert_eq!(
+        v7a_ids,
+        vec![c7.note, n7.note, h7.note],
+        "live active board order [c7, n7, h7] must stay intact when agent card is skipped"
+    );
+
+    // Case 7B: Idempotent replay of committed rollbacks succeeds when (1) the rollback itself
+    // trashed a run-created board view (`rollback_agent_run`), and (2) the rolled-back note
+    // lives inside a trashed folder (`rollback_agent_run_by_id`).
+    let c7b = create_note(
+        store,
+        &owner,
+        Some(proj7a.clone()),
+        "rb-replay-card",
+        "---\nstatus: todo\n---\n".into(),
+    )
+    .await;
+    sync(store, runtime, &scope).await;
+    let run7b = AgentRunId::from_bytes(random_bytes());
+    let agent7b = super::agent(&owner, run7b.clone(), ChatAudience::Personal);
+    let (v7b, v7b_rev) = create_view(
+        store,
+        &agent7b,
+        &proj7a,
+        "rb-agent-created-board",
+        "board",
+        "{scope: project}",
+        "group_by: status\nfilter: {exists: status}\n",
+    )
+    .await;
+    sync(store, runtime, &scope).await;
+    store
+        .move_board_card(
+            agent7b.clone(),
+            mutation(
+                &agent7b,
+                MoveBoardCard {
+                    view: v7b,
+                    note: c7b.note,
+                    group: group("doing"),
+                    before: None,
+                    after: None,
+                    fields: BTreeMap::from([(
+                        "status".into(),
+                        Some(YamlValue::String("doing".into())),
+                    )]),
+                    expected_note: c7b.revision,
+                    expected_view: v7b_rev.revision,
+                    expected_rank: RankExpectation::Absent,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    sync(store, runtime, &scope).await;
+    let prep7b = store
+        .prepare_agent_run_rollback(owner.clone(), run7b)
+        .await
+        .unwrap();
+    let rb7b_cmd = mutation(&owner, prep7b);
+    let rb7b_first = store
+        .rollback_agent_run(owner.clone(), rb7b_cmd.clone())
+        .await
+        .expect("initial rollback of run-created board view must succeed");
+    let rb7b_replay = store
+        .rollback_agent_run(owner.clone(), rb7b_cmd)
+        .await
+        .expect("idempotent replay of committed rollback with trashed view must succeed");
+    assert_eq!(rb7b_replay.receipt, rb7b_first.receipt);
+
+    let sub7b = folder(store, &owner, Some(proj7a.clone()), "rb-trashed-sub", false)
+        .await
+        .unwrap();
+    let n7_sub = create_note(
+        store,
+        &owner,
+        Some(sub7b.clone()),
+        "rb-trashed-sub-note",
+        "Original.\n".into(),
+    )
+    .await;
+    let run7b_sub = AgentRunId::from_bytes(random_bytes());
+    let agent7b_sub = super::agent(&owner, run7b_sub.clone(), ChatAudience::Personal);
+    let sub_span = notarium_syntax::frontmatter::analyze("Original.\n", DocClass::UserDoc)
+        .unwrap()
+        .carrier
+        .body;
+    let sub_plan = notarium_syntax::patch::plan(
+        "Original.\n",
+        sub_span,
+        vec![(CarrierEditOrigin::Body, sub_span, "Agent edit.\n".into())],
+    )
+    .unwrap();
+    let mut edit_sub = mutation(
+        &agent7b_sub,
+        EditNote {
+            note: n7_sub.note,
+            plan: sub_plan,
+        },
+    );
+    edit_sub.preconditions.revision = Some(n7_sub.revision);
+    store.edit_note(agent7b_sub, edit_sub).await.unwrap();
+    let sub7b_rev = store
+        .resolve_folder_path(owner.clone(), Some(sub7b.clone()), String::new())
+        .await
+        .unwrap()
+        .unwrap()
+        .revision;
+    let space_epoch = store
+        .read_space(&scope.space_id)
+        .await
+        .unwrap()
+        .active_epoch;
+    let by_id_cmd = mutation(&owner, run7b_sub);
+    let by_id_first = store
+        .rollback_agent_run_by_id(owner.clone(), by_id_cmd.clone())
+        .await
+        .expect("rollback_agent_run_by_id while folder is active must succeed");
+    let (trashed_sub_rev, _) = store
+        .set_folder_lifecycle(
+            &scope,
+            space_epoch,
+            &sub7b,
+            &sub7b_rev,
+            notarium_core::model::Lifecycle::Trashed,
+            owner.auth().principal(),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            store
+                .rollback_agent_run_by_id(owner.clone(), by_id_cmd.clone())
+                .await,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ),
+        "rollback_agent_run_by_id replay enforces live active-folder visibility while folder is trashed"
+    );
+    store
+        .set_folder_lifecycle(
+            &scope,
+            space_epoch,
+            &sub7b,
+            &trashed_sub_rev,
+            notarium_core::model::Lifecycle::Active,
+            owner.auth().principal(),
+            None,
+        )
+        .await
+        .unwrap();
+    let by_id_replay = store
+        .rollback_agent_run_by_id(owner.clone(), by_id_cmd)
+        .await
+        .expect("rollback_agent_run_by_id replay must succeed once folder is active again");
+    assert_eq!(by_id_replay.receipt, by_id_first.receipt);
+
+    // Case 7C: Anti-oracle authorization ordering in `rollback_agent_run`:
+    // (1) Arbitrary `associated_board_expectations` citing an out-of-project note vs a
+    //     nonexistent note both return `SourceMismatch` (never probing victim note existence).
+    // (2) Probing an unauthorized run in `proj7b` with `expected_entities: []` vs the exact
+    //     touched note both return `SpaceReadOnly` (never leaking the touched set).
+    let n7_p1 = create_note(
+        store,
+        &owner,
+        Some(proj7a.clone()),
+        "rb-oracle-p1",
+        "p1\n".into(),
+    )
+    .await;
+    let n7_p2 = create_note(
+        store,
+        &owner,
+        Some(proj7b.clone()),
+        "rb-oracle-p2",
+        "p2\n".into(),
+    )
+    .await;
+    let run7c_p1 = AgentRunId::from_bytes(random_bytes());
+    let agent7c_p1 = super::agent(&owner, run7c_p1.clone(), ChatAudience::Personal);
+    let p1_span = notarium_syntax::frontmatter::analyze("p1\n", DocClass::UserDoc)
+        .unwrap()
+        .carrier
+        .body;
+    let mut edit_p1 = mutation(
+        &agent7c_p1,
+        EditNote {
+            note: n7_p1.note.clone(),
+            plan: notarium_syntax::patch::plan(
+                "p1\n",
+                p1_span,
+                vec![(CarrierEditOrigin::Body, p1_span, "p1-a\n".into())],
+            )
+            .unwrap(),
+        },
+    );
+    edit_p1.preconditions.revision = Some(n7_p1.revision);
+    let n7_p1_after = store.edit_note(agent7c_p1, edit_p1).await.unwrap().value;
+
+    let run7c_p2 = AgentRunId::from_bytes(random_bytes());
+    let agent7c_p2 = super::agent(&owner, run7c_p2.clone(), ChatAudience::Personal);
+    let p2_span = notarium_syntax::frontmatter::analyze("p2\n", DocClass::UserDoc)
+        .unwrap()
+        .carrier
+        .body;
+    let mut edit_p2 = mutation(
+        &agent7c_p2,
+        EditNote {
+            note: n7_p2.note.clone(),
+            plan: notarium_syntax::patch::plan(
+                "p2\n",
+                p2_span,
+                vec![(CarrierEditOrigin::Body, p2_span, "p2-a\n".into())],
+            )
+            .unwrap(),
+        },
+    );
+    edit_p2.preconditions.revision = Some(n7_p2.revision);
+    let n7_p2_after = store.edit_note(agent7c_p2, edit_p2).await.unwrap().value;
+
+    let pinned_7a = SpaceContext::new(
+        owner
+            .auth()
+            .restrict_to_project(&notarium_core::model::FolderRef {
+                space_id: scope.space_id.clone(),
+                folder_id: proj7a,
+            })
+            .unwrap(),
+        scope.clone(),
+        budget(),
+    )
+    .unwrap();
+    let prep7c_p1 = store
+        .prepare_agent_run_rollback(pinned_7a.clone(), run7c_p1)
+        .await
+        .unwrap();
+    let fake_view_note = NoteId::from_bytes(random_bytes());
+    for probe_view in [n7_p2.note.clone(), fake_view_note] {
+        let mut forged = prep7c_p1.clone();
+        forged.associated_board_expectations.push(
+            notarium_core::ports::AssociatedBoardExpectation {
+                view: ViewRef {
+                    note: probe_view,
+                    key: ViewKey::from_bytes(random_bytes()),
+                },
+                note: n7_p1.note.clone(),
+                expected_rank: RankExpectation::Absent,
+                expected_placement_revision: n7_p1_after.revision.clone(),
+            },
+        );
+        let probe_err = store
+            .rollback_agent_run(pinned_7a.clone(), mutation(&pinned_7a, forged))
+            .await;
+        assert!(
+            matches!(
+                probe_err,
+                Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
+                    if diagnostic.reason == ValidationReason::SourceMismatch
+            ),
+            "arbitrary associated_board_expectations view must return SourceMismatch without probing existence, got {probe_err:?}"
+        );
+    }
+    let prep7c_p2 = store
+        .prepare_agent_run_rollback(owner.clone(), run7c_p2)
+        .await
+        .unwrap();
+    for probe_entities in [
+        Vec::new(),
+        vec![NoteRevision {
+            note: n7_p2.note,
+            revision: n7_p2_after.revision,
+        }],
+    ] {
+        let mut forged = prep7c_p2.clone();
+        forged.expected_entities = probe_entities;
+        let probe_err = store
+            .rollback_agent_run(pinned_7a.clone(), mutation(&pinned_7a, forged))
+            .await;
+        assert!(
+            matches!(
+                probe_err,
+                Err(PortError::Domain(DomainError::SpaceReadOnly))
+            ),
+            "unauthorized P2 run rollback must authorize touched_set before checking expected_entities, got {probe_err:?}"
+        );
+    }
+    let _ = proj7b;
 }
 
 async fn keeper_readonly_abilities_isolation_on_changes_events_and_graph(

@@ -25963,7 +25963,7 @@ async fn hardened_retry_legacy_and_recent_eviction_seams(
     // then rewrite it to bare-bool `true` (`Legacy(true)`), drop `create_destination`, rename the
     // project, and replay!
     fixture.projections.fail_next_create_note_not_committed();
-    let _ = call_mcp(
+    let attempt1 = call_mcp(
         &fixture.registry,
         &owner,
         ex_key,
@@ -25971,6 +25971,11 @@ async fn hardened_retry_legacy_and_recent_eviction_seams(
         ex_args.clone(),
     )
     .await;
+    assert!(
+        matches!(attempt1, Err(PortError::DeadlineExceeded(_))),
+        "Legacy(true) attempt #1 must fail with DeadlineExceeded, got {:?}",
+        attempt1.err()
+    );
     fixture
         .storage
         .observer
@@ -25994,7 +25999,24 @@ async fn hardened_retry_legacy_and_recent_eviction_seams(
         .await
         .expect("Legacy(true) replay after project rename must succeed")
         .structured_content;
-    assert!(ex_res["noteId"].as_str().is_some());
+    let ex_note_id = NoteId::parse(ex_res["noteId"].as_str().expect("noteId")).unwrap();
+    let ex_meta = fixture
+        .canonical
+        .get_note_metadata(
+            s2_sc.clone(),
+            GetNote {
+                note: ex_note_id.clone(),
+                revision: None,
+                causal: CausalBasis::Await(Default::default()),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        ex_meta.parent,
+        Some(p_ex_sub),
+        "Legacy(true) replay after project rename must land inside existing subfolder p_ex_sub"
+    );
     assert!(
         fixture
             .canonical
@@ -26043,12 +26065,8 @@ async fn hardened_retry_legacy_and_recent_eviction_seams(
         .unwrap()
         .value;
     let local_note_id = local_note.note.to_string();
-    // Advance wall clock slightly so all 200 foreign trashed revisions have strictly newer timestamps.
-    fixture
-        .storage
-        .clock
-        .0
-        .fetch_add(10_000, std::sync::atomic::Ordering::SeqCst);
+    // Ensure wall-clock timestamps for all 200 foreign trashed revisions are strictly newer.
+    tokio::time::sleep(Duration::from_millis(5)).await;
     let flood_note = fixture
         .canonical
         .create_note(
@@ -26169,27 +26187,100 @@ async fn hardened_retry_legacy_and_recent_eviction_seams(
                 ]),
             },
             "recent_activity",
-            json!({ "limit": 20 }),
+            json!({ "limit": 1 }),
         )
         .await
         .unwrap()
         .structured_content;
-    assert!(
-        recent_res["items"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|item| item["noteId"].as_str() == Some(local_note_id.as_str())),
+    let recent_items = recent_res["items"].as_array().unwrap();
+    assert_eq!(
+        recent_items.len(),
+        1,
+        "limit=1 must return the newest active local note after skipping 200 newer foreign trashed revisions: {recent_res}"
+    );
+    assert_eq!(
+        recent_items[0]["noteId"].as_str(),
+        Some(local_note_id.as_str()),
         "200 trashed foreign revisions must not evict pinned-Space active note from recent_activity: {recent_res}"
     );
     assert!(
         !recent_auth.taint().is_tainted(),
         "skipped foreign trashed revisions must not falsely taint untainted local recent_activity"
     );
+    // Wider limit must also reach older active foreign notes past the 200 trashed revisions
+    // without cross-target eviction, properly marking BranchTaint when foreign active items return.
+    let recent_auth_wide = owner
+        .auth()
+        .for_agent_run(
+            AgentRunId::from_bytes([0xF0, 7, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3]),
+            pscope.space_id.clone(),
+            ChatAudience::Personal,
+            owner.auth().spaces().clone(),
+        )
+        .unwrap();
+    let recent_wide = local
+        .registry
+        .call_tool(
+            McpInvocationContext {
+                account: AccountContext::new(recent_auth_wide.clone(), budget()),
+                target: EgressTarget::InAppProvider {
+                    provider: local.resource.id.clone(),
+                    model: local.model.clone(),
+                    primary_project: None,
+                },
+                request_key: CommandKey::from_bytes([
+                    0xF0, 7, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4,
+                ]),
+            },
+            "recent_activity",
+            json!({ "limit": 20 }),
+        )
+        .await
+        .unwrap()
+        .structured_content;
+    let wide_items = recent_wide["items"].as_array().unwrap();
+    assert!(
+        wide_items
+            .iter()
+            .any(|item| item["noteId"].as_str() == Some(local_note_id.as_str()))
+            && wide_items.iter().any(|item| {
+                item["spaceId"].as_str().is_some_and(|sid| {
+                    sid != pscope.space_id.as_str() && sid != s2.history.space_id.as_str()
+                })
+            }),
+        "200 trashed revisions in foreign Space F1 (s2) must not evict either local_note (P) or active notes in a second foreign Space F2: {recent_wide}"
+    );
+    assert!(
+        recent_auth_wide.taint().is_tainted(),
+        "returning active notes from second foreign Space F2 past F1's 200 trashed revisions must mark cross-space BranchTaint"
+    );
 
     // Part H: `list_abilities(view: "authoring")` under `InAppProvider` with `project: None`
     // must restrict discovery to consented Spaces only (excluding unconsented `s2` without
     // scanning or leaking its abilities and without tainting the pinned Space).
+    fn scope_space_id(item: &Value) -> Option<&str> {
+        item["scope"]["OwnedSpace"]
+            .as_str()
+            .or_else(|| item["scope"]["OwnedProject"]["space_id"].as_str())
+    }
+    // Positive control via ExternalMcp: confirm `s2` actually holds an active ability.
+    let external_list = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xF0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        "list_abilities",
+        json!({ "view": "authoring", "limit": 50 }),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    let external_items = external_list["items"].as_array().unwrap();
+    assert!(
+        external_items
+            .iter()
+            .any(|item| scope_space_id(item) == Some(s2.history.space_id.as_str())),
+        "positive control: ExternalMcp must see active s2 ability in list_abilities(view: authoring): {external_list}"
+    );
     let auth_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let lp_local_only = loopback_provider(fixture, &owner, &auth_listener, 0x20, true).await;
     approve_disclosure(
@@ -26235,14 +26326,265 @@ async fn hardened_retry_legacy_and_recent_eviction_seams(
         .structured_content;
     let items = authoring_list["items"].as_array().unwrap();
     assert!(
+        !items.is_empty() && items.iter().all(|item| !item["scope"].is_null()),
+        "positive control: consented abilities must be returned with non-null scope: {authoring_list}"
+    );
+    assert!(
         items
             .iter()
-            .all(|item| item["placement"]["spaceId"].as_str() != Some(s2.history.space_id.as_str())),
+            .all(|item| scope_space_id(item) != Some(s2.history.space_id.as_str())),
         "unconsented foreign Space s2 must be excluded from list_abilities(view: authoring): {authoring_list}"
     );
     assert!(
         !authoring_auth.taint().is_tainted(),
         "list_abilities(view: authoring) skipping unconsented Space s2 must not taint pinned Space"
+    );
+
+    // Part I: Pre-lookup path syntax validation on `move_folder`/`rename_folder`,
+    // aligned 4096-byte `search` query validation, and `move_folder` subtree
+    // authorization for `write_locked`, `EncryptedNote`, and `Skill` descendants.
+    for (tag, tool, args) in [
+        (
+            1u8,
+            "move_folder",
+            json!({ "project": "no-such/proj", "folder": "bad/../seg", "toFolder": "x" }),
+        ),
+        (
+            2u8,
+            "rename_folder",
+            json!({ "project": "no-such/proj", "folder": "bad/../seg", "name": "ok" }),
+        ),
+    ] {
+        let err = call_mcp(
+            &fixture.registry,
+            &owner,
+            [0xF0, 9, tag, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+            tool,
+            args,
+        )
+        .await;
+        assert!(
+            matches!(
+                err,
+                Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
+                    if diagnostic.reason == ValidationReason::InvalidPathComponent
+            ),
+            "{tool} must reject malformed folder path before project lookup, got {:?}",
+            err.err()
+        );
+    }
+    let long_utf8_query = "é".repeat(2049); // 2049 chars, 4098 bytes > 4096
+    let search_too_long = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xF0, 9, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "search",
+        json!({ "query": long_utf8_query }),
+    )
+    .await;
+    assert!(
+        matches!(
+            search_too_long,
+            Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
+                if diagnostic.reason == ValidationReason::InvalidQuery
+        ),
+        "search must reject >4096-byte UTF-8 query upfront in schema validation, got {:?}",
+        search_too_long.err()
+    );
+
+    let mv_dest = FolderId::from_bytes([0xF0, 9, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    let mv_lock_parent = FolderId::from_bytes([0xF0, 9, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+    let mv_lock_child = FolderId::from_bytes([0xF0, 9, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3]);
+    let mv_enc_parent = FolderId::from_bytes([0xF0, 9, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4]);
+    let mv_skill_parent = FolderId::from_bytes([0xF0, 9, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5]);
+    for (fid, parent, slug) in [
+        (&mv_dest, s2_p1.folder_id.clone(), "mv-dest"),
+        (&mv_lock_parent, s2_p1.folder_id.clone(), "mv-lock-parent"),
+        (&mv_lock_child, mv_lock_parent.clone(), "mv-lock-child"),
+        (&mv_enc_parent, s2_p1.folder_id.clone(), "mv-enc-parent"),
+        (&mv_skill_parent, s2_p1.folder_id.clone(), "mv-skill-parent"),
+    ] {
+        fixture
+            .canonical
+            .create_folder(CreateFolderSpec {
+                scope: s2.history.clone(),
+                active_epoch: s2_epoch,
+                folder_id: fid.clone(),
+                parent: Some(parent),
+                slug: slug.into(),
+                display_name: slug.into(),
+                is_project: false,
+                project_slug: None,
+                actor: actor.clone(),
+                timestamp: None,
+            })
+            .await
+            .unwrap();
+    }
+    fixture
+        .canonical
+        .set_folder_write_lock(s2_sc.clone(), mv_lock_child, true)
+        .await
+        .unwrap();
+    fixture
+        .canonical
+        .create_note(
+            s2_sc.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: s2.history.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([
+                        0xF0, 9, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xFA; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: CreateNote {
+                    folder_page: false,
+                    note: NoteId::from_bytes([0xF0, 9, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]),
+                    parent: Some(mv_enc_parent.clone()),
+                    slug: "secret-enc".into(),
+                    class: DocClass::EncryptedNote,
+                    carrier: concat!(
+                        "---\nclass: encrypted-note\ntitle: Secret Enc\n---\n# Secret Enc\n\n```age\n",
+                        "-----BEGIN AGE ENCRYPTED FILE-----\n",
+                        "YWdlLWVuY3J5cHRpb24ub3JnL3YxCi0+IFgyNTUxOSBURWlGMHlwcXIrYnB2Y3FY\n",
+                        "TnlDVkpwTDdPdXdQZFZ3UEw3S1FFYkZET0NjCmhqYWJHWHdTTFE5YzNTNkx3Mmkr\n",
+                        "UzJUdTJmaXdRSEhzbGJCTjZCNDFGTEUKLS0tIFd5SnA5Ri85Rk9aaDdnSmRoZXEy\n",
+                        "V0lKY3dIZ1ljOE5JVmgzZGR3aHJjTmcK7s9ix86RtDMnTmjU8vkTTLdMW/73vqpS\n",
+                        "yPC8DpksHoMx+2Y=\n",
+                        "-----END AGE ENCRYPTED FILE-----\n```\n",
+                    )
+                    .into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    fixture
+        .canonical
+        .create_note(
+            s2_sc.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: s2.history.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([
+                        0xF0, 9, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xFB; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: CreateNote {
+                    folder_page: false,
+                    note: NoteId::from_bytes([0xF0, 9, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]),
+                    parent: Some(mv_skill_parent.clone()),
+                    slug: "unpublished-skill".into(),
+                    class: DocClass::Skill,
+                    carrier: "---\nclass: skill\ntitle: Unpublished Skill\n---\n# Skill\n".into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    // 1. Moving an unlocked parent of a write_locked child must fail SpaceReadOnly.
+    let lock_mv = fixture
+        .canonical
+        .move_folder(
+            s2_sc.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: s2.history.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([
+                        0xF0, 9, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xFC; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: MoveFolder {
+                    folder: mv_lock_parent,
+                    new_parent: Some(mv_dest.clone()),
+                },
+            },
+        )
+        .await;
+    assert!(
+        matches!(lock_mv, Err(PortError::Domain(DomainError::SpaceReadOnly))),
+        "moving parent of write_locked descendant must fail SpaceReadOnly, got {lock_mv:?}"
+    );
+    // 2. AgentRun (no EncryptedNote write class) moving folder containing EncryptedNote fails SpaceReadOnly.
+    let mut s2_agent_grants = owner.auth().spaces().clone();
+    if let Some(g) = s2_agent_grants.get_mut(&s2.history.space_id) {
+        g.read_classes.remove(&DocClass::EncryptedNote);
+        g.write_classes.remove(&DocClass::EncryptedNote);
+    }
+    let s2_agent_auth = owner
+        .auth()
+        .for_agent_run(
+            AgentRunId::from_bytes([0xF0, 9, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+            s2.history.space_id.clone(),
+            ChatAudience::Personal,
+            s2_agent_grants,
+        )
+        .unwrap();
+    let s2_agent_sc = SpaceContext::new(s2_agent_auth, s2.history.clone(), budget()).unwrap();
+    let enc_mv = fixture
+        .canonical
+        .move_folder(
+            s2_agent_sc.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: s2.history.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([
+                        0xF0, 9, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xFD; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: MoveFolder {
+                    folder: mv_enc_parent,
+                    new_parent: Some(mv_dest.clone()),
+                },
+            },
+        )
+        .await;
+    assert!(
+        matches!(enc_mv, Err(PortError::Domain(DomainError::SpaceReadOnly))),
+        "AgentRun moving folder containing EncryptedNote must fail SpaceReadOnly, got {enc_mv:?}"
+    );
+    // 3. AgentRun (no AbilityWrite) moving folder containing Skill note within SAME project fails.
+    let skill_mv = fixture
+        .canonical
+        .move_folder(
+            s2_agent_sc,
+            Mutation {
+                identity: CommandIdentity {
+                    scope: s2.history.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([
+                        0xF0, 9, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xFE; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: MoveFolder {
+                    folder: mv_skill_parent,
+                    new_parent: Some(mv_dest),
+                },
+            },
+        )
+        .await;
+    assert!(
+        matches!(
+            skill_mv,
+            Err(PortError::Domain(
+                DomainError::AbilityWriteForbidden | DomainError::SpaceReadOnly
+            ))
+        ),
+        "AgentRun moving folder containing Skill note within same project must fail, got {skill_mv:?}"
     );
 }
 

@@ -1204,39 +1204,51 @@ impl CanonicalStore {
                             note_id_list.push(nid);
                         }
                     }
-                    let folder_cuts: Vec<i64> = if page_rows.is_empty() {
-                        Vec::new()
-                    } else {
-                        match tx {
-                            BackendConn::Sqlite(conn) => sqlx::query_scalar(
-                                "SELECT DISTINCT visibility_seq FROM revisions
-                                 WHERE space_id = ? AND entity_type = 'folder'
-                                   AND visibility_seq > ? AND visibility_seq <= ?
-                                 ORDER BY visibility_seq ASC",
-                            )
-                            .bind(after.scope.space_id.as_str())
-                            .bind(after_i64)
-                            .bind(through_i64)
-                            .fetch_all(&mut **conn)
-                            .await
-                            .map_err(|err| {
-                                internal_not_committed("sqlite_read_folder_cuts", err.to_string())
-                            })?,
-                            BackendConn::Postgres(conn) => sqlx::query_scalar(
-                                "SELECT DISTINCT visibility_seq FROM revisions
-                                 WHERE space_id = $1 AND entity_type = 'folder'
-                                   AND visibility_seq > $2 AND visibility_seq <= $3
-                                 ORDER BY visibility_seq ASC",
-                            )
-                            .bind(after.scope.space_id.as_str())
-                            .bind(after_i64)
-                            .bind(through_i64)
-                            .fetch_all(&mut **conn)
-                            .await
-                            .map_err(|err| {
-                                crate::runtime::pg_read_error("pg_read_folder_cuts", err)
-                            })?,
+                    let folder_cuts: Vec<i64> = match (page_rows.first(), page_rows.last()) {
+                        (Some(first), Some(last))
+                            if first.command_last_seq < last.command_last_seq =>
+                        {
+                            let first_cut = first.command_last_seq;
+                            let last_cut = last.command_last_seq;
+                            match tx {
+                                BackendConn::Sqlite(conn) => sqlx::query_scalar(
+                                    "SELECT DISTINCT command_last_seq FROM change_log
+                                     WHERE space_id = ? AND history_incarnation = ?
+                                       AND space_seq > ? AND space_seq <= ?
+                                       AND entity_type = 'folder'
+                                     ORDER BY command_last_seq ASC",
+                                )
+                                .bind(after.scope.space_id.as_str())
+                                .bind(after.scope.incarnation.as_bytes().as_slice())
+                                .bind(first_cut)
+                                .bind(last_cut)
+                                .fetch_all(&mut **conn)
+                                .await
+                                .map_err(|err| {
+                                    internal_not_committed(
+                                        "sqlite_read_folder_cuts",
+                                        err.to_string(),
+                                    )
+                                })?,
+                                BackendConn::Postgres(conn) => sqlx::query_scalar(
+                                    "SELECT DISTINCT command_last_seq FROM change_log
+                                     WHERE space_id = $1 AND history_incarnation = $2
+                                       AND space_seq > $3 AND space_seq <= $4
+                                       AND entity_type = 'folder'
+                                     ORDER BY command_last_seq ASC",
+                                )
+                                .bind(after.scope.space_id.as_str())
+                                .bind(after.scope.incarnation.as_bytes().as_slice())
+                                .bind(first_cut)
+                                .bind(last_cut)
+                                .fetch_all(&mut **conn)
+                                .await
+                                .map_err(|err| {
+                                    crate::runtime::pg_read_error("pg_read_folder_cuts", err)
+                                })?,
+                            }
                         }
+                        _ => Vec::new(),
                     };
                     let fenced_notes = crate::runtime::purge_fenced_note_ids_tx(
                         tx,

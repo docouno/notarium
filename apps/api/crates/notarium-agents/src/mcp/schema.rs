@@ -252,14 +252,14 @@ impl ToolName {
             GetNote => vec![req("ref", key()), opt("responseFormat", response_format())],
             RecentActivity => vec![opt("project", key()), opt("limit", integer(1, 100))],
             Search => vec![
-                req("query", string(1, 8192)),
+                req("query", byte_string(1, 4096)),
                 opt("project", key()),
                 opt("class", key()),
                 opt("responseFormat", response_format()),
                 opt("limit", integer(1, 100)),
             ],
             Recall => vec![
-                req("query", string(1, 8192)),
+                req("query", byte_string(1, 4096)),
                 opt("project", key()),
                 opt("budgetTokens", integer(200, 32000)),
                 opt("depth", integer(0, i64::from(RecallQuery::MAX_GRAPH_DEPTH))),
@@ -356,6 +356,7 @@ enum Input {
     Text {
         min: usize,
         max: usize,
+        max_bytes: Option<usize>,
     },
     Episode,
     Choice(&'static [&'static str]),
@@ -407,8 +408,13 @@ fn valid_yaml_value(value: &Value, depth: usize) -> bool {
 impl Input {
     fn matches(&self, value: &Value) -> bool {
         match self {
-            Self::Text { min, max } => value.as_str().is_some_and(|text| {
-                text.len() <= max.saturating_mul(4) && (*min..=*max).contains(&text.chars().count())
+            Self::Text {
+                min,
+                max,
+                max_bytes,
+            } => value.as_str().is_some_and(|text| {
+                text.len() <= max_bytes.unwrap_or_else(|| max.saturating_mul(4))
+                    && (*min..=*max).contains(&text.chars().count())
             }),
             Self::Episode => value
                 .as_str()
@@ -452,9 +458,14 @@ impl Input {
 
     fn validate(&self, value: &mut Value) -> bool {
         match self {
-            Self::Text { min, max } => value.as_str().is_some_and(|text| {
+            Self::Text {
+                min,
+                max,
+                max_bytes,
+            } => value.as_str().is_some_and(|text| {
                 // Bound UTF-8 accounting before scanning multibyte strings.
-                text.len() <= max.saturating_mul(4) && (*min..=*max).contains(&text.chars().count())
+                text.len() <= max_bytes.unwrap_or_else(|| max.saturating_mul(4))
+                    && (*min..=*max).contains(&text.chars().count())
             }),
             Self::Episode => value
                 .as_str()
@@ -508,7 +519,9 @@ impl Input {
 
     fn json_schema(&self) -> Value {
         match self {
-            Self::Text { min, max } => json!({"type":"string","minLength":min,"maxLength":max}),
+            Self::Text { min, max, .. } => {
+                json!({"type":"string","minLength":min,"maxLength":max})
+            }
             Self::Episode => json!({
                 "type":"string",
                 "pattern":"^(ses_[0-9a-f]{32}|ses_[A-Za-z0-9_-]{12}|[A-Za-z0-9_-]{12}|[0-9a-fA-F]{16})$"
@@ -618,7 +631,18 @@ fn choice(values: &'static [&'static str]) -> Input {
     Input::Choice(values)
 }
 fn string(min: usize, max: usize) -> Input {
-    Input::Text { min, max }
+    Input::Text {
+        min,
+        max,
+        max_bytes: None,
+    }
+}
+fn byte_string(min: usize, max: usize) -> Input {
+    Input::Text {
+        min,
+        max,
+        max_bytes: Some(max),
+    }
 }
 fn integer(min: i64, max: i64) -> Input {
     Input::Integer { min, max }

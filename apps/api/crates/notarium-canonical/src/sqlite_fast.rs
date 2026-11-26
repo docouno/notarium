@@ -4267,6 +4267,7 @@ fn authorize_replay_rusqlite(
         }
         // The receipt may refer to a different set than the run's current sources.
         // Its own disclosures are checked after this source authorization succeeds.
+        // `rollback_agent_run_by_id` replay intentionally enforces live active-folder visibility.
         verify_run_and_entity_preconditions_note_only_rusqlite(
             conn,
             &mut FastBatchSqlCache::default(),
@@ -4308,7 +4309,7 @@ fn authorize_rollback_disclosures_rusqlite(
             return Err(DomainError::ResourceNotFound.into());
         }
         targets.push(if is_view {
-            ReplayResource::View(note)
+            ReplayResource::RollbackView(note)
         } else {
             ReplayResource::Read(note)
         });
@@ -4356,6 +4357,32 @@ fn authorize_replay_targets_rusqlite(
                 )?;
                 if ancestry.folder_lifecycle == notarium_core::model::Lifecycle::Purged {
                     return Err(DomainError::ResourceNotFound.into());
+                }
+                auth.authorize_read(&facts)?;
+                continue;
+            }
+            ReplayResource::RollbackView(note) => {
+                if is_note_purge_fenced_rusqlite(conn, &srec.space.id, note.as_str())? {
+                    continue;
+                }
+                let Some(head) = load_note_head_row_opt_rusqlite(conn, &srec.space.id, note)?
+                else {
+                    continue;
+                };
+                let (facts, ancestry) = build_resource_facts_rusqlite(
+                    conn,
+                    &srec.space,
+                    &head.parent_folder_id,
+                    head.doc_class,
+                    head.ability_id,
+                    false,
+                )?;
+                let effective = crate::domain::common::combine_lifecycle(
+                    head.lifecycle,
+                    ancestry.folder_lifecycle,
+                );
+                if effective == notarium_core::model::Lifecycle::Purged {
+                    continue;
                 }
                 auth.authorize_read(&facts)?;
                 continue;
@@ -6247,7 +6274,80 @@ impl SqliteSyncItemPlan for RollbackDirectSqliteFastPlan {
                         "sqlite_rollback_run_head_exists",
                     ))
                 })?;
-            return Err(FastItemExecError::PreWrite(if has_run_head {
+            let has_authorized_writes = if has_run_head {
+                let mut touched_ids = Vec::new();
+                let mut stmt = conn
+                    .prepare_cached(
+                        "SELECT DISTINCT entity_key FROM revisions
+                         WHERE space_id = ?1 AND agent_run_id = ?2 AND agent_run_id IS NOT NULL AND entity_type = 'note'",
+                    )
+                    .map_err(|err| {
+                        FastItemExecError::PreWrite(internal_not_committed(
+                            "sqlite_rollback_active_touched",
+                            err.to_string(),
+                        ))
+                    })?;
+                let rows = stmt
+                    .query_map(params![scope_cl.space_id.as_str(), run.as_str()], |r| {
+                        r.get::<_, String>(0)
+                    })
+                    .map_err(|err| {
+                        FastItemExecError::PreWrite(map_interrupt_or_internal(
+                            err,
+                            "sqlite_rollback_active_touched",
+                        ))
+                    })?;
+                for item in rows {
+                    let raw = item.map_err(|err| {
+                        FastItemExecError::PreWrite(map_interrupt_or_internal(
+                            err,
+                            "sqlite_rollback_active_touched",
+                        ))
+                    })?;
+                    let nid = NoteId::parse(&raw).map_err(|_| {
+                        FastItemExecError::PreWrite(internal_not_committed(
+                            "corrupt_touched_note_id",
+                            "invalid NoteId",
+                        ))
+                    })?;
+                    touched_ids.push(nid);
+                }
+                let mut ok = !touched_ids.is_empty();
+                for nid in &touched_ids {
+                    if is_note_purge_fenced_cached(conn, cache, &scope_cl.space_id, nid.as_str())
+                        .map_err(FastItemExecError::PreWrite)?
+                    {
+                        ok = false;
+                        break;
+                    }
+                    let Some(head) = load_note_head_row_opt_rusqlite(conn, &scope_cl.space_id, nid)
+                        .map_err(FastItemExecError::PreWrite)?
+                    else {
+                        ok = false;
+                        break;
+                    };
+                    let (rfacts, anc) = build_resource_facts_cached(
+                        conn,
+                        cache,
+                        &item_ctx.space,
+                        &head.parent_folder_id,
+                        head.doc_class,
+                        head.ability_id.clone(),
+                        false,
+                    )
+                    .map_err(FastItemExecError::PreWrite)?;
+                    if anc.folder_lifecycle == Lifecycle::Purged
+                        || auth.authorize_direct_write(&rfacts, &rfacts).is_err()
+                    {
+                        ok = false;
+                        break;
+                    }
+                }
+                ok
+            } else {
+                false
+            };
+            return Err(FastItemExecError::PreWrite(if has_authorized_writes {
                 DomainError::validation(ValidationReason::InvalidState).into()
             } else {
                 DomainError::ResourceNotFound.into()
@@ -7442,9 +7542,6 @@ fn verify_run_and_entity_preconditions_note_only_rusqlite(
     let expected_notes = if let Some(input) = expected {
         let mut notes = BTreeSet::new();
         for entry in &input.expected_entities {
-            if is_note_purge_fenced_cached(conn, cache, &scope.space_id, entry.note.as_str())? {
-                return Err(DomainError::ResourceNotFound.into());
-            }
             if !notes.insert(&entry.note) {
                 return Err(DomainError::validation(ValidationReason::InvalidState).into());
             }
@@ -7475,22 +7572,14 @@ fn verify_run_and_entity_preconditions_note_only_rusqlite(
             touched_set.insert(nid);
         }
     }
-    if let Some(notes) = expected_notes {
-        if notes.into_iter().ne(touched_set.iter()) {
-            return Err(DomainError::validation(ValidationReason::SourceMismatch).into());
-        }
-    } else {
-        for note in &touched_set {
-            if is_note_purge_fenced_cached(conn, cache, &scope.space_id, note.as_str())? {
-                return Err(DomainError::ResourceNotFound.into());
-            }
-        }
-    }
 
     let mut heads_map = BTreeMap::new();
     for nid in &touched_set {
+        if is_note_purge_fenced_cached(conn, cache, &scope.space_id, nid.as_str())? {
+            return Err(DomainError::ResourceNotFound.into());
+        }
         let head = load_note_head_row_rusqlite(conn, &scope.space_id, nid)?;
-        let (rfacts, _) = build_resource_facts_cached(
+        let (rfacts, anc) = build_resource_facts_cached(
             conn,
             cache,
             space,
@@ -7499,8 +7588,17 @@ fn verify_run_and_entity_preconditions_note_only_rusqlite(
             head.ability_id.clone(),
             require_active_folders,
         )?;
+        if anc.folder_lifecycle == Lifecycle::Purged {
+            return Err(DomainError::ResourceNotFound.into());
+        }
         auth.authorize_direct_write(&rfacts, &rfacts)?;
         heads_map.insert(nid.clone(), head);
+    }
+
+    if let Some(notes) = expected_notes
+        && notes.into_iter().ne(touched_set.iter())
+    {
+        return Err(DomainError::validation(ValidationReason::SourceMismatch).into());
     }
 
     if let Some(input) = expected {

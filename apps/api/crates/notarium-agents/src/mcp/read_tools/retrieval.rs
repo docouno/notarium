@@ -329,6 +329,9 @@ pub(super) async fn retrieve(
         for hit in result.hits {
             let metadata = hit.card.document.provenance();
             if metadata.reference().space_id != target.scope.space_id || !hit.score.is_finite() {
+                if observed_foreign {
+                    call.commit_external_read();
+                }
                 return Err(invalid(ValidationReason::SourceMismatch));
             }
             if !matches_target(metadata, &classes, target.project.as_ref()) {
@@ -336,30 +339,9 @@ pub(super) async fn retrieve(
             }
             candidates.push(Candidate { index, hit });
         }
-        if candidates.len() > MAX_CANDIDATES {
+        if external && candidates.len() > MAX_CANDIDATES {
             candidates.sort_by(rank);
-            if let Some(pin) = (!external)
-                .then(|| call.auth.pinned_write_space())
-                .flatten()
-            {
-                // Preserve pinned-Space candidates past the global cap so skipped
-                // foreign hits (e.g. over-budget recall chunks) can never evict local
-                // hits without marking taint.
-                let tail = candidates.split_off(MAX_CANDIDATES);
-                let local_in_head = candidates
-                    .iter()
-                    .filter(|c| &targets[c.index].scope.space_id == pin)
-                    .count();
-                let extra_cap = MAX_CANDIDATES.saturating_sub(local_in_head);
-                let mut local_tail: Vec<Candidate> = tail
-                    .into_iter()
-                    .filter(|c| &targets[c.index].scope.space_id == pin)
-                    .collect();
-                local_tail.truncate(extra_cap);
-                candidates.extend(local_tail);
-            } else {
-                candidates.truncate(MAX_CANDIDATES);
-            }
+            candidates.truncate(MAX_CANDIDATES);
             truncated = true;
         }
     }
@@ -370,162 +352,176 @@ pub(super) async fn retrieve(
     let mut combined = String::new();
     let mut best = None;
 
-    'candidates: for Candidate { index, hit } in candidates {
-        if output.len() >= limit {
-            truncated = true;
-            break;
-        }
-        let target = &targets[index];
-        let scope = call.space(target.scope.clone())?;
-        let metadata = hit.card.document.provenance();
-        let reference = metadata.reference();
-        let key = (reference.space_id.clone(), reference.note_id.clone());
-        if seen.contains(&key) {
-            continue;
-        }
-        let search_parts = if matches!(args.response_format, Some(Format::Detailed)) {
-            3
-        } else {
-            1
-        };
-        let mut source_remaining = source_budget;
-        let heading = format!("## {}\n", reference.note_id);
-        if recall
-            && !hit.chunks.iter().any(|chunk| {
-                let tokens = chunk.part().tokens();
-                tokens <= source_remaining
-                    && tokens.saturating_add(framing_tokens(&reference.note_id, true)) <= remaining
-            })
-        {
-            if !hit.chunks.is_empty() {
+    let finalize: Result<Value, PortError> = async {
+        'candidates: for Candidate { index, hit } in candidates {
+            if output.len() >= limit {
                 truncated = true;
-            }
-            continue;
-        }
-        let origin_count = call.provenance.origins.len();
-        let project_count = call.provenance.projects.len();
-        let selection = match corpus::note_metadata_selection(call, &scope, metadata).await {
-            Ok(selection) => selection,
-            Err(error) if corpus::hidden(&error) => continue,
-            Err(error) => return Err(error),
-        };
-        if !recall {
-            match corpus::admit_metadata_with_selection(call, &scope, metadata, selection.as_ref())
-                .await
-            {
-                Ok(()) => (),
-                Err(error) if corpus::hidden(&error) => continue,
-                Err(error) => return Err(error),
-            }
-        }
-        let mut parts = Vec::new();
-        for chunk in &hit.chunks {
-            if chunk.provenance().reference() != reference
-                || chunk.provenance().revision() != metadata.revision()
-                || chunk.provenance().digest() != metadata.digest()
-            {
-                return Err(invalid(ValidationReason::SourceMismatch));
-            }
-            if !recall && parts.len() == search_parts {
                 break;
             }
-            let tokens = chunk.part().tokens();
-            let charge = tokens + framing_tokens(&reference.note_id, parts.is_empty());
-            if recall && (tokens > source_remaining || charge > remaining) {
-                truncated = true;
+            let target = &targets[index];
+            let scope = call.space(target.scope.clone())?;
+            let metadata = hit.card.document.provenance();
+            let reference = metadata.reference();
+            let key = (reference.space_id.clone(), reference.note_id.clone());
+            if seen.contains(&key) {
                 continue;
             }
-            let text = match corpus::search_part_with_selection(
-                call,
-                &scope,
-                metadata,
-                chunk,
-                selection.as_ref(),
-            )
-            .await
+            let search_parts = if matches!(args.response_format, Some(Format::Detailed)) {
+                3
+            } else {
+                1
+            };
+            let mut source_remaining = source_budget;
+            let heading = format!("## {}\n", reference.note_id);
+            if recall
+                && !hit.chunks.iter().any(|chunk| {
+                    let tokens = chunk.part().tokens();
+                    tokens <= source_remaining
+                        && tokens.saturating_add(framing_tokens(&reference.note_id, true))
+                            <= remaining
+                })
             {
-                Ok(text) => text,
+                if !hit.chunks.is_empty() {
+                    truncated = true;
+                }
+                continue;
+            }
+            let origin_count = call.provenance.origins.len();
+            let project_count = call.provenance.projects.len();
+            let selection = match corpus::note_metadata_selection(call, &scope, metadata).await {
+                Ok(selection) => selection,
                 Err(error) if corpus::hidden(&error) => continue,
                 Err(error) => return Err(error),
             };
+            if !recall {
+                match corpus::admit_metadata_with_selection(
+                    call,
+                    &scope,
+                    metadata,
+                    selection.as_ref(),
+                )
+                .await
+                {
+                    Ok(()) => (),
+                    Err(error) if corpus::hidden(&error) => continue,
+                    Err(error) => return Err(error),
+                }
+            }
+            let mut parts = Vec::new();
+            for chunk in &hit.chunks {
+                if chunk.provenance().reference() != reference
+                    || chunk.provenance().revision() != metadata.revision()
+                    || chunk.provenance().digest() != metadata.digest()
+                {
+                    return Err(invalid(ValidationReason::SourceMismatch));
+                }
+                if !recall && parts.len() == search_parts {
+                    break;
+                }
+                let tokens = chunk.part().tokens();
+                let charge = tokens + framing_tokens(&reference.note_id, parts.is_empty());
+                if recall && (tokens > source_remaining || charge > remaining) {
+                    truncated = true;
+                    continue;
+                }
+                let text = match corpus::search_part_with_selection(
+                    call,
+                    &scope,
+                    metadata,
+                    chunk,
+                    selection.as_ref(),
+                )
+                .await
+                {
+                    Ok(text) => text,
+                    Err(error) if corpus::hidden(&error) => continue,
+                    Err(error) => return Err(error),
+                };
+                if recall {
+                    source_remaining -= tokens;
+                    remaining -= charge;
+                }
+                parts.push(text);
+            }
             if recall {
-                source_remaining -= tokens;
-                remaining -= charge;
+                if parts.is_empty() {
+                    call.provenance.origins.truncate(origin_count);
+                    call.provenance.projects.truncate(project_count);
+                    continue 'candidates;
+                }
+                combined.push_str(&heading);
+                for part in &parts {
+                    combined.push_str(part);
+                    combined.push_str("\n\n");
+                }
             }
-            parts.push(text);
-        }
-        if recall {
-            if parts.is_empty() {
-                call.provenance.origins.truncate(origin_count);
-                call.provenance.projects.truncate(project_count);
-                continue 'candidates;
+
+            let mut item = json!({
+                "noteId": reference.note_id,
+                "spaceId": reference.space_id,
+                "versionToken": metadata.revision(),
+                "title": hit.card.title,
+                "path": hit.card.path,
+                "class": metadata.class(),
+            });
+            if external {
+                item["score"] = json!(hit.score);
             }
-            combined.push_str(&heading);
-            for part in &parts {
-                combined.push_str(part);
-                combined.push_str("\n\n");
+            if !recall {
+                item["snippet"] = json!(parts.first());
+                if matches!(args.response_format, Some(Format::Detailed)) {
+                    item["chunks"] = json!(parts);
+                }
             }
+            best.get_or_insert(hit.score);
+            seen.insert(key);
+            hits.push(reference.clone());
+            output.push(item);
         }
 
-        let mut item = json!({
-            "noteId": reference.note_id,
-            "spaceId": reference.space_id,
-            "versionToken": metadata.revision(),
-            "title": hit.card.title,
-            "path": hit.card.path,
-            "class": metadata.class(),
-        });
+        let mut degradation = own_degradation;
+        if call.auth.taint().is_tainted() {
+            degradation.extend(foreign_degradation);
+        }
+
+        let kind = if recall || (call.registry.vector_search && degradation.is_empty()) {
+            RetrievalKind::Hybrid
+        } else {
+            RetrievalKind::FullText
+        };
+        call.registry
+            .telemetry
+            .record_agent_retrieval(
+                call.account(),
+                AgentRetrieval {
+                    id: call.call_id.clone(),
+                    call: Some(call.call_id.clone()),
+                    kind,
+                    result_count: u32::try_from(hits.len())
+                        .map_err(|_| DomainError::validation(ValidationReason::InvalidLimit))?,
+                    hits,
+                    top_score: best,
+                },
+            )
+            .await?;
+
+        let mut result = if recall {
+            json!({"sources": output, "context": combined, "tokens": budget - remaining,
+                "degraded": degradation})
+        } else {
+            json!({"results": output, "degraded": degradation})
+        };
         if external {
-            item["score"] = json!(hit.score);
+            result["truncated"] = json!(truncated);
         }
-        if !recall {
-            item["snippet"] = json!(parts.first());
-            if matches!(args.response_format, Some(Format::Detailed)) {
-                item["chunks"] = json!(parts);
-            }
+        Ok(result)
+    }
+    .await;
+    finalize.inspect_err(|_| {
+        if observed_foreign {
+            call.commit_external_read();
         }
-        best.get_or_insert(hit.score);
-        seen.insert(key);
-        hits.push(reference.clone());
-        output.push(item);
-    }
-
-    let mut degradation = own_degradation;
-    if call.auth.taint().is_tainted() {
-        degradation.extend(foreign_degradation);
-    }
-
-    let kind = if recall || (call.registry.vector_search && degradation.is_empty()) {
-        RetrievalKind::Hybrid
-    } else {
-        RetrievalKind::FullText
-    };
-    call.registry
-        .telemetry
-        .record_agent_retrieval(
-            call.account(),
-            AgentRetrieval {
-                id: call.call_id.clone(),
-                call: Some(call.call_id.clone()),
-                kind,
-                result_count: u32::try_from(hits.len())
-                    .map_err(|_| DomainError::validation(ValidationReason::InvalidLimit))?,
-                hits,
-                top_score: best,
-            },
-        )
-        .await?;
-
-    let mut result = if recall {
-        json!({"sources": output, "context": combined, "tokens": budget - remaining,
-            "degraded": degradation})
-    } else {
-        json!({"results": output, "degraded": degradation})
-    };
-    if external {
-        result["truncated"] = json!(truncated);
-    }
-    Ok(result)
+    })
 }
 
 struct Candidate {

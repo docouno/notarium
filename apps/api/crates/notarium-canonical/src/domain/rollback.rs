@@ -455,7 +455,7 @@ fn rollback_policy(input: &RollbackAgentRun) -> crate::writer::replay::ReplayPol
             .expected_entities
             .iter()
             .map(|entry| ReplayResource::Write(entry.note.clone()))
-            .chain(views.into_iter().cloned().map(ReplayResource::View))
+            .chain(views.into_iter().cloned().map(ReplayResource::RollbackView))
             .collect(),
     )
 }
@@ -710,6 +710,7 @@ async fn execute_general_rollback(
             .values()
             .any(|action| matches!(action, CandidateAction::RestorePreExisting { .. }));
         let mut affected_views_set: BTreeSet<ViewRef> = BTreeSet::new();
+        let mut active_after_rollback_views: BTreeSet<ViewRef> = BTreeSet::new();
         for bmh in &run_board_moves {
             let view_active_after_rollback = match eligible_notes.get(&bmh.view.note) {
                 Some(CandidateAction::TrashCreated { .. }) => false,
@@ -718,10 +719,11 @@ async fn execute_general_rollback(
                 }
                 None => active_view_notes.contains(&bmh.view.note),
             };
-            if view_active_after_rollback
-                && (has_restorable_eligible || eligible_notes.contains_key(&bmh.target_note_id))
-            {
-                affected_views_set.insert(bmh.view.clone());
+            if view_active_after_rollback {
+                active_after_rollback_views.insert(bmh.view.clone());
+                if has_restorable_eligible || eligible_notes.contains_key(&bmh.target_note_id) {
+                    affected_views_set.insert(bmh.view.clone());
+                }
             }
         }
 
@@ -867,6 +869,7 @@ async fn execute_general_rollback(
                 skipped_manual_edits.clone(),
                 skipped_room_active.clone(),
                 affected_views_set,
+                active_after_rollback_views,
                 rb_facts_opt,
                 run_board_moves.clone(),
             ),
@@ -1014,23 +1017,27 @@ pub(crate) fn build_rollback_direct_single_tx_exec(
             };
             let actual_run_rev = scoped_run_revision(&scope_cl, &inc_bytes, &run_rev_raw)?;
 
+            let expected_notes = if let Some(input) = expected {
+                let mut notes = BTreeSet::new();
+                for note in &input.expected_entities {
+                    if !notes.insert(&note.note) {
+                        return Err(DomainError::validation(ValidationReason::InvalidState).into());
+                    }
+                }
+                Some(notes)
+            } else {
+                None
+            };
+
             let histories = load_direct_rollback_histories(tx, &scope_cl.space_id, run).await?;
             let touched: Vec<NoteId> = histories.keys().cloned().collect();
-            // Explicit expectations can include a now-purged note no longer in the run.
             let states = if has_note_states {
-                let ids = match expected {
-                    Some(input) => input
-                        .expected_entities
-                        .iter()
-                        .map(|entry| entry.note.as_str())
-                        .collect(),
-                    None => touched.iter().map(NoteId::as_str).collect(),
-                };
+                let ids = touched.iter().map(NoteId::as_str).collect();
                 load_rollback_note_states(tx, &scope_cl.space_id, ids).await?
             } else {
                 RollbackNoteStates::default()
             };
-            if expected.is_none() && !states.purged.is_empty() {
+            if !states.purged.is_empty() {
                 return Err(DomainError::ResourceNotFound.into());
             }
             if has_bmh && let BackendConn::Postgres(conn) = &mut *tx {
@@ -1045,20 +1052,6 @@ pub(crate) fn build_rollback_direct_single_tx_exec(
                     return Err(rollback_fallback_board_present_err());
                 }
             }
-            if let Some(input) = expected {
-                let mut notes = BTreeSet::new();
-                for note in &input.expected_entities {
-                    if states.purged.contains(&note.note) {
-                        return Err(DomainError::ResourceNotFound.into());
-                    }
-                    if !notes.insert(&note.note) {
-                        return Err(DomainError::validation(ValidationReason::InvalidState).into());
-                    }
-                }
-                if notes.into_iter().ne(touched.iter()) {
-                    return Err(DomainError::validation(ValidationReason::SourceMismatch).into());
-                }
-            }
 
             let mut heads_map = load_note_heads_batch_tx(tx, &scope_cl.space_id, &touched).await?;
 
@@ -1067,7 +1060,7 @@ pub(crate) fn build_rollback_direct_single_tx_exec(
                 if head.slug_fold == super::folder_cover::SLUG {
                     return Err(rollback_fallback_cover_change_err());
                 }
-                let (rfacts, _) = folder_cache
+                let (rfacts, anc) = folder_cache
                     .build_resource_facts_tx(
                         tx,
                         &item_ctx.space,
@@ -1077,7 +1070,16 @@ pub(crate) fn build_rollback_direct_single_tx_exec(
                         false,
                     )
                     .await?;
+                if anc.folder_lifecycle == Lifecycle::Purged {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
                 auth.authorize_direct_write(&rfacts, &rfacts)?;
+            }
+
+            if let Some(notes) = expected_notes
+                && notes.into_iter().ne(touched.iter())
+            {
+                return Err(DomainError::validation(ValidationReason::SourceMismatch).into());
             }
 
             if let Some(input) = expected {
@@ -1888,6 +1890,7 @@ fn build_rollback_execute_fn(
     skipped_manual_cl: Vec<NoteId>,
     skipped_room_cl: Vec<NoteId>,
     affected_views_set: BTreeSet<ViewRef>,
+    active_after_rollback_views: BTreeSet<ViewRef>,
     rb_facts_opt: Option<notarium_core::ports::RollbackBoardFacts>,
     run_moves_cl: Vec<RunBoardMoveRow>,
 ) -> crate::writer::ItemExecuteFn {
@@ -2664,9 +2667,11 @@ fn build_rollback_execute_fn(
                 .map(|bmh| &bmh.view)
                 .filter(|view| {
                     !retired_note_ids.contains(&view.note)
-                        && rb_facts_opt
-                            .as_ref()
-                            .is_none_or(|facts| !facts.views().contains_key(*view))
+                        && (!active_after_rollback_views.contains(*view)
+                            || (affected_views_set.contains(*view)
+                                && rb_facts_opt
+                                    .as_ref()
+                                    .is_none_or(|facts| !facts.views().contains_key(*view))))
                 })
                 .cloned()
                 .collect();
@@ -2681,13 +2686,17 @@ fn build_rollback_execute_fn(
                     })
                     .map(|bmh| &bmh.target_note_id)
                     .collect();
+                let view_has_rollback_effect = eligible_all_ids.contains(&view.note)
+                    || run_moves_cl.iter().any(|bmh| {
+                        &bmh.view == view && eligible_all_ids.contains(&bmh.target_note_id)
+                    });
                 for (nid, ov) in &overlays {
                     if retired_note_ids.contains(nid) {
                         continue;
                     }
                     let delete_overlay = if ov.placement_run_id.as_ref() == Some(&input.run) {
                         touched_on_view.contains(nid)
-                    } else if ov.placement_run_id.is_none() {
+                    } else if ov.placement_run_id.is_none() && view_has_rollback_effect {
                         // Also delete neighbor overlays newly materialized solely by `input.run`
                         // (which carry `placement_run_id = None` and whose `placement_revision`
                         // is a root rank revision created by `input.run` with `parent_rev_id IS NULL`).
@@ -3317,7 +3326,7 @@ async fn is_run_materialized_overlay_tx(
         .bind(run.as_str())
         .fetch_optional(&mut **conn)
         .await
-        .map_err(|err| internal_not_committed("pg_check_materialized_overlay", err.to_string()))?
+        .map_err(|err| crate::runtime::pg_read_error("pg_check_materialized_overlay", err))?
         .is_some()),
     }
 }
@@ -3663,7 +3672,58 @@ async fn ensure_chat_run_not_active_tx(
         .map_err(|err| crate::runtime::pg_read_error("pg_rollback_run_head_exists", err))?,
     };
     if has_run_head {
-        return Err(DomainError::validation(ValidationReason::InvalidState).into());
+        let touched = load_run_touched_notes_tx(tx, &space.id, run).await?;
+        let run_moves = load_run_board_moves_tx(tx, &space.id, run).await?;
+        if !touched.is_empty() || !run_moves.is_empty() {
+            let states = load_rollback_note_states(
+                tx,
+                &space.id,
+                touched.iter().map(NoteId::as_str).collect(),
+            )
+            .await?;
+            if states.purged.is_empty() {
+                let heads_map = load_note_heads_batch_tx(tx, &space.id, &touched).await?;
+                let mut folder_cache = FolderAncestryCache::default();
+                let mut authorized = true;
+                for nid in &touched {
+                    let Some(head) = heads_map.get(nid) else {
+                        authorized = false;
+                        break;
+                    };
+                    let (rfacts, anc) = folder_cache
+                        .build_resource_facts_tx(
+                            tx,
+                            space,
+                            &head.parent_folder_id,
+                            head.doc_class,
+                            head.ability_id.clone(),
+                            false,
+                        )
+                        .await?;
+                    if anc.folder_lifecycle == Lifecycle::Purged
+                        || auth.authorize_direct_write(&rfacts, &rfacts).is_err()
+                    {
+                        authorized = false;
+                        break;
+                    }
+                }
+                if authorized {
+                    let views: BTreeSet<&NoteId> = run_moves.iter().map(|m| &m.view.note).collect();
+                    for view in views {
+                        if super::board::authorized_rollback_view_head_opt(tx, space, auth, view)
+                            .await
+                            .is_err()
+                        {
+                            authorized = false;
+                            break;
+                        }
+                    }
+                }
+                if authorized {
+                    return Err(DomainError::validation(ValidationReason::InvalidState).into());
+                }
+            }
+        }
     }
     Err(DomainError::ResourceNotFound.into())
 }
@@ -3840,7 +3900,7 @@ pub(crate) async fn prepare_rollback_sources_tx(
             .map(AbilityId::parse)
             .transpose()
             .map_err(|_| internal_not_committed("corrupt_ability_id", "invalid ability_id"))?;
-        let (facts, _) = folders
+        let (facts, anc) = folders
             .build_resource_facts_tx(
                 tx,
                 &record.space,
@@ -3850,6 +3910,9 @@ pub(crate) async fn prepare_rollback_sources_tx(
                 require_active_folders,
             )
             .await?;
+        if anc.folder_lifecycle == Lifecycle::Purged {
+            return Err(DomainError::ResourceNotFound.into());
+        }
         auth.authorize_direct_write(&facts, &facts)?;
         expected_entities.push(NoteRevision {
             note: NoteId::parse(&id)
@@ -3911,40 +3974,9 @@ async fn verify_run_and_entity_preconditions_tx(
     input: &RollbackAgentRun,
     folder_cache: &mut FolderAncestryCache,
 ) -> Result<VerifiedRollbackSources, PortError> {
-    auth.authorize_space_write(space)?;
-    let mut active_views = BTreeSet::new();
-    for view in input
-        .associated_board_expectations
-        .iter()
-        .map(|entry| &entry.view.note)
-        .collect::<BTreeSet<_>>()
-    {
-        if let Some((_head, effective)) =
-            super::board::authorized_rollback_view_head_opt(tx, space, auth, view).await?
-            && effective == Lifecycle::Active
-        {
-            active_views.insert(view.clone());
-        }
-    }
-    let actual_run_rev = load_run_revision(tx, scope, space, auth, &input.run).await?;
-
-    // Discover full touched set of notes in `revisions` UNION `board_move_history`.
-    let mut touched_set: BTreeSet<NoteId> = BTreeSet::new();
-    for nid in load_run_touched_notes_tx(tx, &scope.space_id, &input.run).await? {
-        touched_set.insert(nid);
-    }
-
-    let ids = input
-        .expected_entities
-        .iter()
-        .map(|entry| entry.note.as_str())
-        .collect();
-    let states = load_rollback_note_states(tx, &scope.space_id, ids).await?;
+    // Pure input duplicate validation first (no DB lookups on caller-supplied IDs).
     let mut caller_notes: BTreeMap<NoteId, RevisionId> = BTreeMap::new();
     for exp in &input.expected_entities {
-        if states.purged.contains(&exp.note) {
-            return Err(DomainError::ResourceNotFound.into());
-        }
         if caller_notes
             .insert(exp.note.clone(), exp.revision.clone())
             .is_some()
@@ -3952,37 +3984,6 @@ async fn verify_run_and_entity_preconditions_tx(
             return Err(DomainError::validation(ValidationReason::InvalidState).into());
         }
     }
-
-    let caller_set: BTreeSet<NoteId> = caller_notes.keys().cloned().collect();
-    if caller_set != touched_set {
-        return Err(DomainError::validation(ValidationReason::SourceMismatch).into());
-    }
-
-    let caller_note_vec: Vec<NoteId> = caller_notes.keys().cloned().collect();
-    let heads_map = load_note_heads_batch_tx(tx, &scope.space_id, &caller_note_vec).await?;
-
-    for nid in caller_notes.keys() {
-        let head = heads_map.get(nid).ok_or(DomainError::ResourceNotFound)?;
-        let (rfacts, _) = folder_cache
-            .build_resource_facts_tx(
-                tx,
-                space,
-                &head.parent_folder_id,
-                head.doc_class,
-                head.ability_id.clone(),
-                false,
-            )
-            .await?;
-        auth.authorize_direct_write(&rfacts, &rfacts)?;
-    }
-
-    // Verify `associated_board_expectations` covers all `(view, target_note)` pairs in `board_move_history` for this run.
-    let run_moves = load_run_board_moves_tx(tx, &scope.space_id, &input.run).await?;
-    let mut required_pairs: BTreeSet<(ViewRef, NoteId)> = BTreeSet::new();
-    for m in &run_moves {
-        required_pairs.insert((m.view.clone(), m.target_note_id.clone()));
-    }
-
     let mut caller_pairs: BTreeMap<(ViewRef, NoteId), &AssociatedBoardExpectation> =
         BTreeMap::new();
     for assoc in &input.associated_board_expectations {
@@ -3992,6 +3993,72 @@ async fn verify_run_and_entity_preconditions_tx(
         {
             return Err(DomainError::validation(ValidationReason::InvalidState).into());
         }
+    }
+
+    auth.authorize_space_write(space)?;
+    let actual_run_rev = load_run_revision(tx, scope, space, auth, &input.run).await?;
+
+    // Discover and authorize the run's actual touched notes and board views BEFORE
+    // checking caller-supplied expectations so unauthorized callers cannot probe
+    // arbitrary note/view existence, purge fences, or the run's touched set.
+    let mut touched_set: BTreeSet<NoteId> = BTreeSet::new();
+    for nid in load_run_touched_notes_tx(tx, &scope.space_id, &input.run).await? {
+        touched_set.insert(nid);
+    }
+    let run_moves = load_run_board_moves_tx(tx, &scope.space_id, &input.run).await?;
+
+    let touched_vec: Vec<NoteId> = touched_set.iter().cloned().collect();
+    let states = load_rollback_note_states(
+        tx,
+        &scope.space_id,
+        touched_vec.iter().map(NoteId::as_str).collect(),
+    )
+    .await?;
+    if !states.purged.is_empty() {
+        return Err(DomainError::ResourceNotFound.into());
+    }
+
+    let heads_map = load_note_heads_batch_tx(tx, &scope.space_id, &touched_vec).await?;
+    for nid in &touched_set {
+        let head = heads_map.get(nid).ok_or(DomainError::ResourceNotFound)?;
+        let (rfacts, anc) = folder_cache
+            .build_resource_facts_tx(
+                tx,
+                space,
+                &head.parent_folder_id,
+                head.doc_class,
+                head.ability_id.clone(),
+                false,
+            )
+            .await?;
+        if anc.folder_lifecycle == Lifecycle::Purged {
+            return Err(DomainError::ResourceNotFound.into());
+        }
+        auth.authorize_direct_write(&rfacts, &rfacts)?;
+    }
+
+    let mut active_views = BTreeSet::new();
+    for view in run_moves
+        .iter()
+        .map(|m| &m.view.note)
+        .collect::<BTreeSet<_>>()
+    {
+        if let Some((_head, effective)) =
+            super::board::authorized_rollback_view_head_opt(tx, space, auth, view).await?
+            && effective == Lifecycle::Active
+        {
+            active_views.insert(view.clone());
+        }
+    }
+
+    let caller_set: BTreeSet<NoteId> = caller_notes.keys().cloned().collect();
+    if caller_set != touched_set {
+        return Err(DomainError::validation(ValidationReason::SourceMismatch).into());
+    }
+
+    let mut required_pairs: BTreeSet<(ViewRef, NoteId)> = BTreeSet::new();
+    for m in &run_moves {
+        required_pairs.insert((m.view.clone(), m.target_note_id.clone()));
     }
     let caller_pair_keys: BTreeSet<(ViewRef, NoteId)> = caller_pairs.keys().cloned().collect();
     if caller_pair_keys != required_pairs {
@@ -6661,10 +6728,7 @@ async fn execute_pg_fast_rollback_inner(
     };
 
     if (flags & 512) != 0 {
-        return PgFastInnerResult::Failed {
-            err: DomainError::validation(ValidationReason::SourceMismatch).into(),
-            effective_cut: Some(current_effective_cut),
-        };
+        return PgFastInnerResult::FallbackToStandard;
     }
 
     let mut folder_cache = FolderAncestryCache::default();
@@ -6736,10 +6800,7 @@ async fn execute_pg_fast_rollback_inner(
             let nid_raw: String = row.get::<String, usize>(1);
             let first_run_seq_raw: i64 = row.get::<i64, usize>(19);
             if first_run_seq_raw < 0 {
-                return PgFastInnerResult::Failed {
-                    err: DomainError::validation(ValidationReason::SourceMismatch).into(),
-                    effective_cut: Some(current_effective_cut),
-                };
+                return PgFastInnerResult::FallbackToStandard;
             }
             let Ok(nid) = NoteId::parse(&nid_raw) else {
                 return PgFastInnerResult::Failed {
@@ -6867,10 +6928,7 @@ async fn execute_pg_fast_rollback_inner(
     drop(r_rows);
 
     if rev_summaries.len() != caller_notes.len() {
-        return PgFastInnerResult::Failed {
-            err: DomainError::validation(ValidationReason::SourceMismatch).into(),
-            effective_cut: Some(current_effective_cut),
-        };
+        return PgFastInnerResult::FallbackToStandard;
     }
 
     {

@@ -343,11 +343,11 @@ fn board_plan_for_rollback<'a>(
                 .notes
                 .get(&view.note)
                 .ok_or(DomainError::ResourceNotFound)?;
+            let _ = cut.authorize_note_allowing_inactive(ctx, current)?;
             if current.revision != restoration.current_revision {
                 return Err(DomainError::validation(ValidationReason::CursorStale).into());
             }
             if restoration.planned_lifecycle != Lifecycle::Active {
-                let _ = cut.authorize_note_allowing_inactive(ctx, current)?;
                 return Ok(RollbackBoardPlan::Retired);
             }
             cut.authorize_placement(

@@ -174,30 +174,9 @@ pub(super) async fn recent(
             }
             candidates.push(Candidate { index, change });
         }
-        if candidates.len() > MAX_CANDIDATES {
+        if external && candidates.len() > MAX_CANDIDATES {
             candidates.sort_by(rank);
-            if let Some(pin) = (!external)
-                .then(|| call.auth.pinned_write_space())
-                .flatten()
-            {
-                // Preserve pinned-Space candidates past the global cap so skipped
-                // foreign candidates (e.g. trashed notes) can neither wipe out local
-                // results nor create a zero-taint eviction oracle.
-                let tail = candidates.split_off(MAX_CANDIDATES);
-                let local_in_head = candidates
-                    .iter()
-                    .filter(|c| &targets[c.index].scope.space_id == pin)
-                    .count();
-                let extra_cap = MAX_CANDIDATES.saturating_sub(local_in_head);
-                let mut local_tail: Vec<Candidate> = tail
-                    .into_iter()
-                    .filter(|c| &targets[c.index].scope.space_id == pin)
-                    .collect();
-                local_tail.truncate(extra_cap);
-                candidates.extend(local_tail);
-            } else {
-                candidates.truncate(MAX_CANDIDATES);
-            }
+            candidates.truncate(MAX_CANDIDATES);
             truncated = true;
         }
     }

@@ -77,3 +77,4 @@ CREATE INDEX schedule_run_retention ON agent_schedule_runs(status,finished_at,ru
 CREATE INDEX schedule_expired_run ON agent_schedule_runs(expires_at,run_id)
     WHERE status IN ('claimed','running');
 CREATE INDEX call_run ON provider_call_log(run_id,call_id);
+CREATE INDEX ability_trail_destination ON ability_placement_trail(destination_placement,destination_id);
