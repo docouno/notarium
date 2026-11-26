@@ -4940,6 +4940,379 @@ async fn run_board_prerun_pma_and_stale_non_moved_suite(store: &CanonicalStore) 
     assert_eq!(g1_ranks.len(), 4);
 }
 
+async fn run_board_per_note_prerun_and_skipped_moved_view_suite(store: &CanonicalStore) {
+    let owner = sample_principal_id(64);
+    let (scope, _root) = seed_space(
+        store,
+        sample_space_id(64),
+        sample_incarnation(64),
+        owner.clone(),
+    )
+    .await;
+    let human_ctx = owner_ctx(&scope, owner.clone());
+
+    let view1_note = sample_note_id(254);
+    let view2_note = sample_note_id(255);
+    let view1_c = store
+        .create_note(
+            human_ctx.clone(),
+            next_mutation(
+                &scope,
+                &owner,
+                CreateNote {
+                    folder_page: false,
+                    note: view1_note.clone(),
+                    parent: None,
+                    slug: "per-note-prerun-board".to_owned(),
+                    class: DocClass::UserDoc,
+                    carrier: "---\ntitle: per-note-prerun-board\n---\n# Board\n".to_owned(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let view2_c = store
+        .create_note(
+            human_ctx.clone(),
+            next_mutation(
+                &scope,
+                &owner,
+                CreateNote {
+                    folder_page: false,
+                    note: view2_note.clone(),
+                    parent: None,
+                    slug: "skipped-moved-board".to_owned(),
+                    class: DocClass::UserDoc,
+                    carrier: "---\ntitle: skipped-moved-board\n---\n# Board\n".to_owned(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let view1 = ViewRef {
+        note: view1_note,
+        key: ViewKey::from_bytes([0x6D; 16]),
+    };
+    let view2 = ViewRef {
+        note: view2_note,
+        key: ViewKey::from_bytes([0x6E; 16]),
+    };
+
+    let early_note = NoteId::from_bytes([0x11; 16]);
+    let t_reconcile = NoteId::from_bytes([0x12; 16]);
+    let n_stale = NoteId::from_bytes([0x13; 16]);
+    let z_non_moved = NoteId::from_bytes([0x14; 16]);
+    let m_skipped = NoteId::from_bytes([0x15; 16]);
+
+    let planner = CanonicalTestBoardPlanner::new(
+        store.clone(),
+        [
+            early_note.clone(),
+            t_reconcile.clone(),
+            n_stale.clone(),
+            z_non_moved.clone(),
+            m_skipped.clone(),
+        ],
+    );
+    store
+        .register_board_facts_provider(planner)
+        .expect("register planner");
+
+    let g1 = GroupKey::Value(ScalarValue::String("todo".to_owned()));
+    let g2 = GroupKey::Value(ScalarValue::String("doing".to_owned()));
+    let g3 = GroupKey::Value(ScalarValue::String("done".to_owned()));
+
+    let mut revs: BTreeMap<NoteId, RevisionId> = BTreeMap::new();
+    for (nid, slug, status) in [
+        (&early_note, "early-note", "backlog"),
+        (&t_reconcile, "t-reconcile", "todo"),
+        (&n_stale, "n-stale", "todo"),
+        (&z_non_moved, "z-non-moved", "todo"),
+        (&m_skipped, "m-skipped", "done"),
+    ] {
+        let c = store
+            .create_note(
+                human_ctx.clone(),
+                next_mutation(
+                    &scope,
+                    &owner,
+                    CreateNote {
+                        folder_page: false,
+                        note: nid.clone(),
+                        parent: None,
+                        slug: slug.to_owned(),
+                        class: DocClass::UserDoc,
+                        carrier: format!("---\ntitle: {slug}\nstatus: {status}\n---\nBody\n"),
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        revs.insert(nid.clone(), c.value.revision);
+    }
+
+    let scope_ref = &scope;
+    let owner_ref = &owner;
+    let set_status = |ctx: SpaceContext, nid: NoteId, st: &'static str| async move {
+        let snap = store
+            .get_note(
+                ctx.clone(),
+                GetNote {
+                    note: nid.clone(),
+                    revision: None,
+                    causal: CausalBasis::Exact(ReceiptSet::default()),
+                },
+            )
+            .await
+            .unwrap();
+        let raw = snap.document.explicit_read(ctx.auth()).unwrap();
+        let plan = extract::finalize_document(
+            raw,
+            DocClass::UserDoc,
+            &nid,
+            &[FieldEdit::Set {
+                key: "status".to_owned(),
+                value: YamlValue::String(st.to_owned()),
+            }],
+        )
+        .unwrap();
+        store
+            .edit_note(
+                ctx,
+                next_mutation(scope_ref, owner_ref, EditNote { note: nid, plan }),
+            )
+            .await
+            .unwrap()
+            .value
+            .revision
+    };
+
+    let run = sample_run_id(244);
+    let agent_ctx = agent_run_ctx(&human_ctx, run.clone());
+
+    // Step 1: Agent run R makes its earliest touch on `early_note` at seq T1.
+    revs.insert(
+        early_note.clone(),
+        set_status(agent_ctx.clone(), early_note.clone(), "triage").await,
+    );
+
+    // Step 2: AFTER T1 (but BEFORE R ever touches `t_reconcile` or `n_stale`),
+    // human ranks both `t_reconcile` and `n_stale` in G1 on `view1`.
+    let tr_pre_mv = store
+        .move_board_card(
+            human_ctx.clone(),
+            next_mutation(
+                &scope,
+                &owner,
+                MoveBoardCard {
+                    view: view1.clone(),
+                    note: t_reconcile.clone(),
+                    group: g1.clone(),
+                    before: None,
+                    after: None,
+                    fields: BTreeMap::new(),
+                    expected_note: revs[&t_reconcile].clone(),
+                    expected_view: view1_c.value.revision.clone(),
+                    expected_rank: RankExpectation::Absent,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    revs.insert(t_reconcile.clone(), tr_pre_mv.value.revision.revision);
+
+    let pre_touch_ov1 = store
+        .inspect_view_overlays_for_test(&scope.space_id, &view1)
+        .await
+        .unwrap();
+    let t_rec_pre_rank = pre_touch_ov1[&t_reconcile].sort_rank_lexo.clone();
+    let t_rec_pre_pl = pre_touch_ov1[&t_reconcile].placement_revision.clone();
+    let n_stale_pre_rank = pre_touch_ov1[&n_stale].sort_rank_lexo.clone();
+    let n_stale_pre_pl = pre_touch_ov1[&n_stale].placement_revision.clone();
+
+    // Step 3: Now run R edits `t_reconcile` and `n_stale` into G2, moves `early_note` into G2
+    // on `view1` (materializing G2 neighbor overlays for `t_reconcile` and `n_stale`), and then
+    // moves `t_reconcile` on `view1` from G2 into G3 (triggering `ReconcilePreRun` for
+    // `t_reconcile` while leaving non-moved `n_stale` with a stale G2 overlay).
+    revs.insert(
+        t_reconcile.clone(),
+        set_status(agent_ctx.clone(), t_reconcile.clone(), "doing").await,
+    );
+    revs.insert(
+        n_stale.clone(),
+        set_status(agent_ctx.clone(), n_stale.clone(), "doing").await,
+    );
+    let early_mv = store
+        .move_board_card(
+            agent_ctx.clone(),
+            next_mutation(
+                &scope,
+                &owner,
+                MoveBoardCard {
+                    view: view1.clone(),
+                    note: early_note.clone(),
+                    group: g2.clone(),
+                    before: None,
+                    after: None,
+                    fields: BTreeMap::from([(
+                        "status".to_owned(),
+                        Some(YamlValue::String("doing".to_owned())),
+                    )]),
+                    expected_note: revs[&early_note].clone(),
+                    expected_view: view1_c.value.revision.clone(),
+                    expected_rank: RankExpectation::Absent,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    revs.insert(early_note.clone(), early_mv.value.revision.revision);
+    let mid_ov1 = store
+        .inspect_view_overlays_for_test(&scope.space_id, &view1)
+        .await
+        .unwrap();
+    assert_eq!(mid_ov1[&t_reconcile].group, g2);
+    assert_eq!(mid_ov1[&n_stale].group, g2);
+
+    let tr_mv = store
+        .move_board_card(
+            agent_ctx.clone(),
+            next_mutation(
+                &scope,
+                &owner,
+                MoveBoardCard {
+                    view: view1.clone(),
+                    note: t_reconcile.clone(),
+                    group: g3.clone(),
+                    before: None,
+                    after: None,
+                    fields: BTreeMap::from([(
+                        "status".to_owned(),
+                        Some(YamlValue::String("done".to_owned())),
+                    )]),
+                    expected_note: revs[&t_reconcile].clone(),
+                    expected_view: view1_c.value.revision.clone(),
+                    expected_rank: RankExpectation::Existing(
+                        mid_ov1[&t_reconcile].rank_rev_id.clone(),
+                    ),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    revs.insert(t_reconcile.clone(), tr_mv.value.revision.revision);
+
+    // Step 4: On `view2`, run R edits `z_non_moved` into G2 and moves `m_skipped` into G2
+    // (materializing a stale G2 neighbor overlay for `z_non_moved` on `view2`).
+    revs.insert(
+        z_non_moved.clone(),
+        set_status(agent_ctx.clone(), z_non_moved.clone(), "doing").await,
+    );
+
+    let m_mv = store
+        .move_board_card(
+            agent_ctx.clone(),
+            next_mutation(
+                &scope,
+                &owner,
+                MoveBoardCard {
+                    view: view2.clone(),
+                    note: m_skipped.clone(),
+                    group: g2.clone(),
+                    before: None,
+                    after: None,
+                    fields: BTreeMap::from([(
+                        "status".to_owned(),
+                        Some(YamlValue::String("doing".to_owned())),
+                    )]),
+                    expected_note: revs[&m_skipped].clone(),
+                    expected_view: view2_c.value.revision.clone(),
+                    expected_rank: RankExpectation::Absent,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    revs.insert(m_skipped.clone(), m_mv.value.revision.revision);
+
+    let pre_rb_ov2 = store
+        .inspect_view_overlays_for_test(&scope.space_id, &view2)
+        .await
+        .unwrap();
+    assert_eq!(
+        pre_rb_ov2[&z_non_moved].group, g2,
+        "m_skipped move must have materialized a G2 neighbor overlay for z_non_moved on view2"
+    );
+
+    // Step 5: Human edits `m_skipped` manually so it is skipped on rollback,
+    // leaving `view2` with zero eligible moved targets in `run_board_moves`.
+    revs.insert(
+        m_skipped.clone(),
+        set_status(human_ctx.clone(), m_skipped.clone(), "review").await,
+    );
+    let _ = revs;
+
+    // Prepare & execute rollback of run R.
+    let prepared = store
+        .prepare_agent_run_rollback(human_ctx.clone(), run.clone())
+        .await
+        .expect("prepare rollback must succeed");
+    let rb = store
+        .rollback_agent_run(human_ctx, next_mutation(&scope, &owner, prepared))
+        .await
+        .expect("rollback with per-note prerun ranks and skipped-moved view must succeed");
+    assert!(
+        rb.value.skipped_manual_edits.contains(&m_skipped),
+        "m_skipped must be reported as skipped due to manual edit"
+    );
+
+    let post_ov1 = store
+        .inspect_view_overlays_for_test(&scope.space_id, &view1)
+        .await
+        .unwrap();
+    assert_eq!(post_ov1[&t_reconcile].group, g1);
+    assert_eq!(post_ov1[&t_reconcile].sort_rank_lexo, t_rec_pre_rank);
+    assert_eq!(post_ov1[&t_reconcile].placement_revision, t_rec_pre_pl);
+    assert_eq!(post_ov1[&n_stale].group, g1);
+    assert_eq!(post_ov1[&n_stale].sort_rank_lexo, n_stale_pre_rank);
+    assert_eq!(post_ov1[&n_stale].placement_revision, n_stale_pre_pl);
+
+    let post_ov2 = store
+        .inspect_view_overlays_for_test(&scope.space_id, &view2)
+        .await
+        .unwrap();
+    assert!(
+        !post_ov2.contains_key(&z_non_moved),
+        "stale G2 neighbor overlay on view2 must be removed even though view2's only moved target was skipped"
+    );
+    assert_eq!(post_ov2[&m_skipped].group, g2);
+}
+
+#[tokio::test]
+async fn l6_rollback_board_per_note_prerun_and_skipped_moved_view_dual_dialect_parity() {
+    {
+        let root = TempDataRoot::new("l6-pernote-sqlite");
+        let cfg = CanonicalConfig::local_default(sample_installation_id(21), root.data_root());
+        let (store, runtime) = CanonicalRuntime::open(cfg).await.expect("open sqlite");
+        run_board_per_note_prerun_and_skipped_moved_view_suite(&store).await;
+        runtime.shutdown().await.expect("shutdown sqlite");
+    }
+    {
+        let fixtures = StorageTestFixtures::load_required();
+        let schema = fixtures.fresh_pg_schema();
+        let bucket = fixtures.fresh_s3_bucket("l6per");
+        let s3_cfg = fixtures.s3_config(&bucket, S3BucketModePolicy::DetectFromBucket);
+        admin_ensure_bucket(&s3_cfg, Some("Enabled"))
+            .await
+            .expect("ensure S3 bucket");
+        let cfg = fixtures.pg_s3_config(sample_installation_id(22), &schema, s3_cfg);
+        let (store, runtime) = CanonicalRuntime::open(cfg).await.expect("open pg+s3");
+        run_board_per_note_prerun_and_skipped_moved_view_suite(&store).await;
+        runtime.shutdown().await.expect("shutdown pg+s3");
+        fixtures.drop_pg_schema(&schema).await;
+    }
+}
+
 #[tokio::test]
 async fn l6_rollback_board_prerun_pma_and_stale_non_moved_dual_dialect_parity() {
     {

@@ -104,7 +104,7 @@ pub struct DeleteSchedule {
     pub schedule: ScheduleId,
     pub expected: ControlRevision,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentSchedule {
     pub id: ScheduleId,
     pub owner: PrincipalId,

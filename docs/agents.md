@@ -110,12 +110,14 @@ embedding request carries only the query text.
 
 `AgentRunSupervisor` drives completion and tool calls for a canonical branch.
 A Personal run pins writes to its thread's Space (Personal or Shared). External
-content reads from other Spaces taint that branch and its descendants. A
-reversible note or memory action with a
-tainted branch or an out-of-Space target can produce a proposal when the
-interactive owner has permission on the target. The tool entry records the
-action and observed revision or expected absence. The supervisor emits an
-approval event without applying the action.
+content reads from other Spaces taint that branch and its descendants. In a
+Personal chat anchored in a Personal Space (`SpaceKind::Personal`), a
+reversible note or memory action with a tainted branch or an out-of-Space
+target can produce a proposal when the interactive owner has permission on the
+target; Personal threads anchored in a Shared Space reject tainted or
+out-of-Space writes directly rather than emitting proposals. The tool entry
+records the action and observed revision or expected absence. The supervisor
+emits an approval event without applying the action.
 
 The owner inspects and applies the proposal with current interactive authority
 through typed `ProposedDiffPreview` and `ConfirmedDiffOutcome` responses.

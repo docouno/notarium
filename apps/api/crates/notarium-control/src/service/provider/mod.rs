@@ -216,6 +216,88 @@ impl ProviderService {
     {
         self.mutate_authorized_inner(ctx, command, true, authorize, apply)
     }
+    async fn mutate_replay_authorized<'a, T, AR, AF, F>(
+        &'a self,
+        ctx: AccountContext,
+        command: Command,
+        authorize_replay: AR,
+        authorize_fresh: AF,
+        apply: F,
+    ) -> Result<ControlCommit<T>, PortError>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync + 'static,
+        AR: for<'tx> FnOnce(&'tx mut Transaction, &'tx UsersRow, &'tx T) -> PortFuture<'tx, ()>
+            + Send
+            + 'a,
+        AF: for<'tx> FnOnce(&'tx mut Transaction, &'tx UsersRow) -> PortFuture<'tx, ()> + Send + 'a,
+        F: for<'tx> FnOnce(
+                &'tx mut Transaction,
+                &'tx UsersRow,
+                i64,
+            ) -> PortFuture<'tx, (T, Vec<RevocationSelector>)>
+            + Send
+            + 'a,
+    {
+        if ctx.auth().taint().is_tainted() {
+            return Err(notarium_core::DomainError::CrossSpaceTainted.into());
+        }
+        command.require(ctx.auth().principal(), ctx.auth().principal())?;
+        let budget = OperationBudget::new(ctx.budget.clone());
+        let mut tx = self.control.store.write(budget.clone()).await?;
+        let (revision, saved) = budget
+            .run(
+                async {
+                    let (_, owner) = self
+                        .control
+                        .manager_impl(
+                            tx.inner_mut(),
+                            ctx.auth(),
+                            ctx.auth().principal(),
+                            ManagerScope::Full,
+                        )
+                        .await?;
+                    if let Some((revision, saved)) = command.replay::<T>(tx.inner_mut()).await? {
+                        authorize_replay(tx.inner_mut(), &owner, &saved.value).await?;
+                        return Ok((revision, saved));
+                    }
+                    authorize_fresh(tx.inner_mut(), &owner).await?;
+                    expect_revision(&owner, command.identity.expected)?;
+                    let now = self.control.clock.now_ms()?;
+                    let (value, selectors) = apply(tx.inner_mut(), &owner, now).await?;
+                    let revision = next(owner.revision)?;
+                    execute!(tx.inner_mut(), "UPDATE users SET revision=$1 WHERE user_id=$2", "UPDATE v1_control.users SET revision=$1 WHERE user_id=$2";revision,&owner.user_id)?;
+                    let mut events = Vec::new();
+                    for selector in selectors {
+                        events.push(
+                            super::outbox::enqueue(
+                                tx.inner_mut(),
+                                selector,
+                                RevocationReason::PermissionChanged,
+                                revision,
+                                now,
+                            )
+                            .await?,
+                        );
+                    }
+                    let revision = notarium_core::ids::ControlRevision::new(revision as u64)?;
+                    let saved = SavedResult { value, events };
+                    command.save(tx.inner_mut(), revision, &saved, now).await?;
+                    Ok((revision, saved))
+                },
+                CommitEffect::NotCommitted,
+            )
+            .await?;
+        self.control
+            .commit_revocations(tx, &budget, &saved.events)
+            .await?;
+        for event in &saved.events {
+            self.control.flush_event(&budget, event).await?;
+        }
+        Ok(ControlCommit {
+            revision,
+            value: saved.value,
+        })
+    }
     async fn mutate_authorized_inner<T, A, F>(
         &self,
         ctx: AccountContext,

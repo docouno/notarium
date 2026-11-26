@@ -9,7 +9,7 @@ use crate::{
     store::{
         Transaction,
         lease::OperationBudget,
-        statements::{execute, read_rows, rows},
+        statements::{execute, rows},
         target::*,
     },
 };
@@ -218,28 +218,6 @@ impl ProviderService {
         }
         Ok(space)
     }
-    pub(super) async fn observe_attachment(
-        &self,
-        ctx: &AccountContext,
-        id: &RequestId,
-    ) -> Result<ProviderAttachmentsRow, PortError> {
-        OperationBudget::new(ctx.budget.clone())
-            .run(
-                async {
-                    read_rows!(
-                        &self.control.store.backend,
-                        ProviderAttachmentsRow,
-                        fetch_optional,
-                        "SELECT * FROM provider_attachments WHERE id=$1",
-                        "SELECT * FROM v1_control.provider_attachments WHERE id=$1";
-                        id.as_str()
-                    )?
-                    .ok_or(DomainError::ResourceNotFound.into())
-                },
-                CommitEffect::NotCommitted,
-            )
-            .await
-    }
     fn observe_attachment_authorized<'a>(
         &'a self,
         ctx: &'a AccountContext,
@@ -436,9 +414,17 @@ impl ProviderService {
         self.management(&ctx).await?;
         let observed = self
             .observe_attachment_authorized(&ctx, &input.id, false)
-            .await?;
-        let target = attachment_target(&observed)?;
-        let catalog_precheck = self.target_catalog(&ctx, &target).await;
+            .await;
+        let prechecked = match observed {
+            Ok(row) => match attachment_target(&row) {
+                Ok(target) => {
+                    let catalog_precheck = self.target_catalog(&ctx, &target).await;
+                    Ok((row, target, catalog_precheck))
+                }
+                Err(error) => Err(error),
+            },
+            Err(error) => Err(error),
+        };
         let command = Command::new(
             request.identity,
             "approve-provider-attachment",
@@ -451,107 +437,228 @@ impl ProviderService {
             ),
         )?;
         let auth = ctx.auth().clone();
-        let auth_check = auth.clone();
-        let target_check = target.clone();
-        let activates_shared = !matches!(target_check, ProviderAttachmentTarget::Personal { .. })
-            && catalog_precheck
-                .as_ref()
-                .is_ok_and(|c| c.space.kind == SpaceKind::Shared);
+        let auth_replay = auth.clone();
+        let auth_fresh = auth.clone();
+        let fresh_check = prechecked
+            .as_ref()
+            .map(|(_, target, catalog)| {
+                let activates_shared = !matches!(target, ProviderAttachmentTarget::Personal { .. })
+                    && catalog
+                        .as_ref()
+                        .is_ok_and(|c| c.space.kind == SpaceKind::Shared);
+                (target.clone(), activates_shared)
+            })
+            .map_err(Clone::clone);
         let clock = self.control.clock.clone();
         ctx.budget = budget.context(ctx.budget.request.clone());
-        self.mutate_authorized(
+        self.mutate_replay_authorized(
             ctx,
             command,
+            move |tx, owner, saved: &ProviderAttachmentInfo| {
+                Box::pin(async move {
+                    let target = &saved.target;
+                    lock_space_read(tx, target_space(target)).await?;
+                    check_member_for_target(tx, &auth_replay, target).await?;
+                    match target {
+                        ProviderAttachmentTarget::Personal {
+                            owner: target_owner,
+                            ..
+                        } => owned(&owner.user_id, target_owner.as_str())?,
+                        _ => require_owner(tx, &auth_replay, target_space(target)).await?,
+                    }
+                    Ok(())
+                })
+            },
             move |tx, owner| {
                 Box::pin(async move {
+                    let (target_check, activates_shared) = fresh_check?;
                     let space_id = target_space(&target_check);
                     if activates_shared {
                         admission(tx, space_id, true).await?;
                     } else {
                         lock_space_read(tx, space_id).await?;
                     }
-                    check_member_for_target(tx, &auth_check, &target_check).await?;
+                    check_member_for_target(tx, &auth_fresh, &target_check).await?;
                     match &target_check {
                         ProviderAttachmentTarget::Personal {
                             owner: target_owner,
                             ..
                         } => owned(&owner.user_id, target_owner.as_str())?,
-                        _ => require_owner(tx, &auth_check, target_space(&target_check)).await?,
+                        _ => require_owner(tx, &auth_fresh, target_space(&target_check)).await?,
                     }
                     Ok(())
                 })
             },
-            move |tx,owner,now|Box::pin(async move {
-            let catalog = catalog_precheck?;
-            disclosure(input.consent.disclosure(), catalog.space.kind)?;
-            let previous=before_attachment(tx, &target, &catalog.space, true, clock.as_ref()).await?;
-            check_member_for_target(tx,&auth,&target).await?;
-            match &target {ProviderAttachmentTarget::Personal{owner:target_owner,..}=>owned(&owner.user_id,target_owner.as_str())?,_=>require_owner(tx,&auth,target_space(&target)).await?};
-            let resource=resource(tx,&observed.resource_id).await?;let credential_epoch=epochs(tx,&resource).await?;
-            let mut row=attachment(tx,input.id.as_str()).await?;revision(row.revision,input.expected)?;
-            if row.resource_id!=resource.id || attachment_target(&row)?!=target || row.expires_at.is_some_and(|time|time<=now) || row.state=="revoked" || row.resource_epoch!=resource.consent_epoch || row.credential_epoch!=credential_epoch || input.resource_consent_epoch!=resource.consent_epoch as u64 || input.credential_consent_epoch!=credential_epoch.map(|epoch|epoch as u64) || parse::<ProviderDisclosure>(&row.disclosure)?!=*input.consent.disclosure() {return Err(DomainError::AccessDenied.into());}
-            row.state="approved".into();row.revision=next(row.revision)?;
-            execute!(tx,"UPDATE provider_attachments SET state='approved',revision=$1 WHERE id=$2","UPDATE v1_control.provider_attachments SET state='approved',revision=$1 WHERE id=$2";row.revision,&row.id)?;
-            bump(tx,&resource).await?;
-            let mut selectors = vec![RevocationSelector::ProviderResource(ProviderResourceId::parse(&resource.id)?)];
-            if let Some(previous) = previous { selectors.extend(previous.changed(tx, clock.now_ms()?).await?); }
-            Ok((attachment_info(&row)?,selectors))
-        })).await
+            move |tx, owner, now| {
+                Box::pin(async move {
+                    let (observed, target, catalog_precheck) = prechecked?;
+                    let catalog = catalog_precheck?;
+                    disclosure(input.consent.disclosure(), catalog.space.kind)?;
+                    let previous =
+                        before_attachment(tx, &target, &catalog.space, true, clock.as_ref())
+                            .await?;
+                    check_member_for_target(tx, &auth, &target).await?;
+                    match &target {
+                        ProviderAttachmentTarget::Personal {
+                            owner: target_owner,
+                            ..
+                        } => owned(&owner.user_id, target_owner.as_str())?,
+                        _ => require_owner(tx, &auth, target_space(&target)).await?,
+                    };
+                    let resource = resource(tx, &observed.resource_id).await?;
+                    let credential_epoch = epochs(tx, &resource).await?;
+                    let mut row = attachment(tx, input.id.as_str()).await?;
+                    revision(row.revision, input.expected)?;
+                    if row.resource_id != resource.id
+                        || attachment_target(&row)? != target
+                        || row.expires_at.is_some_and(|time| time <= now)
+                        || row.state == "revoked"
+                        || row.resource_epoch != resource.consent_epoch
+                        || row.credential_epoch != credential_epoch
+                        || input.resource_consent_epoch != resource.consent_epoch as u64
+                        || input.credential_consent_epoch
+                            != credential_epoch.map(|epoch| epoch as u64)
+                        || parse::<ProviderDisclosure>(&row.disclosure)?
+                            != *input.consent.disclosure()
+                    {
+                        return Err(DomainError::AccessDenied.into());
+                    }
+                    row.state = "approved".into();
+                    row.revision = next(row.revision)?;
+                    execute!(tx,"UPDATE provider_attachments SET state='approved',revision=$1 WHERE id=$2","UPDATE v1_control.provider_attachments SET state='approved',revision=$1 WHERE id=$2";row.revision,&row.id)?;
+                    bump(tx, &resource).await?;
+                    let mut selectors = vec![RevocationSelector::ProviderResource(
+                        ProviderResourceId::parse(&resource.id)?,
+                    )];
+                    if let Some(previous) = previous {
+                        selectors.extend(previous.changed(tx, clock.now_ms()?).await?);
+                    }
+                    Ok((attachment_info(&row)?, selectors))
+                })
+            },
+        )
+        .await
     }
     pub async fn revoke_attachment(
         &self,
         mut ctx: AccountContext,
         request: AccountMutation<RevokeProviderAttachment>,
     ) -> Result<ControlCommit<()>, PortError> {
+        #[derive(serde::Serialize, serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct RevokedAttachmentReplay {
+            target: ProviderAttachmentTarget,
+            resource_owner: PrincipalId,
+        }
         let input = request.input;
         let budget = OperationBudget::new(ctx.budget.clone());
         self.management(&ctx).await?;
-        let observed = self
+        let prechecked = match self
             .observe_attachment_authorized(&ctx, &input.id, true)
-            .await?;
-        let target = attachment_target(&observed)?;
+            .await
+        {
+            Ok(row) => match attachment_target(&row) {
+                Ok(target) => Ok((row, target)),
+                Err(error) => Err(error),
+            },
+            Err(error) => Err(error),
+        };
         let command = Command::new(
             request.identity,
             "revoke-provider-attachment",
             (&input.id, input.expected),
         )?;
         let auth = ctx.auth().clone();
-        let auth_check = auth.clone();
-        let target_check = target.clone();
-        let resource_id_check = observed.resource_id.clone();
+        let auth_replay = auth.clone();
+        let auth_fresh = auth.clone();
+        let fresh_check = prechecked
+            .as_ref()
+            .map(|(row, target)| (row.resource_id.clone(), target.clone()))
+            .map_err(Clone::clone);
         ctx.budget = budget.context(ctx.budget.request.clone());
-        self.mutate_authorized(
-            ctx,
-            command,
-            move |tx, owner| {
-                Box::pin(async move {
-                    lock_space_read(tx, target_space(&target_check)).await?;
-                    let resource = resource(tx, &resource_id_check).await?;
-                    if resource.owner_id != owner.user_id {
-                        match &target_check {
-                            ProviderAttachmentTarget::Personal {
-                                owner: target_owner,
-                                ..
-                            } => owned(&owner.user_id, target_owner.as_str())?,
-                            _ => {
-                                check_member(tx, &auth_check, target_space(&target_check)).await?;
-                                require_owner(tx, &auth_check, target_space(&target_check)).await?;
+        let commit = self
+            .mutate_replay_authorized(
+                ctx,
+                command,
+                move |tx, owner, saved: &RevokedAttachmentReplay| {
+                    Box::pin(async move {
+                        if saved.resource_owner.as_str() != owner.user_id {
+                            lock_space_read(tx, target_space(&saved.target)).await?;
+                            match &saved.target {
+                                ProviderAttachmentTarget::Personal {
+                                    owner: target_owner,
+                                    ..
+                                } => owned(&owner.user_id, target_owner.as_str())?,
+                                _ => {
+                                    check_member(tx, &auth_replay, target_space(&saved.target))
+                                        .await?;
+                                    require_owner(tx, &auth_replay, target_space(&saved.target))
+                                        .await?;
+                                }
                             }
                         }
-                    }
-                    Ok(())
-                })
-            },
-            move |tx,owner,_|Box::pin(async move {
-            let resource=resource(tx,&observed.resource_id).await?;
-            if resource.owner_id!=owner.user_id {
-                match &target {ProviderAttachmentTarget::Personal{owner:target_owner,..}=>owned(&owner.user_id,target_owner.as_str())?,_=>require_owner(tx,&auth,target_space(&target)).await?};
-            }
-            let row=attachment(tx,input.id.as_str()).await?;revision(row.revision,input.expected)?;
-            if row.resource_id!=resource.id || attachment_target(&row)?!=target {return Err(DomainError::AccessDenied.into());}
-            execute!(tx,"UPDATE provider_attachments SET state='revoked',revision=$1 WHERE id=$2","UPDATE v1_control.provider_attachments SET state='revoked',revision=$1 WHERE id=$2";next(row.revision)?,&row.id)?;
-            bump(tx,&resource).await?;
-            Ok(((),vec![RevocationSelector::ProviderResource(ProviderResourceId::parse(&resource.id)?)]))
-        })).await
+                        Ok(())
+                    })
+                },
+                move |tx, owner| {
+                    Box::pin(async move {
+                        let (resource_id_check, target_check) = fresh_check?;
+                        lock_space_read(tx, target_space(&target_check)).await?;
+                        let resource = resource(tx, &resource_id_check).await?;
+                        if resource.owner_id != owner.user_id {
+                            match &target_check {
+                                ProviderAttachmentTarget::Personal {
+                                    owner: target_owner,
+                                    ..
+                                } => owned(&owner.user_id, target_owner.as_str())?,
+                                _ => {
+                                    check_member(tx, &auth_fresh, target_space(&target_check))
+                                        .await?;
+                                    require_owner(tx, &auth_fresh, target_space(&target_check))
+                                        .await?;
+                                }
+                            }
+                        }
+                        Ok(())
+                    })
+                },
+                move |tx, owner, _| {
+                    Box::pin(async move {
+                        let (observed, target) = prechecked?;
+                        let resource = resource(tx, &observed.resource_id).await?;
+                        if resource.owner_id != owner.user_id {
+                            match &target {
+                                ProviderAttachmentTarget::Personal {
+                                    owner: target_owner,
+                                    ..
+                                } => owned(&owner.user_id, target_owner.as_str())?,
+                                _ => require_owner(tx, &auth, target_space(&target)).await?,
+                            };
+                        }
+                        let row = attachment(tx, input.id.as_str()).await?;
+                        revision(row.revision, input.expected)?;
+                        if row.resource_id != resource.id || attachment_target(&row)? != target {
+                            return Err(DomainError::AccessDenied.into());
+                        }
+                        execute!(tx,"UPDATE provider_attachments SET state='revoked',revision=$1 WHERE id=$2","UPDATE v1_control.provider_attachments SET state='revoked',revision=$1 WHERE id=$2";next(row.revision)?,&row.id)?;
+                        bump(tx, &resource).await?;
+                        let replay = RevokedAttachmentReplay {
+                            target,
+                            resource_owner: PrincipalId::parse(&resource.owner_id)?,
+                        };
+                        Ok((
+                            replay,
+                            vec![RevocationSelector::ProviderResource(
+                                ProviderResourceId::parse(&resource.id)?,
+                            )],
+                        ))
+                    })
+                },
+            )
+            .await?;
+        Ok(ControlCommit {
+            revision: commit.revision,
+            value: (),
+        })
     }
 }

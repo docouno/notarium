@@ -202,9 +202,6 @@ pub(super) async fn retrieve(
                 .filter(|class| grant_readable.contains(class))
                 .collect();
             effective_classes.retain(|class| allowed.contains(class));
-            if effective_classes.is_empty() {
-                continue;
-            }
             if let Some(confined) = &selection.project_only {
                 if let Some(existing) = &effective_project
                     && existing != confined
@@ -212,6 +209,14 @@ pub(super) async fn retrieve(
                     continue;
                 }
                 effective_project = Some(confined.clone());
+            }
+            if foreign_space && targeted_project {
+                // Targeting a consented foreign project observes that Space even
+                // when class intersection leaves no searchable classes or zero hits.
+                call.auth.taint().mark_external_read();
+            }
+            if effective_classes.is_empty() {
+                continue;
             }
             scope = match scope.restrict_read_classes(&effective_classes) {
                 Ok(narrowed) => narrowed,

@@ -6,7 +6,7 @@ use notarium_core::{
     error::{PortError, ValidationReason},
     ids::{NoteId, RevisionId, ViewKey},
     patch::{CarrierEditOrigin, CarrierPatchPlan},
-    ports::{EditNote, Mutation, ViewRef},
+    ports::{EditNote, Mutation, SpaceContext, ViewRef},
     query::FieldSchema,
     span::ByteSpan,
     value::{ExactNumber, YamlValue},
@@ -348,6 +348,77 @@ fn nota_fences(source: &str) -> Result<Vec<&str>, PortError> {
         .collect()
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct JournaledViewSchema {
+    revision: Option<RevisionId>,
+}
+
+/// Plan a view edit while journaling only the Space schema revision ID in
+/// content-free `control.mcp_dedup` so retries survive schema drift, project
+/// trash, and large view payloads without storing user-authored content in
+/// control storage.
+pub(super) async fn plan_view_edit_with_schema_journal(
+    call: &ToolCallContext<'_>,
+    scope: &SpaceContext,
+    journal_label: &str,
+    input: &EditInput,
+    original: &str,
+    class: DocClass,
+    route: &NoteRoute,
+) -> Result<CarrierPatchPlan, PortError> {
+    if let Some(saved) = call
+        .lookup_journal_with_key::<JournaledViewSchema>(
+            journal_label,
+            &call.request_key,
+            call.request_hash,
+        )
+        .await?
+    {
+        let fields = match saved.revision {
+            Some(rev) => {
+                call.registry
+                    .engine
+                    .space_schema_snapshot(scope.clone(), Some(rev))
+                    .await?
+                    .fields
+            }
+            None => BTreeMap::new(),
+        };
+        return input.plan(original, class, route, &fields);
+    }
+    let snapshot = call
+        .registry
+        .engine
+        .space_schema_snapshot(scope.clone(), None)
+        .await?;
+    let plan = input.plan(original, class, route, &snapshot.fields)?;
+    let recorded = call
+        .record_journal_with_key(
+            journal_label,
+            &call.request_key,
+            call.request_hash,
+            &JournaledViewSchema {
+                revision: snapshot.revision.clone(),
+            },
+        )
+        .await?;
+    if recorded.revision != snapshot.revision {
+        let fields = match recorded.revision {
+            Some(rev) => {
+                call.registry
+                    .engine
+                    .space_schema_snapshot(scope.clone(), Some(rev))
+                    .await?
+                    .fields
+            }
+            None => BTreeMap::new(),
+        };
+        return input.plan(original, class, route, &fields);
+    }
+    Ok(plan)
+}
+
 pub(super) async fn edit_note(
     call: &mut ToolCallContext<'_>,
     arguments: Value,
@@ -363,22 +434,16 @@ pub(super) async fn edit_note(
         corpus::note_document(call, &scope, &observed.document).await?
     };
     let plan = if input.edits_view() {
-        let call_ref: &ToolCallContext<'_> = call;
-        let scope_ref = &scope;
-        let route_ref = &route;
-        let input_ref = &input;
-        let source_ref = source.as_str();
-        let class = observed.document.class();
-        call_ref
-            .journal("edit-note-view-plan", || async {
-                let schema = call_ref
-                    .registry
-                    .engine
-                    .space_schema(scope_ref.clone())
-                    .await?;
-                input_ref.plan(source_ref, class, route_ref, &schema)
-            })
-            .await?
+        plan_view_edit_with_schema_journal(
+            call,
+            &scope,
+            "edit-note-view-schema",
+            &input,
+            &source,
+            observed.document.class(),
+            &route,
+        )
+        .await?
     } else {
         input.plan(&source, observed.document.class(), &route, &BTreeMap::new())?
     };

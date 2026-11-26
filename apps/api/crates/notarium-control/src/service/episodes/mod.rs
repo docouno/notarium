@@ -157,7 +157,13 @@ impl ControlService {
         let followed_role = if let Some(value) = &row.active_role {
             let reference: AbilityRef =
                 serde_json::from_str(value).map_err(|_| invalid(ValidationReason::InvalidState))?;
-            Some(self.follow_ability_db(tx, ctx, reference).await)
+            Some(
+                match self.follow_ability_chain_db(tx, ctx, reference).await {
+                    Ok(chain) if !chain.revision_mismatched => Ok(chain.terminal),
+                    Ok(_) => Err(DomainError::ResourceNotFound.into()),
+                    Err(error) => Err(error),
+                },
+            )
         } else {
             None
         };

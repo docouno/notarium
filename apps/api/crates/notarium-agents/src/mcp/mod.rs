@@ -409,6 +409,7 @@ impl ToolRegistry {
             cancellation,
             provenance: ChatProvenance::default(),
             policies: corpus::CandidatePolicies::default(),
+            confirmed_proposal: false,
         };
         self.telemetry
             .begin_agent_call(
@@ -601,9 +602,18 @@ struct ToolCallContext<'a> {
     cancellation: Cancellation,
     provenance: ChatProvenance,
     policies: corpus::CandidatePolicies,
+    confirmed_proposal: bool,
 }
 
 impl<'a> ToolCallContext<'a> {
+    fn journal_actor(&self) -> &str {
+        if self.confirmed_proposal {
+            self.auth.principal().as_str()
+        } else {
+            command_actor(&self.auth)
+        }
+    }
+
     /// Mark external-read taint on both the staged tool auth and the caller's
     /// live `BranchTaint` before crossing an irreversible probe boundary.
     pub(super) fn commit_external_read(&self) {
@@ -627,6 +637,7 @@ impl<'a> ToolCallContext<'a> {
             cancellation: self.cancellation.clone(),
             provenance: ChatProvenance::default(),
             policies: corpus::CandidatePolicies::default(),
+            confirmed_proposal: false,
         }
     }
 
@@ -652,6 +663,7 @@ impl<'a> ToolCallContext<'a> {
             cancellation: budget.cancellation,
             provenance: ChatProvenance::default(),
             policies: corpus::CandidatePolicies::default(),
+            confirmed_proposal: true,
         })
     }
 
@@ -727,7 +739,7 @@ impl<'a> ToolCallContext<'a> {
         request_hash: ContentDigest,
     ) -> Result<Option<T>, PortError> {
         let key = McpDedupKey {
-            actor: command_actor(&self.auth).to_owned(),
+            actor: self.journal_actor().to_owned(),
             request_key: subcommand_key(request_key, label, 0),
             request_hash,
             operation: self.tool.name().to_owned(),
@@ -753,7 +765,7 @@ impl<'a> ToolCallContext<'a> {
         plan: &T,
     ) -> Result<T, PortError> {
         let key = McpDedupKey {
-            actor: command_actor(&self.auth).to_owned(),
+            actor: self.journal_actor().to_owned(),
             request_key: subcommand_key(request_key, label, 0),
             request_hash,
             operation: self.tool.name().to_owned(),

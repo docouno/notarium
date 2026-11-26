@@ -18,7 +18,7 @@ impl ControlService {
         ctx: AccountContext,
         command: Command,
         change: Change,
-    ) -> PortFuture<'a, ControlCommit<ScheduleId>> {
+    ) -> PortFuture<'a, ControlCommit<Option<AgentSchedule>>> {
         Box::pin(async move {
             ctx.auth().authorize_human_management()?;
             command.require(ctx.auth().principal(), ctx.auth().principal())?;
@@ -132,10 +132,10 @@ impl ControlService {
                     Some(row)
                 }
             };
-            if let Some(replay) = command.replay::<ScheduleId>(tx.inner_mut()).await? {return Ok(replay);}
+            if let Some(replay) = command.replay::<Option<AgentSchedule>>(tx.inner_mut()).await? {return Ok(replay);}
             expect_revision(&owner,command.identity.expected)?;
             let now = self.clock.now_ms()?;
-            let (id, revoke) = match change {
+            let (id, committed_schedule, revoke) = match change {
                 Change::Create(input) => {
                     validate(&input.definition,Some(input.next_slot),self.config.schedule_limits,false)?;
                     let scope = ScheduleScope::from(&input.definition);
@@ -157,6 +157,7 @@ impl ControlService {
                         paused_reason:input.paused.then(||"manual".into()),write_class_mask:1,budgets:json(&input.definition.limits)?,misfire_policy:"coalesce_latest".into(),
                         next_slot_utc_ms:Some(ms(input.next_slot)?),deleted_at:None,revision:0,config_revision:0,created_at:now,updated_at:now,
                     };
+                    let info = schedule_info(&row)?;
                     let record = TargetRecord::from(row);
                     record.validate()?;
                     record
@@ -173,7 +174,7 @@ impl ControlService {
                                 err
                             }
                         })?;
-                    (input.id,false)
+                    (input.id, Some(info), false)
                 }
                 Change::Update(input) => {
                     let row = locked_row.expect("update pre-locked schedule");
@@ -217,19 +218,45 @@ impl ControlService {
                     let approved = json(&input.definition.approved_role)?;
                     let skills = json(input.approved_skills.as_ref().unwrap_or(&previous.approved_skills))?;
                     let limits = json(&input.definition.limits)?;
+                    let next_slot_ms = input.next_slot.map(ms).transpose()?;
                     let reason:Option<&str> = input.paused.then_some("manual");
+                    let next_rev = next(row.revision)?;
+                    let next_config_rev = next(row.config_revision)?;
+                    let updated_row = AgentSchedulesRow {
+                        schedule_id: row.schedule_id.clone(),
+                        owner_id: row.owner_id.clone(),
+                        space_id: row.space_id.clone(),
+                        project_folder_id: project.clone(),
+                        title: input.definition.title.clone(),
+                        init_prompt: input.definition.init_prompt.clone(),
+                        cron_expr: input.definition.cron.clone(),
+                        timezone: input.definition.timezone.clone(),
+                        approved_role: approved.clone(),
+                        approved_skills: skills.clone(),
+                        paused_reason: reason.map(str::to_owned),
+                        write_class_mask: row.write_class_mask,
+                        budgets: limits.clone(),
+                        misfire_policy: row.misfire_policy.clone(),
+                        next_slot_utc_ms: next_slot_ms,
+                        deleted_at: None,
+                        revision: next_rev,
+                        config_revision: next_config_rev,
+                        created_at: row.created_at,
+                        updated_at: now,
+                    };
+                    let info = schedule_info(&updated_row)?;
                     execute!(tx.inner_mut(),
                         "UPDATE agent_schedules SET project_folder_id=$1,title=$2,init_prompt=$3,cron_expr=$4,timezone=$5,approved_role=$6,approved_skills=$7,budgets=$8,next_slot_utc_ms=$9,paused_reason=$10,revision=$11,config_revision=$12,updated_at=$13 WHERE schedule_id=$14",
                         "UPDATE v1_control.agent_schedules SET project_folder_id=$1,title=$2,init_prompt=$3,cron_expr=$4,timezone=$5,approved_role=$6,approved_skills=$7,budgets=$8,next_slot_utc_ms=$9,paused_reason=$10,revision=$11,config_revision=$12,updated_at=$13 WHERE schedule_id=$14";
-                        project,&input.definition.title,&input.definition.init_prompt,&input.definition.cron,&input.definition.timezone,approved,skills,limits,input.next_slot.map(ms).transpose()?,reason,next(row.revision)?,next(row.config_revision)?,now,input.schedule.as_str())?;
-                    (input.schedule,true)
+                        project,&input.definition.title,&input.definition.init_prompt,&input.definition.cron,&input.definition.timezone,approved,skills,limits,next_slot_ms,reason,next_rev,next_config_rev,now,input.schedule.as_str())?;
+                    (input.schedule, Some(info), true)
                 }
                 Change::Delete(input) => {
                     let row = locked_row.expect("delete pre-locked schedule");
                     if row.owner_id!=owner.user_id || row.deleted_at.is_some() {return Err(DomainError::ResourceNotFound.into());}
                     expect(&row,input.expected)?;
                     execute!(tx.inner_mut(),"UPDATE agent_schedules SET init_prompt='',deleted_at=$1,revision=$2,config_revision=$3,updated_at=$1 WHERE schedule_id=$4","UPDATE v1_control.agent_schedules SET init_prompt='',deleted_at=$1,revision=$2,config_revision=$3,updated_at=$1 WHERE schedule_id=$4";now,next(row.revision)?,next(row.config_revision)?,input.schedule.as_str())?;
-                    (input.schedule,true)
+                    (input.schedule, None, true)
                 }
             };
             let revision = next(owner.revision)?;
@@ -237,7 +264,7 @@ impl ControlService {
             let mut events = Vec::new();
             if revoke {events.push(super::super::outbox::enqueue(tx.inner_mut(),RevocationSelector::Schedule(id.clone()),RevocationReason::PermissionChanged,revision,now).await?);}
             let revision = ControlRevision::new(revision as u64)?;
-            let saved = SavedResult {value:id,events};
+            let saved = SavedResult {value:committed_schedule,events};
             command.save(tx.inner_mut(),revision,&saved,now).await?;
             Ok((revision,saved))
         },CommitEffect::NotCommitted).await?;
@@ -258,14 +285,13 @@ impl ControlService {
     ) -> Result<ControlCommit<AgentSchedule>, PortError> {
         let command = Command::new(request.identity, "create-schedule", &request.input)?;
         let commit = self
-            .mutate_schedule(ctx.clone(), command, Change::Create(request.input))
+            .mutate_schedule(ctx, command, Change::Create(request.input))
             .await?;
         Ok(ControlCommit {
             revision: commit.revision,
-            value: self
-                .account_schedule(ctx, commit.value)
-                .await
-                .map_err(post_commit_schedule_read_error)?,
+            value: commit
+                .value
+                .ok_or_else(|| invalid(ValidationReason::InvalidState))?,
         })
     }
     pub async fn update_schedule(
@@ -275,14 +301,13 @@ impl ControlService {
     ) -> Result<ControlCommit<AgentSchedule>, PortError> {
         let command = Command::new(request.identity, "update-schedule", &request.input)?;
         let commit = self
-            .mutate_schedule(ctx.clone(), command, Change::Update(request.input))
+            .mutate_schedule(ctx, command, Change::Update(request.input))
             .await?;
         Ok(ControlCommit {
             revision: commit.revision,
-            value: self
-                .account_schedule(ctx, commit.value)
-                .await
-                .map_err(post_commit_schedule_read_error)?,
+            value: commit
+                .value
+                .ok_or_else(|| invalid(ValidationReason::InvalidState))?,
         })
     }
     pub async fn delete_schedule(
@@ -298,51 +323,5 @@ impl ControlService {
             revision: commit.revision,
             value: (),
         })
-    }
-}
-
-fn post_commit_schedule_read_error(error: PortError) -> PortError {
-    let diagnostic = ContentDigest::from_bytes(
-        *blake3::hash(format!("schedule-post-commit-read:{}", error.code()).as_bytes()).as_bytes(),
-    );
-    let make = || {
-        notarium_core::error::OperationalFailure::new(
-            diagnostic,
-            CommitEffect::Unknown,
-            notarium_core::error::RetryAdvice::RetrySameCommand,
-            true,
-        )
-        .expect("same-command retry has durable identity")
-    };
-    match error {
-        PortError::Cancelled(f)
-            if f.effect() == CommitEffect::Unknown
-                && f.retry() == notarium_core::error::RetryAdvice::RetrySameCommand =>
-        {
-            PortError::Cancelled(f)
-        }
-        PortError::DeadlineExceeded(f)
-            if f.effect() == CommitEffect::Unknown
-                && f.retry() == notarium_core::error::RetryAdvice::RetrySameCommand =>
-        {
-            PortError::DeadlineExceeded(f)
-        }
-        PortError::Unavailable(f)
-            if f.effect() == CommitEffect::Unknown
-                && f.retry() == notarium_core::error::RetryAdvice::RetrySameCommand =>
-        {
-            PortError::Unavailable(f)
-        }
-        PortError::Internal(f)
-            if f.effect() == CommitEffect::Unknown
-                && f.retry() == notarium_core::error::RetryAdvice::RetrySameCommand =>
-        {
-            PortError::Internal(f)
-        }
-        PortError::Cancelled(_) => PortError::Cancelled(make()),
-        PortError::DeadlineExceeded(_) => PortError::DeadlineExceeded(make()),
-        PortError::Unavailable(_) => PortError::Unavailable(make()),
-        PortError::Internal(_) => PortError::Internal(make()),
-        PortError::Domain(_) => PortError::Unavailable(make()),
     }
 }

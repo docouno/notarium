@@ -6411,6 +6411,7 @@ impl SqliteSyncItemPlan for RollbackDirectSqliteFastPlan {
                     needs_note_mutation,
                     head_unchanged_placement,
                     current_cover_parent: None,
+                    first_run_seq: SpaceSeq::ZERO,
                 },
             );
         }

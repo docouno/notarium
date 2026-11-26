@@ -490,21 +490,126 @@ impl BatchedAbilityControl {
     }
 }
 
+pub(super) struct FollowedChain {
+    pub(super) terminal: AbilityRef,
+    pub(super) visited: Vec<AbilityIdentity>,
+    pub(super) revision_mismatched: bool,
+}
+
+fn authorize_ability_placement_auth(
+    auth: &notarium_core::auth::EngineAuthContext,
+    placement: &AbilityPlacement,
+    ability_id: &AbilityId,
+    personal_space: Option<&SpaceId>,
+) -> Result<(), PortError> {
+    let is_pinned = auth.readonly_abilities().contains(ability_id);
+    let is_keeper = matches!(auth.kind(), notarium_core::auth::PrincipalKind::Keeper(_));
+    match placement {
+        AbilityPlacement::System => {
+            if is_keeper && !is_pinned {
+                return Err(DomainError::ResourceNotFound.into());
+            }
+            Ok(())
+        }
+        AbilityPlacement::OwnedPersonal(owner) => {
+            if owner != auth.principal() {
+                return Err(DomainError::ResourceNotFound.into());
+            }
+            let space_id = personal_space.ok_or(DomainError::ResourceNotFound)?;
+            let grant = auth
+                .spaces()
+                .get(space_id)
+                .ok_or(DomainError::ResourceNotFound)?;
+            if !grant.read_classes.contains(&DocClass::Skill)
+                || (is_keeper && !is_pinned)
+                || (grant.project_root.is_some() && !is_pinned)
+            {
+                return Err(DomainError::ResourceNotFound.into());
+            }
+            Ok(())
+        }
+        AbilityPlacement::OwnedSpace(space) => {
+            let grant = auth
+                .spaces()
+                .get(space)
+                .ok_or(DomainError::ResourceNotFound)?;
+            if !grant.read_classes.contains(&DocClass::Skill)
+                || (is_keeper && !is_pinned)
+                || (grant.project_root.is_some() && !is_pinned)
+            {
+                return Err(DomainError::ResourceNotFound.into());
+            }
+            Ok(())
+        }
+        AbilityPlacement::OwnedProject(project) => {
+            let grant = auth
+                .spaces()
+                .get(&project.space_id)
+                .ok_or(DomainError::ResourceNotFound)?;
+            if !grant.read_classes.contains(&DocClass::Skill)
+                || (is_keeper && !is_pinned)
+                || (grant
+                    .project_root
+                    .as_ref()
+                    .is_some_and(|root| root != &project.folder_id)
+                    && !is_pinned)
+            {
+                return Err(DomainError::ResourceNotFound.into());
+            }
+            Ok(())
+        }
+    }
+}
+
 impl ControlService {
+    async fn personal_space_id_for_owner(
+        &self,
+        owner: &PrincipalId,
+    ) -> Result<Option<SpaceId>, PortError> {
+        let row: Option<(Option<String>,)> = crate::store::statements::read_rows!(
+            &self.store.backend,
+            (Option<String>,),
+            fetch_optional,
+            "SELECT personal_space_id FROM users WHERE user_id=$1",
+            "SELECT personal_space_id FROM v1_control.users WHERE user_id=$1";
+            owner.as_str()
+        )?;
+        row.and_then(|(space,)| space)
+            .map(|space| SpaceId::parse(&space).map_err(PortError::from))
+            .transpose()
+    }
     pub(super) async fn ability_placement(
         &self,
         ctx: &AccountContext,
-        value: &AbilityPlacement,
+        identity: &AbilityIdentity,
     ) -> Result<(), PortError> {
-        match value {
-            AbilityPlacement::OwnedPersonal(owner) if owner != ctx.auth().principal() => {
-                Err(DomainError::ResourceNotFound.into())
+        let personal_space = match &identity.placement {
+            AbilityPlacement::OwnedPersonal(owner) => {
+                if owner != ctx.auth().principal() {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+                self.personal_space_id_for_owner(owner).await?
+            }
+            _ => None,
+        };
+        authorize_ability_placement_auth(
+            ctx.auth(),
+            &identity.placement,
+            &identity.id,
+            personal_space.as_ref(),
+        )?;
+        match &identity.placement {
+            AbilityPlacement::OwnedPersonal(_) => {
+                let space = personal_space
+                    .as_ref()
+                    .ok_or(DomainError::ResourceNotFound)?;
+                self.catalog_space(ctx, space).await.map(|_| ())
             }
             AbilityPlacement::OwnedSpace(space) => self.catalog_space(ctx, space).await.map(|_| ()),
             AbilityPlacement::OwnedProject(project) => {
                 self.catalog_project(ctx, project).await.map(|_| ())
             }
-            _ => Ok(()),
+            AbilityPlacement::System => Ok(()),
         }
     }
     async fn prefetch_projects(
@@ -541,13 +646,45 @@ impl ControlService {
     async fn ability_placement_cached(
         &self,
         ctx: &AccountContext,
-        value: &AbilityPlacement,
+        identity: &AbilityIdentity,
         checked_spaces: &mut BTreeMap<SpaceId, bool>,
         checked_projects: &mut BTreeMap<(SpaceId, FolderId), bool>,
     ) -> Result<(), PortError> {
-        match value {
-            AbilityPlacement::OwnedPersonal(owner) if owner != ctx.auth().principal() => {
-                Err(DomainError::ResourceNotFound.into())
+        let personal_space = match &identity.placement {
+            AbilityPlacement::OwnedPersonal(owner) => {
+                if owner != ctx.auth().principal() {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+                self.personal_space_id_for_owner(owner).await?
+            }
+            _ => None,
+        };
+        authorize_ability_placement_auth(
+            ctx.auth(),
+            &identity.placement,
+            &identity.id,
+            personal_space.as_ref(),
+        )?;
+        match &identity.placement {
+            AbilityPlacement::OwnedPersonal(_) => {
+                let space = personal_space
+                    .as_ref()
+                    .ok_or(DomainError::ResourceNotFound)?;
+                match checked_spaces.get(space) {
+                    Some(true) => Ok(()),
+                    Some(false) => Err(DomainError::ResourceNotFound.into()),
+                    None => match self.catalog_space(ctx, space).await {
+                        Ok(_) => {
+                            checked_spaces.insert(space.clone(), true);
+                            Ok(())
+                        }
+                        Err(error) if hidden(&error) => {
+                            checked_spaces.insert(space.clone(), false);
+                            Err(error)
+                        }
+                        Err(error) => Err(error),
+                    },
+                }
             }
             AbilityPlacement::OwnedSpace(space) => match checked_spaces.get(space) {
                 Some(true) => Ok(()),
@@ -582,7 +719,7 @@ impl ControlService {
                     },
                 }
             }
-            _ => Ok(()),
+            AbilityPlacement::System => Ok(()),
         }
     }
     pub(super) async fn raw_ability(
@@ -602,7 +739,7 @@ impl ControlService {
         checked_spaces: &mut BTreeMap<SpaceId, bool>,
         checked_projects: &mut BTreeMap<(SpaceId, FolderId), bool>,
     ) -> Result<AbilityDescriptor, PortError> {
-        self.ability_placement_cached(ctx, &identity.placement, checked_spaces, checked_projects)
+        self.ability_placement_cached(ctx, &identity, checked_spaces, checked_projects)
             .await?;
         let tip = self
             .catalog
@@ -801,7 +938,7 @@ impl ControlService {
         if !role_placement_matches_project(&final_ref.placement, project) {
             return Ok(None);
         }
-        match self.ability_placement(ctx, &final_ref.placement).await {
+        match self.ability_placement(ctx, &final_ref.identity()).await {
             Ok(()) => (),
             Err(error) if hidden(&error) => return Ok(None),
             Err(error) => return Err(error),
@@ -846,46 +983,71 @@ impl ControlService {
     ) -> Result<AbilityRef, PortError> {
         self.follow_ability_chain_db(tx, ctx, reference)
             .await
-            .map(|(final_ref, _)| final_ref)
+            .map(|chain| chain.terminal)
     }
     pub(super) async fn follow_ability_chain_db(
         &self,
         tx: &mut Transaction,
         ctx: &AccountContext,
         mut reference: AbilityRef,
-    ) -> Result<(AbilityRef, Vec<AbilityPlacement>), PortError> {
+    ) -> Result<FollowedChain, PortError> {
         let mut visited = Vec::with_capacity(17);
-        let mut placements = Vec::with_capacity(17);
+        let mut identities = Vec::with_capacity(17);
+        let mut personal_space: Option<Option<SpaceId>> = None;
+        let mut revision_mismatched = false;
         for hop in 0..=16 {
-            match &reference.placement {
-                AbilityPlacement::OwnedPersonal(owner) if owner != ctx.auth().principal() => {
+            if let AbilityPlacement::OwnedPersonal(owner) = &reference.placement {
+                if owner != ctx.auth().principal() {
                     return Err(DomainError::ResourceNotFound.into());
                 }
-                AbilityPlacement::OwnedSpace(space) if !ctx.auth().spaces().contains_key(space) => {
-                    return Err(DomainError::ResourceNotFound.into());
+                if personal_space.is_none() {
+                    let row: Option<(Option<String>,)> = rows!(
+                        tx,
+                        (Option<String>,),
+                        fetch_optional,
+                        "SELECT personal_space_id FROM users WHERE user_id=$1",
+                        "SELECT personal_space_id FROM v1_control.users WHERE user_id=$1";
+                        owner.as_str()
+                    )?;
+                    personal_space = Some(
+                        row.and_then(|(space,)| space)
+                            .map(|space| SpaceId::parse(&space).map_err(PortError::from))
+                            .transpose()?,
+                    );
                 }
-                AbilityPlacement::OwnedProject(project)
-                    if !ctx.auth().spaces().contains_key(&project.space_id) =>
-                {
-                    return Err(DomainError::ResourceNotFound.into());
-                }
-                _ => (),
             }
+            authorize_ability_placement_auth(
+                ctx.auth(),
+                &reference.placement,
+                &reference.id,
+                personal_space.as_ref().and_then(|space| space.as_ref()),
+            )?;
             let key = placement(&reference.placement)?;
             let identity = (key.clone(), reference.id.clone());
             if visited.contains(&identity) {
                 return Err(invalid(ValidationReason::InvalidState));
             }
             visited.push(identity);
-            placements.push(reference.placement.clone());
+            identities.push(reference.identity());
             let row = rows!(tx,AbilityPlacementTrailRow,fetch_optional,"SELECT * FROM ability_placement_trail WHERE source_placement=$1 AND ability_id=$2","SELECT * FROM v1_control.ability_placement_trail WHERE source_placement=$1 AND ability_id=$2";&key,reference.id.as_str())?;
             let Some(row) = row else {
-                return Ok((reference, placements));
+                return Ok(FollowedChain {
+                    terminal: reference,
+                    visited: identities,
+                    revision_mismatched,
+                });
             };
             let trail: Trail = serde_json::from_str(&row.manifest_ref)
                 .map_err(|_| invalid(ValidationReason::InvalidState))?;
-            if trail.source != reference {
-                return Ok((reference, placements));
+            if trail.source.identity() != reference.identity() {
+                return Ok(FollowedChain {
+                    terminal: reference,
+                    visited: identities,
+                    revision_mismatched,
+                });
+            }
+            if trail.source.revision != reference.revision {
+                revision_mismatched = true;
             }
             if hop == 16 {
                 return Err(invalid(ValidationReason::InvalidState));
@@ -921,70 +1083,72 @@ impl ControlService {
                     )
                     .await;
                 budget.run(rtx.finish(), CommitEffect::NotCommitted).await?;
-                let (value, followed_reference, effective_project) = match budget
-                    .run(
-                        async {
-                            if let Some(project) = &project {
-                                match self.catalog_project(&current, project).await {
-                                    Ok(_) => (),
+                let (value, followed_reference, effective_project, revision_mismatched) =
+                    match budget
+                        .run(
+                            async {
+                                if let Some(project) = &project {
+                                    match self.catalog_project(&current, project).await {
+                                        Ok(_) => (),
+                                        Err(error) if hidden(&error) => {
+                                            return Ok(Err(AbilityResolution::OutOfScope));
+                                        }
+                                        Err(error) => return Err(error),
+                                    }
+                                }
+                                let chain = match followed {
+                                    Ok(chain) => chain,
                                     Err(error) if hidden(&error) => {
                                         return Ok(Err(AbilityResolution::OutOfScope));
                                     }
                                     Err(error) => return Err(error),
+                                };
+                                for item in &chain.visited {
+                                    match self.ability_placement(&current, item).await {
+                                        Ok(()) => (),
+                                        Err(error) if hidden(&error) => {
+                                            return Ok(Err(AbilityResolution::OutOfScope));
+                                        }
+                                        Err(error) => return Err(error),
+                                    }
                                 }
-                            }
-                            let (reference, visited) = match followed {
-                                Ok(pair) => pair,
-                                Err(error) if hidden(&error) => {
-                                    return Ok(Err(AbilityResolution::OutOfScope));
-                                }
-                                Err(error) => return Err(error),
-                            };
-                            for item in &visited {
-                                match self.ability_placement(&current, item).await {
-                                    Ok(()) => (),
-                                    Err(error) if hidden(&error) => {
+                                let reference = chain.terminal;
+                                match (&reference.placement, project.as_ref()) {
+                                    (AbilityPlacement::OwnedProject(placement), Some(active))
+                                        if placement != active =>
+                                    {
                                         return Ok(Err(AbilityResolution::OutOfScope));
                                     }
-                                    Err(error) => return Err(error),
+                                    (AbilityPlacement::OwnedSpace(space), Some(active))
+                                        if *space != active.space_id =>
+                                    {
+                                        return Ok(Err(AbilityResolution::OutOfScope));
+                                    }
+                                    _ => (),
                                 }
-                            }
-                            match (&reference.placement, project.as_ref()) {
-                                (AbilityPlacement::OwnedProject(placement), Some(active))
-                                    if placement != active =>
-                                {
-                                    return Ok(Err(AbilityResolution::OutOfScope));
-                                }
-                                (AbilityPlacement::OwnedSpace(space), Some(active))
-                                    if *space != active.space_id =>
-                                {
-                                    return Ok(Err(AbilityResolution::OutOfScope));
-                                }
-                                _ => (),
-                            }
-                            let value = match self.raw_ability(&current, reference.identity()).await
-                            {
-                                Ok(value) => value,
-                                Err(error) if hidden(&error) => {
-                                    return Ok(Err(AbilityResolution::Missing));
-                                }
-                                Err(error) => return Err(error),
-                            };
-                            let effective = match &reference.placement {
-                                AbilityPlacement::OwnedProject(placement) => {
-                                    Some(placement.clone())
-                                }
-                                _ => project,
-                            };
-                            Ok(Ok((value, reference, effective)))
-                        },
-                        CommitEffect::NotCommitted,
-                    )
-                    .await?
-                {
-                    Ok(triple) => triple,
-                    Err(early) => return Ok(early),
-                };
+                                let value =
+                                    match self.raw_ability(&current, reference.identity()).await {
+                                        Ok(value) => value,
+                                        Err(error) if hidden(&error) => {
+                                            return Ok(Err(AbilityResolution::Missing));
+                                        }
+                                        Err(error) => return Err(error),
+                                    };
+                                let effective = match &reference.placement {
+                                    AbilityPlacement::OwnedProject(placement) => {
+                                        Some(placement.clone())
+                                    }
+                                    _ => project,
+                                };
+                                Ok(Ok((value, reference, effective, chain.revision_mismatched)))
+                            },
+                            CommitEffect::NotCommitted,
+                        )
+                        .await?
+                    {
+                        Ok(quad) => quad,
+                        Err(early) => return Ok(early),
+                    };
                 let mut rtx = self.store.read(budget.clone()).await?;
                 let resolved = budget
                     .run(
@@ -999,7 +1163,7 @@ impl ControlService {
                             {
                                 return Ok(AbilityResolution::Missing);
                             }
-                            if value.reference != followed_reference {
+                            if revision_mismatched || value.reference != followed_reference {
                                 return Ok(AbilityResolution::Stale);
                             }
                             let overlaid = self
@@ -1159,8 +1323,8 @@ impl ControlService {
             )
             .await;
         budget.run(rtx.finish(), CommitEffect::NotCommitted).await?;
-        let (terminal, visited) = followed?;
-        for item in &visited {
+        let chain = followed?;
+        for item in &chain.visited {
             budget
                 .run(
                     self.ability_placement(&current, item),
@@ -1168,7 +1332,7 @@ impl ControlService {
                 )
                 .await?;
         }
-        Ok(terminal)
+        Ok(chain.terminal)
     }
     pub async fn inspect_ability(
         &self,
@@ -1334,7 +1498,7 @@ impl ControlService {
         match self
             .ability_placement_cached(
                 ctx,
-                &candidate.reference.placement,
+                &candidate.reference.identity(),
                 checked_spaces,
                 checked_projects,
             )

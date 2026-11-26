@@ -860,8 +860,37 @@ impl ProviderService {
     ) -> Result<ProviderSelection, PortError> {
         self.control.reject_search_indexing(ctx.auth())?;
         let budget = OperationBudget::new(ctx.budget.clone());
+        // Revalidate caller membership and Space grant before probing live
+        // canonical Space/project history.
+        let (pre_tx, pre_auth) = self
+            .control
+            .open_revalidated_read(&budget, &ctx.budget.request, ctx.auth())
+            .await?;
+        budget
+            .run(pre_tx.rollback(), CommitEffect::NotCommitted)
+            .await?;
+        let Some(pre_grant) = pre_auth.spaces().get(&ctx.scope().space_id) else {
+            return Err(unavailable());
+        };
+        if let Some(project) = request.project.as_ref() {
+            if project.space_id != ctx.scope().space_id {
+                return Err(invalid(ValidationReason::ScopeMismatch));
+            }
+            if pre_grant
+                .project_root
+                .as_ref()
+                .is_some_and(|root| root != &project.folder_id)
+            {
+                return Err(DomainError::ResourceNotFound.into());
+            }
+        }
+        let pre_ctx = SpaceContext::new(
+            pre_auth,
+            ctx.scope().clone(),
+            budget.context(ctx.budget.request.clone()),
+        )?;
         let space = self
-            .selection_catalog(&ctx, request.project.as_ref())
+            .selection_catalog(&pre_ctx, request.project.as_ref())
             .await?;
         let wanted_kind = model_kind_name(request.kind);
         let (mut tx, auth) = self

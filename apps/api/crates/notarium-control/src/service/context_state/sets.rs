@@ -437,12 +437,34 @@ impl ControlService {
                 .await
         }
         .await;
+        #[derive(Clone, Serialize, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct SavedContextSet {
+            id: ContextSetId,
+            owner: PrincipalId,
+            home: SpaceId,
+            name: String,
+            notes: Vec<NoteRef>,
+            revision: ControlRevision,
+        }
         let mut tx = self.store.write(budget.clone()).await?;
-        let (revision, current_ctx, saved_id) = budget.run(async {
+        let (revision, current_ctx, saved_set, replayed) = budget.run(async {
             let owner = self.context_manager(tx.inner_mut(), &ctx).await?;
-            if let Some((revision, saved)) = command.replay::<ContextSetId>(tx.inner_mut()).await? {
+            if let Some((revision, saved)) = command.replay::<SavedContextSet>(tx.inner_mut()).await? {
                 let auth = self.revalidate(tx.inner_mut(), ctx.auth()).await?;
-                return Ok((revision, AccountContext::new(auth, budget.context(ctx.budget.request.clone())), saved.value));
+                if auth
+                    .spaces()
+                    .get(&saved.value.home)
+                    .is_none_or(|grant| grant.read_classes.is_empty() || grant.project_root.is_some())
+                {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+                return Ok((
+                    revision,
+                    AccountContext::new(auth, budget.context(ctx.budget.request.clone())),
+                    saved.value,
+                    true,
+                ));
             }
             let space_kinds = space_kinds_precheck?;
             expect_revision(&owner, command.identity.expected)?;
@@ -471,40 +493,56 @@ impl ControlService {
                 record.insert_or_conflict(tx.inner_mut()).await?;
             } else { execute!(tx.inner_mut(),"UPDATE context_sets SET name=$1,note_refs=$2,revision=$3 WHERE set_id=$4","UPDATE v1_control.context_sets SET name=$1,note_refs=$2,revision=$3 WHERE set_id=$4";&row.name,&row.note_refs,row.revision,&row.set_id)?; }
             let revision = self.bump_context_spaces(tx.inner_mut(), &owner, &spaces).await?;
-            command.save(tx.inner_mut(), revision, &SavedResult { value: request.input.id.clone(), events: vec![] }, self.clock.now_ms()?).await?;
-            Ok((revision, ctx.clone(), request.input.id.clone()))
+            let committed = SavedContextSet {
+                id: request.input.id.clone(),
+                owner: PrincipalId::parse(&row.owner_id)?,
+                home: request.input.home.clone(),
+                name: request.input.name.clone(),
+                notes: request.input.notes.clone(),
+                revision: ControlRevision::new(row.revision as u64)?,
+            };
+            command.save(tx.inner_mut(), revision, &SavedResult { value: committed.clone(), events: vec![] }, self.clock.now_ms()?).await?;
+            Ok((revision, ctx.clone(), committed, false))
         }, CommitEffect::NotCommitted).await?;
         budget.run(tx.commit(), CommitEffect::Unknown).await?;
-        let value = async {
-            let mut rtx = self.store.read(budget.clone()).await?;
-            let db_result = budget
-                .run(
-                    async {
-                        let row = bundle(rtx.inner_mut(), &saved_id, false)
-                            .await?
-                            .ok_or(DomainError::ResourceNotFound)?;
-                        self.check_bundle_attachment_db(rtx.inner_mut(), &current_ctx, &row)
-                            .await?;
-                        Ok::<_, PortError>(row)
-                    },
-                    CommitEffect::Unknown,
-                )
-                .await;
-            budget.run(rtx.rollback(), CommitEffect::Unknown).await?;
-            let row = db_result?;
+        let value = if !replayed {
+            ContextSetInfo {
+                id: saved_set.id,
+                owner: saved_set.owner,
+                home: saved_set.home,
+                name: saved_set.name,
+                notes: saved_set.notes,
+                unavailable: 0,
+                revision: saved_set.revision,
+            }
+        } else {
             budget
                 .run(
                     async {
-                        let mut cache = BTreeMap::new();
-                        self.context_bundle_info(&current_ctx, row, None, &mut cache)
-                            .await
+                        let mut visible = Vec::with_capacity(saved_set.notes.len());
+                        let mut unavailable = 0u16;
+                        for note in saved_set.notes {
+                            match self.catalog_note(&current_ctx, &note).await {
+                                Ok(_) => visible.push(note),
+                                Err(error) if hidden(&error) => unavailable += 1,
+                                Err(error) => return Err(error),
+                            }
+                        }
+                        Ok::<_, PortError>(ContextSetInfo {
+                            id: saved_set.id,
+                            owner: saved_set.owner,
+                            home: saved_set.home,
+                            name: saved_set.name,
+                            notes: visible,
+                            unavailable,
+                            revision: saved_set.revision,
+                        })
                     },
                     CommitEffect::Unknown,
                 )
                 .await
-        }
-        .await
-        .map_err(post_commit_context_set_read_error)?;
+                .map_err(post_commit_context_set_read_error)?
+        };
         Ok(ControlCommit { revision, value })
     }
     pub async fn delete_context_set(

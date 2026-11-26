@@ -167,6 +167,7 @@ pub(crate) enum CandidateAction {
         needs_note_mutation: bool,
         head_unchanged_placement: bool,
         current_cover_parent: Option<FolderId>,
+        first_run_seq: SpaceSeq,
     },
 }
 
@@ -701,10 +702,15 @@ async fn execute_general_rollback(
 
         attempt += 1;
 
-        // Step 4: If eligible notes have board moves in `input.run`, evaluate rollback board facts.
+        // Step 4: If eligible notes have board moves in `input.run` or any pre-existing
+        // eligible note may carry a stale neighbor overlay from `input.run`'s board moves,
+        // evaluate rollback board facts for those views.
+        let has_restorable_eligible = eligible_notes
+            .values()
+            .any(|action| matches!(action, CandidateAction::RestorePreExisting { .. }));
         let mut affected_views_set: BTreeSet<ViewRef> = BTreeSet::new();
         for bmh in &run_board_moves {
-            if eligible_notes.contains_key(&bmh.target_note_id) {
+            if has_restorable_eligible || eligible_notes.contains_key(&bmh.target_note_id) {
                 affected_views_set.insert(bmh.view.clone());
             }
         }
@@ -1139,6 +1145,7 @@ pub(crate) fn build_rollback_direct_single_tx_exec(
                             needs_note_mutation,
                             head_unchanged_placement,
                             current_cover_parent: None,
+                            first_run_seq: SpaceSeq::ZERO,
                         }
                     }
                 };
@@ -1732,36 +1739,6 @@ fn materialize_working_group(
     Ok(working_groups.len() - 1)
 }
 
-async fn load_first_run_seq_tx(
-    tx: &mut BackendConn<'_>,
-    scope: &HistoryScope,
-    run: &AgentRunId,
-) -> Result<Option<SpaceSeq>, PortError> {
-    let min_seq: Option<i64> = match tx {
-        BackendConn::Sqlite(conn) => sqlx::query_scalar(
-            "SELECT MIN(space_seq) FROM revisions
-             WHERE space_id = ?1 AND history_incarnation = ?2 AND agent_run_id = ?3",
-        )
-        .bind(scope.space_id.as_str())
-        .bind(scope.incarnation.as_bytes().as_slice())
-        .bind(run.as_str())
-        .fetch_one(&mut **conn)
-        .await
-        .map_err(|err| internal_not_committed("sqlite_first_run_seq", err.to_string()))?,
-        BackendConn::Postgres(conn) => sqlx::query_scalar(
-            "SELECT MIN(space_seq) FROM revisions
-             WHERE space_id = $1 AND history_incarnation = $2 AND agent_run_id = $3",
-        )
-        .bind(scope.space_id.as_str())
-        .bind(scope.incarnation.as_bytes().as_slice())
-        .bind(run.as_str())
-        .fetch_one(&mut **conn)
-        .await
-        .map_err(|err| internal_not_committed("pg_first_run_seq", err.to_string()))?,
-    };
-    Ok(min_seq.map(crate::codec::i64_to_space_seq).transpose()?)
-}
-
 async fn load_latest_prerun_rank_meta_tx(
     tx: &mut BackendConn<'_>,
     scope: &HistoryScope,
@@ -2277,7 +2254,14 @@ fn build_rollback_execute_fn(
                     // Pass 1 settles `Replayed` and `Ineligible` targets into `view_target_restores`
                     // first so any subsequent `ReconcilePreRun` PMA window shift updates all
                     // already-replayed targets in place rather than leaving stale ranks.
-                    let first_run_seq = load_first_run_seq_tx(tx, &scope_cl, &input.run).await?;
+                    let note_first_run_seq = |nid: &NoteId| -> Option<SpaceSeq> {
+                        match eligible_notes.get(nid) {
+                            Some(CandidateAction::RestorePreExisting { first_run_seq, .. }) => {
+                                Some(*first_run_seq)
+                            }
+                            _ => None,
+                        }
+                    };
                     let mut view_target_restores: Vec<PlannedTargetRankRestore> = Vec::new();
                     let mut reconcile_prerun_targets: Vec<(NoteId, GroupKey, SpaceSeq)> =
                         Vec::new();
@@ -2337,9 +2321,142 @@ fn build_rollback_execute_fn(
                         }
                     }
 
+                    // Reconcile non-moved eligible notes whose persisted overlay on `view`
+                    // no longer matches their restored membership (for example, an in-run
+                    // `edit_note` brought the note into a group where another card's move
+                    // materialized a neighbor overlay for it). Classify and strip all
+                    // pre-run-restorable stale notes from `kept_groups`/`working_groups`
+                    // BEFORE materializing any group for `reconcile_prerun_targets` so they
+                    // never receive synthetic tail ranks that collide with pre-run ranks.
+                    let mut stale_non_moved: Vec<NoteId> = overlays
+                        .keys()
+                        .filter(|nid| {
+                            eligible_all_ids.contains(*nid)
+                                && !retired_note_ids.contains(*nid)
+                                && !moved_targets_on_view.contains(*nid)
+                        })
+                        .cloned()
+                        .collect();
+                    stale_non_moved.sort();
+                    let mut pending_stale_deletes: Vec<NoteId> = Vec::new();
+                    let mut stale_prerun_restores: Vec<(
+                        NoteId,
+                        GroupKey,
+                        crate::codec::RankRevisionMetadata,
+                    )> = Vec::new();
+                    for nid in stale_non_moved {
+                        let Some(ov) = overlays.get(&nid) else {
+                            continue;
+                        };
+                        let expected_post = view_facts
+                            .post_restore_membership
+                            .get(&nid)
+                            .cloned()
+                            .unwrap_or(None);
+                        if expected_post.as_ref() == Some(&ov.group) {
+                            continue;
+                        }
+                        match expected_post {
+                            None => {
+                                pending_stale_deletes.push(nid);
+                            }
+                            Some(post_grp) => {
+                                let prerun = if let Some(stale_before) = note_first_run_seq(&nid) {
+                                    load_latest_prerun_rank_meta_tx(
+                                        tx,
+                                        &scope_cl,
+                                        view,
+                                        &nid,
+                                        &input.run,
+                                        stale_before,
+                                    )
+                                    .await?
+                                } else {
+                                    None
+                                };
+                                if let Some(meta) = prerun
+                                    && !meta.removed
+                                    && meta.group_key == post_grp
+                                {
+                                    for (_, notes) in &mut kept_groups {
+                                        notes.retain(|id| id != &nid);
+                                    }
+                                    for (_, g_items) in &mut working_groups {
+                                        g_items.retain(|it| it.note_id != nid);
+                                    }
+                                    neighbor_dirty.remove(&nid);
+                                    stale_prerun_restores.push((nid, post_grp, meta));
+                                } else {
+                                    pending_stale_deletes.push(nid);
+                                }
+                            }
+                        }
+                    }
+
+                    for (nid, post_grp, meta) in stale_prerun_restores {
+                        let g_idx = materialize_working_group(
+                            &post_grp,
+                            &kept_groups,
+                            &overlays,
+                            &moved_targets_on_view,
+                            &mut working_groups,
+                            &mut neighbor_dirty,
+                        )?;
+                        let g_items = &mut working_groups[g_idx].1;
+                        let collides = g_items.iter().any(|it| it.rank == meta.sort_rank_lexo);
+                        let restored_rank = if !collides {
+                            let pos = g_items
+                                .iter()
+                                .position(|it| it.rank > meta.sort_rank_lexo)
+                                .unwrap_or(g_items.len());
+                            g_items.insert(
+                                pos,
+                                ExistingRankedItem {
+                                    note_id: nid.clone(),
+                                    rank: meta.sort_rank_lexo.clone(),
+                                },
+                            );
+                            meta.sort_rank_lexo
+                        } else {
+                            let pos = g_items
+                                .iter()
+                                .position(|it| it.rank >= meta.sort_rank_lexo)
+                                .unwrap_or(g_items.len());
+                            let computed = compute_rank_placement(g_items, &nid, pos)?;
+                            for (pn, pr) in computed.pma_neighbor_updates {
+                                if let Some(it) = g_items.iter_mut().find(|i| i.note_id == pn) {
+                                    it.rank = pr.clone();
+                                }
+                                if let Some(tr) = view_target_restores
+                                    .iter_mut()
+                                    .find(|r| r.target_note == pn)
+                                {
+                                    tr.rank = pr;
+                                } else if !moved_targets_on_view.contains(&pn) {
+                                    neighbor_dirty.insert(pn, (post_grp.clone(), pr, true));
+                                }
+                            }
+                            g_items.insert(
+                                pos,
+                                ExistingRankedItem {
+                                    note_id: nid.clone(),
+                                    rank: computed.target_rank.clone(),
+                                },
+                            );
+                            computed.target_rank
+                        };
+                        view_target_restores.push(PlannedTargetRankRestore {
+                            view: view.clone(),
+                            target_note: nid,
+                            group: post_grp,
+                            rank: restored_rank,
+                            restored_placement_revision: Some(meta.placement_revision),
+                        });
+                    }
+
                     for (target, post_grp, earliest_seq) in reconcile_prerun_targets {
-                        let prerun_before =
-                            first_run_seq.map_or(earliest_seq, |first| first.min(earliest_seq));
+                        let prerun_before = note_first_run_seq(&target)
+                            .map_or(earliest_seq, |first| first.min(earliest_seq));
                         let prerun = load_latest_prerun_rank_meta_tx(
                             tx,
                             &scope_cl,
@@ -2416,137 +2533,6 @@ fn build_rollback_execute_fn(
                                 view: view.clone(),
                                 target_note: target,
                             });
-                        }
-                    }
-
-                    // Reconcile non-moved eligible notes whose persisted overlay on `view`
-                    // no longer matches their restored membership (for example, an in-run
-                    // `edit_note` brought the note into a group where another card's move
-                    // materialized a neighbor overlay for it). Defer deletions until after
-                    // `touched_final_groups` and `planned_neighbor_updates` are finalized so
-                    // no `(view, note)` ever schedules both a deletion and a neighbor upsert.
-                    let first_view_move_seq = run_moves_cl
-                        .iter()
-                        .filter(|bmh| &bmh.view == view)
-                        .map(|bmh| bmh.command_end_seq)
-                        .min()
-                        .unwrap_or(SpaceSeq::ZERO);
-                    let stale_prerun_before = first_run_seq
-                        .map_or(first_view_move_seq, |first| first.min(first_view_move_seq));
-                    let mut stale_non_moved: Vec<NoteId> = overlays
-                        .keys()
-                        .filter(|nid| {
-                            eligible_all_ids.contains(*nid)
-                                && !retired_note_ids.contains(*nid)
-                                && !moved_targets_on_view.contains(*nid)
-                        })
-                        .cloned()
-                        .collect();
-                    stale_non_moved.sort();
-                    let mut pending_stale_deletes: Vec<NoteId> = Vec::new();
-                    for nid in stale_non_moved {
-                        let Some(ov) = overlays.get(&nid) else {
-                            continue;
-                        };
-                        let expected_post = view_facts
-                            .post_restore_membership
-                            .get(&nid)
-                            .cloned()
-                            .unwrap_or(None);
-                        if expected_post.as_ref() == Some(&ov.group) {
-                            continue;
-                        }
-                        match expected_post {
-                            None => {
-                                pending_stale_deletes.push(nid);
-                            }
-                            Some(post_grp) => {
-                                let prerun = load_latest_prerun_rank_meta_tx(
-                                    tx,
-                                    &scope_cl,
-                                    view,
-                                    &nid,
-                                    &input.run,
-                                    stale_prerun_before,
-                                )
-                                .await?;
-                                if let Some(meta) = prerun
-                                    && !meta.removed
-                                    && meta.group_key == post_grp
-                                {
-                                    for (_, notes) in &mut kept_groups {
-                                        notes.retain(|id| id != &nid);
-                                    }
-                                    for (_, g_items) in &mut working_groups {
-                                        g_items.retain(|it| it.note_id != nid);
-                                    }
-                                    neighbor_dirty.remove(&nid);
-                                    let g_idx = materialize_working_group(
-                                        &post_grp,
-                                        &kept_groups,
-                                        &overlays,
-                                        &moved_targets_on_view,
-                                        &mut working_groups,
-                                        &mut neighbor_dirty,
-                                    )?;
-                                    let g_items = &mut working_groups[g_idx].1;
-                                    let collides =
-                                        g_items.iter().any(|it| it.rank == meta.sort_rank_lexo);
-                                    let restored_rank = if !collides {
-                                        let pos = g_items
-                                            .iter()
-                                            .position(|it| it.rank > meta.sort_rank_lexo)
-                                            .unwrap_or(g_items.len());
-                                        g_items.insert(
-                                            pos,
-                                            ExistingRankedItem {
-                                                note_id: nid.clone(),
-                                                rank: meta.sort_rank_lexo.clone(),
-                                            },
-                                        );
-                                        meta.sort_rank_lexo
-                                    } else {
-                                        let pos = g_items
-                                            .iter()
-                                            .position(|it| it.rank >= meta.sort_rank_lexo)
-                                            .unwrap_or(g_items.len());
-                                        let computed = compute_rank_placement(g_items, &nid, pos)?;
-                                        for (pn, pr) in computed.pma_neighbor_updates {
-                                            if let Some(it) =
-                                                g_items.iter_mut().find(|i| i.note_id == pn)
-                                            {
-                                                it.rank = pr.clone();
-                                            }
-                                            if let Some(tr) = view_target_restores
-                                                .iter_mut()
-                                                .find(|r| r.target_note == pn)
-                                            {
-                                                tr.rank = pr;
-                                            } else if !moved_targets_on_view.contains(&pn) {
-                                                neighbor_dirty
-                                                    .insert(pn, (post_grp.clone(), pr, true));
-                                            }
-                                        }
-                                        g_items.insert(
-                                            pos,
-                                            ExistingRankedItem {
-                                                note_id: nid.clone(),
-                                                rank: computed.target_rank.clone(),
-                                            },
-                                        );
-                                        computed.target_rank
-                                    };
-                                    view_target_restores.push(PlannedTargetRankRestore {
-                                        view: view.clone(),
-                                        target_note: nid,
-                                        group: post_grp,
-                                        rank: restored_rank,
-                                        restored_placement_revision: Some(meta.placement_revision),
-                                    });
-                                } else {
-                                    pending_stale_deletes.push(nid);
-                                }
-                            }
                         }
                     }
 
@@ -3378,6 +3364,7 @@ async fn discover_rollback_state_tx(
                         needs_note_mutation,
                         head_unchanged_placement,
                         current_cover_parent,
+                        first_run_seq,
                     },
                 );
             }
@@ -6844,6 +6831,7 @@ async fn execute_pg_fast_rollback_inner(
                     needs_note_mutation,
                     head_unchanged_placement,
                     current_cover_parent: None,
+                    first_run_seq: SpaceSeq::ZERO,
                 }
             }
         };

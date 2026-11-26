@@ -478,32 +478,16 @@ pub(super) async fn create(
     }
     let carrier = created_carrier(&args, kind, &format_attachments(attachments, &plan.skills)?)?;
     const CREATE_LABEL: &str = "notarium.mcp.create-ability.v1";
-    let parent = if let Some(saved) = call
-        .lookup_journal_with_key::<FolderId>(
-            "create-ability-folder",
-            &call.request_key,
-            call.request_hash,
-        )
-        .await?
-    {
-        saved
-    } else {
-        let resolved = ability_folder(call, &plan.home.scope, plan.home.parent.clone())
-            .await
-            .map_err(|error| {
-                super::super::note_tools::batch_operational_error(CREATE_LABEL, error, false)
-            })?;
-        call.record_journal_with_key(
-            "create-ability-folder",
-            &call.request_key,
-            call.request_hash,
-            &resolved,
-        )
-        .await
-        .map_err(|error| {
-            super::super::note_tools::batch_operational_error(CREATE_LABEL, error, true)
-        })?
-    };
+    let ensured_parent = ensure_ability_folder_journaled(
+        call,
+        &plan.home.scope,
+        plan.home.parent.clone(),
+        "create-ability-folder",
+        CREATE_LABEL,
+    )
+    .await?;
+    let parent = ensured_parent.folder;
+    let folder_created = ensured_parent.created;
     let note_id = NoteId::from_bytes(stable_id(call, "ability-entrypoint-id"));
     let ability_id = AbilityId::from_bytes(stable_id(call, "ability-package-id"));
     let entrypoint = call
@@ -511,7 +495,11 @@ pub(super) async fn create(
         .engine
         .create_note(
             writer(call, &plan.home.scope).await.map_err(|error| {
-                super::super::note_tools::batch_operational_error(CREATE_LABEL, error, true)
+                super::super::note_tools::batch_operational_error(
+                    CREATE_LABEL,
+                    error,
+                    folder_created,
+                )
             })?,
             Mutation {
                 identity: call.command_identity(&plan.home.scope, "create-ability-entrypoint", 0),
@@ -528,7 +516,7 @@ pub(super) async fn create(
         )
         .await
         .map_err(|error| {
-            super::super::note_tools::batch_operational_error(CREATE_LABEL, error, true)
+            super::super::note_tools::batch_operational_error(CREATE_LABEL, error, folder_created)
         })?;
     let created = call
         .registry
@@ -1018,7 +1006,7 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
             if plan.promote {
                 phase = "home";
                 let journaled_parent = if plan_replayed {
-                    call.lookup_journal_with_key::<FolderId>(
+                    call.lookup_journal_with_key::<JournaledAbilityFolder>(
                         "edit-ability-promote-folder",
                         &call.request_key,
                         call.request_hash,
@@ -1027,8 +1015,9 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
                 } else {
                     None
                 };
-                let parent = if let Some(folder) = journaled_parent {
-                    folder
+                let parent = if let Some(saved) = journaled_parent {
+                    folder_ensured = saved.created;
+                    saved.folder
                 } else if trashed_replay {
                     let scope = call.space(plan.scope.clone())?;
                     if let Some(found) = call
@@ -1044,20 +1033,16 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
                             .ok_or(DomainError::ResourceNotFound)?
                     }
                 } else {
-                    let folder = ability_folder(call, &plan.scope, None).await?;
-                    folder_ensured = true;
-                    let _ = call
-                        .record_journal_with_key(
-                            "edit-ability-promote-folder",
-                            &call.request_key,
-                            call.request_hash,
-                            &folder,
-                        )
-                        .await
-                        .map_err(|error| {
-                            post_commit_ability_error("notarium.mcp.edit-ability.v1", error)
-                        })?;
-                    folder
+                    let ensured = ensure_ability_folder_journaled(
+                        call,
+                        &plan.scope,
+                        None,
+                        "edit-ability-promote-folder",
+                        "notarium.mcp.edit-ability.v1",
+                    )
+                    .await?;
+                    folder_ensured = ensured.created;
+                    ensured.folder
                 };
                 let settled = call
                     .registry
@@ -1381,6 +1366,67 @@ struct TrashPlan {
     reference: AbilityRef,
     entrypoint: NoteRef,
     note_revision: RevisionId,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct JournaledAbilityFolder {
+    folder: FolderId,
+    created: bool,
+}
+
+async fn ensure_ability_folder_journaled(
+    call: &ToolCallContext<'_>,
+    scope: &HistoryScope,
+    parent: Option<FolderId>,
+    label: &str,
+    err_label: &str,
+) -> Result<JournaledAbilityFolder, PortError> {
+    if let Some(saved) = call
+        .lookup_journal_with_key::<JournaledAbilityFolder>(
+            label,
+            &call.request_key,
+            call.request_hash,
+        )
+        .await?
+    {
+        return Ok(saved);
+    }
+    let existed_label = format!("{label}-existed");
+    let existed: bool = call
+        .journal_with_key(
+            &existed_label,
+            &call.request_key,
+            call.request_hash,
+            || async {
+                Ok(call
+                    .registry
+                    .engine
+                    .resolve_folder_path(
+                        call.space(scope.clone())?,
+                        parent.clone(),
+                        ".abilities".to_owned(),
+                    )
+                    .await?
+                    .is_some())
+            },
+        )
+        .await
+        .map_err(|error| {
+            super::super::note_tools::batch_operational_error(err_label, error, false)
+        })?;
+    let folder = ability_folder(call, scope, parent).await.map_err(|error| {
+        super::super::note_tools::batch_operational_error(err_label, error, false)
+    })?;
+    let recorded = JournaledAbilityFolder {
+        folder,
+        created: !existed,
+    };
+    call.record_journal_with_key(label, &call.request_key, call.request_hash, &recorded)
+        .await
+        .map_err(|error| {
+            super::super::note_tools::batch_operational_error(err_label, error, recorded.created)
+        })
 }
 
 pub(super) async fn trash(

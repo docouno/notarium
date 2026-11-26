@@ -170,6 +170,24 @@ impl ControlService {
                         user_read(rtx.inner_mut(), ctx.auth().principal().as_str()).await?;
                     self.live_human(rtx.inner_mut(), ctx.auth(), &current)
                         .await?;
+                    if ctx.auth().is_space_narrowed()
+                        || ctx
+                            .auth()
+                            .spaces()
+                            .values()
+                            .any(|grant| grant.project_root.is_some())
+                    {
+                        let allowed =
+                            ctx.auth()
+                                .spaces()
+                                .get(&scope.space_id)
+                                .is_some_and(|grant| {
+                                    grant.role == SpaceRole::Owner && grant.project_root.is_none()
+                                });
+                        if !allowed {
+                            return Err(access_denied());
+                        }
+                    }
                     let member = rows!(
                         rtx.inner_mut(),
                         SpaceMembersRow,

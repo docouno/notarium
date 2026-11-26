@@ -1,6 +1,13 @@
 use super::{PortFuture, SpaceContext, types::*};
-use crate::{ids::*, model::*, query::*, receipt::CausalBasis};
+use crate::{DomainError, ids::*, model::*, query::*, receipt::CausalBasis};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SpaceSchemaSnapshot {
+    pub revision: Option<RevisionId>,
+    pub fields: BTreeMap<String, FieldSchema>,
+}
 
 pub trait NoteReadPort: Send + Sync {
     fn resolve_folder_path(
@@ -24,6 +31,25 @@ pub trait NoteReadPort: Send + Sync {
         slug_title_or_id: String,
     ) -> PortFuture<'_, Option<NoteRef>>;
     fn space_schema(&self, ctx: SpaceContext) -> PortFuture<'_, BTreeMap<String, FieldSchema>>;
+    /// Read either the current field schema (`revision == None`) or an exact
+    /// historical schema revision (`revision == Some(rev)`), returning its
+    /// revision identity alongside the fields so retries can replay against the
+    /// original schema without journaling user content.
+    fn space_schema_snapshot(
+        &self,
+        ctx: SpaceContext,
+        revision: Option<RevisionId>,
+    ) -> PortFuture<'_, SpaceSchemaSnapshot> {
+        if revision.is_some() {
+            return Box::pin(async { Err(DomainError::ResourceNotFound.into()) });
+        }
+        Box::pin(async move {
+            Ok(SpaceSchemaSnapshot {
+                revision: None,
+                fields: self.space_schema(ctx).await?,
+            })
+        })
+    }
     /// Aggregate only visible notes from the exact project and requested history.
     /// Counts and the source cut use the caller's live class and project grants.
     fn project_note_counts(

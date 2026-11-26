@@ -2164,8 +2164,24 @@ pub(crate) async fn load_current_space_schema_tx(
     tx: &mut BackendConn<'_>,
     space_id: &SpaceId,
 ) -> Result<Option<CurrentSpaceSchema>, PortError> {
-    let raw: Option<(String, String, Vec<u8>, Vec<u8>)> = match tx {
-        BackendConn::Sqlite(conn) => {
+    load_space_schema_tx(tx, space_id, None).await
+}
+
+pub(crate) async fn load_space_schema_revision_tx(
+    tx: &mut BackendConn<'_>,
+    space_id: &SpaceId,
+    schema_rev_id: &RevisionId,
+) -> Result<Option<CurrentSpaceSchema>, PortError> {
+    load_space_schema_tx(tx, space_id, Some(schema_rev_id)).await
+}
+
+async fn load_space_schema_tx(
+    tx: &mut BackendConn<'_>,
+    space_id: &SpaceId,
+    schema_rev_id: Option<&RevisionId>,
+) -> Result<Option<CurrentSpaceSchema>, PortError> {
+    let raw: Option<(String, String, Vec<u8>, Vec<u8>)> = match (tx, schema_rev_id) {
+        (BackendConn::Sqlite(conn), None) => {
             let row = sqlx::query(
                 "SELECT schema_rev_id, schema_note_id, descriptor_msgpack, descriptor_fingerprint
                  FROM space_field_schemas
@@ -2185,7 +2201,30 @@ pub(crate) async fn load_current_space_schema_tx(
                 )
             })
         }
-        BackendConn::Postgres(conn) => {
+        (BackendConn::Sqlite(conn), Some(rev)) => {
+            let row = sqlx::query(
+                "SELECT schema_rev_id, schema_note_id, descriptor_msgpack, descriptor_fingerprint
+                 FROM space_field_schemas
+                 WHERE space_id = ?1 AND schema_rev_id = ?2
+                 LIMIT 1",
+            )
+            .bind(space_id.as_str())
+            .bind(rev.as_str())
+            .fetch_optional(&mut **conn)
+            .await
+            .map_err(|err| {
+                internal_not_committed("sqlite_load_space_schema_rev", err.to_string())
+            })?;
+            row.map(|r| {
+                (
+                    r.get("schema_rev_id"),
+                    r.get("schema_note_id"),
+                    r.get("descriptor_msgpack"),
+                    r.get("descriptor_fingerprint"),
+                )
+            })
+        }
+        (BackendConn::Postgres(conn), None) => {
             let row = sqlx::query(
                 "SELECT schema_rev_id, schema_note_id, descriptor_msgpack, descriptor_fingerprint
                  FROM space_field_schemas
@@ -2196,6 +2235,27 @@ pub(crate) async fn load_current_space_schema_tx(
             .fetch_optional(&mut **conn)
             .await
             .map_err(|err| crate::runtime::pg_read_error("pg_load_space_schema", err))?;
+            row.map(|r| {
+                (
+                    r.get("schema_rev_id"),
+                    r.get("schema_note_id"),
+                    r.get("descriptor_msgpack"),
+                    r.get("descriptor_fingerprint"),
+                )
+            })
+        }
+        (BackendConn::Postgres(conn), Some(rev)) => {
+            let row = sqlx::query(
+                "SELECT schema_rev_id, schema_note_id, descriptor_msgpack, descriptor_fingerprint
+                 FROM space_field_schemas
+                 WHERE space_id = $1 AND schema_rev_id = $2
+                 LIMIT 1",
+            )
+            .bind(space_id.as_str())
+            .bind(rev.as_str())
+            .fetch_optional(&mut **conn)
+            .await
+            .map_err(|err| crate::runtime::pg_read_error("pg_load_space_schema_rev", err))?;
             row.map(|r| {
                 (
                     r.get("schema_rev_id"),

@@ -135,11 +135,10 @@ impl ProviderService {
     // These are metadata snapshots, not dispatch authority. Metadata reads do
     // not lock configuration rows. Confirmation and dispatch separately compare
     // the reviewed versions under their own authority locks.
-    async fn offered_review(
+    async fn offered_review_without_kind(
         &self,
         tx: &mut Transaction,
         row: &ProviderAttachmentsRow,
-        kind: SpaceKind,
     ) -> Result<Option<ProviderAttachmentReview>, PortError> {
         let now = self.control.clock.now_ms()?;
         if !matches!(row.target_kind.as_str(), "space" | "project")
@@ -181,14 +180,26 @@ impl ProviderService {
             return Ok(None);
         }
         let attachment = attachment_info(row)?;
-        if attachments::disclosure(&attachment.disclosure, kind).is_err() {
-            return Ok(None);
-        }
         Ok(Some(ProviderAttachmentReview {
             attachment,
             resource: resource_info(&resource)?,
             current_credential_consent_epoch: credential_epoch.map(|epoch| epoch as u64),
         }))
+    }
+
+    async fn offered_review(
+        &self,
+        tx: &mut Transaction,
+        row: &ProviderAttachmentsRow,
+        kind: SpaceKind,
+    ) -> Result<Option<ProviderAttachmentReview>, PortError> {
+        let Some(review) = self.offered_review_without_kind(tx, row).await? else {
+            return Ok(None);
+        };
+        if attachments::disclosure(&review.attachment.disclosure, kind).is_err() {
+            return Ok(None);
+        }
+        Ok(Some(review))
     }
 
     pub async fn list_offers(
@@ -198,6 +209,31 @@ impl ProviderService {
     ) -> Result<ControlPage<ProviderAttachmentReview>, PortError> {
         let budget = OperationBudget::new(ctx.budget.clone());
         ctx.budget = budget.context(ctx.budget.request.clone());
+        if query
+            .project
+            .as_ref()
+            .is_some_and(|p| p.space_id != ctx.scope().space_id)
+        {
+            return Err(DomainError::ResourceNotFound.into());
+        }
+        // Revalidate caller membership and Space admission before probing live
+        // canonical Space/project history.
+        let mut pre_tx = self.control.store.read(budget.clone()).await?;
+        let pre_access = budget
+            .run(
+                self.offer_access(
+                    pre_tx.inner_mut(),
+                    &ctx,
+                    query.project.as_ref(),
+                    ("offers", &query.project),
+                ),
+                CommitEffect::NotCommitted,
+            )
+            .await;
+        budget
+            .run(pre_tx.rollback(), CommitEffect::NotCommitted)
+            .await?;
+        pre_access?;
         let catalog = self.offer_catalog(&ctx, &query.project).await?;
         let mut tx = self.control.store.read(budget.clone()).await?;
         let result = budget.run(async {
@@ -251,35 +287,54 @@ impl ProviderService {
     ) -> Result<ControlPage<ProviderModelInfo>, PortError> {
         let budget = OperationBudget::new(ctx.budget.clone());
         ctx.budget = budget.context(ctx.budget.request.clone());
-        let account = AccountContext::new(ctx.auth().clone(), ctx.budget.clone());
-        self.management_read_scoped(&account).await?;
-        if ctx.auth().spaces().get(&ctx.scope().space_id).is_none() {
-            return Err(DomainError::ResourceNotFound.into());
-        }
-        let observed = self.observe_attachment(&account, &offer).await?;
-        if observed.target_space != ctx.scope().space_id.as_str() {
-            return Err(DomainError::ResourceNotFound.into());
-        }
-        let project = match attachment_target(&observed)? {
-            ProviderAttachmentTarget::Space(_) => None,
-            ProviderAttachmentTarget::Project(project) => Some(project),
-            ProviderAttachmentTarget::Personal { .. } => {
-                return Err(DomainError::ResourceNotFound.into());
-            }
-        };
-        if ctx
-            .auth()
-            .spaces()
-            .get(&ctx.scope().space_id)
-            .is_none_or(|grant| {
-                grant
-                    .project_root
-                    .as_ref()
-                    .is_some_and(|root| project.as_ref().map(|p| &p.folder_id) != Some(root))
-            })
-        {
-            return Err(DomainError::ResourceNotFound.into());
-        }
+        // Revalidate caller membership and confirm the offer is currently
+        // approved and active before checking live canonical history/project.
+        let mut pre_tx = self.control.store.read(budget.clone()).await?;
+        let pre_checked = budget
+            .run(
+                async {
+                    let row = rows!(
+                        pre_tx.inner_mut(),
+                        ProviderAttachmentsRow,
+                        fetch_optional,
+                        "SELECT * FROM provider_attachments WHERE id=$1",
+                        "SELECT * FROM v1_control.provider_attachments WHERE id=$1";
+                        offer.as_str()
+                    )?
+                    .ok_or(DomainError::ResourceNotFound)?;
+                    if row.target_space != ctx.scope().space_id.as_str() {
+                        return Err(DomainError::ResourceNotFound.into());
+                    }
+                    let project = match attachment_target(&row)? {
+                        ProviderAttachmentTarget::Space(_) => None,
+                        ProviderAttachmentTarget::Project(project) => Some(project),
+                        ProviderAttachmentTarget::Personal { .. } => {
+                            return Err(DomainError::ResourceNotFound.into());
+                        }
+                    };
+                    self.offer_access(
+                        pre_tx.inner_mut(),
+                        &ctx,
+                        project.as_ref(),
+                        ("offer-models", &project, &offer),
+                    )
+                    .await?;
+                    if self
+                        .offered_review_without_kind(pre_tx.inner_mut(), &row)
+                        .await?
+                        .is_none()
+                    {
+                        return Err(DomainError::ResourceNotFound.into());
+                    }
+                    Ok::<_, PortError>((row, project))
+                },
+                CommitEffect::NotCommitted,
+            )
+            .await;
+        budget
+            .run(pre_tx.rollback(), CommitEffect::NotCommitted)
+            .await?;
+        let (observed, project) = pre_checked?;
         let catalog = self.offer_catalog(&ctx, &project).await?;
         let mut tx = self.control.store.read(budget.clone()).await?;
         let result = budget.run(async {

@@ -670,7 +670,7 @@ impl ControlService {
                     )
                     .await?;
                 let mut rtx = self.store.read(budget.clone()).await?;
-                let (_, visited) = budget
+                let chain = budget
                     .run(
                         self.follow_ability_chain_db(
                             rtx.inner_mut(),
@@ -686,7 +686,7 @@ impl ControlService {
                 budget
                     .run(
                         async {
-                            for item in &visited {
+                            for item in &chain.visited {
                                 self.ability_placement(&current, item).await?;
                             }
                             Ok::<_, PortError>(())

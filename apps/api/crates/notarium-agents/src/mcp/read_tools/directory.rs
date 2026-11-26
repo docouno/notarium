@@ -55,7 +55,18 @@ pub(super) async fn list(call: &mut ToolCallContext<'_>, args: Value) -> Result<
         }
         return Ok(empty(external));
     };
+    if previous
+        .as_ref()
+        .is_some_and(|prev| prev.scope.space_id != target.scope.space_id)
+    {
+        return Err(DomainError::ResourceNotFound.into());
+    }
     let mut scope = call.space(target.scope.clone())?;
+    let foreign_space = !external
+        && scope
+            .auth()
+            .pinned_write_space()
+            .is_some_and(|pin| pin != &scope.scope().space_id);
     let mut allow_user_doc = true;
     if !external {
         let selection_project = target.project.clone().or_else(|| match &call.target {
@@ -71,6 +82,9 @@ pub(super) async fn list(call: &mut ToolCallContext<'_>, args: Value) -> Result<
             Ok(selection) => selection,
             Err(error) if corpus::hidden(&error) => {
                 if previous.is_some() {
+                    if foreign_space && targeted_project {
+                        call.commit_external_read();
+                    }
                     return Err(invalid(ValidationReason::CursorStale));
                 }
                 return Ok(empty(external));
@@ -86,6 +100,9 @@ pub(super) async fn list(call: &mut ToolCallContext<'_>, args: Value) -> Result<
                     .is_some_and(|existing| existing != required)
                 {
                     if previous.is_some() {
+                        if foreign_space && targeted_project {
+                            call.commit_external_read();
+                        }
                         return Err(invalid(ValidationReason::CursorStale));
                     }
                     return Ok(empty(external));
@@ -94,6 +111,9 @@ pub(super) async fn list(call: &mut ToolCallContext<'_>, args: Value) -> Result<
                     Ok(narrowed) => narrowed,
                     Err(_) => {
                         if previous.is_some() {
+                            if foreign_space && targeted_project {
+                                call.commit_external_read();
+                            }
                             return Err(invalid(ValidationReason::CursorStale));
                         }
                         return Ok(empty(external));
@@ -107,6 +127,9 @@ pub(super) async fn list(call: &mut ToolCallContext<'_>, args: Value) -> Result<
             Ok(narrowed) => narrowed,
             Err(_) => {
                 if previous.is_some() {
+                    if foreign_space && targeted_project {
+                        call.commit_external_read();
+                    }
                     return Err(invalid(ValidationReason::CursorStale));
                 }
                 return Ok(empty(external));
@@ -118,13 +141,13 @@ pub(super) async fn list(call: &mut ToolCallContext<'_>, args: Value) -> Result<
     } else {
         scope.with_preflight_taint()
     };
-    let foreign_space = !external
-        && scope
-            .auth()
-            .pinned_write_space()
-            .is_some_and(|pin| pin != &scope.scope().space_id);
-    if let Some(previous) = &previous {
-        scope.scope().check(&previous.scope)?;
+    if let Some(previous) = &previous
+        && let Err(error) = scope.scope().check(&previous.scope)
+    {
+        if foreign_space && targeted_project && !matches!(error, DomainError::ResourceNotFound) {
+            call.commit_external_read();
+        }
+        return Err(error.into());
     }
     if foreign_space && targeted_project {
         // Targeting a consented foreign project (explicitly or via episode
@@ -132,7 +155,7 @@ pub(super) async fn list(call: &mut ToolCallContext<'_>, args: Value) -> Result<
         call.auth.taint().mark_external_read();
     }
     let Some(folder) = directory(call, &target, &preflight_scope, &cleaned_path).await? else {
-        if foreign_space && args.path.is_some() {
+        if foreign_space && (args.path.is_some() || (targeted_project && previous.is_some())) {
             call.commit_external_read();
         }
         if previous.is_some() {
@@ -159,6 +182,9 @@ pub(super) async fn list(call: &mut ToolCallContext<'_>, args: Value) -> Result<
     {
         if corpus::hidden(&error) {
             if previous.is_some() {
+                if foreign_space && targeted_project {
+                    call.commit_external_read();
+                }
                 return Err(invalid(ValidationReason::CursorStale));
             }
             return Ok(empty(external));
@@ -209,8 +235,17 @@ pub(super) async fn list(call: &mut ToolCallContext<'_>, args: Value) -> Result<
     .map_err(|_| invalid(ValidationReason::InvalidState))?;
     let fingerprint = ContentDigest::from_bytes(*blake3::hash(&encoded).as_bytes());
     if let Some(previous) = &previous {
-        scope.scope().check(&previous.scope)?;
+        if let Err(error) = scope.scope().check(&previous.scope) {
+            if foreign_space && targeted_project && !matches!(error, DomainError::ResourceNotFound)
+            {
+                call.commit_external_read();
+            }
+            return Err(error.into());
+        }
         if previous.folder != folder.reference || previous.fingerprint != fingerprint {
+            if foreign_space && targeted_project {
+                call.commit_external_read();
+            }
             return Err(invalid(ValidationReason::CursorScopeMismatch));
         }
     }
@@ -218,6 +253,9 @@ pub(super) async fn list(call: &mut ToolCallContext<'_>, args: Value) -> Result<
         Ok(info) => info,
         Err(error) if corpus::hidden(&error) => {
             if args.cursor.is_some() {
+                if foreign_space && targeted_project {
+                    call.commit_external_read();
+                }
                 return Err(invalid(ValidationReason::CursorStale));
             }
             return Ok(empty(external));

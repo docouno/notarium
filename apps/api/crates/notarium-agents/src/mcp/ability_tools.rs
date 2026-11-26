@@ -129,12 +129,11 @@ impl AbilityCursors {
         Ok(format!("{ABILITY_CURSOR_PREFIX}{id:032x}"))
     }
 
-    fn lookup(
+    fn open(
         &self,
         principal: &PrincipalId,
         token: &str,
-        expected_scope: &ContentDigest,
-    ) -> Result<AbilityCursorInner, PortError> {
+    ) -> Result<(ContentDigest, AbilityCursorInner), PortError> {
         let raw = token
             .strip_prefix(ABILITY_CURSOR_PREFIX)
             .ok_or_else(|| invalid(ValidationReason::InvalidId))?;
@@ -150,10 +149,7 @@ impl AbilityCursors {
         else {
             return Err(invalid(ValidationReason::CursorStale));
         };
-        if &entry.scope != expected_scope {
-            return Err(invalid(ValidationReason::CursorStale));
-        }
-        Ok(entry.inner.clone())
+        Ok((entry.scope, entry.inner.clone()))
     }
 }
 
@@ -236,6 +232,16 @@ pub(super) async fn handle(
         ToolName::ListAbilities => {
             Box::pin(async move {
                 let args: ListArgs = decode(args)?;
+                let _ = ControlPageRequest::new(args.limit.unwrap_or(20), None)?;
+                let opened_cursor = args
+                    .cursor
+                    .as_deref()
+                    .map(|cursor| {
+                        call.registry
+                            .ability_cursors
+                            .open(call.auth.principal(), cursor)
+                    })
+                    .transpose()?;
                 let episode = load_episode(call, args.session.as_ref()).await?;
                 let project = session::selected_project_for_episode(
                     call,
@@ -243,7 +249,7 @@ pub(super) async fn handle(
                     episode.as_ref(),
                 )
                 .await?;
-                list(call, args, project).await
+                list(call, args, project, opened_cursor).await
             })
             .await
         }
@@ -876,7 +882,11 @@ async fn inspect_with_project(
     project: Option<&FolderRef>,
 ) -> Result<AbilityInspection, PortError> {
     let reference: AbilityRef = if text.starts_with("ar1:") {
-        parse_token(text, "ar1:", MAX_TOKEN_BYTES)?
+        let parsed: AbilityRef = parse_token(text, "ar1:", MAX_TOKEN_BYTES)?;
+        call.registry
+            .control
+            .follow_ability(call.account(), parsed)
+            .await?
     } else {
         raw_reference_for_call(call, AbilityId::parse(text)?, project, true)
             .await?
@@ -1341,6 +1351,7 @@ async fn list(
     call: &mut ToolCallContext<'_>,
     args: ListArgs,
     project: Option<FolderRef>,
+    opened_cursor: Option<(ContentDigest, AbilityCursorInner)>,
 ) -> Result<Value, PortError> {
     let view = args.view.unwrap_or(View::Runtime);
     let limit = args.limit.unwrap_or(20);
@@ -1366,12 +1377,21 @@ async fn list(
     ))
     .map_err(|_| invalid(ValidationReason::InvalidState))?;
     let scope = ContentDigest::from_bytes(*blake3::hash(&filters).as_bytes());
-    let inner = match &args.cursor {
-        Some(cursor) => Some(call.registry.ability_cursors.lookup(
-            call.auth.principal(),
-            cursor,
-            &scope,
-        )?),
+    let foreign_project = project.as_ref().is_some_and(|proj| {
+        call.auth
+            .pinned_write_space()
+            .is_some_and(|pin| pin != &proj.space_id)
+    });
+    let inner = match opened_cursor {
+        Some((entry_scope, inner)) => {
+            if entry_scope != scope {
+                if foreign_project {
+                    call.commit_external_read();
+                }
+                return Err(invalid(ValidationReason::CursorStale));
+            }
+            Some(inner)
+        }
         None => None,
     };
     let external = matches!(call.target, EgressTarget::ExternalMcp);
@@ -1379,10 +1399,7 @@ async fn list(
     let mut items = Vec::new();
     let mut deferred_taints = Vec::new();
     if let Some(proj) = &project
-        && call
-            .auth
-            .pinned_write_space()
-            .is_some_and(|pin| pin != &proj.space_id)
+        && foreign_project
     {
         let proj_scope = session::space(call, &proj.space_id).await?;
         deferred_taints.push(AbilityTaintCommit::ForeignProject { scope: proj_scope });
@@ -1392,6 +1409,9 @@ async fn list(
         let control_cursor = match inner {
             Some(AbilityCursorInner::Control(token)) => Some(token),
             Some(AbilityCursorInner::ProviderAfter { .. }) => {
+                if foreign_project {
+                    call.commit_external_read();
+                }
                 return Err(invalid(ValidationReason::CursorStale));
             }
             None => None,
@@ -1765,23 +1785,56 @@ pub(super) async fn session_ability_summaries(
             session: (!project_unavailable).then(|| episode.id.clone()),
         },
         episode.project_hint.clone(),
+        None,
     )
     .await
 }
 
 async fn get(call: &mut ToolCallContext<'_>, args: GetArgs) -> Result<Value, PortError> {
+    if args.reference.starts_with("ar1:") {
+        let _: AbilityRef = parse_token(&args.reference, "ar1:", MAX_TOKEN_BYTES)?;
+    } else {
+        let _ = AbilityId::parse(&args.reference)?;
+    }
     let episode = load_episode(call, args.session.as_ref()).await?;
     let project = session::selected_project_for_episode(call, None, episode.as_ref()).await?;
-    let inspection = inspect_with_project(call, &args.reference, project.as_ref())
+    let mut deferred_taints = Vec::new();
+    if let Some(proj) = &project
+        && call
+            .auth
+            .pinned_write_space()
+            .is_some_and(|pin| pin != &proj.space_id)
+    {
+        let proj_scope = session::space(call, &proj.space_id).await?;
+        deferred_taints.push(AbilityTaintCommit::ForeignProject { scope: proj_scope });
+    }
+    let inspection = match inspect_with_project(call, &args.reference, project.as_ref())
         .await
-        .map_err(|error| collapse_provider_error(call, error))?;
+        .map_err(|error| collapse_provider_error(call, error))
+    {
+        Ok(inspection) => inspection,
+        Err(error) => {
+            if !matches!(error, PortError::Domain(DomainError::ResourceNotFound)) {
+                commit_deferred_taints_on_error(call, &deferred_taints);
+            }
+            return Err(error);
+        }
+    };
     if !provider_ability_allowed(call, &inspection, project.as_ref()) {
         return Err(DomainError::ResourceNotFound.into());
     }
-    let body = read_body_inner(call, &inspection.descriptor, project.as_ref(), false)
+    let body = match read_body_inner(call, &inspection.descriptor, project.as_ref(), false)
         .await
-        .map_err(|error| collapse_provider_error(call, error))?;
-    let mut deferred_taints = Vec::new();
+        .map_err(|error| collapse_provider_error(call, error))
+    {
+        Ok(body) => body,
+        Err(error) => {
+            if !matches!(error, PortError::Domain(DomainError::ResourceNotFound)) {
+                commit_deferred_taints_on_error(call, &deferred_taints);
+            }
+            return Err(error);
+        }
+    };
     if let Some(taint) = body.deferred_taint {
         deferred_taints.push(taint);
     }
@@ -2375,6 +2428,12 @@ async fn use_ability(
         (Some(selector), None) | (None, Some(selector)) => selector,
         _ => return Err(invalid(ValidationReason::InvalidQuery)),
     };
+    if selector.trim().is_empty() {
+        return Err(invalid(ValidationReason::InvalidQuery));
+    }
+    if selector.starts_with("ar1:") {
+        let _: AbilityRef = parse_token(&selector, "ar1:", MAX_TOKEN_BYTES)?;
+    }
     let episode = load_episode(call, args.session.as_ref()).await?;
     let project =
         session::selected_project_for_episode(call, args.project.as_deref(), episode.as_ref())
@@ -2390,7 +2449,19 @@ async fn use_ability(
     } else {
         None
     };
-    let descriptor = resolve(call, &selector, kind, project.clone()).await?;
+    let descriptor = match resolve(call, &selector, kind, project.clone()).await {
+        Ok(descriptor) => descriptor,
+        Err(error) => {
+            if !matches!(error, PortError::Domain(DomainError::ResourceNotFound))
+                && foreign_project_taint
+                    .as_ref()
+                    .is_some_and(AbilityTaintCommit::would_taint_branch)
+            {
+                call.commit_external_read();
+            }
+            return Err(error);
+        }
+    };
     let (rendered, mut deferred_taints) = match activation(
         call,
         &descriptor,
@@ -2401,13 +2472,10 @@ async fn use_ability(
     {
         Ok(value) => value,
         Err(error) => {
-            if matches!(
-                &error,
-                PortError::Domain(DomainError::ValidationFailed { diagnostic })
-                    if diagnostic.reason == ValidationReason::BudgetExceeded
-            ) && foreign_project_taint
-                .as_ref()
-                .is_some_and(AbilityTaintCommit::would_taint_branch)
+            if !matches!(error, PortError::Domain(DomainError::ResourceNotFound))
+                && foreign_project_taint
+                    .as_ref()
+                    .is_some_and(AbilityTaintCommit::would_taint_branch)
             {
                 call.commit_external_read();
             }

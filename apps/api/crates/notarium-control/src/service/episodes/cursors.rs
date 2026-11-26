@@ -288,7 +288,7 @@ impl ControlService {
         let hit = budget
             .run(
                 async {
-                    if key.actor != expected_dedup_actor(&auth) {
+                    if !dedup_actor_allowed(&auth, &key.actor) {
                         return Err(DomainError::AccessDenied.into());
                     }
                     if auth.principal().as_str().len() + key.actor.len() + key.request_key.as_str().len()
@@ -371,7 +371,7 @@ impl ControlService {
                     if auth.taint().is_tainted() {
                         return Err(DomainError::CrossSpaceTainted.into());
                     }
-                    if record.key.actor != expected_dedup_actor(&auth) {
+                    if !dedup_actor_allowed(&auth, &record.key.actor) {
                         return Err(DomainError::AccessDenied.into());
                     }
                     if auth.bearer_scope() == Some(BearerScope::Read)
@@ -494,6 +494,13 @@ fn expected_dedup_actor(auth: &notarium_core::auth::EngineAuthContext) -> &str {
         PrincipalKind::AgentRun(run) | PrincipalKind::Keeper(run) => run.as_str(),
         _ => auth.grant().as_str(),
     }
+}
+
+fn dedup_actor_allowed(auth: &notarium_core::auth::EngineAuthContext, actor: &str) -> bool {
+    actor == expected_dedup_actor(auth)
+        || (matches!(auth.kind(), PrincipalKind::DirectHuman)
+            && auth.authorize_human_management().is_ok()
+            && actor == auth.principal().as_str())
 }
 
 fn validate_dedup_key(key: &McpDedupKey) -> Result<(), PortError> {

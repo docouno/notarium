@@ -187,6 +187,9 @@ pub(super) async fn list_children(
                                     "SELECT 1 FROM folder_heads \
                                      WHERE space_id=$1 AND updated_seq>$2 \
                                        AND (parent_folder_id=$3 OR folder_id IN (SELECT value FROM json_each($4))) \
+                                     UNION ALL \
+                                     SELECT 1 FROM folder_aliases \
+                                     WHERE space_id=$1 AND old_parent_folder_id=$3 AND created_seq>$2 \
                                      LIMIT 1",
                                 )
                                 .bind(scope.space_id.as_str())
@@ -201,6 +204,9 @@ pub(super) async fn list_children(
                                     "SELECT 1 FROM folder_heads \
                                      WHERE space_id=$1 AND updated_seq>$2 \
                                        AND (parent_folder_id=$3 OR folder_id = ANY($4)) \
+                                     UNION ALL \
+                                     SELECT 1 FROM folder_aliases \
+                                     WHERE space_id=$1 AND old_parent_folder_id=$3 AND created_seq>$2 \
                                      LIMIT 1",
                                 )
                                 .bind(scope.space_id.as_str())
@@ -559,6 +565,14 @@ pub(super) async fn space_schema(
     store: &CanonicalStore,
     ctx: SpaceContext,
 ) -> Result<BTreeMap<String, FieldSchema>, PortError> {
+    Ok(space_schema_snapshot(store, ctx, None).await?.fields)
+}
+
+pub(super) async fn space_schema_snapshot(
+    store: &CanonicalStore,
+    ctx: SpaceContext,
+    revision: Option<RevisionId>,
+) -> Result<notarium_core::ports::SpaceSchemaSnapshot, PortError> {
     let scope = ctx.scope().clone();
     let auth = ctx.auth().clone();
     store
@@ -571,13 +585,29 @@ pub(super) async fn space_schema(
                     .get(&scope.space_id)
                     .ok_or(DomainError::ResourceNotFound)?;
                 let base = grant.project_root.as_ref().unwrap_or(&space.root_folder_id);
+                let require_all_active = revision.is_none();
                 let facts = FolderAncestryCache::default()
-                    .load_ancestry_tx(tx, &scope.space_id, base, true)
+                    .load_ancestry_tx(tx, &scope.space_id, base, require_all_active)
                     .await?;
+                if !require_all_active && facts.folder_lifecycle == Lifecycle::Purged {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
                 auth.authorize_folder_read(&space.space, base, &facts.ancestors)?;
-                Ok(load_current_space_schema_tx(tx, &scope.space_id)
-                    .await?
-                    .map_or_else(BTreeMap::new, |schema| schema.fields))
+                let loaded = match revision {
+                    Some(rev) => {
+                        super::common::load_space_schema_revision_tx(tx, &scope.space_id, &rev)
+                            .await?
+                            .ok_or(DomainError::ResourceNotFound)?
+                    }
+                    None => match load_current_space_schema_tx(tx, &scope.space_id).await? {
+                        Some(schema) => schema,
+                        None => return Ok(notarium_core::ports::SpaceSchemaSnapshot::default()),
+                    },
+                };
+                Ok(notarium_core::ports::SpaceSchemaSnapshot {
+                    revision: Some(loaded.schema_revision),
+                    fields: loaded.fields,
+                })
             })
         })
         .await
@@ -638,20 +668,13 @@ pub(super) async fn ensure(
         .await?;
     if let Some(replay) = replay {
         ctx.budget.remaining = deadline.remaining(&budget)?;
-        return verify_ensured_folder(
-            store,
-            &ctx,
-            confirmed.is_none().then_some(base),
-            replay.into_committed().value,
-        )
-        .await;
+        return verify_ensured_folder(store, &ctx, replay.into_committed().value).await;
     }
     ctx.budget.remaining = deadline.remaining(&budget)?;
     if confirmed.is_none()
-        && let Some(found) =
-            resolve_with_components(store, &ctx, Some(base.clone()), parts.clone(), false).await?
+        && let Some(found) = authorize_existing_folder_ensure(store, &ctx, &base, &parts).await?
     {
-        return Ok(found.reference);
+        return Ok(found);
     }
     ctx.budget.remaining = deadline.remaining(&budget)?;
 
@@ -687,16 +710,6 @@ pub(super) async fn ensure(
                         existing_prefix_tx(tx, &live, &auth, base.clone(), &parts, None).await?
                     };
                     let missing = &parts[existing_count..];
-                    if missing.is_empty() {
-                        return Err(DomainError::PathConflict {
-                            target: PathTarget {
-                                space_id: scope.space_id,
-                                parent: Some(base),
-                                component: String::new(),
-                            },
-                        }
-                        .into());
-                    }
                     let class = if confirmed.is_some() && move_source.is_none() {
                         DocClass::UserDoc
                     } else {
@@ -709,6 +722,16 @@ pub(super) async fn ensure(
                         .build_resource_facts_tx(tx, &live.space, &folder, class, None, true)
                         .await?;
                     auth.authorize_direct_write(&facts, &facts)?;
+                    if missing.is_empty() {
+                        return Err(DomainError::PathConflict {
+                            target: PathTarget {
+                                space_id: scope.space_id,
+                                parent: Some(base),
+                                component: String::new(),
+                            },
+                        }
+                        .into());
+                    }
                     if ancestry.ancestors.len().saturating_sub(1) + missing.len() > MAX_FOLDER_DEPTH
                     {
                         return Err(DomainError::validation(
@@ -796,13 +819,7 @@ pub(super) async fn ensure(
             let reference = result.into_committed().value;
             if !executed.load(std::sync::atomic::Ordering::SeqCst) {
                 ctx.budget.remaining = deadline.remaining(&budget)?;
-                return verify_ensured_folder(
-                    store,
-                    &ctx,
-                    confirmed.is_none().then_some(base),
-                    reference,
-                )
-                .await;
+                return verify_ensured_folder(store, &ctx, reference).await;
             }
             Ok(reference)
         }
@@ -811,19 +828,54 @@ pub(super) async fn ensure(
             if let Some(step) = confirmed {
                 return confirmed_existing(store, &ctx, step.as_ref(), &parts).await;
             }
-            resolve_with_components(store, &ctx, Some(base), parts, false)
+            authorize_existing_folder_ensure(store, &ctx, &base, &parts)
                 .await?
-                .map(|found| found.reference)
                 .ok_or(DomainError::ResourceNotFound.into())
         }
         Err(err) => Err(err),
     }
 }
 
+async fn authorize_existing_folder_ensure(
+    store: &CanonicalStore,
+    ctx: &SpaceContext,
+    base: &FolderId,
+    parts: &[(String, String)],
+) -> Result<Option<FolderRef>, PortError> {
+    let scope = ctx.scope().clone();
+    let auth = ctx.auth().clone();
+    let base = base.clone();
+    let parts = parts.to_vec();
+    store
+        .with_read_tx_budget(Some(&ctx.budget), |tx| {
+            Box::pin(async move {
+                let space = load_space_record(tx, &scope.space_id).await?;
+                space.scope.check(&scope)?;
+                if space.space.lifecycle != SpaceLifecycle::Active {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+                let (folder, matched) =
+                    existing_prefix_tx(tx, &space, &auth, base, &parts, None).await?;
+                if matched != parts.len() {
+                    return Ok(None);
+                }
+                let class = folder_mutation_class(&auth, &scope.space_id)?;
+                let (facts, _) = FolderAncestryCache::default()
+                    .build_resource_facts_tx(tx, &space.space, &folder, class, None, true)
+                    .await?;
+                auth.authorize_direct_write(&facts, &facts)?;
+                Ok(Some(FolderRef {
+                    space_id: scope.space_id,
+                    folder_id: folder,
+                }))
+            })
+        })
+        .await
+}
+
 async fn verify_ensured_folder(
     store: &CanonicalStore,
     ctx: &SpaceContext,
-    base: Option<FolderId>,
     reference: FolderRef,
 ) -> Result<FolderRef, PortError> {
     let scope = ctx.scope().clone();
@@ -855,7 +907,7 @@ async fn verify_ensured_folder(
                     &auth,
                     &mut folders,
                     &reference.folder_id,
-                    base.as_ref(),
+                    None,
                     false,
                 )
                 .await?;
@@ -970,6 +1022,9 @@ async fn confirmed_existing(
             Box::pin(async move {
                 let space = load_space_record(tx, &scope.space_id).await?;
                 space.scope.check(&scope)?;
+                if space.space.lifecycle != SpaceLifecycle::Active {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
                 crate::chats::verify_confirmed_chat_step_tx(
                     tx,
                     &auth,
@@ -984,6 +1039,19 @@ async fn confirmed_existing(
                 if matched != parts.len() {
                     return Err(DomainError::ResourceNotFound.into());
                 }
+                let move_source = step.destination().and_then(|d| d.move_source.as_ref());
+                let class = if move_source.is_none() {
+                    DocClass::UserDoc
+                } else {
+                    folder_mutation_class(&auth, &scope.space_id)?
+                };
+                if let Some(source) = move_source {
+                    check_move_source_tx(tx, &space, &auth, source).await?;
+                }
+                let (facts, _) = FolderAncestryCache::default()
+                    .build_resource_facts_tx(tx, &space.space, &folder_id, class, None, true)
+                    .await?;
+                auth.authorize_direct_write(&facts, &facts)?;
                 Ok(FolderRef {
                     space_id: scope.space_id,
                     folder_id,

@@ -741,6 +741,14 @@ impl NoteReadPort for TestEngine {
         Box::pin(self.0.space_schema(ctx))
     }
 
+    fn space_schema_snapshot(
+        &self,
+        ctx: SpaceContext,
+        revision: Option<RevisionId>,
+    ) -> PortFuture<'_, SpaceSchemaSnapshot> {
+        Box::pin(self.0.space_schema_snapshot(ctx, revision))
+    }
+
     fn project_note_counts(
         &self,
         ctx: SpaceContext,

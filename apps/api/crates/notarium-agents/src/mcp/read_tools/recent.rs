@@ -54,6 +54,17 @@ pub(super) async fn recent(
                 Err(error) => return Err(error),
             };
             if let Some(sel) = selection {
+                if let Some(required) = sel.project_only {
+                    read_scope = match read_scope.restrict_to_project(&required) {
+                        Ok(narrowed) => narrowed,
+                        Err(_) => continue,
+                    };
+                }
+                if foreign_space && targeted_project {
+                    // Targeting a consented foreign project observes that Space even
+                    // when allowed classes leave no readable classes.
+                    call.auth.taint().mark_external_read();
+                }
                 read_scope = read_scope.restrict_read_classes(&sel.policy.allowed_classes)?;
                 if read_scope
                     .auth()
@@ -62,12 +73,6 @@ pub(super) async fn recent(
                     .is_none_or(|grant| grant.read_classes.is_empty())
                 {
                     continue;
-                }
-                if let Some(required) = sel.project_only {
-                    read_scope = match read_scope.restrict_to_project(&required) {
-                        Ok(narrowed) => narrowed,
-                        Err(_) => continue,
-                    };
                 }
             }
         }

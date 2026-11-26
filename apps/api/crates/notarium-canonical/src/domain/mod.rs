@@ -250,6 +250,14 @@ impl CanonicalStore {
         folder_paths::space_schema(self, ctx).await
     }
 
+    pub async fn space_schema_snapshot(
+        &self,
+        ctx: SpaceContext,
+        revision: Option<notarium_core::ids::RevisionId>,
+    ) -> Result<notarium_core::ports::SpaceSchemaSnapshot, PortError> {
+        folder_paths::space_schema_snapshot(self, ctx, revision).await
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub async fn prepare_agent_run_rollback(
         &self,
