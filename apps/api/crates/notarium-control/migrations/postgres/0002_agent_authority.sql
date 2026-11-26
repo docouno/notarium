@@ -35,3 +35,6 @@ CREATE INDEX attachment_target_approved_id ON v1_control.provider_attachments(ta
 CREATE INDEX call_run ON v1_control.provider_call_log(run_id,call_id);
 CREATE INDEX ability_trail_destination ON v1_control.ability_placement_trail(destination_placement,destination_id);
 CREATE INDEX ability_preference_placement ON v1_control.ability_preferences(placement,ability_id,owner_id);
+CREATE INDEX favorite_note_order ON v1_control.favorites(owner_id,rank,space_id,entity_id)
+    WHERE entity_kind = 'note';
+CREATE INDEX context_order_lookup ON v1_control.context_order(target_kind,target_id,entry_kind,entry_ref,rank);

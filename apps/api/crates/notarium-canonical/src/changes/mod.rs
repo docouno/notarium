@@ -845,6 +845,14 @@ impl<'a> ChangeCaller<'a> {
                 return Err(DomainError::ResourceNotFound);
             }
             sctx.scope().check(target_scope)?;
+            if sctx
+                .auth()
+                .spaces()
+                .get(&target_scope.space_id)
+                .is_none_or(|grant| grant.read_classes.is_empty())
+            {
+                return Err(DomainError::ResourceNotFound);
+            }
         }
         Ok(())
     }
@@ -1626,8 +1634,8 @@ impl CanonicalStore {
                                 }
 
                                 if let Some(auth) = &auth_in
-                                    && (auth.authorize_read(&live_facts).is_err()
-                                        || auth.authorize_read(&snap_facts).is_err())
+                                    && (auth.can_view_resource(&live_facts).is_err()
+                                        || auth.can_view_resource(&snap_facts).is_err())
                                 {
                                     continue;
                                 }
@@ -1640,6 +1648,13 @@ impl CanonicalStore {
                                         .clone();
                                     next_seed_pos = Some(SeedPosition::NotesAfter(last_id));
                                     break 'notes_scan;
+                                }
+
+                                if let Some(auth) = &auth_in
+                                    && (auth.authorize_read(&live_facts).is_err()
+                                        || auth.authorize_read(&snap_facts).is_err())
+                                {
+                                    continue;
                                 }
 
                                 let digest = note_meta

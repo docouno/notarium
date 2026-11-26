@@ -85,3 +85,6 @@ CREATE INDEX attachment_target_approved_id ON provider_attachments(target_space,
 CREATE INDEX call_run ON provider_call_log(run_id,call_id);
 CREATE INDEX ability_trail_destination ON ability_placement_trail(destination_placement,destination_id);
 CREATE INDEX ability_preference_placement ON ability_preferences(placement,ability_id,owner_id);
+CREATE INDEX favorite_note_order ON favorites(owner_id,rank,space_id,entity_id)
+    WHERE entity_kind = 'note';
+CREATE INDEX context_order_lookup ON context_order(target_kind,target_id,entry_kind,entry_ref,rank);

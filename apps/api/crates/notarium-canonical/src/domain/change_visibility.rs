@@ -307,7 +307,23 @@ impl<'a> ChangeVisibility<'a> {
         let mut computed_provenance: Option<NoteProvenance> = None;
         let allowed: Result<(), PortError> = async {
             match &change.entity {
-                EntityId::Note(_) if self.all_notes_visible => {
+                EntityId::Note(note) if self.all_notes_visible => {
+                    if change.lifecycle != Lifecycle::Purged {
+                        let fenced = match self.is_preloaded_fenced(note) {
+                            Some(fenced) => fenced,
+                            None => {
+                                crate::runtime::is_note_purge_fenced_tx(
+                                    tx,
+                                    &space.id,
+                                    note.as_str(),
+                                )
+                                .await?
+                            }
+                        };
+                        if fenced {
+                            return Err(DomainError::ResourceNotFound.into());
+                        }
+                    }
                     self.auth
                         .authorize_folder_read(space, &record.root_folder_id, &[])?;
                 }

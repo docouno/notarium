@@ -635,12 +635,13 @@ comparison and revision invalidation keep concurrent edits coherent. Consumers'
 content permissions remain independent. Deletion removes dangling order entries.
 
 Bootstrap selection accepts an optional current Space. It must match an available
-saved project; otherwise the caller must explicitly update the episode. Selection
-orders project, Space, personal context and favorites, retaining each NoteRef's
-first occurrence via bounded in-memory deduplication over indexed SQL reads before
-keyset paging. Each page checks
-at most 200 candidate notes; an empty filtered page can still have a continuation.
-Folder favorites are never expanded into a corpus. Cursors bind authority, episode
+saved project; otherwise the caller must explicitly update the episode. Selection orders project, Space, personal context and favorites, retaining each
+NoteRef's first occurrence via bounded in-memory deduplication over indexed SQL
+reads before keyset paging. Scope queries and favorite scans are bounded at
+4,096 candidate rows per page; unauthorized or out-of-project favorites are
+skipped without emitting empty pages or disclosing their count via
+`unavailable` or continuations. Folder favorites are never expanded into a
+corpus. Cursors bind authority, episode
 selection and metadata revisions. `users.metadata_revision` changes with reference
 preferences; the separate account CAS revision also changes for acknowledgements,
 which do not invalidate an unchanged preference page.

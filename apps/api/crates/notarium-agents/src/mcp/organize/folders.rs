@@ -242,14 +242,11 @@ impl FolderAddress {
         call: &ToolCallContext<'_>,
         path: &str,
     ) -> Result<FolderSnapshot, PortError> {
-        let root_relative = path.starts_with('/');
         let path = path.trim_matches('/');
         let (base, relative) = match &self.project {
             Some(project) => {
                 if let Some(suffix) = corpus::strip_folder_prefix(path, &project.path) {
                     (Some(project.reference.folder_id.clone()), suffix)
-                } else if root_relative {
-                    (None, path.to_owned())
                 } else {
                     (Some(project.reference.folder_id.clone()), path.to_owned())
                 }

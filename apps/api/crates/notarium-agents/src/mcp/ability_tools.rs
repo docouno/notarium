@@ -2506,6 +2506,9 @@ pub async fn bind_chat_role(
     }
     if episode.active_role.as_ref() == Some(&ability.reference)
         && episode.project_hint.as_ref() == project
+        && !episode
+            .diagnostics
+            .contains(&notarium_core::ports::EpisodeDiagnostic::ProjectUnavailable)
     {
         return Ok(());
     }
@@ -2591,6 +2594,11 @@ async fn use_ability(
             return Err(error);
         }
     };
+    if kind == AbilityKind::Role
+        && !role_placement_matches_project(&descriptor.reference.placement, project.as_ref())
+    {
+        return Err(DomainError::ResourceNotFound.into());
+    }
     let (rendered, mut deferred_taints) = match activation(
         call,
         &descriptor,
@@ -2643,6 +2651,9 @@ pub(super) async fn validate_session_role(
     project: Option<&FolderRef>,
 ) -> Result<(), PortError> {
     let descriptor = resolve(call, selector, AbilityKind::Role, project.cloned()).await?;
+    if !role_placement_matches_project(&descriptor.reference.placement, project) {
+        return Err(DomainError::ResourceNotFound.into());
+    }
     let body = read_body_inner(call, &descriptor, project, false)
         .await
         .map_err(|error| collapse_provider_error(call, error))?;
@@ -2670,7 +2681,11 @@ pub(super) async fn activate_session_role(
         session::selected_project_for_hint(call, None, episode.project_hint.as_ref()).await?
     };
     let descriptor = if let Some(selector) = explicit {
-        resolve(call, selector, AbilityKind::Role, project.clone()).await?
+        let descriptor = resolve(call, selector, AbilityKind::Role, project.clone()).await?;
+        if !role_placement_matches_project(&descriptor.reference.placement, project.as_ref()) {
+            return Err(DomainError::ResourceNotFound.into());
+        }
+        descriptor
     } else {
         let Some(reference) = &episode.active_role else {
             return Ok(None);

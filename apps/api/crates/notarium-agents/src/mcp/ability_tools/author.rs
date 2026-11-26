@@ -415,7 +415,6 @@ pub(super) async fn create(
     if call.auth.taint().is_tainted() {
         return Err(DomainError::CrossSpaceTainted.into());
     }
-    load_episode(call, args.session.as_ref()).await?;
     let kind = AbilityKind::from(args.kind);
     let slug = unicode::lookup_key(&args.name);
     unicode::validate_component(&slug)?;
@@ -425,12 +424,23 @@ pub(super) async fn create(
     if slug.is_empty() || slug.len() > 128 || is_reserved_ability_name(&slug) {
         return Err(invalid(ValidationReason::InvalidQuery));
     }
+    if args.description.trim().is_empty() {
+        return Err(invalid(ValidationReason::InvalidQuery));
+    }
+    unicode::validate_content(&args.description)?;
+    unicode::validate_content(&args.instructions)?;
     let attachments = args.attachments.as_deref().unwrap_or_default();
     if kind == AbilityKind::Skill
         && (!attachments.is_empty() || matches!(args.placement, Placement::Project { .. }))
     {
         return Err(invalid(ValidationReason::ScopeMismatch));
     }
+    for attachment in attachments {
+        if let Some(label) = &attachment.label {
+            unicode::validate_content(label)?;
+        }
+    }
+    load_episode(call, args.session.as_ref()).await?;
     let mut plan_replayed = true;
     let plan: CreatePlan = call
         .journal("create-ability-plan", || async {
@@ -866,6 +876,22 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
     }
     if authored && args.version_token.is_none() {
         return Err(invalid(ValidationReason::InvalidQuery));
+    }
+    if let Some(description) = &args.description {
+        if description.trim().is_empty() {
+            return Err(invalid(ValidationReason::InvalidQuery));
+        }
+        unicode::validate_content(description)?;
+    }
+    if let Some(instructions) = &args.instructions {
+        unicode::validate_content(instructions)?;
+    }
+    if let Some(attachments) = &args.attachments {
+        for attachment in attachments {
+            if let Some(label) = &attachment.label {
+                unicode::validate_content(label)?;
+            }
+        }
     }
     load_episode(call, args.session.as_ref()).await?;
     let mut plan_replayed = true;

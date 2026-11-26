@@ -3625,6 +3625,9 @@ pub(crate) async fn accept_batch_impl(
     space_rec.scope.check(ctx.scope())?;
 
     if request.items.is_empty() {
+        if ctx.confirmed_chat_step().is_some() {
+            return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
+        }
         if space_rec.space.lifecycle != notarium_core::auth::SpaceLifecycle::Active {
             return Err(DomainError::ResourceNotFound.into());
         }
@@ -3639,6 +3642,10 @@ pub(crate) async fn accept_batch_impl(
         }
         if grant.write_classes.is_empty() {
             return Err(DomainError::SpaceReadOnly.into());
+        }
+        if let Some(effect) = ctx.canonical_effect() {
+            let lease = effect.begin().await?;
+            lease.check()?;
         }
         return Ok(BatchResult {
             items: Vec::new(),
@@ -4655,6 +4662,9 @@ pub(crate) async fn link_many_impl(
         .await??;
     space.scope.check(ctx.scope())?;
     if request.items.is_empty() {
+        if ctx.confirmed_chat_step().is_some() {
+            return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
+        }
         if space.space.lifecycle != notarium_core::auth::SpaceLifecycle::Active {
             return Err(DomainError::ResourceNotFound.into());
         }
@@ -4669,6 +4679,10 @@ pub(crate) async fn link_many_impl(
         }
         if grant.write_classes.is_empty() {
             return Err(DomainError::SpaceReadOnly.into());
+        }
+        if let Some(effect) = ctx.canonical_effect() {
+            let lease = effect.begin().await?;
+            lease.check()?;
         }
         return Ok(BatchResult {
             items: Vec::new(),

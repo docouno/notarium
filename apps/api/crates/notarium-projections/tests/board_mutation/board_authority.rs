@@ -50,6 +50,7 @@ pub(super) async fn exercise(store: &CanonicalStore, runtime: &ProjectorRuntime)
         store, runtime,
     ))
     .await;
+    Box::pin(rollback_case_7g_clear_overlay_ordering(store, runtime)).await;
     Box::pin(keeper_readonly_abilities_isolation_on_changes_events_and_graph(store, runtime)).await;
 }
 
@@ -4855,6 +4856,443 @@ async fn rollback_case_7f_materialization_and_partial_retry(
     let _ = fd_x_m;
 }
 
+#[inline(never)]
+async fn rollback_case_7g_clear_overlay_ordering(
+    store: &CanonicalStore,
+    runtime: &ProjectorRuntime,
+) {
+    use notarium_core::ports::EditNote;
+
+    let (scope, owner) = open_space(store).await;
+    let engine = runtime.engine();
+    let body = "group_by: status\nfilter: {exists: status}\n";
+
+    let edit_status =
+        |ctx: &SpaceContext, note: &NoteRevision, current_carrier: &str, status: &str| {
+            let store = store.clone();
+            let ctx = ctx.clone();
+            let note_id = note.note.clone();
+            let rev = note.revision.clone();
+            let carrier = current_carrier.to_owned();
+            let status_val = status.to_owned();
+            async move {
+                let plan = notarium_syntax::frontmatter::set_field(
+                    &carrier,
+                    DocClass::UserDoc,
+                    "status",
+                    YamlValue::String(status_val),
+                )
+                .unwrap();
+                let mut m = mutation(
+                    &ctx,
+                    EditNote {
+                        note: note_id,
+                        plan,
+                    },
+                );
+                m.preconditions.revision = Some(rev);
+                store.edit_note(ctx, m).await.unwrap().value
+            }
+        };
+
+    // Trace 1: [A, B, C] unranked -> A moved to done, B edited to doing + moved to done -> rollback restores [A, B, C].
+    let p1 = folder(store, &owner, None, "rb-7g-p1", true).await.unwrap();
+    let (v1, v1_rev) = create_view(
+        store,
+        &owner,
+        &p1,
+        "rb-7g-v1",
+        "board",
+        "{scope: project}",
+        body,
+    )
+    .await;
+    let t1_a = create_note(
+        store,
+        &owner,
+        Some(p1.clone()),
+        "01-a",
+        "---\nstatus: todo\n---\n".into(),
+    )
+    .await;
+    let t1_b = create_note(
+        store,
+        &owner,
+        Some(p1.clone()),
+        "02-b",
+        "---\nstatus: todo\n---\n".into(),
+    )
+    .await;
+    let t1_c = create_note(
+        store,
+        &owner,
+        Some(p1),
+        "03-c",
+        "---\nstatus: todo\n---\n".into(),
+    )
+    .await;
+    sync(store, runtime, &scope).await;
+    let pre1: Vec<NoteId> = query(&engine, owner.clone(), v1.clone())
+        .await
+        .unwrap()
+        .rows
+        .items
+        .into_iter()
+        .map(|r| r.card.document.provenance().reference().note_id.clone())
+        .collect();
+    let rev_for = |id: &NoteId, list: &[&NoteRevision]| -> NoteRevision {
+        (*list.iter().find(|n| &n.note == id).unwrap()).clone()
+    };
+    let (n1_a, n1_b, _n1_c) = (
+        rev_for(&pre1[0], &[&t1_a, &t1_b, &t1_c]),
+        rev_for(&pre1[1], &[&t1_a, &t1_b, &t1_c]),
+        rev_for(&pre1[2], &[&t1_a, &t1_b, &t1_c]),
+    );
+    let r1 = AgentRunId::from_bytes(random_bytes());
+    let ag1 = super::agent(&owner, r1.clone(), ChatAudience::Personal);
+    store
+        .move_board_card(
+            ag1.clone(),
+            mutation(
+                &ag1,
+                MoveBoardCard {
+                    view: v1.clone(),
+                    note: n1_a.note.clone(),
+                    group: group("done"),
+                    before: None,
+                    after: None,
+                    fields: BTreeMap::from([(
+                        "status".into(),
+                        Some(YamlValue::String("done".into())),
+                    )]),
+                    expected_note: n1_a.revision.clone(),
+                    expected_view: v1_rev.revision.clone(),
+                    expected_rank: RankExpectation::Absent,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let n1_b_doing = edit_status(&ag1, &n1_b, "---\nstatus: todo\n---\n", "doing").await;
+    sync(store, runtime, &scope).await;
+    store
+        .move_board_card(
+            ag1.clone(),
+            mutation(
+                &ag1,
+                MoveBoardCard {
+                    view: v1.clone(),
+                    note: n1_b.note.clone(),
+                    group: group("done"),
+                    before: None,
+                    after: None,
+                    fields: BTreeMap::from([(
+                        "status".into(),
+                        Some(YamlValue::String("done".into())),
+                    )]),
+                    expected_note: n1_b_doing.revision.clone(),
+                    expected_view: v1_rev.revision.clone(),
+                    expected_rank: RankExpectation::Absent,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    sync(store, runtime, &scope).await;
+    let prep1 = store
+        .prepare_agent_run_rollback(owner.clone(), r1)
+        .await
+        .unwrap();
+    store
+        .rollback_agent_run(owner.clone(), mutation(&owner, prep1))
+        .await
+        .unwrap();
+    sync(store, runtime, &scope).await;
+    let post1: Vec<NoteId> = query(&engine, owner.clone(), v1)
+        .await
+        .unwrap()
+        .rows
+        .items
+        .into_iter()
+        .filter(|r| r.group == group("todo"))
+        .map(|r| r.card.document.provenance().reference().note_id.clone())
+        .collect();
+    assert_eq!(post1, pre1, "Trace 1 rollback must restore exact [A, B, C]");
+
+    // Trace 2: [A, B, C] unranked -> B moved to done, A edited to doing + moved to done -> rollback restores [A, B, C].
+    let p2 = folder(store, &owner, None, "rb-7g-p2", true).await.unwrap();
+    let (v2, v2_rev) = create_view(
+        store,
+        &owner,
+        &p2,
+        "rb-7g-v2",
+        "board",
+        "{scope: project}",
+        body,
+    )
+    .await;
+    let t2_a = create_note(
+        store,
+        &owner,
+        Some(p2.clone()),
+        "01-a",
+        "---\nstatus: todo\n---\n".into(),
+    )
+    .await;
+    let t2_b = create_note(
+        store,
+        &owner,
+        Some(p2.clone()),
+        "02-b",
+        "---\nstatus: todo\n---\n".into(),
+    )
+    .await;
+    let t2_c = create_note(
+        store,
+        &owner,
+        Some(p2),
+        "03-c",
+        "---\nstatus: todo\n---\n".into(),
+    )
+    .await;
+    sync(store, runtime, &scope).await;
+    let pre2: Vec<NoteId> = query(&engine, owner.clone(), v2.clone())
+        .await
+        .unwrap()
+        .rows
+        .items
+        .into_iter()
+        .map(|r| r.card.document.provenance().reference().note_id.clone())
+        .collect();
+    let (n2_a, n2_b) = (
+        rev_for(&pre2[0], &[&t2_a, &t2_b, &t2_c]),
+        rev_for(&pre2[1], &[&t2_a, &t2_b, &t2_c]),
+    );
+    let r2 = AgentRunId::from_bytes(random_bytes());
+    let ag2 = super::agent(&owner, r2.clone(), ChatAudience::Personal);
+    store
+        .move_board_card(
+            ag2.clone(),
+            mutation(
+                &ag2,
+                MoveBoardCard {
+                    view: v2.clone(),
+                    note: n2_b.note.clone(),
+                    group: group("done"),
+                    before: None,
+                    after: None,
+                    fields: BTreeMap::from([(
+                        "status".into(),
+                        Some(YamlValue::String("done".into())),
+                    )]),
+                    expected_note: n2_b.revision.clone(),
+                    expected_view: v2_rev.revision.clone(),
+                    expected_rank: RankExpectation::Absent,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let n2_a_doing = edit_status(&ag2, &n2_a, "---\nstatus: todo\n---\n", "doing").await;
+    sync(store, runtime, &scope).await;
+    store
+        .move_board_card(
+            ag2.clone(),
+            mutation(
+                &ag2,
+                MoveBoardCard {
+                    view: v2.clone(),
+                    note: n2_a.note.clone(),
+                    group: group("done"),
+                    before: None,
+                    after: None,
+                    fields: BTreeMap::from([(
+                        "status".into(),
+                        Some(YamlValue::String("done".into())),
+                    )]),
+                    expected_note: n2_a_doing.revision.clone(),
+                    expected_view: v2_rev.revision.clone(),
+                    expected_rank: RankExpectation::Absent,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    sync(store, runtime, &scope).await;
+    let prep2 = store
+        .prepare_agent_run_rollback(owner.clone(), r2)
+        .await
+        .unwrap();
+    store
+        .rollback_agent_run(owner.clone(), mutation(&owner, prep2))
+        .await
+        .unwrap();
+    sync(store, runtime, &scope).await;
+    let post2: Vec<NoteId> = query(&engine, owner.clone(), v2)
+        .await
+        .unwrap()
+        .rows
+        .items
+        .into_iter()
+        .filter(|r| r.group == group("todo"))
+        .map(|r| r.card.document.provenance().reference().note_id.clone())
+        .collect();
+    assert_eq!(post2, pre2, "Trace 2 rollback must restore exact [A, B, C]");
+
+    // Trace 3: [R(human rank), A, B] on deterministic title sort -> A edited to doing + moved to done, B moved to done -> rollback restores [R, A, B].
+    let p3 = folder(store, &owner, None, "rb-7g-p3", true).await.unwrap();
+    let sort_body = "group_by: status\nfilter: {exists: status}\nsort: [{field: title, type: string, direction: asc}]\n";
+    let (v3, v3_rev) = create_view(
+        store,
+        &owner,
+        &p3,
+        "rb-7g-v3",
+        "board",
+        "{scope: project}",
+        sort_body,
+    )
+    .await;
+    let t3_r = create_note(
+        store,
+        &owner,
+        Some(p3.clone()),
+        "99-r",
+        "---\ntitle: 99-r\nstatus: doing\n---\n".into(),
+    )
+    .await;
+    sync(store, runtime, &scope).await;
+    // Human moves R from doing to empty todo -> R gets a human rank overlay.
+    store
+        .move_board_card(
+            owner.clone(),
+            mutation(
+                &owner,
+                MoveBoardCard {
+                    view: v3.clone(),
+                    note: t3_r.note.clone(),
+                    group: group("todo"),
+                    before: None,
+                    after: None,
+                    fields: BTreeMap::from([(
+                        "status".into(),
+                        Some(YamlValue::String("todo".into())),
+                    )]),
+                    expected_note: t3_r.revision.clone(),
+                    expected_view: v3_rev.revision.clone(),
+                    expected_rank: RankExpectation::Absent,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    // Now create A and B unranked in todo -> [R(ranked), A(unranked), B(unranked)].
+    let n3_a = create_note(
+        store,
+        &owner,
+        Some(p3.clone()),
+        "01-a",
+        "---\ntitle: 01-a\nstatus: todo\n---\n".into(),
+    )
+    .await;
+    let n3_b = create_note(
+        store,
+        &owner,
+        Some(p3),
+        "02-b",
+        "---\ntitle: 02-b\nstatus: todo\n---\n".into(),
+    )
+    .await;
+    sync(store, runtime, &scope).await;
+    let pre3 = vec![t3_r.note.clone(), n3_a.note.clone(), n3_b.note.clone()];
+    let initial3: Vec<NoteId> = query(&engine, owner.clone(), v3.clone())
+        .await
+        .unwrap()
+        .rows
+        .items
+        .into_iter()
+        .filter(|r| r.group == group("todo"))
+        .map(|r| r.card.document.provenance().reference().note_id.clone())
+        .collect();
+    assert_eq!(initial3, pre3, "Trace 3 initial order must be [R, A, B]");
+    let r3 = AgentRunId::from_bytes(random_bytes());
+    let ag3 = super::agent(&owner, r3.clone(), ChatAudience::Personal);
+    let n3_a_doing = edit_status(
+        &ag3,
+        &n3_a,
+        "---\ntitle: 01-a\nstatus: todo\n---\n",
+        "doing",
+    )
+    .await;
+    sync(store, runtime, &scope).await;
+    store
+        .move_board_card(
+            ag3.clone(),
+            mutation(
+                &ag3,
+                MoveBoardCard {
+                    view: v3.clone(),
+                    note: n3_a.note.clone(),
+                    group: group("done"),
+                    before: None,
+                    after: None,
+                    fields: BTreeMap::from([(
+                        "status".into(),
+                        Some(YamlValue::String("done".into())),
+                    )]),
+                    expected_note: n3_a_doing.revision.clone(),
+                    expected_view: v3_rev.revision.clone(),
+                    expected_rank: RankExpectation::Absent,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    sync(store, runtime, &scope).await;
+    store
+        .move_board_card(
+            ag3.clone(),
+            mutation(
+                &ag3,
+                MoveBoardCard {
+                    view: v3.clone(),
+                    note: n3_b.note.clone(),
+                    group: group("done"),
+                    before: None,
+                    after: None,
+                    fields: BTreeMap::from([(
+                        "status".into(),
+                        Some(YamlValue::String("done".into())),
+                    )]),
+                    expected_note: n3_b.revision.clone(),
+                    expected_view: v3_rev.revision.clone(),
+                    expected_rank: RankExpectation::Absent,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    sync(store, runtime, &scope).await;
+    let prep3 = store
+        .prepare_agent_run_rollback(owner.clone(), r3)
+        .await
+        .unwrap();
+    store
+        .rollback_agent_run(owner.clone(), mutation(&owner, prep3))
+        .await
+        .unwrap();
+    sync(store, runtime, &scope).await;
+    let post3: Vec<NoteId> = query(&engine, owner.clone(), v3)
+        .await
+        .unwrap()
+        .rows
+        .items
+        .into_iter()
+        .filter(|r| r.group == group("todo"))
+        .map(|r| r.card.document.provenance().reference().note_id.clone())
+        .collect();
+    assert_eq!(post3, pre3, "Trace 3 rollback must restore exact [R, A, B]");
+}
+
 async fn keeper_readonly_abilities_isolation_on_changes_events_and_graph(
     store: &CanonicalStore,
     runtime: &ProjectorRuntime,
@@ -5131,6 +5569,30 @@ async fn keeper_readonly_abilities_isolation_on_changes_events_and_graph(
             ))
         ),
         "whole-space Keeper must not bypass Skill isolation on Superclusters graph, got {graph_err:?}"
+    );
+    let lens_cluster_err = engine
+        .query_graph(
+            keeper.clone(),
+            GraphQuery {
+                tier: GraphTier::Lens {
+                    cluster: Some(notarium_core::ids::ClusterId::from_bytes([1; 16])),
+                    project: None,
+                    tags: Vec::new(),
+                },
+                filter: FieldFilterAstV1 {
+                    version: 1,
+                    predicate: Predicate::All(Vec::new()),
+                },
+                causal: None,
+            },
+        )
+        .await;
+    assert!(
+        matches!(
+            lens_cluster_err,
+            Err(PortError::Domain(DomainError::AccessDenied))
+        ),
+        "scoped Keeper must not bypass cluster isolation on GraphTier::Lens {{ cluster: Some(..) }}, got {lens_cluster_err:?}"
     );
 
     // 4. Board planner must not admit a Keeper onto a board sourcing DocClass::Skill.

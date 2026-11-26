@@ -275,11 +275,132 @@ async fn wide_subtree_probes_children_by_parent_before_analyze() {
     assert!(
         matches!(
             store
-                .link_many(write_only_ctx, LinkBatch { items: Vec::new() })
+                .link_many(write_only_ctx.clone(), LinkBatch { items: Vec::new() })
                 .await,
             Err(PortError::Domain(DomainError::ResourceNotFound))
         ),
         "empty link_many by write-only grant must fail ResourceNotFound"
+    );
+    // Write-only grants (`read_classes.is_empty()`) must also be rejected on read_changes
+    // (both Log and Seed) and recent_activity without disclosing last_seq or command boundaries.
+    let wo_log_err = store
+        .read_changes(
+            write_only_ctx.clone(),
+            notarium_core::ports::ChangeRead::Log {
+                after: notarium_core::receipt::ChangeCursor {
+                    scope: scope.clone(),
+                    after: SpaceSeq::ZERO,
+                },
+                through: sqlite_cut,
+                limit: notarium_core::ports::PageLimit::new(10).unwrap(),
+            },
+        )
+        .await;
+    assert!(
+        matches!(
+            wo_log_err,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ),
+        "write-only read_changes(Log) must fail ResourceNotFound, got {wo_log_err:?}"
+    );
+    let wo_seed_err = store
+        .read_changes(
+            write_only_ctx.clone(),
+            notarium_core::ports::ChangeRead::Seed {
+                scope: scope.clone(),
+                cutoff: None,
+                limit: notarium_core::ports::PageLimit::new(10).unwrap(),
+            },
+        )
+        .await;
+    assert!(
+        matches!(
+            wo_seed_err,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ),
+        "write-only read_changes(Seed) must fail ResourceNotFound, got {wo_seed_err:?}"
+    );
+    let wo_act_err = store
+        .recent_activity(
+            write_only_ctx,
+            notarium_core::ports::ChangeRead::Log {
+                after: notarium_core::receipt::ChangeCursor {
+                    scope: scope.clone(),
+                    after: SpaceSeq::ZERO,
+                },
+                through: sqlite_cut,
+                limit: notarium_core::ports::PageLimit::new(10).unwrap(),
+            },
+        )
+        .await;
+    assert!(
+        matches!(
+            wo_act_err,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ),
+        "write-only recent_activity must fail ResourceNotFound, got {wo_act_err:?}"
+    );
+
+    // Hard-purged EncryptedNote must NOT leak pre-purge Create/Update rows in recent_activity
+    // even for a full-Space caller (`all_notes_visible == true`).
+    let purged_enc_id = NoteId::from_bytes([0xE6; 16]);
+    store
+        .create_note(
+            owner_space_ctx.clone(),
+            next_mutation(
+                &scope,
+                &owner,
+                CreateNote {
+                    folder_page: false,
+                    note: purged_enc_id.clone(),
+                    parent: None,
+                    slug: "enc-purge-activity-check".into(),
+                    class: DocClass::EncryptedNote,
+                    carrier: super::valid_encrypted_carrier("Purged Secret"),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    store
+        .delete_note(
+            owner_space_ctx.clone(),
+            next_mutation(
+                &scope,
+                &owner,
+                DeleteNote {
+                    note: purged_enc_id.clone(),
+                    disposition: DeleteDisposition::Purge,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let after_purge_cut = store.read_space(&scope.space_id).await.unwrap().last_seq;
+    let notarium_core::ports::ChangeReadResult::Log(act_page) = store
+        .recent_activity(
+            owner_space_ctx,
+            notarium_core::ports::ChangeRead::Log {
+                after: notarium_core::receipt::ChangeCursor {
+                    scope: scope.clone(),
+                    after: sqlite_cut,
+                },
+                through: after_purge_cut,
+                limit: notarium_core::ports::PageLimit::new(64).unwrap(),
+            },
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("expected ChangeReadResult::Log from recent_activity");
+    };
+    assert!(
+        !act_page.changes.iter().any(|ch| {
+            ch.entity == notarium_core::ports::EntityId::Note(purged_enc_id.clone())
+                && ch.lifecycle != notarium_core::model::Lifecycle::Purged
+        }),
+        "recent_activity must not leak pre-purge history of hard-purged EncryptedNote: {:?}",
+        act_page.changes
     );
     {
         let conn = rusqlite::Connection::open(local.data_root().canonical()).unwrap();
@@ -316,8 +437,63 @@ async fn wide_subtree_probes_children_by_parent_before_analyze() {
             include_str!("../../src/domain/rollback/prerun_rank.sqlite.sql");
         const COMPACTION_CANDIDATES_SQL: &str =
             include_str!("../../src/chats/latest_compaction_candidates.sqlite.sql");
+        const PROJECT_ABILITY_SUBTREE_SQL: &str =
+            include_str!("../../src/catalog/project_ability_subtree_version.sql");
         conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
         {
+            let mut nstmt = conn
+                .prepare(
+                    "INSERT INTO note_heads(space_id,note_id,parent_folder_id,slug,slug_fold,title,title_fold,doc_class,ability_id,head_rev_id,content_blake3,byte_size,lifecycle_state,visibility_mask,settlement_successor_id,created_seq,updated_seq,created_at_sec,created_at_nsec,updated_at_sec,updated_at_nsec,last_actor_id)
+                     VALUES (?1,?2,?3,?4,?4,?4,?4,'user-doc',NULL,?5,?6,10,'active',0,NULL,?7,?7,1,0,1,0,'act_1')",
+                )
+                .unwrap();
+            let digest_bytes = [0xABu8; 32];
+            for i in 1..=500i64 {
+                nstmt
+                    .execute(rusqlite::params![
+                        scope.space_id.as_str(),
+                        format!("nt_ab_{i:04}"),
+                        source.as_str(),
+                        format!("ab-note-{i:04}"),
+                        format!("rev_ab_{i:04}"),
+                        digest_bytes.as_slice(),
+                        1000 + i,
+                    ])
+                    .unwrap();
+            }
+            let mut apstmt = conn
+                .prepare(
+                    "INSERT INTO ability_packages(space_id,ability_id,kind,slug_fold,entrypoint_note_id,manifest_rev_id,resource_manifest_json,lifecycle_state,created_seq,updated_seq)
+                     VALUES (?1,?2,'skill',?3,?4,?5,'{}','active',?6,?6)",
+                )
+                .unwrap();
+            for i in 1..=3i64 {
+                apstmt
+                    .execute(rusqlite::params![
+                        scope.space_id.as_str(),
+                        format!("ab_pkg_{i:02}"),
+                        format!("pkg-{i:02}"),
+                        format!("nt_ab_{i:04}"),
+                        format!("rev_ab_{i:04}"),
+                        1000 + i,
+                    ])
+                    .unwrap();
+            }
+            for s in 1..=20i64 {
+                let other_space = format!("sp_other_{s:02}");
+                for i in 1..=10i64 {
+                    apstmt
+                        .execute(rusqlite::params![
+                            other_space,
+                            format!("ab_other_{s:02}_{i:02}"),
+                            format!("other-{s:02}-{i:02}"),
+                            format!("nt_other_{s:02}_{i:02}"),
+                            format!("rev_other_{s:02}_{i:02}"),
+                            100 + i,
+                        ])
+                        .unwrap();
+                }
+            }
             let mut stmt = conn
                 .prepare(
                     "INSERT INTO revisions(space_id,history_incarnation,rev_id,entity_type,entity_key,space_seq,visibility_seq,parent_rev_id,content_blake3,metadata_msgpack,actor_id,agent_run_id,created_at_sec,created_at_nsec)
@@ -417,6 +593,33 @@ async fn wide_subtree_probes_children_by_parent_before_analyze() {
                     && !comp_details.contains("TEMP B-TREE")
                     && !comp_details.contains("ANY("),
                 "{phase} compaction candidate query must avoid scans, skip-scans, and temp B-trees:\n{comp_details}"
+            );
+
+            let mut ab_plan = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {PROJECT_ABILITY_SUBTREE_SQL}"))
+                .unwrap();
+            let ab_details = ab_plan
+                .query_map(
+                    rusqlite::params![scope.space_id.as_str(), source.as_str()],
+                    |r| r.get::<_, String>(3),
+                )
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+                .join("\n");
+            assert!(
+                ab_details.contains("SEARCH ap USING") && ab_details.contains("SEARCH nh USING"),
+                "{phase} project ability subtree version must drive from ability_packages into note_heads PK:\n{ab_details}"
+            );
+            assert!(
+                !ab_details.contains("SCAN note_heads")
+                    && !ab_details.contains("SCAN nh")
+                    && !ab_details.contains("SCAN folder_heads")
+                    && !ab_details.contains("SCAN fh")
+                    && !ab_details.contains("SCAN ability_packages")
+                    && !ab_details.contains("SCAN ap")
+                    && !ab_details.contains("TEMP B-TREE"),
+                "{phase} project ability subtree version must avoid table scans and temp B-trees:\n{ab_details}"
             );
         }
     }

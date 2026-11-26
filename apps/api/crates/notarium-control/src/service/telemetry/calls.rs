@@ -21,13 +21,17 @@ impl ControlService {
             }
             let episode = match &request.episode {
                 Some(id) => {
+                    let owner_row = user_read(tx.inner_mut(), auth.principal().as_str()).await?;
                     let row =
                         super::super::episodes::episode(tx.inner_mut(), auth.principal(), id)
                             .await?;
                     let project = super::super::episodes::stored_project_ref(&row)?;
                     if !super::super::episodes::episode_visible_to_narrowed(
                         &auth,
+                        owner_row.personal_space_id.as_deref(),
                         project.as_ref(),
+                        row.name.as_deref(),
+                        true,
                     ) {
                         return Err(DomainError::ResourceNotFound.into());
                     }

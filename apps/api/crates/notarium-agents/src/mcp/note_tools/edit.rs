@@ -118,7 +118,10 @@ fn view_value_at(value: &Value, depth: usize) -> Result<YamlValue, PortError> {
     }
     Ok(match value {
         Value::Null => YamlValue::Null,
-        Value::String(text) => YamlValue::String(text.clone()),
+        Value::String(text) => {
+            notarium_syntax::unicode::validate_content(text)?;
+            YamlValue::String(text.clone())
+        }
         Value::Bool(value) => YamlValue::Bool(*value),
         Value::Number(number) => YamlValue::Number(ExactNumber::new(number.clone())),
         Value::Array(items) => YamlValue::Sequence(

@@ -322,23 +322,45 @@ async fn exercise(pg: bool) {
     );
     assert!(projected.active_role.is_none());
 
-    // An owned episode does not broaden a narrowed credential's read authority.
-    let mut grants = auth.spaces().clone();
-    grants.get_mut(&personal).unwrap().read_classes = BTreeSet::new();
-    let narrowed = auth
+    // An owned episode does not broaden a narrowed credential's read authority:
+    // a zero-read-grant credential cannot read the episode at all, and a class-narrowed
+    // credential still receives stripped unavailable bindings.
+    let mut zero_read_grants = auth.spaces().clone();
+    zero_read_grants.get_mut(&personal).unwrap().read_classes = BTreeSet::new();
+    let zero_read = auth
         .for_agent_run(
             AgentRunId::from_bytes([8; 16]),
             personal.clone(),
             ChatAudience::Personal,
-            grants,
+            zero_read_grants,
+        )
+        .unwrap();
+    assert!(matches!(
+        service
+            .get_episode(
+                AccountContext::new(zero_read, budget()),
+                original.id.clone()
+            )
+            .await,
+        Err(PortError::Domain(DomainError::ResourceNotFound))
+    ));
+    let mut narrow_grants = auth.spaces().clone();
+    narrow_grants.get_mut(&personal).unwrap().read_classes =
+        BTreeSet::from([notarium_core::classes::DocClass::UserDoc]);
+    let narrowed = auth
+        .for_agent_run(
+            AgentRunId::from_bytes([9; 16]),
+            personal.clone(),
+            ChatAudience::Personal,
+            narrow_grants,
         )
         .unwrap();
     let projected = service
         .get_episode(AccountContext::new(narrowed, budget()), original.id.clone())
         .await
         .unwrap();
-    assert!(projected.acknowledgements.is_empty());
     assert!(projected.project_hint.is_none());
+    assert!(projected.active_role.is_none());
 
     let other = service
         .create_account(

@@ -2332,6 +2332,10 @@ fn build_rollback_execute_fn(
                     let mut neighbor_dirty: BTreeMap<NoteId, (GroupKey, String, bool)> =
                         BTreeMap::new();
                     let mut cleared_to_unranked_group: HashMap<NoteId, GroupKey> = HashMap::new();
+                    let mut replayed_anchors: HashMap<
+                        NoteId,
+                        (GroupKey, Option<NoteId>, Option<NoteId>),
+                    > = HashMap::new();
 
                     enum TargetSettlement {
                         Ineligible,
@@ -2410,6 +2414,7 @@ fn build_rollback_execute_fn(
                                 // groups or clobbered its pre-run overlay during an in-run round-trip.
                                 match expected_post {
                                     None => {
+                                        replayed_anchors.remove(target);
                                         target_final_state
                                             .insert(target.clone(), TargetSettlement::Ineligible);
                                         continue;
@@ -2497,6 +2502,7 @@ fn build_rollback_execute_fn(
                                                 );
                                                 computed.target_rank
                                             };
+                                            replayed_anchors.remove(target);
                                             target_final_state.insert(
                                                 target.clone(),
                                                 TargetSettlement::Replayed {
@@ -2511,6 +2517,7 @@ fn build_rollback_execute_fn(
                                             );
                                             continue;
                                         } else if group_changed {
+                                            replayed_anchors.remove(target);
                                             cleared_to_unranked_group
                                                 .insert(target.clone(), post_grp);
                                             target_final_state.insert(
@@ -2541,6 +2548,7 @@ fn build_rollback_execute_fn(
                                                 _ => false,
                                             };
                                             if !has_ranked_successor {
+                                                replayed_anchors.remove(target);
                                                 cleared_to_unranked_group
                                                     .insert(target.clone(), post_grp);
                                                 target_final_state.insert(
@@ -2559,6 +2567,7 @@ fn build_rollback_execute_fn(
                                                 cleared_to_unranked_group.get(s) == Some(group)
                                             })
                                         {
+                                            replayed_anchors.remove(target);
                                             cleared_to_unranked_group
                                                 .insert(target.clone(), post_grp);
                                             target_final_state.insert(
@@ -2574,6 +2583,7 @@ fn build_rollback_execute_fn(
 
                         match &bmh.before_placement {
                             StoredSemanticPlacementV1::Ineligible => {
+                                replayed_anchors.remove(target);
                                 target_final_state
                                     .insert(target.clone(), TargetSettlement::Ineligible);
                             }
@@ -2741,6 +2751,10 @@ fn build_rollback_execute_fn(
                                 } else {
                                     (None, None)
                                 };
+                                replayed_anchors.insert(
+                                    target.clone(),
+                                    (group.clone(), predecessor.clone(), successor.clone()),
+                                );
                                 target_final_state.insert(
                                     target.clone(),
                                     TargetSettlement::Replayed {
@@ -2749,6 +2763,210 @@ fn build_rollback_execute_fn(
                                         placement_revision: restored_pl_rev,
                                         placement_actor,
                                         placement_run,
+                                    },
+                                );
+                            }
+                        }
+                    }
+
+                    // Reconcile `ClearOverlay` targets against columns that retain any
+                    // non-originally-ranked card (materialized/replayed or surviving
+                    // `same_group_run_materialized` neighbor) after them in base order.
+                    // Ranked cards always sort strictly ahead of unranked cards on a board,
+                    // so leaving a cleared card unranked ahead of a ranked card would reverse them.
+                    if !cleared_to_unranked_group.is_empty() {
+                        let mut cleared_by_group: Vec<(GroupKey, Vec<NoteId>)> = Vec::new();
+                        for (cid, grp) in &cleared_to_unranked_group {
+                            if !matches!(
+                                target_final_state.get(cid),
+                                Some(TargetSettlement::ClearOverlay)
+                            ) {
+                                continue;
+                            }
+                            if let Some((_, list)) =
+                                cleared_by_group.iter_mut().find(|(g, _)| g == grp)
+                            {
+                                list.push(cid.clone());
+                            } else {
+                                cleared_by_group.push((grp.clone(), vec![cid.clone()]));
+                            }
+                        }
+                        for (grp, mut cleared_ids) in cleared_by_group {
+                            let base_pos: HashMap<&NoteId, usize> = view_facts
+                                .post_restore_group_order
+                                .iter()
+                                .find(|(g, _)| g == &grp)
+                                .map(|(_, order)| {
+                                    order
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(idx, id)| (id, idx))
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            cleared_ids.sort_by(|a, b| {
+                                base_pos
+                                    .get(a)
+                                    .copied()
+                                    .unwrap_or(usize::MAX)
+                                    .cmp(&base_pos.get(b).copied().unwrap_or(usize::MAX))
+                                    .then_with(|| a.cmp(b))
+                            });
+
+                            let is_originally_ranked =
+                                |nid: &NoteId, tfs: &BTreeMap<NoteId, TargetSettlement>| -> bool {
+                                    if stale_prerun_restores
+                                        .get(nid)
+                                        .is_some_and(|(g, _)| g == &grp)
+                                    {
+                                        return true;
+                                    }
+                                    if let Some(TargetSettlement::Replayed {
+                                        group,
+                                        placement_revision: Some(_),
+                                        ..
+                                    }) = tfs.get(nid)
+                                    {
+                                        return group == &grp;
+                                    }
+                                    !moved_targets_on_view.contains(nid)
+                                        && !same_group_run_materialized.contains_key(nid)
+                                        && effective_overlays
+                                            .get(nid)
+                                            .is_some_and(|o| o.group == grp)
+                                };
+
+                            let has_surviving_non_mat_ranked = stale_prerun_restores
+                                .values()
+                                .any(|(g, _)| g == &grp)
+                                || target_final_state.values().any(|s| {
+                                    matches!(
+                                        s,
+                                        TargetSettlement::Replayed { group, .. } if group == &grp
+                                    )
+                                })
+                                || effective_overlays.iter().any(|(other_id, other_ov)| {
+                                    other_ov.group == grp
+                                        && !retired_note_ids.contains(other_id)
+                                        && !moved_targets_on_view.contains(other_id)
+                                        && !same_group_run_materialized.contains_key(other_id)
+                                });
+
+                            for cid in cleared_ids {
+                                let cid_pos = base_pos.get(&cid).copied().unwrap_or(usize::MAX);
+                                let (min_idx, max_idx, working_len) = working_groups
+                                    .iter()
+                                    .find(|(g, _)| g == &grp)
+                                    .map(|(_, items)| {
+                                        let mut lo = 0usize;
+                                        let mut hi = items.len();
+                                        for (idx, it) in items.iter().enumerate() {
+                                            if let Some((ag, pred, succ)) =
+                                                replayed_anchors.get(&it.note_id)
+                                                && ag == &grp
+                                            {
+                                                if succ.as_ref() == Some(&cid) {
+                                                    lo = lo.max(idx + 1);
+                                                }
+                                                if pred.as_ref() == Some(&cid) {
+                                                    hi = hi.min(idx);
+                                                }
+                                            }
+                                        }
+                                        (lo, hi, items.len())
+                                    })
+                                    .unwrap_or((0, 0, 0));
+                                let has_replayed_successor = max_idx < working_len;
+                                let needs_rank_in_working = working_groups
+                                    .iter()
+                                    .find(|(g, _)| g == &grp)
+                                    .is_some_and(|(_, items)| {
+                                        let start = min_idx.min(items.len());
+                                        items[start..].iter().any(|it| {
+                                            !is_originally_ranked(&it.note_id, &target_final_state)
+                                                && base_pos
+                                                    .get(&it.note_id)
+                                                    .copied()
+                                                    .unwrap_or(usize::MAX)
+                                                    > cid_pos
+                                        })
+                                    });
+                                let needs_rank_for_surviving_mat = has_surviving_non_mat_ranked
+                                    && same_group_run_materialized.iter().any(|(mid, mg)| {
+                                        mg == &grp
+                                            && base_pos.get(mid).copied().unwrap_or(usize::MAX)
+                                                > cid_pos
+                                    });
+                                if !needs_rank_in_working
+                                    && !needs_rank_for_surviving_mat
+                                    && !has_replayed_successor
+                                {
+                                    continue;
+                                }
+                                let g_idx = materialize_working_group(
+                                    &grp,
+                                    &kept_groups,
+                                    &effective_overlays,
+                                    &moved_targets_on_view,
+                                    &stale_prerun_restores,
+                                    &same_group_run_materialized,
+                                    &mut working_groups,
+                                    &mut neighbor_dirty,
+                                )?;
+                                let g_items = &mut working_groups[g_idx].1;
+                                let lo = min_idx.min(g_items.len());
+                                let hi = if has_replayed_successor {
+                                    max_idx.min(g_items.len())
+                                } else {
+                                    g_items.len()
+                                };
+                                let search_lo = lo.min(hi);
+                                let ins_idx = g_items[search_lo..hi]
+                                    .iter()
+                                    .position(|it| {
+                                        !is_originally_ranked(&it.note_id, &target_final_state)
+                                            && base_pos
+                                                .get(&it.note_id)
+                                                .copied()
+                                                .unwrap_or(usize::MAX)
+                                                > cid_pos
+                                    })
+                                    .map(|offset| search_lo + offset)
+                                    .unwrap_or(hi);
+                                let computed = compute_rank_placement(g_items, &cid, ins_idx)?;
+                                for (pn, pr) in computed.pma_neighbor_updates {
+                                    if let Some(it) = g_items.iter_mut().find(|i| i.note_id == pn) {
+                                        it.rank = pr.clone();
+                                    }
+                                    if let Some(TargetSettlement::Replayed { rank, .. }) =
+                                        target_final_state.get_mut(&pn)
+                                    {
+                                        *rank = pr;
+                                    } else if !moved_targets_on_view.contains(&pn)
+                                        && !stale_prerun_restores.contains_key(&pn)
+                                    {
+                                        let is_pma = effective_overlays
+                                            .get(&pn)
+                                            .is_some_and(|o| o.group == grp)
+                                            && !same_group_run_materialized.contains_key(&pn);
+                                        neighbor_dirty.insert(pn, (grp.clone(), pr, is_pma));
+                                    }
+                                }
+                                g_items.insert(
+                                    ins_idx,
+                                    ExistingRankedItem {
+                                        note_id: cid.clone(),
+                                        rank: computed.target_rank.clone(),
+                                    },
+                                );
+                                target_final_state.insert(
+                                    cid,
+                                    TargetSettlement::Replayed {
+                                        group: grp.clone(),
+                                        rank: computed.target_rank,
+                                        placement_revision: None,
+                                        placement_actor: None,
+                                        placement_run: None,
                                     },
                                 );
                             }

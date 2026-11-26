@@ -1,7 +1,7 @@
 //! Durable reference preferences, separate from content ownership and permission.
 mod favorites;
 mod scopes;
-mod selection;
+pub(in super::super) mod selection;
 mod sets;
 use super::{
     ControlService,

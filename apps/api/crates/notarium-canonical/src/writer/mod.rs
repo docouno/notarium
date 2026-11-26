@@ -2309,39 +2309,41 @@ async fn execute_batch_on_conn(
     // Fail fast before publishing local CAS payloads into live `blobs/` if any
     // guarded slot was already revoked during SQL execution.
     let pre_publish_revoked = collect_revoked(&active_effects);
-    let newly_published = if pre_publish_revoked.is_empty() {
+    let mut newly_published = Vec::new();
+    if pre_publish_revoked.is_empty() {
         // Coalesced Wave A: flush blob data durability (`fdatasync` / `F_FULLFSYNC`) + atomic `rename`
         // for all batch-staged local CAS temp files BEFORE directory `fsync` and SQL `COMMIT`!
-        let newly_published = match store
-            .publish_deferred_local_tickets_async(&batch_retained_tickets)
+        match store
+            .publish_deferred_local_tickets_async(&batch_retained_tickets, &mut newly_published)
             .await
         {
-            Ok((extra_dirs, newly_published)) => {
+            Ok(extra_dirs) => {
                 batch_dir_syncs.merge(&extra_dirs);
-                newly_published
             }
             Err(pub_err) => {
                 transaction.rollback().await;
+                drop(active_effects);
                 drop(batch_retained_tickets);
                 drop(batch_retained_guards);
+                store
+                    .cleanup_unretained_local_files_async(newly_published)
+                    .await;
                 return BatchExecOutcome::AbortedBeforeCommit(pub_err);
             }
-        };
+        }
 
         // Coalesced Wave B: local CAS directory fsync BEFORE SQL COMMIT!
         if let Err(sync_err) = store.flush_pending_local_dirs_async(&batch_dir_syncs).await {
             transaction.rollback().await;
+            drop(active_effects);
+            drop(batch_retained_tickets);
+            drop(batch_retained_guards);
             store
                 .cleanup_unretained_local_files_async(newly_published)
                 .await;
-            drop(batch_retained_tickets);
-            drop(batch_retained_guards);
             return BatchExecOutcome::AbortedBeforeCommit(sync_err);
         }
-        newly_published
-    } else {
-        Vec::new()
-    };
+    }
 
     let revoked_effects = if pre_publish_revoked.is_empty() {
         collect_revoked(&active_effects)
@@ -2350,12 +2352,12 @@ async fn execute_batch_on_conn(
     };
     if !revoked_effects.is_empty() {
         let conn_clean = transaction.rollback().await;
-        store
-            .cleanup_unretained_local_files_async(newly_published)
-            .await;
         drop(active_effects);
         drop(batch_retained_tickets);
         drop(batch_retained_guards);
+        store
+            .cleanup_unretained_local_files_async(newly_published)
+            .await;
         if slots.len() == 1 {
             return BatchExecOutcome::AbortedBeforeCommit(
                 revoked_effects.into_iter().next().unwrap().1,
@@ -2478,6 +2480,9 @@ async fn execute_batch_on_conn(
             }
             drop(batch_retained_tickets);
             drop(batch_retained_guards);
+            store
+                .cleanup_unretained_local_files_async(newly_published)
+                .await;
             BatchExecOutcome::UnknownCommit {
                 slots,
                 diag_reason: format!("{commit_err:?}"),
@@ -3730,15 +3735,70 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(persisted, 0, "rolled-back batch must persist zero rows");
-        let hex = staged_digest.to_hex();
-        let leaked_blob_path = root
-            .join("v1/blobs")
-            .join(space_id.as_str())
-            .join(&hex[..2])
-            .join(format!("{hex}.zst"));
+        let leaked_blob_path = DataRoot::new(&root).blob(&space_id, staged_digest);
         assert!(
             !leaked_blob_path.exists(),
             "revoked batch must not leave uncatalogued local CAS file at {}",
+            leaked_blob_path.display()
+        );
+
+        // Synchronized orphan cleanup MUST NEVER delete a local CAS `.zst` file once a
+        // concurrent writer has committed a live catalog/reference row for that digest.
+        let live_payload =
+            crate::blobs::PreparedBlobSource::prepare(b"revoked-blob-payload", store.blob_codec())
+                .unwrap();
+        let live_digest = live_payload.digest;
+        let live_ticket = store
+            .stage_blob_for_batch(&rec.scope, epoch, &live_payload)
+            .await
+            .unwrap();
+        let live_claim = crate::blobs::BlobReferenceClaim {
+            ticket: live_ticket.clone(),
+            owner_kind: crate::blobs::BlobOwnerKind::NoteRevision,
+            owner_id: "note-live-cas-guard".to_owned(),
+            owner_rev_id: "rev-live-cas-guard".to_owned(),
+            resource_key: "note-live-cas-guard".to_owned(),
+        };
+        let scope_live = rec.scope.clone();
+        store
+            .with_write_tx(|tx| {
+                Box::pin(async move {
+                    crate::blobs::activate_and_bind_blob_ref_tx(
+                        tx,
+                        &scope_live,
+                        epoch,
+                        &live_claim,
+                        SpaceSeq::new(1).unwrap(),
+                    )
+                    .await
+                })
+            })
+            .await
+            .unwrap();
+        let mut live_published = Vec::new();
+        let live_dirs = store
+            .publish_deferred_local_tickets_async(
+                std::slice::from_ref(&live_ticket),
+                &mut live_published,
+            )
+            .await
+            .unwrap();
+        store
+            .flush_pending_local_dirs_async(&live_dirs)
+            .await
+            .unwrap();
+        drop(live_ticket);
+        assert!(
+            leaked_blob_path.exists(),
+            "committed live blob must exist at {}",
+            leaked_blob_path.display()
+        );
+        store
+            .cleanup_unretained_local_files_async(vec![(space_id.clone(), live_digest)])
+            .await;
+        assert!(
+            leaked_blob_path.exists(),
+            "cleanup_unretained_local_files_async must preserve live committed local CAS blob at {}",
             leaked_blob_path.display()
         );
 

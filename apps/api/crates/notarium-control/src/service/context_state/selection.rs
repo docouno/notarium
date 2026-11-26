@@ -1,5 +1,10 @@
 use super::*;
 
+pub(crate) const BOOTSTRAP_SCOPE_PINS_SQLITE_SQL: &str = "SELECT coalesce(o.rank,0) AS rank, p.note_space, p.note_id FROM context_scope_pins p LEFT JOIN context_order o ON o.target_kind=p.target_kind AND o.target_id=p.target_id AND o.entry_kind='note' AND o.entry_ref=('{\"space_id\":\"' || p.note_space || '\",\"note_id\":\"' || p.note_id || '\"}') WHERE p.target_kind=$1 AND p.target_id=$2 LIMIT 4096";
+pub(crate) const BOOTSTRAP_SCOPE_SETS_SQLITE_SQL: &str = "SELECT coalesce(o.rank,0) AS rank, a.target_space, s.set_id, s.owner_id, s.home_space, s.name, s.note_refs, s.revision FROM context_set_attachments a JOIN context_sets s ON s.set_id=a.set_id LEFT JOIN context_order o ON o.target_kind=a.target_kind AND o.target_id=a.target_id AND o.entry_kind='set' AND o.entry_ref=a.set_id WHERE a.target_kind=$1 AND a.target_id=$2 LIMIT 4096";
+pub(crate) const BOOTSTRAP_FAVORITES_FIRST_SQLITE_SQL: &str = "SELECT rank, space_id, entity_id FROM favorites WHERE owner_id=$1 AND entity_kind='note' ORDER BY rank,space_id,entity_id LIMIT $2";
+pub(crate) const BOOTSTRAP_FAVORITES_AFTER_SQLITE_SQL: &str = "SELECT rank, space_id, entity_id FROM favorites WHERE owner_id=$1 AND entity_kind='note' AND (rank,space_id,entity_id)>($2,$3,$4) ORDER BY rank,space_id,entity_id LIMIT $5";
+
 #[derive(sqlx::FromRow)]
 struct PinCandidateRow {
     rank: i64,
@@ -9,6 +14,7 @@ struct PinCandidateRow {
 #[derive(sqlx::FromRow)]
 struct SetCandidateRow {
     rank: i64,
+    target_space: String,
     set_id: String,
     owner_id: String,
     home_space: String,
@@ -56,8 +62,8 @@ async fn load_bootstrap_scope_items(
             tx,
             PinCandidateRow,
             fetch_all,
-            "SELECT coalesce(o.rank,0) AS rank, p.note_space, p.note_id FROM context_scope_pins p LEFT JOIN context_order o ON o.target_kind=p.target_kind AND o.target_id=p.target_id AND o.entry_kind='note' AND o.entry_ref=('{\"space_id\":\"' || p.note_space || '\",\"note_id\":\"' || p.note_id || '\"}') WHERE p.target_kind=$1 AND p.target_id=$2",
-            "SELECT coalesce(o.rank,0) AS rank, p.note_space, p.note_id FROM v1_control.context_scope_pins p LEFT JOIN v1_control.context_order o ON o.target_kind=p.target_kind AND o.target_id=p.target_id AND o.entry_kind='note' AND o.entry_ref=('{\"space_id\":\"' || p.note_space || '\",\"note_id\":\"' || p.note_id || '\"}') WHERE p.target_kind=$1 AND p.target_id=$2";
+            BOOTSTRAP_SCOPE_PINS_SQLITE_SQL,
+            "SELECT coalesce(o.rank,0) AS rank, p.note_space, p.note_id FROM v1_control.context_scope_pins p LEFT JOIN v1_control.context_order o ON o.target_kind=p.target_kind AND o.target_id=p.target_id AND o.entry_kind='note' AND o.entry_ref=('{\"space_id\":\"' || p.note_space || '\",\"note_id\":\"' || p.note_id || '\"}') WHERE p.target_kind=$1 AND p.target_id=$2 LIMIT 4096";
             kind,
             target_id
         )?;
@@ -76,28 +82,47 @@ async fn load_bootstrap_scope_items(
             tx,
             SetCandidateRow,
             fetch_all,
-            "SELECT coalesce(o.rank,0) AS rank, s.set_id, s.owner_id, s.home_space, s.name, s.note_refs, s.revision FROM context_set_attachments a JOIN context_sets s ON s.set_id=a.set_id LEFT JOIN context_order o ON o.target_kind=a.target_kind AND o.target_id=a.target_id AND o.entry_kind='set' AND o.entry_ref=a.set_id WHERE a.target_kind=$1 AND a.target_id=$2",
-            "SELECT coalesce(o.rank,0) AS rank, s.set_id, s.owner_id, s.home_space, s.name, s.note_refs, s.revision FROM v1_control.context_set_attachments a JOIN v1_control.context_sets s ON s.set_id=a.set_id LEFT JOIN v1_control.context_order o ON o.target_kind=a.target_kind AND o.target_id=a.target_id AND o.entry_kind='set' AND o.entry_ref=a.set_id WHERE a.target_kind=$1 AND a.target_id=$2";
+            BOOTSTRAP_SCOPE_SETS_SQLITE_SQL,
+            "SELECT coalesce(o.rank,0) AS rank, a.target_space, s.set_id, s.owner_id, s.home_space, s.name, s.note_refs, s.revision FROM v1_control.context_set_attachments a JOIN v1_control.context_sets s ON s.set_id=a.set_id LEFT JOIN v1_control.context_order o ON o.target_kind=a.target_kind AND o.target_id=a.target_id AND o.entry_kind='set' AND o.entry_ref=a.set_id WHERE a.target_kind=$1 AND a.target_id=$2 LIMIT 4096";
             kind,
             target_id
         )?;
         for set in sets {
-            let bundle_row = ContextSetsRow {
-                set_id: set.set_id.clone(),
-                owner_id: set.owner_id.clone(),
-                home_space: set.home_space.clone(),
-                name: set.name,
-                note_refs: set.note_refs.clone(),
-                revision: set.revision,
-                created_at: 0,
+            let home = SpaceId::parse(&set.home_space)?;
+            let Some(grant) = current.auth().spaces().get(&home) else {
+                continue;
             };
-            match service
-                .check_bundle_attachment_db(tx, current, &bundle_row)
-                .await
-            {
-                Ok(()) => {}
-                Err(error) if hidden(&error) => continue,
-                Err(error) => return Err(error),
+            if grant.read_classes.is_empty() {
+                continue;
+            }
+            if let Some(root) = &grant.project_root {
+                let expected_target = serde_json::to_string(&FolderRef {
+                    space_id: home.clone(),
+                    folder_id: root.clone(),
+                })
+                .map_err(|_| invalid(ValidationReason::InvalidState))?;
+                if !(kind == "project"
+                    && target_id == expected_target
+                    && set.target_space == home.as_str())
+                {
+                    let bundle_row = ContextSetsRow {
+                        set_id: set.set_id.clone(),
+                        owner_id: set.owner_id.clone(),
+                        home_space: set.home_space.clone(),
+                        name: set.name,
+                        note_refs: set.note_refs.clone(),
+                        revision: set.revision,
+                        created_at: 0,
+                    };
+                    match service
+                        .check_bundle_attachment_db(tx, current, &bundle_row)
+                        .await
+                    {
+                        Ok(()) => {}
+                        Err(error) if hidden(&error) => continue,
+                        Err(error) => return Err(error),
+                    }
+                }
             }
             if set.note_refs.len() > 65536 {
                 return Err(invalid(ValidationReason::InvalidState));
@@ -185,7 +210,9 @@ impl ControlService {
                 async {
                     let owner =
                         user_read(rtx.inner_mut(), current.auth().principal().as_str()).await?;
-                    let loaded_ep = self.load_episode_db(rtx.inner_mut(), &current, &id).await?;
+                    let loaded_ep = self
+                        .load_episode_db_strict(rtx.inner_mut(), &current, &id)
+                        .await?;
                     let owner_ack_rows = self
                         .acknowledgement_rows(rtx.inner_mut(), &current, None)
                         .await?;
@@ -553,7 +580,7 @@ impl ControlService {
                                 ftx.inner_mut(),
                                 FavoriteCandidateRow,
                                 fetch_all,
-                                "SELECT rank, space_id, entity_id FROM favorites WHERE owner_id=$1 AND entity_kind='note' ORDER BY rank,space_id,entity_id LIMIT $2",
+                                BOOTSTRAP_FAVORITES_FIRST_SQLITE_SQL,
                                 "SELECT rank, space_id, entity_id FROM v1_control.favorites WHERE owner_id=$1 AND entity_kind='note' ORDER BY rank,space_id,entity_id LIMIT $2";
                                 owner_id,
                                 batch_limit
@@ -562,7 +589,7 @@ impl ControlService {
                                 ftx.inner_mut(),
                                 FavoriteCandidateRow,
                                 fetch_all,
-                                "SELECT rank, space_id, entity_id FROM favorites WHERE owner_id=$1 AND entity_kind='note' AND (rank,space_id,entity_id)>($2,$3,$4) ORDER BY rank,space_id,entity_id LIMIT $5",
+                                BOOTSTRAP_FAVORITES_AFTER_SQLITE_SQL,
                                 "SELECT rank, space_id, entity_id FROM v1_control.favorites WHERE owner_id=$1 AND entity_kind='note' AND (rank,space_id,entity_id)>($2,$3,$4) ORDER BY rank,space_id,entity_id LIMIT $5";
                                 owner_id,
                                 prev.rank,
@@ -651,6 +678,15 @@ impl ControlService {
         Ok((favorites, unavailable, has_more, last_fav_cursor))
     }
     pub async fn list_context_entries(
+        &self,
+        ctx: AccountContext,
+        scope: ContextScope,
+        page: ControlPageRequest,
+    ) -> Result<ControlPage<ContextEntryInfo>, PortError> {
+        Box::pin(self.list_context_entries_inner(ctx, scope, page)).await
+    }
+
+    async fn list_context_entries_inner(
         &self,
         ctx: AccountContext,
         scope: ContextScope,
@@ -756,7 +792,8 @@ impl ControlService {
                             entity: after.entity.clone(),
                             rank: after.rank,
                         };
-                        let mut candidates = Vec::with_capacity(batch_len);
+                        let mut candidates: Vec<(EntryRow, Option<(SpaceId, String)>)> =
+                            Vec::with_capacity(batch_len);
                         for row in batch {
                             next_after = EntryRow {
                                 kind: row.kind.clone(),
@@ -780,7 +817,11 @@ impl ControlService {
                                         )
                                         .await
                                     {
-                                        Ok(()) => candidates.push(row),
+                                        Ok(()) => {
+                                            let home = SpaceId::parse(&bundle_row.home_space)?;
+                                            candidates
+                                                .push((row, Some((home, bundle_row.owner_id))));
+                                        }
                                         Err(error) if hidden(&error) => continue,
                                         Err(error) => return Err(error),
                                     }
@@ -793,7 +834,7 @@ impl ControlService {
                                         .get(&space_id)
                                         .is_some_and(|grant| !grant.read_classes.is_empty())
                                     {
-                                        candidates.push(row);
+                                        candidates.push((row, None));
                                     }
                                 }
                                 _ => return Err(invalid(ValidationReason::InvalidState)),
@@ -810,9 +851,42 @@ impl ControlService {
             let (batch_len, next_after, candidates) = batch_result?;
             scanned = scanned.saturating_add(batch_len);
             after = next_after;
-            for row in candidates {
+            let mut set_space_cache: BTreeMap<SpaceId, Option<SpaceKind>> = BTreeMap::new();
+            for (row, set_home) in candidates {
                 let entry = match row.kind.as_str() {
-                    "set" => ContextEntry::Set(ContextSetId::parse(&row.entity)?),
+                    "set" => {
+                        let Some((home_space, set_owner)) = set_home else {
+                            return Err(invalid(ValidationReason::InvalidState));
+                        };
+                        let home_kind = match set_space_cache.get(&home_space) {
+                            Some(cached) => *cached,
+                            None => {
+                                let looked = budget
+                                    .run(
+                                        async {
+                                            match self.catalog_space(&current, &home_space).await {
+                                                Ok(info) => Ok(Some(info.space.kind)),
+                                                Err(error) if hidden(&error) => Ok(None),
+                                                Err(error) => Err(error),
+                                            }
+                                        },
+                                        CommitEffect::NotCommitted,
+                                    )
+                                    .await?;
+                                set_space_cache.insert(home_space, looked);
+                                looked
+                            }
+                        };
+                        let Some(kind) = home_kind else {
+                            continue;
+                        };
+                        if kind == SpaceKind::Personal
+                            && set_owner != current.auth().principal().as_str()
+                        {
+                            continue;
+                        }
+                        ContextEntry::Set(ContextSetId::parse(&row.entity)?)
+                    }
                     "note" => {
                         let note = NoteRef {
                             space_id: SpaceId::parse(&row.space)?,

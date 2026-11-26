@@ -46,7 +46,10 @@ pub(super) fn stored_project_ref(row: &AgentEpisodesRow) -> Result<Option<Folder
 
 pub(super) fn episode_project_admitted(
     auth: &notarium_core::auth::EngineAuthContext,
+    personal_space: Option<&str>,
     project: Option<&FolderRef>,
+    episode_name: Option<&str>,
+    allow_shared_unnamed_chat: bool,
 ) -> bool {
     match project {
         Some(reference) => auth.spaces().get(&reference.space_id).is_some_and(|grant| {
@@ -56,24 +59,64 @@ pub(super) fn episode_project_admitted(
                     .as_ref()
                     .is_none_or(|root| root == &reference.folder_id)
         }),
-        None => auth
-            .spaces()
-            .values()
-            .all(|grant| grant.project_root.is_none()),
+        None => {
+            if !auth
+                .spaces()
+                .values()
+                .any(|grant| !grant.read_classes.is_empty())
+                || auth
+                    .spaces()
+                    .values()
+                    .any(|grant| grant.project_root.is_some())
+            {
+                return false;
+            }
+            if !auth.is_space_narrowed() {
+                return true;
+            }
+            if let Some(ps) = personal_space
+                && let Ok(ps_id) = SpaceId::parse(ps)
+                && auth.spaces().get(&ps_id).is_some_and(|grant| {
+                    !grant.read_classes.is_empty() && grant.project_root.is_none()
+                })
+            {
+                return true;
+            }
+            allow_shared_unnamed_chat
+                && episode_name.is_none()
+                && matches!(auth.kind(), PrincipalKind::AgentRun(_))
+                && auth.chat_audience() == Some(ChatAudience::Shared)
+        }
     }
 }
 
 pub(super) fn episode_visible_to_narrowed(
     auth: &notarium_core::auth::EngineAuthContext,
+    personal_space: Option<&str>,
     project: Option<&FolderRef>,
+    episode_name: Option<&str>,
+    allow_shared_unnamed_chat: bool,
 ) -> bool {
+    if !auth
+        .spaces()
+        .values()
+        .any(|grant| !grant.read_classes.is_empty())
+    {
+        return false;
+    }
     if auth.is_space_narrowed()
         || auth
             .spaces()
             .values()
             .any(|grant| grant.project_root.is_some())
     {
-        episode_project_admitted(auth, project)
+        episode_project_admitted(
+            auth,
+            personal_space,
+            project,
+            episode_name,
+            allow_shared_unnamed_chat,
+        )
     } else {
         true
     }
@@ -148,11 +191,37 @@ impl ControlService {
         ctx: &AccountContext,
         id: &EpisodeId,
     ) -> Result<LoadedEpisodeDb, PortError> {
+        self.load_episode_db_with_mode(tx, ctx, id, true).await
+    }
+
+    pub(in super::super) async fn load_episode_db_strict(
+        &self,
+        tx: &mut Transaction,
+        ctx: &AccountContext,
+        id: &EpisodeId,
+    ) -> Result<LoadedEpisodeDb, PortError> {
+        self.load_episode_db_with_mode(tx, ctx, id, false).await
+    }
+
+    async fn load_episode_db_with_mode(
+        &self,
+        tx: &mut Transaction,
+        ctx: &AccountContext,
+        id: &EpisodeId,
+        allow_shared_unnamed_chat: bool,
+    ) -> Result<LoadedEpisodeDb, PortError> {
         let row = episode(tx, ctx.auth().principal(), id).await?;
         if row.owner_id != ctx.auth().principal().as_str() {
             return Err(DomainError::ResourceNotFound.into());
         }
-        if !episode_visible_to_narrowed(ctx.auth(), stored_project_ref(&row)?.as_ref()) {
+        let owner = user_read(tx, ctx.auth().principal().as_str()).await?;
+        if !episode_visible_to_narrowed(
+            ctx.auth(),
+            owner.personal_space_id.as_deref(),
+            stored_project_ref(&row)?.as_ref(),
+            row.name.as_deref(),
+            allow_shared_unnamed_chat,
+        ) {
             return Err(DomainError::ResourceNotFound.into());
         }
         let followed_role = if let Some(value) = &row.active_role {
@@ -291,22 +360,30 @@ impl ControlService {
         result: Started,
     ) -> Result<LoadedStartedDb, PortError> {
         Ok(match result {
-            Started::New(id) => LoadedStartedDb::New(self.load_episode_db(tx, ctx, &id).await?),
+            Started::New(id) => {
+                LoadedStartedDb::New(self.load_episode_db_strict(tx, ctx, &id).await?)
+            }
             Started::Resumed(id) => {
-                LoadedStartedDb::Resumed(self.load_episode_db(tx, ctx, &id).await?)
+                LoadedStartedDb::Resumed(self.load_episode_db_strict(tx, ctx, &id).await?)
             }
             Started::Forked(id) => {
-                LoadedStartedDb::Forked(self.load_episode_db(tx, ctx, &id).await?)
+                LoadedStartedDb::Forked(self.load_episode_db_strict(tx, ctx, &id).await?)
             }
             Started::Ambiguous(ids) => {
                 if ids.len() > 200 {
                     return Err(invalid(ValidationReason::InvalidState));
                 }
+                let owner = user_read(tx, ctx.auth().principal().as_str()).await?;
                 let mut choices = Vec::with_capacity(ids.len());
                 for id in ids {
                     let row = episode(tx, ctx.auth().principal(), &id).await?;
-                    if !episode_visible_to_narrowed(ctx.auth(), stored_project_ref(&row)?.as_ref())
-                    {
+                    if !episode_visible_to_narrowed(
+                        ctx.auth(),
+                        owner.personal_space_id.as_deref(),
+                        stored_project_ref(&row)?.as_ref(),
+                        row.name.as_deref(),
+                        false,
+                    ) {
                         return Err(DomainError::ResourceNotFound.into());
                     }
                     choices.push(EpisodeChoice { id, name: row.name });
@@ -431,7 +508,13 @@ impl ControlService {
                             scanned = scanned.saturating_add(1);
                             after = row.episode_id.clone();
                             let project = stored_project_ref(&row)?;
-                            if !episode_project_admitted(current.auth(), project.as_ref()) {
+                            if !episode_project_admitted(
+                                current.auth(),
+                                owner.personal_space_id.as_deref(),
+                                project.as_ref(),
+                                row.name.as_deref(),
+                                false,
+                            ) {
                                 continue;
                             }
                             admitted_rows.push(row);
@@ -465,7 +548,13 @@ impl ControlService {
                 },
             };
             let started = if let Some(mut old) = existing {
-                if !episode_project_admitted(current.auth(), stored_project_ref(&old)?.as_ref()) {
+                if !episode_project_admitted(
+                    current.auth(),
+                    owner.personal_space_id.as_deref(),
+                    stored_project_ref(&old)?.as_ref(),
+                    old.name.as_deref(),
+                    false,
+                ) {
                     return Err(DomainError::ResourceNotFound.into());
                 }
                 if guard == EpisodeRevisionGuard::Target && let Some(project) = &request.input.project_hint
@@ -493,7 +582,13 @@ impl ControlService {
                 }
             } else {
                 prechecked_project?;
-                if !episode_project_admitted(current.auth(), request.input.project_hint.as_ref()) {
+                if !episode_project_admitted(
+                    current.auth(),
+                    owner.personal_space_id.as_deref(),
+                    request.input.project_hint.as_ref(),
+                    chosen_name.as_deref(),
+                    false,
+                ) {
                     return Err(DomainError::ResourceNotFound.into());
                 }
                 let collision = rows!(tx.inner_mut(),AgentEpisodesRow,fetch_optional,"SELECT * FROM agent_episodes WHERE episode_id=$1","SELECT * FROM v1_control.agent_episodes WHERE episode_id=$1";requested.as_str())?;
@@ -563,6 +658,8 @@ impl ControlService {
         let preview = budget
             .run(
                 async {
+                    let owner =
+                        user_read(tx.inner_mut(), current.auth().principal().as_str()).await?;
                     let mut after = String::new();
                     let mut admitted: Vec<Option<FolderRef>> = Vec::with_capacity(2);
                     let mut scanned = 0usize;
@@ -582,7 +679,13 @@ impl ControlService {
                             scanned = scanned.saturating_add(1);
                             after = row.episode_id.clone();
                             let project = stored_project_ref(&row)?;
-                            if !episode_project_admitted(current.auth(), project.as_ref()) {
+                            if !episode_project_admitted(
+                                current.auth(),
+                                owner.personal_space_id.as_deref(),
+                                project.as_ref(),
+                                row.name.as_deref(),
+                                false,
+                            ) {
                                 continue;
                             }
                             admitted.push(project);
@@ -624,6 +727,14 @@ impl ControlService {
         }
     }
     pub async fn update_episode(
+        &self,
+        ctx: AccountContext,
+        request: AccountMutation<EpisodeMutation>,
+    ) -> Result<ControlCommit<AgentEpisode>, PortError> {
+        Box::pin(self.update_episode_inner(ctx, request)).await
+    }
+
+    async fn update_episode_inner(
         &self,
         ctx: AccountContext,
         request: AccountMutation<EpisodeMutation>,
@@ -783,6 +894,17 @@ impl ControlService {
             let current = AccountContext::new(auth, budget.context(ctx.budget.request.clone()));
             let owner = user(tx.inner_mut(), current.auth().principal().as_str()).await?;
             if let Some((revision, saved)) = command.replay::<EpisodeId>(tx.inner_mut()).await? {
+                let replayed = episode(tx.inner_mut(), current.auth().principal(), &saved.value).await?;
+                let replayed_project = stored_project_ref(&replayed)?;
+                if !episode_project_admitted(
+                    current.auth(),
+                    owner.personal_space_id.as_deref(),
+                    replayed_project.as_ref(),
+                    replayed.name.as_deref(),
+                    false,
+                ) {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
                 return Ok((revision, current, saved.value));
             }
             prechecked_project?;
@@ -792,7 +914,13 @@ impl ControlService {
             }
             let old = episode(tx.inner_mut(), current.auth().principal(), &episode_id).await?;
             let old_project = stored_project_ref(&old)?;
-            if !episode_project_admitted(current.auth(), old_project.as_ref()) {
+            if !episode_project_admitted(
+                current.auth(),
+                owner.personal_space_id.as_deref(),
+                old_project.as_ref(),
+                old.name.as_deref(),
+                false,
+            ) {
                 return Err(DomainError::ResourceNotFound.into());
             }
             if old.revision as u64 != expected.get() {
@@ -812,7 +940,17 @@ impl ControlService {
             } else {
                 project_hint.clone()
             };
-            if !episode_project_admitted(current.auth(), effective_project.as_ref()) {
+            let next_name_preview = match &full_fields {
+                Some((name, _)) => name.as_deref(),
+                None => old.name.as_deref(),
+            };
+            if !episode_project_admitted(
+                current.auth(),
+                owner.personal_space_id.as_deref(),
+                effective_project.as_ref(),
+                next_name_preview,
+                false,
+            ) {
                 return Err(DomainError::ResourceNotFound.into());
             }
             if let Some(raw) = prechecked_role
@@ -895,8 +1033,15 @@ impl ControlService {
                     if auth.taint().is_tainted() {
                         return Err(DomainError::CrossSpaceTainted.into());
                     }
+                    let owner = user_read(tx.inner_mut(), auth.principal().as_str()).await?;
                     let row = episode(tx.inner_mut(), auth.principal(), &id).await?;
-                    if !episode_project_admitted(&auth, stored_project_ref(&row)?.as_ref()) {
+                    if !episode_project_admitted(
+                        &auth,
+                        owner.personal_space_id.as_deref(),
+                        stored_project_ref(&row)?.as_ref(),
+                        row.name.as_deref(),
+                        false,
+                    ) {
                         return Err(DomainError::ResourceNotFound.into());
                     }
                     if row.lifecycle != "active" {

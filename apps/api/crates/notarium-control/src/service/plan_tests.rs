@@ -3,6 +3,10 @@ use super::{
         ABILITY_PREFS_MOVE_DELETE_SQLITE_SQL, ABILITY_PREFS_MOVE_UPDATE_SQLITE_SQL,
         ABILITY_TRAIL_BY_DEST_SQLITE_SQL,
     },
+    context_state::selection::{
+        BOOTSTRAP_FAVORITES_AFTER_SQLITE_SQL, BOOTSTRAP_FAVORITES_FIRST_SQLITE_SQL,
+        BOOTSTRAP_SCOPE_PINS_SQLITE_SQL, BOOTSTRAP_SCOPE_SETS_SQLITE_SQL,
+    },
     episodes::OPEN_EPISODES_BY_NAME_SQLITE_SQL,
     provider::{
         admission::CALL_RUN_EPOCHS_SQLITE_SQL,
@@ -241,6 +245,79 @@ async fn sqlite_hot_control_queries_use_indexes_before_and_after_analyze() {
             .await
             .unwrap();
         }
+        for f in 0..32u8 {
+            let kind = if f % 2 == 0 { "note" } else { "folder" };
+            let eid = format!("ent_{u:02x}_{f:02x}");
+            sqlx::query(
+                "INSERT INTO favorites(owner_id,space_id,entity_kind,entity_id,rank,created_at)
+                 VALUES (?1,?2,?3,?4,?5,1)",
+            )
+            .bind(&uid)
+            .bind(&space_id)
+            .bind(kind)
+            .bind(&eid)
+            .bind(i64::from(f))
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        }
+        for p in 0..16u8 {
+            let nid = format!("nt_{u:02x}_{p:02x}");
+            sqlx::query(
+                "INSERT INTO context_scope_pins(owner_id,target_kind,target_id,target_space,note_space,note_id,revision,created_at)
+                 VALUES (?1,'space',?2,?2,?2,?3,1,1)",
+            )
+            .bind(&uid)
+            .bind(&space_id)
+            .bind(&nid)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+            let set_id = format!("set_{u:02x}_{p:02x}");
+            sqlx::query(
+                "INSERT INTO context_sets(set_id,owner_id,home_space,name,note_refs,revision,created_at)
+                 VALUES (?1,?2,?3,'bundle','[]',1,1)",
+            )
+            .bind(&set_id)
+            .bind(&uid)
+            .bind(&space_id)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO context_set_attachments(set_id,target_kind,target_id,target_space,owner_id,revision)
+                 VALUES (?1,'space',?2,?2,?3,1)",
+            )
+            .bind(&set_id)
+            .bind(&space_id)
+            .bind(&uid)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+            let note_ref_json = format!(r#"{{"space_id":"{space_id}","note_id":"{nid}"}}"#);
+            sqlx::query(
+                "INSERT INTO context_order(owner_id,target_kind,target_id,target_space,entry_kind,entry_ref,rank,revision)
+                 VALUES (?1,'space',?2,?2,'note',?3,?4,1)",
+            )
+            .bind(&uid)
+            .bind(&space_id)
+            .bind(&note_ref_json)
+            .bind(i64::from(p))
+            .execute(&mut conn)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO context_order(owner_id,target_kind,target_id,target_space,entry_kind,entry_ref,rank,revision)
+                 VALUES (?1,'space',?2,?2,'set',?3,?4,1)",
+            )
+            .bind(&uid)
+            .bind(&space_id)
+            .bind(&set_id)
+            .bind(i64::from(p) + 100)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        }
     }
 
     for phase in ["pre-ANALYZE", "post-ANALYZE"] {
@@ -414,6 +491,81 @@ async fn sqlite_hot_control_queries_use_indexes_before_and_after_analyze() {
             phase,
             "ability_preference_placement_update",
             "USING INDEX ability_preference_placement",
+            &rows,
+        );
+
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "EXPLAIN QUERY PLAN {BOOTSTRAP_FAVORITES_FIRST_SQLITE_SQL}"
+        )))
+        .bind(&first_uid)
+        .bind(32i64)
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+        check_plan(
+            phase,
+            "bootstrap_favorites_first",
+            "USING COVERING INDEX favorite_note_order",
+            &rows,
+        );
+
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "EXPLAIN QUERY PLAN {BOOTSTRAP_FAVORITES_AFTER_SQLITE_SQL}"
+        )))
+        .bind(&first_uid)
+        .bind(4i64)
+        .bind(&first_space)
+        .bind("ent_00_04")
+        .bind(32i64)
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+        check_plan(
+            phase,
+            "bootstrap_favorites_after",
+            "USING COVERING INDEX favorite_note_order",
+            &rows,
+        );
+
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "EXPLAIN QUERY PLAN {BOOTSTRAP_SCOPE_PINS_SQLITE_SQL}"
+        )))
+        .bind("space")
+        .bind(&first_space)
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+        check_plan(
+            phase,
+            "bootstrap_scope_pins_pin",
+            "USING COVERING INDEX context_pin_target",
+            &rows,
+        );
+        check_plan(
+            phase,
+            "bootstrap_scope_pins_order",
+            "USING COVERING INDEX context_order_lookup",
+            &rows,
+        );
+
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "EXPLAIN QUERY PLAN {BOOTSTRAP_SCOPE_SETS_SQLITE_SQL}"
+        )))
+        .bind("space")
+        .bind(&first_space)
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+        check_plan(
+            phase,
+            "bootstrap_scope_sets_att",
+            "USING INDEX context_attachment_target",
+            &rows,
+        );
+        check_plan(
+            phase,
+            "bootstrap_scope_sets_order",
+            "USING COVERING INDEX context_order_lookup",
             &rows,
         );
     }

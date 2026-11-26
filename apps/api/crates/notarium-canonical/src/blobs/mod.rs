@@ -646,6 +646,12 @@ impl crate::CanonicalStore {
         }
     }
 
+    /// Synchronized cleanup for local CAS `.zst` files that were newly renamed into `blobs/`
+    /// by a command or batch whose SQL transaction aborted/rolled back (or had an unknown commit
+    /// outcome). Callers MUST have dropped all their own `StagedBlobTicket`s (`LocalSharedGuard`s)
+    /// and finalized (rolled back or committed) their SQL transaction BEFORE calling this method.
+    /// Acquires `LocalExclusiveGuard` per `(space_id, digest)` and verifies zero backup holds,
+    /// zero live `blob_references`, and no `blob_catalog` row before deleting the physical file.
     pub(crate) async fn cleanup_unretained_local_files_async(
         &self,
         to_cleanup: Vec<(SpaceId, ContentDigest)>,
@@ -656,13 +662,55 @@ impl crate::CanonicalStore {
         let BlobBackendDriver::Local(local) = &self.inner.blobs else {
             return;
         };
-        let local_cl = Arc::clone(local);
-        let _ = tokio::task::spawn_blocking(move || {
-            for (space_id, digest) in to_cleanup {
-                let _ = local_cl.delete_physical_file(&space_id, digest);
+        let mut seen: HashSet<(SpaceId, ContentDigest)> = HashSet::with_capacity(to_cleanup.len());
+        for (space_id, digest) in to_cleanup {
+            if !seen.insert((space_id.clone(), digest)) {
+                continue;
             }
-        })
-        .await;
+            let guard = local.acquire_exclusive_guard(&space_id, digest).await;
+            let space_chk = space_id.clone();
+            let can_delete = self
+                .with_read_tx(|tx| {
+                    Box::pin(async move {
+                        ensure_no_backup_holds_tx(tx, &space_chk).await?;
+                        ensure_zero_reachable_refs_tx(tx, &space_chk, digest).await?;
+                        let cataloged: Option<i64> = match tx {
+                            BackendConn::Sqlite(conn) => sqlx::query_scalar(
+                                "SELECT 1 FROM blob_catalog WHERE space_id = ? AND content_blake3 = ? LIMIT 1",
+                            )
+                            .bind(space_chk.as_str())
+                            .bind(digest.as_bytes().as_slice())
+                            .fetch_optional(&mut **conn)
+                            .await
+                            .map_err(|err| {
+                                internal_not_committed("sqlite_check_orphan_catalog", err.to_string())
+                            })?,
+                            BackendConn::Postgres(conn) => sqlx::query_scalar(
+                                "SELECT 1::BIGINT FROM blob_catalog WHERE space_id = $1 AND content_blake3 = $2 LIMIT 1",
+                            )
+                            .bind(space_chk.as_str())
+                            .bind(digest.as_bytes().as_slice())
+                            .fetch_optional(&mut **conn)
+                            .await
+                            .map_err(|err| {
+                                crate::runtime::pg_read_error("pg_check_orphan_catalog", err)
+                            })?,
+                        };
+                        Ok(cataloged.is_none())
+                    })
+                })
+                .await
+                .unwrap_or(false);
+            if can_delete {
+                let local_cl = Arc::clone(local);
+                let space_del = space_id.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _guard = guard;
+                    let _ = local_cl.delete_physical_file(&space_del, digest);
+                })
+                .await;
+            }
+        }
     }
 
     /// Wave A0 + A1: materializes unique `.staging/*.part` files and flushes `fdatasync` / `F_FULLFSYNC`
@@ -801,13 +849,15 @@ impl crate::CanonicalStore {
 
     /// Wave A2: atomically renames ONLY `.staging/*.part` files whose `(space_id, digest)` succeeded
     /// in SQL Stage 1 (`retained_keys`) into `blobs/`, dropping and unlinking any rolled-back items.
-    /// Returns both the directories needing fsync and the `(space_id, digest)` pairs newly renamed
-    /// into `blobs/` so pre-commit abort paths can unlink them while holding their exclusive locks.
+    /// Appends every `(space_id, digest)` newly renamed into `blobs/` to `published_out` (including
+    /// partial renames before an I/O error) so callers can run `cleanup_unretained_local_files_async`
+    /// AFTER SQL rollback and AFTER dropping their `StagedBlobTicket`s.
     pub(crate) async fn rename_synced_local_entries_async(
         &self,
         synced_entries: Vec<PreparedLocalStagingEntry>,
         retained_keys: &HashSet<(String, ContentDigest)>,
-    ) -> Result<(PendingDirSyncs, Vec<(SpaceId, ContentDigest)>), PortError> {
+        published_out: &mut Vec<(SpaceId, ContentDigest)>,
+    ) -> Result<PendingDirSyncs, PortError> {
         let mut extra_dirs = PendingDirSyncs::default();
         let mut to_rename: Vec<(SpaceId, ContentDigest, local::DeferredLocalTempFile)> =
             Vec::with_capacity(synced_entries.len());
@@ -838,7 +888,6 @@ impl crate::CanonicalStore {
                     internal_not_committed("local_cas_unlink_batch_join", err.to_string())
                 })?;
         }
-        let mut newly_published = Vec::with_capacity(to_rename.len());
         if to_rename.len() <= 8 {
             if !to_rename.is_empty() {
                 let (published, err) = tokio::task::spawn_blocking(move || {
@@ -855,11 +904,10 @@ impl crate::CanonicalStore {
                 .map_err(|err| {
                     internal_not_committed("local_cas_rename_batch_join", err.to_string())
                 })?;
+                published_out.extend(published);
                 if let Some(err) = err {
-                    self.cleanup_unretained_local_files_async(published).await;
                     return Err(err);
                 }
-                newly_published = published;
             }
         } else {
             let chunk_size = to_rename.len().div_ceil(16);
@@ -884,9 +932,9 @@ impl crate::CanonicalStore {
             let mut first_err: Option<PortError> = None;
             while let Some(res) = ren_set.join_next().await {
                 match res {
-                    Ok((done, None)) => newly_published.extend(done),
+                    Ok((done, None)) => published_out.extend(done),
                     Ok((done, Some(e))) => {
-                        newly_published.extend(done);
+                        published_out.extend(done);
                         if first_err.is_none() {
                             first_err = Some(e);
                         }
@@ -902,20 +950,19 @@ impl crate::CanonicalStore {
                 }
             }
             if let Some(err) = first_err {
-                self.cleanup_unretained_local_files_async(newly_published)
-                    .await;
                 return Err(err);
             }
         }
 
-        Ok((extra_dirs, newly_published))
+        Ok(extra_dirs)
     }
 
     /// Sequential Wave A0 + A1 + A2 helper used by async `execute_batch_on_conn`.
     pub(crate) async fn publish_deferred_local_tickets_async(
         &self,
         tickets: &[StagedBlobTicket],
-    ) -> Result<(PendingDirSyncs, Vec<(SpaceId, ContentDigest)>), PortError> {
+        published_out: &mut Vec<(SpaceId, ContentDigest)>,
+    ) -> Result<PendingDirSyncs, PortError> {
         let mut pending_stagings = Vec::new();
         let mut retained_keys = HashSet::with_capacity(tickets.len());
         for ticket in tickets {
@@ -927,12 +974,12 @@ impl crate::CanonicalStore {
             }
         }
         if pending_stagings.is_empty() {
-            return Ok((PendingDirSyncs::default(), Vec::new()));
+            return Ok(PendingDirSyncs::default());
         }
         let synced = self
             .prepare_and_sync_local_stagings_async(pending_stagings)
             .await?;
-        self.rename_synced_local_entries_async(synced, &retained_keys)
+        self.rename_synced_local_entries_async(synced, &retained_keys, published_out)
             .await
     }
 

@@ -316,6 +316,24 @@ impl CommandIdentitySpec {
                         {
                             return Err(DomainError::ResourceNotFound.into());
                         }
+                        let target_space = crate::runtime::load_space_record(tx, &note.space_id)
+                            .await
+                            .map_err(|err| match err {
+                                PortError::Domain(DomainError::ResourceNotFound) => err,
+                                other => other,
+                            })?;
+                        if target_space.space.lifecycle
+                            != notarium_core::auth::SpaceLifecycle::Active
+                        {
+                            return Err(DomainError::ResourceNotFound.into());
+                        }
+                        authorize_resource(
+                            tx,
+                            &target_space,
+                            auth,
+                            &ReplayResource::Read(note.note_id.clone()),
+                        )
+                        .await?;
                         auth.taint().mark_external_read();
                     }
                 }

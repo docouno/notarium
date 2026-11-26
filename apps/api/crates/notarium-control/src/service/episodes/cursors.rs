@@ -218,8 +218,15 @@ impl ControlService {
                 return Err(DomainError::ResourceNotFound.into());
             }
             let episode_row = if let AckOwner::Episode(id) = &request.input.owner {
+                let owner_row = user_read(tx.inner_mut(), auth.principal().as_str()).await?;
                 let row = episode(tx.inner_mut(), auth.principal(), id).await?;
-                if !super::episode_project_admitted(&auth, super::stored_project_ref(&row)?.as_ref()) {
+                if !super::episode_project_admitted(
+                    &auth,
+                    owner_row.personal_space_id.as_deref(),
+                    super::stored_project_ref(&row)?.as_ref(),
+                    row.name.as_deref(),
+                    false,
+                ) {
                     return Err(DomainError::ResourceNotFound.into());
                 }
                 Some(row)

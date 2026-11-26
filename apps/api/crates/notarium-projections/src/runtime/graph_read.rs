@@ -172,7 +172,15 @@ impl ProjectionEngine {
         let (head, authorized, lens, lens_tags_need_exact) = {
             let permit = cut.live.try_read()?;
             authorize_graph_entry(&permit, ctx, &cut)?;
-            if matches!(query.tier, GraphTier::Superclusters) && !has_full_plain_graph_access(ctx) {
+            if matches!(
+                query.tier,
+                GraphTier::Superclusters
+                    | GraphTier::Lens {
+                        cluster: Some(_),
+                        ..
+                    }
+            ) && !has_full_plain_graph_access(ctx)
+            {
                 return Err(DomainError::AccessDenied.into());
             }
             query.filter.validate_declared(&cut.fields)?;

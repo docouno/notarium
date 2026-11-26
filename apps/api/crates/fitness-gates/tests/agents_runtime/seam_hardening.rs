@@ -2681,7 +2681,7 @@ async fn unconsented_space_taint_isolation_probes(
         .await
         .unwrap();
     let make_probe_ctx = |sub: u8| McpInvocationContext {
-        account: probe_agent_account.clone(),
+        account: AccountContext::new(probe_agent_account.auth().clone(), budget()),
         target: EgressTarget::InAppProvider {
             provider: chat_narrow_res.clone(),
             model: chat_narrow_model.clone(),
@@ -16488,6 +16488,16 @@ async fn run_control_replay_and_taint_hardening(pg: bool) {
         )
     })
     .await;
+    box_step(|| {
+        verify_part_j_cross_space_role_and_validation_hardening(
+            &fixture,
+            &part_i_owner,
+            personal.scope(),
+            &s2.history,
+            &s2.slug,
+        )
+    })
+    .await;
 
     fixture.close().await;
 }
@@ -17012,6 +17022,13 @@ async fn episodes_context_and_ability_overlay_replay_hardening(
             .restrict_to_spaces(&BTreeSet::from([s1_history.space_id.clone()])),
         budget(),
     );
+    let only_s1_and_personal = AccountContext::new(
+        owner.auth().restrict_to_spaces(&BTreeSet::from([
+            pscope.space_id.clone(),
+            s1_history.space_id.clone(),
+        ])),
+        budget(),
+    );
     assert!(matches!(
         fixture
             .control
@@ -17029,10 +17046,27 @@ async fn episodes_context_and_ability_overlay_replay_hardening(
             .await,
         Err(PortError::Domain(DomainError::ResourceNotFound))
     ));
+    assert!(matches!(
+        fixture
+            .control
+            .start_or_resume_episode(
+                only_s1.clone(),
+                AccountMutation {
+                    identity: identity(fixture, &owner, 0xFA).await,
+                    input: StartEpisode {
+                        selector: EpisodeSelector::Name("ep-s2".into()),
+                        project_hint: None,
+                        guard: EpisodeRevisionGuard::Account,
+                    },
+                },
+            )
+            .await,
+        Err(PortError::Domain(DomainError::ResourceNotFound))
+    ));
     let s1_named_new = fixture
         .control
         .start_or_resume_episode(
-            only_s1.clone(),
+            only_s1_and_personal.clone(),
             AccountMutation {
                 identity: identity(fixture, &owner, 0xF3).await,
                 input: StartEpisode {
@@ -17043,7 +17077,7 @@ async fn episodes_context_and_ability_overlay_replay_hardening(
             },
         )
         .await
-        .expect("narrowed caller starting episode with hidden excluded-Space name must create New instead of leaking existence");
+        .expect("narrowed caller with Personal Space starting episode with hidden excluded-Space name must create New instead of leaking existence");
     match s1_named_new.value {
         EpisodeStartResult::New(ep) => {
             assert_ne!(
@@ -28160,6 +28194,462 @@ async fn verify_part_i_contract_and_chat_hardening(
         branch.entries[0].referenced_notes,
         vec![vis_ref],
         "read_chat must retain visible referenced_notes and filter out EncryptedNote"
+    );
+}
+
+#[inline(never)]
+async fn verify_part_j_cross_space_role_and_validation_hardening(
+    fixture: &RuntimeFixture,
+    owner: &AccountContext,
+    personal_history: &HistoryScope,
+    s2_history: &HistoryScope,
+    s2_slug: &str,
+) {
+    let actor = owner.auth().principal().clone();
+    let s2_sc = SpaceContext::new(owner.auth().clone(), s2_history.clone(), budget()).unwrap();
+    let pers_sc =
+        SpaceContext::new(owner.auth().clone(), personal_history.clone(), budget()).unwrap();
+    let s2_epoch = fixture
+        .canonical
+        .read_space(&s2_history.space_id)
+        .await
+        .unwrap()
+        .active_epoch;
+
+    // 1. OwnedProject role by `ar1:` token with NO `project` in `start_session` or `use_role`
+    //    must fail deterministically with ResourceNotFound (never Unknown) and create no orphan episode.
+    let proj_role_dir = FolderId::from_bytes([0xD8, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    fixture
+        .canonical
+        .create_folder(CreateFolderSpec {
+            scope: s2_history.clone(),
+            active_epoch: s2_epoch,
+            folder_id: proj_role_dir.clone(),
+            parent: None,
+            slug: "proj-role-guard".into(),
+            display_name: "proj-role-guard".into(),
+            is_project: true,
+            project_slug: Some("proj-role-guard".into()),
+            actor: actor.clone(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+    let proj_handle = format!("{s2_slug}/proj-role-guard");
+    let created_role = call_mcp(
+        &fixture.registry,
+        owner,
+        [0xD8, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "create_ability",
+        json!({
+            "kind": "role",
+            "name": "proj-only-role",
+            "description": "Project-owned role",
+            "instructions": "Work strictly in this project.",
+            "placement": { "home": "project", "project": proj_handle },
+        }),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    let proj_role_ref = created_role["ref"].as_str().unwrap().to_owned();
+
+    let start_proj_role_err = call_mcp(
+        &fixture.registry,
+        owner,
+        [0xD8, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "start_session",
+        json!({
+            "session": { "name": "no-orphan-proj-role-ep" },
+            "role": proj_role_ref,
+        }),
+    )
+    .await;
+    assert!(
+        matches!(
+            start_proj_role_err,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ),
+        "start_session with OwnedProject ar1: role and no project must fail ResourceNotFound (never Unknown), got {:?}",
+        start_proj_role_err.err()
+    );
+    let orphan_check = fixture
+        .control
+        .named_episode_project_hint(owner.clone(), "no-orphan-proj-role-ep".into())
+        .await
+        .unwrap();
+    assert_eq!(
+        orphan_check,
+        NamedEpisodePreview::NoMatch,
+        "failed start_session must not commit an orphaned episode"
+    );
+    let use_role_err = call_mcp(
+        &fixture.registry,
+        owner,
+        [0xD8, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "use_role",
+        json!({ "role": proj_role_ref }),
+    )
+    .await;
+    assert!(
+        matches!(
+            use_role_err,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ),
+        "use_role with OwnedProject ar1: role and no project must fail ResourceNotFound, got {:?}",
+        use_role_err.err()
+    );
+
+    // 2. Pre-lookup `validate_content` checks in create_ability, edit_ability, edit_note(view),
+    //    and create_note(type/tags).
+    let bad_ab_ctrl = call_mcp(
+        &fixture.registry,
+        owner,
+        [0xD8, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "create_ability",
+        json!({
+            "kind": "skill",
+            "name": "ctrl-skill",
+            "description": "bad\u{0000}desc",
+            "instructions": "Valid instructions.",
+            "placement": { "home": "personal" },
+        }),
+    )
+    .await;
+    assert!(
+        matches!(
+            bad_ab_ctrl,
+            Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
+                if diagnostic.reason == ValidationReason::DisallowedCodePoint
+        ),
+        "create_ability with NUL in description must fail DisallowedCodePoint pre-lookup, got {:?}",
+        bad_ab_ctrl.err()
+    );
+    let bad_edit_ab_ctrl = call_mcp(
+        &fixture.registry,
+        owner,
+        [0xD8, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "edit_ability",
+        json!({
+            "ref": proj_role_ref,
+            "versionToken": created_role["versionToken"],
+            "instructions": "bad\u{0007}instructions",
+        }),
+    )
+    .await;
+    assert!(
+        matches!(
+            bad_edit_ab_ctrl,
+            Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
+                if diagnostic.reason == ValidationReason::DisallowedCodePoint
+        ),
+        "edit_ability with BEL in instructions must fail DisallowedCodePoint pre-lookup, got {:?}",
+        bad_edit_ab_ctrl.err()
+    );
+    let bogus_nid = NoteId::from_bytes([0xD8, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    let bogus_vk = ViewKey::from_bytes([0xD8, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    let bad_view_ctrl = call_mcp(
+        &fixture.registry,
+        owner,
+        [0xD8, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "edit_note",
+        json!({
+            "ref": bogus_nid.as_str(),
+            "view": {
+                "viewRef": format!("{}:{}", bogus_nid.as_str(), bogus_vk.as_str()),
+                "options": { "set": { "x": "bad\u{0007}val" } }
+            }
+        }),
+    )
+    .await;
+    assert!(
+        matches!(
+            bad_view_ctrl,
+            Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
+                if diagnostic.reason == ValidationReason::DisallowedCodePoint
+        ),
+        "edit_note(view) with BEL value must fail DisallowedCodePoint pre-lookup, got {:?}",
+        bad_view_ctrl.err()
+    );
+    let bad_create_tag = call_mcp(
+        &fixture.registry,
+        owner,
+        [0xD8, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "create_note",
+        json!({
+            "project": "no-such-space/no-such-proj",
+            "title": "Clean Title",
+            "body": "Clean body.",
+            "tags": ["bad\u{0000}tag"],
+        }),
+    )
+    .await;
+    assert!(
+        matches!(
+            bad_create_tag,
+            Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
+                if diagnostic.reason == ValidationReason::DisallowedCodePoint
+        ),
+        "create_note with NUL tag must fail DisallowedCodePoint pre-lookup, got {:?}",
+        bad_create_tag.err()
+    );
+
+    // 3. Cross-space referenced_notes in Personal chat enforce note-level auth, class, and
+    //    hard-purge fences on append_chat and read_chat.
+    let s2_plain_id = NoteId::from_bytes([0xD8, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    let s2_enc_id = NoteId::from_bytes([0xD8, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    fixture
+        .canonical
+        .create_note(
+            s2_sc.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: s2_history.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([
+                        0xD8, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xD8; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: CreateNote {
+                    folder_page: false,
+                    note: s2_plain_id.clone(),
+                    parent: None,
+                    slug: "cross-space-chat-plain".into(),
+                    class: DocClass::UserDoc,
+                    carrier: "# Cross-space plain\n".into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    fixture
+        .canonical
+        .create_note(
+            s2_sc.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: s2_history.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([0xD8, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+                    hash: ContentDigest::from_bytes([0xD9; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: CreateNote {
+                    folder_page: false,
+                    note: s2_enc_id.clone(),
+                    parent: None,
+                    slug: "cross-space-chat-enc".into(),
+                    class: DocClass::EncryptedNote,
+                    carrier: concat!(
+                        "---\nclass: encrypted-note\ntitle: Cross Space Enc\n---\n# Cross Space Enc\n\n```age\n",
+                        "-----BEGIN AGE ENCRYPTED FILE-----\n",
+                        "YWdlLWVuY3J5cHRpb24ub3JnL3YxCi0+IFgyNTUxOSBURWlGMHlwcXIrYnB2Y3FY\n",
+                        "TnlDVkpwTDdPdXdQZFZ3UEw3S1FFYkZET0NjCmhqYWJHWHdTTFE5YzNTNkx3Mmkr\n",
+                        "UzJUdTJmaXdRSEhzbGJCTjZCNDFGTEUKLS0tIFd5SnA5Ri85Rk9aaDdnSmRoZXEy\n",
+                        "V0lKY3dIZ1ljOE5JVmgzZGR3aHJjTmcK7s9ix86RtDMnTmjU8vkTTLdMW/73vqpS\n",
+                        "yPC8DpksHoMx+2Y=\n",
+                        "-----END AGE ENCRYPTED FILE-----\n```\n",
+                    )
+                    .into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let cross_tid = ChatThreadId::from_bytes([0xD8, 13, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    fixture
+        .canonical
+        .create_chat(
+            pers_sc.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: personal_history.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([
+                        0xD8, 13, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xDA; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: CreateChat {
+                    thread: cross_tid.clone(),
+                    kind: ChatThreadKind::Personal,
+                    owner: actor.clone(),
+                    title: "cross-space refs".into(),
+                    project_folder: None,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let s2_plain_ref = NoteRef {
+        space_id: s2_history.space_id.clone(),
+        note_id: s2_plain_id.clone(),
+    };
+    let s2_enc_ref = NoteRef {
+        space_id: s2_history.space_id.clone(),
+        note_id: s2_enc_id.clone(),
+    };
+    // Restricted DirectHuman grant without EncryptedNote read on s2 cannot append a cross-space EncryptedNote ref.
+    let mut no_enc_s2_grants = owner.auth().spaces().clone();
+    no_enc_s2_grants
+        .get_mut(&s2_history.space_id)
+        .unwrap()
+        .read_classes = BTreeSet::from([DocClass::UserDoc]);
+    let no_enc_s2_pers_sc = SpaceContext::new(
+        notarium_core::auth::EngineAuthContext::for_human(
+            notarium_core::auth::VerifiedHuman::attest(
+                actor.clone(),
+                notarium_core::ids::GrantId::from_bytes([0xD8; 16]),
+                no_enc_s2_grants,
+                false,
+            ),
+        ),
+        personal_history.clone(),
+        budget(),
+    )
+    .unwrap();
+    let append_cross_enc_err = fixture
+        .canonical
+        .append_chat(
+            no_enc_s2_pers_sc.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: personal_history.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([
+                        0xD8, 14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xDB; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: AppendChat {
+                    thread: cross_tid.clone(),
+                    parent: ThreadEntrySeq::ZERO,
+                    kind: ChatEntryKind::Human,
+                    body: ChatInputBody::Text("attempt forbidden cross-space enc ref".into()),
+                    referenced_notes: vec![s2_enc_ref.clone()],
+                    tainted: true,
+                    tool_calls: Vec::new(),
+                    provenance: None,
+                    interruption: None,
+                    proposed_diff: None,
+                    proposed_effect: None,
+                },
+            },
+        )
+        .await;
+    assert!(
+        matches!(
+            append_cross_enc_err,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ),
+        "append_chat must reject cross-space EncryptedNote ref for UserDoc-only reader, got {append_cross_enc_err:?}"
+    );
+    // Full owner appends both cross-space refs (which taints that branch); UserDoc-only reader
+    // sees only plain ref; after hard-purging plain ref in s2, even full owner sees it scrubbed.
+    let cross_pers_owner = fresh_owner(fixture).await;
+    let cross_pers_sc = SpaceContext::new(
+        cross_pers_owner.auth().clone(),
+        personal_history.clone(),
+        budget(),
+    )
+    .unwrap();
+    let appended_cross = fixture
+        .canonical
+        .append_chat(
+            cross_pers_sc.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: personal_history.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([
+                        0xD8, 15, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xDC; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: AppendChat {
+                    thread: cross_tid.clone(),
+                    parent: ThreadEntrySeq::ZERO,
+                    kind: ChatEntryKind::Human,
+                    body: ChatInputBody::Text("cross-space refs".into()),
+                    referenced_notes: vec![s2_plain_ref.clone(), s2_enc_ref.clone()],
+                    tainted: true,
+                    tool_calls: Vec::new(),
+                    provenance: None,
+                    interruption: None,
+                    proposed_diff: None,
+                    proposed_effect: None,
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    assert!(
+        cross_pers_sc.auth().taint().is_tainted(),
+        "appending cross-space referenced_notes must mark BranchTaint"
+    );
+    let restricted_read = fixture
+        .canonical
+        .read_chat(
+            no_enc_s2_pers_sc,
+            ChatRead {
+                thread: cross_tid.clone(),
+                leaf: appended_cross.seq,
+                before: None,
+                max_entries: PageLimit::new(10).unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        restricted_read.entries[0].referenced_notes,
+        vec![s2_plain_ref],
+        "read_chat must filter unauthorized cross-space EncryptedNote ref"
+    );
+    fixture
+        .canonical
+        .delete_note(
+            s2_sc,
+            Mutation {
+                identity: CommandIdentity {
+                    scope: s2_history.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([
+                        0xD8, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xDD; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: DeleteNote {
+                    note: s2_plain_id,
+                    disposition: DeleteDisposition::Purge,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let post_purge_read = fixture
+        .canonical
+        .read_chat(
+            pers_sc,
+            ChatRead {
+                thread: cross_tid,
+                leaf: appended_cross.seq,
+                before: None,
+                max_entries: PageLimit::new(10).unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        post_purge_read.entries[0].referenced_notes,
+        vec![s2_enc_ref],
+        "read_chat must scrub hard-purged cross-space referenced_notes"
     );
 }
 

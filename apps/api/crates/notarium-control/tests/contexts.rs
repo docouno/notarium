@@ -979,6 +979,7 @@ async fn exercise_shared_consumer(
         login.token.expose(),
     )
     .await;
+    exercise_narrowed_episode_isolation(service, ctx, shared).await;
 }
 
 #[inline(never)]
@@ -1209,6 +1210,22 @@ fn exercise_hidden_bundle_and_order_isolation<'a>(
             "bootstrap_context must not expand unauthorized Personal ContextSet attached to Shared Space: {:?}",
             other_boot.selection
         );
+        let other_entries = service
+            .list_context_entries(
+                other_editor.clone(),
+                scope.clone(),
+                ControlPageRequest::new(50, None).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !other_entries
+                .items
+                .iter()
+                .any(|item| item.entry == ContextEntry::Set(personal_bundle.id.clone())),
+            "list_context_entries must hide unauthorized Personal ContextSet attached to Shared Space: {:?}",
+            other_entries.items
+        );
         let scope_rev_now = scope_revision(service, &other_editor, scope).await;
         let order_hidden_set = service
             .set_context_order(
@@ -1255,6 +1272,99 @@ fn exercise_hidden_bundle_and_order_isolation<'a>(
                 Err(PortError::Domain(DomainError::ResourceNotFound))
             ),
             "set_context_order on hidden Personal pinned note must fail ResourceNotFound, got {order_hidden_pin:?}"
+        );
+    })
+}
+
+#[inline(never)]
+fn exercise_narrowed_episode_isolation<'a>(
+    service: &'a std::sync::Arc<ControlService>,
+    ctx: &'a AccountContext,
+    shared: &'a AccessibleSpace,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>> {
+    Box::pin(async move {
+        // Single-Space Shared PAT (excluding Personal Space) must NOT see or mutate
+        // projectless Personal episodes, and replaying update_episode under a narrowed
+        // scope must return ResourceNotFound rather than CommitEffect::Unknown.
+        let personal_ep = episode(service, ctx, None, 56).await;
+        let personal_ep_info = service
+            .get_episode(ctx.clone(), personal_ep.clone())
+            .await
+            .unwrap();
+        let shared_only_pat = service
+            .create_pat(
+                ctx.clone(),
+                CreatePat {
+                    name: "shared-only-ep-check".into(),
+                    scope: BearerScope::Write,
+                    ability_write: false,
+                    selected_spaces: Some(vec![shared.space.id.clone()]),
+                    expires_at_ms: None,
+                    expected: service
+                        .account(ctx.clone(), ctx.auth().principal().clone())
+                        .await
+                        .unwrap()
+                        .revision,
+                },
+            )
+            .await
+            .unwrap()
+            .value;
+        let shared_pat_ctx = AccountContext::new(
+            service
+                .resolve(evidence(
+                    AuthEvidenceKind::Pat,
+                    shared_only_pat.token.expose(),
+                ))
+                .await
+                .unwrap(),
+            budget(),
+        );
+        assert!(matches!(
+            service
+                .get_episode(shared_pat_ctx.clone(), personal_ep.clone())
+                .await,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ));
+        assert!(matches!(
+            service
+                .bootstrap_context(
+                    shared_pat_ctx.clone(),
+                    personal_ep.clone(),
+                    None,
+                    ControlPageRequest::new(10, None).unwrap(),
+                )
+                .await,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ));
+        assert!(matches!(
+            service
+                .touch_episode(shared_pat_ctx.clone(), personal_ep.clone())
+                .await,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ));
+        let update_mut = AccountMutation {
+            identity: identity(service, ctx, 57).await,
+            input: EpisodeMutation::Full(EpisodeUpdate {
+                episode: personal_ep.clone(),
+                expected: personal_ep_info.revision,
+                name: Some("personal-private-name".into()),
+                active_role: None,
+                project_hint: None,
+                lifecycle: EpisodeLifecycle::Active,
+            }),
+        };
+        service
+            .update_episode(ctx.clone(), update_mut.clone())
+            .await
+            .unwrap();
+        let replay_narrow_err = service.update_episode(shared_pat_ctx, update_mut).await;
+        assert!(
+            matches!(
+                replay_narrow_err,
+                Err(PortError::Domain(DomainError::ResourceNotFound))
+            ),
+            "narrowed update_episode replay on hidden Personal episode must fail ResourceNotFound (never Unknown), got {replay_narrow_err:?}"
         );
     })
 }

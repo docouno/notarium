@@ -225,6 +225,14 @@ fn validate_draft_syntax(draft: &NoteDraft, folder_page: bool) -> Result<bool, P
         return Err(invalid(ValidationReason::InvalidPathComponent));
     }
     let title = draft_title(draft)?;
+    if let Some(note_type) = &draft.note_type {
+        notarium_syntax::unicode::validate_content(note_type)?;
+    }
+    if let Some(tags) = &draft.tags {
+        for tag in tags {
+            notarium_syntax::unicode::validate_content(tag)?;
+        }
+    }
     if !folder_page {
         let slug = if let Some(raw) = &draft.file_name {
             let name = raw.trim();
