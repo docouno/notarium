@@ -488,6 +488,12 @@ impl BackendCase {
                 .execute(&mut *tx)
                 .await
                 .unwrap();
+            if decoded.schema_version < 9 {
+                sqlx::raw_sql("DROP TABLE vault_handoffs, vault_observations, vault_bindings")
+                    .execute(&mut *tx)
+                    .await
+                    .unwrap();
+            }
             if decoded.schema_version == 7 {
                 sqlx::raw_sql(include_str!("fixtures/schema-v7-chat-refs.sql"))
                     .execute(&mut *tx)

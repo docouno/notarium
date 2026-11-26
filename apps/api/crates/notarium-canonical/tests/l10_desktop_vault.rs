@@ -35,6 +35,84 @@ use support::{
     sample_principal_id, sample_space_id,
 };
 
+#[tokio::test]
+async fn schema_eight_upgrades_to_vault_bindings_on_both_dialects() {
+    use sqlx::Executor;
+
+    const PREDECESSOR: &str = "085e724d4cf969a85265d36b616fe04bc78a51c3beadf86dee7f1664bee2dcd7";
+    const DROP_VAULT: &str =
+        "DROP TABLE vault_handoffs; DROP TABLE vault_observations; DROP TABLE vault_bindings;";
+    let fixtures = StorageTestFixtures::load_required();
+    let schema = fixtures.fresh_pg_schema();
+    let root = TempDataRoot::new("vault-schema-eight");
+    let pg_root = TempDataRoot::new("vault-schema-eight-pg-cas");
+    let installation = sample_installation_id(31);
+    for config in [
+        CanonicalConfig::local_default(installation.clone(), root.data_root()),
+        fixtures.pg_local_config(installation, &schema, pg_root.data_root()),
+    ] {
+        let (store, runtime) = CanonicalRuntime::open(config.clone()).await.unwrap();
+        let ctx = seed_space(&store).await;
+        let note = store
+            .create_note(
+                ctx.clone(),
+                mutation(&ctx, candidate(40, None, "retained", "first").create),
+            )
+            .await
+            .unwrap();
+        let edited = edit_body(&store, &ctx, &note.value, "retained content").await;
+        runtime.shutdown().await.unwrap();
+
+        match &config.sql {
+            SqlBackendConfig::Sqlite { .. } => {
+                let db = rusqlite::Connection::open(root.data_root().canonical()).unwrap();
+                db.execute_batch(DROP_VAULT).unwrap();
+                db.execute(
+                    "UPDATE schema_meta SET schema_version=8, manifest_checksum=?",
+                    [hex::decode(PREDECESSOR).unwrap()],
+                )
+                .unwrap();
+            }
+            SqlBackendConfig::Postgres { .. } => {
+                let mut db = fixtures.open_raw_pg().await;
+                db.execute(sqlx::AssertSqlSafe(format!("SET search_path TO {schema}")))
+                    .await
+                    .unwrap();
+                db.execute(sqlx::raw_sql(DROP_VAULT)).await.unwrap();
+                sqlx::query("UPDATE schema_meta SET schema_version=8, manifest_checksum=$1")
+                    .bind(hex::decode(PREDECESSOR).unwrap())
+                    .execute(&mut db)
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let (store, runtime) = CanonicalRuntime::open(config).await.unwrap();
+        assert_eq!(
+            store
+                .read_vault_note(&ctx, &edited.note)
+                .await
+                .unwrap()
+                .unwrap()
+                .carrier,
+            "retained content"
+        );
+        assert!(store.vault_binding(&ctx).await.unwrap().is_none());
+        assert_eq!(
+            store
+                .execute_diagnostic_read_sql_for_test(
+                    None,
+                    "SELECT CAST(COUNT(*) AS BIGINT) FROM materialized_observations",
+                )
+                .await
+                .unwrap(),
+            0
+        );
+        runtime.shutdown().await.unwrap();
+    }
+    fixtures.drop_pg_schema(&schema).await;
+}
+
 async fn seed_space(store: &CanonicalStore) -> SpaceContext {
     let owner = sample_principal_id(31);
     let rec = store

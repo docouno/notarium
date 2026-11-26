@@ -2006,7 +2006,7 @@ async fn sleep_async_interruptible(
 #[cfg(test)]
 #[test]
 fn historical_spool_shapes_match_their_published_manifests() {
-    for version in [6, 7] {
+    for version in [6, 7, 8] {
         let observed = checksum_tables(version, spool_tables(version));
         assert!(crate::schema::migrate::recognized_predecessor(
             i64::from(version),

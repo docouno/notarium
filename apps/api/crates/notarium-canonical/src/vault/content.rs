@@ -675,6 +675,7 @@ impl VaultWrite {
         let current = Self {
             binding,
             change: VaultChange::Edit { expected },
+            watch_fence: None,
         };
         if current.observation_witness()? != witness {
             return Err(observation_changed());

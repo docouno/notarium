@@ -5069,7 +5069,10 @@ pub(crate) async fn accept_external_observation_with_vault(
         super::common::CommandDeadline::start(&ctx.budget, "accept_external_observation");
     let budget = ctx.budget.clone();
     validate_mutation_identity(&ctx, &request.identity)?;
-    let vault_witness = vault.as_ref().map(VaultWrite::observation_witness).transpose()?;
+    let vault_witness = vault
+        .as_ref()
+        .map(VaultWrite::observation_witness)
+        .transpose()?;
     if let Some(vault) = &vault {
         deadline
             .prepare(&budget, || vault.require_current_binding(store, &ctx))
@@ -5400,7 +5403,11 @@ fn build_observation_intent(
                 let live_space = load_space_record(tx, &scope_cl.space_id).await?;
                 if let Some((ctx, witness)) = &vault_witness {
                     VaultWrite::check_observation_witness(
-                        tx, ctx, &live_space, &obs_input.note, *witness,
+                        tx,
+                        ctx,
+                        &live_space,
+                        &obs_input.note,
+                        *witness,
                     )
                     .await?;
                 }
@@ -5598,7 +5605,9 @@ fn build_observation_intent(
                             .bind(seq_i64)
                             .execute(&mut **conn)
                             .await
-                            .map_err(|err| internal_not_committed("pg_obs_upsert", err.to_string()))?;
+                            .map_err(|err| {
+                                internal_not_committed("pg_obs_upsert", err.to_string())
+                            })?;
 
                             sqlx::query(
                                 "INSERT INTO payload_owners (

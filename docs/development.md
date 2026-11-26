@@ -239,3 +239,17 @@ the owner and permissions of an existing private root before opening storage.
 The host can read the saved vault selection from the private root before
 validating and reopening the pair. Packaged distribution and the full runtime
 still require target-OS checks.
+
+The Windows and macOS adapters use the same vault journal and publication
+outcomes as Linux. On a target OS, start with the isolated vault suites using
+the repository's pinned Rust toolchain and local compiler:
+
+```sh
+cd apps/api
+cargo test --locked -p notarium-vault --lib --test vault_sync --test sidecar_process
+```
+
+Run the Windows checks with a local NTFS test directory and the macOS checks
+with a local APFS test directory. For each platform, record the OS,
+architecture, filesystem, and tested Git tree. Exercise the packaged Electron
+launcher with the production sidecar before declaring platform support.

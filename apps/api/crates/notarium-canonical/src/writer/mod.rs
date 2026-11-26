@@ -2382,6 +2382,7 @@ async fn execute_single_item_in_savepoint(
             dir_syncs: item_ctx.pending_dir_syncs,
             retained_tickets: item_ctx.retained_tickets,
             retained_guards: item_ctx.retained_guards,
+            before_commit: item_ctx.before_commit,
             after_commit: item_ctx.after_commit,
         });
     }

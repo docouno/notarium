@@ -2,6 +2,7 @@ use super::*;
 use notarium_canonical::{
     CloseCollabSession, CollabCarrierSettlement, CollabRoomState, CollabSessionRecord,
     OpenCollabSession, RoomCommandSettlement, RoomFenceTable,
+    vault::{VaultFileStamp, VaultObservation, VaultPath},
 };
 use notarium_core::{
     ids::RevisionId,
@@ -366,6 +367,7 @@ pub(super) async fn check(
     assert!(matches!(answer, Err(PortError::Unavailable(f))
         if f.effect() == notarium_core::error::CommitEffect::Unknown));
     check_room_command_commit(store, ctx, &room).await;
+    check_vault_observation_on_live_room(store, ctx, &room).await;
     check_planned_observation_conflict_replay(store, ctx).await;
 
     planner.tracked_notes.lock().unwrap().insert(note.clone());
@@ -1308,6 +1310,147 @@ async fn check_room_command_commit(store: &CanonicalStore, ctx: &SpaceContext, r
     assert_eq!(replayed.value, applied.value);
     assert_eq!(replayed.receipt, applied.receipt);
     assert_ne!(replayed.value.revision, later.carrier_rev_id);
+}
+
+async fn check_vault_observation_on_live_room(
+    store: &CanonicalStore,
+    ctx: &SpaceContext,
+    room: &PausedRoom,
+) {
+    let note = sample_note_id(0xec);
+    let base = "Original materialized note.\n";
+    let edited = "External edit to the live note.\n";
+    let created = store
+        .create_note(
+            ctx.clone(),
+            next_mutation(
+                ctx.scope(),
+                ctx.auth().principal(),
+                CreateNote {
+                    note: note.clone(),
+                    class: DocClass::UserDoc,
+                    parent: None,
+                    slug: "live-vault-note".into(),
+                    carrier: base.into(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let binding = store
+        .bind_vault(
+            ctx.clone(),
+            ContentDigest::from_bytes([1; 32]),
+            ContentDigest::from_bytes([2; 32]),
+            None,
+        )
+        .await
+        .unwrap();
+    let digest = notarium_syntax::content_digest(base);
+    let observation = VaultObservation {
+        note: note.clone(),
+        revision: created.value.revision.clone(),
+        carrier_digest: digest,
+        path: VaultPath {
+            relative: "live-vault-note.md".into(),
+            key: "live-vault-note.md".into(),
+        },
+        file: VaultFileStamp {
+            identity: ContentDigest::from_bytes([3; 32]),
+            size: base.len() as u64,
+            mtime_seconds: 42,
+            mtime_nanos: 0,
+            digest,
+        },
+    };
+    store
+        .put_vault_observation(ctx.clone(), &binding, None, observation.clone())
+        .await
+        .unwrap();
+    let active = store
+        .open_collab_session(
+            &ctx.budget,
+            OpenCollabSession {
+                scope: ctx.scope().clone(),
+                note: note.clone(),
+                owner_id: "vault-room".into(),
+                expected_carrier_rev: observation.revision.clone(),
+                expected_lease: None,
+                expected_lineage: None,
+                initial_yrs_snapshot: None,
+                allow_fenced_recovery: false,
+            },
+        )
+        .await
+        .unwrap();
+    let request = next_mutation(
+        ctx.scope(),
+        ctx.auth().principal(),
+        ExternalObservation {
+            note: note.clone(),
+            observed_digest: notarium_syntax::content_digest(edited),
+            base_revision: observation.revision.clone(),
+            disk_identity: observation.file.identity,
+            content: ObservedContent::Carrier(edited.into()),
+        },
+    );
+    let mut changed = observation.clone();
+    changed.file.mtime_nanos = 1;
+    let (stale, ()) = room
+        .during_interception_reply(
+            store.accept_vault_observation(
+                ctx.clone(),
+                &binding,
+                observation.clone(),
+                request.clone(),
+            ),
+            async {
+                store
+                    .put_vault_observation(
+                        ctx.clone(),
+                        &binding,
+                        Some(observation.clone()),
+                        changed.clone(),
+                    )
+                    .await
+                    .unwrap();
+                (
+                    PauseReply::Commit(PausedRoom::settlement_for(
+                        &active,
+                        observation.revision.clone(),
+                        edited,
+                        b"vault checkpoint".to_vec(),
+                        None,
+                    )),
+                    (),
+                )
+            },
+        )
+        .await;
+    assert_validation_err(&stale, ValidationReason::CursorStale);
+
+    room.accept(
+        &active,
+        observation.revision,
+        edited,
+        b"vault checkpoint".to_vec(),
+        None,
+    );
+    let ExternalObservationResult::Committed(applied) = store
+        .accept_vault_observation(ctx.clone(), &binding, changed.clone(), request.clone())
+        .await
+        .unwrap()
+    else {
+        panic!("the current vault observation must commit through the room");
+    };
+    let ExternalObservationResult::Committed(replayed) = store
+        .accept_vault_observation(ctx.clone(), &binding, changed, request)
+        .await
+        .unwrap()
+    else {
+        panic!("the committed vault observation must be replayable");
+    };
+    assert_eq!(replayed.receipt, applied.receipt);
 }
 
 #[tokio::test]
