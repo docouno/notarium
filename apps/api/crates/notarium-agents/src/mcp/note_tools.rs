@@ -127,6 +127,17 @@ pub(in crate::mcp) fn authorize_note_write(
     Ok(())
 }
 
+pub(in crate::mcp) fn authorize_metadata_note_write(
+    scope: &SpaceContext,
+    metadata: &notarium_core::classes::ClassifiedMetadata,
+) -> Result<(), PortError> {
+    metadata.authorize_current_write(scope.auth())?;
+    if metadata.current_has_ability_package() {
+        return Err(DomainError::AbilityWriteForbidden.into());
+    }
+    Ok(())
+}
+
 async fn route(
     call: &ToolCallContext<'_>,
     note: &NoteId,
@@ -168,7 +179,10 @@ async fn route_inner(
         }
         let scope = call.space(route.scope.clone())?;
         match corpus::note_in_space(call, &scope, &route.note).await {
-            Ok(catalog) => corpus::admit_note_write(call, &scope, &catalog).await?,
+            Ok(catalog) => {
+                corpus::admit_note_write(call, &scope, &catalog).await?;
+                authorize_note_write(&scope, &catalog.facts)?;
+            }
             Err(PortError::Domain(DomainError::ResourceNotFound)) if replayed => {
                 let observed = metadata_snapshot(
                     call,
@@ -182,26 +196,32 @@ async fn route_inner(
                     return Err(DomainError::ResourceNotFound.into());
                 }
                 corpus::admit_note_metadata_write(call, &scope, &observed.metadata).await?;
+                authorize_metadata_note_write(&scope, &observed.metadata)?;
                 trashed_replay = true;
             }
             Err(error) => return Err(error),
         }
     } else if replayed {
         let scope = call.space(route.scope.clone())?;
-        if let Err(PortError::Domain(DomainError::ResourceNotFound)) =
-            corpus::note_in_space(call, &scope, &route.note).await
-        {
-            let observed = metadata_snapshot(
-                call,
-                &scope,
-                &route.note,
-                None,
-                CausalBasis::Await(Default::default()),
-            )
-            .await?;
-            if observed.metadata.lifecycle() == Lifecycle::Trashed {
-                trashed_replay = true;
+        match corpus::note_in_space(call, &scope, &route.note).await {
+            Ok(catalog) => {
+                authorize_note_write(&scope, &catalog.facts)?;
             }
+            Err(PortError::Domain(DomainError::ResourceNotFound)) => {
+                let observed = metadata_snapshot(
+                    call,
+                    &scope,
+                    &route.note,
+                    None,
+                    CausalBasis::Await(Default::default()),
+                )
+                .await?;
+                authorize_metadata_note_write(&scope, &observed.metadata)?;
+                if observed.metadata.lifecycle() == Lifecycle::Trashed {
+                    trashed_replay = true;
+                }
+            }
+            Err(error) => return Err(error),
         }
     }
     Ok((route, trashed_replay))

@@ -3230,9 +3230,9 @@ async fn rollback_skipped_replay_and_oracle_views(
         assert!(
             matches!(
                 probe_err,
-                Err(PortError::Domain(DomainError::SpaceReadOnly))
+                Err(PortError::Domain(DomainError::ResourceNotFound))
             ),
-            "unauthorized P2 run rollback must authorize touched_set before checking expected_entities, got {probe_err:?}"
+            "unauthorized P2 run rollback must hide out-of-project touched_set as ResourceNotFound before checking expected_entities, got {probe_err:?}"
         );
     }
     // Case 7D: Stale-group neighbor overlay materialization & rollback restoration/cleanup.

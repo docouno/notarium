@@ -432,11 +432,21 @@ async fn authorize_trashed_replay_source(
     scope: &SpaceContext,
     note: &NoteId,
 ) -> Result<DocClass, PortError> {
+    if scope.auth().taint().is_tainted() {
+        return Err(DomainError::CrossSpaceTainted.into());
+    }
+    if scope
+        .auth()
+        .pinned_write_space()
+        .is_some_and(|pin| pin != &scope.scope().space_id)
+    {
+        return Err(DomainError::SpaceReadOnly.into());
+    }
     let observed = call
         .registry
         .engine
         .get_note_metadata(
-            scope.clone(),
+            scope.with_preflight_taint(),
             GetNote {
                 note: note.clone(),
                 revision: None,
@@ -453,23 +463,8 @@ async fn authorize_trashed_replay_source(
     }
     observed.metadata.listing(scope.auth())?;
     corpus::admit_note_metadata_write(call, scope, &observed.metadata).await?;
-    let class = observed.metadata.class();
-    if class == DocClass::Skill {
-        return Err(DomainError::AbilityWriteForbidden.into());
-    }
-    let grant = scope
-        .auth()
-        .spaces()
-        .get(&scope.scope().space_id)
-        .ok_or(DomainError::ResourceNotFound)?;
-    if grant.role == notarium_core::auth::SpaceRole::Viewer || !grant.write_classes.contains(&class)
-    {
-        return Err(DomainError::SpaceReadOnly.into());
-    }
-    if scope.auth().taint().is_tainted() {
-        return Err(DomainError::CrossSpaceTainted.into());
-    }
-    Ok(class)
+    super::super::note_tools::authorize_metadata_note_write(scope, &observed.metadata)?;
+    Ok(observed.metadata.class())
 }
 
 async fn authorize(

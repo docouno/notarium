@@ -1047,11 +1047,11 @@ impl ProviderService {
             let resource=resource(tx,input.resource.as_str()).await?;
             super::inventory::resource_visible(tx,&auth,&owner.user_id,&resource).await?;
             let credential_epoch=epochs(tx,&resource).await?;
+            let loaded=model_info(&model(tx,&resource.id,input.model.as_str()).await?)?;
             if let Some(catalog)=&catalog {
                 let project=match &input.scope{ProviderPreferenceScope::Project(project)=>Some(project),_=>None};
                 shared_attachment(tx,&resource,credential_epoch,&catalog.space.id,project,now,true).await?;
             }
-            let loaded=model_info(&model(tx,&resource.id,input.model.as_str()).await?)?;
             if !matches_preference_kind(&loaded.model.kind, input.kind) {
                 return Err(invalid(ValidationReason::InvalidQuery));
             }

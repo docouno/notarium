@@ -594,11 +594,12 @@ same example against an isolated prefix.
   Startup reconciles abandoned holds and pending local artifacts.
   The offline `notarium_canonical::backup::decode_postgres_spool_v1_bounded`
   API verifies the trailer and recognizes the exact linear manifests for schemas 1 through 9.
-  Schema version 9 adds `chat_threads.{active_run_epoch, redaction_epoch}` for
-  run fencing and O(1) folded-proof invalidation,
+  Schema version 9 adds `chat_threads.{active_run_epoch, active_run_generation, redaction_epoch}`
+  for run fencing and O(1) folded-proof invalidation,
   `chat_entries.{human_origin, body_format, provenance_json}` (with typed `effect_kind`
-  inside the structured proposal JSON body), and secondary indexes for personal Space
-  lookup (`idx_spaces_personal_owner`), receipt sequence scans
+  inside the structured proposal JSON body), replaces `uq_ability_packages_active_slug`
+  with non-unique `idx_ability_packages_active_slug`, and adds secondary indexes for
+  personal Space lookup (`idx_spaces_personal_owner`), receipt sequence scans
   (`idx_command_receipts_seq`), active project roots
   (`idx_folder_heads_active_projects_id`), incremental folder-change scans
   (`idx_folder_heads_space_updated`), active chat-run lookup

@@ -4342,6 +4342,7 @@ fn authorize_replay_targets_rusqlite(
                         return Err(DomainError::ResourceNotFound.into());
                     }
                 }
+                auth.can_view_folder(&srec.space, folder, &ancestry.ancestors)?;
                 auth.authorize_direct_write(&facts, &facts)?;
                 continue;
             }
@@ -4360,6 +4361,7 @@ fn authorize_replay_targets_rusqlite(
                         return Err(DomainError::ResourceNotFound.into());
                     }
                 }
+                auth.can_view_folder(&srec.space, folder, &ancestry.ancestors)?;
                 auth.authorize_direct_write(&facts, &facts)?;
                 let mut stmt = conn
                     .prepare_cached(crate::domain::folders::FOLDER_SUBTREE_AUTH_SQL_WITH_ROOT)
@@ -6393,6 +6395,7 @@ impl SqliteSyncItemPlan for RollbackDirectSqliteFastPlan {
                     )
                     .map_err(FastItemExecError::PreWrite)?;
                     if anc.folder_lifecycle == Lifecycle::Purged
+                        || auth.can_view_resource(&rfacts).is_err()
                         || auth.authorize_direct_write(&rfacts, &rfacts).is_err()
                     {
                         ok = false;
@@ -7644,6 +7647,7 @@ fn verify_run_and_entity_preconditions_note_only_rusqlite(
         if anc.folder_lifecycle == Lifecycle::Purged {
             return Err(DomainError::ResourceNotFound.into());
         }
+        auth.can_view_resource(&rfacts)?;
         auth.authorize_direct_write(&rfacts, &rfacts)?;
         heads_map.insert(nid.clone(), head);
     }

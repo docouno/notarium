@@ -371,6 +371,7 @@ async fn authorize_resource(
                     return Err(DomainError::ResourceNotFound.into());
                 }
             }
+            auth.can_view_folder(&srec.space, folder, &ancestry.ancestors)?;
             return Ok(auth.authorize_direct_write(&facts, &facts)?);
         }
         ReplayResource::WriteFolderSubtree(folder) => {
@@ -389,6 +390,7 @@ async fn authorize_resource(
                     return Err(DomainError::ResourceNotFound.into());
                 }
             }
+            auth.can_view_folder(&srec.space, folder, &ancestry.ancestors)?;
             auth.authorize_direct_write(&facts, &facts)?;
             return crate::domain::folders::authorize_folder_subtree_tx(
                 tx,

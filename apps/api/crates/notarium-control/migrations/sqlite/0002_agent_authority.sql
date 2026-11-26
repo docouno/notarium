@@ -70,10 +70,12 @@ DROP TABLE agent_schedules_v1;
 
 CREATE INDEX schedule_due ON agent_schedules(next_slot_utc_ms,schedule_id)
     WHERE deleted_at IS NULL AND paused_reason IS NULL AND next_slot_utc_ms IS NOT NULL;
-CREATE INDEX schedule_deleted ON agent_schedules(deleted_at,updated_at,schedule_id);
+CREATE INDEX schedule_deleted ON agent_schedules(deleted_at,updated_at,schedule_id)
+    WHERE deleted_at IS NOT NULL;
 CREATE INDEX schedule_owner ON agent_schedules(owner_id,space_id,schedule_id);
 CREATE INDEX schedule_run_status ON agent_schedule_runs(schedule_id,status,slot_utc_ms,run_id);
-CREATE INDEX schedule_run_retention ON agent_schedule_runs(status,finished_at,run_id);
+CREATE INDEX schedule_run_retention ON agent_schedule_runs(status,finished_at,run_id)
+    WHERE status IN ('succeeded','failed','unknown');
 CREATE INDEX schedule_expired_run ON agent_schedule_runs(expires_at,run_id)
     WHERE status IN ('claimed','running');
 CREATE INDEX call_run ON provider_call_log(run_id,call_id);

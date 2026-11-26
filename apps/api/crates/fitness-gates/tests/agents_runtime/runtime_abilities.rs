@@ -68,8 +68,9 @@ pub(super) async fn secondary_project_abilities_reach_the_wire(
         space_id: project.space_id.clone(),
         folder_id: FolderId::from_bytes([222; 16]),
     };
+    let mut project_rev = None;
     for (folder, slug) in [(&project, "runtime"), (&neighbor, "other")] {
-        fixture
+        let (_, rev, _) = fixture
             .canonical
             .create_folder(CreateFolderSpec {
                 scope: shared.history.clone(),
@@ -85,7 +86,11 @@ pub(super) async fn secondary_project_abilities_reach_the_wire(
             })
             .await
             .unwrap();
+        if folder == &project {
+            project_rev = Some(rev);
+        }
     }
+    let project_rev = project_rev.expect("project folder revision");
     let project_handle = format!("{}/runtime", shared.slug);
     let skill = call(fixture, &human, 222, "create_ability", json!({
         "kind":"skill", "name":"runtime-shared-skill", "description":"A scoped skill",
@@ -221,12 +226,12 @@ pub(super) async fn secondary_project_abilities_reach_the_wire(
     let second = interactive(&local.registry, &primary, &selection, &episode)
         .await
         .unwrap();
-    assert_eq!(second.secondary_projects, [project]);
+    assert_eq!(second.secondary_projects, std::slice::from_ref(&project));
     assert!(matches!(
         second.parts.as_slice(),
         [ProviderMessage::Ability(_)]
     ));
-    let space_request = request(230, selection, second);
+    let space_request = request(230, selection.clone(), second);
     // The Space role has no project in its canonical origin. Its chosen
     // project must be supplied by the runtime loader for project-only consent.
     assert_denied(provider, &primary, &space_request, 228, vec![]).await;
@@ -240,6 +245,31 @@ pub(super) async fn secondary_project_abilities_reach_the_wire(
     assert!(messages(&received[0]).contains("Instructions from the project role."));
     assert!(messages(&received[0]).contains("Instructions from the Space skill."));
     assert!(messages(&received[1]).contains("Instructions from the Space role."));
+
+    // Once the episode's bound project becomes unavailable, interactive runtime ability
+    // loading must fail closed instead of dropping the project hint.
+    fixture
+        .canonical
+        .set_folder_lifecycle(
+            &shared.history,
+            storage.active_epoch,
+            &project.folder_id,
+            &project_rev,
+            notarium_core::model::Lifecycle::Trashed,
+            human.auth().principal(),
+            None,
+        )
+        .await
+        .unwrap();
+    let unavailable = interactive(&local.registry, &primary, &selection, &episode).await;
+    assert!(
+        matches!(
+            unavailable,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ),
+        "interactive runtime abilities with ProjectUnavailable episode must fail ResourceNotFound, got {:?}",
+        unavailable.err()
+    );
 }
 
 pub(super) async fn identity(

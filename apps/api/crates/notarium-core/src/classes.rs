@@ -262,6 +262,13 @@ impl ClassifiedMetadata {
         self.facts.authorize(auth)?;
         Ok(ListedDocument(self.clone()))
     }
+    pub fn authorize_current_write(&self, auth: &EngineAuthContext) -> DomainResult<()> {
+        let current = self.facts.current();
+        auth.authorize_direct_write(current, current)
+    }
+    pub fn current_has_ability_package(&self) -> bool {
+        self.facts.current().ability_package.is_some()
+    }
 }
 
 /// An active, readable secondary card; it conveys no whole-text capability.

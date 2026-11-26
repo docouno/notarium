@@ -20,6 +20,12 @@ ALTER TABLE v1_control.agent_schedule_runs
 DROP INDEX v1_control.schedule_due;
 CREATE INDEX schedule_due ON v1_control.agent_schedules(next_slot_utc_ms,schedule_id)
     WHERE deleted_at IS NULL AND paused_reason IS NULL AND next_slot_utc_ms IS NOT NULL;
+DROP INDEX v1_control.schedule_deleted;
+CREATE INDEX schedule_deleted ON v1_control.agent_schedules(deleted_at,updated_at,schedule_id)
+    WHERE deleted_at IS NOT NULL;
+DROP INDEX v1_control.schedule_run_retention;
+CREATE INDEX schedule_run_retention ON v1_control.agent_schedule_runs(status,finished_at,run_id)
+    WHERE status IN ('succeeded','failed','unknown');
 CREATE INDEX schedule_expired_run ON v1_control.agent_schedule_runs(expires_at,run_id)
     WHERE status IN ('claimed','running');
 CREATE INDEX call_run ON v1_control.provider_call_log(run_id,call_id);

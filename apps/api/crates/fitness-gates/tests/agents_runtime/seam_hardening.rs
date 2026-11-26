@@ -26854,10 +26854,10 @@ async fn hardened_retry_legacy_and_recent_eviction_seams(
         ),
         "replaying rename_folder after descendant write lock must fail SpaceReadOnly, got {replay_after_lock:?}"
     );
-    // 5. set_folder_write_lock enforces strict-ancestor lock and subtree class/ability authority.
+    // 5. set_folder_write_lock enforces strict-ancestor lock, strict-descendant lock, and subtree class/ability authority.
     let lock_under_locked_parent = fixture
         .canonical
-        .set_folder_write_lock(s2_sc.clone(), mv_ok_parent, true)
+        .set_folder_write_lock(s2_sc.clone(), mv_ok_parent.clone(), true)
         .await;
     assert!(
         matches!(
@@ -26868,9 +26868,138 @@ async fn hardened_retry_legacy_and_recent_eviction_seams(
     );
     fixture
         .canonical
-        .set_folder_write_lock(s2_sc.clone(), mv_ok_child, false)
+        .set_folder_write_lock(s2_sc.clone(), mv_ok_child.clone(), false)
         .await
         .expect("unlocking locked leaf with unlocked strict ancestors/descendants must succeed");
+    fixture
+        .canonical
+        .set_folder_write_lock(s2_sc.clone(), mv_ok_parent.clone(), true)
+        .await
+        .expect("locking mv_ok_parent after unlocking child must succeed");
+    let child_lock_under_locked_anc = fixture
+        .canonical
+        .set_folder_write_lock(s2_sc.clone(), mv_ok_child, true)
+        .await;
+    assert!(
+        matches!(
+            child_lock_under_locked_anc,
+            Err(PortError::Domain(DomainError::SpaceReadOnly))
+        ),
+        "modifying write lock under a write-locked strict ancestor must fail SpaceReadOnly, got {child_lock_under_locked_anc:?}"
+    );
+    fixture
+        .canonical
+        .set_folder_write_lock(s2_sc.clone(), mv_ok_parent.clone(), false)
+        .await
+        .expect("unlocking mv_ok_parent must succeed");
+    // Project-pinned move_folder must reject out-of-project source or destination as ResourceNotFound.
+    let s2_p2 = FolderId::from_bytes([0xF0, 9, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6]);
+    let s2_p2_child = FolderId::from_bytes([0xF0, 9, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7]);
+    fixture
+        .canonical
+        .create_folder(CreateFolderSpec {
+            scope: s2.history.clone(),
+            active_epoch: s2_epoch,
+            folder_id: s2_p2.clone(),
+            parent: None,
+            slug: "s2-p2".into(),
+            display_name: "s2-p2".into(),
+            is_project: true,
+            project_slug: Some("s2-p2".into()),
+            actor: actor.clone(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+    fixture
+        .canonical
+        .create_folder(CreateFolderSpec {
+            scope: s2.history.clone(),
+            active_epoch: s2_epoch,
+            folder_id: s2_p2_child.clone(),
+            parent: Some(s2_p2.clone()),
+            slug: "s2-p2-child".into(),
+            display_name: "s2-p2-child".into(),
+            is_project: false,
+            project_slug: None,
+            actor: actor.clone(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+    let mut s2_pinned_grants = owner.auth().spaces().clone();
+    if let Some(g) = s2_pinned_grants.get_mut(&s2.history.space_id) {
+        g.project_root = Some(s2_p2.clone());
+    }
+    let s2_pinned_sc = SpaceContext::new(
+        notarium_core::auth::EngineAuthContext::for_human(
+            notarium_core::auth::VerifiedHuman::attest(
+                actor.clone(),
+                GrantId::from_bytes([0xF0, 9, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4]),
+                s2_pinned_grants,
+                true,
+            ),
+        ),
+        s2.history.clone(),
+        budget(),
+    )
+    .unwrap();
+    let pinned_out_of_proj_src = fixture
+        .canonical
+        .move_folder(
+            s2_pinned_sc.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: s2.history.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([
+                        0xF0, 9, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xF1; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: MoveFolder {
+                    folder: mv_ok_parent,
+                    new_parent: Some(s2_p2),
+                },
+            },
+        )
+        .await;
+    assert!(
+        matches!(
+            pinned_out_of_proj_src,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ),
+        "project-pinned move_folder on out-of-project source must fail ResourceNotFound, got {pinned_out_of_proj_src:?}"
+    );
+    let pinned_out_of_proj_dst = fixture
+        .canonical
+        .move_folder(
+            s2_pinned_sc,
+            Mutation {
+                identity: CommandIdentity {
+                    scope: s2.history.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([
+                        0xF0, 9, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xEF; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: MoveFolder {
+                    folder: s2_p2_child,
+                    new_parent: Some(s2_p1.folder_id.clone()),
+                },
+            },
+        )
+        .await;
+    assert!(
+        matches!(
+            pinned_out_of_proj_dst,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ),
+        "project-pinned move_folder to out-of-project destination must fail ResourceNotFound, got {pinned_out_of_proj_dst:?}"
+    );
     let agent_lock_enc = fixture
         .canonical
         .set_folder_write_lock(s2_agent_sc.clone(), mv_enc_parent, true)
@@ -26884,7 +27013,7 @@ async fn hardened_retry_legacy_and_recent_eviction_seams(
     );
     let agent_lock_skill = fixture
         .canonical
-        .set_folder_write_lock(s2_agent_sc, mv_skill_parent, true)
+        .set_folder_write_lock(s2_agent_sc.clone(), mv_skill_parent, true)
         .await;
     assert!(
         matches!(
@@ -26895,17 +27024,18 @@ async fn hardened_retry_legacy_and_recent_eviction_seams(
     );
     // 6. Pre-lookup validation on create_ability ("Index"), link syntax/self-link,
     //    link rejection on published ability entrypoints, and rollback duplicate expectations.
+    // Pass an unresolvable project placement so skipping author.rs:422 would yield ResourceNotFound.
     let index_ability = call_mcp(
         &fixture.registry,
         &owner,
         [0xF0, 9, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
         "create_ability",
         json!({
-            "kind": "skill",
+            "kind": "role",
             "name": "Index",
             "description": "reserved slug",
-            "instructions": "should fail before folder creation",
-            "placement": { "home": "personal" }
+            "instructions": "should fail before project lookup or folder creation",
+            "placement": { "home": "project", "project": "no-such/proj" }
         }),
     )
     .await;
@@ -26915,17 +27045,19 @@ async fn hardened_retry_legacy_and_recent_eviction_seams(
             Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
                 if diagnostic.reason == ValidationReason::InvalidPathComponent
         ),
-        "create_ability with name 'Index' must fail upfront with InvalidPathComponent, got {:?}",
+        "create_ability with name 'Index' must fail upfront with InvalidPathComponent before project lookup, got {:?}",
         index_ability.err()
     );
     let missing_note = NoteId::from_bytes([0xF0, 9, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
-    for (tag, args) in [
+    for (tag, expected_reason, args) in [
         (
             2u8,
+            ValidationReason::InvalidPathComponent,
             json!({ "from": missing_note, "relation": "bad:rel", "to": NoteId::from_bytes([0xF0, 9, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3]) }),
         ),
         (
             3u8,
+            ValidationReason::InvalidQuery,
             json!({ "from": missing_note, "relation": "rel", "to": missing_note }),
         ),
     ] {
@@ -26940,9 +27072,10 @@ async fn hardened_retry_legacy_and_recent_eviction_seams(
         assert!(
             matches!(
                 link_err,
-                Err(PortError::Domain(DomainError::ValidationFailed { .. }))
+                Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
+                    if diagnostic.reason == expected_reason
             ),
-            "link with invalid relation or self-link must reject ValidationFailed before note lookup, got {:?}",
+            "link must reject {expected_reason:?} before note lookup, got {:?}",
             link_err.err()
         );
     }
@@ -27053,6 +27186,76 @@ async fn hardened_retry_legacy_and_recent_eviction_seams(
                 if diagnostic.reason == ValidationReason::InvalidState
         ),
         "duplicate expected_entities on nonexistent run must reject InvalidState before lookup, got {dup_rb_err:?}"
+    );
+    // 7. Write-only caller without read permission on touched notes cannot roll back a note-only run.
+    let rb_view_note = NoteId::from_bytes([0xF0, 9, 11, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    fixture
+        .canonical
+        .create_note(
+            s2_agent_sc,
+            Mutation {
+                identity: CommandIdentity {
+                    scope: s2.history.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([
+                        0xF0, 9, 11, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xF1; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: CreateNote {
+                    note: rb_view_note,
+                    parent: None,
+                    slug: "rb-view-guard".into(),
+                    class: DocClass::UserDoc,
+                    carrier: "---\ntitle: Rollback View Guard\n---\n# Body\n".into(),
+                    folder_page: false,
+                },
+            },
+        )
+        .await
+        .expect("agent run creating root UserDoc for rollback view check must succeed");
+    let mut write_only_grants = owner.auth().spaces().clone();
+    if let Some(g) = write_only_grants.get_mut(&s2.history.space_id) {
+        g.read_classes.clear();
+    }
+    let write_only_sc = SpaceContext::new(
+        notarium_core::auth::EngineAuthContext::for_human(
+            notarium_core::auth::VerifiedHuman::attest(
+                actor.clone(),
+                GrantId::from_bytes([0xF0, 9, 11, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3]),
+                write_only_grants,
+                true,
+            ),
+        ),
+        s2.history.clone(),
+        budget(),
+    )
+    .unwrap();
+    let rb_view_err = fixture
+        .canonical
+        .rollback_agent_run_by_id(
+            write_only_sc,
+            Mutation {
+                identity: CommandIdentity {
+                    scope: s2.history.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([
+                        0xF0, 9, 11, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xF0; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: AgentRunId::from_bytes([0xF0, 9, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+            },
+        )
+        .await;
+    assert!(
+        matches!(
+            rb_view_err,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ),
+        "write-only caller without read permission must not roll back note-only run, got {rb_view_err:?}"
     );
 }
 

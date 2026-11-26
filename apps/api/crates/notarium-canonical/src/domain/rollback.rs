@@ -1095,6 +1095,7 @@ pub(crate) fn build_rollback_direct_single_tx_exec(
                 if anc.folder_lifecycle == Lifecycle::Purged {
                     return Err(DomainError::ResourceNotFound.into());
                 }
+                auth.can_view_resource(&rfacts)?;
                 auth.authorize_direct_write(&rfacts, &rfacts)?;
             }
 
@@ -1854,7 +1855,7 @@ async fn load_latest_prerun_rank_meta_tx(
                      AND r2.visibility_seq = revisions.visibility_seq
                      AND r2.agent_run_id = ?4
                )
-             ORDER BY space_seq DESC
+             ORDER BY visibility_seq DESC, space_seq DESC
              LIMIT 1",
         )
         .bind(scope.space_id.as_str())
@@ -1878,7 +1879,7 @@ async fn load_latest_prerun_rank_meta_tx(
                      AND r2.visibility_seq = revisions.visibility_seq
                      AND r2.agent_run_id = $4
                )
-             ORDER BY space_seq DESC
+             ORDER BY visibility_seq DESC, space_seq DESC
              LIMIT 1",
         )
         .bind(scope.space_id.as_str())
@@ -2372,115 +2373,144 @@ fn build_rollback_execute_fn(
                             StoredSemanticPlacementV1::Ineligible => None,
                             StoredSemanticPlacementV1::InGroup { group, .. } => Some(group.clone()),
                         };
-                        if is_earliest && before_group != expected_post {
-                            // An earlier in-run `edit_note` moved `target` between its pre-run
-                            // group and `before_group` before this first `move_board_card`.
-                            // Reconcile `target` directly against its pre-run rank history RIGHT
-                            // NOW so earlier-in-run moves (replayed next in DESC order) see
-                            // `target` in place in `working_groups` and update it via PMA if needed.
-                            match expected_post {
-                                None => {
-                                    target_final_state
-                                        .insert(target.clone(), TargetSettlement::Ineligible);
-                                }
-                                Some(post_grp) => {
-                                    let prerun_before = note_first_run_seq(target)
-                                        .map_or(bmh.command_end_seq, |first| {
-                                            first.min(bmh.command_end_seq)
-                                        });
-                                    let prerun = load_latest_prerun_rank_meta_tx(
+                        if is_earliest {
+                            let before_mat_seq =
+                                if let Some(ref pl_rev) = bmh.before_placement_revision {
+                                    run_materialized_overlay_seq_tx(
                                         tx,
-                                        &scope_cl,
-                                        view,
-                                        target,
+                                        &scope_cl.space_id,
+                                        pl_rev,
                                         &input.run,
-                                        prerun_before,
                                     )
-                                    .await?;
-                                    if let Some(meta) = prerun
-                                        && !meta.removed
-                                        && meta.group_key == post_grp
-                                    {
-                                        let g_idx = materialize_working_group(
-                                            &post_grp,
-                                            &kept_groups,
-                                            &overlays,
-                                            &moved_targets_on_view,
-                                            &stale_prerun_restores,
-                                            &mut working_groups,
-                                            &mut neighbor_dirty,
-                                        )?;
-                                        let g_items = &mut working_groups[g_idx].1;
-                                        let collides =
-                                            g_items.iter().any(|it| it.rank == meta.sort_rank_lexo);
-                                        let restored_rank = if !collides {
-                                            let pos = g_items
-                                                .iter()
-                                                .position(|it| it.rank > meta.sort_rank_lexo)
-                                                .unwrap_or(g_items.len());
-                                            g_items.insert(
-                                                pos,
-                                                ExistingRankedItem {
-                                                    note_id: target.clone(),
-                                                    rank: meta.sort_rank_lexo.clone(),
-                                                },
-                                            );
-                                            meta.sort_rank_lexo
-                                        } else {
-                                            let pos = g_items
-                                                .iter()
-                                                .position(|it| it.rank >= meta.sort_rank_lexo)
-                                                .unwrap_or(g_items.len());
-                                            let computed =
-                                                compute_rank_placement(g_items, target, pos)?;
-                                            for (pn, pr) in computed.pma_neighbor_updates {
-                                                if let Some(it) =
-                                                    g_items.iter_mut().find(|i| i.note_id == pn)
-                                                {
-                                                    it.rank = pr.clone();
-                                                }
-                                                if let Some(TargetSettlement::Replayed {
-                                                    rank,
-                                                    ..
-                                                }) = target_final_state.get_mut(&pn)
-                                                {
-                                                    *rank = pr;
-                                                } else if !moved_targets_on_view.contains(&pn)
-                                                    && !stale_prerun_restores.contains_key(&pn)
-                                                {
-                                                    let is_pma = overlays
-                                                        .get(&pn)
-                                                        .is_some_and(|o| o.group == post_grp);
-                                                    neighbor_dirty
-                                                        .insert(pn, (post_grp.clone(), pr, is_pma));
-                                                }
-                                            }
-                                            g_items.insert(
-                                                pos,
-                                                ExistingRankedItem {
-                                                    note_id: target.clone(),
-                                                    rank: computed.target_rank.clone(),
-                                                },
-                                            );
-                                            computed.target_rank
-                                        };
-                                        target_final_state.insert(
-                                            target.clone(),
-                                            TargetSettlement::Replayed {
-                                                group: post_grp,
-                                                rank: restored_rank,
-                                                placement_revision: Some(meta.placement_revision),
-                                                placement_actor: Some(meta.placement_actor_id),
-                                                placement_run: meta.placement_run_id,
-                                            },
-                                        );
-                                    } else {
+                                    .await?
+                                } else {
+                                    None
+                                };
+                            let mut prerun_before = bmh.command_end_seq;
+                            if let Some(first) = note_first_run_seq(target) {
+                                prerun_before = prerun_before.min(first);
+                            }
+                            if let Some(mat_seq) = before_mat_seq {
+                                prerun_before = prerun_before.min(mat_seq);
+                            }
+                            let group_changed = before_group != expected_post;
+                            let may_have_clobbered_prerun = !group_changed
+                                && expected_post.is_some()
+                                && (bmh.before_placement_revision.is_none()
+                                    || before_mat_seq.is_some());
+                            if group_changed || may_have_clobbered_prerun {
+                                // Reconcile `target` directly against its pre-run rank history when
+                                // an earlier in-run edit/view-change either moved `target` across
+                                // groups or clobbered its pre-run overlay during an in-run round-trip.
+                                match expected_post {
+                                    None => {
                                         target_final_state
-                                            .insert(target.clone(), TargetSettlement::ClearOverlay);
+                                            .insert(target.clone(), TargetSettlement::Ineligible);
+                                        continue;
+                                    }
+                                    Some(post_grp) => {
+                                        let prerun = load_latest_prerun_rank_meta_tx(
+                                            tx,
+                                            &scope_cl,
+                                            view,
+                                            target,
+                                            &input.run,
+                                            prerun_before,
+                                        )
+                                        .await?;
+                                        if let Some(meta) = prerun
+                                            && !meta.removed
+                                            && meta.group_key == post_grp
+                                        {
+                                            let g_idx = materialize_working_group(
+                                                &post_grp,
+                                                &kept_groups,
+                                                &overlays,
+                                                &moved_targets_on_view,
+                                                &stale_prerun_restores,
+                                                &mut working_groups,
+                                                &mut neighbor_dirty,
+                                            )?;
+                                            let g_items = &mut working_groups[g_idx].1;
+                                            let collides = g_items
+                                                .iter()
+                                                .any(|it| it.rank == meta.sort_rank_lexo);
+                                            let restored_rank = if !collides {
+                                                let pos = g_items
+                                                    .iter()
+                                                    .position(|it| it.rank > meta.sort_rank_lexo)
+                                                    .unwrap_or(g_items.len());
+                                                g_items.insert(
+                                                    pos,
+                                                    ExistingRankedItem {
+                                                        note_id: target.clone(),
+                                                        rank: meta.sort_rank_lexo.clone(),
+                                                    },
+                                                );
+                                                meta.sort_rank_lexo
+                                            } else {
+                                                let pos = g_items
+                                                    .iter()
+                                                    .position(|it| it.rank >= meta.sort_rank_lexo)
+                                                    .unwrap_or(g_items.len());
+                                                let computed =
+                                                    compute_rank_placement(g_items, target, pos)?;
+                                                for (pn, pr) in computed.pma_neighbor_updates {
+                                                    if let Some(it) =
+                                                        g_items.iter_mut().find(|i| i.note_id == pn)
+                                                    {
+                                                        it.rank = pr.clone();
+                                                    }
+                                                    if let Some(TargetSettlement::Replayed {
+                                                        rank,
+                                                        ..
+                                                    }) = target_final_state.get_mut(&pn)
+                                                    {
+                                                        *rank = pr;
+                                                    } else if !moved_targets_on_view.contains(&pn)
+                                                        && !stale_prerun_restores.contains_key(&pn)
+                                                    {
+                                                        let is_pma = overlays
+                                                            .get(&pn)
+                                                            .is_some_and(|o| o.group == post_grp);
+                                                        neighbor_dirty.insert(
+                                                            pn,
+                                                            (post_grp.clone(), pr, is_pma),
+                                                        );
+                                                    }
+                                                }
+                                                g_items.insert(
+                                                    pos,
+                                                    ExistingRankedItem {
+                                                        note_id: target.clone(),
+                                                        rank: computed.target_rank.clone(),
+                                                    },
+                                                );
+                                                computed.target_rank
+                                            };
+                                            target_final_state.insert(
+                                                target.clone(),
+                                                TargetSettlement::Replayed {
+                                                    group: post_grp,
+                                                    rank: restored_rank,
+                                                    placement_revision: Some(
+                                                        meta.placement_revision,
+                                                    ),
+                                                    placement_actor: Some(meta.placement_actor_id),
+                                                    placement_run: meta.placement_run_id,
+                                                },
+                                            );
+                                            continue;
+                                        } else if group_changed {
+                                            target_final_state.insert(
+                                                target.clone(),
+                                                TargetSettlement::ClearOverlay,
+                                            );
+                                            continue;
+                                        }
                                     }
                                 }
                             }
-                            continue;
                         }
 
                         match &bmh.before_placement {
@@ -3825,6 +3855,7 @@ async fn ensure_chat_run_not_active_tx(
                         )
                         .await?;
                     if anc.folder_lifecycle == Lifecycle::Purged
+                        || auth.can_view_resource(&rfacts).is_err()
                         || auth.authorize_direct_write(&rfacts, &rfacts).is_err()
                     {
                         authorized = false;
@@ -4037,6 +4068,7 @@ pub(crate) async fn prepare_rollback_sources_tx(
         if anc.folder_lifecycle == Lifecycle::Purged {
             return Err(DomainError::ResourceNotFound.into());
         }
+        auth.can_view_resource(&facts)?;
         auth.authorize_direct_write(&facts, &facts)?;
         expected_entities.push(NoteRevision {
             note: NoteId::parse(&id)
@@ -4158,6 +4190,7 @@ async fn verify_run_and_entity_preconditions_tx(
         if anc.folder_lifecycle == Lifecycle::Purged {
             return Err(DomainError::ResourceNotFound.into());
         }
+        auth.can_view_resource(&rfacts)?;
         auth.authorize_direct_write(&rfacts, &rfacts)?;
     }
 
@@ -5859,10 +5892,11 @@ async fn try_execute_pg_root_rollback(
         folder_write_locked: false,
         ability_package: None,
     };
-    if ctx
-        .auth()
-        .authorize_direct_write(&root_facts, &root_facts)
-        .is_err()
+    if ctx.auth().can_view_resource(&root_facts).is_err()
+        || ctx
+            .auth()
+            .authorize_direct_write(&root_facts, &root_facts)
+            .is_err()
     {
         park_pg_rollback_connection(store, pooled);
         return None;
@@ -6402,7 +6436,11 @@ async fn try_execute_pg_root_rollback(
         .is_batch_telemetry_enabled()
         .then(std::time::Instant::now);
 
-    if let Err(err) = ctx.auth().authorize_direct_write(&root_facts, &root_facts) {
+    if let Err(err) = ctx
+        .auth()
+        .can_view_resource(&root_facts)
+        .and_then(|()| ctx.auth().authorize_direct_write(&root_facts, &root_facts))
+    {
         park_pg_rollback_connection(store, pooled);
         return Some(Err(err.into()));
     }
@@ -7089,7 +7127,10 @@ async fn execute_pg_fast_rollback_inner(
                     };
                 }
             };
-            if let Err(err) = auth.authorize_direct_write(&rfacts, &rfacts) {
+            if let Err(err) = auth
+                .can_view_resource(&rfacts)
+                .and_then(|()| auth.authorize_direct_write(&rfacts, &rfacts))
+            {
                 return PgFastInnerResult::Failed {
                     err: err.into(),
                     effective_cut: Some(current_effective_cut),

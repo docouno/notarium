@@ -105,14 +105,8 @@ pub(crate) async fn move_folder_impl(
                     load_folder_ancestry_tx(tx, &scope.space_id, &input.folder, true).await?;
                 let dest_anc =
                     load_folder_ancestry_tx(tx, &scope.space_id, &dest_parent, true).await?;
-                if auth
-                    .spaces()
-                    .get(&scope.space_id)
-                    .and_then(|grant| grant.project_root.as_ref())
-                    .is_some_and(|root| !dest_anc.ancestors.contains(root))
-                {
-                    return Err(DomainError::ResourceNotFound.into());
-                }
+                auth.can_view_folder(&live_space.space, &input.folder, &before_anc.ancestors)?;
+                auth.can_view_folder(&live_space.space, &dest_parent, &dest_anc.ancestors)?;
                 let crosses_ability_scope =
                     !folder_row.is_project && before_anc.project != dest_anc.project;
                 let destination_project = dest_anc.project.clone();
@@ -465,6 +459,7 @@ pub(crate) async fn rename_folder_impl(
                     return Err(DomainError::ResourceNotFound.into());
                 }
                 let anc = load_folder_ancestry_tx(tx, &scope.space_id, &input.folder, true).await?;
+                auth.can_view_folder(&live_space.space, &input.folder, &anc.ancestors)?;
                 let facts = notarium_core::auth::ResourceFacts {
                     space: live_space.space.clone(),
                     class: target_write_class,
@@ -748,6 +743,7 @@ pub(crate) async fn rename_project_impl(
                     return Err(DomainError::ResourceNotFound.into());
                 }
                 let anc = load_folder_ancestry_tx(tx, &scope.space_id, &input.folder, true).await?;
+                auth.can_view_folder(&live_space.space, &input.folder, &anc.ancestors)?;
                 let facts = notarium_core::auth::ResourceFacts {
                     space: live_space.space.clone(),
                     class: target_write_class,
@@ -1413,6 +1409,7 @@ pub(crate) async fn set_folder_write_lock_impl(
                     return Err(DomainError::ResourceNotFound.into());
                 }
                 let anc = load_folder_ancestry_tx(tx, &scope.space_id, &folder_cl, true).await?;
+                auth.can_view_folder(&live_space.space, &folder_cl, &anc.ancestors)?;
                 let strict_ancestor_locked = if let Some(parent_id) = &folder_row.parent_folder_id {
                     load_folder_ancestry_tx(tx, &scope.space_id, parent_id, true)
                         .await?
@@ -1640,12 +1637,12 @@ pub(crate) async fn is_note_live_readable_tx(
 
 pub(crate) const FOLDER_SUBTREE_AUTH_SQL_WITH_ROOT: &str = "WITH RECURSIVE subtree(folder_id, locked) AS (
         SELECT folder_id,
-               CASE WHEN lifecycle_state = 'active' AND write_lock_json IS NOT NULL THEN 1 ELSE 0 END
+               CASE WHEN lifecycle_state != 'purged' AND write_lock_json IS NOT NULL THEN 1 ELSE 0 END
         FROM folder_heads
         WHERE space_id = $1 AND folder_id = $2
         UNION
         SELECT child.folder_id,
-               CASE WHEN child.lifecycle_state = 'active' AND child.write_lock_json IS NOT NULL THEN 1 ELSE 0 END
+               CASE WHEN child.lifecycle_state != 'purged' AND child.write_lock_json IS NOT NULL THEN 1 ELSE 0 END
         FROM subtree AS parent
         CROSS JOIN folder_heads AS child
         WHERE child.space_id = $1
@@ -1677,7 +1674,7 @@ const FOLDER_SUBTREE_AUTH_SQL_WITHOUT_ROOT: &str = "WITH RECURSIVE subtree(folde
         WHERE space_id = $1 AND folder_id = $2
         UNION
         SELECT child.folder_id,
-               CASE WHEN child.lifecycle_state = 'active' AND child.write_lock_json IS NOT NULL THEN 1 ELSE 0 END
+               CASE WHEN child.lifecycle_state != 'purged' AND child.write_lock_json IS NOT NULL THEN 1 ELSE 0 END
         FROM subtree AS parent
         CROSS JOIN folder_heads AS child
         WHERE child.space_id = $1
