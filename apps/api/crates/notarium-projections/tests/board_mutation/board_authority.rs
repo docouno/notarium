@@ -46,6 +46,10 @@ pub(super) async fn exercise(store: &CanonicalStore, runtime: &ProjectorRuntime)
     ))
     .await;
     Box::pin(rollback_skipped_replay_and_oracle_views(store, runtime)).await;
+    Box::pin(rollback_case_7f_materialization_and_partial_retry(
+        store, runtime,
+    ))
+    .await;
     Box::pin(keeper_readonly_abilities_isolation_on_changes_events_and_graph(store, runtime)).await;
 }
 
@@ -4124,6 +4128,731 @@ async fn rollback_skipped_replay_and_oracle_views(
         "round-trip view-edit clobbered stale_untouched card must restore pre-run human placement_revision"
     );
     let _ = proj7b;
+}
+
+#[inline(never)]
+async fn rollback_case_7f_materialization_and_partial_retry(
+    store: &CanonicalStore,
+    runtime: &ProjectorRuntime,
+) {
+    use notarium_core::ports::RankNeighbor;
+
+    let (scope, owner) = open_space(store).await;
+    let engine = runtime.engine();
+
+    // Case 7F: Board rollback overlay ordering & partial-retry invariants:
+    //   (a) Single-move rollback on unranked `[B, A]` restores `[B, A]` (never flips to `[A, B]`).
+    //   (b) Untouched column `[B, C]` with subsequent human `D` between `B` and `C` keeps `[B, D, C]`
+    //       when rolled-back `A` returns to `doing`.
+    //   (c) Clearing an originally-unranked anchor `A` in `[H (human-ranked), A, B]` restores `[H, A, B]`
+    //       without jumping `B` to index 0 ahead of `H`.
+    //   (d) Retrying a partial rollback (after an active collab room on `B` closes) skips already-rolled-back
+    //       same-column rank-only move on `A` and preserves intervening human placement `[X, C, A]`.
+    let proj7f = folder(store, &owner, None, "rb-7f-proj", true)
+        .await
+        .unwrap();
+    let v7f_body = "group_by: status\nfilter: {exists: status}\n";
+    let (v7f_a, v7f_a_rev) = create_view(
+        store,
+        &owner,
+        &proj7f,
+        "rb-7f-a",
+        "board",
+        "{scope: project}",
+        v7f_body,
+    )
+    .await;
+    let f1a_b = create_note(
+        store,
+        &owner,
+        Some(proj7f.clone()),
+        "f1a-01-b",
+        "---\nstatus: todo\n---\n".into(),
+    )
+    .await;
+    let f1a_a = create_note(
+        store,
+        &owner,
+        Some(proj7f.clone()),
+        "f1a-02-a",
+        "---\nstatus: todo\n---\n".into(),
+    )
+    .await;
+    sync(store, runtime, &scope).await;
+    let pre_7fa: Vec<NoteId> = query(&engine, owner.clone(), v7f_a.clone())
+        .await
+        .unwrap()
+        .rows
+        .items
+        .into_iter()
+        .map(|r| r.card.document.provenance().reference().note_id.clone())
+        .collect();
+    assert_eq!(pre_7fa.len(), 2);
+    let (first_7fa, second_7fa) = (pre_7fa[0].clone(), pre_7fa[1].clone());
+    let second_7fa_rev = if second_7fa == f1a_a.note {
+        f1a_a.revision.clone()
+    } else {
+        f1a_b.revision.clone()
+    };
+    let run7fa = AgentRunId::from_bytes(random_bytes());
+    let agent7fa = super::agent(&owner, run7fa.clone(), ChatAudience::Personal);
+    store
+        .move_board_card(
+            agent7fa.clone(),
+            mutation(
+                &agent7fa,
+                MoveBoardCard {
+                    view: v7f_a.clone(),
+                    note: second_7fa.clone(),
+                    group: group("todo"),
+                    before: Some(RankNeighbor {
+                        note: first_7fa.clone(),
+                        expected_rank: RankExpectation::Absent,
+                    }),
+                    after: None,
+                    fields: BTreeMap::new(),
+                    expected_note: second_7fa_rev,
+                    expected_view: v7f_a_rev.revision.clone(),
+                    expected_rank: RankExpectation::Absent,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    sync(store, runtime, &scope).await;
+    let prep7fa = store
+        .prepare_agent_run_rollback(owner.clone(), run7fa)
+        .await
+        .unwrap();
+    store
+        .rollback_agent_run(owner.clone(), mutation(&owner, prep7fa))
+        .await
+        .unwrap();
+    sync(store, runtime, &scope).await;
+    let post_7fa: Vec<NoteId> = query(&engine, owner.clone(), v7f_a.clone())
+        .await
+        .unwrap()
+        .rows
+        .items
+        .into_iter()
+        .map(|r| r.card.document.provenance().reference().note_id.clone())
+        .collect();
+    assert_eq!(
+        post_7fa,
+        vec![first_7fa, second_7fa],
+        "single-move rollback on unranked [B, A] must restore exact order [B, A]"
+    );
+
+    // 7F(b): Untouched column [B, C] + human D between B and C preserves [B, D, C].
+    let proj7fb = folder(store, &owner, None, "rb-7fb-proj", true)
+        .await
+        .unwrap();
+    let (v7f_b, v7f_b_rev) = create_view(
+        store,
+        &owner,
+        &proj7fb,
+        "rb-7f-b",
+        "board",
+        "{scope: project}",
+        v7f_body,
+    )
+    .await;
+    let fb_b = create_note(
+        store,
+        &owner,
+        Some(proj7fb.clone()),
+        "fb-01-b",
+        "---\nstatus: todo\n---\n".into(),
+    )
+    .await;
+    let fb_c = create_note(
+        store,
+        &owner,
+        Some(proj7fb.clone()),
+        "fb-02-c",
+        "---\nstatus: todo\n---\n".into(),
+    )
+    .await;
+    let fb_a = create_note(
+        store,
+        &owner,
+        Some(proj7fb.clone()),
+        "fb-03-a",
+        "---\nstatus: doing\n---\n".into(),
+    )
+    .await;
+    let fb_d = create_note(
+        store,
+        &owner,
+        Some(proj7fb.clone()),
+        "fb-04-d",
+        "---\nstatus: backlog\n---\n".into(),
+    )
+    .await;
+    sync(store, runtime, &scope).await;
+    let pre_todo_7fb: Vec<NoteId> = query(&engine, owner.clone(), v7f_b.clone())
+        .await
+        .unwrap()
+        .rows
+        .items
+        .into_iter()
+        .filter(|r| r.group == group("todo"))
+        .map(|r| r.card.document.provenance().reference().note_id.clone())
+        .collect();
+    assert_eq!(pre_todo_7fb.len(), 2);
+    let (tb0, tb1) = (pre_todo_7fb[0].clone(), pre_todo_7fb[1].clone());
+    let run7fb = AgentRunId::from_bytes(random_bytes());
+    let agent7fb = super::agent(&owner, run7fb.clone(), ChatAudience::Personal);
+    store
+        .move_board_card(
+            agent7fb.clone(),
+            mutation(
+                &agent7fb,
+                MoveBoardCard {
+                    view: v7f_b.clone(),
+                    note: fb_a.note.clone(),
+                    group: group("todo"),
+                    before: Some(RankNeighbor {
+                        note: tb0.clone(),
+                        expected_rank: RankExpectation::Absent,
+                    }),
+                    after: None,
+                    fields: BTreeMap::from([(
+                        "status".into(),
+                        Some(YamlValue::String("todo".into())),
+                    )]),
+                    expected_note: fb_a.revision.clone(),
+                    expected_view: v7f_b_rev.revision.clone(),
+                    expected_rank: RankExpectation::Absent,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    sync(store, runtime, &scope).await;
+    let ov_7fb = store
+        .inspect_view_overlays_for_test(&scope.space_id, &v7f_b)
+        .await
+        .unwrap();
+    store
+        .move_board_card(
+            owner.clone(),
+            mutation(
+                &owner,
+                MoveBoardCard {
+                    view: v7f_b.clone(),
+                    note: fb_d.note.clone(),
+                    group: group("todo"),
+                    before: Some(RankNeighbor {
+                        note: tb1.clone(),
+                        expected_rank: RankExpectation::Existing(ov_7fb[&tb1].rank_rev_id.clone()),
+                    }),
+                    after: Some(RankNeighbor {
+                        note: tb0.clone(),
+                        expected_rank: RankExpectation::Existing(ov_7fb[&tb0].rank_rev_id.clone()),
+                    }),
+                    fields: BTreeMap::from([(
+                        "status".into(),
+                        Some(YamlValue::String("todo".into())),
+                    )]),
+                    expected_note: fb_d.revision.clone(),
+                    expected_view: v7f_b_rev.revision.clone(),
+                    expected_rank: RankExpectation::Absent,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    sync(store, runtime, &scope).await;
+    let prep7fb = store
+        .prepare_agent_run_rollback(owner.clone(), run7fb)
+        .await
+        .unwrap();
+    store
+        .rollback_agent_run(owner.clone(), mutation(&owner, prep7fb))
+        .await
+        .unwrap();
+    sync(store, runtime, &scope).await;
+    let post_todo_7fb: Vec<NoteId> = query(&engine, owner.clone(), v7f_b.clone())
+        .await
+        .unwrap()
+        .rows
+        .items
+        .into_iter()
+        .filter(|r| r.group == group("todo"))
+        .map(|r| r.card.document.provenance().reference().note_id.clone())
+        .collect();
+    assert_eq!(
+        post_todo_7fb,
+        vec![tb0, fb_d.note.clone(), tb1],
+        "rollback returning A to doing must preserve human D between materialized B and C"
+    );
+    let _ = (fb_b, fb_c);
+
+    // 7F(c): [H (human-ranked), A (unranked), B (unranked)] -> R moves B before H, then A to doing ->
+    // rollback restores [H, A, B] without jumping B ahead of H.
+    let proj7fc = folder(store, &owner, None, "rb-7fc-proj", true)
+        .await
+        .unwrap();
+    let (v7f_c, v7f_c_rev) = create_view(
+        store,
+        &owner,
+        &proj7fc,
+        "rb-7f-c",
+        "board",
+        "{scope: project}",
+        v7f_body,
+    )
+    .await;
+    let fc_h = create_note(
+        store,
+        &owner,
+        Some(proj7fc.clone()),
+        "fc-00-h",
+        "---\nstatus: todo\n---\n".into(),
+    )
+    .await;
+    let fc_h_moved = store
+        .move_board_card(
+            owner.clone(),
+            mutation(
+                &owner,
+                MoveBoardCard {
+                    view: v7f_c.clone(),
+                    note: fc_h.note.clone(),
+                    group: group("todo"),
+                    before: None,
+                    after: None,
+                    fields: BTreeMap::new(),
+                    expected_note: fc_h.revision.clone(),
+                    expected_view: v7f_c_rev.revision.clone(),
+                    expected_rank: RankExpectation::Absent,
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .value;
+    let fc_1 = create_note(
+        store,
+        &owner,
+        Some(proj7fc.clone()),
+        "fc-01-a",
+        "---\nstatus: todo\n---\n".into(),
+    )
+    .await;
+    let fc_2 = create_note(
+        store,
+        &owner,
+        Some(proj7fc.clone()),
+        "fc-02-b",
+        "---\nstatus: todo\n---\n".into(),
+    )
+    .await;
+    sync(store, runtime, &scope).await;
+    let pre_7fc: Vec<NoteId> = query(&engine, owner.clone(), v7f_c.clone())
+        .await
+        .unwrap()
+        .rows
+        .items
+        .into_iter()
+        .map(|r| r.card.document.provenance().reference().note_id.clone())
+        .collect();
+    assert_eq!(pre_7fc[0], fc_h.note);
+    let (fc_a_id, fc_b_id) = (pre_7fc[1].clone(), pre_7fc[2].clone());
+    let (fc_a_rev, fc_b_rev) = if fc_a_id == fc_1.note {
+        (fc_1.revision.clone(), fc_2.revision.clone())
+    } else {
+        (fc_2.revision.clone(), fc_1.revision.clone())
+    };
+    let run7fc = AgentRunId::from_bytes(random_bytes());
+    let agent7fc = super::agent(&owner, run7fc.clone(), ChatAudience::Personal);
+    store
+        .move_board_card(
+            agent7fc.clone(),
+            mutation(
+                &agent7fc,
+                MoveBoardCard {
+                    view: v7f_c.clone(),
+                    note: fc_b_id.clone(),
+                    group: group("todo"),
+                    before: Some(RankNeighbor {
+                        note: fc_h.note.clone(),
+                        expected_rank: RankExpectation::Existing(fc_h_moved.rank_revision.clone()),
+                    }),
+                    after: None,
+                    fields: BTreeMap::new(),
+                    expected_note: fc_b_rev,
+                    expected_view: v7f_c_rev.revision.clone(),
+                    expected_rank: RankExpectation::Absent,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    sync(store, runtime, &scope).await;
+    let ov_7fc = store
+        .inspect_view_overlays_for_test(&scope.space_id, &v7f_c)
+        .await
+        .unwrap();
+    store
+        .move_board_card(
+            agent7fc.clone(),
+            mutation(
+                &agent7fc,
+                MoveBoardCard {
+                    view: v7f_c.clone(),
+                    note: fc_a_id.clone(),
+                    group: group("doing"),
+                    before: None,
+                    after: None,
+                    fields: BTreeMap::from([(
+                        "status".into(),
+                        Some(YamlValue::String("doing".into())),
+                    )]),
+                    expected_note: fc_a_rev,
+                    expected_view: v7f_c_rev.revision.clone(),
+                    expected_rank: RankExpectation::Existing(ov_7fc[&fc_a_id].rank_rev_id.clone()),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    sync(store, runtime, &scope).await;
+    let prep7fc = store
+        .prepare_agent_run_rollback(owner.clone(), run7fc)
+        .await
+        .unwrap();
+    store
+        .rollback_agent_run(owner.clone(), mutation(&owner, prep7fc))
+        .await
+        .unwrap();
+    sync(store, runtime, &scope).await;
+    let post_7fc: Vec<NoteId> = query(&engine, owner.clone(), v7f_c.clone())
+        .await
+        .unwrap()
+        .rows
+        .items
+        .into_iter()
+        .filter(|r| r.group == group("todo"))
+        .map(|r| r.card.document.provenance().reference().note_id.clone())
+        .collect();
+    assert_eq!(
+        post_7fc,
+        vec![fc_h.note.clone(), fc_a_id, fc_b_id],
+        "ClearOverlay on anchor A must restore [H, A, B] without jumping B above H"
+    );
+
+    // 7F(d): Partial rollback retry must skip an already-rolled-back same-column rank-only move
+    // and preserve intervening human placements [X, C, A].
+    let proj7fd = folder(store, &owner, None, "rb-7fd-proj", true)
+        .await
+        .unwrap();
+    let (v7f_d, v7f_d_rev) = create_view(
+        store,
+        &owner,
+        &proj7fd,
+        "rb-7f-d",
+        "board",
+        "{scope: project}",
+        v7f_body,
+    )
+    .await;
+    let fd_x = create_note(
+        store,
+        &owner,
+        Some(proj7fd.clone()),
+        "fd-01-x",
+        "---\nstatus: todo\n---\n".into(),
+    )
+    .await;
+    let fd_a = create_note(
+        store,
+        &owner,
+        Some(proj7fd.clone()),
+        "fd-02-a",
+        "---\nstatus: todo\n---\n".into(),
+    )
+    .await;
+    let fd_c = create_note(
+        store,
+        &owner,
+        Some(proj7fd.clone()),
+        "fd-03-c",
+        "---\nstatus: todo\n---\n".into(),
+    )
+    .await;
+    let fd_b_body = "---\nstatus: backlog\n---\nOriginal B.\n".to_owned();
+    let fd_b = create_note(
+        store,
+        &owner,
+        Some(proj7fd.clone()),
+        "fd-04-b",
+        fd_b_body.clone(),
+    )
+    .await;
+    sync(store, runtime, &scope).await;
+    // Human establishes ranked [X, A, C] in `todo`.
+    let fd_x_m = store
+        .move_board_card(
+            owner.clone(),
+            mutation(
+                &owner,
+                MoveBoardCard {
+                    view: v7f_d.clone(),
+                    note: fd_x.note.clone(),
+                    group: group("todo"),
+                    before: None,
+                    after: None,
+                    fields: BTreeMap::new(),
+                    expected_note: fd_x.revision.clone(),
+                    expected_view: v7f_d_rev.revision.clone(),
+                    expected_rank: RankExpectation::Absent,
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .value;
+    sync(store, runtime, &scope).await;
+    let ov_fd1 = store
+        .inspect_view_overlays_for_test(&scope.space_id, &v7f_d)
+        .await
+        .unwrap();
+    let fd_a_m = store
+        .move_board_card(
+            owner.clone(),
+            mutation(
+                &owner,
+                MoveBoardCard {
+                    view: v7f_d.clone(),
+                    note: fd_a.note.clone(),
+                    group: group("todo"),
+                    before: None,
+                    after: Some(RankNeighbor {
+                        note: fd_x.note.clone(),
+                        expected_rank: RankExpectation::Existing(
+                            ov_fd1[&fd_x.note].rank_rev_id.clone(),
+                        ),
+                    }),
+                    fields: BTreeMap::new(),
+                    expected_note: fd_a.revision.clone(),
+                    expected_view: v7f_d_rev.revision.clone(),
+                    expected_rank: ov_fd1.get(&fd_a.note).map_or(RankExpectation::Absent, |o| {
+                        RankExpectation::Existing(o.rank_rev_id.clone())
+                    }),
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .value;
+    sync(store, runtime, &scope).await;
+    let ov_fd2 = store
+        .inspect_view_overlays_for_test(&scope.space_id, &v7f_d)
+        .await
+        .unwrap();
+    store
+        .move_board_card(
+            owner.clone(),
+            mutation(
+                &owner,
+                MoveBoardCard {
+                    view: v7f_d.clone(),
+                    note: fd_c.note.clone(),
+                    group: group("todo"),
+                    before: None,
+                    after: Some(RankNeighbor {
+                        note: fd_a.note.clone(),
+                        expected_rank: RankExpectation::Existing(
+                            ov_fd2[&fd_a.note].rank_rev_id.clone(),
+                        ),
+                    }),
+                    fields: BTreeMap::new(),
+                    expected_note: fd_c.revision.clone(),
+                    expected_view: v7f_d_rev.revision.clone(),
+                    expected_rank: ov_fd2.get(&fd_c.note).map_or(RankExpectation::Absent, |o| {
+                        RankExpectation::Existing(o.rank_rev_id.clone())
+                    }),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    sync(store, runtime, &scope).await;
+    let ov_fd3 = store
+        .inspect_view_overlays_for_test(&scope.space_id, &v7f_d)
+        .await
+        .unwrap();
+
+    // Run `run7fd`: same-column rank-only move of `A` before `X`, plus body edit on `B`.
+    let run7fd = AgentRunId::from_bytes(random_bytes());
+    let agent7fd = super::agent(&owner, run7fd.clone(), ChatAudience::Personal);
+    store
+        .move_board_card(
+            agent7fd.clone(),
+            mutation(
+                &agent7fd,
+                MoveBoardCard {
+                    view: v7f_d.clone(),
+                    note: fd_a.note.clone(),
+                    group: group("todo"),
+                    before: Some(RankNeighbor {
+                        note: fd_x.note.clone(),
+                        expected_rank: RankExpectation::Existing(
+                            ov_fd3[&fd_x.note].rank_rev_id.clone(),
+                        ),
+                    }),
+                    after: None,
+                    fields: BTreeMap::new(),
+                    expected_note: fd_a_m.revision.revision.clone(),
+                    expected_view: v7f_d_rev.revision.clone(),
+                    expected_rank: RankExpectation::Existing(
+                        ov_fd3[&fd_a.note].rank_rev_id.clone(),
+                    ),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let b_span = notarium_syntax::frontmatter::analyze(&fd_b_body, DocClass::UserDoc)
+        .unwrap()
+        .carrier
+        .body;
+    let mut edit_b = mutation(
+        &agent7fd,
+        EditNote {
+            note: fd_b.note.clone(),
+            plan: notarium_syntax::patch::plan(
+                &fd_b_body,
+                b_span,
+                vec![(CarrierEditOrigin::Body, b_span, "Agent edited B.\n".into())],
+            )
+            .unwrap(),
+        },
+    );
+    edit_b.preconditions.revision = Some(fd_b.revision.clone());
+    let fd_b_edited = store
+        .edit_note(agent7fd.clone(), edit_b)
+        .await
+        .unwrap()
+        .value;
+    sync(store, runtime, &scope).await;
+
+    // Open an active collab room on `B` so Rollback #1 restores `A` and skips `B`.
+    let opened_b = store
+        .open_collab_session(
+            &budget(),
+            notarium_canonical::OpenCollabSession {
+                scope: scope.clone(),
+                note: fd_b.note.clone(),
+                owner_id: "room-7fd".into(),
+                expected_carrier_rev: fd_b_edited.revision.clone(),
+                expected_lease: None,
+                expected_lineage: None,
+                initial_yrs_snapshot: None,
+                allow_fenced_recovery: false,
+            },
+        )
+        .await
+        .unwrap();
+    let prep7fd_1 = store
+        .prepare_agent_run_rollback(owner.clone(), run7fd.clone())
+        .await
+        .unwrap();
+    let rb7fd_1 = store
+        .rollback_agent_run(owner.clone(), mutation(&owner, prep7fd_1))
+        .await
+        .unwrap()
+        .value;
+    assert_eq!(rb7fd_1.skipped_room_active, vec![fd_b.note.clone()]);
+    sync(store, runtime, &scope).await;
+
+    // Intervening human moves `C` between `X` and `A` -> `[X, C, A]`.
+    let ov_fd4 = store
+        .inspect_view_overlays_for_test(&scope.space_id, &v7f_d)
+        .await
+        .unwrap();
+    store
+        .move_board_card(
+            owner.clone(),
+            mutation(
+                &owner,
+                MoveBoardCard {
+                    view: v7f_d.clone(),
+                    note: fd_c.note.clone(),
+                    group: group("todo"),
+                    before: Some(RankNeighbor {
+                        note: fd_a.note.clone(),
+                        expected_rank: RankExpectation::Existing(
+                            ov_fd4[&fd_a.note].rank_rev_id.clone(),
+                        ),
+                    }),
+                    after: Some(RankNeighbor {
+                        note: fd_x.note.clone(),
+                        expected_rank: RankExpectation::Existing(
+                            ov_fd4[&fd_x.note].rank_rev_id.clone(),
+                        ),
+                    }),
+                    fields: BTreeMap::new(),
+                    expected_note: fd_c.revision.clone(),
+                    expected_view: v7f_d_rev.revision.clone(),
+                    expected_rank: RankExpectation::Existing(
+                        ov_fd4[&fd_c.note].rank_rev_id.clone(),
+                    ),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    // Close `B`'s collab session and retry Rollback #2.
+    store
+        .close_collab_session(
+            &budget(),
+            notarium_canonical::CloseCollabSession {
+                unchanged_carrier_digest: None,
+                scope: scope.clone(),
+                note: fd_b.note.clone(),
+                owner_id: Some("room-7fd".into()),
+                expected_lease: opened_b.lease_epoch,
+                expected_lineage: opened_b.lineage_epoch,
+                final_yrs_snapshot: None,
+                compacted_through_update_seq: None,
+                carrier_settlement: None,
+            },
+        )
+        .await
+        .unwrap();
+    sync(store, runtime, &scope).await;
+    let prep7fd_2 = store
+        .prepare_agent_run_rollback(owner.clone(), run7fd)
+        .await
+        .unwrap();
+    let rb7fd_2 = store
+        .rollback_agent_run(owner.clone(), mutation(&owner, prep7fd_2))
+        .await
+        .unwrap()
+        .value;
+    assert!(
+        rb7fd_2.skipped_manual_edits.contains(&fd_a.note),
+        "partial rollback retry must skip already-rolled-back rank-only board move A: {rb7fd_2:?}"
+    );
+    sync(store, runtime, &scope).await;
+    let post_todo_7fd: Vec<NoteId> = query(&engine, owner.clone(), v7f_d.clone())
+        .await
+        .unwrap()
+        .rows
+        .items
+        .into_iter()
+        .filter(|r| r.group == group("todo"))
+        .map(|r| r.card.document.provenance().reference().note_id.clone())
+        .collect();
+    assert_eq!(
+        post_todo_7fd,
+        vec![fd_x.note, fd_c.note, fd_a.note],
+        "partial rollback retry must preserve intervening human placement [X, C, A]"
+    );
+    let _ = fd_x_m;
 }
 
 async fn keeper_readonly_abilities_isolation_on_changes_events_and_graph(

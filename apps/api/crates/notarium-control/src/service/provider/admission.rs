@@ -1,4 +1,6 @@
 //! Reusable pre-send checks. These helpers never perform a provider request.
+pub(crate) const CALL_RUN_EPOCHS_SQLITE_SQL: &str =
+    "SELECT policy_epochs FROM provider_call_log WHERE run_id=$1 ORDER BY call_id LIMIT 65";
 use super::{
     ProviderService,
     accounting::BudgetLimit,
@@ -91,7 +93,7 @@ pub(super) async fn required_query_source_disclosure(
         tx,
         (String,),
         fetch_all,
-        "SELECT policy_epochs FROM provider_call_log WHERE run_id=$1 ORDER BY call_id LIMIT 65",
+        CALL_RUN_EPOCHS_SQLITE_SQL,
         "SELECT policy_epochs FROM v1_control.provider_call_log WHERE run_id=$1 ORDER BY call_id LIMIT 65";
         run.as_str()
     )?;

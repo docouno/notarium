@@ -1697,6 +1697,7 @@ fn materialize_working_group(
     overlays: &HashMap<NoteId, crate::domain::board::OverlayRow>,
     moved_targets_on_view: &BTreeSet<&NoteId>,
     stale_prerun_restores: &BTreeMap<NoteId, (GroupKey, crate::codec::RankRevisionMetadata)>,
+    same_group_run_materialized: &BTreeMap<NoteId, GroupKey>,
     working_groups: &mut Vec<(GroupKey, Vec<ExistingRankedItem>)>,
     neighbor_dirty: &mut BTreeMap<NoteId, (GroupKey, String, bool)>,
 ) -> Result<usize, PortError> {
@@ -1782,7 +1783,8 @@ fn materialize_working_group(
                     if !moved_targets_on_view.contains(&pn)
                         && !stale_prerun_restores.contains_key(&pn)
                     {
-                        let is_pma = overlays.get(&pn).is_some_and(|o| &o.group == group);
+                        let is_pma = overlays.get(&pn).is_some_and(|o| &o.group == group)
+                            && !same_group_run_materialized.contains_key(&pn);
                         neighbor_dirty.insert(pn, (group.clone(), pr, is_pma));
                     }
                 }
@@ -1809,7 +1811,8 @@ fn materialize_working_group(
                     if !moved_targets_on_view.contains(&pn)
                         && !stale_prerun_restores.contains_key(&pn)
                     {
-                        let is_pma = overlays.get(&pn).is_some_and(|o| &o.group == group);
+                        let is_pma = overlays.get(&pn).is_some_and(|o| &o.group == group)
+                            && !same_group_run_materialized.contains_key(&pn);
                         neighbor_dirty.insert(pn, (group.clone(), pr, is_pma));
                     }
                 }
@@ -1839,33 +1842,19 @@ async fn load_latest_prerun_rank_meta_tx(
     run: &AgentRunId,
     before_seq: SpaceSeq,
 ) -> Result<Option<crate::codec::RankRevisionMetadata>, PortError> {
+    const PRERUN_RANK_SQLITE_SQL: &str = include_str!("rollback/prerun_rank.sqlite.sql");
     let key = super::board::rank_entity_key(&view.note, &view.key, target);
     let before_i64 = before_seq.get() as i64;
     let bytes_opt: Option<Vec<u8>> = match tx {
-        BackendConn::Sqlite(conn) => sqlx::query_scalar(
-            "SELECT metadata_msgpack FROM revisions
-             WHERE space_id = ?1 AND history_incarnation = ?2
-               AND entity_type = 'rank' AND entity_key = ?3
-               AND (agent_run_id IS NULL OR agent_run_id != ?4)
-               AND space_seq < ?5
-               AND NOT EXISTS (
-                   SELECT 1 FROM revisions r2
-                   WHERE r2.space_id = revisions.space_id
-                     AND r2.history_incarnation = revisions.history_incarnation
-                     AND r2.visibility_seq = revisions.visibility_seq
-                     AND r2.agent_run_id = ?4
-               )
-             ORDER BY visibility_seq DESC, space_seq DESC
-             LIMIT 1",
-        )
-        .bind(scope.space_id.as_str())
-        .bind(scope.incarnation.as_bytes().as_slice())
-        .bind(&key)
-        .bind(run.as_str())
-        .bind(before_i64)
-        .fetch_optional(&mut **conn)
-        .await
-        .map_err(|err| internal_not_committed("sqlite_prerun_rank_meta", err.to_string()))?,
+        BackendConn::Sqlite(conn) => sqlx::query_scalar(PRERUN_RANK_SQLITE_SQL)
+            .bind(scope.space_id.as_str())
+            .bind(scope.incarnation.as_bytes().as_slice())
+            .bind(&key)
+            .bind(run.as_str())
+            .bind(before_i64)
+            .fetch_optional(&mut **conn)
+            .await
+            .map_err(|err| internal_not_committed("sqlite_prerun_rank_meta", err.to_string()))?,
         BackendConn::Postgres(conn) => sqlx::query_scalar(
             "SELECT metadata_msgpack FROM revisions
              WHERE space_id = $1 AND history_incarnation = $2
@@ -2191,6 +2180,7 @@ fn build_rollback_execute_fn(
                     // any moved cards, so pre-run-restorable stale neighbors enter
                     // `working_groups` at their true pre-run ranks instead of receiving
                     // synthetic tail ranks that corrupt neighbor-relative placement.
+                    let mut effective_overlays = overlays.clone();
                     let mut stale_non_moved: Vec<NoteId> = overlays
                         .keys()
                         .filter(|nid| {
@@ -2202,6 +2192,8 @@ fn build_rollback_execute_fn(
                         .collect();
                     stale_non_moved.sort();
                     let mut pending_stale_deletes: Vec<NoteId> = Vec::new();
+                    let mut same_group_run_materialized: BTreeMap<NoteId, GroupKey> =
+                        BTreeMap::new();
                     let mut stale_prerun_restores: BTreeMap<
                         NoteId,
                         (GroupKey, crate::codec::RankRevisionMetadata),
@@ -2221,6 +2213,7 @@ fn build_rollback_execute_fn(
                         }
                         match expected_post {
                             None => {
+                                effective_overlays.remove(&nid);
                                 pending_stale_deletes.push(nid);
                             }
                             Some(post_grp) => {
@@ -2262,8 +2255,12 @@ fn build_rollback_execute_fn(
                                     for (_, notes) in &mut kept_groups {
                                         notes.retain(|id| id != &nid);
                                     }
+                                    effective_overlays.remove(&nid);
                                     stale_prerun_restores.insert(nid, (post_grp, meta));
+                                } else if same_group {
+                                    same_group_run_materialized.insert(nid, post_grp);
                                 } else {
+                                    effective_overlays.remove(&nid);
                                     pending_stale_deletes.push(nid);
                                 }
                             }
@@ -2271,11 +2268,10 @@ fn build_rollback_execute_fn(
                     }
 
                     // Also classify untouched notes whose current overlay on `view` was
-                    // materialized solely by `input.run` (`placement_run_id IS NULL`) into a
-                    // group the note no longer occupies after rollback (e.g., after restoring
-                    // a run-edited `group_by` or narrowed filter): restore a matching pre-run
-                    // human overlay if one existed before `input.run` replaced it, otherwise
-                    // delete the orphaned overlay unless re-materialized as a neighbor.
+                    // materialized solely by `input.run` (`placement_run_id IS NULL`):
+                    // restore any matching pre-run human overlay, defer same-group
+                    // run-materialized neighbors until surviving column ranks are known,
+                    // and delete orphaned overlays in groups the note no longer occupies.
                     let mut stale_untouched: Vec<NoteId> = overlays
                         .iter()
                         .filter_map(|(nid, ov)| {
@@ -2305,6 +2301,7 @@ fn build_rollback_execute_fn(
                         else {
                             continue;
                         };
+                        let same_group = current_group.as_ref() == Some(&ov.group);
                         if let Some(post_grp) = current_group {
                             let prerun = load_latest_prerun_rank_meta_tx(
                                 tx, &scope_cl, view, &nid, &input.run, mat_seq,
@@ -2317,11 +2314,16 @@ fn build_rollback_execute_fn(
                                 for (_, notes) in &mut kept_groups {
                                     notes.retain(|id| id != &nid);
                                 }
+                                effective_overlays.remove(&nid);
                                 stale_prerun_restores.insert(nid, (post_grp, meta));
+                            } else if same_group {
+                                same_group_run_materialized.insert(nid, post_grp);
                             } else {
+                                effective_overlays.remove(&nid);
                                 pending_stale_deletes.push(nid);
                             }
                         } else {
+                            effective_overlays.remove(&nid);
                             pending_stale_deletes.push(nid);
                         }
                     }
@@ -2329,6 +2331,7 @@ fn build_rollback_execute_fn(
                     let mut working_groups: Vec<(GroupKey, Vec<ExistingRankedItem>)> = Vec::new();
                     let mut neighbor_dirty: BTreeMap<NoteId, (GroupKey, String, bool)> =
                         BTreeMap::new();
+                    let mut cleared_to_unranked_group: HashMap<NoteId, GroupKey> = HashMap::new();
 
                     enum TargetSettlement {
                         Ineligible,
@@ -2374,6 +2377,7 @@ fn build_rollback_execute_fn(
                             StoredSemanticPlacementV1::Ineligible => None,
                             StoredSemanticPlacementV1::InGroup { group, .. } => Some(group.clone()),
                         };
+                        let mut before_mat_seq_for_bmh: Option<SpaceSeq> = None;
                         if is_earliest {
                             let before_mat_seq =
                                 if let Some(ref pl_rev) = bmh.before_placement_revision {
@@ -2387,6 +2391,7 @@ fn build_rollback_execute_fn(
                                 } else {
                                     None
                                 };
+                            before_mat_seq_for_bmh = before_mat_seq;
                             let mut prerun_before = bmh.command_end_seq;
                             if let Some(first) = note_first_run_seq(target) {
                                 prerun_before = prerun_before.min(first);
@@ -2426,9 +2431,10 @@ fn build_rollback_execute_fn(
                                             let g_idx = materialize_working_group(
                                                 &post_grp,
                                                 &kept_groups,
-                                                &overlays,
+                                                &effective_overlays,
                                                 &moved_targets_on_view,
                                                 &stale_prerun_restores,
+                                                &same_group_run_materialized,
                                                 &mut working_groups,
                                                 &mut neighbor_dirty,
                                             )?;
@@ -2471,9 +2477,11 @@ fn build_rollback_execute_fn(
                                                     } else if !moved_targets_on_view.contains(&pn)
                                                         && !stale_prerun_restores.contains_key(&pn)
                                                     {
-                                                        let is_pma = overlays
+                                                        let is_pma = effective_overlays
                                                             .get(&pn)
-                                                            .is_some_and(|o| o.group == post_grp);
+                                                            .is_some_and(|o| o.group == post_grp)
+                                                            && !same_group_run_materialized
+                                                                .contains_key(&pn);
                                                         neighbor_dirty.insert(
                                                             pn,
                                                             (post_grp.clone(), pr, is_pma),
@@ -2502,7 +2510,57 @@ fn build_rollback_execute_fn(
                                                 },
                                             );
                                             continue;
-                                        } else if group_changed || before_mat_seq.is_some() {
+                                        } else if group_changed {
+                                            cleared_to_unranked_group
+                                                .insert(target.clone(), post_grp);
+                                            target_final_state.insert(
+                                                target.clone(),
+                                                TargetSettlement::ClearOverlay,
+                                            );
+                                            continue;
+                                        } else if before_mat_seq.is_some() {
+                                            let has_ranked_successor = match &bmh.before_placement {
+                                                StoredSemanticPlacementV1::InGroup {
+                                                    successor: Some(succ),
+                                                    ..
+                                                } => {
+                                                    effective_overlays
+                                                        .get(succ)
+                                                        .is_some_and(|o| o.group == post_grp)
+                                                        || stale_prerun_restores
+                                                            .get(succ)
+                                                            .is_some_and(|(g, _)| g == &post_grp)
+                                                        || matches!(
+                                                            target_final_state.get(succ),
+                                                            Some(TargetSettlement::Replayed {
+                                                                group,
+                                                                ..
+                                                            }) if group == &post_grp
+                                                        )
+                                                }
+                                                _ => false,
+                                            };
+                                            if !has_ranked_successor {
+                                                cleared_to_unranked_group
+                                                    .insert(target.clone(), post_grp);
+                                                target_final_state.insert(
+                                                    target.clone(),
+                                                    TargetSettlement::ClearOverlay,
+                                                );
+                                                continue;
+                                            }
+                                        } else if let StoredSemanticPlacementV1::InGroup {
+                                            group,
+                                            predecessor: Some(pred),
+                                            successor,
+                                        } = &bmh.before_placement
+                                            && cleared_to_unranked_group.get(pred) == Some(group)
+                                            && successor.as_ref().is_none_or(|s| {
+                                                cleared_to_unranked_group.get(s) == Some(group)
+                                            })
+                                        {
+                                            cleared_to_unranked_group
+                                                .insert(target.clone(), post_grp);
                                             target_final_state.insert(
                                                 target.clone(),
                                                 TargetSettlement::ClearOverlay,
@@ -2527,9 +2585,10 @@ fn build_rollback_execute_fn(
                                 let g_idx = materialize_working_group(
                                     group,
                                     &kept_groups,
-                                    &overlays,
+                                    &effective_overlays,
                                     &moved_targets_on_view,
                                     &stale_prerun_restores,
+                                    &same_group_run_materialized,
                                     &mut working_groups,
                                     &mut neighbor_dirty,
                                 )?;
@@ -2577,7 +2636,13 @@ fn build_rollback_execute_fn(
                                 };
 
                                 let ins_idx = match (pred_pos, succ_pos) {
-                                    (None, None) => 0,
+                                    (None, None) => {
+                                        if predecessor.is_some() && successor.is_none() {
+                                            g_items.len()
+                                        } else {
+                                            0
+                                        }
+                                    }
                                     (None, Some(s)) => s,
                                     (Some(p), None) => p + 1,
                                     (Some(p), Some(s)) => {
@@ -2599,7 +2664,9 @@ fn build_rollback_execute_fn(
                                                 .into());
                                             }
                                             let is_ranked = |id: &NoteId| {
-                                                overlays.get(id).is_some_and(|o| &o.group == group)
+                                                effective_overlays
+                                                    .get(id)
+                                                    .is_some_and(|o| &o.group == group)
                                                     || stale_prerun_restores
                                                         .get(id)
                                                         .is_some_and(|(g, _)| g == group)
@@ -2631,8 +2698,10 @@ fn build_rollback_execute_fn(
                                     } else if !moved_targets_on_view.contains(&pn)
                                         && !stale_prerun_restores.contains_key(&pn)
                                     {
-                                        let is_pma =
-                                            overlays.get(&pn).is_some_and(|o| &o.group == group);
+                                        let is_pma = effective_overlays
+                                            .get(&pn)
+                                            .is_some_and(|o| &o.group == group)
+                                            && !same_group_run_materialized.contains_key(&pn);
                                         neighbor_dirty.insert(pn, (group.clone(), pr, is_pma));
                                     }
                                 }
@@ -2643,8 +2712,13 @@ fn build_rollback_execute_fn(
                                         rank: computed.target_rank.clone(),
                                     },
                                 );
+                                let restored_pl_rev = if before_mat_seq_for_bmh.is_some() {
+                                    None
+                                } else {
+                                    bmh.before_placement_revision.clone()
+                                };
                                 let (placement_actor, placement_run) = if let Some(ref pl_rev) =
-                                    bmh.before_placement_revision
+                                    restored_pl_rev
                                 {
                                     load_latest_prerun_rank_meta_tx(
                                         tx,
@@ -2672,7 +2746,7 @@ fn build_rollback_execute_fn(
                                     TargetSettlement::Replayed {
                                         group: group.clone(),
                                         rank: computed.target_rank,
-                                        placement_revision: bmh.before_placement_revision.clone(),
+                                        placement_revision: restored_pl_rev,
                                         placement_actor,
                                         placement_run,
                                     },
@@ -2733,9 +2807,10 @@ fn build_rollback_execute_fn(
                         let g_idx = materialize_working_group(
                             post_grp,
                             &kept_groups,
-                            &overlays,
+                            &effective_overlays,
                             &moved_targets_on_view,
                             &stale_prerun_restores,
+                            &same_group_run_materialized,
                             &mut working_groups,
                             &mut neighbor_dirty,
                         )?;
@@ -2790,6 +2865,18 @@ fn build_rollback_execute_fn(
                             rank: rnk,
                             is_pma,
                         });
+                    }
+                    for (nid, grp) in &same_group_run_materialized {
+                        let group_has_surviving_ranked = touched_final_groups.contains(grp)
+                            || effective_overlays.iter().any(|(other_id, other_ov)| {
+                                &other_ov.group == grp
+                                    && !retired_note_ids.contains(other_id)
+                                    && !moved_targets_on_view.contains(other_id)
+                                    && !same_group_run_materialized.contains_key(other_id)
+                            });
+                        if !group_has_surviving_ranked {
+                            pending_stale_deletes.push(nid.clone());
+                        }
                     }
                     for nid in pending_stale_deletes {
                         if !materialized_neighbors.contains(&nid) {
@@ -3283,7 +3370,7 @@ fn build_rollback_execute_fn(
                     .get(&nbr.view)
                     .and_then(|m| m.get(&nbr.neighbor_note));
                 let (pl_rev, pl_actor, pl_run) = match existing_ov {
-                    Some(ov) if ov.group == nbr.group => (
+                    Some(ov) if nbr.is_pma && ov.group == nbr.group => (
                         ov.placement_revision.clone(),
                         ov.placement_actor_id.clone(),
                         ov.placement_run_id.clone(),
@@ -3604,8 +3691,22 @@ async fn discover_rollback_state_tx(
         let has_foreign_board_move = target_bmh
             .iter()
             .any(|m| m.0 > first_run_seq && m.1.as_ref() != Some(&input.run));
+        let has_foreign_rank_restore =
+            if !has_foreign_note_edit && !has_foreign_board_move && earliest_bmh_touch.is_some() {
+                has_later_foreign_non_pma_rank_revision_tx(
+                    tx,
+                    &srec.scope,
+                    &run_moves,
+                    &nid,
+                    first_run_seq,
+                    &input.run,
+                )
+                .await?
+            } else {
+                false
+            };
 
-        if has_foreign_note_edit || has_foreign_board_move {
+        if has_foreign_note_edit || has_foreign_board_move || has_foreign_rank_restore {
             skipped_manual_edits.push(nid);
             continue;
         }
@@ -4405,6 +4506,75 @@ async fn load_run_board_moves_tx(
         });
     }
     Ok(out)
+}
+
+async fn has_later_foreign_non_pma_rank_revision_tx(
+    tx: &mut BackendConn<'_>,
+    scope: &HistoryScope,
+    run_moves: &[RunBoardMoveRow],
+    note_id: &NoteId,
+    first_run_seq: SpaceSeq,
+    run: &AgentRunId,
+) -> Result<bool, PortError> {
+    let mut views = BTreeSet::new();
+    for bmh in run_moves {
+        if &bmh.target_note_id == note_id {
+            views.insert(&bmh.view);
+        }
+    }
+    let after_i64 = first_run_seq.get() as i64;
+    for view in views {
+        let key = super::board::rank_entity_key(&view.note, &view.key, note_id);
+        let rows: Vec<Vec<u8>> = match tx {
+            BackendConn::Sqlite(conn) => sqlx::query_scalar(
+                "SELECT metadata_msgpack FROM revisions
+                 WHERE space_id = ?1 AND history_incarnation = ?2
+                   AND entity_type = 'rank' AND entity_key = ?3
+                   AND space_seq > ?4
+                   AND (agent_run_id IS NULL OR agent_run_id != ?5)
+                 ORDER BY visibility_seq DESC, space_seq DESC",
+            )
+            .bind(scope.space_id.as_str())
+            .bind(scope.incarnation.as_bytes().as_slice())
+            .bind(&key)
+            .bind(after_i64)
+            .bind(run.as_str())
+            .fetch_all(&mut **conn)
+            .await
+            .map_err(|err| internal_not_committed("sqlite_later_rank_revs", err.to_string()))?,
+            BackendConn::Postgres(conn) => sqlx::query_scalar(
+                "SELECT metadata_msgpack FROM revisions
+                 WHERE space_id = $1 AND history_incarnation = $2
+                   AND entity_type = 'rank' AND entity_key = $3
+                   AND space_seq > $4
+                   AND (agent_run_id IS NULL OR agent_run_id != $5)
+                 ORDER BY visibility_seq DESC, space_seq DESC",
+            )
+            .bind(scope.space_id.as_str())
+            .bind(scope.incarnation.as_bytes().as_slice())
+            .bind(&key)
+            .bind(after_i64)
+            .bind(run.as_str())
+            .fetch_all(&mut **conn)
+            .await
+            .map_err(|err| crate::runtime::pg_read_error("pg_later_rank_revs", err))?,
+        };
+        for bytes in rows {
+            match RevisionMetadataEnvelope::decode(&bytes)?.payload {
+                RevisionMetadataPayload::Rank(meta) if !meta.is_pma_normalization => {
+                    return Ok(true);
+                }
+                RevisionMetadataPayload::Rank(_) => {}
+                _ => {
+                    return Err(internal_not_committed(
+                        "rollback_later_rank_meta_kind",
+                        "rank revision metadata has unexpected payload variant",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(false)
 }
 
 async fn load_target_board_move_runs_tx(

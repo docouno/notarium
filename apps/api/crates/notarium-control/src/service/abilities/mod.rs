@@ -1,5 +1,5 @@
 //! Effective ability metadata; immutable package content remains canonical-owned.
-mod mutations;
+pub(crate) mod mutations;
 use super::{
     ControlService,
     authority::*,

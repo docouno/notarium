@@ -16472,8 +16472,20 @@ async fn run_control_replay_and_taint_hardening(pg: bool) {
         )
     })
     .await;
-    box_step(|| {
+    let closed_ep = box_step(|| {
         verify_part_i_mcp_hardening(&fixture, &part_i_owner, &actor, &s2.history, &s2.slug)
+    })
+    .await;
+    box_step(|| {
+        verify_part_i_contract_and_chat_hardening(
+            &fixture,
+            &local,
+            &part_i_owner,
+            personal.scope(),
+            &s2.history,
+            &s2.slug,
+            closed_ep,
+        )
     })
     .await;
 
@@ -27064,7 +27076,7 @@ async fn verify_part_i_locks_and_rollback(
                 },
                 preconditions: Preconditions::default(),
                 input: MoveFolder {
-                    folder: mv_ok_parent,
+                    folder: mv_ok_parent.clone(),
                     new_parent: Some(s2_p2),
                 },
             },
@@ -27105,27 +27117,106 @@ async fn verify_part_i_locks_and_rollback(
         ),
         "project-pinned move_folder to out-of-project destination must fail ResourceNotFound, got {pinned_out_of_proj_dst:?}"
     );
-    let agent_lock_enc = fixture
+    // AgentRun must not lock or unlock folders at the CanonicalStore boundary, while
+    // human/PAT callers still enforce subtree EncryptedNote and Skill authorization.
+    let agent_lock_plain = fixture
         .canonical
-        .set_folder_write_lock(s2_agent_sc.clone(), mv_enc_parent, true)
+        .set_folder_write_lock(s2_agent_sc.clone(), mv_ok_parent.clone(), true)
         .await;
     assert!(
         matches!(
-            agent_lock_enc,
+            agent_lock_plain,
             Err(PortError::Domain(DomainError::SpaceReadOnly))
         ),
-        "AgentRun without EncryptedNote write class must not lock folder containing EncryptedNote, got {agent_lock_enc:?}"
+        "AgentRun must not lock ordinary folder, got {agent_lock_plain:?}"
     );
-    let agent_lock_skill = fixture
+    fixture
         .canonical
-        .set_folder_write_lock(s2_agent_sc.clone(), mv_skill_parent, true)
+        .set_folder_write_lock(s2_sc.clone(), mv_ok_parent.clone(), true)
+        .await
+        .expect("human locks ordinary folder");
+    let agent_unlock_plain = fixture
+        .canonical
+        .set_folder_write_lock(s2_agent_sc.clone(), mv_ok_parent.clone(), false)
         .await;
     assert!(
         matches!(
-            agent_lock_skill,
+            agent_unlock_plain,
+            Err(PortError::Domain(DomainError::SpaceReadOnly))
+        ),
+        "AgentRun must not unlock human-locked folder, got {agent_unlock_plain:?}"
+    );
+    fixture
+        .canonical
+        .set_folder_write_lock(s2_sc.clone(), mv_ok_parent, false)
+        .await
+        .expect("human unlocks ordinary folder");
+
+    let mut no_enc_grants = s2_sc.auth().spaces().clone();
+    if let Some(g) = no_enc_grants.get_mut(&s2.history.space_id) {
+        g.write_classes.remove(&DocClass::EncryptedNote);
+    }
+    let no_enc_pat_sc = SpaceContext::new(
+        s2_sc
+            .auth()
+            .for_pat(no_enc_grants)
+            .expect("PAT without EncryptedNote write"),
+        s2.history.clone(),
+        budget(),
+    )
+    .unwrap();
+    let pat_lock_enc = fixture
+        .canonical
+        .set_folder_write_lock(no_enc_pat_sc, mv_enc_parent, true)
+        .await;
+    assert!(
+        matches!(
+            pat_lock_enc,
+            Err(PortError::Domain(DomainError::SpaceReadOnly))
+        ),
+        "PAT without EncryptedNote write class must not lock folder containing EncryptedNote, got {pat_lock_enc:?}"
+    );
+    let no_ab_pat_rev = fixture
+        .control
+        .account(owner.clone(), actor.clone())
+        .await
+        .unwrap()
+        .revision;
+    let no_ab_pat = fixture
+        .control
+        .create_pat(
+            owner.clone(),
+            CreatePat {
+                name: "lock-no-ability-write".into(),
+                scope: BearerScope::Write,
+                ability_write: false,
+                selected_spaces: Some(vec![s2.history.space_id.clone()]),
+                expires_at_ms: None,
+                expected: no_ab_pat_rev,
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    let no_ab_pat_auth = fixture
+        .control
+        .resolve(PreAuthContext {
+            budget: budget(),
+            evidence: AuthEvidence::new(AuthEvidenceKind::Pat, no_ab_pat.token.expose().to_owned()),
+        })
+        .await
+        .unwrap();
+    let no_ab_pat_sc = SpaceContext::new(no_ab_pat_auth, s2.history.clone(), budget()).unwrap();
+    let pat_lock_skill = fixture
+        .canonical
+        .set_folder_write_lock(no_ab_pat_sc, mv_skill_parent, true)
+        .await;
+    assert!(
+        matches!(
+            pat_lock_skill,
             Err(PortError::Domain(DomainError::AbilityWriteForbidden))
         ),
-        "AgentRun without AbilityWrite must not lock folder containing Skill note, got {agent_lock_skill:?}"
+        "PAT without AbilityWrite must not lock folder containing Skill note, got {pat_lock_skill:?}"
     );
     // 6. Pre-lookup validation on create_ability ("Index"), link syntax/self-link,
     //    link rejection on published ability entrypoints, and rollback duplicate expectations.
@@ -27371,7 +27462,7 @@ async fn verify_part_i_mcp_hardening(
     actor: &PrincipalId,
     s2_history: &HistoryScope,
     s2_slug: &str,
-) {
+) -> EpisodeId {
     let owner = owner.clone();
     let actor = actor.clone();
     struct S2Ref<'a> {
@@ -27675,6 +27766,400 @@ async fn verify_part_i_mcp_hardening(
         ),
         "replaying trashed-source link while tainted must fail CrossSpaceTainted upfront, got {:?}",
         trashed_link_replay_err.err()
+    );
+    closed_ep
+}
+
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+async fn verify_part_i_contract_and_chat_hardening(
+    fixture: &RuntimeFixture,
+    local: &LoopbackProvider,
+    owner: &AccountContext,
+    personal_history: &HistoryScope,
+    s2_history: &HistoryScope,
+    s2_slug: &str,
+    closed_ep: EpisodeId,
+) {
+    let owner = owner.clone();
+    let s2_p1_handle = format!("{s2_slug}/h-s2-p1");
+
+    // 12. MCP `rename_folder` (mutating & no-op) rejects project folders so `slug` cannot
+    //     diverge from `project_slug`.
+    for (tag, new_name) in [(1u8, "renamed-p1"), (2u8, "h-s2-p1")] {
+        let proj_rename_err = call_mcp(
+            &fixture.registry,
+            &owner,
+            [0xF0, 9, 13, tag, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+            "rename_folder",
+            json!({
+                "project": s2_p1_handle,
+                "folder": "h-s2-p1",
+                "name": new_name,
+            }),
+        )
+        .await;
+        assert!(
+            matches!(
+                proj_rename_err,
+                Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
+                    if diagnostic.reason == ValidationReason::InvalidState
+            ),
+            "MCP rename_folder on project folder (name={new_name}) must fail InvalidState, got {:?}",
+            proj_rename_err.err()
+        );
+    }
+
+    // 13. Pre-lookup syntax validation prevents zero-taint cross-space existence oracles and
+    //     un-confirmable ProposedDiffs (`edit_note` whitespace section & control chars,
+    //     `clean_path` > 256 segments, `remember_about_project` control chars, multibyte 4096B cap).
+    let missing_ref = NoteId::from_bytes([0xD9; 16]).to_string();
+    let ws_section_err = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xF0, 9, 13, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "edit_note",
+        json!({
+            "ref": missing_ref,
+            "operation": "replaceSection",
+            "section": "   ",
+            "content": "body"
+        }),
+    )
+    .await;
+    assert!(
+        matches!(
+            ws_section_err,
+            Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
+                if diagnostic.reason == ValidationReason::InvalidQuery
+        ),
+        "edit_note with whitespace section must fail InvalidQuery before note lookup, got {:?}",
+        ws_section_err.err()
+    );
+    let ctrl_edit_err = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xF0, 9, 13, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "edit_note",
+        json!({
+            "ref": missing_ref,
+            "operation": "append",
+            "content": "bad\u{0007}text"
+        }),
+    )
+    .await;
+    assert!(
+        matches!(
+            ctrl_edit_err,
+            Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
+                if diagnostic.reason == ValidationReason::DisallowedCodePoint
+        ),
+        "edit_note with control char must fail DisallowedCodePoint before note lookup, got {:?}",
+        ctrl_edit_err.err()
+    );
+    let deep_path = vec!["a"; 257].join("/");
+    let deep_list_err = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xF0, 9, 13, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "list_notes",
+        json!({
+            "project": "no-such-space/no-such-project",
+            "path": deep_path
+        }),
+    )
+    .await;
+    assert!(
+        matches!(
+            deep_list_err,
+            Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
+                if diagnostic.reason == ValidationReason::InvalidPathComponent
+        ),
+        "list_notes with >256-segment path must fail InvalidPathComponent before project lookup, got {:?}",
+        deep_list_err.err()
+    );
+    let ctrl_mem_err = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xF0, 9, 13, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "remember_about_project",
+        json!({
+            "project": "no-such-space/no-such-project",
+            "observation": "bad\u{0007}obs"
+        }),
+    )
+    .await;
+    assert!(
+        matches!(
+            ctrl_mem_err,
+            Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
+                if diagnostic.reason == ValidationReason::DisallowedCodePoint
+        ),
+        "remember_about_project with control char must fail DisallowedCodePoint before lookup/proposal, got {:?}",
+        ctrl_mem_err.err()
+    );
+    let wide_utf8_folder = "😀".repeat(1500);
+    let wide_folder_err = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xF0, 9, 13, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "rename_folder",
+        json!({
+            "folder": wide_utf8_folder,
+            "name": "x"
+        }),
+    )
+    .await;
+    assert!(
+        matches!(
+            wide_folder_err,
+            Err(PortError::Domain(DomainError::ValidationFailed { .. }))
+        ),
+        "rename_folder with >4096 UTF-8 bytes must fail schema validation, got {:?}",
+        wide_folder_err.err()
+    );
+
+    // 14. `bind_chat_role` on a Closed episode with matching active_role fails InvalidState.
+    let s2_owner_sc =
+        SpaceContext::new(owner.auth().clone(), s2_history.clone(), budget()).unwrap();
+    let personal_owner_sc =
+        SpaceContext::new(owner.auth().clone(), personal_history.clone(), budget()).unwrap();
+    let personal_sel = local
+        .provider
+        .select_provider(
+            personal_owner_sc,
+            SelectProvider {
+                kind: PreferenceModelKind::Completion,
+                resource: Some(local.resource.id.clone()),
+                model: Some(local.model.clone()),
+                project: None,
+            },
+        )
+        .await
+        .unwrap();
+    let bind_run = AgentRunId::from_bytes([0xD8; 16]);
+    let bind_run_auth = owner
+        .auth()
+        .for_agent_run(
+            bind_run.clone(),
+            personal_history.space_id.clone(),
+            ChatAudience::Personal,
+            owner.auth().spaces().clone(),
+        )
+        .unwrap();
+    let bind_run_sc = SpaceContext::new(bind_run_auth, personal_history.clone(), budget()).unwrap();
+    let closed_bind_err = notarium_agents::mcp::bind_chat_role_for_test(
+        &fixture.registry,
+        owner.clone(),
+        bind_run_sc,
+        &personal_sel,
+        &closed_ep,
+        "closed-ep-role",
+        None,
+        &bind_run,
+    )
+    .await;
+    assert!(
+        matches!(
+            closed_bind_err,
+            Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
+                if diagnostic.reason == ValidationReason::InvalidState
+        ),
+        "bind_chat_role on closed episode with matching role must fail InvalidState, got {closed_bind_err:?}"
+    );
+
+    // 15. Write-only grant (`read_classes = {}`) cannot read chat threads, and `read_chat`
+    //     filters unreadable `referenced_notes` (e.g., EncryptedNote for UserDoc-only reader).
+    let vis_note = fixture
+        .canonical
+        .create_note(
+            s2_owner_sc.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: s2_history.clone(),
+                    actor: owner.auth().principal().clone(),
+                    key: CommandKey::from_bytes([
+                        0xF0, 9, 13, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xD0; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: CreateNote {
+                    folder_page: false,
+                    note: NoteId::from_bytes([0xD7; 16]),
+                    parent: None,
+                    slug: "chat-ref-visible".into(),
+                    class: DocClass::UserDoc,
+                    carrier: "Visible doc.\n".into(),
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    let enc_note = fixture
+        .canonical
+        .create_note(
+            s2_owner_sc.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: s2_history.clone(),
+                    actor: owner.auth().principal().clone(),
+                    key: CommandKey::from_bytes([
+                        0xF0, 9, 13, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xD1; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: CreateNote {
+                    folder_page: false,
+                    note: NoteId::from_bytes([0xD2; 16]),
+                    parent: None,
+                    slug: "chat-ref-secret".into(),
+                    class: DocClass::EncryptedNote,
+                    carrier: concat!(
+                        "---\nclass: encrypted-note\ntitle: Chat Ref Secret\n---\n# Chat Ref Secret\n\n```age\n",
+                        "-----BEGIN AGE ENCRYPTED FILE-----\n",
+                        "YWdlLWVuY3J5cHRpb24ub3JnL3YxCi0+IFgyNTUxOSBURWlGMHlwcXIrYnB2Y3FY\n",
+                        "TnlDVkpwTDdPdXdQZFZ3UEw3S1FFYkZET0NjCmhqYWJHWHdTTFE5YzNTNkx3Mmkr\n",
+                        "UzJUdTJmaXdRSEhzbGJCTjZCNDFGTEUKLS0tIFd5SnA5Ri85Rk9aaDdnSmRoZXEy\n",
+                        "V0lKY3dIZ1ljOE5JVmgzZGR3aHJjTmcK7s9ix86RtDMnTmjU8vkTTLdMW/73vqpS\n",
+                        "yPC8DpksHoMx+2Y=\n",
+                        "-----END AGE ENCRYPTED FILE-----\n```\n",
+                    )
+                    .into(),
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    let vis_ref = NoteRef {
+        space_id: s2_history.space_id.clone(),
+        note_id: vis_note.note,
+    };
+    let enc_ref = NoteRef {
+        space_id: s2_history.space_id.clone(),
+        note_id: enc_note.note,
+    };
+    let chat_tid = ChatThreadId::from_bytes([0xD3; 16]);
+    fixture
+        .canonical
+        .create_chat(
+            s2_owner_sc.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: s2_history.clone(),
+                    actor: owner.auth().principal().clone(),
+                    key: CommandKey::from_bytes([
+                        0xF0, 9, 13, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xD4; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: CreateChat {
+                    thread: chat_tid.clone(),
+                    kind: ChatThreadKind::SpaceGroup,
+                    owner: owner.auth().principal().clone(),
+                    project_folder: None,
+                    title: "Ref Filter".into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let appended = fixture
+        .canonical
+        .append_chat(
+            s2_owner_sc.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: s2_history.clone(),
+                    actor: owner.auth().principal().clone(),
+                    key: CommandKey::from_bytes([
+                        0xF0, 9, 13, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xD5; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: AppendChat {
+                    thread: chat_tid.clone(),
+                    parent: ThreadEntrySeq::ZERO,
+                    kind: ChatEntryKind::Human,
+                    body: ChatInputBody::Text("Check refs".into()),
+                    tool_calls: vec![],
+                    provenance: None,
+                    interruption: None,
+                    proposed_diff: None,
+                    proposed_effect: None,
+                    referenced_notes: vec![vis_ref.clone(), enc_ref.clone()],
+                    tainted: false,
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    let mut wo_grants = owner.auth().spaces().clone();
+    wo_grants
+        .get_mut(&s2_history.space_id)
+        .unwrap()
+        .read_classes
+        .clear();
+    let wo_sc = SpaceContext::new(
+        owner.auth().for_pat(wo_grants).unwrap(),
+        s2_history.clone(),
+        budget(),
+    )
+    .unwrap();
+    let wo_chat_err = fixture
+        .canonical
+        .read_chat(
+            wo_sc,
+            ChatRead {
+                thread: chat_tid.clone(),
+                leaf: appended.seq,
+                before: None,
+                max_entries: PageLimit::new(10).unwrap(),
+            },
+        )
+        .await;
+    assert!(
+        matches!(
+            wo_chat_err,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ),
+        "write-only grant must not read chat thread, got {wo_chat_err:?}"
+    );
+    let mut userdoc_only = owner.auth().spaces().clone();
+    userdoc_only
+        .get_mut(&s2_history.space_id)
+        .unwrap()
+        .read_classes = BTreeSet::from([DocClass::UserDoc]);
+    let restricted_sc = SpaceContext::new(
+        owner.auth().for_pat(userdoc_only).unwrap(),
+        s2_history.clone(),
+        budget(),
+    )
+    .unwrap();
+    let branch = fixture
+        .canonical
+        .read_chat(
+            restricted_sc,
+            ChatRead {
+                thread: chat_tid,
+                leaf: appended.seq,
+                before: None,
+                max_entries: PageLimit::new(10).unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(branch.entries.len(), 1);
+    assert_eq!(
+        branch.entries[0].referenced_notes,
+        vec![vis_ref],
+        "read_chat must retain visible referenced_notes and filter out EncryptedNote"
     );
 }
 

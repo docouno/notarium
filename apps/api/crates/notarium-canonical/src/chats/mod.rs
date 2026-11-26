@@ -651,14 +651,40 @@ impl CanonicalStore {
         let resource_key = staging::request_key(ctx.auth(), &ctx.budget.request);
         let publish_ticket = ticket.clone();
         let publisher = self.clone();
+        let abort_publisher = self.clone();
+        type PublishedBlobGuard = std::sync::Arc<
+            std::sync::Mutex<
+                Option<(
+                    crate::blobs::StagedBlobTicket,
+                    Vec<(SpaceId, ContentDigest)>,
+                )>,
+            >,
+        >;
+        let published_guard: PublishedBlobGuard = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let published_guard_op = std::sync::Arc::clone(&published_guard);
+        let published_guard_abort = std::sync::Arc::clone(&published_guard);
         let effect = ctx.canonical_effect().cloned();
         let value = self
-            .with_guarded_auxiliary_command(
+            .with_guarded_auxiliary_command_with_abort_cleanup(
                 ctx.scope().space_id.clone(),
                 None,
                 Some((&ctx.budget, deadline)),
                 effect,
                 Ok,
+                move || {
+                    Box::pin(async move {
+                        let pending = published_guard_abort
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .take();
+                        if let Some((held_ticket, newly_published)) = pending {
+                            abort_publisher
+                                .cleanup_unretained_local_files_async(newly_published)
+                                .await;
+                            drop(held_ticket);
+                        }
+                    })
+                },
                 move |tx, effect| {
                     Box::pin(async move {
                         let live_space =
@@ -695,27 +721,167 @@ impl CanonicalStore {
                             live_space.last_seq,
                         )
                         .await?;
-                        let dirs = publisher
+                        effect.check()?;
+                        let (dirs, newly_published) = publisher
                             .publish_deferred_local_tickets_async(std::slice::from_ref(
                                 &publish_ticket,
                             ))
                             .await?;
-                        publisher.flush_pending_local_dirs_async(&dirs).await?;
-                        Ok((
-                            staging::UndeliveredLease::new(
-                                publisher,
-                                scope,
-                                attested.with_lease(lease),
-                                owner_lease,
-                            ),
-                            publish_ticket,
+                        if let Err(sync_err) = publisher.flush_pending_local_dirs_async(&dirs).await
+                        {
+                            publisher
+                                .cleanup_unretained_local_files_async(newly_published)
+                                .await;
+                            drop(publish_ticket);
+                            return Err(sync_err);
+                        }
+                        *published_guard_op.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Some((publish_ticket, newly_published));
+                        Ok(staging::UndeliveredLease::new(
+                            publisher,
+                            scope,
+                            attested.with_lease(lease),
+                            owner_lease,
                         ))
                     })
                 },
             )
             .await?;
-        Ok(value.0.deliver())
+        drop(
+            published_guard
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take(),
+        );
+        Ok(value.deliver())
     }
+}
+
+pub(super) async fn filter_readable_referenced_notes_tx(
+    tx: &mut BackendConn<'_>,
+    space: &Space,
+    auth: &EngineAuthContext,
+    refs: Vec<NoteRef>,
+    cache: &mut std::collections::HashMap<notarium_core::ids::NoteId, bool>,
+) -> Result<Vec<NoteRef>, PortError> {
+    if refs.is_empty() {
+        return Ok(refs);
+    }
+    let mut visible = Vec::with_capacity(refs.len());
+    for note_ref in refs {
+        if note_ref.space_id == space.id {
+            let readable = if let Some(&cached) = cache.get(&note_ref.note_id) {
+                cached
+            } else {
+                let ok = if crate::runtime::is_note_purge_fenced_tx(
+                    tx,
+                    &space.id,
+                    note_ref.note_id.as_str(),
+                )
+                .await?
+                {
+                    false
+                } else if let Some(head) = crate::domain::common::load_note_head_row_opt_tx(
+                    tx,
+                    &space.id,
+                    &note_ref.note_id,
+                )
+                .await?
+                    && head.lifecycle == Lifecycle::Active
+                {
+                    match crate::domain::common::optional_read(
+                        crate::domain::common::build_resource_facts_tx(
+                            tx,
+                            space,
+                            &head.parent_folder_id,
+                            head.doc_class,
+                            head.ability_id,
+                            true,
+                        )
+                        .await,
+                    )? {
+                        Some((facts, _)) => auth.can_view_resource(&facts).is_ok(),
+                        None => false,
+                    }
+                } else {
+                    false
+                };
+                cache.insert(note_ref.note_id.clone(), ok);
+                ok
+            };
+            if readable {
+                visible.push(note_ref);
+            }
+        } else if auth
+            .spaces()
+            .get(&note_ref.space_id)
+            .is_some_and(|grant| !grant.read_classes.is_empty())
+        {
+            visible.push(note_ref);
+        }
+    }
+    Ok(visible)
+}
+
+fn filter_readable_referenced_notes_rusqlite(
+    conn: &rusqlite::Connection,
+    space: &Space,
+    auth: &EngineAuthContext,
+    refs: Vec<NoteRef>,
+    cache: &mut std::collections::HashMap<notarium_core::ids::NoteId, bool>,
+) -> Result<Vec<NoteRef>, PortError> {
+    if refs.is_empty() {
+        return Ok(refs);
+    }
+    let mut visible = Vec::with_capacity(refs.len());
+    for note_ref in refs {
+        if note_ref.space_id == space.id {
+            let readable = if let Some(&cached) = cache.get(&note_ref.note_id) {
+                cached
+            } else {
+                let ok = if crate::sqlite_fast::is_note_purge_fenced_rusqlite(
+                    conn,
+                    &space.id,
+                    note_ref.note_id.as_str(),
+                )? {
+                    false
+                } else if let Some(head) = crate::sqlite_fast::load_note_head_row_opt_rusqlite(
+                    conn,
+                    &space.id,
+                    &note_ref.note_id,
+                )? && head.lifecycle == Lifecycle::Active
+                {
+                    match crate::domain::common::optional_read(
+                        crate::sqlite_fast::build_resource_facts_rusqlite(
+                            conn,
+                            space,
+                            &head.parent_folder_id,
+                            head.doc_class,
+                            head.ability_id,
+                            true,
+                        ),
+                    )? {
+                        Some((facts, _)) => auth.can_view_resource(&facts).is_ok(),
+                        None => false,
+                    }
+                } else {
+                    false
+                };
+                cache.insert(note_ref.note_id.clone(), ok);
+                ok
+            };
+            if readable {
+                visible.push(note_ref);
+            }
+        } else if auth
+            .spaces()
+            .get(&note_ref.space_id)
+            .is_some_and(|grant| !grant.read_classes.is_empty())
+        {
+            visible.push(note_ref);
+        }
+    }
+    Ok(visible)
 }
 
 fn authorize_chat_write_on_space(auth: &EngineAuthContext, space: &Space) -> Result<(), PortError> {
@@ -1504,7 +1670,7 @@ async fn lookup_staged_chat_lease_tx(
                    AND (($4::int = 1 AND substr(r.owner_rev_id,1,4) = 'stg_')
                    OR ($4::int = 0 AND r.owner_rev_id IN ($5,$6)))
                    AND c.blob_state = 'active' AND c.admission_state = 'open'
-                 ORDER BY r.created_seq, r.owner_rev_id
+                 ORDER BY r.created_seq, r.owner_rev_id COLLATE \"C\"
                  LIMIT 1",
             )
             .bind(space_id.as_str())
@@ -1915,6 +2081,8 @@ async fn read_chat_impl(
                     return Err(DomainError::ResourceNotFound.into());
                 }
 
+                let mut ref_vis_cache: std::collections::HashMap<notarium_core::ids::NoteId, bool> =
+        std::collections::HashMap::new();
                 let mut entries = Vec::with_capacity(raw_rows.len());
                 for (
                     e_seq_raw,
@@ -1979,13 +2147,21 @@ async fn read_chat_impl(
                         })?),
                         None => None,
                     };
-                    let referenced_notes: Vec<NoteRef> = if kind == ChatEntryKind::Redacted || refs_json == "[]" {
+                    let raw_referenced_notes: Vec<NoteRef> = if kind == ChatEntryKind::Redacted || refs_json == "[]" {
                         Vec::new()
                     } else {
                         serde_json::from_str(&refs_json).map_err(|err| {
                             internal_not_committed("corrupt_chat_refs", err.to_string())
                         })?
                     };
+                    let referenced_notes = filter_readable_referenced_notes_tx(
+                        tx,
+                        &srec.space,
+                        &auth,
+                        raw_referenced_notes,
+                        &mut ref_vis_cache,
+                    )
+                    .await?;
                     let depth = u32::try_from(depth_raw).map_err(|_| {
                         internal_not_committed("corrupt_chat_depth", "invalid depth")
                     })?;
@@ -2335,10 +2511,24 @@ async fn read_chat_pg_single_query(
         })
     };
 
-    let entries = rows
-        .iter()
-        .map(|row| decode_entry_row(row, 10))
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut ref_vis_cache: std::collections::HashMap<notarium_core::ids::NoteId, bool> =
+        std::collections::HashMap::new();
+    let mut entries = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let mut entry = decode_entry_row(row, 10)?;
+        if !entry.referenced_notes.is_empty() {
+            let mut backend = BackendConn::Postgres(conn);
+            entry.referenced_notes = filter_readable_referenced_notes_tx(
+                &mut backend,
+                &space,
+                auth,
+                entry.referenced_notes,
+                &mut ref_vis_cache,
+            )
+            .await?;
+        }
+        entries.push(entry);
+    }
     let next_ancestor = entries.first().and_then(|oldest| oldest.parent);
     Ok(ChatBranch {
         thread: thread_out,
@@ -2652,6 +2842,8 @@ fn read_chat_rusqlite(
             crate::sqlite_fast::map_interrupt_or_internal(err, "sqlite_read_chat_win")
         })?;
 
+    let mut ref_vis_cache: std::collections::HashMap<notarium_core::ids::NoteId, bool> =
+        std::collections::HashMap::new();
     let mut entries = Vec::with_capacity(usize::from(request.max_entries.get().min(256)));
     for item in rows {
         let (
@@ -2719,13 +2911,20 @@ fn read_chat_rusqlite(
                 })?),
                 None => None,
             };
-        let referenced_notes: Vec<NoteRef> = if kind == ChatEntryKind::Redacted || refs_json == "[]"
-        {
-            Vec::new()
-        } else {
-            serde_json::from_str(&refs_json)
-                .map_err(|err| internal_not_committed("corrupt_chat_refs", err.to_string()))?
-        };
+        let raw_referenced_notes: Vec<NoteRef> =
+            if kind == ChatEntryKind::Redacted || refs_json == "[]" {
+                Vec::new()
+            } else {
+                serde_json::from_str(&refs_json)
+                    .map_err(|err| internal_not_committed("corrupt_chat_refs", err.to_string()))?
+            };
+        let referenced_notes = filter_readable_referenced_notes_rusqlite(
+            conn,
+            &srec.space,
+            auth,
+            raw_referenced_notes,
+            &mut ref_vis_cache,
+        )?;
         let depth = u32::try_from(depth_raw)
             .map_err(|_| internal_not_committed("corrupt_chat_depth", "invalid depth"))?;
         let entry_taint = taint_raw != 0;

@@ -178,11 +178,36 @@ impl EditInput {
             || matches!(self.operation, Some(EditOperation::ReplaceSection))
                 != self.section.is_some()
             || matches!(self.operation, Some(EditOperation::FindReplace)) != self.find.is_some()
+            || self
+                .section
+                .as_deref()
+                .is_some_and(|section| section.trim().is_empty())
+            || self.find.as_deref().is_some_and(str::is_empty)
         {
             return Err(invalid(ValidationReason::InvalidQuery));
         }
-        for key in self.fields.keys() {
+        if let Some(content) = &self.content {
+            notarium_syntax::unicode::validate_content(content)?;
+        }
+        if let Some(section) = &self.section {
+            notarium_syntax::unicode::validate_content(section)?;
+        }
+        if let Some(find) = &self.find {
+            notarium_syntax::unicode::validate_content(find)?;
+        }
+        for (key, value) in &self.fields {
             corpus::validate_field_key(key)?;
+            match value {
+                FrontmatterValue::Null => {}
+                FrontmatterValue::Text(text) => {
+                    notarium_syntax::unicode::validate_content(text)?;
+                }
+                FrontmatterValue::Texts(texts) => {
+                    for text in texts {
+                        notarium_syntax::unicode::validate_content(text)?;
+                    }
+                }
+            }
         }
         if let Some(view) = &self.view {
             view.reference(&self.note)?;

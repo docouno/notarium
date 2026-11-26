@@ -363,7 +363,12 @@ async fn delete(call: &mut ToolCallContext<'_>, input: NoteInput) -> Result<Valu
 pub(super) fn clean_path(input: &str) -> Result<String, PortError> {
     let path = input.trim_matches('/');
     if !path.is_empty() {
+        let mut depth = 0usize;
         for component in path.split('/') {
+            depth += 1;
+            if depth > 256 {
+                return Err(invalid(ValidationReason::InvalidPathComponent));
+            }
             notarium_syntax::unicode::validate_component(component)?;
         }
     }

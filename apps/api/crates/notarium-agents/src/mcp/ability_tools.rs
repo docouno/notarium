@@ -2501,6 +2501,9 @@ pub async fn bind_chat_role(
         .control
         .get_episode(owner_account.clone(), episode_id.clone())
         .await?;
+    if episode.lifecycle == notarium_core::ports::EpisodeLifecycle::Closed {
+        return Err(invalid(ValidationReason::InvalidState));
+    }
     if episode.active_role.as_ref() == Some(&ability.reference)
         && episode.project_hint.as_ref() == project
     {

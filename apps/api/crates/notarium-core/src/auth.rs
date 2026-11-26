@@ -1118,7 +1118,7 @@ impl EngineAuthContext {
             .spaces
             .get(&space.id)
             .ok_or(DomainError::ResourceNotFound)?;
-        if space.lifecycle != SpaceLifecycle::Active {
+        if space.lifecycle != SpaceLifecycle::Active || grant.read_classes.is_empty() {
             return Err(DomainError::ResourceNotFound);
         }
         if let Some(root) = &grant.project_root

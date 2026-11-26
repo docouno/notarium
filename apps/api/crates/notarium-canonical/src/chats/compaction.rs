@@ -196,16 +196,17 @@ async fn latest_compaction_candidates_tx(
     max_seq: i64,
     limit: i64,
 ) -> Result<Vec<(i64, i32)>, PortError> {
-    const SQL: &str = "SELECT entry_seq, CAST(branch_depth AS INTEGER)
-                       FROM chat_entries
-                       WHERE space_id = $1 AND thread_id = $2
-                         AND kind = 'compaction' AND checkpoint_stale = 0
-                         AND entry_seq <= $3
-                       ORDER BY entry_seq DESC
-                       LIMIT $4";
+    const SQLITE_SQL: &str = include_str!("latest_compaction_candidates.sqlite.sql");
+    const PG_SQL: &str = "SELECT entry_seq, CAST(branch_depth AS INTEGER)
+                          FROM chat_entries
+                          WHERE space_id = $1 AND thread_id = $2
+                            AND kind = 'compaction' AND checkpoint_stale = 0
+                            AND entry_seq <= $3
+                          ORDER BY entry_seq DESC
+                          LIMIT $4";
     match tx {
         BackendConn::Sqlite(conn) => {
-            sqlx::query_as(SQL)
+            sqlx::query_as(SQLITE_SQL)
                 .bind(space_id.as_str())
                 .bind(thread_id.as_str())
                 .bind(max_seq)
@@ -214,7 +215,7 @@ async fn latest_compaction_candidates_tx(
                 .await
         }
         BackendConn::Postgres(conn) => {
-            sqlx::query_as(SQL)
+            sqlx::query_as(PG_SQL)
                 .bind(space_id.as_str())
                 .bind(thread_id.as_str())
                 .bind(max_seq)
@@ -871,9 +872,18 @@ async fn oldest_prefix(
                     title: th.title.clone(),
                     active_run: th.active_run_id.clone(),
                 };
+                let mut ref_vis_cache = std::collections::HashMap::new();
                 let mut entries = Vec::with_capacity(retained.len());
                 let mut payloads = Vec::with_capacity(retained.len());
-                for (entry, payload) in retained {
+                for (mut entry, payload) in retained {
+                    entry.referenced_notes = super::filter_readable_referenced_notes_tx(
+                        tx,
+                        &space.space,
+                        &auth,
+                        entry.referenced_notes,
+                        &mut ref_vis_cache,
+                    )
+                    .await?;
                     entries.push(entry);
                     payloads.push(payload);
                 }

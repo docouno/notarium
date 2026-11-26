@@ -2,7 +2,7 @@
 mod approvals;
 mod calendar;
 mod mutations;
-mod queries;
+pub(crate) mod queries;
 mod runs;
 use super::{
     ControlService,

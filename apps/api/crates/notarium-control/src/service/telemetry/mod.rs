@@ -1,6 +1,6 @@
 //! Bounded, content-free audit persistence. Transport logging is a separate owner.
 mod calls;
-mod cleanup;
+pub(crate) mod cleanup;
 mod ports;
 mod queries;
 use super::{

@@ -1,11 +1,5 @@
 use super::*;
 
-struct Candidate {
-    position: i64,
-    note_space: String,
-    note_id: String,
-    favorite: i64,
-}
 #[derive(sqlx::FromRow)]
 struct PinCandidateRow {
     rank: i64,
@@ -16,7 +10,11 @@ struct PinCandidateRow {
 struct SetCandidateRow {
     rank: i64,
     set_id: String,
+    owner_id: String,
+    home_space: String,
+    name: String,
     note_refs: String,
+    revision: i64,
 }
 #[derive(sqlx::FromRow)]
 struct FavoriteCandidateRow {
@@ -32,23 +30,16 @@ struct ScopeItem {
     item_index: usize,
     note_space: String,
     note_id: String,
+    set_home: Option<(String, String)>,
 }
-#[allow(clippy::too_many_arguments)]
-async fn load_bootstrap_candidates(
+async fn load_bootstrap_scope_items(
+    service: &ControlService,
     tx: &mut Transaction,
-    owner_id: &str,
+    current: &AccountContext,
     project: &str,
     space: &str,
     personal: &str,
-    allowed_spaces: &BTreeMap<SpaceId, notarium_core::auth::SpaceGrant>,
-    after: i64,
-    page_limit: u16,
-) -> Result<Vec<Candidate>, PortError> {
-    let skip = usize::try_from(after).map_err(|_| invalid(ValidationReason::InvalidQuery))?;
-    let want = usize::from(page_limit) + 1;
-    let needed = skip
-        .checked_add(want)
-        .ok_or_else(|| invalid(ValidationReason::InvalidLimit))?;
+) -> Result<Vec<ScopeItem>, PortError> {
     let mut targets = Vec::with_capacity(3);
     if !project.is_empty() {
         targets.push((0_i64, "project", project));
@@ -78,18 +69,36 @@ async fn load_bootstrap_candidates(
                 item_index: 0,
                 note_space: pin.note_space,
                 note_id: pin.note_id,
+                set_home: None,
             });
         }
         let sets = rows!(
             tx,
             SetCandidateRow,
             fetch_all,
-            "SELECT coalesce(o.rank,0) AS rank, a.set_id, s.note_refs FROM context_set_attachments a JOIN context_sets s ON s.set_id=a.set_id LEFT JOIN context_order o ON o.target_kind=a.target_kind AND o.target_id=a.target_id AND o.entry_kind='set' AND o.entry_ref=a.set_id WHERE a.target_kind=$1 AND a.target_id=$2",
-            "SELECT coalesce(o.rank,0) AS rank, a.set_id, s.note_refs FROM v1_control.context_set_attachments a JOIN v1_control.context_sets s ON s.set_id=a.set_id LEFT JOIN v1_control.context_order o ON o.target_kind=a.target_kind AND o.target_id=a.target_id AND o.entry_kind='set' AND o.entry_ref=a.set_id WHERE a.target_kind=$1 AND a.target_id=$2";
+            "SELECT coalesce(o.rank,0) AS rank, s.set_id, s.owner_id, s.home_space, s.name, s.note_refs, s.revision FROM context_set_attachments a JOIN context_sets s ON s.set_id=a.set_id LEFT JOIN context_order o ON o.target_kind=a.target_kind AND o.target_id=a.target_id AND o.entry_kind='set' AND o.entry_ref=a.set_id WHERE a.target_kind=$1 AND a.target_id=$2",
+            "SELECT coalesce(o.rank,0) AS rank, s.set_id, s.owner_id, s.home_space, s.name, s.note_refs, s.revision FROM v1_control.context_set_attachments a JOIN v1_control.context_sets s ON s.set_id=a.set_id LEFT JOIN v1_control.context_order o ON o.target_kind=a.target_kind AND o.target_id=a.target_id AND o.entry_kind='set' AND o.entry_ref=a.set_id WHERE a.target_kind=$1 AND a.target_id=$2";
             kind,
             target_id
         )?;
         for set in sets {
+            let bundle_row = ContextSetsRow {
+                set_id: set.set_id.clone(),
+                owner_id: set.owner_id.clone(),
+                home_space: set.home_space.clone(),
+                name: set.name,
+                note_refs: set.note_refs.clone(),
+                revision: set.revision,
+                created_at: 0,
+            };
+            match service
+                .check_bundle_attachment_db(tx, current, &bundle_row)
+                .await
+            {
+                Ok(()) => {}
+                Err(error) if hidden(&error) => continue,
+                Err(error) => return Err(error),
+            }
             if set.note_refs.len() > 65536 {
                 return Err(invalid(ValidationReason::InvalidState));
             }
@@ -99,6 +108,7 @@ async fn load_bootstrap_candidates(
                 return Err(invalid(ValidationReason::InvalidState));
             }
             let entry = format!("s:{}", set.set_id);
+            let set_home = Some((set.home_space, set.owner_id));
             for (idx, note) in notes.into_iter().enumerate() {
                 scope_items.push(ScopeItem {
                     level,
@@ -107,84 +117,20 @@ async fn load_bootstrap_candidates(
                     item_index: idx,
                     note_space: note.space_id.to_string(),
                     note_id: note.note_id.to_string(),
+                    set_home: set_home.clone(),
                 });
             }
         }
     }
     scope_items.sort();
-    let mut seen = std::collections::BTreeSet::new();
-    let mut deduped: Vec<(String, String, i64)> = Vec::new();
-    for item in scope_items {
-        if seen.insert((item.note_space.clone(), item.note_id.clone())) {
-            deduped.push((item.note_space, item.note_id, 0));
-        }
-    }
-    let mut fav_cursor: Option<(i64, String, String)> = None;
-    while deduped.len() < needed {
-        let batch_limit = ((needed - deduped.len())
-            .saturating_add(seen.len())
-            .clamp(32, 512)) as i64;
-        let favs = match &fav_cursor {
-            None => rows!(
-                tx,
-                FavoriteCandidateRow,
-                fetch_all,
-                "SELECT rank, space_id, entity_id FROM favorites WHERE owner_id=$1 AND entity_kind='note' ORDER BY rank,space_id,entity_id LIMIT $2",
-                "SELECT rank, space_id, entity_id FROM v1_control.favorites WHERE owner_id=$1 AND entity_kind='note' ORDER BY rank,space_id,entity_id LIMIT $2";
-                owner_id,
-                batch_limit
-            )?,
-            Some((rank, space_id, entity_id)) => rows!(
-                tx,
-                FavoriteCandidateRow,
-                fetch_all,
-                "SELECT rank, space_id, entity_id FROM favorites WHERE owner_id=$1 AND entity_kind='note' AND (rank,space_id,entity_id)>($2,$3,$4) ORDER BY rank,space_id,entity_id LIMIT $5",
-                "SELECT rank, space_id, entity_id FROM v1_control.favorites WHERE owner_id=$1 AND entity_kind='note' AND (rank,space_id,entity_id)>($2,$3,$4) ORDER BY rank,space_id,entity_id LIMIT $5";
-                owner_id,
-                *rank,
-                space_id,
-                entity_id,
-                batch_limit
-            )?,
-        };
-        if favs.is_empty() {
-            break;
-        }
-        let exhausted = (favs.len() as i64) < batch_limit;
-        if let Some(last) = favs.last() {
-            fav_cursor = Some((last.rank, last.space_id.clone(), last.entity_id.clone()));
-        }
-        for fav in favs {
-            let fav_space = SpaceId::parse(&fav.space_id)?;
-            if allowed_spaces
-                .get(&fav_space)
-                .is_none_or(|grant| grant.read_classes.is_empty())
-            {
-                continue;
-            }
-            if seen.insert((fav.space_id.clone(), fav.entity_id.clone())) {
-                deduped.push((fav.space_id, fav.entity_id, 1));
-                if deduped.len() >= needed {
-                    break;
-                }
-            }
-        }
-        if exhausted {
-            break;
-        }
-    }
-    Ok(deduped
-        .into_iter()
-        .enumerate()
-        .skip(skip)
-        .take(want)
-        .map(|(idx, (note_space, note_id, favorite))| Candidate {
-            position: (idx + 1) as i64,
-            note_space,
-            note_id,
-            favorite,
-        })
-        .collect())
+    Ok(scope_items)
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BootstrapFavCursor {
+    rank: i64,
+    space: SpaceId,
+    note: NoteId,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -192,6 +138,8 @@ struct BootstrapCursor {
     version: u8,
     scope: ContentDigest,
     after: i64,
+    #[serde(default)]
+    fav_after: Option<BootstrapFavCursor>,
 }
 #[derive(sqlx::FromRow, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -211,6 +159,16 @@ struct EntryCursor {
 
 impl ControlService {
     pub async fn bootstrap_context(
+        &self,
+        ctx: AccountContext,
+        id: EpisodeId,
+        space: Option<SpaceId>,
+        page: ControlPageRequest,
+    ) -> Result<BootstrapContext, PortError> {
+        Box::pin(self.bootstrap_context_inner(ctx, id, space, page)).await
+    }
+
+    async fn bootstrap_context_inner(
         &self,
         ctx: AccountContext,
         id: EpisodeId,
@@ -239,7 +197,14 @@ impl ControlService {
         budget.run(rtx.finish(), CommitEffect::NotCommitted).await?;
         let (owner, loaded_ep, owner_ack_rows) = first_db?;
         let had_project = loaded_ep.row.project_space.is_some();
-        let (mut episode, role_to_overlay, selected, personal, owner_acknowledgements) = budget
+        let (
+            mut episode,
+            role_to_overlay,
+            selected,
+            personal,
+            owner_acknowledgements,
+            mut space_cache,
+        ) = budget
             .run(
                 async {
                     let mut space_cache = std::collections::BTreeMap::new();
@@ -325,6 +290,7 @@ impl ControlService {
                         selected,
                         personal,
                         owner_acknowledgements,
+                        space_cache,
                     ))
                 },
                 CommitEffect::NotCommitted,
@@ -395,102 +361,294 @@ impl ControlService {
                         .map_err(|_| invalid(ValidationReason::InvalidState))?
                         .unwrap_or_default();
                     let space_str = space_scope.map_or("", SpaceId::as_str);
-                    let after = cursor.as_ref().map_or(0, |cursor| cursor.after);
-                    let mut candidates = load_bootstrap_candidates(
+                    let raw_scope_items = load_bootstrap_scope_items(
+                        self,
                         rtx.inner_mut(),
-                        &owner.user_id,
+                        &current,
                         &project,
                         space_str,
                         &personal,
-                        current.auth().spaces(),
-                        after,
-                        page.limit(),
                     )
                     .await?;
-                    let continuation = if candidates.len() > usize::from(page.limit()) {
-                        candidates.pop();
-                        Some(
-                            serde_json::to_string(&BootstrapCursor {
-                                version: 1,
-                                scope,
-                                after: candidates.last().expect("positive page limit").position,
-                            })
-                            .map_err(|_| invalid(ValidationReason::InvalidState))?,
-                        )
-                    } else {
-                        None
-                    };
-                    Ok::<_, PortError>((role_enabled, after, candidates, continuation))
+                    Ok::<_, PortError>((role_enabled, scope, cursor, raw_scope_items))
                 },
                 CommitEffect::NotCommitted,
             )
             .await;
         budget.run(rtx.finish(), CommitEffect::NotCommitted).await?;
-        let (role_enabled, after, candidates, continuation) = second_db?;
+        let (role_enabled, scope, cursor, raw_scope_items) = second_db?;
         if let Some(reference) = role_enabled {
             episode.active_role = Some(reference);
         } else if had_overlay_candidate {
             episode.diagnostics.push(EpisodeDiagnostic::RoleUnavailable);
         }
+        let (scope_notes, seen_scope) = budget
+            .run(
+                async {
+                    let mut seen = std::collections::BTreeSet::new();
+                    let mut scope_notes = Vec::new();
+                    for item in raw_scope_items {
+                        if let Some((home_str, set_owner)) = &item.set_home {
+                            let home_space = SpaceId::parse(home_str)?;
+                            let home_kind = match space_cache.get(&home_space) {
+                                Some(Some(info)) => Some(info.space.kind),
+                                Some(None) => None,
+                                None => match self.catalog_space(&current, &home_space).await {
+                                    Ok(info) => {
+                                        let kind = info.space.kind;
+                                        space_cache.insert(home_space, Some(info));
+                                        Some(kind)
+                                    }
+                                    Err(error) if hidden(&error) => {
+                                        space_cache.insert(home_space, None);
+                                        None
+                                    }
+                                    Err(error) => return Err(error),
+                                },
+                            };
+                            let Some(kind) = home_kind else {
+                                continue;
+                            };
+                            if kind == SpaceKind::Personal
+                                && set_owner != current.auth().principal().as_str()
+                            {
+                                continue;
+                            }
+                        }
+                        let note = NoteRef {
+                            space_id: SpaceId::parse(&item.note_space)?,
+                            note_id: NoteId::parse(&item.note_id)?,
+                        };
+                        if seen.insert((note.space_id.clone(), note.note_id.clone())) {
+                            scope_notes.push(note);
+                        }
+                    }
+                    Ok::<_, PortError>((scope_notes, seen))
+                },
+                CommitEffect::NotCommitted,
+            )
+            .await?;
+        let scope_skip = cursor
+            .as_ref()
+            .map(|c| usize::try_from(c.after).map_err(|_| invalid(ValidationReason::CursorStale)))
+            .transpose()?
+            .unwrap_or(0);
+        let fav_start = cursor.as_ref().and_then(|c| c.fav_after.clone());
+        if scope_skip > scope_notes.len()
+            || (fav_start.is_some() && scope_skip != scope_notes.len())
+        {
+            return Err(invalid(ValidationReason::CursorStale));
+        }
+
+        let target = usize::from(page.limit());
+        let mut emitted = 0usize;
+        let mut pinned = Vec::new();
+        let mut favorites = Vec::new();
+        let mut unavailable = 0u32;
+        let mut has_more = false;
+        let mut next_scope_after = scope_skip;
+        let mut last_fav_cursor = fav_start.clone();
+
         budget
             .run(
                 async {
-                    let mut pinned = Vec::new();
-                    let mut favorites = Vec::new();
-                    let mut unavailable = 0;
-                    for candidate in candidates {
-                        if candidate.position <= after || !matches!(candidate.favorite, 0 | 1) {
-                            return Err(invalid(ValidationReason::InvalidState));
+                    for note in scope_notes.iter().skip(scope_skip) {
+                        if emitted == target {
+                            has_more = true;
+                            break;
                         }
-                        let note = NoteRef {
-                            space_id: SpaceId::parse(&candidate.note_space)?,
-                            note_id: NoteId::parse(&candidate.note_id)?,
+                        match self.catalog_note(&current, note).await {
+                            Ok(_) => pinned.push(note.clone()),
+                            Err(error) if hidden(&error) => unavailable += 1,
+                            Err(error) => return Err(error),
+                        }
+                        emitted += 1;
+                        next_scope_after += 1;
+                    }
+                    Ok::<_, PortError>(())
+                },
+                CommitEffect::NotCommitted,
+            )
+            .await?;
+
+        if !has_more {
+            let (fav_items, fav_unavail, fav_more, fav_last) =
+                Box::pin(self.bootstrap_favorites_page(
+                    &budget,
+                    &current,
+                    &owner.user_id,
+                    &seen_scope,
+                    fav_start,
+                    target.saturating_sub(emitted),
+                    page.limit(),
+                ))
+                .await?;
+            favorites.extend(fav_items);
+            unavailable = unavailable.saturating_add(fav_unavail);
+            has_more = fav_more;
+            last_fav_cursor = fav_last;
+        }
+
+        let continuation = if has_more {
+            Some(
+                serde_json::to_string(&BootstrapCursor {
+                    version: 1,
+                    scope,
+                    after: next_scope_after as i64,
+                    fav_after: last_fav_cursor,
+                })
+                .map_err(|_| invalid(ValidationReason::InvalidState))?,
+            )
+        } else {
+            None
+        };
+        let readable_spaces = current
+            .auth()
+            .spaces()
+            .iter()
+            .filter(|(_, grant)| !grant.read_classes.is_empty())
+            .map(|(space, _)| space.clone())
+            .collect();
+        Ok(BootstrapContext {
+            episode,
+            selection: ContextSelection {
+                space: selected,
+                pinned,
+                favorites,
+                readable_spaces,
+                unavailable,
+            },
+            owner_acknowledgements,
+            continuation,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn bootstrap_favorites_page(
+        &self,
+        budget: &OperationBudget,
+        current: &AccountContext,
+        owner_id: &str,
+        seen_scope: &std::collections::BTreeSet<(SpaceId, NoteId)>,
+        fav_start: Option<BootstrapFavCursor>,
+        remaining_slots: usize,
+        page_limit: u16,
+    ) -> Result<(Vec<NoteRef>, u32, bool, Option<BootstrapFavCursor>), PortError> {
+        const MAX_SCAN: usize = 4096;
+        let batch_limit = i64::from(page_limit).saturating_add(1).max(16);
+        let mut scan_cursor = fav_start.clone();
+        let mut last_fav_cursor = fav_start;
+        let mut favorites = Vec::new();
+        let mut unavailable = 0u32;
+        let mut emitted = 0usize;
+        let mut has_more = false;
+        let mut scanned = 0usize;
+        loop {
+            let mut ftx = self.store.read(budget.clone()).await?;
+            let batch_res = budget
+                .run(
+                    async {
+                        let favs = match &scan_cursor {
+                            None => rows!(
+                                ftx.inner_mut(),
+                                FavoriteCandidateRow,
+                                fetch_all,
+                                "SELECT rank, space_id, entity_id FROM favorites WHERE owner_id=$1 AND entity_kind='note' ORDER BY rank,space_id,entity_id LIMIT $2",
+                                "SELECT rank, space_id, entity_id FROM v1_control.favorites WHERE owner_id=$1 AND entity_kind='note' ORDER BY rank,space_id,entity_id LIMIT $2";
+                                owner_id,
+                                batch_limit
+                            )?,
+                            Some(prev) => rows!(
+                                ftx.inner_mut(),
+                                FavoriteCandidateRow,
+                                fetch_all,
+                                "SELECT rank, space_id, entity_id FROM favorites WHERE owner_id=$1 AND entity_kind='note' AND (rank,space_id,entity_id)>($2,$3,$4) ORDER BY rank,space_id,entity_id LIMIT $5",
+                                "SELECT rank, space_id, entity_id FROM v1_control.favorites WHERE owner_id=$1 AND entity_kind='note' AND (rank,space_id,entity_id)>($2,$3,$4) ORDER BY rank,space_id,entity_id LIMIT $5";
+                                owner_id,
+                                prev.rank,
+                                prev.space.as_str(),
+                                prev.note.as_str(),
+                                batch_limit
+                            )?,
                         };
-                        match self.catalog_note(&current, &note).await {
-                            Ok(_) => {
-                                if candidate.favorite == 1 {
-                                    favorites.push(note);
-                                } else {
-                                    pinned.push(note);
-                                }
+                        Ok::<_, PortError>(favs)
+                    },
+                    CommitEffect::NotCommitted,
+                )
+                .await;
+            budget.run(ftx.finish(), CommitEffect::NotCommitted).await?;
+            let favs = batch_res?;
+            let batch_len = favs.len();
+            scanned = scanned.saturating_add(batch_len);
+            budget
+                .run(
+                    async {
+                        for fav in favs {
+                            let fav_space = SpaceId::parse(&fav.space_id)?;
+                            let fav_note = NoteId::parse(&fav.entity_id)?;
+                            let fav_key = BootstrapFavCursor {
+                                rank: fav.rank,
+                                space: fav_space.clone(),
+                                note: fav_note.clone(),
+                            };
+                            scan_cursor = Some(fav_key.clone());
+                            if current
+                                .auth()
+                                .spaces()
+                                .get(&fav_space)
+                                .is_none_or(|grant| grant.read_classes.is_empty())
+                            {
+                                continue;
                             }
-                            Err(error) if hidden(&error) => {
-                                let out_of_project_fav = candidate.favorite == 1
-                                    && current
+                            if seen_scope.contains(&(fav_space.clone(), fav_note.clone())) {
+                                continue;
+                            }
+                            let note = NoteRef {
+                                space_id: fav_space,
+                                note_id: fav_note,
+                            };
+                            match self.catalog_note(current, &note).await {
+                                Ok(_) => {
+                                    if emitted == remaining_slots {
+                                        has_more = true;
+                                        break;
+                                    }
+                                    favorites.push(note);
+                                    emitted += 1;
+                                    last_fav_cursor = Some(fav_key);
+                                }
+                                Err(error) if hidden(&error) => {
+                                    let out_of_project_fav = current
                                         .auth()
                                         .spaces()
                                         .get(&note.space_id)
                                         .is_some_and(|grant| grant.project_root.is_some());
-                                if !out_of_project_fav {
-                                    unavailable += 1;
+                                    if !out_of_project_fav {
+                                        if emitted == remaining_slots {
+                                            has_more = true;
+                                            break;
+                                        }
+                                        unavailable += 1;
+                                        emitted += 1;
+                                        last_fav_cursor = Some(fav_key);
+                                    }
                                 }
+                                Err(error) => return Err(error),
                             }
-                            Err(error) => return Err(error),
                         }
-                    }
-                    let readable_spaces = current
-                        .auth()
-                        .spaces()
-                        .iter()
-                        .filter(|(_, grant)| !grant.read_classes.is_empty())
-                        .map(|(space, _)| space.clone())
-                        .collect();
-                    Ok(BootstrapContext {
-                        episode,
-                        selection: ContextSelection {
-                            space: selected,
-                            pinned,
-                            favorites,
-                            readable_spaces,
-                            unavailable,
-                        },
-                        owner_acknowledgements,
-                        continuation,
-                    })
-                },
-                CommitEffect::NotCommitted,
-            )
-            .await
+                        Ok::<_, PortError>(())
+                    },
+                    CommitEffect::NotCommitted,
+                )
+                .await?;
+            if has_more || batch_len < usize::try_from(batch_limit).unwrap_or(usize::MAX) {
+                break;
+            }
+            if scanned >= MAX_SCAN {
+                return Err(invalid(ValidationReason::BudgetExceeded));
+            }
+        }
+        Ok((favorites, unavailable, has_more, last_fav_cursor))
     }
     pub async fn list_context_entries(
         &self,

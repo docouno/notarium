@@ -2298,35 +2298,61 @@ async fn execute_batch_on_conn(
         }
     }
 
-    // Coalesced Wave A: flush blob data durability (`fdatasync` / `F_FULLFSYNC`) + atomic `rename`
-    // for all batch-staged local CAS temp files BEFORE directory `fsync` and SQL `COMMIT`!
-    match store
-        .publish_deferred_local_tickets_async(&batch_retained_tickets)
-        .await
-    {
-        Ok(extra_dirs) => batch_dir_syncs.merge(&extra_dirs),
-        Err(pub_err) => {
+    let collect_revoked =
+        |effects: &[(usize, Box<dyn RevocationLease>)]| -> Vec<(usize, PortError)> {
+            effects
+                .iter()
+                .filter_map(|(slot_idx, effect)| effect.check().err().map(|err| (*slot_idx, err)))
+                .collect()
+        };
+
+    // Fail fast before publishing local CAS payloads into live `blobs/` if any
+    // guarded slot was already revoked during SQL execution.
+    let pre_publish_revoked = collect_revoked(&active_effects);
+    let newly_published = if pre_publish_revoked.is_empty() {
+        // Coalesced Wave A: flush blob data durability (`fdatasync` / `F_FULLFSYNC`) + atomic `rename`
+        // for all batch-staged local CAS temp files BEFORE directory `fsync` and SQL `COMMIT`!
+        let newly_published = match store
+            .publish_deferred_local_tickets_async(&batch_retained_tickets)
+            .await
+        {
+            Ok((extra_dirs, newly_published)) => {
+                batch_dir_syncs.merge(&extra_dirs);
+                newly_published
+            }
+            Err(pub_err) => {
+                transaction.rollback().await;
+                drop(batch_retained_tickets);
+                drop(batch_retained_guards);
+                return BatchExecOutcome::AbortedBeforeCommit(pub_err);
+            }
+        };
+
+        // Coalesced Wave B: local CAS directory fsync BEFORE SQL COMMIT!
+        if let Err(sync_err) = store.flush_pending_local_dirs_async(&batch_dir_syncs).await {
             transaction.rollback().await;
+            store
+                .cleanup_unretained_local_files_async(newly_published)
+                .await;
             drop(batch_retained_tickets);
             drop(batch_retained_guards);
-            return BatchExecOutcome::AbortedBeforeCommit(pub_err);
+            return BatchExecOutcome::AbortedBeforeCommit(sync_err);
         }
-    }
+        newly_published
+    } else {
+        Vec::new()
+    };
 
-    // Coalesced Wave B: local CAS directory fsync BEFORE SQL COMMIT!
-    if let Err(sync_err) = store.flush_pending_local_dirs_async(&batch_dir_syncs).await {
-        transaction.rollback().await;
-        drop(batch_retained_tickets);
-        drop(batch_retained_guards);
-        return BatchExecOutcome::AbortedBeforeCommit(sync_err);
-    }
-
-    let revoked_effects: Vec<(usize, PortError)> = active_effects
-        .iter()
-        .filter_map(|(slot_idx, effect)| effect.check().err().map(|err| (*slot_idx, err)))
-        .collect();
+    let revoked_effects = if pre_publish_revoked.is_empty() {
+        collect_revoked(&active_effects)
+    } else {
+        pre_publish_revoked
+    };
     if !revoked_effects.is_empty() {
         let conn_clean = transaction.rollback().await;
+        store
+            .cleanup_unretained_local_files_async(newly_published)
+            .await;
         drop(active_effects);
         drop(batch_retained_tickets);
         drop(batch_retained_guards);
@@ -3567,15 +3593,23 @@ mod tests {
                 })
             }),
         });
+        let staged_payload =
+            crate::blobs::PreparedBlobSource::prepare(b"revoked-blob-payload", store.blob_codec())
+                .unwrap();
+        let staged_digest = staged_payload.digest;
+        let staged_ticket = store
+            .stage_blob_for_batch(&rec.scope, epoch, &staged_payload)
+            .await
+            .unwrap();
         let slot1 = BatchWriteIntent {
             prepared: PreparedWriteIntent {
                 scope: rec.scope.clone(),
                 active_epoch: epoch,
                 idempotency: None,
                 source_note_ids: Vec::new(),
-                staged_bytes: 0,
+                staged_bytes: staged_payload.raw_size,
                 required_semantic_cut: None,
-                execute: Box::new(|tx, item_ctx| {
+                execute: Box::new(move |tx, item_ctx| {
                     Box::pin(async move {
                         let BackendConn::Sqlite(conn) = tx else {
                             unreachable!()
@@ -3584,6 +3618,7 @@ mod tests {
                             .execute(&mut **conn)
                             .await
                             .unwrap();
+                        item_ctx.record_staged_ticket(staged_ticket);
                         let seq = item_ctx.alloc_next_seq()?;
                         Ok(ItemCommitArtifacts {
                             command_id: "cmd_peer_revoke".into(),
@@ -3695,6 +3730,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(persisted, 0, "rolled-back batch must persist zero rows");
+        let hex = staged_digest.to_hex();
+        let leaked_blob_path = root
+            .join("v1/blobs")
+            .join(space_id.as_str())
+            .join(&hex[..2])
+            .join(format!("{hex}.zst"));
+        assert!(
+            !leaked_blob_path.exists(),
+            "revoked batch must not leave uncatalogued local CAS file at {}",
+            leaked_blob_path.display()
+        );
 
         drop(store);
         runtime.shutdown().await.unwrap();

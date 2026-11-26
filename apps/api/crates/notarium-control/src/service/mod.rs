@@ -22,6 +22,8 @@ mod provisioning;
 mod schedules;
 pub use schedules::compute_next_slot;
 pub(crate) use schedules::validate_stored_calendar;
+#[cfg(test)]
+mod plan_tests;
 mod sessions;
 mod spaces;
 mod telemetry;

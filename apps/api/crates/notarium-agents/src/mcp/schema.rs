@@ -329,12 +329,12 @@ impl ToolName {
             MoveNote => vec![req("ref", key()), req("toFolder", path())],
             RenameNote => vec![req("ref", key()), req("title", key())],
             MoveFolder => vec![
-                req("folder", string(1, 4096)),
+                req("folder", byte_string(1, 4096)),
                 req("toFolder", path()),
                 opt("project", key()),
             ],
             RenameFolder => vec![
-                req("folder", string(1, 4096)),
+                req("folder", byte_string(1, 4096)),
                 req("name", key()),
                 opt("project", key()),
             ],
@@ -651,7 +651,7 @@ fn key() -> Input {
     string(1, 1024)
 }
 fn path() -> Input {
-    string(0, 4096)
+    byte_string(0, 4096)
 }
 fn cursor() -> Input {
     string(1, 4096)

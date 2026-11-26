@@ -1599,6 +1599,10 @@ enum FastSqlStageResult {
         slots: Vec<ItemOutcomeSlot>,
         wal_frames: Option<u64>,
     },
+    RolledBackAllFailed {
+        space_states: BTreeMap<SpaceId, SpaceBatchEntry>,
+        slots: Vec<ItemOutcomeSlot>,
+    },
     UnknownDirectCommit {
         slots: Vec<ItemOutcomeSlot>,
         diag_reason: String,
@@ -1730,20 +1734,16 @@ pub(crate) async fn execute_sqlite_fast_batch(
             }
         };
 
-        let mut newly_published = Vec::new();
-        for entry in &synced_entries {
-            if entry.temp_file.is_some()
-                && keys_to_publish.contains(&(entry.space_id_str.clone(), entry.digest))
-            {
-                newly_published.push((entry.space_id.clone(), entry.digest));
-            }
-        }
-
-        let synced_dirs = store
+        let (synced_dirs, newly_published) = store
             .rename_synced_local_entries_async(synced_entries, &keys_to_publish)
             .await?;
 
-        store.flush_pending_local_dirs_async(&synced_dirs).await?;
+        if let Err(sync_err) = store.flush_pending_local_dirs_async(&synced_dirs).await {
+            store
+                .cleanup_unretained_local_files_async(newly_published)
+                .await;
+            return Err(sync_err);
+        }
 
         Ok(LocalCasWaveOutcome::Completed {
             synced_dirs,
@@ -1804,6 +1804,16 @@ pub(crate) async fn execute_sqlite_fast_batch(
             if let Some(w) = wal_opt.as_deref() {
                 w.note_writer_commit_with_frames(wal_frames);
             }
+            restore_writer_rconn(pair, rconn);
+            finalize_committed_batch(store, &space_states, slots, faults)
+        }
+        FastSqlStageResult::RolledBackAllFailed {
+            space_states,
+            slots,
+        } => {
+            store
+                .cleanup_unretained_local_files_async(cleanup_all_published(local_cas_res))
+                .await;
             restore_writer_rconn(pair, rconn);
             finalize_committed_batch(store, &space_states, slots, faults)
         }
@@ -2478,10 +2488,9 @@ fn run_savepoint_fallback_sql_stage(
                 } else {
                     let _ = conn.execute_batch("ROLLBACK");
                     slots.push(ItemOutcomeSlot::Failed(item_err));
-                    return FastSqlStageResult::CommittedDirectly {
+                    return FastSqlStageResult::RolledBackAllFailed {
                         space_states,
                         slots,
-                        wal_frames: Some(0),
                     };
                 }
             }
@@ -4546,7 +4555,7 @@ fn lookup_command_receipt_rusqlite(
     Ok(Some(receipt))
 }
 
-fn is_note_purge_fenced_rusqlite(
+pub(crate) fn is_note_purge_fenced_rusqlite(
     conn: &rusqlite::Connection,
     space_id: &SpaceId,
     note_id: &str,
@@ -4593,7 +4602,7 @@ fn is_note_purge_fenced_cached(
     is_note_purge_fenced_rusqlite(conn, space_id, note_id)
 }
 
-fn load_note_head_row_opt_rusqlite(
+pub(crate) fn load_note_head_row_opt_rusqlite(
     conn: &rusqlite::Connection,
     space_id: &SpaceId,
     note_id: &NoteId,

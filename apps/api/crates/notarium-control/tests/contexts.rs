@@ -731,7 +731,7 @@ async fn exercise_shared_consumer(
             SpaceContext::new(ctx.auth().clone(), shared.history.clone(), budget()).unwrap(),
             MembershipChange {
                 command: CommandKey::from_bytes([28; 16]),
-                member: other.id,
+                member: other.id.clone(),
                 role: Some(SpaceRole::Viewer),
                 expected: scope_revision(service, ctx, scope).await,
             },
@@ -966,109 +966,297 @@ async fn exercise_shared_consumer(
         .value;
     assert_eq!(pin_2.revision, pin_1.revision);
 
-    // Project-pinned bootstrap_context must not load Space-level or Personal-level
-    // pins/sets or leak out-of-project favorites via `unavailable`, and must reject
-    // an explicit `space` selection when the episode has no live `project_hint`.
-    let proj_pin_a = FolderRef {
-        space_id: shared.space.id.clone(),
-        folder_id: FolderId::from_bytes([0x69; 16]),
-    };
-    let proj_pin_b = FolderRef {
-        space_id: shared.space.id.clone(),
-        folder_id: FolderId::from_bytes([0x6A; 16]),
-    };
-    fixture.catalog.project_entries.lock().unwrap().insert(
-        (proj_pin_a.space_id.clone(), proj_pin_a.folder_id.clone()),
-        ProjectInfo {
-            folder: proj_pin_a.clone(),
-            name: "Proj Pin A".into(),
-            project_slug: "proj-pin-a".into(),
-        },
-    );
-    fixture.catalog.project_entries.lock().unwrap().insert(
-        (proj_pin_b.space_id.clone(), proj_pin_b.folder_id.clone()),
-        ProjectInfo {
-            folder: proj_pin_b.clone(),
-            name: "Proj Pin B".into(),
-            project_slug: "proj-pin-b".into(),
-        },
-    );
-    let in_proj_note = note(
+    exercise_project_pinned_bootstrap(fixture, service, ctx, shared, scope).await;
+    exercise_hidden_bundle_and_order_isolation(
         fixture,
-        &shared.space,
-        81,
-        Some(proj_pin_a.folder_id.clone()),
-    );
-    let out_proj_note = note(
-        fixture,
-        &shared.space,
-        82,
-        Some(proj_pin_b.folder_id.clone()),
-    );
-    pin(service, ctx, scope.clone(), in_proj_note.clone(), 41).await;
-    pin(service, ctx, scope.clone(), out_proj_note.clone(), 42).await;
-    service
-        .set_favorite(
-            ctx.clone(),
-            AccountMutation {
-                identity: identity(service, ctx, 43).await,
-                input: SetFavorite {
-                    reference: FavoriteRef::Note(out_proj_note.clone()),
-                    saved: true,
-                    rank: 200,
-                },
+        service,
+        ctx,
+        shared,
+        scope,
+        &ctx_personal,
+        &ctx_personal_space,
+        &other.id,
+        login.token.expose(),
+    )
+    .await;
+}
+
+#[inline(never)]
+fn exercise_project_pinned_bootstrap<'a>(
+    fixture: &'a mut Fixture,
+    service: &'a std::sync::Arc<ControlService>,
+    ctx: &'a AccountContext,
+    shared: &'a AccessibleSpace,
+    scope: &'a ContextScope,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>> {
+    Box::pin(async move {
+        // Project-pinned bootstrap_context must not load Space-level or Personal-level
+        // pins/sets or leak out-of-project favorites via `unavailable`, and must reject
+        // an explicit `space` selection when the episode has no live `project_hint`.
+        let proj_pin_a = FolderRef {
+            space_id: shared.space.id.clone(),
+            folder_id: FolderId::from_bytes([0x69; 16]),
+        };
+        let proj_pin_b = FolderRef {
+            space_id: shared.space.id.clone(),
+            folder_id: FolderId::from_bytes([0x6A; 16]),
+        };
+        fixture.catalog.project_entries.lock().unwrap().insert(
+            (proj_pin_a.space_id.clone(), proj_pin_a.folder_id.clone()),
+            ProjectInfo {
+                folder: proj_pin_a.clone(),
+                name: "Proj Pin A".into(),
+                project_slug: "proj-pin-a".into(),
             },
-        )
-        .await
-        .unwrap();
-    let proj_ep = episode(service, ctx, Some(proj_pin_a.clone()), 44).await;
-    let pinned_ctx = AccountContext::new(
-        ctx.auth().restrict_to_project(&proj_pin_a).unwrap(),
-        budget(),
-    );
-    let pinned_boot = service
-        .bootstrap_context(
-            pinned_ctx.clone(),
-            proj_ep.clone(),
-            Some(shared.space.id.clone()),
-            ControlPageRequest::new(50, None).unwrap(),
-        )
-        .await
-        .unwrap();
-    assert!(
-        !pinned_boot.selection.pinned.contains(&in_proj_note)
-            && !pinned_boot.selection.pinned.contains(&out_proj_note),
-        "project-pinned bootstrap_context must not surface Space/Personal pins: {:?}",
-        pinned_boot.selection
-    );
-    assert_eq!(
-        pinned_boot.selection.unavailable, 0,
-        "project-pinned bootstrap_context must not leak out-of-project Space pins or favorites via unavailable: {:?}",
-        pinned_boot.selection
-    );
-    // Remove proj_pin_a from catalog so episode hits ProjectUnavailable, then verify
-    // passing explicit `space: Some(shared)` fails ResourceNotFound for project-pinned caller.
-    fixture
-        .catalog
-        .project_entries
-        .lock()
-        .unwrap()
-        .remove(&(proj_pin_a.space_id.clone(), proj_pin_a.folder_id.clone()));
-    let unavail_space_err = service
-        .bootstrap_context(
-            pinned_ctx,
-            proj_ep,
-            Some(shared.space.id.clone()),
-            ControlPageRequest::new(10, None).unwrap(),
-        )
-        .await;
-    assert!(
-        matches!(
-            unavail_space_err,
-            Err(PortError::Domain(DomainError::ResourceNotFound))
-        ),
-        "project-pinned bootstrap_context with explicit space when project is unavailable must fail ResourceNotFound, got {unavail_space_err:?}"
-    );
+        );
+        fixture.catalog.project_entries.lock().unwrap().insert(
+            (proj_pin_b.space_id.clone(), proj_pin_b.folder_id.clone()),
+            ProjectInfo {
+                folder: proj_pin_b.clone(),
+                name: "Proj Pin B".into(),
+                project_slug: "proj-pin-b".into(),
+            },
+        );
+        let in_proj_note = note(
+            fixture,
+            &shared.space,
+            81,
+            Some(proj_pin_a.folder_id.clone()),
+        );
+        let out_proj_note = note(
+            fixture,
+            &shared.space,
+            82,
+            Some(proj_pin_b.folder_id.clone()),
+        );
+        pin(service, ctx, scope.clone(), in_proj_note.clone(), 41).await;
+        pin(service, ctx, scope.clone(), out_proj_note.clone(), 42).await;
+        let in_proj_fav = note(
+            fixture,
+            &shared.space,
+            83,
+            Some(proj_pin_a.folder_id.clone()),
+        );
+        let out_proj_fav_1 = note(
+            fixture,
+            &shared.space,
+            84,
+            Some(proj_pin_b.folder_id.clone()),
+        );
+        let out_proj_fav_2 = note(
+            fixture,
+            &shared.space,
+            85,
+            Some(proj_pin_b.folder_id.clone()),
+        );
+        for (idx, (fav_note, rank)) in [
+            (out_proj_fav_1, 150i64),
+            (out_proj_fav_2, 160i64),
+            (out_proj_note.clone(), 200i64),
+            (in_proj_fav.clone(), 210i64),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            service
+                .set_favorite(
+                    ctx.clone(),
+                    AccountMutation {
+                        identity: identity(service, ctx, 43 + idx as u8).await,
+                        input: SetFavorite {
+                            reference: FavoriteRef::Note(fav_note),
+                            saved: true,
+                            rank,
+                        },
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let proj_ep = episode(service, ctx, Some(proj_pin_a.clone()), 48).await;
+        let pinned_ctx = AccountContext::new(
+            ctx.auth().restrict_to_project(&proj_pin_a).unwrap(),
+            budget(),
+        );
+        // Page size 1 must skip out-of-project favorites without emitting empty pages or
+        // leaking their count via continuation/unavailable.
+        let pinned_boot = service
+            .bootstrap_context(
+                pinned_ctx.clone(),
+                proj_ep.clone(),
+                Some(shared.space.id.clone()),
+                ControlPageRequest::new(1, None).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !pinned_boot.selection.pinned.contains(&in_proj_note)
+                && !pinned_boot.selection.pinned.contains(&out_proj_note),
+            "project-pinned bootstrap_context must not surface Space/Personal pins: {:?}",
+            pinned_boot.selection
+        );
+        assert_eq!(
+            pinned_boot.selection.favorites,
+            vec![in_proj_fav],
+            "project-pinned bootstrap_context(limit=1) must return the in-project favorite directly without empty pages"
+        );
+        assert_eq!(
+            pinned_boot.selection.unavailable, 0,
+            "project-pinned bootstrap_context must not leak out-of-project Space pins or favorites via unavailable: {:?}",
+            pinned_boot.selection
+        );
+        assert!(
+            pinned_boot.continuation.is_none(),
+            "project-pinned bootstrap_context must not emit continuation for trailing out-of-project favorites"
+        );
+
+        // Remove proj_pin_a from catalog so episode hits ProjectUnavailable, then verify
+        // passing explicit `space: Some(shared)` fails ResourceNotFound for project-pinned caller.
+        fixture
+            .catalog
+            .project_entries
+            .lock()
+            .unwrap()
+            .remove(&(proj_pin_a.space_id.clone(), proj_pin_a.folder_id.clone()));
+        let unavail_space_err = service
+            .bootstrap_context(
+                pinned_ctx,
+                proj_ep,
+                Some(shared.space.id.clone()),
+                ControlPageRequest::new(10, None).unwrap(),
+            )
+            .await;
+        assert!(
+            matches!(
+                unavail_space_err,
+                Err(PortError::Domain(DomainError::ResourceNotFound))
+            ),
+            "project-pinned bootstrap_context with explicit space when project is unavailable must fail ResourceNotFound, got {unavail_space_err:?}"
+        );
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn exercise_hidden_bundle_and_order_isolation<'a>(
+    fixture: &'a mut Fixture,
+    service: &'a std::sync::Arc<ControlService>,
+    ctx: &'a AccountContext,
+    shared: &'a AccessibleSpace,
+    scope: &'a ContextScope,
+    ctx_personal: &'a SpaceId,
+    ctx_personal_space: &'a Space,
+    other_id: &'a PrincipalId,
+    other_session_token: &'a str,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>> {
+    Box::pin(async move {
+        // Owner attaches a Personal-home ContextSet (containing a shared note + a private note)
+        // and pins a private Personal note onto Shared Space `shared`. Another member (`other`)
+        // must not see those notes or private unavailable counts in `bootstrap_context`, and
+        // must receive `ResourceNotFound` from `set_context_order` on hidden pins/sets.
+        let priv_note_in_bundle = note(fixture, ctx_personal_space, 86, None);
+        let leaked_shared_note = note(fixture, &shared.space, 87, None);
+        let personal_bundle = service
+            .put_context_set(
+                ctx.clone(),
+                AccountMutation {
+                    identity: identity(service, ctx, 49).await,
+                    input: PutContextSet {
+                        id: ContextSetId::from_bytes([65; 16]),
+                        home: ctx_personal.clone(),
+                        name: "Owner private bundle".into(),
+                        notes: vec![leaked_shared_note.clone(), priv_note_in_bundle.clone()],
+                        expected: None,
+                    },
+                },
+            )
+            .await
+            .unwrap()
+            .value;
+        attach(service, ctx, scope.clone(), &personal_bundle, 50).await;
+        pin(service, ctx, scope.clone(), priv_note_in_bundle.clone(), 51).await;
+        service
+            .change_membership(
+                SpaceContext::new(ctx.auth().clone(), shared.history.clone(), budget()).unwrap(),
+                MembershipChange {
+                    command: CommandKey::from_bytes([52; 16]),
+                    member: other_id.clone(),
+                    role: Some(SpaceRole::Editor),
+                    expected: scope_revision(service, ctx, scope).await,
+                },
+            )
+            .await
+            .unwrap();
+        let other_editor = AccountContext::new(
+            service
+                .resolve(evidence(AuthEvidenceKind::Session, other_session_token))
+                .await
+                .unwrap(),
+            budget(),
+        );
+        let other_ep2 = episode(service, &other_editor, None, 53).await;
+        let other_boot = service
+            .bootstrap_context(
+                other_editor.clone(),
+                other_ep2,
+                Some(shared.space.id.clone()),
+                ControlPageRequest::new(50, None).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !other_boot.selection.pinned.contains(&leaked_shared_note),
+            "bootstrap_context must not expand unauthorized Personal ContextSet attached to Shared Space: {:?}",
+            other_boot.selection
+        );
+        let scope_rev_now = scope_revision(service, &other_editor, scope).await;
+        let order_hidden_set = service
+            .set_context_order(
+                other_editor.clone(),
+                AccountMutation {
+                    identity: identity(service, &other_editor, 54).await,
+                    input: SetContextOrder {
+                        scope: scope.clone(),
+                        expected: scope_rev_now,
+                        entries: vec![ContextRank {
+                            entry: ContextEntry::Set(personal_bundle.id.clone()),
+                            rank: 5,
+                        }],
+                    },
+                },
+            )
+            .await;
+        assert!(
+            matches!(
+                order_hidden_set,
+                Err(PortError::Domain(DomainError::ResourceNotFound))
+            ),
+            "set_context_order on hidden Personal ContextSet must fail ResourceNotFound, got {order_hidden_set:?}"
+        );
+        let order_hidden_pin = service
+            .set_context_order(
+                other_editor.clone(),
+                AccountMutation {
+                    identity: identity(service, &other_editor, 55).await,
+                    input: SetContextOrder {
+                        scope: scope.clone(),
+                        expected: scope_rev_now,
+                        entries: vec![ContextRank {
+                            entry: ContextEntry::Note(priv_note_in_bundle),
+                            rank: 6,
+                        }],
+                    },
+                },
+            )
+            .await;
+        assert!(
+            matches!(
+                order_hidden_pin,
+                Err(PortError::Domain(DomainError::ResourceNotFound))
+            ),
+            "set_context_order on hidden Personal pinned note must fail ResourceNotFound, got {order_hidden_pin:?}"
+        );
+    })
 }
 #[tokio::test]
 async fn sqlite_context_references_and_pagination() {

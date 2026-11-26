@@ -352,6 +352,9 @@ async fn plan(
                 FolderAddress::open(call, args.project.as_deref(), args.session.as_ref()).await?;
             let source = address.resolve(call, &args.folder).await?;
             admit_folder_snapshot(call, &address.scope, &source).await?;
+            if source.project.as_ref() == Some(&source.reference.folder_id) {
+                return Err(invalid(ValidationReason::InvalidState));
+            }
             let ancestor_revisions = capture_ancestor_revisions(
                 call,
                 &address.scope,

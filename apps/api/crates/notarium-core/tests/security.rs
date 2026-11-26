@@ -144,6 +144,14 @@ fn folder_metadata_obeys_project_scope_and_shared_branch_taint() {
             .authorize_folder_read(&first, &root, &[])
             .is_err()
     );
+    assert_eq!(
+        unreadable.can_view_chat(&first, None, false),
+        Err(DomainError::ResourceNotFound)
+    );
+    assert_eq!(
+        unreadable.authorize_chat_read(&first, None, false),
+        Err(DomainError::ResourceNotFound)
+    );
     let agent = owner
         .for_agent_run(
             AgentRunId::from_bytes([7; 16]),

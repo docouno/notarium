@@ -472,7 +472,7 @@ pub(crate) async fn rename_folder_impl(
                 authorize_folder_subtree_tx(tx, &scope.space_id, &input.folder, &auth, true)
                     .await?;
 
-                if folder_row.is_root {
+                if folder_row.is_root || folder_row.is_project {
                     return Err(DomainError::validation(ValidationReason::InvalidState).into());
                 }
                 if let Some(expected_rev) = &preconditions.revision
@@ -1236,7 +1236,7 @@ pub(crate) async fn resolve_note_alias_impl(
                                 "SELECT note_id FROM note_heads
                                  WHERE space_id = $1 AND parent_folder_id = $2 AND title_fold = $3
                                    AND lifecycle_state = 'active'
-                                 ORDER BY updated_seq DESC, note_id ASC
+                                 ORDER BY updated_seq DESC, note_id COLLATE \"C\" ASC
                                  LIMIT 16",
                             )
                             .bind(scope.space_id.as_str())
@@ -1428,6 +1428,13 @@ pub(crate) async fn set_folder_write_lock_impl(
                     ability_package: None,
                 };
                 auth.authorize_direct_write(&check_facts, &check_facts)?;
+                if matches!(
+                    auth.kind(),
+                    notarium_core::auth::PrincipalKind::AgentRun(_)
+                        | notarium_core::auth::PrincipalKind::Keeper(_)
+                ) {
+                    return Err(DomainError::SpaceReadOnly.into());
+                }
                 authorize_folder_subtree_tx(tx, &scope.space_id, &folder_cl, &auth, false).await?;
 
                 let lock_json: Option<&str> = if locked {

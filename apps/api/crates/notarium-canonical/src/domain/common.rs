@@ -1199,7 +1199,7 @@ pub(crate) struct NoteHeadRow {
 
 // Optional projections omit inaccessible or unavailable values. A cancelled or
 // expired request must still interrupt the enclosing page, even in a last slot.
-pub(super) fn optional_read<T>(result: Result<T, PortError>) -> Result<Option<T>, PortError> {
+pub(crate) fn optional_read<T>(result: Result<T, PortError>) -> Result<Option<T>, PortError> {
     match result {
         Ok(value) => Ok(Some(value)),
         Err(err @ (PortError::DeadlineExceeded(_) | PortError::Cancelled(_))) => Err(err),

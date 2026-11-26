@@ -5,6 +5,10 @@ use notarium_core::auth::SpaceRole;
 use std::collections::BTreeSet;
 
 const ABILITY_TRAIL_LOCK: i64 = 0x4e54_5452_4149_4c31;
+pub(crate) const ABILITY_TRAIL_BY_DEST_SQLITE_SQL: &str = "SELECT source_placement, ability_id FROM ability_placement_trail WHERE destination_placement=$1 AND destination_id=$2";
+pub(crate) const ABILITY_PREFS_MOVE_DELETE_SQLITE_SQL: &str = "DELETE FROM ability_preferences AS src WHERE src.placement=$1 AND src.ability_id=$2 AND EXISTS (SELECT 1 FROM ability_preferences AS dst WHERE dst.placement=$3 AND dst.owner_id=src.owner_id AND dst.ability_id=src.ability_id)";
+pub(crate) const ABILITY_PREFS_MOVE_UPDATE_SQLITE_SQL: &str =
+    "UPDATE ability_preferences SET placement=$1 WHERE placement=$2 AND ability_id=$3";
 
 impl ControlService {
     async fn ensure_current_ability_mutation(
@@ -876,7 +880,7 @@ async fn max_incoming_trail_depth_db(
             tx,
             (String, String),
             fetch_all,
-            "SELECT source_placement, ability_id FROM ability_placement_trail WHERE destination_placement=$1 AND destination_id=$2",
+            ABILITY_TRAIL_BY_DEST_SQLITE_SQL,
             "SELECT source_placement, ability_id FROM v1_control.ability_placement_trail WHERE destination_placement=$1 AND destination_id=$2";
             &dst_pl,
             &dst_id
@@ -1003,11 +1007,11 @@ async fn transfer_promotion_overlays(
             destination,source,ability.as_str())?;
     }
     execute!(tx,
-        "DELETE FROM ability_preferences AS src WHERE src.placement=$1 AND src.ability_id=$2 AND EXISTS (SELECT 1 FROM ability_preferences AS dst WHERE dst.placement=$3 AND dst.owner_id=src.owner_id AND dst.ability_id=src.ability_id)",
+        ABILITY_PREFS_MOVE_DELETE_SQLITE_SQL,
         "DELETE FROM v1_control.ability_preferences AS src WHERE src.placement=$1 AND src.ability_id=$2 AND EXISTS (SELECT 1 FROM v1_control.ability_preferences AS dst WHERE dst.placement=$3 AND dst.owner_id=src.owner_id AND dst.ability_id=src.ability_id)";
         source,ability.as_str(),destination)?;
     execute!(tx,
-        "UPDATE ability_preferences SET placement=$1 WHERE placement=$2 AND ability_id=$3",
+        ABILITY_PREFS_MOVE_UPDATE_SQLITE_SQL,
         "UPDATE v1_control.ability_preferences SET placement=$1 WHERE placement=$2 AND ability_id=$3";
         destination,source,ability.as_str())?;
     Ok(AbilityProjects::Selected(if admits_project {

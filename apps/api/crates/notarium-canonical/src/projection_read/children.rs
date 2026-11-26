@@ -29,9 +29,11 @@ const PG_HISTORICAL_CHILDREN: &str = candidate_probe!(
 // Each arm seeks directly into (space, parent, lifecycle, folder_id). Merging
 // the three ordered streams keeps the continuation stable across trash/restore.
 macro_rules! heads {
-    ($state:literal, $cmp:literal) => {
+    ($state:literal, $sel:literal, $cmp:literal) => {
         concat!(
-            "SELECT folder_id FROM folder_heads WHERE space_id=$1 AND created_seq <= $2
+            "SELECT ",
+            $sel,
+            " FROM folder_heads WHERE space_id=$1 AND created_seq <= $2
             AND parent_folder_id=$3 AND ",
             $cmp,
             " > $4 AND lifecycle_state='",
@@ -41,20 +43,32 @@ macro_rules! heads {
     };
 }
 const HEADS_SQLITE: &str = concat!(
-    heads!("active", "folder_id"),
+    heads!("active", "folder_id", "folder_id"),
     "UNION ALL ",
-    heads!("trashed", "folder_id"),
+    heads!("trashed", "folder_id", "folder_id"),
     "UNION ALL ",
-    heads!("purged", "folder_id"),
+    heads!("purged", "folder_id", "folder_id"),
     "ORDER BY folder_id LIMIT 200"
 );
 const HEADS_PG: &str = concat!(
-    heads!("active", "folder_id COLLATE \"C\""),
+    heads!(
+        "active",
+        "folder_id COLLATE \"C\" AS folder_id",
+        "folder_id COLLATE \"C\""
+    ),
     "UNION ALL ",
-    heads!("trashed", "folder_id COLLATE \"C\""),
+    heads!(
+        "trashed",
+        "folder_id COLLATE \"C\" AS folder_id",
+        "folder_id COLLATE \"C\""
+    ),
     "UNION ALL ",
-    heads!("purged", "folder_id COLLATE \"C\""),
-    "ORDER BY folder_id COLLATE \"C\" LIMIT 200"
+    heads!(
+        "purged",
+        "folder_id COLLATE \"C\" AS folder_id",
+        "folder_id COLLATE \"C\""
+    ),
+    "ORDER BY folder_id LIMIT 200"
 );
 
 // Alias keys are append-only. Use the primary key order, including its

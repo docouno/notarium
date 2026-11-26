@@ -64,8 +64,9 @@ declarations. All workspace dependencies must be inherited by an owning crate an
 locked for offline setup. `Cargo.lock` must contain none of `openssl-sys`,
 `native-tls`, `aws-lc-sys`, `cmake`, `cxx`, `usearch` or `tikv-jemalloc-sys`.
 
-TLS uses rustls 0.23 with ring, reqwest 0.13 with `rustls-no-provider`, and tonic
-0.14 with `tls-ring`. Dependencies build in the pinned Rust image without adding
+TLS uses rustls 0.23 with ring (via hyper 1, tokio-rustls 0.26, and
+rustls-platform-verifier 0.7 in `notarium-control`), reqwest 0.13 with
+`rustls-no-provider`, and tonic 0.14 with `tls-ring`. Dependencies build in the pinned Rust image without adding
 C++/OpenSSL tools. Core and syntax tests exercise domain and document behavior.
 Canonical tests exercise dual-dialect storage and CAS. Control storage tests its
 SQL schema, target import/export, authentication, Space authority and crash

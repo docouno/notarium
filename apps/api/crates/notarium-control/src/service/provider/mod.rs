@@ -1,12 +1,12 @@
 //! Provider configuration, current disclosure admission and durable accounting.
 mod accounting;
-mod admission;
+pub(crate) mod admission;
 mod attachments;
 mod configuration;
 mod dispatch;
 mod execution;
 mod inventory;
-mod offers;
+pub(crate) mod offers;
 mod ports;
 mod records;
 mod recovery;

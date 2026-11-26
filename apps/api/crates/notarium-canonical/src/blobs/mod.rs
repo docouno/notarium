@@ -801,13 +801,16 @@ impl crate::CanonicalStore {
 
     /// Wave A2: atomically renames ONLY `.staging/*.part` files whose `(space_id, digest)` succeeded
     /// in SQL Stage 1 (`retained_keys`) into `blobs/`, dropping and unlinking any rolled-back items.
+    /// Returns both the directories needing fsync and the `(space_id, digest)` pairs newly renamed
+    /// into `blobs/` so pre-commit abort paths can unlink them while holding their exclusive locks.
     pub(crate) async fn rename_synced_local_entries_async(
         &self,
         synced_entries: Vec<PreparedLocalStagingEntry>,
         retained_keys: &HashSet<(String, ContentDigest)>,
-    ) -> Result<PendingDirSyncs, PortError> {
+    ) -> Result<(PendingDirSyncs, Vec<(SpaceId, ContentDigest)>), PortError> {
         let mut extra_dirs = PendingDirSyncs::default();
-        let mut to_rename = Vec::with_capacity(synced_entries.len());
+        let mut to_rename: Vec<(SpaceId, ContentDigest, local::DeferredLocalTempFile)> =
+            Vec::with_capacity(synced_entries.len());
         let mut to_unlink = Vec::new();
         let mut seen_renamed: HashSet<(String, ContentDigest)> =
             HashSet::with_capacity(synced_entries.len());
@@ -818,7 +821,7 @@ impl crate::CanonicalStore {
                 extra_dirs.merge(&entry.item_dirs);
                 if let Some(tf) = entry.temp_file {
                     if seen_renamed.insert(key) {
-                        to_rename.push(tf);
+                        to_rename.push((entry.space_id, entry.digest, tf));
                     } else {
                         to_unlink.push(tf);
                     }
@@ -835,18 +838,28 @@ impl crate::CanonicalStore {
                     internal_not_committed("local_cas_unlink_batch_join", err.to_string())
                 })?;
         }
+        let mut newly_published = Vec::with_capacity(to_rename.len());
         if to_rename.len() <= 8 {
             if !to_rename.is_empty() {
-                tokio::task::spawn_blocking(move || -> Result<(), PortError> {
-                    for tf in to_rename {
-                        tf.rename_into_place()?;
+                let (published, err) = tokio::task::spawn_blocking(move || {
+                    let mut done = Vec::with_capacity(to_rename.len());
+                    for (space_id, digest, tf) in to_rename {
+                        if let Err(e) = tf.rename_into_place() {
+                            return (done, Some(e));
+                        }
+                        done.push((space_id, digest));
                     }
-                    Ok(())
+                    (done, None)
                 })
                 .await
                 .map_err(|err| {
                     internal_not_committed("local_cas_rename_batch_join", err.to_string())
-                })??;
+                })?;
+                if let Some(err) = err {
+                    self.cleanup_unretained_local_files_async(published).await;
+                    return Err(err);
+                }
+                newly_published = published;
             }
         } else {
             let chunk_size = to_rename.len().div_ceil(16);
@@ -857,18 +870,23 @@ impl crate::CanonicalStore {
                 if chunk.is_empty() {
                     break;
                 }
-                ren_set.spawn_blocking(move || -> Result<(), PortError> {
-                    for tf in chunk {
-                        tf.rename_into_place()?;
+                ren_set.spawn_blocking(move || {
+                    let mut done = Vec::with_capacity(chunk.len());
+                    for (space_id, digest, tf) in chunk {
+                        if let Err(e) = tf.rename_into_place() {
+                            return (done, Some(e));
+                        }
+                        done.push((space_id, digest));
                     }
-                    Ok(())
+                    (done, None)
                 });
             }
             let mut first_err: Option<PortError> = None;
             while let Some(res) = ren_set.join_next().await {
                 match res {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => {
+                    Ok((done, None)) => newly_published.extend(done),
+                    Ok((done, Some(e))) => {
+                        newly_published.extend(done);
                         if first_err.is_none() {
                             first_err = Some(e);
                         }
@@ -884,18 +902,20 @@ impl crate::CanonicalStore {
                 }
             }
             if let Some(err) = first_err {
+                self.cleanup_unretained_local_files_async(newly_published)
+                    .await;
                 return Err(err);
             }
         }
 
-        Ok(extra_dirs)
+        Ok((extra_dirs, newly_published))
     }
 
     /// Sequential Wave A0 + A1 + A2 helper used by async `execute_batch_on_conn`.
     pub(crate) async fn publish_deferred_local_tickets_async(
         &self,
         tickets: &[StagedBlobTicket],
-    ) -> Result<PendingDirSyncs, PortError> {
+    ) -> Result<(PendingDirSyncs, Vec<(SpaceId, ContentDigest)>), PortError> {
         let mut pending_stagings = Vec::new();
         let mut retained_keys = HashSet::with_capacity(tickets.len());
         for ticket in tickets {
@@ -907,7 +927,7 @@ impl crate::CanonicalStore {
             }
         }
         if pending_stagings.is_empty() {
-            return Ok(PendingDirSyncs::default());
+            return Ok((PendingDirSyncs::default(), Vec::new()));
         }
         let synced = self
             .prepare_and_sync_local_stagings_async(pending_stagings)

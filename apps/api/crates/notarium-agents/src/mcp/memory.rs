@@ -53,6 +53,10 @@ impl MemoryArgs {
         if args.observation.is_empty() {
             return Err(invalid(ValidationReason::InvalidQuery));
         }
+        notarium_syntax::unicode::validate_content(&args.observation)?;
+        if let Some(summary) = &args.summary {
+            notarium_syntax::unicode::validate_content(summary)?;
+        }
         validate_category(&args.category)?;
         Ok(args)
     }

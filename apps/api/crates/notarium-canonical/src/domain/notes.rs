@@ -3625,6 +3625,21 @@ pub(crate) async fn accept_batch_impl(
     space_rec.scope.check(ctx.scope())?;
 
     if request.items.is_empty() {
+        if space_rec.space.lifecycle != notarium_core::auth::SpaceLifecycle::Active {
+            return Err(DomainError::ResourceNotFound.into());
+        }
+        ctx.auth().authorize_space_write(&space_rec.space)?;
+        let grant = ctx
+            .auth()
+            .spaces()
+            .get(&space_rec.scope.space_id)
+            .ok_or(DomainError::ResourceNotFound)?;
+        if grant.read_classes.is_empty() {
+            return Err(DomainError::ResourceNotFound.into());
+        }
+        if grant.write_classes.is_empty() {
+            return Err(DomainError::SpaceReadOnly.into());
+        }
         return Ok(BatchResult {
             items: Vec::new(),
             committed_high_watermark: space_rec.last_seq,
@@ -4639,6 +4654,27 @@ pub(crate) async fn link_many_impl(
         })
         .await??;
     space.scope.check(ctx.scope())?;
+    if request.items.is_empty() {
+        if space.space.lifecycle != notarium_core::auth::SpaceLifecycle::Active {
+            return Err(DomainError::ResourceNotFound.into());
+        }
+        ctx.auth().authorize_space_write(&space.space)?;
+        let grant = ctx
+            .auth()
+            .spaces()
+            .get(&space.scope.space_id)
+            .ok_or(DomainError::ResourceNotFound)?;
+        if grant.read_classes.is_empty() {
+            return Err(DomainError::ResourceNotFound.into());
+        }
+        if grant.write_classes.is_empty() {
+            return Err(DomainError::SpaceReadOnly.into());
+        }
+        return Ok(BatchResult {
+            items: Vec::new(),
+            committed_high_watermark: space.last_seq,
+        });
+    }
     let keys = request
         .items
         .iter()

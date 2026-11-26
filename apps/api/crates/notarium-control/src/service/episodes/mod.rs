@@ -1,5 +1,6 @@
 //! Owner-bound episodes and independent per-Space delivery acknowledgements.
 mod cursors;
+pub(crate) const OPEN_EPISODES_BY_NAME_SQLITE_SQL: &str = "SELECT * FROM agent_episodes WHERE owner_id=$1 AND name=$2 AND lifecycle<>'closed' AND episode_id>$3 ORDER BY episode_id LIMIT 64";
 use super::{
     ControlService,
     authority::*,
@@ -419,7 +420,7 @@ impl ControlService {
                             tx.inner_mut(),
                             AgentEpisodesRow,
                             fetch_all,
-                            "SELECT * FROM agent_episodes WHERE owner_id=$1 AND name=$2 AND lifecycle<>'closed' AND episode_id>$3 ORDER BY episode_id LIMIT 64",
+                            OPEN_EPISODES_BY_NAME_SQLITE_SQL,
                             "SELECT * FROM v1_control.agent_episodes WHERE owner_id=$1 AND name=$2 AND lifecycle<>'closed' AND episode_id>$3 ORDER BY episode_id LIMIT 64";
                             &owner.user_id,
                             name,
@@ -570,7 +571,7 @@ impl ControlService {
                             tx.inner_mut(),
                             AgentEpisodesRow,
                             fetch_all,
-                            "SELECT * FROM agent_episodes WHERE owner_id=$1 AND name=$2 AND lifecycle<>'closed' AND episode_id>$3 ORDER BY episode_id LIMIT 64",
+                            OPEN_EPISODES_BY_NAME_SQLITE_SQL,
                             "SELECT * FROM v1_control.agent_episodes WHERE owner_id=$1 AND name=$2 AND lifecycle<>'closed' AND episode_id>$3 ORDER BY episode_id LIMIT 64";
                             current.auth().principal().as_str(),
                             &episode_name,

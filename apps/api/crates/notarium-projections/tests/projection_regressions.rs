@@ -30,7 +30,7 @@ use notarium_core::{
         DeleteNote, EditNote, EventBusPort, GroupCount, GroupKey, JobState, LinkReadPort,
         MaintenanceContext, MoveBoardCard, MoveFolder, Mutation, NoteQuery, NoteReadPort,
         NoteRevision, NoteWritePort, PageLimit, Preconditions, RankExpectation, RankNeighbor,
-        RenameFolder, ServiceAuthority, ServicePurpose, SpaceContext, SpaceEvent, SpaceEventKind,
+        RenameProject, ServiceAuthority, ServicePurpose, SpaceContext, SpaceEvent, SpaceEventKind,
         StructuralReadPort, ViewGraphPort, ViewQuery, ViewRef,
     },
     query::{
@@ -643,13 +643,14 @@ async fn folder_by_path_ignores_trashed_collision_and_list_notes_hydrates_cover_
     }
     let mut rename = mutation(
         &owner,
-        RenameFolder {
+        RenameProject {
             folder: live_dir.clone(),
             name: "docs".into(),
+            display_name: None,
         },
     );
     rename.preconditions.revision = Some(live_rev);
-    store.rename_folder(owner.clone(), rename).await.unwrap();
+    store.rename_project(owner.clone(), rename).await.unwrap();
 
     // Board/table view addressing the folder by path "/docs" must resolve cleanly
     // despite the trashed folder that previously held the same path.
@@ -817,13 +818,14 @@ async fn folder_by_path_ignores_trashed_collision_and_list_notes_hydrates_cover_
         .unwrap();
     }
     store
-        .rename_folder(
+        .rename_project(
             owner.clone(),
             mutation(
                 &owner,
-                RenameFolder {
+                RenameProject {
                     folder: live_dir.clone(),
                     name: "docs".into(),
+                    display_name: None,
                 },
             ),
         )

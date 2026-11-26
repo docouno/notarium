@@ -1,4 +1,8 @@
 use super::*;
+
+pub(crate) const DELETE_SCHEDULE_RUNS_RETENTION_SQLITE_SQL: &str = "DELETE FROM agent_schedule_runs WHERE run_id IN (SELECT r.run_id FROM agent_schedule_runs r WHERE r.status IN ('succeeded','failed','unknown') AND r.finished_at IS NOT NULL AND r.finished_at<=$1 AND NOT EXISTS(SELECT 1 FROM agent_schedules s WHERE s.schedule_id=r.schedule_id AND s.deleted_at IS NULL AND r.slot_utc_ms BETWEEN s.next_slot_utc_ms-$3 AND s.next_slot_utc_ms) ORDER BY r.finished_at,r.run_id LIMIT $2)";
+pub(crate) const DELETE_SCHEDULES_RETENTION_SQLITE_SQL: &str = "DELETE FROM agent_schedules WHERE schedule_id IN (SELECT s.schedule_id FROM agent_schedules s WHERE s.deleted_at IS NOT NULL AND s.deleted_at<=$1 AND NOT EXISTS(SELECT 1 FROM agent_schedule_runs r WHERE r.schedule_id=s.schedule_id) ORDER BY s.deleted_at,s.schedule_id LIMIT $2)";
+
 impl ControlService {
     pub async fn cleanup_telemetry(
         &self,
@@ -235,7 +239,7 @@ impl ControlService {
                     if remaining > 0 {
                         remaining -= execute!(
                             tx.inner_mut(),
-                            "DELETE FROM agent_schedule_runs WHERE run_id IN (SELECT r.run_id FROM agent_schedule_runs r WHERE r.status IN ('succeeded','failed','unknown') AND r.finished_at IS NOT NULL AND r.finished_at<=$1 AND NOT EXISTS(SELECT 1 FROM agent_schedules s WHERE s.schedule_id=r.schedule_id AND s.deleted_at IS NULL AND r.slot_utc_ms BETWEEN s.next_slot_utc_ms-$3 AND s.next_slot_utc_ms) ORDER BY r.finished_at,r.run_id LIMIT $2)",
+                            DELETE_SCHEDULE_RUNS_RETENTION_SQLITE_SQL,
                             "DELETE FROM v1_control.agent_schedule_runs WHERE run_id IN (SELECT r.run_id FROM v1_control.agent_schedule_runs r WHERE r.status IN ('succeeded','failed','unknown') AND r.finished_at IS NOT NULL AND r.finished_at<=$1 AND NOT EXISTS(SELECT 1 FROM v1_control.agent_schedules s WHERE s.schedule_id=r.schedule_id AND s.deleted_at IS NULL AND r.slot_utc_ms BETWEEN s.next_slot_utc_ms-$3 AND s.next_slot_utc_ms) ORDER BY r.finished_at,r.run_id LIMIT $2 FOR UPDATE OF r SKIP LOCKED)";
                             compact, remaining, 2 * DAY
                         )? as i64;
@@ -243,7 +247,7 @@ impl ControlService {
                     if remaining > 0 {
                         remaining -= execute!(
                             tx.inner_mut(),
-                            "DELETE FROM agent_schedules WHERE schedule_id IN (SELECT s.schedule_id FROM agent_schedules s WHERE s.deleted_at IS NOT NULL AND s.deleted_at<=$1 AND NOT EXISTS(SELECT 1 FROM agent_schedule_runs r WHERE r.schedule_id=s.schedule_id) ORDER BY s.deleted_at,s.schedule_id LIMIT $2)",
+                            DELETE_SCHEDULES_RETENTION_SQLITE_SQL,
                             "DELETE FROM v1_control.agent_schedules WHERE schedule_id IN (SELECT s.schedule_id FROM v1_control.agent_schedules s WHERE s.deleted_at IS NOT NULL AND s.deleted_at<=$1 AND NOT EXISTS(SELECT 1 FROM v1_control.agent_schedule_runs r WHERE r.schedule_id=s.schedule_id) ORDER BY s.deleted_at,s.schedule_id LIMIT $2 FOR UPDATE OF s SKIP LOCKED)";
                             compact, remaining
                         )? as i64;

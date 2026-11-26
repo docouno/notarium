@@ -65,7 +65,7 @@ impl AuxiliaryEffect {
         Ok(())
     }
 
-    fn check(&self) -> Result<(), PortError> {
+    pub(crate) fn check(&self) -> Result<(), PortError> {
         if let Some(effect) = &self.0 {
             let active = effect.active.lock().expect("auxiliary effect lock");
             active
@@ -185,6 +185,40 @@ impl CanonicalStore {
         T: Send + 'static,
         R: Send + 'static,
     {
+        self.with_guarded_auxiliary_command_with_abort_cleanup(
+            space,
+            visible_space,
+            timing,
+            registration,
+            after_commit,
+            || Box::pin(async {}),
+            op,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn with_guarded_auxiliary_command_with_abort_cleanup<T, R, F, C>(
+        &self,
+        space: SpaceId,
+        visible_space: Option<SpaceId>,
+        timing: Option<(&CallBudget, CommandDeadline)>,
+        registration: Option<CanonicalEffectAdmission>,
+        after_commit: impl FnOnce(T) -> Result<R, PortError> + Send + 'static,
+        on_pre_commit_abort: C,
+        op: F,
+    ) -> Result<R, PortError>
+    where
+        F: for<'c> FnOnce(
+                &'c mut BackendConn<'_>,
+                AuxiliaryEffect,
+            ) -> crate::BoxFuture<'c, Result<T, PortError>>
+            + Send
+            + 'static,
+        C: FnOnce() -> crate::BoxFuture<'static, ()> + Send + 'static,
+        T: Send + 'static,
+        R: Send + 'static,
+    {
         let worker_timing = timing.map(|(budget, deadline)| (budget.clone(), deadline));
         let check = move || -> Result<(), PortError> {
             if let Some((budget, deadline)) = &worker_timing {
@@ -208,6 +242,8 @@ impl CanonicalStore {
             // The owner keeps the active lease past a canceled waiter and
             // while the connection acknowledges COMMIT or ROLLBACK.
             let operation_effect = active.clone();
+            let entered_commit = Arc::new(AtomicBool::new(false));
+            let entered_commit_tx = Arc::clone(&entered_commit);
             let result = store
                 .with_visibility_write_tx(
                     Some(space),
@@ -230,12 +266,16 @@ impl CanonicalStore {
                                     "caller left before commit",
                                 ));
                             }
+                            entered_commit_tx.store(true, Ordering::Release);
                             Ok(result)
                         })
                     },
                     after_commit,
                 )
                 .await;
+            if result.is_err() && !entered_commit.load(Ordering::Acquire) {
+                on_pre_commit_abort().await;
+            }
             drop(active);
             result
         });
