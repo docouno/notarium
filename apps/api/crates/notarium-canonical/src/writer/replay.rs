@@ -309,7 +309,11 @@ impl CommandIdentitySpec {
                         )
                         .await?;
                     } else {
-                        if !auth.spaces().contains_key(&note.space_id) {
+                        if auth
+                            .spaces()
+                            .get(&note.space_id)
+                            .is_none_or(|g| g.read_classes.is_empty())
+                        {
                             return Err(DomainError::ResourceNotFound.into());
                         }
                         auth.taint().mark_external_read();

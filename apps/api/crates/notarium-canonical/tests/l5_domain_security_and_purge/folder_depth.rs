@@ -112,6 +112,54 @@ async fn wide_subtree_probes_children_by_parent_before_analyze() {
             query.get_status(rusqlite::StatementStatus::VmStep) < 100_000,
             "1,254 descendants must not trigger repeated Space scans"
         );
+        // Also verify rollback's pre-run rank revision query uses `idx_revisions_entity_vis_seq`
+        // without temp B-tree both pre- and post-ANALYZE.
+        const PRERUN_RANK_SQL: &str = "SELECT rev_id, actor_id, agent_run_id, metadata_msgpack, visibility_seq \
+            FROM revisions \
+            WHERE space_id = ?1 AND history_incarnation = ?2 \
+              AND entity_type = 'rank' AND entity_key = ?3 \
+              AND (agent_run_id IS NULL OR agent_run_id != ?4) \
+              AND space_seq < ?5 \
+              AND NOT EXISTS ( \
+                  SELECT 1 FROM revisions r2 \
+                  WHERE r2.space_id = revisions.space_id \
+                    AND r2.history_incarnation = revisions.history_incarnation \
+                    AND r2.visibility_seq = revisions.visibility_seq \
+                    AND r2.agent_run_id = ?4 \
+              ) \
+            ORDER BY visibility_seq DESC, space_seq DESC \
+            LIMIT 1";
+        for phase in ["pre-ANALYZE", "post-ANALYZE"] {
+            if phase == "post-ANALYZE" {
+                conn.execute_batch("ANALYZE").unwrap();
+            }
+            let mut rank_plan = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {PRERUN_RANK_SQL}"))
+                .unwrap();
+            let rank_details = rank_plan
+                .query_map(
+                    rusqlite::params![
+                        scope.space_id.as_str(),
+                        scope.incarnation.as_bytes().as_slice(),
+                        "rk_1",
+                        "run_1",
+                        100i64
+                    ],
+                    |r| r.get::<_, String>(3),
+                )
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+                .join("\n");
+            assert!(
+                rank_details.contains("idx_revisions_entity_vis_seq"),
+                "{phase} pre-run rank query must use idx_revisions_entity_vis_seq:\n{rank_details}"
+            );
+            assert!(
+                !rank_details.contains("SCAN ") && !rank_details.contains("TEMP B-TREE"),
+                "{phase} pre-run rank query must avoid scans and temp B-trees:\n{rank_details}"
+            );
+        }
     }
     runtime.shutdown().await.unwrap();
 

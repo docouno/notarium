@@ -1563,15 +1563,25 @@ pub(crate) fn folder_mutation_class(
         .spaces()
         .get(space)
         .ok_or(DomainError::ResourceNotFound)?;
-    if grant.write_classes.contains(&DocClass::UserDoc) {
+    if grant.write_classes.contains(&DocClass::UserDoc)
+        && grant.read_classes.contains(&DocClass::UserDoc)
+    {
         return Ok(DocClass::UserDoc);
     }
-    grant
+    if let Some(class) = grant.write_classes.iter().copied().find(|class| {
+        !matches!(class, DocClass::AgentMemory | DocClass::Skill)
+            && grant.read_classes.contains(class)
+    }) {
+        return Ok(class);
+    }
+    if grant
         .write_classes
         .iter()
-        .copied()
-        .find(|class| !matches!(class, DocClass::AgentMemory | DocClass::Skill))
-        .ok_or(DomainError::SpaceReadOnly)
+        .any(|class| !matches!(class, DocClass::AgentMemory | DocClass::Skill))
+    {
+        return Err(DomainError::ResourceNotFound);
+    }
+    Err(DomainError::SpaceReadOnly)
 }
 
 async fn is_folder_readable_tx(
@@ -1586,21 +1596,9 @@ async fn is_folder_readable_tx(
     else {
         return Ok(false);
     };
-    let Some(grant) = auth.spaces().get(&space.id) else {
-        return Ok(false);
-    };
-    let Some(readable_class) = grant.read_classes.iter().copied().next() else {
-        return Ok(false);
-    };
-    let facts = notarium_core::auth::ResourceFacts {
-        space: space.clone(),
-        class: readable_class,
-        project: anc.project,
-        ancestor_folders: anc.ancestors,
-        folder_write_locked: anc.write_locked,
-        ability_package: None,
-    };
-    Ok(auth.authorize_read(&facts).is_ok())
+    Ok(auth
+        .authorize_folder_read(space, folder_id, &anc.ancestors)
+        .is_ok())
 }
 
 pub(crate) async fn is_note_live_readable_tx(

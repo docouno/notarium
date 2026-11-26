@@ -179,7 +179,7 @@ fn a_project_pin_retains_the_credential_and_refuses_a_relocated_destination() {
     moved.ancestor_folders = vec![FolderId::from_bytes([4; 16])];
     assert_eq!(
         pinned.authorize_direct_write(&inside, &moved),
-        Err(DomainError::SpaceReadOnly)
+        Err(DomainError::ResourceNotFound)
     );
     assert!(
         pinned

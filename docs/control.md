@@ -28,17 +28,18 @@ read-only pool; PostgreSQL separates a 6-connection write/export pool from a
 20-connection read pool, with 16 active reader slots, a bounded 512-waiter read
 queue, and per-operation `SET LOCAL statement_timeout` and
 `idle_in_transaction_session_timeout`. SQL migrations
-reject unknown migration versions. Both dialects preserve the baseline
-migration `0001` and add bearer, schedule, and lookup index authority
-(`schedule_expired_run` on `agent_schedule_runs(expires_at, run_id)`,
-`call_run` on `provider_call_log(run_id, call_id)`,
-`ability_trail_destination` on
-`ability_placement_trail(destination_placement, destination_id)`, and
-`ability_preference_placement` on
-`ability_preferences(placement, ability_id, owner_id)`) in migration
-`0002`. Existing bearers default to no ability-authoring opt-in. Existing
-schedules with unverified skill approvals require explicit review before a
-provider call.
+reject unknown migration versions. Both dialects preserve the baseline migration `0001` and evolve bearer,
+schedule, and lookup index authority in migration `0002`: adding bearer
+`ability_write` opt-in columns, making terminal schedule slots nullable
+(`next_slot_utc_ms`, `reserved_next_slot`), adding Keeper approval and log
+binding columns (`approved_skills`, `keeper_log_id`,
+`keeper_project_folder_id`), recreating `schedule_due`, `schedule_deleted`,
+and `schedule_run_retention` as partial indexes aligned to their scan orders,
+and adding `schedule_expired_run`, `episode_owner_name_open`,
+`attachment_target_approved_id`, `call_run`, `ability_trail_destination`, and
+`ability_preference_placement`. Existing bearers default to no
+ability-authoring opt-in. Existing schedules with unverified skill approvals
+require explicit review before a provider call.
 
 Read-only queries and fast-path credential resolution (`ControlStore::read()`)
 use read-only transactions (`BEGIN DEFERRED` on SQLite read pool, `BEGIN READ ONLY`

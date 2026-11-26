@@ -2121,9 +2121,12 @@ async fn execute_batch_on_conn(
 
     let wal_only = !intents.is_empty() && intents.iter().all(|it| it.room_wal.is_some());
     let use_savepoints = intents.len() > 1;
+    let mut slot_spaces: Vec<SpaceId> = Vec::with_capacity(intents.len());
+    let mut first_mutating_slot: BTreeMap<SpaceId, usize> = BTreeMap::new();
 
     for (idx, intent) in intents.into_iter().enumerate() {
         let space_id = intent.prepared.scope.space_id.clone();
+        slot_spaces.push(space_id.clone());
 
         // Lock Space row OUTSIDE item savepoint on first encounter in this batch so a rolled-back
         // item savepoint on PostgreSQL never drops the batch's `SELECT ... FOR UPDATE` row lock!
@@ -2207,6 +2210,9 @@ async fn execute_batch_on_conn(
                 if let Some(effect) = active_effect {
                     active_effects.push((slots.len(), effect));
                 }
+                first_mutating_slot
+                    .entry(space_id.clone())
+                    .or_insert(slots.len());
                 after_commit.extend(item_after_commit);
                 slots.push(ItemOutcomeSlot::Succeeded {
                     response_bytes,
@@ -2333,7 +2339,11 @@ async fn execute_batch_on_conn(
         for (slot_idx, slot) in slots.iter_mut().enumerate() {
             if let Some(err) = revoked_by_slot.remove(&slot_idx) {
                 *slot = ItemOutcomeSlot::Failed(err);
-            } else if matches!(slot, ItemOutcomeSlot::Succeeded { .. }) {
+            } else if matches!(slot, ItemOutcomeSlot::Succeeded { .. })
+                || first_mutating_slot
+                    .get(&slot_spaces[slot_idx])
+                    .is_some_and(|&first| first < slot_idx)
+            {
                 *slot = ItemOutcomeSlot::Failed(unavailable_retryable(
                     "batch_peer_revoked",
                     "peer write in batch was revoked before commit",
@@ -3416,6 +3426,276 @@ mod tests {
             })
             .await
             .unwrap();
+        drop(store);
+        runtime.shutdown().await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn coalesced_batch_peer_revocation_rewrites_later_same_space_dirty_failures() {
+        use notarium_core::{
+            auth::{
+                AuthenticatedCredential, EngineAuthContext, SpaceGrant, SpaceRole, VerifiedHuman,
+            },
+            ids::{AuthSessionId, GrantId, PrincipalId},
+            model::PathTarget,
+            ports::{
+                AccountContext, CallBudget, Cancellation, CanonicalEffectRegistration, PortFuture,
+                RevocationLease, SpaceContext,
+            },
+        };
+        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+        struct ToggleLease(Arc<AtomicBool>);
+        impl RevocationLease for ToggleLease {
+            fn check(&self) -> Result<(), PortError> {
+                if self.0.load(AtomicOrdering::SeqCst) {
+                    Err(DomainError::AccessDenied.into())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        struct ToggleReg(Arc<AtomicBool>);
+        impl CanonicalEffectRegistration for ToggleReg {
+            fn check(&self) -> Result<(), PortError> {
+                if self.0.load(AtomicOrdering::SeqCst) {
+                    Err(DomainError::AccessDenied.into())
+                } else {
+                    Ok(())
+                }
+            }
+            fn restrict_until(&self, _deadline: std::time::Instant) -> Result<(), PortError> {
+                self.check()
+            }
+            fn begin(self: Arc<Self>) -> PortFuture<'static, Box<dyn RevocationLease>> {
+                let flag = Arc::clone(&self.0);
+                Box::pin(async move { Ok(Box::new(ToggleLease(flag)) as Box<dyn RevocationLease>) })
+            }
+        }
+
+        let mut id = [0u8; 16];
+        getrandom::fill(&mut id).unwrap();
+        let root =
+            std::env::temp_dir().join(format!("notarium-writer-peer-revoke-{}", hex::encode(id)));
+        let cfg =
+            CanonicalConfig::local_default(InstallationId::from_bytes(id), DataRoot::new(&root));
+        let (store, runtime) = CanonicalRuntime::open(cfg).await.unwrap();
+        let space_id = SpaceId::from_bytes([0xE1; 16]);
+        let owner = PrincipalId::from_bytes([0xE2; 16]);
+        let epoch = LeaseEpoch::new(1).unwrap();
+        let rec = store
+            .create_space(crate::CreateSpaceSpec {
+                space_id: space_id.clone(),
+                incarnation: HistoryIncarnation::from_bytes([0xE3; 16]),
+                root_folder_id: FolderId::from_bytes([0xE4; 16]),
+                slug: "peer-revoke".into(),
+                kind: notarium_core::auth::SpaceKind::Shared,
+                owner: owner.clone(),
+                active_epoch: epoch,
+                initial_last_seq: SpaceSeq::ZERO,
+                created_at: None,
+            })
+            .await
+            .unwrap();
+        store
+            .with_write_tx(|tx| {
+                Box::pin(async move {
+                    let BackendConn::Sqlite(conn) = tx else {
+                        unreachable!()
+                    };
+                    sqlx::query("CREATE TABLE batch_probe (v INTEGER NOT NULL)")
+                        .execute(&mut **conn)
+                        .await
+                        .unwrap();
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
+
+        let revoked = Arc::new(AtomicBool::new(false));
+        let auth = EngineAuthContext::for_human(
+            VerifiedHuman::attest(
+                owner,
+                GrantId::from_bytes([0xE5; 16]),
+                BTreeMap::from([(
+                    space_id.clone(),
+                    SpaceGrant {
+                        role: SpaceRole::Owner,
+                        read_classes: DocClass::all(),
+                        write_classes: DocClass::all(),
+                        project_root: None,
+                    },
+                )]),
+                false,
+            )
+            .with_credential(AuthenticatedCredential::Session(
+                AuthSessionId::from_bytes([0xE9; 16]),
+            )),
+        );
+        let budget = CallBudget {
+            request: RequestId::from_bytes([0xE6; 16]),
+            cancellation: Cancellation::default(),
+            remaining: Duration::from_secs(5),
+        };
+        let account = AccountContext::new(auth.clone(), budget.clone());
+        let fenced = SpaceContext::new(auth, rec.scope.clone(), budget)
+            .unwrap()
+            .with_canonical_effect(&account, Arc::new(ToggleReg(Arc::clone(&revoked))))
+            .unwrap();
+        let effect = fenced.canonical_effect().cloned();
+
+        let phantom_rev = RevisionId::from_bytes([0xE7; 16]);
+        let slot0 = BatchWriteIntent::from(PreparedWriteIntent {
+            scope: rec.scope.clone(),
+            active_epoch: epoch,
+            idempotency: None,
+            source_note_ids: Vec::new(),
+            staged_bytes: 0,
+            required_semantic_cut: None,
+            execute: Box::new(|_tx, _ctx| {
+                Box::pin(async move {
+                    Err(DomainError::PathConflict {
+                        target: PathTarget {
+                            space_id: SpaceId::from_bytes([0xE1; 16]),
+                            parent: None,
+                            component: "already-taken".into(),
+                        },
+                    }
+                    .into())
+                })
+            }),
+        });
+        let slot1 = BatchWriteIntent {
+            prepared: PreparedWriteIntent {
+                scope: rec.scope.clone(),
+                active_epoch: epoch,
+                idempotency: None,
+                source_note_ids: Vec::new(),
+                staged_bytes: 0,
+                required_semantic_cut: None,
+                execute: Box::new(|tx, item_ctx| {
+                    Box::pin(async move {
+                        let BackendConn::Sqlite(conn) = tx else {
+                            unreachable!()
+                        };
+                        sqlx::query("INSERT INTO batch_probe(v) VALUES (42)")
+                            .execute(&mut **conn)
+                            .await
+                            .unwrap();
+                        let seq = item_ctx.alloc_next_seq()?;
+                        Ok(ItemCommitArtifacts {
+                            command_id: "cmd_peer_revoke".into(),
+                            command_kind: "test_peer_revoke".into(),
+                            events: vec![BatchEventDraft {
+                                space_seq: seq,
+                                entity_type: "note".into(),
+                                entity_id: NoteId::from_bytes([0xE8; 16]).to_string(),
+                                op_kind: "edit".into(),
+                                rev_id: RevisionId::from_bytes([0xE8; 16]),
+                                lifecycle: Lifecycle::Active,
+                                doc_class: Some(DocClass::UserDoc),
+                            }],
+                            change_payload: None,
+                            receipt_detail_blob: None,
+                            receipt_sanitized_blob: Vec::new(),
+                            receipt_owner_note_ids: Vec::new(),
+                            response_bytes: vec![1],
+                        })
+                    })
+                }),
+            },
+            room_wal: None,
+            canonical_effect: effect,
+        };
+        let revoked_flip = Arc::clone(&revoked);
+        let slot2 = BatchWriteIntent::from(PreparedWriteIntent {
+            scope: rec.scope.clone(),
+            active_epoch: epoch,
+            idempotency: None,
+            source_note_ids: Vec::new(),
+            staged_bytes: 0,
+            required_semantic_cut: None,
+            execute: Box::new(move |tx, _ctx| {
+                Box::pin(async move {
+                    let BackendConn::Sqlite(conn) = tx else {
+                        unreachable!()
+                    };
+                    let seen: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM batch_probe")
+                        .fetch_one(&mut **conn)
+                        .await
+                        .unwrap();
+                    assert_eq!(seen, 1, "slot 2 observes slot 1's uncommitted write");
+                    revoked_flip.store(true, AtomicOrdering::SeqCst);
+                    Err(DomainError::RevisionConflict {
+                        current: phantom_rev,
+                        lineage: None,
+                    }
+                    .into())
+                })
+            }),
+        });
+
+        let outcome = {
+            let mut guard = match &store.inner.sql {
+                SqlDriverState::Sqlite { writer, .. } => writer.lock().await,
+                SqlDriverState::Postgres { .. } => unreachable!(),
+            };
+            let pair = guard.as_mut().expect("open sqlite writer");
+            let mut backend = BackendConn::Sqlite(&mut pair.sqlx_conn);
+            execute_batch_on_conn(
+                &store,
+                &mut backend,
+                vec![slot0, slot1, slot2],
+                &[],
+                WriterConfig::default(),
+                &WriterFaultState::default(),
+            )
+            .await
+        };
+
+        let BatchExecOutcome::Committed { slots, .. } = outcome else {
+            panic!("expected Committed outcome carrying per-slot peer revocation errors");
+        };
+        assert_eq!(slots.len(), 3);
+        assert!(
+            matches!(
+                &slots[0],
+                ItemOutcomeSlot::Failed(PortError::Domain(DomainError::PathConflict { .. }))
+            ),
+            "slot 0 failed before any uncommitted mutation and must retain its genuine DomainError"
+        );
+        assert!(
+            matches!(
+                &slots[1],
+                ItemOutcomeSlot::Failed(PortError::Domain(DomainError::AccessDenied))
+            ),
+            "revoked slot 1 must receive its revocation error"
+        );
+        assert!(
+            matches!(
+                &slots[2],
+                ItemOutcomeSlot::Failed(PortError::Unavailable(_))
+            ),
+            "slot 2 observed slot 1's rolled-back write and must be rewritten to retryable Unavailable instead of phantom RevisionConflict"
+        );
+        let persisted: i64 = store
+            .with_write_tx(|tx| {
+                Box::pin(async move {
+                    let BackendConn::Sqlite(conn) = tx else {
+                        unreachable!()
+                    };
+                    Ok(sqlx::query_scalar("SELECT COUNT(*) FROM batch_probe")
+                        .fetch_one(&mut **conn)
+                        .await
+                        .unwrap())
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(persisted, 0, "rolled-back batch must persist zero rows");
+
         drop(store);
         runtime.shutdown().await.unwrap();
         std::fs::remove_dir_all(root).unwrap();

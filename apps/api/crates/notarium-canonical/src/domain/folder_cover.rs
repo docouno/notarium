@@ -1,5 +1,7 @@
 use notarium_core::{
     DomainError,
+    auth::{EngineAuthContext, Space},
+    classes::DocClass,
     error::{PortError, ValidationReason},
     ids::{AgentRunId, FolderId, NoteId, PrincipalId, SpaceSeq},
     model::HistoryScope,
@@ -20,7 +22,25 @@ use crate::{
 pub(crate) const SLUG: &str = "index";
 
 pub(super) fn validate_create(input: &CreateNote) -> Result<String, PortError> {
+    if input.folder_page && input.class != DocClass::UserDoc {
+        return Err(DomainError::validation(ValidationReason::InvalidState).into());
+    }
     validate_new_slug(&input.slug, input.folder_page)
+}
+
+pub(super) async fn authorize_cover_folder_mutation_tx(
+    tx: &mut BackendConn<'_>,
+    space: &Space,
+    auth: &EngineAuthContext,
+    folder: &FolderId,
+    require_active: bool,
+) -> Result<(), PortError> {
+    let class = super::folders::folder_mutation_class(auth, &space.id)?;
+    let (facts, _) =
+        super::common::build_resource_facts_tx(tx, space, folder, class, None, require_active)
+            .await?;
+    auth.authorize_direct_write(&facts, &facts)?;
+    Ok(())
 }
 
 pub(super) fn validate_new_slug(slug: &str, folder_page: bool) -> Result<String, PortError> {

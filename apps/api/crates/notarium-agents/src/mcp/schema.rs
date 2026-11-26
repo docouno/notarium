@@ -329,12 +329,12 @@ impl ToolName {
             MoveNote => vec![req("ref", key()), req("toFolder", path())],
             RenameNote => vec![req("ref", key()), req("title", key())],
             MoveFolder => vec![
-                req("folder", key()),
+                req("folder", string(1, 4096)),
                 req("toFolder", path()),
                 opt("project", key()),
             ],
             RenameFolder => vec![
-                req("folder", key()),
+                req("folder", string(1, 4096)),
                 req("name", key()),
                 opt("project", key()),
             ],

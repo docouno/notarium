@@ -2300,6 +2300,16 @@ fn build_trash_or_restore_intent(
                 } else {
                     None
                 };
+                if cover_target.is_some() {
+                    super::folder_cover::authorize_cover_folder_mutation_tx(
+                        tx,
+                        &live_space.space,
+                        &auth,
+                        &head.parent_folder_id,
+                        target_lc == Lifecycle::Active,
+                    )
+                    .await?;
+                }
                 let total_seqs = if cover_target.is_some() { 2 } else { 1 };
                 let (_first_seq, visibility_seq) = item_ctx.preview_seq_range(total_seqs)?;
                 let seq = item_ctx.alloc_next_seq()?;
@@ -2892,6 +2902,29 @@ fn build_move_note_intent(
                     &input.slug,
                     folder_page,
                 )?;
+                let move_cover = folder_page && dest_parent != head.parent_folder_id;
+                let dest_cover_changes =
+                    move_cover && after_anc.cover_note.as_ref() != Some(&note_id);
+                if move_cover {
+                    super::folder_cover::authorize_cover_folder_mutation_tx(
+                        tx,
+                        &live_space.space,
+                        &auth,
+                        &head.parent_folder_id,
+                        true,
+                    )
+                    .await?;
+                    if dest_cover_changes {
+                        super::folder_cover::authorize_cover_folder_mutation_tx(
+                            tx,
+                            &live_space.space,
+                            &auth,
+                            &dest_parent,
+                            true,
+                        )
+                        .await?;
+                    }
+                }
 
                 if (dest_parent != head.parent_folder_id || new_slug_fold != head.slug_fold)
                     && active_note_sibling_exists_tx(
@@ -2957,9 +2990,6 @@ fn build_move_note_intent(
                 };
                 let final_title_fold = normalize_title_key(&final_title);
 
-                let move_cover = folder_page && dest_parent != head.parent_folder_id;
-                let dest_cover_changes =
-                    move_cover && after_anc.cover_note.as_ref() != Some(&note_id);
                 let total_seqs = 1 + u64::from(move_cover) + u64::from(dest_cover_changes);
                 let (_first_seq, visibility_seq) = item_ctx.preview_seq_range(total_seqs)?;
                 let seq = item_ctx.alloc_next_seq()?;

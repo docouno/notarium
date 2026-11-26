@@ -213,13 +213,13 @@ async fn postgres_centralized_control_and_delta_taint_isolation() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sqlite_control_replay_and_taint_hardening() {
     let _guard = support::AUTH_TEST_LOCK.lock().await;
-    Box::pin(run_control_replay_and_taint_hardening(false)).await;
+    box_step(|| run_control_replay_and_taint_hardening(false)).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn postgres_control_replay_and_taint_hardening() {
     let _guard = support::AUTH_TEST_LOCK.lock().await;
-    Box::pin(run_control_replay_and_taint_hardening(true)).await;
+    box_step(|| run_control_replay_and_taint_hardening(true)).await;
 }
 
 async fn run_centralized_control_and_delta_taint_isolation(pg: bool) {
@@ -16437,6 +16437,46 @@ async fn run_control_replay_and_taint_hardening(pg: bool) {
     })
     .await;
 
+    let part_i_owner = fresh_owner(&fixture).await;
+    let part_i_s2_epoch = fixture
+        .canonical
+        .read_space(&s2.history.space_id)
+        .await
+        .unwrap()
+        .active_epoch;
+    let part_i_s2_sc =
+        SpaceContext::new(part_i_owner.auth().clone(), s2.history.clone(), budget()).unwrap();
+    let part_i_handles = box_step(|| {
+        verify_part_i_paths_and_subtree(
+            &fixture,
+            &part_i_owner,
+            &actor,
+            &s2.history,
+            part_i_s2_epoch,
+            &part_i_s2_sc,
+            &s2_p1,
+        )
+    })
+    .await;
+    box_step(|| {
+        verify_part_i_locks_and_rollback(
+            &fixture,
+            &part_i_owner,
+            &actor,
+            &s2.history,
+            part_i_s2_epoch,
+            &part_i_s2_sc,
+            &s2_p1,
+            personal.scope(),
+            part_i_handles,
+        )
+    })
+    .await;
+    box_step(|| {
+        verify_part_i_mcp_hardening(&fixture, &part_i_owner, &actor, &s2.history, &s2.slug)
+    })
+    .await;
+
     fixture.close().await;
 }
 
@@ -26339,10 +26379,36 @@ async fn hardened_retry_legacy_and_recent_eviction_seams(
         !authoring_auth.taint().is_tainted(),
         "list_abilities(view: authoring) skipping unconsented Space s2 must not taint pinned Space"
     );
+}
 
-    // Part I: Pre-lookup path syntax validation on `move_folder`/`rename_folder`/`create_note`,
-    // aligned 4096-byte `search`/`recall` schema validation, and `move_folder`/`rename_folder`/
-    // `rename_project` subtree authorization for `write_locked`, `EncryptedNote`, and `Skill` descendants.
+struct PartISubtreeHandles {
+    mv_ok_parent: FolderId,
+    mv_ok_child: FolderId,
+    mv_enc_parent: FolderId,
+    mv_skill_parent: FolderId,
+    s2_agent_sc: SpaceContext,
+}
+
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+async fn verify_part_i_paths_and_subtree(
+    fixture: &RuntimeFixture,
+    owner: &AccountContext,
+    actor: &PrincipalId,
+    s2_history: &HistoryScope,
+    s2_epoch: LeaseEpoch,
+    s2_sc: &SpaceContext,
+    s2_p1: &FolderRef,
+) -> PartISubtreeHandles {
+    let owner = owner.clone();
+    let actor = actor.clone();
+    let s2_sc = s2_sc.clone();
+    struct S2Ref<'a> {
+        history: &'a HistoryScope,
+    }
+    let s2 = S2Ref {
+        history: s2_history,
+    };
     for (tag, tool, args) in [
         (
             1u8,
@@ -26854,6 +26920,45 @@ async fn hardened_retry_legacy_and_recent_eviction_seams(
         ),
         "replaying rename_folder after descendant write lock must fail SpaceReadOnly, got {replay_after_lock:?}"
     );
+    PartISubtreeHandles {
+        mv_ok_parent,
+        mv_ok_child,
+        mv_enc_parent,
+        mv_skill_parent,
+        s2_agent_sc,
+    }
+}
+
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+async fn verify_part_i_locks_and_rollback(
+    fixture: &RuntimeFixture,
+    owner: &AccountContext,
+    actor: &PrincipalId,
+    s2_history: &HistoryScope,
+    s2_epoch: LeaseEpoch,
+    s2_sc: &SpaceContext,
+    s2_p1: &FolderRef,
+    pscope: &HistoryScope,
+    handles: PartISubtreeHandles,
+) {
+    let PartISubtreeHandles {
+        mv_ok_parent,
+        mv_ok_child,
+        mv_enc_parent,
+        mv_skill_parent,
+        s2_agent_sc,
+    } = handles;
+    let owner = owner.clone();
+    let actor = actor.clone();
+    let s2_sc = s2_sc.clone();
+    let pscope = pscope.clone();
+    struct S2Ref<'a> {
+        history: &'a HistoryScope,
+    }
+    let s2 = S2Ref {
+        history: s2_history,
+    };
     // 5. set_folder_write_lock enforces strict-ancestor lock, strict-descendant lock, and subtree class/ability authority.
     let lock_under_locked_parent = fixture
         .canonical
@@ -27256,6 +27361,320 @@ async fn hardened_retry_legacy_and_recent_eviction_seams(
             Err(PortError::Domain(DomainError::ResourceNotFound))
         ),
         "write-only caller without read permission must not roll back note-only run, got {rb_view_err:?}"
+    );
+}
+
+#[inline(never)]
+async fn verify_part_i_mcp_hardening(
+    fixture: &RuntimeFixture,
+    owner: &AccountContext,
+    actor: &PrincipalId,
+    s2_history: &HistoryScope,
+    s2_slug: &str,
+) {
+    let owner = owner.clone();
+    let actor = actor.clone();
+    struct S2Ref<'a> {
+        history: &'a HistoryScope,
+        slug: &'a str,
+    }
+    let s2 = S2Ref {
+        history: s2_history,
+        slug: s2_slug,
+    };
+    // 8. `create_notes` batch `toTitle` resolution must never bind a note's own title into a self-ID link.
+    let s2_p1_handle = format!("{}/h-s2-p1", s2.slug);
+    let self_created = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xF0, 9, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "create_notes",
+        json!({
+            "project": s2_p1_handle,
+            "notes": [{
+                "title": "SelfRef",
+                "body": "Body text",
+                "links": [{ "relation": "ref", "toTitle": "SelfRef" }]
+            }]
+        }),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    let self_note_id = self_created["results"][0]["noteId"]
+        .as_str()
+        .expect("created noteId")
+        .to_owned();
+    let self_note_doc = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xF0, 9, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
+        "get_note",
+        json!({ "ref": self_note_id }),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    let self_content = self_note_doc["content"].as_str().unwrap_or_default();
+    assert!(
+        !self_content.contains(&format!("[[{self_note_id}|")),
+        "create_notes must not rewrite self-title link into persisted self-ID link: {self_content}"
+    );
+    // 9. No-op `rename_folder` (including trailing slash normalization) must enforce live
+    //    subtree ability & write-lock authorization identical to mutating calls.
+    let pat_no_ab_rev = fixture
+        .control
+        .account(owner.clone(), actor.clone())
+        .await
+        .unwrap()
+        .revision;
+    let pat_no_ab_created = fixture
+        .control
+        .create_pat(
+            owner.clone(),
+            CreatePat {
+                name: "s2-no-ability-write-pat".into(),
+                scope: BearerScope::Write,
+                ability_write: false,
+                selected_spaces: Some(vec![s2.history.space_id.clone()]),
+                expires_at_ms: None,
+                expected: pat_no_ab_rev,
+            },
+        )
+        .await
+        .unwrap();
+    let pat_no_ab_auth = fixture
+        .control
+        .resolve(PreAuthContext {
+            budget: budget(),
+            evidence: AuthEvidence::new(
+                AuthEvidenceKind::Pat,
+                pat_no_ab_created.value.token.expose().to_owned(),
+            ),
+        })
+        .await
+        .unwrap();
+    let noop_no_ab_acct = AccountContext::new(pat_no_ab_auth, budget());
+    let noop_skill = call_mcp(
+        &fixture.registry,
+        &noop_no_ab_acct,
+        [0xF0, 9, 12, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
+        "rename_folder",
+        json!({
+            "project": s2_p1_handle,
+            "folder": "mv-skill-parent/",
+            "name": "mv-skill-parent"
+        }),
+    )
+    .await;
+    assert!(
+        matches!(
+            noop_skill,
+            Err(PortError::Domain(DomainError::AbilityWriteForbidden))
+        ),
+        "no-op rename_folder on folder containing Skill note without AbilityWrite must fail AbilityWriteForbidden, got {:?}",
+        noop_skill.err()
+    );
+    let noop_lock = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xF0, 9, 12, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3],
+        "rename_folder",
+        json!({
+            "project": s2_p1_handle,
+            "folder": "mv-lock-parent/",
+            "name": "mv-lock-parent"
+        }),
+    )
+    .await;
+    assert!(
+        matches!(
+            noop_lock,
+            Err(PortError::Domain(DomainError::SpaceReadOnly))
+        ),
+        "no-op rename_folder on folder with write-locked descendant must fail SpaceReadOnly, got {:?}",
+        noop_lock.err()
+    );
+    // 10. `use_role` on a closed episode with the exact same active role & project must fail InvalidState.
+    let closed_role = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xF0, 9, 12, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "create_ability",
+        json!({
+            "kind": "role",
+            "name": "closed-ep-role",
+            "description": "closed episode check",
+            "instructions": "test role",
+            "placement": { "home": "personal" }
+        }),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    let closed_ep = EpisodeId::from_bytes([0xF0, 9, 12, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+    let mut ep_start_id = identity(fixture, &owner, 0xA1).await;
+    ep_start_id.key = CommandKey::from_bytes([0xF0, 9, 12, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5]);
+    let started_ep = fixture
+        .control
+        .start_or_resume_episode(
+            owner.clone(),
+            AccountMutation {
+                identity: ep_start_id,
+                input: StartEpisode {
+                    selector: EpisodeSelector::New {
+                        requested: closed_ep.clone(),
+                        name: None,
+                    },
+                    project_hint: None,
+                    guard: EpisodeRevisionGuard::Account,
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    let EpisodeStartResult::New(_) = started_ep else {
+        panic!("expected new episode");
+    };
+    call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xF0, 9, 12, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3],
+        "use_role",
+        json!({ "role": "closed-ep-role", "session": closed_ep }),
+    )
+    .await
+    .unwrap();
+    let live_ep = fixture
+        .control
+        .get_episode(owner.clone(), closed_ep.clone())
+        .await
+        .unwrap();
+    let mut ep_close_id = identity(fixture, &owner, 0xA2).await;
+    ep_close_id.key = CommandKey::from_bytes([0xF0, 9, 12, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6]);
+    fixture
+        .control
+        .update_episode(
+            owner.clone(),
+            AccountMutation {
+                identity: ep_close_id,
+                input: EpisodeMutation::Full(EpisodeUpdate {
+                    episode: closed_ep.clone(),
+                    expected: live_ep.revision,
+                    name: live_ep.name,
+                    project_hint: live_ep.project_hint,
+                    active_role: live_ep.active_role,
+                    lifecycle: EpisodeLifecycle::Closed,
+                }),
+            },
+        )
+        .await
+        .unwrap();
+    let closed_use_role = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xF0, 9, 12, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4],
+        "use_role",
+        json!({ "role": "closed-ep-role", "session": closed_ep }),
+    )
+    .await;
+    assert!(
+        matches!(
+            closed_use_role,
+            Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
+                if diagnostic.reason == ValidationReason::InvalidState
+        ),
+        "use_role on closed episode with identical active_role must fail InvalidState, got {:?}",
+        closed_use_role.err()
+    );
+    let _ = closed_role;
+    // 11. Replayed ExternalMcp `edit_note` enforces current write authority, and replayed
+    //     trashed-source `link` enforces taint before metadata lookup.
+    let edit_replay_key = [0xF0, 9, 12, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    let edit_replay_args = json!({
+        "ref": self_note_id,
+        "operation": "append",
+        "content": "\nUpdated line\n"
+    });
+    call_mcp(
+        &fixture.registry,
+        &owner,
+        edit_replay_key,
+        "edit_note",
+        edit_replay_args.clone(),
+    )
+    .await
+    .unwrap();
+    let mut no_userdoc_write = noop_no_ab_acct.auth().spaces().clone();
+    if let Some(g) = no_userdoc_write.get_mut(&s2.history.space_id) {
+        g.write_classes.remove(&DocClass::UserDoc);
+    }
+    let no_write_acct = AccountContext::new(
+        noop_no_ab_acct
+            .auth()
+            .for_pat(no_userdoc_write)
+            .expect("narrow PAT write_classes"),
+        budget(),
+    );
+    let edit_replay_err = call_mcp(
+        &fixture.registry,
+        &no_write_acct,
+        edit_replay_key,
+        "edit_note",
+        edit_replay_args,
+    )
+    .await;
+    assert!(
+        matches!(
+            edit_replay_err,
+            Err(PortError::Domain(DomainError::SpaceReadOnly))
+        ),
+        "replaying ExternalMcp edit_note after UserDoc write revocation must fail SpaceReadOnly, got {:?}",
+        edit_replay_err.err()
+    );
+    let link_replay_key = [0xF0, 9, 12, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3];
+    let link_replay_args = json!({
+        "from": self_note_id,
+        "relation": "references",
+        "toTitle": "Some Target"
+    });
+    call_mcp(
+        &fixture.registry,
+        &owner,
+        link_replay_key,
+        "link",
+        link_replay_args.clone(),
+    )
+    .await
+    .unwrap();
+    call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xF0, 9, 12, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4],
+        "delete_note",
+        json!({ "ref": self_note_id }),
+    )
+    .await
+    .unwrap();
+    let tainted_auth = owner.auth().with_staged_taint();
+    tainted_auth.taint().mark_external_read();
+    let tainted_acct = AccountContext::new(tainted_auth, budget());
+    let trashed_link_replay_err = call_mcp(
+        &fixture.registry,
+        &tainted_acct,
+        link_replay_key,
+        "link",
+        link_replay_args,
+    )
+    .await;
+    assert!(
+        matches!(
+            trashed_link_replay_err,
+            Err(PortError::Domain(DomainError::CrossSpaceTainted))
+        ),
+        "replaying trashed-source link while tainted must fail CrossSpaceTainted upfront, got {:?}",
+        trashed_link_replay_err.err()
     );
 }
 

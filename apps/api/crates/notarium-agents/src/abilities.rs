@@ -212,6 +212,16 @@ impl<C: ControlCatalogPort + ?Sized> ControlCatalogPort for SystemAbilityCatalog
         self.owned.trashed_folder_ancestry(ctx, reference)
     }
 
+    fn authorize_folder_subtree_write(
+        &self,
+        ctx: SpaceContext,
+        folder: FolderId,
+        expected: RevisionId,
+    ) -> PortFuture<'_, ()> {
+        self.owned
+            .authorize_folder_subtree_write(ctx, folder, expected)
+    }
+
     fn abilities(
         &self,
         ctx: AccountContext,

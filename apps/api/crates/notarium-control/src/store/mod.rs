@@ -759,7 +759,11 @@ impl WriteResources {
         drop(_guard);
         drop(_admission);
         result?;
-        fence_result
+        // `tx.commit()` is already durable and `fence.release(self)` closed the
+        // file descriptor on return, releasing the OS lock; do not misreport
+        // `CommitEffect::NotCommitted` after a committed write.
+        let _ = fence_result;
+        Ok(())
     }
 }
 pub(crate) struct WriteTransaction {

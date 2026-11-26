@@ -2167,7 +2167,10 @@ async fn check_rollback_destination_authority(
     let before = store.read_space(&scope.space_id).await.unwrap().last_seq;
     let denied = store.rollback_agent_run(pinned, rollback.clone()).await;
     assert!(
-        matches!(denied, Err(PortError::Domain(DomainError::SpaceReadOnly))),
+        matches!(
+            denied,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ),
         "out-of-project rollback destination: {denied:?}"
     );
     assert_eq!(

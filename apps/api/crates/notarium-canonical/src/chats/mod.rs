@@ -3600,7 +3600,11 @@ async fn append_chat_tx(
             auth.authorize_read(&facts)?;
             owner_notes.push(nref.note_id.clone());
         } else {
-            if !auth.spaces().contains_key(&nref.space_id) {
+            if auth
+                .spaces()
+                .get(&nref.space_id)
+                .is_none_or(|g| g.read_classes.is_empty())
+            {
                 return Err(DomainError::ResourceNotFound.into());
             }
             auth.taint().mark_external_read();

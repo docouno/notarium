@@ -2215,7 +2215,8 @@ fn build_rollback_execute_fn(
                             .get(&nid)
                             .cloned()
                             .unwrap_or(None);
-                        if expected_post.as_ref() == Some(&ov.group) {
+                        let same_group = expected_post.as_ref() == Some(&ov.group);
+                        if same_group && ov.placement_run_id.is_some() {
                             continue;
                         }
                         match expected_post {
@@ -2234,6 +2235,9 @@ fn build_rollback_execute_fn(
                                 } else {
                                     None
                                 };
+                                if same_group && mat_seq.is_none() {
+                                    continue;
+                                }
                                 let stale_before = match (note_first_run_seq(&nid), mat_seq) {
                                     (Some(a), Some(b)) => Some(a.min(b)),
                                     (a, b) => a.or(b),
@@ -2291,9 +2295,6 @@ fn build_rollback_execute_fn(
                             .iter()
                             .find(|g| g.rows.iter().any(|r| r.note == nid))
                             .map(|g| g.group.clone());
-                        if current_group.as_ref() == Some(&ov.group) {
-                            continue;
-                        }
                         let Some(mat_seq) = run_materialized_overlay_seq_tx(
                             tx,
                             &scope_cl.space_id,
@@ -2501,7 +2502,7 @@ fn build_rollback_execute_fn(
                                                 },
                                             );
                                             continue;
-                                        } else if group_changed {
+                                        } else if group_changed || before_mat_seq.is_some() {
                                             target_final_state.insert(
                                                 target.clone(),
                                                 TargetSettlement::ClearOverlay,
@@ -2539,7 +2540,8 @@ fn build_rollback_execute_fn(
                                         match g_items.iter().position(|it| &it.note_id == pred_id) {
                                             Some(pos) => Some(pos),
                                             None if eligible_all_ids.contains(pred_id)
-                                                || view_restored =>
+                                                || view_restored
+                                                || !is_earliest =>
                                             {
                                                 None
                                             }
@@ -2558,7 +2560,8 @@ fn build_rollback_execute_fn(
                                         match g_items.iter().position(|it| &it.note_id == succ_id) {
                                             Some(pos) => Some(pos),
                                             None if eligible_all_ids.contains(succ_id)
-                                                || view_restored =>
+                                                || view_restored
+                                                || !is_earliest =>
                                             {
                                                 None
                                             }
@@ -2585,7 +2588,11 @@ fn build_rollback_execute_fn(
                                             let succ_eligible = successor
                                                 .as_ref()
                                                 .is_some_and(|id| eligible_all_ids.contains(id));
-                                            if !pred_eligible && !succ_eligible && !view_restored {
+                                            if !pred_eligible
+                                                && !succ_eligible
+                                                && !view_restored
+                                                && is_earliest
+                                            {
                                                 return Err(DomainError::validation(
                                                     ValidationReason::InvalidState,
                                                 )

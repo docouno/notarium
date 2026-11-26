@@ -29,22 +29,32 @@ const PG_HISTORICAL_CHILDREN: &str = candidate_probe!(
 // Each arm seeks directly into (space, parent, lifecycle, folder_id). Merging
 // the three ordered streams keeps the continuation stable across trash/restore.
 macro_rules! heads {
-    ($state:literal) => {
+    ($state:literal, $cmp:literal) => {
         concat!(
             "SELECT folder_id FROM folder_heads WHERE space_id=$1 AND created_seq <= $2
-            AND parent_folder_id=$3 AND folder_id > $4 AND lifecycle_state='",
+            AND parent_folder_id=$3 AND ",
+            $cmp,
+            " > $4 AND lifecycle_state='",
             $state,
             "' "
         )
     };
 }
-const HEADS: &str = concat!(
-    heads!("active"),
+const HEADS_SQLITE: &str = concat!(
+    heads!("active", "folder_id"),
     "UNION ALL ",
-    heads!("trashed"),
+    heads!("trashed", "folder_id"),
     "UNION ALL ",
-    heads!("purged"),
+    heads!("purged", "folder_id"),
     "ORDER BY folder_id LIMIT 200"
+);
+const HEADS_PG: &str = concat!(
+    heads!("active", "folder_id COLLATE \"C\""),
+    "UNION ALL ",
+    heads!("trashed", "folder_id COLLATE \"C\""),
+    "UNION ALL ",
+    heads!("purged", "folder_id COLLATE \"C\""),
+    "ORDER BY folder_id COLLATE \"C\" LIMIT 200"
 );
 
 // Alias keys are append-only. Use the primary key order, including its
@@ -156,12 +166,16 @@ async fn candidate_page(
     let cut = cutoff.get() as i64;
     match at {
         ChildCursor::Heads(after) => {
+            let sql = match tx {
+                BackendConn::Sqlite(_) => HEADS_SQLITE,
+                BackendConn::Postgres(_) => HEADS_PG,
+            };
             let keys = read_rows!(
                 tx,
                 fetch_all,
                 "historical_child_heads",
                 (String,),
-                HEADS,
+                sql,
                 space,
                 cut,
                 parent.as_str(),
@@ -260,7 +274,7 @@ fn historical_children_seek_the_requested_parents_among_unrelated_folders() {
         "a leaf lookup must not visit unrelated folder heads"
     );
 
-    for (sql, parent) in [(HEADS, "unrelated"), (ALIASES, "old")] {
+    for (sql, parent) in [(HEADS_SQLITE, "unrelated"), (ALIASES, "old")] {
         let mut page = db.prepare(sql).unwrap();
         for (name, value) in [("$1", "s"), ("$3", parent), ("$4", "f8000")] {
             page.raw_bind_parameter(page.parameter_index(name).unwrap().unwrap(), value)

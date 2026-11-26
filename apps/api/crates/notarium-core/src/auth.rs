@@ -1167,15 +1167,27 @@ impl EngineAuthContext {
         after: &ResourceFacts,
     ) -> DomainResult<()> {
         for resource in [before, after] {
-            self.authorize_space_write(&resource.space)?;
-            let grant = &self.spaces[&resource.space.id];
-            if resource.folder_write_locked
-                || !grant.write_classes.contains(&resource.class)
-                || grant
+            let grant = self
+                .spaces
+                .get(&resource.space.id)
+                .ok_or(DomainError::ResourceNotFound)?;
+            let is_pinned_ability = resource
+                .ability_package
+                .as_ref()
+                .is_some_and(|id| self.readonly_abilities.contains(id));
+            if resource.space.lifecycle == SpaceLifecycle::Active
+                && (grant
                     .project_root
                     .as_ref()
                     .is_some_and(|root| !resource.ancestor_folders.contains(root))
+                    || (matches!(self.kind, PrincipalKind::Keeper(_))
+                        && resource.class == DocClass::Skill
+                        && !is_pinned_ability))
             {
+                return Err(DomainError::ResourceNotFound);
+            }
+            self.authorize_space_write(&resource.space)?;
+            if resource.folder_write_locked || !grant.write_classes.contains(&resource.class) {
                 return Err(DomainError::SpaceReadOnly);
             }
             if resource.class == DocClass::Skill || resource.ability_package.is_some() {

@@ -3557,6 +3557,572 @@ async fn rollback_skipped_replay_and_oracle_views(
         human_pos < prior_pos && prior_pos < other_pos,
         "todo order must remain [u_human, u_prior_run, u_other] after rollback: {todo_ids_7d:?}"
     );
+
+    // Case 7E: In-run round-trip overlay clobbering (`stale_non_moved` & `stale_untouched`),
+    // originally-unranked moved card materialized in-run (`ClearOverlay`), and non-earliest
+    // pass-through column anchor mutation (must not abort rollback with `InvalidState`).
+    let proj7e = folder(store, &owner, None, "rb-roundtrip-proj", true)
+        .await
+        .unwrap();
+    let (v7e, v7e_rev) = create_view(
+        store,
+        &owner,
+        &proj7e,
+        "rb-roundtrip-board",
+        "board",
+        "{scope: project}",
+        "group_by: status\nfilter: {exists: status}\n",
+    )
+    .await;
+    let u_rt_nonmoved = create_note(
+        store,
+        &owner,
+        Some(proj7e.clone()),
+        "z-rt-nonmoved",
+        "---\ntitle: Z-RtNonMoved\nstatus: todo\npriority: p1\n---\n".into(),
+    )
+    .await;
+    let u_rt_untouched = create_note(
+        store,
+        &owner,
+        Some(proj7e.clone()),
+        "y-rt-untouched",
+        "---\ntitle: Y-RtUntouched\nstatus: todo\npriority: p1\n---\n".into(),
+    )
+    .await;
+    let u_tail = create_note(
+        store,
+        &owner,
+        Some(proj7e.clone()),
+        "a-rt-tail",
+        "---\ntitle: A-RtTail\nstatus: todo\npriority: p1\n---\n".into(),
+    )
+    .await;
+    let u_mid = create_note(
+        store,
+        &owner,
+        Some(proj7e.clone()),
+        "d-rt-mid",
+        "---\ntitle: D-RtMid\nstatus: review\npriority: p2\n---\n".into(),
+    )
+    .await;
+    let m_helper = create_note(
+        store,
+        &owner,
+        Some(proj7e.clone()),
+        "e-rt-helper",
+        "---\ntitle: E-RtHelper\nstatus: doing\npriority: p1\n---\n".into(),
+    )
+    .await;
+    sync(store, runtime, &scope).await;
+    // Human pre-run ranks `u_rt_nonmoved` before `u_tail` and `u_rt_untouched` before `u_tail` in `todo`.
+    store
+        .move_board_card(
+            owner.clone(),
+            mutation(
+                &owner,
+                MoveBoardCard {
+                    view: v7e.clone(),
+                    note: u_rt_nonmoved.note.clone(),
+                    group: group("todo"),
+                    before: Some(RankNeighbor {
+                        note: u_tail.note.clone(),
+                        expected_rank: RankExpectation::Absent,
+                    }),
+                    after: None,
+                    fields: BTreeMap::new(),
+                    expected_note: u_rt_nonmoved.revision.clone(),
+                    expected_view: v7e_rev.revision.clone(),
+                    expected_rank: RankExpectation::Absent,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    sync(store, runtime, &scope).await;
+    let pre_ov_step1 = store
+        .inspect_view_overlays_for_test(&scope.space_id, &v7e)
+        .await
+        .unwrap();
+    store
+        .move_board_card(
+            owner.clone(),
+            mutation(
+                &owner,
+                MoveBoardCard {
+                    view: v7e.clone(),
+                    note: u_rt_untouched.note.clone(),
+                    group: group("todo"),
+                    before: Some(RankNeighbor {
+                        note: u_tail.note.clone(),
+                        expected_rank: RankExpectation::Existing(
+                            pre_ov_step1[&u_tail.note].rank_rev_id.clone(),
+                        ),
+                    }),
+                    after: Some(RankNeighbor {
+                        note: u_rt_nonmoved.note.clone(),
+                        expected_rank: RankExpectation::Existing(
+                            pre_ov_step1[&u_rt_nonmoved.note].rank_rev_id.clone(),
+                        ),
+                    }),
+                    fields: BTreeMap::new(),
+                    expected_note: u_rt_untouched.revision.clone(),
+                    expected_view: v7e_rev.revision.clone(),
+                    expected_rank: pre_ov_step1
+                        .get(&u_rt_untouched.note)
+                        .map_or(RankExpectation::Absent, |o| {
+                            RankExpectation::Existing(o.rank_rev_id.clone())
+                        }),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let m_unranked = create_note(
+        store,
+        &owner,
+        Some(proj7e.clone()),
+        "b-rt-unranked",
+        "---\ntitle: B-RtUnranked\nstatus: todo\npriority: p2\n---\n".into(),
+    )
+    .await;
+    let m_pass = create_note(
+        store,
+        &owner,
+        Some(proj7e.clone()),
+        "c-rt-pass",
+        "---\ntitle: C-RtPass\nstatus: todo\npriority: p2\n---\n".into(),
+    )
+    .await;
+    sync(store, runtime, &scope).await;
+    let pre_ov_7e = store
+        .inspect_view_overlays_for_test(&scope.space_id, &v7e)
+        .await
+        .unwrap();
+    let rt_nonmoved_pre_ov = pre_ov_7e[&u_rt_nonmoved.note].clone();
+    let rt_untouched_pre_ov = pre_ov_7e[&u_rt_untouched.note].clone();
+    assert!(!pre_ov_7e.contains_key(&m_unranked.note));
+
+    let run7e = AgentRunId::from_bytes(random_bytes());
+    let agent7e = super::agent(&owner, run7e.clone(), ChatAudience::Personal);
+    // 1. Agent edits `u_rt_nonmoved` todo -> doing, moves `m_helper` in doing (materializing `u_rt_nonmoved` in doing),
+    //    edits `u_rt_nonmoved` back doing -> todo, then moves `m_helper` into todo (clobbering `u_rt_nonmoved` at tail
+    //    of todo AND materializing `m_unranked` in todo).
+    let rt_text_todo = "---\ntitle: Z-RtNonMoved\nstatus: todo\npriority: p1\n---\n";
+    let rt_text_doing = "---\ntitle: Z-RtNonMoved\nstatus: doing\npriority: p1\n---\n";
+    let rt_todo_an =
+        notarium_syntax::frontmatter::analyze(rt_text_todo, DocClass::UserDoc).unwrap();
+    let plan_to_doing = notarium_syntax::patch::plan(
+        rt_text_todo,
+        rt_todo_an.carrier.body,
+        vec![(
+            CarrierEditOrigin::Header,
+            rt_todo_an.carrier.header.unwrap(),
+            rt_text_doing.to_owned(),
+        )],
+    )
+    .unwrap();
+    let mut e1 = mutation(
+        &agent7e,
+        EditNote {
+            note: u_rt_nonmoved.note.clone(),
+            plan: plan_to_doing,
+        },
+    );
+    e1.preconditions.revision = Some(u_rt_nonmoved.revision.clone());
+    let u_rt_in_doing = store.edit_note(agent7e.clone(), e1).await.unwrap().value;
+    sync(store, runtime, &scope).await;
+    let m_helper_after1 = store
+        .move_board_card(
+            agent7e.clone(),
+            mutation(
+                &agent7e,
+                MoveBoardCard {
+                    view: v7e.clone(),
+                    note: m_helper.note.clone(),
+                    group: group("doing"),
+                    before: Some(RankNeighbor {
+                        note: u_rt_nonmoved.note.clone(),
+                        expected_rank: RankExpectation::Existing(
+                            rt_nonmoved_pre_ov.rank_rev_id.clone(),
+                        ),
+                    }),
+                    after: None,
+                    fields: BTreeMap::new(),
+                    expected_note: m_helper.revision.clone(),
+                    expected_view: v7e_rev.revision.clone(),
+                    expected_rank: RankExpectation::Absent,
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .value;
+    sync(store, runtime, &scope).await;
+    let rt_doing_an =
+        notarium_syntax::frontmatter::analyze(rt_text_doing, DocClass::UserDoc).unwrap();
+    let plan_back_todo = notarium_syntax::patch::plan(
+        rt_text_doing,
+        rt_doing_an.carrier.body,
+        vec![(
+            CarrierEditOrigin::Header,
+            rt_doing_an.carrier.header.unwrap(),
+            rt_text_todo.to_owned(),
+        )],
+    )
+    .unwrap();
+    let mut e2 = mutation(
+        &agent7e,
+        EditNote {
+            note: u_rt_nonmoved.note.clone(),
+            plan: plan_back_todo,
+        },
+    );
+    e2.preconditions.revision = Some(u_rt_in_doing.revision.clone());
+    let _ = store.edit_note(agent7e.clone(), e2).await.unwrap().value;
+    sync(store, runtime, &scope).await;
+    let mid_ov_a = store
+        .inspect_view_overlays_for_test(&scope.space_id, &v7e)
+        .await
+        .unwrap();
+    store
+        .move_board_card(
+            agent7e.clone(),
+            mutation(
+                &agent7e,
+                MoveBoardCard {
+                    view: v7e.clone(),
+                    note: m_helper.note.clone(),
+                    group: group("todo"),
+                    before: None,
+                    after: Some(RankNeighbor {
+                        note: u_rt_nonmoved.note.clone(),
+                        expected_rank: RankExpectation::Existing(
+                            mid_ov_a[&u_rt_nonmoved.note].rank_rev_id.clone(),
+                        ),
+                    }),
+                    fields: BTreeMap::from([(
+                        "status".into(),
+                        Some(YamlValue::String("todo".into())),
+                    )]),
+                    expected_note: m_helper_after1.revision.revision.clone(),
+                    expected_view: v7e_rev.revision.clone(),
+                    expected_rank: RankExpectation::Existing(
+                        mid_ov_a[&m_helper.note].rank_rev_id.clone(),
+                    ),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    sync(store, runtime, &scope).await;
+    let mid_ov_b = store
+        .inspect_view_overlays_for_test(&scope.space_id, &v7e)
+        .await
+        .unwrap();
+    assert_eq!(mid_ov_b[&u_rt_nonmoved.note].group, group("todo"));
+    assert_ne!(
+        mid_ov_b[&u_rt_nonmoved.note].placement_revision,
+        rt_nonmoved_pre_ov.placement_revision
+    );
+    assert!(mid_ov_b.contains_key(&m_unranked.note));
+
+    // 2. Move originally-unranked `m_unranked` (now run-materialized in todo) from todo -> doing.
+    store
+        .move_board_card(
+            agent7e.clone(),
+            mutation(
+                &agent7e,
+                MoveBoardCard {
+                    view: v7e.clone(),
+                    note: m_unranked.note.clone(),
+                    group: group("doing"),
+                    before: None,
+                    after: None,
+                    fields: BTreeMap::from([(
+                        "status".into(),
+                        Some(YamlValue::String("doing".into())),
+                    )]),
+                    expected_note: m_unranked.revision.clone(),
+                    expected_view: v7e_rev.revision.clone(),
+                    expected_rank: RankExpectation::Existing(
+                        mid_ov_b[&m_unranked.note].rank_rev_id.clone(),
+                    ),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    sync(store, runtime, &scope).await;
+
+    // 3. Move `m_pass` todo -> doing (after `u_mid`), then doing -> done.
+    let mid_ov_c = store
+        .inspect_view_overlays_for_test(&scope.space_id, &v7e)
+        .await
+        .unwrap();
+    let m_pass_doing = store
+        .move_board_card(
+            agent7e.clone(),
+            mutation(
+                &agent7e,
+                MoveBoardCard {
+                    view: v7e.clone(),
+                    note: m_pass.note.clone(),
+                    group: group("review"),
+                    before: None,
+                    after: Some(RankNeighbor {
+                        note: u_mid.note.clone(),
+                        expected_rank: mid_ov_c
+                            .get(&u_mid.note)
+                            .map_or(RankExpectation::Absent, |o| {
+                                RankExpectation::Existing(o.rank_rev_id.clone())
+                            }),
+                    }),
+                    fields: BTreeMap::from([(
+                        "status".into(),
+                        Some(YamlValue::String("review".into())),
+                    )]),
+                    expected_note: m_pass.revision.clone(),
+                    expected_view: v7e_rev.revision.clone(),
+                    expected_rank: mid_ov_c
+                        .get(&m_pass.note)
+                        .map_or(RankExpectation::Absent, |o| {
+                            RankExpectation::Existing(o.rank_rev_id.clone())
+                        }),
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .value;
+    sync(store, runtime, &scope).await;
+    let mid_ov_d = store
+        .inspect_view_overlays_for_test(&scope.space_id, &v7e)
+        .await
+        .unwrap();
+    store
+        .move_board_card(
+            agent7e.clone(),
+            mutation(
+                &agent7e,
+                MoveBoardCard {
+                    view: v7e.clone(),
+                    note: m_pass.note.clone(),
+                    group: group("done"),
+                    before: None,
+                    after: None,
+                    fields: BTreeMap::from([(
+                        "status".into(),
+                        Some(YamlValue::String("done".into())),
+                    )]),
+                    expected_note: m_pass_doing.revision.revision.clone(),
+                    expected_view: v7e_rev.revision.clone(),
+                    expected_rank: RankExpectation::Existing(
+                        mid_ov_d[&m_pass.note].rank_rev_id.clone(),
+                    ),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    sync(store, runtime, &scope).await;
+
+    // Post-run: human trashes unrelated card `u_mid` from pass-through column `doing`.
+    store
+        .delete_note(
+            owner.clone(),
+            mutation(
+                &owner,
+                notarium_core::ports::DeleteNote {
+                    note: u_mid.note.clone(),
+                    disposition: notarium_core::ports::DeleteDisposition::Trash,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    sync(store, runtime, &scope).await;
+
+    // Roll back `run7e`: must succeed (ignoring trashed anchor `u_mid` on non-earliest pass-through move),
+    // restore `u_rt_nonmoved`'s pre-run human overlay, and clear `m_unranked`'s run-materialized overlay.
+    let prep7e = store
+        .prepare_agent_run_rollback(owner.clone(), run7e)
+        .await
+        .unwrap();
+    let rb7e = store
+        .rollback_agent_run(owner.clone(), mutation(&owner, prep7e))
+        .await
+        .expect("rollback with mutated pass-through anchor must succeed")
+        .value;
+    let m_helper_after_rb7e = rb7e
+        .restored
+        .iter()
+        .find(|nr| nr.note == m_helper.note)
+        .expect("m_helper restored by run7e rollback")
+        .revision
+        .clone();
+    sync(store, runtime, &scope).await;
+    let post_ov_7e = store
+        .inspect_view_overlays_for_test(&scope.space_id, &v7e)
+        .await
+        .unwrap();
+    assert_eq!(
+        post_ov_7e
+            .get(&u_rt_nonmoved.note)
+            .map(|o| (&o.group, &o.placement_revision)),
+        Some((&group("todo"), &rt_nonmoved_pre_ov.placement_revision)),
+        "round-trip clobbered stale_non_moved card must restore pre-run human placement_revision"
+    );
+    assert!(
+        !post_ov_7e.contains_key(&m_unranked.note),
+        "originally-unranked card materialized in-run must have its overlay cleared on rollback: {:?}",
+        post_ov_7e.get(&m_unranked.note)
+    );
+
+    // 4. Round-trip view edit (`group_by: status -> priority -> status`) clobbering untouched
+    //    `u_rt_untouched` in `todo`: rollback must restore `u_rt_untouched`'s pre-run human overlay.
+    let run7e_v = AgentRunId::from_bytes(random_bytes());
+    let agent7e_v = super::agent(&owner, run7e_v.clone(), ChatAudience::Personal);
+    let v7e_status_txt = view_carrier(
+        &v7e.key,
+        "board",
+        "{scope: project}",
+        "group_by: status\nfilter: {exists: status}\n",
+    );
+    let v7e_prio_txt = view_carrier(
+        &v7e.key,
+        "board",
+        "{scope: project}",
+        "group_by: priority\nfilter: {exists: status}\n",
+    );
+    let v_span1 = notarium_syntax::frontmatter::analyze(&v7e_status_txt, DocClass::UserDoc)
+        .unwrap()
+        .carrier
+        .body;
+    let mut ve1 = mutation(
+        &agent7e_v,
+        EditNote {
+            note: v7e.note.clone(),
+            plan: notarium_syntax::patch::plan(
+                &v7e_status_txt,
+                v_span1,
+                vec![(CarrierEditOrigin::Body, v_span1, v7e_prio_txt.clone())],
+            )
+            .unwrap(),
+        },
+    );
+    ve1.preconditions.revision = Some(v7e_rev.revision.clone());
+    let v7e_prio_rev = store.edit_note(agent7e_v.clone(), ve1).await.unwrap().value;
+    sync(store, runtime, &scope).await;
+    let ov_v1 = store
+        .inspect_view_overlays_for_test(&scope.space_id, &v7e)
+        .await
+        .unwrap();
+    let mh_v1 = store
+        .move_board_card(
+            agent7e_v.clone(),
+            mutation(
+                &agent7e_v,
+                MoveBoardCard {
+                    view: v7e.clone(),
+                    note: m_helper.note.clone(),
+                    group: group("p1"),
+                    before: Some(RankNeighbor {
+                        note: u_rt_untouched.note.clone(),
+                        expected_rank: RankExpectation::Existing(
+                            ov_v1[&u_rt_untouched.note].rank_rev_id.clone(),
+                        ),
+                    }),
+                    after: None,
+                    fields: BTreeMap::new(),
+                    expected_note: m_helper_after_rb7e,
+                    expected_view: v7e_prio_rev.revision.clone(),
+                    expected_rank: ov_v1
+                        .get(&m_helper.note)
+                        .map_or(RankExpectation::Absent, |o| {
+                            RankExpectation::Existing(o.rank_rev_id.clone())
+                        }),
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .value;
+    sync(store, runtime, &scope).await;
+    let v_span2 = notarium_syntax::frontmatter::analyze(&v7e_prio_txt, DocClass::UserDoc)
+        .unwrap()
+        .carrier
+        .body;
+    let mut ve2 = mutation(
+        &agent7e_v,
+        EditNote {
+            note: v7e.note.clone(),
+            plan: notarium_syntax::patch::plan(
+                &v7e_prio_txt,
+                v_span2,
+                vec![(CarrierEditOrigin::Body, v_span2, v7e_status_txt)],
+            )
+            .unwrap(),
+        },
+    );
+    ve2.preconditions.revision = Some(v7e_prio_rev.revision.clone());
+    let v7e_back_rev = store.edit_note(agent7e_v.clone(), ve2).await.unwrap().value;
+    sync(store, runtime, &scope).await;
+    let ov_v2 = store
+        .inspect_view_overlays_for_test(&scope.space_id, &v7e)
+        .await
+        .unwrap();
+    store
+        .move_board_card(
+            agent7e_v.clone(),
+            mutation(
+                &agent7e_v,
+                MoveBoardCard {
+                    view: v7e.clone(),
+                    note: m_helper.note.clone(),
+                    group: group("todo"),
+                    before: None,
+                    after: Some(RankNeighbor {
+                        note: u_rt_untouched.note.clone(),
+                        expected_rank: RankExpectation::Existing(
+                            ov_v2[&u_rt_untouched.note].rank_rev_id.clone(),
+                        ),
+                    }),
+                    fields: BTreeMap::from([(
+                        "status".into(),
+                        Some(YamlValue::String("todo".into())),
+                    )]),
+                    expected_note: mh_v1.revision.revision,
+                    expected_view: v7e_back_rev.revision,
+                    expected_rank: RankExpectation::Existing(
+                        ov_v2[&m_helper.note].rank_rev_id.clone(),
+                    ),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    sync(store, runtime, &scope).await;
+    let prep7e_v = store
+        .prepare_agent_run_rollback(owner.clone(), run7e_v)
+        .await
+        .unwrap();
+    store
+        .rollback_agent_run(owner.clone(), mutation(&owner, prep7e_v))
+        .await
+        .unwrap();
+    sync(store, runtime, &scope).await;
+    let post_ov_7e_v = store
+        .inspect_view_overlays_for_test(&scope.space_id, &v7e)
+        .await
+        .unwrap();
+    assert_eq!(
+        post_ov_7e_v
+            .get(&u_rt_untouched.note)
+            .map(|o| (&o.group, &o.placement_revision)),
+        Some((&group("todo"), &rt_untouched_pre_ov.placement_revision)),
+        "round-trip view-edit clobbered stale_untouched card must restore pre-run human placement_revision"
+    );
     let _ = proj7b;
 }
 

@@ -21,13 +21,17 @@ DROP INDEX v1_control.schedule_due;
 CREATE INDEX schedule_due ON v1_control.agent_schedules(next_slot_utc_ms,schedule_id)
     WHERE deleted_at IS NULL AND paused_reason IS NULL AND next_slot_utc_ms IS NOT NULL;
 DROP INDEX v1_control.schedule_deleted;
-CREATE INDEX schedule_deleted ON v1_control.agent_schedules(deleted_at,updated_at,schedule_id)
+CREATE INDEX schedule_deleted ON v1_control.agent_schedules(deleted_at,schedule_id)
     WHERE deleted_at IS NOT NULL;
 DROP INDEX v1_control.schedule_run_retention;
-CREATE INDEX schedule_run_retention ON v1_control.agent_schedule_runs(status,finished_at,run_id)
-    WHERE status IN ('succeeded','failed','unknown');
+CREATE INDEX schedule_run_retention ON v1_control.agent_schedule_runs(finished_at,run_id)
+    WHERE status IN ('succeeded','failed','unknown') AND finished_at IS NOT NULL;
 CREATE INDEX schedule_expired_run ON v1_control.agent_schedule_runs(expires_at,run_id)
     WHERE status IN ('claimed','running');
+CREATE INDEX episode_owner_name_open ON v1_control.agent_episodes(owner_id,name,episode_id)
+    WHERE lifecycle <> 'closed';
+CREATE INDEX attachment_target_approved_id ON v1_control.provider_attachments(target_space,id)
+    WHERE state = 'approved';
 CREATE INDEX call_run ON v1_control.provider_call_log(run_id,call_id);
 CREATE INDEX ability_trail_destination ON v1_control.ability_placement_trail(destination_placement,destination_id);
 CREATE INDEX ability_preference_placement ON v1_control.ability_preferences(placement,ability_id,owner_id);

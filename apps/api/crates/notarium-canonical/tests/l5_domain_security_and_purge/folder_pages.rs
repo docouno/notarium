@@ -583,7 +583,7 @@ pub(super) async fn check(
     }
     let listed = store
         .list_child_folders(
-            ctx,
+            ctx.clone(),
             Some(batch_parent.folder_id.clone()),
             None,
             None,
@@ -601,4 +601,159 @@ pub(super) async fn check(
             covered_folders.get(&item.reference.folder_id)
         );
     }
+
+    // Folder cover notes must be `DocClass::UserDoc` at creation, and even for a legacy
+    // non-`UserDoc` cover note a memory-only Keeper must not mutate `folder_heads.cover_note_id`
+    // via `move_note`, `delete_note`, or `purge_note`.
+    let bad_cover_dir = FolderId::from_bytes([0xD1; 16]);
+    let other_cover_dir = FolderId::from_bytes([0xD2; 16]);
+    for (fid, slug) in [
+        (&bad_cover_dir, "cover-auth-src"),
+        (&other_cover_dir, "cover-auth-dst"),
+    ] {
+        store
+            .create_folder(notarium_canonical::CreateFolderSpec {
+                scope: scope.clone(),
+                active_epoch,
+                folder_id: fid.clone(),
+                parent: Some(batch_parent.folder_id.clone()),
+                slug: slug.into(),
+                display_name: slug.into(),
+                is_project: false,
+                project_slug: None,
+                actor: owner.clone(),
+                timestamp: None,
+            })
+            .await
+            .unwrap();
+    }
+    let owner_ctx_again = owner_ctx(scope, owner.clone(), true, true);
+    let mem_cover_create = store
+        .create_note(
+            owner_ctx_again.clone(),
+            next_mutation(
+                scope,
+                owner,
+                CreateNote {
+                    parent: Some(bad_cover_dir.clone()),
+                    note: sample_note_id(245),
+                    slug: "index".into(),
+                    folder_page: true,
+                    class: DocClass::AgentMemory,
+                    carrier: "---\nclass: agent-memory\ntitle: Memory Cover\n---\n# Bad\n".into(),
+                },
+            ),
+        )
+        .await;
+    assert_validation_err(&mem_cover_create, ValidationReason::InvalidState);
+
+    let legacy_mem_cover = sample_note_id(246);
+    store
+        .create_note(
+            owner_ctx_again.clone(),
+            next_mutation(
+                scope,
+                owner,
+                CreateNote {
+                    parent: Some(bad_cover_dir.clone()),
+                    note: legacy_mem_cover.clone(),
+                    slug: "index".into(),
+                    folder_page: true,
+                    class: DocClass::UserDoc,
+                    carrier: "# Cover Auth\n".into(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    // Simulate a legacy non-UserDoc cover row so defense-in-depth guards on move/delete/purge are exercised.
+    let updated = store
+        .execute_diagnostic_write_sql_for_test(&format!(
+            "UPDATE note_heads SET doc_class='agent-memory' WHERE space_id='{}' AND note_id='{}'",
+            scope.space_id.as_str(),
+            legacy_mem_cover.as_str()
+        ))
+        .await
+        .unwrap();
+    assert_eq!(updated, 1);
+    let keeper_auth = owner_ctx_again
+        .auth()
+        .for_keeper(
+            AgentRunId::from_bytes([0xD3; 16]),
+            scope.space_id.clone(),
+            None,
+            std::collections::BTreeSet::new(),
+        )
+        .unwrap();
+    let keeper_ctx = SpaceContext::new(keeper_auth, scope.clone(), make_budget()).unwrap();
+    let keeper_move = store
+        .move_note(
+            keeper_ctx.clone(),
+            next_mutation(
+                scope,
+                owner,
+                MoveNote {
+                    note: legacy_mem_cover.clone(),
+                    parent: Some(other_cover_dir),
+                    slug: "index".into(),
+                },
+            ),
+        )
+        .await;
+    assert!(
+        matches!(
+            keeper_move,
+            Err(PortError::Domain(DomainError::SpaceReadOnly))
+        ),
+        "memory-only Keeper must not move a folder cover note, got {keeper_move:?}"
+    );
+    let keeper_trash = store
+        .delete_note(
+            keeper_ctx.clone(),
+            next_mutation(
+                scope,
+                owner,
+                DeleteNote {
+                    note: legacy_mem_cover.clone(),
+                    disposition: DeleteDisposition::Trash,
+                },
+            ),
+        )
+        .await;
+    assert!(
+        matches!(
+            keeper_trash,
+            Err(PortError::Domain(DomainError::SpaceReadOnly))
+        ),
+        "memory-only Keeper must not trash a folder cover note, got {keeper_trash:?}"
+    );
+    let keeper_purge = store
+        .delete_note(
+            keeper_ctx,
+            next_mutation(
+                scope,
+                owner,
+                DeleteNote {
+                    note: legacy_mem_cover.clone(),
+                    disposition: DeleteDisposition::Purge,
+                },
+            ),
+        )
+        .await;
+    assert!(
+        matches!(
+            keeper_purge,
+            Err(PortError::Domain(DomainError::SpaceReadOnly))
+        ),
+        "memory-only Keeper must not purge a folder cover note, got {keeper_purge:?}"
+    );
+    assert_eq!(
+        cover_at(&FolderRef {
+            space_id: scope.space_id.clone(),
+            folder_id: bad_cover_dir,
+        })
+        .await,
+        Some(legacy_mem_cover),
+        "failed Keeper mutations must leave folder cover binding intact"
+    );
 }

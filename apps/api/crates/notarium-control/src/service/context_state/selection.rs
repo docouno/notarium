@@ -247,12 +247,13 @@ impl ControlService {
                         .resolve_episode_catalog_cached(&current, loaded_ep, &mut space_cache)
                         .await?;
                     let selected = if let Some(space) = space {
-                        if current
-                            .auth()
-                            .spaces()
-                            .get(&space)
-                            .is_none_or(|grant| grant.read_classes.is_empty())
-                        {
+                        let Some(grant) = current.auth().spaces().get(&space) else {
+                            return Err(DomainError::ResourceNotFound.into());
+                        };
+                        if grant.read_classes.is_empty() {
+                            return Err(DomainError::ResourceNotFound.into());
+                        }
+                        if grant.project_root.is_some() && episode.project_hint.is_none() {
                             return Err(DomainError::ResourceNotFound.into());
                         }
                         if !matches!(space_cache.get(&space), Some(Some(_))) {
@@ -276,11 +277,9 @@ impl ControlService {
                             .map(SpaceId::parse)
                             .transpose()?
                             .filter(|space| {
-                                current
-                                    .auth()
-                                    .spaces()
-                                    .get(space)
-                                    .is_some_and(|grant| !grant.read_classes.is_empty())
+                                current.auth().spaces().get(space).is_some_and(|grant| {
+                                    !grant.read_classes.is_empty() && grant.project_root.is_none()
+                                })
                             })
                     } else {
                         None
@@ -293,12 +292,9 @@ impl ControlService {
                     }
                     let personal = if let Some(value) = &owner.personal_space_id {
                         let space = SpaceId::parse(value)?;
-                        if current
-                            .auth()
-                            .spaces()
-                            .get(&space)
-                            .is_some_and(|grant| !grant.read_classes.is_empty())
-                        {
+                        if current.auth().spaces().get(&space).is_some_and(|grant| {
+                            !grant.read_classes.is_empty() && grant.project_root.is_none()
+                        }) {
                             match space_cache.get(&space) {
                                 Some(Some(_)) => owner.user_id.clone(),
                                 Some(None) => String::new(),
@@ -357,6 +353,13 @@ impl ControlService {
                     } else {
                         None
                     };
+                    let space_scope = selected.as_ref().filter(|space| {
+                        current
+                            .auth()
+                            .spaces()
+                            .get(*space)
+                            .is_some_and(|grant| grant.project_root.is_none())
+                    });
                     let scope = self
                         .context_digest(
                             rtx.inner_mut(),
@@ -366,6 +369,7 @@ impl ControlService {
                                 &id,
                                 episode.revision,
                                 &selected,
+                                &space_scope,
                                 &episode.project_hint,
                                 &personal,
                             ),
@@ -390,7 +394,7 @@ impl ControlService {
                         .transpose()
                         .map_err(|_| invalid(ValidationReason::InvalidState))?
                         .unwrap_or_default();
-                    let space_str = selected.as_ref().map_or("", SpaceId::as_str);
+                    let space_str = space_scope.map_or("", SpaceId::as_str);
                     let after = cursor.as_ref().map_or(0, |cursor| cursor.after);
                     let mut candidates = load_bootstrap_candidates(
                         rtx.inner_mut(),
@@ -450,7 +454,17 @@ impl ControlService {
                                     pinned.push(note);
                                 }
                             }
-                            Err(error) if hidden(&error) => unavailable += 1,
+                            Err(error) if hidden(&error) => {
+                                let out_of_project_fav = candidate.favorite == 1
+                                    && current
+                                        .auth()
+                                        .spaces()
+                                        .get(&note.space_id)
+                                        .is_some_and(|grant| grant.project_root.is_some());
+                                if !out_of_project_fav {
+                                    unavailable += 1;
+                                }
+                            }
                             Err(error) => return Err(error),
                         }
                     }

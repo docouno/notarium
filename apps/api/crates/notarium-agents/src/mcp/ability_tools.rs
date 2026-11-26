@@ -2740,6 +2740,9 @@ async fn save_active_role(
     if call.auth.taint().is_tainted() {
         return Err(DomainError::CrossSpaceTainted.into());
     }
+    if episode.lifecycle == notarium_core::ports::EpisodeLifecycle::Closed {
+        return Err(invalid(ValidationReason::InvalidState));
+    }
     if episode.active_role.as_ref() == Some(role) && episode.project_hint == project {
         return Ok(());
     }

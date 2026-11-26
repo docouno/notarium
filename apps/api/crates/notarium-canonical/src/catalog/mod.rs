@@ -570,6 +570,61 @@ impl ControlCatalogPort for CanonicalStore {
             .await
         })
     }
+    fn authorize_folder_subtree_write(
+        &self,
+        ctx: SpaceContext,
+        folder: FolderId,
+        expected: RevisionId,
+    ) -> PortFuture<'_, ()> {
+        Box::pin(async move {
+            let budget = ctx.budget.clone();
+            self.with_read_tx_budget(Some(&budget), move |tx| {
+                Box::pin(async move {
+                    let space = load_space_record(tx, &ctx.scope().space_id).await?;
+                    ctx.check_current(&space.scope)?;
+                    let row = load_folder_head_row(tx, &space.space.id, &folder).await?;
+                    if row.lifecycle != Lifecycle::Active {
+                        return Err(DomainError::ResourceNotFound.into());
+                    }
+                    let mut cache = crate::domain::common::FolderAncestryCache::default();
+                    cache.insert_preloaded_row(space.space.id.clone(), row.clone());
+                    let anc = cache
+                        .load_ancestry_tx(tx, &space.space.id, &folder, true)
+                        .await?;
+                    ctx.auth()
+                        .can_view_folder(&space.space, &folder, &anc.ancestors)?;
+                    let class =
+                        crate::domain::folders::folder_mutation_class(ctx.auth(), &space.space.id)?;
+                    let facts = ResourceFacts {
+                        space: space.space.clone(),
+                        class,
+                        project: anc.project,
+                        ancestor_folders: anc.ancestors,
+                        folder_write_locked: anc.write_locked,
+                        ability_package: None,
+                    };
+                    ctx.auth().authorize_direct_write(&facts, &facts)?;
+                    crate::domain::folders::authorize_folder_subtree_tx(
+                        tx,
+                        &space.space.id,
+                        &folder,
+                        ctx.auth(),
+                        true,
+                    )
+                    .await?;
+                    if row.head_rev_id != expected {
+                        return Err(DomainError::RevisionConflict {
+                            current: row.head_rev_id,
+                            lineage: None,
+                        }
+                        .into());
+                    }
+                    Ok(())
+                })
+            })
+            .await
+        })
+    }
     fn note(&self, ctx: AccountContext, reference: NoteRef) -> PortFuture<'_, CatalogNote> {
         Box::pin(async move {
             let budget = ctx.budget.clone();

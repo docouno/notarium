@@ -221,6 +221,53 @@ pub trait ControlCatalogPort: Send + Sync {
     ) -> PortFuture<'_, TrashedFolderAncestry> {
         Box::pin(async { Err(DomainError::ResourceNotFound.into()) })
     }
+    /// Authorize a no-op folder mutation (`move_folder`, `rename_folder`,
+    /// `rename_project` with unchanged target) against the folder's live
+    /// ancestry, subtree write locks/classes/abilities, and expected revision.
+    fn authorize_folder_subtree_write(
+        &self,
+        ctx: SpaceContext,
+        folder: FolderId,
+        _expected: RevisionId,
+    ) -> PortFuture<'_, ()> {
+        Box::pin(async move {
+            let reference = FolderRef {
+                space_id: ctx.scope().space_id.clone(),
+                folder_id: folder,
+            };
+            let account = AccountContext::new(ctx.auth().clone(), ctx.budget.clone());
+            let facts = self.folder(account, reference.clone()).await?;
+            if facts.reference != reference || facts.lifecycle != Lifecycle::Active {
+                return Err(DomainError::ResourceNotFound.into());
+            }
+            let grant = ctx
+                .auth()
+                .spaces()
+                .get(&ctx.scope().space_id)
+                .ok_or(DomainError::ResourceNotFound)?;
+            let class = grant
+                .write_classes
+                .iter()
+                .copied()
+                .find(|class| {
+                    !matches!(
+                        class,
+                        crate::classes::DocClass::AgentMemory | crate::classes::DocClass::Skill
+                    ) && grant.read_classes.contains(class)
+                })
+                .ok_or(DomainError::SpaceReadOnly)?;
+            let resource = ResourceFacts {
+                space: facts.space,
+                class,
+                project: None,
+                ancestor_folders: facts.ancestor_folders,
+                folder_write_locked: facts.write_locked,
+                ability_package: None,
+            };
+            ctx.auth().authorize_direct_write(&resource, &resource)?;
+            Ok(())
+        })
+    }
     fn ensure_space(
         &self,
         budget: CallBudget,

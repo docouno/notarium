@@ -791,7 +791,9 @@ async fn resolve_batch_links(
                         };
                         let ids = titles.get(&lookup_key(title))?;
                         match ids.first() {
-                            Some(note) if ids.len() == 1 => Some((index, note.clone())),
+                            Some(note) if ids.len() == 1 && note != &draft.prepared.note => {
+                                Some((index, note.clone()))
+                            }
                             _ => None,
                         }
                     })

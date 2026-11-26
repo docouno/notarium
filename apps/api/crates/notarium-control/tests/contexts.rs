@@ -965,6 +965,110 @@ async fn exercise_shared_consumer(
         .expect("set_context_pin replay must survive target note deletion")
         .value;
     assert_eq!(pin_2.revision, pin_1.revision);
+
+    // Project-pinned bootstrap_context must not load Space-level or Personal-level
+    // pins/sets or leak out-of-project favorites via `unavailable`, and must reject
+    // an explicit `space` selection when the episode has no live `project_hint`.
+    let proj_pin_a = FolderRef {
+        space_id: shared.space.id.clone(),
+        folder_id: FolderId::from_bytes([0x69; 16]),
+    };
+    let proj_pin_b = FolderRef {
+        space_id: shared.space.id.clone(),
+        folder_id: FolderId::from_bytes([0x6A; 16]),
+    };
+    fixture.catalog.project_entries.lock().unwrap().insert(
+        (proj_pin_a.space_id.clone(), proj_pin_a.folder_id.clone()),
+        ProjectInfo {
+            folder: proj_pin_a.clone(),
+            name: "Proj Pin A".into(),
+            project_slug: "proj-pin-a".into(),
+        },
+    );
+    fixture.catalog.project_entries.lock().unwrap().insert(
+        (proj_pin_b.space_id.clone(), proj_pin_b.folder_id.clone()),
+        ProjectInfo {
+            folder: proj_pin_b.clone(),
+            name: "Proj Pin B".into(),
+            project_slug: "proj-pin-b".into(),
+        },
+    );
+    let in_proj_note = note(
+        fixture,
+        &shared.space,
+        81,
+        Some(proj_pin_a.folder_id.clone()),
+    );
+    let out_proj_note = note(
+        fixture,
+        &shared.space,
+        82,
+        Some(proj_pin_b.folder_id.clone()),
+    );
+    pin(service, ctx, scope.clone(), in_proj_note.clone(), 41).await;
+    pin(service, ctx, scope.clone(), out_proj_note.clone(), 42).await;
+    service
+        .set_favorite(
+            ctx.clone(),
+            AccountMutation {
+                identity: identity(service, ctx, 43).await,
+                input: SetFavorite {
+                    reference: FavoriteRef::Note(out_proj_note.clone()),
+                    saved: true,
+                    rank: 200,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let proj_ep = episode(service, ctx, Some(proj_pin_a.clone()), 44).await;
+    let pinned_ctx = AccountContext::new(
+        ctx.auth().restrict_to_project(&proj_pin_a).unwrap(),
+        budget(),
+    );
+    let pinned_boot = service
+        .bootstrap_context(
+            pinned_ctx.clone(),
+            proj_ep.clone(),
+            Some(shared.space.id.clone()),
+            ControlPageRequest::new(50, None).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !pinned_boot.selection.pinned.contains(&in_proj_note)
+            && !pinned_boot.selection.pinned.contains(&out_proj_note),
+        "project-pinned bootstrap_context must not surface Space/Personal pins: {:?}",
+        pinned_boot.selection
+    );
+    assert_eq!(
+        pinned_boot.selection.unavailable, 0,
+        "project-pinned bootstrap_context must not leak out-of-project Space pins or favorites via unavailable: {:?}",
+        pinned_boot.selection
+    );
+    // Remove proj_pin_a from catalog so episode hits ProjectUnavailable, then verify
+    // passing explicit `space: Some(shared)` fails ResourceNotFound for project-pinned caller.
+    fixture
+        .catalog
+        .project_entries
+        .lock()
+        .unwrap()
+        .remove(&(proj_pin_a.space_id.clone(), proj_pin_a.folder_id.clone()));
+    let unavail_space_err = service
+        .bootstrap_context(
+            pinned_ctx,
+            proj_ep,
+            Some(shared.space.id.clone()),
+            ControlPageRequest::new(10, None).unwrap(),
+        )
+        .await;
+    assert!(
+        matches!(
+            unavail_space_err,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ),
+        "project-pinned bootstrap_context with explicit space when project is unavailable must fail ResourceNotFound, got {unavail_space_err:?}"
+    );
 }
 #[tokio::test]
 async fn sqlite_context_references_and_pagination() {

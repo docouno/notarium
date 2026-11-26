@@ -420,6 +420,16 @@ async fn purge_note_inner(
 
                 let cover_folders =
                     super::folder_cover::find_cover_folders(tx, &scope.space_id, &old_note).await?;
+                for cover_folder in &cover_folders {
+                    super::folder_cover::authorize_cover_folder_mutation_tx(
+                        tx,
+                        &live_space.space,
+                        &auth,
+                        cover_folder,
+                        false,
+                    )
+                    .await?;
+                }
                 let (_first_seq, visibility_seq) =
                     item_ctx.preview_seq_range(1 + cover_folders.len() as u64)?;
                 let purge_seq = item_ctx.alloc_next_seq()?;
@@ -607,6 +617,19 @@ async fn authorize_mint_placement_tx(
     )
     .await?;
     auth.authorize_direct_write(&old_facts, &new_facts)?;
+    let cover_folders =
+        super::folder_cover::find_cover_folders(tx, &space.scope.space_id, &old_head.note_id)
+            .await?;
+    for cover_folder in &cover_folders {
+        super::folder_cover::authorize_cover_folder_mutation_tx(
+            tx,
+            &space.space,
+            auth,
+            cover_folder,
+            false,
+        )
+        .await?;
+    }
 
     Ok(new_anc)
 }

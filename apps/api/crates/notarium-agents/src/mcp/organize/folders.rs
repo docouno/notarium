@@ -1,6 +1,5 @@
 use notarium_core::{
     DomainError,
-    auth::ResourceFacts,
     classes::DocClass,
     error::{PortError, ValidationReason},
     ids::{EpisodeId, FolderId, RevisionId, SpaceSeq},
@@ -50,26 +49,12 @@ struct FolderRoute {
     operation: FolderOperation,
     #[serde(default)]
     ancestor_revisions: Vec<(FolderId, RevisionId)>,
-    #[serde(default)]
-    #[allow(dead_code)]
-    project: Option<FolderId>,
-    #[serde(default)]
-    #[allow(dead_code)]
-    ancestors: Vec<FolderId>,
 }
 
 #[derive(Deserialize, Serialize)]
 enum FolderOperation {
     Unchanged,
-    Move {
-        parent: FolderId,
-        #[serde(default)]
-        #[allow(dead_code)]
-        parent_project: Option<FolderId>,
-        #[serde(default)]
-        #[allow(dead_code)]
-        parent_ancestors: Vec<FolderId>,
-    },
+    Move { parent: FolderId },
     Rename,
     RenameProject,
 }
@@ -81,7 +66,7 @@ enum ParsedFolderArgs {
 }
 
 fn validate_folder_path(raw: &str, allow_empty: bool) -> Result<(), PortError> {
-    let trimmed = raw.trim_start_matches('/');
+    let trimmed = raw.trim_matches('/');
     if trimmed.is_empty() {
         return if allow_empty {
             Ok(())
@@ -143,8 +128,6 @@ impl FolderRoute {
             revision: source.revision,
             operation,
             ancestor_revisions,
-            project: source.project,
-            ancestors: source.ancestor_folders,
         })
     }
 }
@@ -260,7 +243,7 @@ impl FolderAddress {
         path: &str,
     ) -> Result<FolderSnapshot, PortError> {
         let root_relative = path.starts_with('/');
-        let path = path.trim_start_matches('/');
+        let path = path.trim_matches('/');
         let (base, relative) = match &self.project {
             Some(project) => {
                 if let Some(suffix) = corpus::strip_folder_prefix(path, &project.path) {
@@ -360,14 +343,7 @@ async fn plan(
                     Some(&dest),
                 )
                 .await?;
-                (
-                    FolderOperation::Move {
-                        parent,
-                        parent_project: dest.project,
-                        parent_ancestors: dest.ancestor_folders,
-                    },
-                    revs,
-                )
+                (FolderOperation::Move { parent }, revs)
             };
             FolderRoute::new(source, operation, ancestor_revisions)
         }
@@ -429,50 +405,6 @@ async fn plan(
 
 fn same_name(source: &FolderSnapshot, leaf: &str, display_name: &str) -> bool {
     source.path.rsplit('/').next() == Some(leaf) && source.name == display_name
-}
-
-async fn check_noop(
-    call: &ToolCallContext<'_>,
-    scope: &SpaceContext,
-    source: &FolderSnapshot,
-    expected: &RevisionId,
-) -> Result<(), PortError> {
-    let facts = call
-        .registry
-        .catalog
-        .folder(call.account(), source.reference.clone())
-        .await?;
-    if facts.reference != source.reference || facts.lifecycle != Lifecycle::Active {
-        return Err(DomainError::ResourceNotFound.into());
-    }
-    let grant = call
-        .auth
-        .spaces()
-        .get(&scope.scope().space_id)
-        .ok_or(DomainError::ResourceNotFound)?;
-    let class = grant
-        .write_classes
-        .iter()
-        .copied()
-        .find(|class| !matches!(class, DocClass::AgentMemory | DocClass::Skill))
-        .ok_or(DomainError::SpaceReadOnly)?;
-    let resource = ResourceFacts {
-        space: facts.space,
-        class,
-        project: None,
-        ancestor_folders: facts.ancestor_folders,
-        folder_write_locked: facts.write_locked,
-        ability_package: None,
-    };
-    scope.auth().authorize_direct_write(&resource, &resource)?;
-    if &source.revision != expected {
-        return Err(DomainError::RevisionConflict {
-            current: source.revision.clone(),
-            lineage: None,
-        }
-        .into());
-    }
-    Ok(())
 }
 
 async fn exact_folder_revision(
@@ -751,8 +683,19 @@ pub(super) async fn handle(
         }
         return Ok(result);
     }
+    let fenced = call.corpus_writer(scope.clone()).await?;
+    call.registry
+        .catalog
+        .authorize_folder_subtree_write(fenced, folder.clone(), route.revision.clone())
+        .await?;
     let current = snapshot_by_id(call, &scope, &folder).await?;
-    check_noop(call, &scope, &current, &route.revision).await?;
+    if current.revision != route.revision {
+        return Err(DomainError::RevisionConflict {
+            current: current.revision,
+            lineage: None,
+        }
+        .into());
+    }
     let stable_ancestors =
         ancestors_unchanged(call, &scope, &current, &route.ancestor_revisions).await?;
     let proof = corpus::folder_metadata(call, &scope, &current).await?;

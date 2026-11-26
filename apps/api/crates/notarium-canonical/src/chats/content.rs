@@ -191,7 +191,11 @@ pub(super) fn authorize_recorded_sources(
         .filter_map(ProviderOrigin::space_id)
         .chain(proof.projects.iter().map(|folder| &folder.space_id))
     {
-        if !auth.spaces().contains_key(source_space) {
+        if auth
+            .spaces()
+            .get(source_space)
+            .is_none_or(|g| g.read_classes.is_empty())
+        {
             return Err(DomainError::ResourceNotFound.into());
         }
         if source_space != space {
