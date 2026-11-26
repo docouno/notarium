@@ -975,6 +975,121 @@ async fn live_room_keeps_the_filename_until_its_pin_is_released() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_room_and_disk_edits_converge_on_the_same_file() {
+    use notarium_canonical::{OpenCollabSession, RoomCommandSettlement};
+    use notarium_core::ports::{
+        FilenamePin, InterceptedMutation, InterceptedOutcome, InterceptedPayload,
+        InterceptionResult, LiveCollabInterceptor, PortFuture, RollbackReservation,
+    };
+
+    struct Room(CanonicalStore, RoomCommandSettlement);
+    impl LiveCollabInterceptor for Room {
+        fn filename_pin(&self, _ctx: SpaceContext, _note: NoteId) -> PortFuture<'_, FilenamePin> {
+            Box::pin(async { Ok(FilenamePin::Unpinned) })
+        }
+
+        fn intercept(&self, request: InterceptedMutation) -> PortFuture<'_, InterceptionResult> {
+            Box::pin(async move {
+                let InterceptedPayload::ExternalObservation {
+                    observation,
+                    vault_commit,
+                    ..
+                } = request.payload
+                else {
+                    panic!("the fixture only settles an external edit");
+                };
+                let result = self
+                    .0
+                    .commit_intercepted_external_observation(
+                        request.context,
+                        request.identity,
+                        request.preconditions,
+                        observation,
+                        self.1.clone(),
+                        vault_commit,
+                    )
+                    .await?;
+                Ok(InterceptionResult::Applied(Box::new(
+                    InterceptedOutcome::ExternalObservation(result),
+                )))
+            })
+        }
+
+        fn reserve_rollback(
+            &self,
+            _ctx: SpaceContext,
+            _note: NoteId,
+            _identity: CommandIdentity,
+        ) -> PortFuture<'_, RollbackReservation> {
+            panic!("the fixture does not issue rollback")
+        }
+    }
+
+    let fixture = Fixture::open().await;
+    let note = fixture.create("merged", 53).await;
+    let file = fixture.root.join("merged.md");
+    let worker = fixture.start();
+    ready(&mut worker.status(), |_| {
+        disk_id(&file) == Some(note.clone())
+    })
+    .await;
+    worker.shutdown().await.unwrap();
+
+    let ctx = context(&fixture.scope);
+    let head = fixture
+        .store
+        .read_vault_note(&ctx, &note)
+        .await
+        .unwrap()
+        .unwrap();
+    let active = fixture
+        .store
+        .open_collab_session(
+            &ctx.budget,
+            OpenCollabSession {
+                scope: fixture.scope.clone(),
+                note: note.clone(),
+                owner_id: "vault-room".into(),
+                expected_carrier_rev: head.note.revision.clone(),
+                expected_lease: None,
+                expected_lineage: None,
+                initial_yrs_snapshot: None,
+                allow_fenced_recovery: false,
+            },
+        )
+        .await
+        .unwrap();
+    let disk_edit = fs::read_to_string(&file)
+        .unwrap()
+        .replace("Initial words.", "Disk edit.");
+    fs::write(&file, &disk_edit).unwrap();
+    let merged = "---\nstatus: room edit\n---\n# Start\n\nDisk edit.\n";
+    let expected = carrier::materialize(merged, DocClass::UserDoc, &note).unwrap();
+    let room = Arc::new(Room(
+        fixture.store.clone(),
+        RoomCommandSettlement {
+            owner_id: active.owner_id.unwrap(),
+            expected_lease: active.lease_epoch,
+            expected_lineage: active.lineage_epoch,
+            expected_base_rev: head.note.revision,
+            final_carrier: merged.into(),
+            yrs_snapshot: b"vault checkpoint".to_vec(),
+            compacted_through_update_seq: None,
+        },
+    ));
+    let worker = fixture.start_with_collaboration(Some(room));
+    let state = ready(&mut worker.status(), |_| {
+        fs::read_to_string(&file).is_ok_and(|text| text == expected)
+    })
+    .await;
+    assert!(state.conflicts.is_empty());
+    assert_eq!(disk_id(&file), Some(note));
+    assert_eq!(fs::read_dir(&fixture.root).unwrap().count(), 1);
+    worker.shutdown().await.unwrap();
+    fixture.runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_folder_name_can_be_reused_after_the_old_folder_moves() {
     let fixture = Fixture::open().await;
     let original_folder = fixture.root.join("inbox");

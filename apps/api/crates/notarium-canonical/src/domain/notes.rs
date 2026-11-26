@@ -62,7 +62,7 @@ use crate::{
         read_immutable_revision_tx, validate_snapshot_cutoff_tx,
     },
     sql_exec::BackendConn,
-    vault::VaultWrite,
+    vault::{VaultWrite, upsert_observation_tx},
     writer::{BatchEventDraft, ItemCommitArtifacts, PreparedWriteIntent},
 };
 
@@ -4889,8 +4889,8 @@ async fn current_observation_head(
 fn external_observation_identity(
     ctx: &SpaceContext,
     request: &Mutation<ExternalObservation>,
-    vault_witness: Option<ContentDigest>,
-) -> crate::writer::CommandIdentitySpec {
+    vault_commit: Option<&notarium_core::ports::VaultObservationCommit>,
+) -> Result<crate::writer::CommandIdentitySpec, PortError> {
     let mut fp = blake3::Hasher::new();
     fp.update(request.input.note.as_str().as_bytes());
     fp.update(&[0]);
@@ -4899,18 +4899,18 @@ fn external_observation_identity(
     fp.update(request.input.base_revision.as_str().as_bytes());
     fp.update(&[0]);
     fp.update(request.input.disk_identity.as_bytes());
-    if let Some(witness) = vault_witness {
-        fp.update(b"vault-observation-witness");
-        fp.update(witness.as_bytes());
+    if let Some(commit) = vault_commit {
+        fp.update(b"vault-observation-commit");
+        fp.update(&CanonicalStore::encode_command_outcome(commit)?);
     }
-    derive_command_identity_spec(
+    Ok(derive_command_identity_spec(
         &request.identity,
         "accept_external_observation",
         fp.finalize().as_bytes(),
     )
     .with_preconditions(&request.preconditions, "note", request.input.note.as_str())
     .with_known_base(&request.input.base_revision)
-    .for_note(ctx.auth(), &request.input.note)
+    .for_note(ctx.auth(), &request.input.note))
 }
 
 fn external_observation_result(outcome: StoredExternalObsOutcomeV1) -> ExternalObservationResult {
@@ -4978,7 +4978,7 @@ impl CanonicalStore {
         preconditions: Preconditions,
         input: ExternalObservation,
         settlement: RoomCommandSettlement,
-        vault_witness: Option<ContentDigest>,
+        vault_commit: Option<notarium_core::ports::VaultObservationCommit>,
     ) -> Result<ExternalObservationResult, PortError> {
         let deadline = CommandDeadline::start(&ctx.budget, "observation_room");
         let active_op = self.enter_write_op(&ctx.scope().space_id)?;
@@ -4988,7 +4988,7 @@ impl CanonicalStore {
             input,
         };
         validate_mutation_identity(&ctx, &request.identity)?;
-        let idemp = external_observation_identity(&ctx, &request, vault_witness);
+        let idemp = external_observation_identity(&ctx, &request, vault_commit.as_ref())?;
         if let Some(replayed) =
             replay_external_observation(self, &ctx, deadline, &request.input, &idemp).await?
         {
@@ -5032,7 +5032,7 @@ impl CanonicalStore {
             observed_bytes,
             verified_plan,
             Some(CarrierRoomWrite::Accepted(work.transition)),
-            vault_witness,
+            vault_commit,
         );
         match self
             .submit_write_command_until::<StoredExternalObsOutcomeV1>(
@@ -5063,22 +5063,19 @@ pub(crate) async fn accept_external_observation_with_vault(
     store: &CanonicalStore,
     mut ctx: SpaceContext,
     request: Mutation<ExternalObservation>,
-    vault: Option<VaultWrite>,
+    vault: Option<(VaultWrite, notarium_core::ports::VaultObservationCommit)>,
 ) -> Result<ExternalObservationResult, PortError> {
     let deadline =
         super::common::CommandDeadline::start(&ctx.budget, "accept_external_observation");
     let budget = ctx.budget.clone();
     validate_mutation_identity(&ctx, &request.identity)?;
-    let vault_witness = vault
-        .as_ref()
-        .map(VaultWrite::observation_witness)
-        .transpose()?;
-    if let Some(vault) = &vault {
+    if let Some((vault, _)) = &vault {
         deadline
             .prepare(&budget, || vault.require_current_binding(store, &ctx))
             .await?;
     }
-    let idemp = external_observation_identity(&ctx, &request, vault_witness);
+    let vault_commit = vault.as_ref().map(|(_, commit)| commit.clone());
+    let idemp = external_observation_identity(&ctx, &request, vault_commit.as_ref())?;
 
     if let Some(replayed) =
         replay_external_observation(store, &ctx, deadline, &request.input, &idemp).await?
@@ -5086,7 +5083,7 @@ pub(crate) async fn accept_external_observation_with_vault(
         return Ok(replayed);
     }
 
-    if let Some(vault) = &vault {
+    if let Some((vault, _)) = &vault {
         deadline
             .prepare(&budget, || vault.require_current_observation(store, &ctx))
             .await?;
@@ -5267,7 +5264,7 @@ pub(crate) async fn accept_external_observation_with_vault(
                         observation: request.input.clone(),
                         body: body_plan,
                         header: header_mut,
-                        vault_witness,
+                        vault_commit: vault_commit.clone(),
                     },
                 }) => result?,
                 () = budget.cancellation.cancelled() => return Err(unknown()),
@@ -5354,7 +5351,7 @@ pub(crate) async fn accept_external_observation_with_vault(
         new_carrier.len() as u64,
         verified_plan,
         reservation_opt,
-        vault_witness,
+        vault_commit,
     );
     ctx.budget.remaining = deadline.remaining(&budget)?;
     match deadline
@@ -5378,7 +5375,7 @@ fn build_observation_intent(
     observed_bytes: u64,
     verified_plan: Option<ContentDigest>,
     reservation_opt: Option<CarrierRoomWrite>,
-    vault_witness: Option<ContentDigest>,
+    vault_commit: Option<notarium_core::ports::VaultObservationCommit>,
 ) -> PreparedWriteIntent {
     let scope_cl = space_rec.scope.clone();
     let staged_bytes = ticket.compressed_size;
@@ -5389,7 +5386,7 @@ fn build_observation_intent(
         input: obs_input,
     } = request;
     let room_store = store.clone();
-    let vault_witness = vault_witness.map(|witness| (ctx.clone(), witness));
+    let vault_commit = vault_commit.map(|commit| (ctx.clone(), commit));
 
     PreparedWriteIntent {
         scope: scope_cl.clone(),
@@ -5401,16 +5398,20 @@ fn build_observation_intent(
         execute: Box::new(move |tx, item_ctx| {
             Box::pin(async move {
                 let live_space = load_space_record(tx, &scope_cl.space_id).await?;
-                if let Some((ctx, witness)) = &vault_witness {
-                    VaultWrite::check_observation_witness(
-                        tx,
-                        ctx,
-                        &live_space,
-                        &obs_input.note,
-                        *witness,
+                let accepted_vault = if let Some((ctx, commit)) = &vault_commit {
+                    Some(
+                        VaultWrite::prepare_observation_commit(
+                            tx,
+                            ctx,
+                            &live_space,
+                            &obs_input,
+                            commit,
+                        )
+                        .await?,
                     )
-                    .await?;
-                }
+                } else {
+                    None
+                };
                 let head = load_note_head_row_tx(tx, &scope_cl.space_id, &obs_input.note).await?;
                 if head.lifecycle != Lifecycle::Active {
                     return Err(DomainError::ResourceNotFound.into());
@@ -5485,7 +5486,7 @@ fn build_observation_intent(
                     seq,
                 )
                 .await?;
-                let legacy_path = vault_witness.is_none().then(|| {
+                let legacy_path = accepted_vault.is_none().then(|| {
                     if anc.folder_path.is_empty() {
                         format!("{}.md", head.slug)
                     } else {
@@ -5627,6 +5628,11 @@ fn build_observation_intent(
                     }
                 }
 
+                if let Some((binding, mut observation)) = accepted_vault {
+                    observation.revision = new_rev.clone();
+                    observation.carrier_digest = digest;
+                    upsert_observation_tx(tx, &binding, &observation).await?;
+                }
                 let current_schema = load_current_space_schema_tx(tx, &scope_cl.space_id).await?;
                 let eval_fields = if head.doc_class == DocClass::EncryptedNote {
                     BTreeMap::new()

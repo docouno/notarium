@@ -44,7 +44,8 @@ mod storage;
 
 pub(crate) use content::VaultWrite;
 pub(crate) use folders::VaultFolderReplay;
-pub(crate) use storage::handoff_purged_note_tx;
+pub use notarium_core::ports::VaultFileStamp;
+pub(crate) use storage::{handoff_purged_note_tx, upsert_observation_tx};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct VaultBinding {
@@ -59,15 +60,6 @@ pub struct VaultBinding {
 pub struct VaultPath {
     pub relative: String,
     pub key: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct VaultFileStamp {
-    pub identity: ContentDigest,
-    pub size: u64,
-    pub mtime_seconds: i64,
-    pub mtime_nanos: u32,
-    pub digest: ContentDigest,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

@@ -92,7 +92,7 @@ impl PausedRoom {
             }
             InterceptedPayload::ExternalObservation {
                 observation,
-                vault_witness,
+                vault_commit,
                 ..
             } => {
                 let outcome = self
@@ -103,7 +103,7 @@ impl PausedRoom {
                         request.preconditions,
                         observation,
                         settlement,
-                        vault_witness,
+                        vault_commit,
                     )
                     .await?;
                 Ok(InterceptionResult::Applied(Box::new(
@@ -1320,6 +1320,7 @@ async fn check_vault_observation_on_live_room(
     let note = sample_note_id(0xec);
     let base = "Original materialized note.\n";
     let edited = "External edit to the live note.\n";
+    let merged = "---\nstatus: room edit\n---\nExternal edit to the live note.\n";
     let created = store
         .create_note(
             ctx.clone(),
@@ -1396,12 +1397,19 @@ async fn check_vault_observation_on_live_room(
     );
     let mut changed = observation.clone();
     changed.file.mtime_nanos = 1;
+    let observed = VaultFileStamp {
+        digest: notarium_syntax::content_digest(edited),
+        size: edited.len() as u64,
+        mtime_nanos: 2,
+        ..observation.file.clone()
+    };
     let (stale, ()) = room
         .during_interception_reply(
             store.accept_vault_observation(
                 ctx.clone(),
                 &binding,
                 observation.clone(),
+                observed.clone(),
                 request.clone(),
             ),
             async {
@@ -1418,7 +1426,7 @@ async fn check_vault_observation_on_live_room(
                     PauseReply::Commit(PausedRoom::settlement_for(
                         &active,
                         observation.revision.clone(),
-                        edited,
+                        merged,
                         b"vault checkpoint".to_vec(),
                         None,
                     )),
@@ -1432,25 +1440,42 @@ async fn check_vault_observation_on_live_room(
     room.accept(
         &active,
         observation.revision,
-        edited,
+        merged,
         b"vault checkpoint".to_vec(),
         None,
     );
     let ExternalObservationResult::Committed(applied) = store
-        .accept_vault_observation(ctx.clone(), &binding, changed.clone(), request.clone())
+        .accept_vault_observation(
+            ctx.clone(),
+            &binding,
+            changed.clone(),
+            observed.clone(),
+            request.clone(),
+        )
         .await
         .unwrap()
     else {
         panic!("the current vault observation must commit through the room");
     };
     let ExternalObservationResult::Committed(replayed) = store
-        .accept_vault_observation(ctx.clone(), &binding, changed, request)
+        .accept_vault_observation(ctx.clone(), &binding, changed, observed.clone(), request)
         .await
         .unwrap()
     else {
         panic!("the committed vault observation must be replayable");
     };
     assert_eq!(replayed.receipt, applied.receipt);
+    let durable = store
+        .vault_observation_for(ctx, &binding, &note)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(durable.file, observed);
+    assert_eq!(durable.revision, applied.value.revision);
+    assert_eq!(
+        durable.carrier_digest,
+        notarium_syntax::content_digest(merged)
+    );
 }
 
 #[tokio::test]

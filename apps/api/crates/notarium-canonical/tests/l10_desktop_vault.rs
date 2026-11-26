@@ -630,12 +630,24 @@ async fn guarded_purge_roundtrip(config: CanonicalConfig) {
     );
     assert_validation_err(
         &store
-            .accept_vault_observation(ctx.clone(), &binding, original_stamp, observe.clone())
+            .accept_vault_observation(
+                ctx.clone(),
+                &binding,
+                original_stamp,
+                fresh_stamp.clone(),
+                observe.clone(),
+            )
             .await,
         ValidationReason::CursorStale,
     );
     let ExternalObservationResult::Committed(edited) = store
-        .accept_vault_observation(ctx.clone(), &binding, moved_stamp.clone(), observe)
+        .accept_vault_observation(
+            ctx.clone(),
+            &binding,
+            moved_stamp,
+            fresh_stamp.clone(),
+            observe,
+        )
         .await
         .unwrap()
     else {
@@ -648,15 +660,13 @@ async fn guarded_purge_roundtrip(config: CanonicalConfig) {
         file: fresh_stamp.clone(),
         carrier_digest: fresh_stamp.digest,
     };
-    store
-        .put_vault_observation(
-            ctx.clone(),
-            &binding,
-            Some(moved_stamp),
-            edited_stamp.clone(),
-        )
-        .await
-        .unwrap();
+    assert_eq!(
+        store
+            .vault_observation_for(&ctx, &binding, &original)
+            .await
+            .unwrap(),
+        Some(edited_stamp.clone()),
+    );
 
     let delayed = mutation(
         &ctx,

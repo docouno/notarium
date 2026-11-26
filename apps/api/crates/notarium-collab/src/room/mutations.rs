@@ -461,7 +461,7 @@ async fn commit(
         }
         InterceptedPayload::ExternalObservation {
             observation,
-            vault_witness,
+            vault_commit,
             ..
         } => {
             let lineage = settlement.expected_lineage;
@@ -472,7 +472,7 @@ async fn commit(
                     preconditions,
                     observation,
                     settlement,
-                    vault_witness,
+                    vault_commit,
                 )
                 .await?
             {

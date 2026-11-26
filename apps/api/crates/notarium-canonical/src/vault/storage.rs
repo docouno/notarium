@@ -773,7 +773,7 @@ pub(super) async fn observation_for_key_tx(
     row.map(VaultObservation::try_from).transpose()
 }
 
-pub(super) async fn upsert_observation_tx(
+pub(crate) async fn upsert_observation_tx(
     tx: &mut BackendConn<'_>,
     binding: &VaultBinding,
     observation: &VaultObservation,

@@ -773,6 +773,7 @@ impl Worker<'_> {
                                 ctx,
                                 &binding,
                                 edit.old.clone(),
+                                file_stamp(&edit.stamp),
                                 edit.request.clone(),
                             )
                             .await;
@@ -813,7 +814,12 @@ impl Worker<'_> {
         (edit, result): (Edit, Result<ExternalObservationResult, PortError>),
     ) -> Result<(), VaultError> {
         let revision = match result {
-            Ok(ExternalObservationResult::Committed(result)) => result.value.revision,
+            Ok(ExternalObservationResult::Committed(result)) => {
+                // The canonical writer recorded the actual disk stamp with
+                // the committed revision, including when a live room merged it.
+                self.known.remove(&edit.old.path.key);
+                return self.materialize(&result.value.note).await;
+            }
             Ok(ExternalObservationResult::NoChange { revision }) => revision,
             Ok(ExternalObservationResult::Conflict { .. }) | Err(PortError::Domain(_)) => {
                 let current = self

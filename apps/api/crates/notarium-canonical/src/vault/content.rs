@@ -8,7 +8,7 @@ use notarium_core::{
     model::Lifecycle,
     ports::{
         Committed, DeleteDisposition, DeleteNote, ExternalObservation, ExternalObservationResult,
-        MoveNote, Mutation, NoteRevision, SpaceContext,
+        MoveNote, Mutation, NoteRevision, SpaceContext, VaultObservationCommit,
     },
 };
 use notarium_syntax::unicode::{PortableFilename, lookup_key};
@@ -534,22 +534,27 @@ impl CanonicalStore {
         ctx: SpaceContext,
         binding: &VaultBinding,
         expected: VaultObservation,
+        observed: VaultFileStamp,
         request: Mutation<ExternalObservation>,
     ) -> Result<ExternalObservationResult, PortError> {
-        if request.input.note != expected.note || request.input.base_revision != expected.revision {
+        check_file(&observed)?;
+        if request.input.note != expected.note
+            || request.input.base_revision != expected.revision
+            || request.input.disk_identity != observed.identity
+        {
             return Err(observation_changed());
         }
-        notes::accept_external_observation_with_vault(
-            self,
-            ctx,
-            request,
-            Some(VaultWrite {
-                binding: binding.clone(),
-                watch_fence: None,
-                change: VaultChange::Edit { expected },
-            }),
-        )
-        .await
+        let guard = VaultWrite {
+            binding: binding.clone(),
+            change: VaultChange::Edit { expected },
+            watch_fence: None,
+        };
+        let commit = VaultObservationCommit {
+            prior: guard.observation_witness()?,
+            observed,
+        };
+        notes::accept_external_observation_with_vault(self, ctx, request, Some((guard, commit)))
+            .await
     }
 
     pub async fn vault_is_purge_fenced(
@@ -657,30 +662,39 @@ impl VaultWrite {
         Ok(ContentDigest::from_bytes(*hasher.finalize().as_bytes()))
     }
 
-    pub(crate) async fn check_observation_witness(
+    pub(crate) async fn prepare_observation_commit(
         tx: &mut BackendConn<'_>,
         ctx: &SpaceContext,
         space: &SpaceRecord,
-        note: &NoteId,
-        witness: ContentDigest,
-    ) -> Result<(), PortError> {
+        input: &ExternalObservation,
+        commit: &VaultObservationCommit,
+    ) -> Result<(VaultBinding, VaultObservation), PortError> {
         check_actor(ctx.auth(), ctx.scope(), space)?;
+        check_file(&commit.observed)?;
+        if input.disk_identity != commit.observed.identity {
+            return Err(observation_changed());
+        }
         let binding = active_binding_tx(tx, &space.scope, ctx.auth())
             .await?
             .filter(|binding| binding.scope == space.scope)
             .ok_or_else(observation_changed)?;
-        let expected = observation_for_note_tx(tx, &binding, note)
+        let mut expected = observation_for_note_tx(tx, &binding, &input.note)
             .await?
             .ok_or_else(observation_changed)?;
         let current = Self {
-            binding,
-            change: VaultChange::Edit { expected },
+            binding: binding.clone(),
+            change: VaultChange::Edit {
+                expected: expected.clone(),
+            },
             watch_fence: None,
         };
-        if current.observation_witness()? != witness {
+        if expected.revision != input.base_revision
+            || current.observation_witness()? != commit.prior
+        {
             return Err(observation_changed());
         }
-        Ok(())
+        expected.file = commit.observed.clone();
+        Ok((binding, expected))
     }
 
     pub(crate) async fn require_current_binding(
