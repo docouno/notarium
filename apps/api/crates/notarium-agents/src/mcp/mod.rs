@@ -732,6 +732,14 @@ impl<'a> ToolCallContext<'a> {
             .await
     }
 
+    async fn lookup_journal<T: DeserializeOwned>(
+        &self,
+        label: &str,
+    ) -> Result<Option<T>, PortError> {
+        self.lookup_journal_with_key(label, &self.request_key, self.request_hash)
+            .await
+    }
+
     async fn lookup_journal_with_key<T: DeserializeOwned>(
         &self,
         label: &str,

@@ -382,17 +382,6 @@ async fn inspect_followed_ability(
     }
 }
 
-async fn exact_ability_matches_kind(
-    registry: &ToolRegistry,
-    account: &AccountContext,
-    reference: &AbilityRef,
-    expected_kind: AbilityKind,
-) -> Result<bool, PortError> {
-    Ok(inspect_followed_ability(registry, account, reference)
-        .await?
-        .is_some_and(|inspection| inspection.descriptor.kind == expected_kind))
-}
-
 async fn resolve_exact_for_kind(
     registry: &ToolRegistry,
     account: &AccountContext,
@@ -406,7 +395,7 @@ async fn resolve_exact_for_kind(
             account.clone(),
             AbilitySelection::Exact {
                 reference: reference.clone(),
-                project,
+                project: project.clone(),
             },
         )
         .await?;
@@ -414,12 +403,32 @@ async fn resolve_exact_for_kind(
         AbilityResolution::Resolved(value) if value.kind != kind => {
             Ok(AbilityResolution::WrongKind)
         }
+        AbilityResolution::Resolved(value)
+            if kind == AbilityKind::Role
+                && !role_placement_matches_project(
+                    &value.reference.placement,
+                    project.as_ref(),
+                ) =>
+        {
+            Ok(AbilityResolution::OutOfScope)
+        }
         AbilityResolution::Disabled | AbilityResolution::Stale => {
-            if exact_ability_matches_kind(registry, account, &reference, kind).await? {
-                Ok(resolution)
-            } else {
-                Ok(AbilityResolution::WrongKind)
+            let Some(inspection) = inspect_followed_ability(registry, account, &reference).await?
+            else {
+                return Ok(AbilityResolution::Missing);
+            };
+            if inspection.descriptor.kind != kind {
+                return Ok(AbilityResolution::WrongKind);
             }
+            if kind == AbilityKind::Role
+                && !role_placement_matches_project(
+                    &inspection.descriptor.reference.placement,
+                    project.as_ref(),
+                )
+            {
+                return Ok(AbilityResolution::OutOfScope);
+            }
+            Ok(resolution)
         }
         other => Ok(other),
     }

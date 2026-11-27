@@ -728,6 +728,24 @@ impl CanonicalRuntime {
         if let Some(wal) = self.inner.wal_coord.get() {
             wal.shutdown().await;
         }
+        // Drain any post-rollback local CAS orphan cleanup tasks spawned by final batches
+        // before marking shutdown and closing SQL pools.
+        loop {
+            let pending = {
+                let mut tasks = self
+                    .inner
+                    .backup_cleanups
+                    .lock()
+                    .expect("backup cleanups mutex");
+                std::mem::take(&mut *tasks)
+            };
+            if pending.is_empty() {
+                break;
+            }
+            for task in pending {
+                let _ = task.await;
+            }
+        }
         self.inner.shutting_down.store(true, Ordering::SeqCst);
         match &self.inner.sql {
             SqlDriverState::Sqlite {

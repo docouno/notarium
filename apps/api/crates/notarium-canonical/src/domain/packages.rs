@@ -476,15 +476,21 @@ pub(crate) async fn publish_ability_package_impl(
         return Ok(committed.into_committed());
     }
 
-    // Stage all auxiliary CAS blobs in Phase 1 outside the writer lock.
+    // Stage all auxiliary CAS blobs in Phase 1 outside the writer lock in canonical sorted
+    // deduplicated ContentDigest order so LocalSharedGuard acquisition cannot self-deadlock.
+    let aux_refs: Vec<&PreparedBlobSource> = prepared_aux.iter().map(|(_, _, prep)| prep).collect();
+    let staged_by_digest = deadline
+        .prepare(&ctx.budget, || {
+            store.stage_blobs_for_batch_sorted(&space_rec.scope, space_rec.active_epoch, &aux_refs)
+        })
+        .await?;
     let mut staged_aux = Vec::with_capacity(prepared_aux.len());
     let mut total_staged_bytes: u64 = 0;
-    for (path, digest, prep) in &prepared_aux {
-        let ticket = deadline
-            .prepare(&ctx.budget, || {
-                store.stage_blob_for_batch(&space_rec.scope, space_rec.active_epoch, prep)
-            })
-            .await?;
+    for (path, digest, _) in &prepared_aux {
+        let ticket = staged_by_digest
+            .get(digest)
+            .cloned()
+            .ok_or_else(|| internal_not_committed("missing_staged_aux_blob", "ticket missing"))?;
         total_staged_bytes = total_staged_bytes.saturating_add(ticket.compressed_size);
         staged_aux.push((path.clone(), *digest, ticket));
     }

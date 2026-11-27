@@ -3615,6 +3615,9 @@ pub(crate) async fn accept_batch_impl(
     request: AcceptBatch,
 ) -> Result<BatchResult<NoteRevision>, PortError> {
     let deadline = super::common::CommandDeadline::start(&ctx.budget, "accept_batch");
+    if request.items.is_empty() && ctx.confirmed_chat_step().is_some() {
+        return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
+    }
     let budget = ctx.budget.clone();
     let space_rec = deadline
         .wait(&budget, || {
@@ -3625,9 +3628,6 @@ pub(crate) async fn accept_batch_impl(
     space_rec.scope.check(ctx.scope())?;
 
     if request.items.is_empty() {
-        if ctx.confirmed_chat_step().is_some() {
-            return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
-        }
         if space_rec.space.lifecycle != notarium_core::auth::SpaceLifecycle::Active {
             return Err(DomainError::ResourceNotFound.into());
         }
@@ -3768,16 +3768,34 @@ async fn prepare_batch_intents(
         }
     }
 
-    let mut intents = Vec::with_capacity(request.items.len());
+    enum DeferredBatchSlot {
+        Ready(PreparedWriteIntent),
+        Create {
+            idemp: Option<crate::writer::CommandIdentitySpec>,
+            cr: CreateNote,
+            slug_fold: String,
+            info: PreparedCarrierInfo,
+        },
+        Edit {
+            idemp: Option<crate::writer::CommandIdentitySpec>,
+            preconditions: Preconditions,
+            note: NoteId,
+            base_content_hash: ContentDigest,
+            variants: BTreeMap<DocClass, Result<PreparedCarrierInfo, PortError>>,
+            blob: Option<PreparedBlobSource>,
+        },
+    }
+
+    let mut slots: Vec<DeferredBatchSlot> = Vec::with_capacity(request.items.len());
     let mut placements = BTreeMap::new();
     for item_mut in request.items {
         ctx.budget.remaining = deadline.remaining(&ctx.budget)?;
         if let Err(err) = validate_batch_item(ctx, &item_mut) {
-            intents.push(build_failing_item_intent(
+            slots.push(DeferredBatchSlot::Ready(build_failing_item_intent(
                 &space_rec.scope,
                 space_rec.active_epoch,
                 err,
-            ));
+            )));
             continue;
         }
         let idemp = match &item_mut.input {
@@ -3844,7 +3862,7 @@ async fn prepare_batch_intents(
                     build_failing_item_intent(&space_rec.scope, space_rec.active_epoch, err)
                 }
             };
-            intents.push(replay);
+            slots.push(DeferredBatchSlot::Ready(replay));
             continue;
         }
         match item_mut.input {
@@ -3857,7 +3875,7 @@ async fn prepare_batch_intents(
                 {
                     return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
                 }
-                let res: Result<PreparedWriteIntent, PortError> = async {
+                let res: Result<(String, PreparedCarrierInfo), PortError> = async {
                     let slug_fold = super::folder_cover::validate_create(&cr)?;
                     if cr.class == DocClass::Skill {
                         ctx.auth().authorize_ability_mutation()?;
@@ -3879,33 +3897,22 @@ async fn prepare_batch_intents(
                         &cr.slug,
                         store.blob_codec(),
                     )?;
-                    let ticket = store
-                        .stage_blob_for_batch(
-                            &space_rec.scope,
-                            space_rec.active_epoch,
-                            &info.prepared_blob,
-                        )
-                        .await?;
                     sources
                         .classes
                         .entry(cr.note.clone())
                         .or_default()
                         .insert(cr.class);
                     sources.remember(&cr.note, info.prepared_blob.digest, &cr.carrier);
-                    Ok(build_create_note_intent(
-                        &space_rec.scope,
-                        space_rec.active_epoch,
-                        idemp.clone(),
-                        ctx.auth().clone(),
-                        cr,
-                        slug_fold,
-                        info,
-                        ticket,
-                    ))
+                    Ok((slug_fold, info))
                 }
                 .await;
                 match res {
-                    Ok(intent) => intents.push(intent),
+                    Ok((slug_fold, info)) => slots.push(DeferredBatchSlot::Create {
+                        idemp,
+                        cr,
+                        slug_fold,
+                        info,
+                    }),
                     Err(err) => {
                         let mut failed = build_failing_item_intent(
                             &space_rec.scope,
@@ -3913,64 +3920,77 @@ async fn prepare_batch_intents(
                             err,
                         );
                         failed.idempotency = idemp;
-                        intents.push(failed);
+                        slots.push(DeferredBatchSlot::Ready(failed));
                     }
                 }
             }
             BatchItem::Edit(ed) => {
-                let prepared: Result<PreparedBatchEdit, PortError> = async {
-                    let base = sources
-                        .take_base(&ed.note, ed.plan.base_content_hash)
-                        .ok_or_else(|| DomainError::validation(ValidationReason::SourceMismatch))?;
-                    let next = notarium_syntax::patch::apply(&base, &ed.plan)?;
-                    let blob = PreparedBlobSource::prepare(next.as_bytes(), store.blob_codec())?;
-                    let mut variants = BTreeMap::new();
-                    for &class in sources.classes.get(&ed.note).into_iter().flatten() {
-                        let variant = (|| {
-                            let header = if class == DocClass::EncryptedNote {
-                                None
-                            } else {
-                                enforce_protected_frontmatter_unchanged_with_header(
-                                    &base, &next, class,
-                                )?
-                            };
-                            // An empty fallback marks a title derived from the slug. The
-                            // savepoint fills it from the actual head after any move.
-                            analyze_carrier_metadata(&next, class, "", header, || Ok(blob.clone()))
-                        })();
-                        variants.insert(class, variant);
-                    }
-                    let ticket = if variants.values().any(Result::is_ok) {
-                        let ticket = store
-                            .stage_blob_for_batch(&space_rec.scope, space_rec.active_epoch, &blob)
-                            .await?;
-                        sources.remember(&ed.note, blob.digest, &next);
-                        Some(ticket)
-                    } else {
-                        None
-                    };
-                    Ok(PreparedBatchEdit { variants, ticket })
+                type EditVariants = BTreeMap<DocClass, Result<PreparedCarrierInfo, PortError>>;
+                let prepared: Result<(EditVariants, Option<PreparedBlobSource>), PortError> =
+                    (|| {
+                        let base = sources
+                            .take_base(&ed.note, ed.plan.base_content_hash)
+                            .ok_or_else(|| {
+                                DomainError::validation(ValidationReason::SourceMismatch)
+                            })?;
+                        let next = notarium_syntax::patch::apply(&base, &ed.plan)?;
+                        let blob =
+                            PreparedBlobSource::prepare(next.as_bytes(), store.blob_codec())?;
+                        let mut variants = BTreeMap::new();
+                        for &class in sources.classes.get(&ed.note).into_iter().flatten() {
+                            let variant = (|| {
+                                let header = if class == DocClass::EncryptedNote {
+                                    None
+                                } else {
+                                    enforce_protected_frontmatter_unchanged_with_header(
+                                        &base, &next, class,
+                                    )?
+                                };
+                                // An empty fallback marks a title derived from the slug. The
+                                // savepoint fills it from the actual head after any move.
+                                analyze_carrier_metadata(&next, class, "", header, || {
+                                    Ok(blob.clone())
+                                })
+                            })();
+                            variants.insert(class, variant);
+                        }
+                        let blob_opt = if variants.values().any(Result::is_ok) {
+                            sources.remember(&ed.note, blob.digest, &next);
+                            Some(blob)
+                        } else {
+                            None
+                        };
+                        Ok((variants, blob_opt))
+                    })();
+                match prepared {
+                    Ok((variants, blob)) => slots.push(DeferredBatchSlot::Edit {
+                        idemp,
+                        preconditions: item_mut.preconditions,
+                        note: ed.note,
+                        base_content_hash: ed.plan.base_content_hash,
+                        variants,
+                        blob,
+                    }),
+                    Err(err) => slots.push(DeferredBatchSlot::Ready(build_batch_edit_intent(
+                        store,
+                        &space_rec.scope,
+                        space_rec.active_epoch,
+                        idemp,
+                        ctx.auth().clone(),
+                        item_mut.preconditions,
+                        ed.note,
+                        ed.plan.base_content_hash,
+                        Err(err),
+                    ))),
                 }
-                .await;
-                intents.push(build_batch_edit_intent(
-                    store,
-                    &space_rec.scope,
-                    space_rec.active_epoch,
-                    idemp,
-                    ctx.auth().clone(),
-                    item_mut.preconditions,
-                    ed.note,
-                    ed.plan.base_content_hash,
-                    prepared,
-                ));
             }
             BatchItem::Delete(del) => {
                 if del.disposition == DeleteDisposition::Purge {
-                    intents.push(build_failing_item_intent(
+                    slots.push(DeferredBatchSlot::Ready(build_failing_item_intent(
                         &space_rec.scope,
                         space_rec.active_epoch,
                         DomainError::validation(ValidationReason::InvalidState).into(),
-                    ));
+                    )));
                     continue;
                 }
                 let disp_tag = match del.disposition {
@@ -3984,7 +4004,7 @@ async fn prepare_batch_intents(
                         .with_preconditions(&item_mut.preconditions, "note", del.note.as_str())
                         .with_confirmed_chat_step(ctx, disp_tag)
                         .for_note(ctx.auth(), &del.note);
-                intents.push(build_trash_or_restore_intent(
+                slots.push(DeferredBatchSlot::Ready(build_trash_or_restore_intent(
                     store,
                     &space_rec.scope,
                     space_rec.active_epoch,
@@ -3992,7 +4012,7 @@ async fn prepare_batch_intents(
                     ctx.auth().clone(),
                     item_mut.preconditions,
                     DeleteTarget::Note(del),
-                ));
+                )));
             }
             BatchItem::Move(mv) => {
                 if let Some(step) = ctx.confirmed_chat_step() {
@@ -4013,7 +4033,7 @@ async fn prepare_batch_intents(
                         let pin = deadline
                             .wait(&ctx.budget, || prepare_batch_move_pin(store, ctx, &mv))
                             .await?;
-                        intents.push(build_move_note_intent(
+                        slots.push(DeferredBatchSlot::Ready(build_move_note_intent(
                             &space_rec.scope,
                             space_rec.active_epoch,
                             idemp,
@@ -4022,14 +4042,96 @@ async fn prepare_batch_intents(
                             MetadataChange::Move(mv),
                             sf,
                             pin,
-                        ));
+                        )));
                     }
-                    Err(err) => intents.push(build_failing_item_intent(
+                    Err(err) => slots.push(DeferredBatchSlot::Ready(build_failing_item_intent(
                         &space_rec.scope,
                         space_rec.active_epoch,
                         err.into(),
-                    )),
+                    ))),
                 }
+            }
+        }
+    }
+
+    // Stage all unique Create/Edit blobs in canonical sorted ContentDigest order so
+    // LocalSharedGuard acquisition never self-deadlocks or inverts lock order.
+    let mut batch_blobs: Vec<&PreparedBlobSource> = Vec::new();
+    for slot in &slots {
+        match slot {
+            DeferredBatchSlot::Create { info, .. } => batch_blobs.push(&info.prepared_blob),
+            DeferredBatchSlot::Edit {
+                blob: Some(blob), ..
+            } => batch_blobs.push(blob),
+            _ => {}
+        }
+    }
+    let staged_by_digest = if batch_blobs.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        deadline
+            .prepare(&ctx.budget, || {
+                store.stage_blobs_for_batch_sorted(
+                    &space_rec.scope,
+                    space_rec.active_epoch,
+                    &batch_blobs,
+                )
+            })
+            .await?
+    };
+
+    let mut intents = Vec::with_capacity(slots.len());
+    for slot in slots {
+        match slot {
+            DeferredBatchSlot::Ready(intent) => intents.push(intent),
+            DeferredBatchSlot::Create {
+                idemp,
+                cr,
+                slug_fold,
+                info,
+            } => {
+                let ticket = staged_by_digest
+                    .get(&info.prepared_blob.digest)
+                    .cloned()
+                    .ok_or_else(|| {
+                        internal_not_committed("missing_staged_batch_create_blob", "ticket missing")
+                    })?;
+                intents.push(build_create_note_intent(
+                    &space_rec.scope,
+                    space_rec.active_epoch,
+                    idemp,
+                    ctx.auth().clone(),
+                    cr,
+                    slug_fold,
+                    info,
+                    ticket,
+                ));
+            }
+            DeferredBatchSlot::Edit {
+                idemp,
+                preconditions,
+                note,
+                base_content_hash,
+                variants,
+                blob,
+            } => {
+                let ticket = match blob {
+                    Some(b) => Some(staged_by_digest.get(&b.digest).cloned().ok_or_else(|| {
+                        internal_not_committed("missing_staged_batch_edit_blob", "ticket missing")
+                    })?),
+                    None => None,
+                };
+                intents.push(build_batch_edit_intent(
+                    store,
+                    &space_rec.scope,
+                    space_rec.active_epoch,
+                    idemp,
+                    ctx.auth().clone(),
+                    preconditions,
+                    note,
+                    base_content_hash,
+                    Ok(PreparedBatchEdit { variants, ticket }),
+                ));
             }
         }
     }
@@ -4655,6 +4757,9 @@ pub(crate) async fn link_many_impl(
 ) -> Result<BatchResult<Link>, PortError> {
     let budget = ctx.budget.clone();
     let deadline = super::common::CommandDeadline::start(&budget, "link_many");
+    if request.items.is_empty() && ctx.confirmed_chat_step().is_some() {
+        return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
+    }
     let space = deadline
         .wait(&budget, || {
             store.read_space_fast_or_pool(&ctx.scope().space_id, Some(&budget))
@@ -4662,9 +4767,6 @@ pub(crate) async fn link_many_impl(
         .await??;
     space.scope.check(ctx.scope())?;
     if request.items.is_empty() {
-        if ctx.confirmed_chat_step().is_some() {
-            return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
-        }
         if space.space.lifecycle != notarium_core::auth::SpaceLifecycle::Active {
             return Err(DomainError::ResourceNotFound.into());
         }

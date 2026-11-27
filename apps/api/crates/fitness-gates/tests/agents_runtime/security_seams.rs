@@ -1840,11 +1840,7 @@ async fn exact_causal_graph_and_control_replay_seams(
             .unwrap(),
         budget(),
     );
-    for (tag, caller) in [
-        (137u8, agent_run_ctx),
-        (138u8, keeper_call_ctx),
-        (141u8, read_pat_ctx),
-    ] {
+    for (tag, caller) in [(137u8, agent_run_ctx), (141u8, read_pat_ctx)] {
         fixture
             .control
             .begin_agent_call(
@@ -1862,6 +1858,27 @@ async fn exact_causal_graph_and_control_replay_seams(
             .await
             .unwrap();
     }
+    assert!(
+        matches!(
+            fixture
+                .control
+                .begin_agent_call(
+                    keeper_call_ctx,
+                    BeginAgentCall {
+                        call: RequestId::from_bytes([138u8; 16]),
+                        request: RequestId::from_bytes([138u8; 16]),
+                        episode: Some(ep_id.clone()),
+                        operation: AgentOperation::Context,
+                        transport: AgentTransport::Mcp,
+                        effect: AgentEffect::Read,
+                        input_bytes: 0,
+                    },
+                )
+                .await,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ),
+        "Keeper is episode-free and must fail ResourceNotFound on begin_agent_call with an episode"
+    );
     // Advance +15 min (35 min since ep_id creation, only 15 min since the
     // forbidden heartbeat attempts). Because none updated last_seen_at, ep_id
     // must be treated as idle (>= 30 min) and Resumed rather than Forked.

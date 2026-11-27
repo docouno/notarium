@@ -456,6 +456,7 @@ impl EngineAuthContext {
             BTreeMap::from([(space, grant)]),
         )?;
         derived.kind = PrincipalKind::Keeper(run);
+        derived.spaces_narrowed = true;
         derived.readonly_abilities = if may_pin_dependencies {
             readonly_abilities
         } else {

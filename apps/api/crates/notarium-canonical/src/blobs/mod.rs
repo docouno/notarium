@@ -646,6 +646,51 @@ impl crate::CanonicalStore {
         }
     }
 
+    /// Schedules synchronized orphan local CAS cleanup asynchronously on `backup_executor`
+    /// so callers on `WriteBatchActor` or auxiliary writer paths NEVER block awaiting
+    /// `LocalExclusiveGuard` while holding `writer.lock()`, `live_visibility`, `commit_gate`,
+    /// or `ActiveCanonicalEffect`, or while sibling commands holding `LocalSharedGuard` wait
+    /// in `WriteBatchActor`'s mailbox.
+    pub(crate) fn schedule_unretained_local_files_cleanup(
+        &self,
+        to_cleanup: Vec<(SpaceId, ContentDigest)>,
+    ) {
+        if to_cleanup.is_empty() {
+            return;
+        }
+        if !matches!(self.inner.blobs, BlobBackendDriver::Local(_)) {
+            return;
+        }
+        let store = self.clone();
+        let handle = self.inner.backup_executor.spawn(async move {
+            store.cleanup_unretained_local_files_async(to_cleanup).await;
+        });
+        if let Ok(mut tasks) = self.inner.backup_cleanups.lock() {
+            tasks.retain(|t| !t.is_finished());
+            tasks.push(handle);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn drain_scheduled_cleanups_for_test(&self) {
+        loop {
+            let pending = {
+                let mut tasks = self
+                    .inner
+                    .backup_cleanups
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                std::mem::take(&mut *tasks)
+            };
+            if pending.is_empty() {
+                break;
+            }
+            for task in pending {
+                let _ = task.await;
+            }
+        }
+    }
+
     /// Synchronized cleanup for local CAS `.zst` files that were newly renamed into `blobs/`
     /// by a command or batch whose SQL transaction aborted/rolled back (or had an unknown commit
     /// outcome). Callers MUST have dropped all their own `StagedBlobTicket`s (`LocalSharedGuard`s)
@@ -1079,6 +1124,126 @@ impl crate::CanonicalStore {
             }
             BlobBackendDriver::S3(s3) => {
                 self.stage_s3_blob(s3, scope, active_epoch, prepared).await
+            }
+        }
+    }
+
+    /// Stages multiple prepared CAS payloads for execution inside `WriteBatchActor` in canonical
+    /// sorted, deduplicated `ContentDigest` order so multi-blob batches (`accept_batch`,
+    /// `publish_ability_package`) never acquire `LocalSharedGuard` re-entrantly or out-of-order.
+    pub(crate) async fn stage_blobs_for_batch_sorted(
+        &self,
+        scope: &HistoryScope,
+        active_epoch: LeaseEpoch,
+        prepared_items: &[&PreparedBlobSource],
+    ) -> Result<HashMap<ContentDigest, StagedBlobTicket>, PortError> {
+        self.inner
+            .check_writer_epoch(&scope.space_id, active_epoch)?;
+        if prepared_items.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut unique: Vec<&PreparedBlobSource> = Vec::with_capacity(prepared_items.len());
+        let mut seen: HashSet<ContentDigest> = HashSet::with_capacity(prepared_items.len());
+        for &item in prepared_items {
+            if item.codec != self.blob_codec() {
+                return Err(internal_not_committed(
+                    "blob_codec_mismatch",
+                    "PreparedBlobSource codec does not match store backend",
+                ));
+            }
+            if seen.insert(item.digest) {
+                unique.push(item);
+            }
+        }
+        unique.sort_unstable_by_key(|item| item.digest);
+
+        match &self.inner.blobs {
+            BlobBackendDriver::Local(local) => {
+                let digests: Vec<ContentDigest> = unique.iter().map(|p| p.digest).collect();
+                let guards = local
+                    .acquire_shared_guards_sorted(&scope.space_id, &digests)
+                    .await;
+                let scope_cl = scope.clone();
+                let digests_cl = digests.clone();
+                let existing_pubs: HashMap<ContentDigest, String> = self
+                    .with_read_tx(|tx| {
+                        Box::pin(async move {
+                            let space_rec = load_space_record(tx, &scope_cl.space_id).await?;
+                            space_rec.scope.check(&scope_cl)?;
+                            if space_rec.active_epoch != active_epoch {
+                                return Err(DomainError::validation(
+                                    ValidationReason::InvalidAuthority,
+                                )
+                                .into());
+                            }
+                            let mut pubs = HashMap::new();
+                            for digest in digests_cl {
+                                if let Some(pub_id) =
+                                    check_local_catalog_open_read_tx(tx, &scope_cl.space_id, digest)
+                                        .await?
+                                {
+                                    pubs.insert(digest, pub_id);
+                                }
+                            }
+                            Ok(pubs)
+                        })
+                    })
+                    .await?;
+
+                let mut out = HashMap::with_capacity(unique.len());
+                for item in unique {
+                    let guard = guards.get(&item.digest).cloned().ok_or_else(|| {
+                        internal_not_committed("missing_sorted_guard", "digest guard missing")
+                    })?;
+                    let frame = Arc::clone(item.local_frame.as_ref().ok_or_else(|| {
+                        internal_not_committed("missing_local_frame", "local frame not prepared")
+                    })?);
+                    let deferred = DeferredLocalStaging::new(
+                        Arc::clone(local),
+                        scope.space_id.clone(),
+                        item.digest,
+                        item.raw_size,
+                        frame,
+                    );
+                    let pub_id = match existing_pubs.get(&item.digest) {
+                        Some(id) => id.clone(),
+                        None => new_prefixed_hex_id("pub_")?,
+                    };
+                    out.insert(
+                        item.digest,
+                        StagedBlobTicket {
+                            space_id: scope.space_id.clone(),
+                            incarnation: scope.incarnation,
+                            epoch: active_epoch,
+                            digest: item.digest,
+                            raw_size: item.raw_size,
+                            compressed_size: item.total_compressed_size,
+                            publication_id: pub_id,
+                            codec: BlobCodecTag::LocalZstdV1,
+                            discard: None,
+                            local_pending_dirs: PendingDirSyncs::default(),
+                            _local_guard: Some(guard),
+                            deferred_local_key: Some((
+                                scope.space_id.as_str().to_owned(),
+                                item.digest,
+                            )),
+                            deferred_local_publish: Some(Arc::new(std::sync::Mutex::new(Some(
+                                deferred,
+                            )))),
+                        },
+                    );
+                }
+                Ok(out)
+            }
+            BlobBackendDriver::S3(s3) => {
+                let mut out = HashMap::with_capacity(unique.len());
+                for item in unique {
+                    let ticket = self
+                        .stage_owned_s3_blob(s3, scope, active_epoch, item)
+                        .await?;
+                    out.insert(item.digest, ticket);
+                }
+                Ok(out)
             }
         }
     }

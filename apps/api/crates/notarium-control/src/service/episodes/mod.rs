@@ -51,6 +51,9 @@ pub(super) fn episode_project_admitted(
     episode_name: Option<&str>,
     allow_shared_unnamed_chat: bool,
 ) -> bool {
+    if matches!(auth.kind(), PrincipalKind::Keeper(_)) {
+        return false;
+    }
     match project {
         Some(reference) => auth.spaces().get(&reference.space_id).is_some_and(|grant| {
             !grant.read_classes.is_empty()
@@ -97,10 +100,11 @@ pub(super) fn episode_visible_to_narrowed(
     episode_name: Option<&str>,
     allow_shared_unnamed_chat: bool,
 ) -> bool {
-    if !auth
-        .spaces()
-        .values()
-        .any(|grant| !grant.read_classes.is_empty())
+    if matches!(auth.kind(), PrincipalKind::Keeper(_))
+        || !auth
+            .spaces()
+            .values()
+            .any(|grant| !grant.read_classes.is_empty())
     {
         return false;
     }

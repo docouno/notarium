@@ -38,6 +38,10 @@ pub(super) struct RunQuerySourceDisclosure {
     /// `Some(None)` when any prior non-query call had Space-wide, multi-project,
     /// legacy, unparseable, or overflow (>64 rows) disclosure.
     pub confined_project: Option<Option<FolderRef>>,
+    /// When `true` (disclosure scan overflow >64 non-query calls or legacy/unparseable
+    /// `policy_epochs`), remote query embedding fails closed unconditionally independent
+    /// of caller-narrowed `grant.read_classes`.
+    pub fail_closed: bool,
 }
 
 impl RunQuerySourceDisclosure {
@@ -46,6 +50,9 @@ impl RunQuerySourceDisclosure {
         allowed_classes: &BTreeSet<DocClass>,
         embedder_project_only: Option<&FolderRef>,
     ) -> bool {
+        if self.fail_closed {
+            return false;
+        }
         if !self.classes.is_subset(allowed_classes) {
             return false;
         }
@@ -61,14 +68,13 @@ impl RunQuerySourceDisclosure {
 /// Model-authored search queries may reflect any non-encrypted class and scope
 /// previously disclosed to the calling run across its recorded provider calls.
 /// Require the remote embedding provider to cover every such class and respect
-/// project confinement, failing closed to the run's non-encrypted Space grant
-/// and unconfined scope if any recorded call lacks disclosure data, fails
-/// parsing, or exceeds the bounded scan limit. A clean run with zero prior
-/// non-query provider calls has no recorded disclosure.
+/// project confinement, failing closed unconditionally if any recorded call lacks
+/// disclosure data, fails parsing, or exceeds the bounded scan limit. A clean run
+/// with zero prior non-query provider calls has no recorded disclosure.
 pub(super) async fn required_query_source_disclosure(
     tx: &mut Transaction,
     auth: &EngineAuthContext,
-    grant: &SpaceGrant,
+    _grant: &SpaceGrant,
 ) -> Result<RunQuerySourceDisclosure, PortError> {
     let run = match auth.kind() {
         PrincipalKind::AgentRun(run) | PrincipalKind::Keeper(run) => run,
@@ -76,18 +82,14 @@ pub(super) async fn required_query_source_disclosure(
             return Ok(RunQuerySourceDisclosure {
                 classes: BTreeSet::new(),
                 confined_project: None,
+                fail_closed: false,
             });
         }
     };
-    let grant_readable: BTreeSet<DocClass> = grant
-        .read_classes
-        .iter()
-        .copied()
-        .filter(|class| *class != DocClass::EncryptedNote)
-        .collect();
     let fail_closed = || RunQuerySourceDisclosure {
-        classes: grant_readable.clone(),
+        classes: BTreeSet::new(),
         confined_project: Some(None),
+        fail_closed: true,
     };
     let prior_calls = rows!(
         tx,
@@ -101,6 +103,7 @@ pub(super) async fn required_query_source_disclosure(
         return Ok(RunQuerySourceDisclosure {
             classes: BTreeSet::new(),
             confined_project: None,
+            fail_closed: false,
         });
     }
     if prior_calls.len() > 64 {
@@ -131,6 +134,7 @@ pub(super) async fn required_query_source_disclosure(
     Ok(RunQuerySourceDisclosure {
         classes: required,
         confined_project,
+        fail_closed: false,
     })
 }
 
@@ -895,4 +899,22 @@ fn put_header(
     value.set_sensitive(true);
     headers.insert(name, value);
     Ok(())
+}
+
+#[cfg(test)]
+mod disclosure_tests {
+    use super::*;
+
+    #[test]
+    fn fail_closed_disclosure_never_admits_embedder_even_for_all_classes() {
+        let disclosure = RunQuerySourceDisclosure {
+            classes: BTreeSet::new(),
+            confined_project: Some(None),
+            fail_closed: true,
+        };
+        assert!(
+            !disclosure.allows_embedder(&DocClass::all(), None),
+            "overflow/unparseable disclosure must fail closed unconditionally"
+        );
+    }
 }

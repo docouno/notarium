@@ -36,8 +36,9 @@ binding columns (`approved_skills`, `keeper_log_id`,
 `keeper_project_folder_id`), recreating `schedule_due`, `schedule_deleted`,
 and `schedule_run_retention` as partial indexes aligned to their scan orders,
 and adding `schedule_expired_run`, `episode_owner_name_open`,
-`attachment_target_approved_id`, `call_run`, `ability_trail_destination`, and
-`ability_preference_placement`. Existing bearers default to no
+`attachment_target_approved_id`, `call_run`, `ability_trail_destination`,
+`ability_preference_placement`, `favorite_note_order`, and
+`context_order_lookup`. Existing bearers default to no
 ability-authoring opt-in. Existing schedules with unverified skill approvals
 require explicit review before a provider call.
 
@@ -637,7 +638,7 @@ content permissions remain independent. Deletion removes dangling order entries.
 Bootstrap selection accepts an optional current Space. It must match an available
 saved project; otherwise the caller must explicitly update the episode. Selection orders project, Space, personal context and favorites, retaining each
 NoteRef's first occurrence via bounded in-memory deduplication over indexed SQL
-reads before keyset paging. Scope queries and favorite scans are bounded at
+reads before keyset paging. Scope pin and attachment queries fail closed (`BudgetExceeded`) above 4,096 rows per scope (and above 8,192 expanded scope items); favorite scans are bounded at
 4,096 candidate rows per page; unauthorized or out-of-project favorites are
 skipped without emitting empty pages or disclosing their count via
 `unavailable` or continuations. Folder favorites are never expanded into a

@@ -133,7 +133,7 @@ pub(crate) fn encode_rollback_note(
 }
 
 fn current_rollback_metadata(
-    history: &[(RevisionId, SpaceSeq, Vec<u8>, Option<AgentRunId>)],
+    history: &[NoteRevHistoryRow],
     head: &RevisionId,
     note: &NoteId,
 ) -> Result<Box<NoteRevisionMetadata>, PortError> {
@@ -164,6 +164,7 @@ pub(crate) enum CandidateAction {
         pre_rev_id: RevisionId,
         pre_meta: Box<NoteRevisionMetadata>,
         pre_carrier: Option<String>,
+        pre_updated_at: Option<notarium_core::value::Timestamp>,
         needs_note_mutation: bool,
         head_unchanged_placement: bool,
         current_cover_parent: Option<FolderId>,
@@ -770,6 +771,7 @@ async fn execute_general_rollback(
                             planned_header_diagnostic: None,
                             planned_carrier: None,
                             planned_fields: BTreeMap::new(),
+                            planned_updated_at: None,
                         });
                     }
                     CandidateAction::RestorePreExisting {
@@ -777,6 +779,7 @@ async fn execute_general_rollback(
                         pre_rev_id,
                         pre_meta,
                         pre_carrier,
+                        pre_updated_at,
                         ..
                     } => {
                         let mut pfields = BTreeMap::new();
@@ -796,6 +799,7 @@ async fn execute_general_rollback(
                             planned_header_diagnostic: pre_meta.diagnostics.first().cloned(),
                             planned_carrier: pre_carrier.clone(),
                             planned_fields: pfields,
+                            planned_updated_at: *pre_updated_at,
                         });
                     }
                 }
@@ -1177,6 +1181,7 @@ pub(crate) fn build_rollback_direct_single_tx_exec(
                             pre_rev_id,
                             pre_meta: Box::new(pre_meta),
                             pre_carrier: None,
+                            pre_updated_at: None,
                             needs_note_mutation,
                             head_unchanged_placement,
                             current_cover_parent: None,
@@ -2531,9 +2536,11 @@ fn build_rollback_execute_fn(
                                                     successor: Some(succ),
                                                     ..
                                                 } => {
-                                                    effective_overlays
+                                                    (effective_overlays
                                                         .get(succ)
                                                         .is_some_and(|o| o.group == post_grp)
+                                                        && !same_group_run_materialized
+                                                            .contains_key(succ))
                                                         || stale_prerun_restores
                                                             .get(succ)
                                                             .is_some_and(|(g, _)| g == &post_grp)
@@ -2645,7 +2652,7 @@ fn build_rollback_execute_fn(
                                     None => None,
                                 };
 
-                                let ins_idx = match (pred_pos, succ_pos) {
+                                let mut ins_idx = match (pred_pos, succ_pos) {
                                     (None, None) => {
                                         if predecessor.is_some() && successor.is_none() {
                                             g_items.len()
@@ -2695,6 +2702,73 @@ fn build_rollback_execute_fn(
                                         }
                                     }
                                 };
+                                if is_earliest
+                                    && (bmh.before_placement_revision.is_none()
+                                        || before_mat_seq_for_bmh.is_some())
+                                    && let Some((_, base_order)) = view_facts
+                                        .post_restore_group_order
+                                        .iter()
+                                        .find(|(g, _)| g == group)
+                                    && let Some(target_base_pos) =
+                                        base_order.iter().position(|id| id == target)
+                                {
+                                    let is_orig_ranked_in_grp = |nid: &NoteId| -> bool {
+                                        if stale_prerun_restores
+                                            .get(nid)
+                                            .is_some_and(|(g, _)| g == group)
+                                        {
+                                            return true;
+                                        }
+                                        if let Some(TargetSettlement::Replayed {
+                                            group: rg,
+                                            placement_revision: Some(_),
+                                            ..
+                                        }) = target_final_state.get(nid)
+                                        {
+                                            return rg == group;
+                                        }
+                                        !moved_targets_on_view.contains(nid)
+                                            && !same_group_run_materialized.contains_key(nid)
+                                            && effective_overlays
+                                                .get(nid)
+                                                .is_some_and(|o| &o.group == group)
+                                    };
+                                    let upper =
+                                        succ_pos.unwrap_or(g_items.len()).min(g_items.len());
+                                    let lower = pred_pos.map_or(0, |p| p + 1).min(upper);
+                                    while ins_idx < upper {
+                                        let next_id = &g_items[ins_idx].note_id;
+                                        if is_orig_ranked_in_grp(next_id) {
+                                            break;
+                                        }
+                                        let Some(next_base_pos) =
+                                            base_order.iter().position(|id| id == next_id)
+                                        else {
+                                            break;
+                                        };
+                                        if next_base_pos < target_base_pos {
+                                            ins_idx += 1;
+                                        } else {
+                                            break;
+                                        }
+                                    }
+                                    while ins_idx > lower {
+                                        let prev_id = &g_items[ins_idx - 1].note_id;
+                                        if is_orig_ranked_in_grp(prev_id) {
+                                            break;
+                                        }
+                                        let Some(prev_base_pos) =
+                                            base_order.iter().position(|id| id == prev_id)
+                                        else {
+                                            break;
+                                        };
+                                        if prev_base_pos > target_base_pos {
+                                            ins_idx -= 1;
+                                        } else {
+                                            break;
+                                        }
+                                    }
+                                }
 
                                 let computed = compute_rank_placement(g_items, target, ins_idx)?;
                                 for (pn, pr) in computed.pma_neighbor_updates {
@@ -3994,7 +4068,7 @@ async fn discover_rollback_state_tx(
                     },
                 );
             }
-            Some((pre_rev_id, _, meta_bytes, _)) => {
+            Some((pre_rev_id, _, meta_bytes, _, pre_updated_at)) => {
                 let mut pre_meta = decode_rollback_note(meta_bytes, &nid)?;
                 ability::retain_binding(&mut pre_meta, &head)?;
                 authorize_rollback_destination_tx(
@@ -4018,6 +4092,7 @@ async fn discover_rollback_state_tx(
                         pre_rev_id: pre_rev_id.clone(),
                         pre_meta: Box::new(pre_meta),
                         pre_carrier: None,
+                        pre_updated_at: Some(*pre_updated_at),
                         needs_note_mutation,
                         head_unchanged_placement,
                         current_cover_parent,
@@ -4851,21 +4926,29 @@ async fn load_target_board_move_runs_tx(
 }
 
 #[allow(clippy::type_complexity)]
+type NoteRevHistoryRow = (
+    RevisionId,
+    SpaceSeq,
+    Vec<u8>,
+    Option<AgentRunId>,
+    notarium_core::value::Timestamp,
+);
+
 async fn load_notes_revision_histories_batch_tx(
     tx: &mut BackendConn<'_>,
     space_id: &SpaceId,
     note_ids: &[NoteId],
-) -> Result<BTreeMap<NoteId, Vec<(RevisionId, SpaceSeq, Vec<u8>, Option<AgentRunId>)>>, PortError> {
-    let mut out: BTreeMap<NoteId, Vec<(RevisionId, SpaceSeq, Vec<u8>, Option<AgentRunId>)>> =
-        BTreeMap::new();
+) -> Result<BTreeMap<NoteId, Vec<NoteRevHistoryRow>>, PortError> {
+    let mut out: BTreeMap<NoteId, Vec<NoteRevHistoryRow>> = BTreeMap::new();
     if note_ids.is_empty() {
         return Ok(out);
     }
+    type RawNoteRevRow = (String, String, i64, Vec<u8>, Option<String>, i64, i32);
     for chunk in note_ids.chunks(200) {
-        let rows: Vec<(String, String, i64, Vec<u8>, Option<String>)> = match tx {
+        let rows: Vec<RawNoteRevRow> = match tx {
             BackendConn::Sqlite(conn) => {
                 let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
-                    "SELECT entity_key, rev_id, space_seq, metadata_msgpack, agent_run_id
+                    "SELECT entity_key, rev_id, space_seq, metadata_msgpack, agent_run_id, created_at_sec, created_at_nsec
                      FROM revisions
                      WHERE space_id = ",
                 );
@@ -4888,13 +4971,15 @@ async fn load_notes_revision_histories_batch_tx(
                             r.get("space_seq"),
                             r.get("metadata_msgpack"),
                             r.get("agent_run_id"),
+                            r.get("created_at_sec"),
+                            r.get("created_at_nsec"),
                         )
                     })
                     .collect()
             }
             BackendConn::Postgres(conn) => {
                 let mut qb = sqlx::QueryBuilder::<sqlx::Postgres>::new(
-                    "SELECT entity_key, rev_id, space_seq, metadata_msgpack, agent_run_id
+                    "SELECT entity_key, rev_id, space_seq, metadata_msgpack, agent_run_id, created_at_sec, created_at_nsec
                      FROM revisions
                      WHERE space_id = ",
                 );
@@ -4918,13 +5003,15 @@ async fn load_notes_revision_histories_batch_tx(
                             r.get("space_seq"),
                             r.get("metadata_msgpack"),
                             r.get("agent_run_id"),
+                            r.get("created_at_sec"),
+                            r.get("created_at_nsec"),
                         )
                     })
                     .collect()
             }
         };
 
-        for (nid_raw, rev_raw, seq_raw, meta, run_raw) in rows {
+        for (nid_raw, rev_raw, seq_raw, meta, run_raw, sec, nsec) in rows {
             let nid = NoteId::parse(&nid_raw)
                 .map_err(|_| internal_not_committed("corrupt_rev_nid", "invalid note_id"))?;
             let rev = RevisionId::parse(&rev_raw)
@@ -4937,7 +5024,13 @@ async fn load_notes_revision_histories_batch_tx(
                 ),
                 None => None,
             };
-            out.entry(nid).or_default().push((rev, seq, meta, run));
+            let ts = notarium_core::value::Timestamp::from_unix_parts(
+                sec,
+                u32::try_from(nsec)
+                    .map_err(|_| internal_not_committed("corrupt_rev_ts", "invalid nsec"))?,
+            )
+            .map_err(|_| internal_not_committed("corrupt_rev_ts", "invalid timestamp"))?;
+            out.entry(nid).or_default().push((rev, seq, meta, run, ts));
         }
     }
     Ok(out)
@@ -7631,6 +7724,7 @@ async fn execute_pg_fast_rollback_inner(
                     pre_rev_id,
                     pre_meta: Box::new(pre_meta),
                     pre_carrier: None,
+                    pre_updated_at: None,
                     needs_note_mutation,
                     head_unchanged_placement,
                     current_cover_parent: None,

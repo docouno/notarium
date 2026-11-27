@@ -568,6 +568,41 @@ async fn sqlite_hot_control_queries_use_indexes_before_and_after_analyze() {
             "USING COVERING INDEX context_order_lookup",
             &rows,
         );
+
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "EXPLAIN QUERY PLAN {}",
+            include_str!("context_state/entries.sqlite.sql")
+        )))
+        .bind("space")
+        .bind(&first_space)
+        .bind(0i64)
+        .bind("")
+        .bind("")
+        .bind("")
+        .bind(32i64)
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+        let entry_details: Vec<String> = rows.iter().map(|r| r.get::<String, _>(3)).collect();
+        let entry_joined = entry_details.join("\n");
+        for expected in [
+            "SEARCH a USING INDEX context_attachment_target",
+            "SEARCH s USING INDEX sqlite_autoindex_context_sets_1",
+            "SEARCH p USING COVERING INDEX context_pin_target",
+            "SEARCH o USING COVERING INDEX context_order_lookup",
+        ] {
+            assert!(
+                entry_joined.contains(expected),
+                "{phase} context_entries must include `{expected}`, got:\n{entry_joined}"
+            );
+        }
+        assert!(
+            !entry_details
+                .iter()
+                .any(|d| d.starts_with("SCAN ") && !d.starts_with("SCAN entries")
+                    || d.contains("ANY(")),
+            "{phase} context_entries must avoid base-table scans and skip-scans, got:\n{entry_joined}"
+        );
     }
 
     conn.close().await.unwrap();

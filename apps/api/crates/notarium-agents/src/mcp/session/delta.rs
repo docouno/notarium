@@ -358,6 +358,15 @@ pub(super) async fn resume(
         })
 }
 
+pub(super) async fn validate_delivery(
+    call: &ToolCallContext<'_>,
+    token: &str,
+) -> Result<(), PortError> {
+    let ticket = call.registry.bootstrap.find(token, DELIVERY_PREFIX)?;
+    revalidate(call, &ticket.batch).await?;
+    Ok(())
+}
+
 pub(super) async fn deliver(
     call: &ToolCallContext<'_>,
     token: &str,

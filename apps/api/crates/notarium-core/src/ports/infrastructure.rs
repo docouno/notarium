@@ -505,6 +505,9 @@ pub struct PlannedNoteRestoration {
     pub planned_header_diagnostic: Option<Diagnostic>,
     pub planned_carrier: Option<String>,
     pub planned_fields: BTreeMap<String, Option<YamlValue>>,
+    /// Pre-run revision timestamp used to preserve pure base-order sorting on default-sorted
+    /// (`updated_at DESC`) boards during rollback planning.
+    pub planned_updated_at: Option<crate::value::Timestamp>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -621,7 +621,7 @@ impl BoardPlan<'_> {
     fn post_restore_group_order(
         &self,
         cut: &BoardCut,
-        view: &ViewRef,
+        _view: &ViewRef,
         groups: &[EvaluatedBoardGroup],
         restored: &[(GroupKey, NoteId, notarium_core::query::SortTuple)],
         deadline: &PlannerDeadline,
@@ -635,7 +635,6 @@ impl BoardPlan<'_> {
         let mut by_group: Vec<(GroupKey, Vec<GroupOrderEntry<'_>>)> = Vec::new();
         for eg in groups {
             deadline.check()?;
-            let (_, group_hex) = group_key_hex(&eg.group)?;
             let entry = if let Some((_, existing)) =
                 by_group.iter_mut().find(|(grp, _)| grp == &eg.group)
             {
@@ -653,10 +652,6 @@ impl BoardPlan<'_> {
                 let Some(note) = cut.notes.get(&row.note) else {
                     continue;
                 };
-                let overlay = cut.ranks.get(view).and_then(|ranks| ranks.get(&row.note));
-                let rank = overlay
-                    .filter(|rank| rank.group_hex == group_hex)
-                    .map(|rank| rank.rank.as_str());
                 let order = restored_by_note
                     .get(&row.note)
                     .map(|(_, order)| (*order).clone())
@@ -668,12 +663,13 @@ impl BoardPlan<'_> {
                             &note.fields,
                         )
                     });
-                entry.push((rank, order, row.note.clone()));
+                // Always emit pure base sort order (ignoring run-mutated pre-rollback
+                // overlays); canonical rollback re-applies surviving overlays by rank.
+                entry.push((None, order, row.note.clone()));
             }
         }
         for (grp, note, order) in restored {
             deadline.check()?;
-            let (_, group_hex) = group_key_hex(grp)?;
             let entry = if let Some((_, existing)) = by_group.iter_mut().find(|(g, _)| g == grp) {
                 existing
             } else {
@@ -683,11 +679,7 @@ impl BoardPlan<'_> {
             if entry.iter().any(|(_, _, id)| id == note) {
                 continue;
             }
-            let overlay = cut.ranks.get(view).and_then(|ranks| ranks.get(note));
-            let rank = overlay
-                .filter(|rank| rank.group_hex == group_hex)
-                .map(|rank| rank.rank.as_str());
-            entry.push((rank, order.clone(), note.clone()));
+            entry.push((None, order.clone(), note.clone()));
         }
         let mut ordered = Vec::with_capacity(by_group.len());
         for (grp, mut rows) in by_group {
@@ -792,7 +784,7 @@ fn restored_membership(
         let order = sort_tuple(
             &plan.descriptor.sort,
             &restoration.note,
-            current.updated_at,
+            restoration.planned_updated_at.unwrap_or(current.updated_at),
             &fields,
         );
         return Ok(Some((group, order)));

@@ -278,6 +278,14 @@ impl PreparedDraft {
         let command = item_command(call, project, &draft, position, item_hash);
         let note = stable_note_id(&command.key, &project.reference);
         let title = draft_title(&draft)?;
+        if let Some(note_type) = &draft.note_type {
+            notarium_syntax::unicode::validate_content(note_type)?;
+        }
+        if let Some(tags) = &draft.tags {
+            for tag in tags {
+                notarium_syntax::unicode::validate_content(tag)?;
+            }
+        }
         let slug = if folder_page {
             "index".to_owned()
         } else {

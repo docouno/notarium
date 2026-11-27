@@ -295,13 +295,18 @@ impl ControlService {
                         let mut allowed_rows = Vec::with_capacity(batch_len);
                         for row in values {
                             next_after = row.set_id.clone();
-                            match self
-                                .check_bundle_attachment_db(tx.inner_mut(), &current, &row)
-                                .await
-                            {
-                                Ok(()) => allowed_rows.push(row),
-                                Err(error) if hidden(&error) => (),
-                                Err(error) => return Err(error),
+                            if project_target.is_some() {
+                                // SQL already enforced `home_space = $1` and matching project attachment.
+                                allowed_rows.push(row);
+                            } else {
+                                match self
+                                    .check_bundle_attachment_db(tx.inner_mut(), &current, &row)
+                                    .await
+                                {
+                                    Ok(()) => allowed_rows.push(row),
+                                    Err(error) if hidden(&error) => (),
+                                    Err(error) => return Err(error),
+                                }
                             }
                         }
                         Ok::<_, PortError>((batch_len, next_after, allowed_rows))

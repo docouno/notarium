@@ -1515,6 +1515,7 @@ mod tests {
                     "status".to_owned(),
                     Some(YamlValue::String("todo".to_owned())),
                 )]),
+                planned_updated_at: None,
             }],
         };
         cut.notes.insert(target.clone(), note);
@@ -1858,6 +1859,7 @@ mod tests {
             planned_fields: BTreeMap::new(),
             planned_header_diagnostic: None,
             planned_carrier: None,
+            planned_updated_at: None,
         };
         assert!(matches!(
             cut.check_live(
@@ -1904,6 +1906,7 @@ mod tests {
             planned_fields: BTreeMap::new(),
             planned_header_diagnostic: None,
             planned_carrier: None,
+            planned_updated_at: None,
         };
         assert!(matches!(
             cut.check_live(

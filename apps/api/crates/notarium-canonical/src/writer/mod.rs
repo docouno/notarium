@@ -2325,9 +2325,7 @@ async fn execute_batch_on_conn(
                 drop(active_effects);
                 drop(batch_retained_tickets);
                 drop(batch_retained_guards);
-                store
-                    .cleanup_unretained_local_files_async(newly_published)
-                    .await;
+                store.schedule_unretained_local_files_cleanup(newly_published);
                 return BatchExecOutcome::AbortedBeforeCommit(pub_err);
             }
         }
@@ -2338,9 +2336,7 @@ async fn execute_batch_on_conn(
             drop(active_effects);
             drop(batch_retained_tickets);
             drop(batch_retained_guards);
-            store
-                .cleanup_unretained_local_files_async(newly_published)
-                .await;
+            store.schedule_unretained_local_files_cleanup(newly_published);
             return BatchExecOutcome::AbortedBeforeCommit(sync_err);
         }
     }
@@ -2355,9 +2351,7 @@ async fn execute_batch_on_conn(
         drop(active_effects);
         drop(batch_retained_tickets);
         drop(batch_retained_guards);
-        store
-            .cleanup_unretained_local_files_async(newly_published)
-            .await;
+        store.schedule_unretained_local_files_cleanup(newly_published);
         if slots.len() == 1 {
             return BatchExecOutcome::AbortedBeforeCommit(
                 revoked_effects.into_iter().next().unwrap().1,
@@ -2480,9 +2474,7 @@ async fn execute_batch_on_conn(
             }
             drop(batch_retained_tickets);
             drop(batch_retained_guards);
-            store
-                .cleanup_unretained_local_files_async(newly_published)
-                .await;
+            store.schedule_unretained_local_files_cleanup(newly_published);
             BatchExecOutcome::UnknownCommit {
                 slots,
                 diag_reason: format!("{commit_err:?}"),
@@ -3735,6 +3727,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(persisted, 0, "rolled-back batch must persist zero rows");
+        store.drain_scheduled_cleanups_for_test().await;
         let leaked_blob_path = DataRoot::new(&root).blob(&space_id, staged_digest);
         assert!(
             !leaked_blob_path.exists(),
@@ -3800,6 +3793,46 @@ mod tests {
             leaked_blob_path.exists(),
             "cleanup_unretained_local_files_async must preserve live committed local CAS blob at {}",
             leaked_blob_path.display()
+        );
+
+        // Async orphan cleanup MUST NOT deadlock WriteBatchActor when a concurrent caller
+        // holds LocalSharedGuard on the exact same (space_id, digest) while a failed batch
+        // schedules orphan cleanup.
+        let deadlock_payload =
+            crate::blobs::PreparedBlobSource::prepare(b"concurrent-guard-blob", store.blob_codec())
+                .unwrap();
+        let deadlock_digest = deadlock_payload.digest;
+        let held_shared_ticket = store
+            .stage_blob_for_batch(&rec.scope, epoch, &deadlock_payload)
+            .await
+            .unwrap();
+        let deadlock_blob_path = DataRoot::new(&root).blob(&space_id, deadlock_digest);
+        let mut deadlock_published = Vec::new();
+        let deadlock_dirs = store
+            .publish_deferred_local_tickets_async(
+                std::slice::from_ref(&held_shared_ticket),
+                &mut deadlock_published,
+            )
+            .await
+            .unwrap();
+        store
+            .flush_pending_local_dirs_async(&deadlock_dirs)
+            .await
+            .unwrap();
+        assert!(deadlock_blob_path.exists());
+        // Schedule cleanup while `held_shared_ticket` still holds LocalSharedGuard!
+        store.schedule_unretained_local_files_cleanup(deadlock_published);
+        // Must return immediately without blocking on `held_shared_ticket` and release on drop.
+        drop(held_shared_ticket);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            store.drain_scheduled_cleanups_for_test(),
+        )
+        .await
+        .expect("scheduled orphan cleanup must complete once LocalSharedGuard drops");
+        assert!(
+            !deadlock_blob_path.exists(),
+            "scheduled cleanup must unlink uncatalogued orphan blob once guard drops"
         );
 
         drop(store);

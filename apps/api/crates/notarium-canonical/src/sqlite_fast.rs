@@ -1791,9 +1791,7 @@ pub(crate) async fn execute_sqlite_fast_batch(
             if let Ok(reopened) = open_rusqlite_writer_connection(&pair.db_path) {
                 pair.rusqlite_conn = Some(reopened);
             }
-            store
-                .cleanup_unretained_local_files_async(cleanup_all_published(local_cas_res))
-                .await;
+            store.schedule_unretained_local_files_cleanup(cleanup_all_published(local_cas_res));
             return BatchExecOutcome::AbortedBeforeCommit(internal_not_committed(
                 "sqlite_fast_stage1_join",
                 join_err.to_string(),
@@ -1804,16 +1802,12 @@ pub(crate) async fn execute_sqlite_fast_batch(
     match stage1_res {
         FastSqlStageResult::AbortedBeforeCommit(err) => {
             restore_writer_rconn(pair, rconn);
-            store
-                .cleanup_unretained_local_files_async(cleanup_all_published(local_cas_res))
-                .await;
+            store.schedule_unretained_local_files_cleanup(cleanup_all_published(local_cas_res));
             BatchExecOutcome::AbortedBeforeCommit(err)
         }
         FastSqlStageResult::UnknownDirectCommit { slots, diag_reason } => {
             restore_writer_rconn(pair, rconn);
-            store
-                .cleanup_unretained_local_files_async(cleanup_all_published(local_cas_res))
-                .await;
+            store.schedule_unretained_local_files_cleanup(cleanup_all_published(local_cas_res));
             BatchExecOutcome::UnknownCommit { slots, diag_reason }
         }
         FastSqlStageResult::CommittedDirectly {
@@ -1826,7 +1820,7 @@ pub(crate) async fn execute_sqlite_fast_batch(
                 w.note_writer_commit_with_frames(wal_frames);
             }
             restore_writer_rconn(pair, rconn);
-            store.cleanup_unretained_local_files_async(orphaned).await;
+            store.schedule_unretained_local_files_cleanup(orphaned);
             finalize_committed_batch(store, &space_states, slots, faults)
         }
         FastSqlStageResult::RolledBackAllFailed {
@@ -1834,9 +1828,7 @@ pub(crate) async fn execute_sqlite_fast_batch(
             slots,
         } => {
             restore_writer_rconn(pair, rconn);
-            store
-                .cleanup_unretained_local_files_async(cleanup_all_published(local_cas_res))
-                .await;
+            store.schedule_unretained_local_files_cleanup(cleanup_all_published(local_cas_res));
             finalize_committed_batch(store, &space_states, slots, faults)
         }
         FastSqlStageResult::NeedsLocalWaves(pending) => {
@@ -1910,9 +1902,7 @@ pub(crate) async fn execute_sqlite_fast_batch(
                     drop(pending.batch_retained_tickets);
                     drop(pending.batch_retained_guards);
                     published_for_abort_cleanup.extend(unretained_for_post_tx_cleanup);
-                    store
-                        .cleanup_unretained_local_files_async(published_for_abort_cleanup)
-                        .await;
+                    store.schedule_unretained_local_files_cleanup(published_for_abort_cleanup);
                     BatchExecOutcome::AbortedBeforeCommit(io_err)
                 }
                 Ok(()) => {
@@ -1973,11 +1963,9 @@ pub(crate) async fn execute_sqlite_fast_batch(
                     match commit_res {
                         Ok(()) => {
                             if !unretained_for_post_tx_cleanup.is_empty() {
-                                store
-                                    .cleanup_unretained_local_files_async(
-                                        unretained_for_post_tx_cleanup,
-                                    )
-                                    .await;
+                                store.schedule_unretained_local_files_cleanup(
+                                    unretained_for_post_tx_cleanup,
+                                );
                             }
                             if let Some(w) = wal_opt.as_deref() {
                                 w.note_writer_commit_with_frames(wal_frames);
@@ -1991,9 +1979,9 @@ pub(crate) async fn execute_sqlite_fast_batch(
                         }
                         Err(diag_reason) => {
                             published_for_abort_cleanup.extend(unretained_for_post_tx_cleanup);
-                            store
-                                .cleanup_unretained_local_files_async(published_for_abort_cleanup)
-                                .await;
+                            store.schedule_unretained_local_files_cleanup(
+                                published_for_abort_cleanup,
+                            );
                             BatchExecOutcome::UnknownCommit {
                                 slots: pending.slots,
                                 diag_reason,
@@ -4475,7 +4463,7 @@ fn authorize_replay_targets_rusqlite(
             | ReplayResource::Create(note, ..)
             | ReplayResource::Move(note, ..) => note,
         };
-        if matches!(target, ReplayResource::View(_))
+        if matches!(target, ReplayResource::Read(_) | ReplayResource::View(_))
             && is_note_purge_fenced_rusqlite(conn, &srec.space.id, note.as_str())?
         {
             return Err(DomainError::ResourceNotFound.into());
@@ -6609,6 +6597,7 @@ impl SqliteSyncItemPlan for RollbackDirectSqliteFastPlan {
                     pre_rev_id,
                     pre_meta: Box::new(pre_meta),
                     pre_carrier: None,
+                    pre_updated_at: None,
                     needs_note_mutation,
                     head_unchanged_placement,
                     current_cover_parent: None,

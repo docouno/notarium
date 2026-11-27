@@ -353,6 +353,10 @@ impl ControlService {
         } else {
             SpaceRole::Editor
         };
+        let mut read_classes = DocClass::all();
+        if owner.personal_space_id.as_deref() != Some(space.as_str()) {
+            read_classes.remove(&DocClass::Profile);
+        }
         let auth = EngineAuthContext::for_human(
             VerifiedHuman::attest(
                 PrincipalId::parse(&owner.user_id)?,
@@ -361,7 +365,7 @@ impl ControlService {
                     space.clone(),
                     SpaceGrant {
                         role,
-                        read_classes: DocClass::all(),
+                        read_classes,
                         write_classes: BTreeSet::from([DocClass::AgentMemory]),
                         project_root: None,
                     },
@@ -369,7 +373,8 @@ impl ControlService {
                 false,
             )
             .with_credential(credential),
-        );
+        )
+        .mark_spaces_narrowed();
         Ok(Some((auth, admission)))
     }
     pub(super) async fn scheduled_context(

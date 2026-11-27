@@ -872,21 +872,14 @@ async fn oldest_prefix(
                     title: th.title.clone(),
                     active_run: th.active_run_id.clone(),
                 };
-                let mut ref_vis_cache = std::collections::HashMap::new();
                 let mut entries = Vec::with_capacity(retained.len());
                 let mut payloads = Vec::with_capacity(retained.len());
-                for (mut entry, payload) in retained {
-                    entry.referenced_notes = super::filter_readable_referenced_notes_tx(
-                        tx,
-                        &space.space,
-                        &auth,
-                        entry.referenced_notes,
-                        &mut ref_vis_cache,
-                    )
-                    .await?;
+                for (entry, payload) in retained {
                     entries.push(entry);
                     payloads.push(payload);
                 }
+                super::filter_branch_referenced_notes_tx(tx, &space.space, &auth, &mut entries)
+                    .await?;
                 Ok(PrefixWindow {
                     space,
                     thread_head: th,

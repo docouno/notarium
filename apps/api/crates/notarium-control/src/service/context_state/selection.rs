@@ -1,7 +1,10 @@
 use super::*;
 
-pub(crate) const BOOTSTRAP_SCOPE_PINS_SQLITE_SQL: &str = "SELECT coalesce(o.rank,0) AS rank, p.note_space, p.note_id FROM context_scope_pins p LEFT JOIN context_order o ON o.target_kind=p.target_kind AND o.target_id=p.target_id AND o.entry_kind='note' AND o.entry_ref=('{\"space_id\":\"' || p.note_space || '\",\"note_id\":\"' || p.note_id || '\"}') WHERE p.target_kind=$1 AND p.target_id=$2 LIMIT 4096";
-pub(crate) const BOOTSTRAP_SCOPE_SETS_SQLITE_SQL: &str = "SELECT coalesce(o.rank,0) AS rank, a.target_space, s.set_id, s.owner_id, s.home_space, s.name, s.note_refs, s.revision FROM context_set_attachments a JOIN context_sets s ON s.set_id=a.set_id LEFT JOIN context_order o ON o.target_kind=a.target_kind AND o.target_id=a.target_id AND o.entry_kind='set' AND o.entry_ref=a.set_id WHERE a.target_kind=$1 AND a.target_id=$2 LIMIT 4096";
+const MAX_BOOTSTRAP_SCOPE_ROWS: usize = 4096;
+const MAX_BOOTSTRAP_SCOPE_ITEMS: usize = 8192;
+
+pub(crate) const BOOTSTRAP_SCOPE_PINS_SQLITE_SQL: &str = "SELECT coalesce(o.rank,0) AS rank, p.note_space, p.note_id FROM context_scope_pins p LEFT JOIN context_order o ON o.target_kind=p.target_kind AND o.target_id=p.target_id AND o.entry_kind='note' AND o.entry_ref=('{\"space_id\":\"' || p.note_space || '\",\"note_id\":\"' || p.note_id || '\"}') WHERE p.target_kind=$1 AND p.target_id=$2 LIMIT 4097";
+pub(crate) const BOOTSTRAP_SCOPE_SETS_SQLITE_SQL: &str = "SELECT coalesce(o.rank,0) AS rank, a.target_space, s.set_id, s.owner_id, s.home_space, s.name, s.note_refs, s.revision FROM context_set_attachments a JOIN context_sets s ON s.set_id=a.set_id LEFT JOIN context_order o ON o.target_kind=a.target_kind AND o.target_id=a.target_id AND o.entry_kind='set' AND o.entry_ref=a.set_id WHERE a.target_kind=$1 AND a.target_id=$2 LIMIT 4097";
 pub(crate) const BOOTSTRAP_FAVORITES_FIRST_SQLITE_SQL: &str = "SELECT rank, space_id, entity_id FROM favorites WHERE owner_id=$1 AND entity_kind='note' ORDER BY rank,space_id,entity_id LIMIT $2";
 pub(crate) const BOOTSTRAP_FAVORITES_AFTER_SQLITE_SQL: &str = "SELECT rank, space_id, entity_id FROM favorites WHERE owner_id=$1 AND entity_kind='note' AND (rank,space_id,entity_id)>($2,$3,$4) ORDER BY rank,space_id,entity_id LIMIT $5";
 
@@ -63,11 +66,17 @@ async fn load_bootstrap_scope_items(
             PinCandidateRow,
             fetch_all,
             BOOTSTRAP_SCOPE_PINS_SQLITE_SQL,
-            "SELECT coalesce(o.rank,0) AS rank, p.note_space, p.note_id FROM v1_control.context_scope_pins p LEFT JOIN v1_control.context_order o ON o.target_kind=p.target_kind AND o.target_id=p.target_id AND o.entry_kind='note' AND o.entry_ref=('{\"space_id\":\"' || p.note_space || '\",\"note_id\":\"' || p.note_id || '\"}') WHERE p.target_kind=$1 AND p.target_id=$2 LIMIT 4096";
+            "SELECT coalesce(o.rank,0) AS rank, p.note_space, p.note_id FROM v1_control.context_scope_pins p LEFT JOIN v1_control.context_order o ON o.target_kind=p.target_kind AND o.target_id=p.target_id AND o.entry_kind='note' AND o.entry_ref=('{\"space_id\":\"' || p.note_space || '\",\"note_id\":\"' || p.note_id || '\"}') WHERE p.target_kind=$1 AND p.target_id=$2 LIMIT 4097";
             kind,
             target_id
         )?;
+        if pins.len() > MAX_BOOTSTRAP_SCOPE_ROWS {
+            return Err(invalid(ValidationReason::BudgetExceeded));
+        }
         for pin in pins {
+            if scope_items.len() >= MAX_BOOTSTRAP_SCOPE_ITEMS {
+                return Err(invalid(ValidationReason::BudgetExceeded));
+            }
             scope_items.push(ScopeItem {
                 level,
                 rank: pin.rank,
@@ -83,10 +92,13 @@ async fn load_bootstrap_scope_items(
             SetCandidateRow,
             fetch_all,
             BOOTSTRAP_SCOPE_SETS_SQLITE_SQL,
-            "SELECT coalesce(o.rank,0) AS rank, a.target_space, s.set_id, s.owner_id, s.home_space, s.name, s.note_refs, s.revision FROM v1_control.context_set_attachments a JOIN v1_control.context_sets s ON s.set_id=a.set_id LEFT JOIN v1_control.context_order o ON o.target_kind=a.target_kind AND o.target_id=a.target_id AND o.entry_kind='set' AND o.entry_ref=a.set_id WHERE a.target_kind=$1 AND a.target_id=$2 LIMIT 4096";
+            "SELECT coalesce(o.rank,0) AS rank, a.target_space, s.set_id, s.owner_id, s.home_space, s.name, s.note_refs, s.revision FROM v1_control.context_set_attachments a JOIN v1_control.context_sets s ON s.set_id=a.set_id LEFT JOIN v1_control.context_order o ON o.target_kind=a.target_kind AND o.target_id=a.target_id AND o.entry_kind='set' AND o.entry_ref=a.set_id WHERE a.target_kind=$1 AND a.target_id=$2 LIMIT 4097";
             kind,
             target_id
         )?;
+        if sets.len() > MAX_BOOTSTRAP_SCOPE_ROWS {
+            return Err(invalid(ValidationReason::BudgetExceeded));
+        }
         for set in sets {
             let home = SpaceId::parse(&set.home_space)?;
             let Some(grant) = current.auth().spaces().get(&home) else {
@@ -135,6 +147,9 @@ async fn load_bootstrap_scope_items(
             let entry = format!("s:{}", set.set_id);
             let set_home = Some((set.home_space, set.owner_id));
             for (idx, note) in notes.into_iter().enumerate() {
+                if scope_items.len() >= MAX_BOOTSTRAP_SCOPE_ITEMS {
+                    return Err(invalid(ValidationReason::BudgetExceeded));
+                }
                 scope_items.push(ScopeItem {
                     level,
                     rank: set.rank,
@@ -166,7 +181,17 @@ struct BootstrapCursor {
     #[serde(default)]
     fav_after: Option<BootstrapFavCursor>,
 }
-#[derive(sqlx::FromRow, Serialize, Deserialize)]
+#[derive(sqlx::FromRow)]
+struct EntryQueryRow {
+    kind: String,
+    space: String,
+    entity: String,
+    rank: i64,
+    target_space: String,
+    set_owner: String,
+    set_home: String,
+}
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EntryRow {
     kind: String,
@@ -752,12 +777,13 @@ impl ControlService {
         let mut last_visible: Option<EntryRow> = None;
         let mut has_more = false;
         let mut scanned = 0usize;
+        let mut set_space_cache: BTreeMap<SpaceId, Option<SpaceKind>> = BTreeMap::new();
         loop {
             let mut tx = self.store.read(budget.clone()).await?;
             let batch_result = budget
                 .run(
                     async {
-                        let batch: Vec<EntryRow> = match tx.inner_mut() {
+                        let batch: Vec<EntryQueryRow> = match tx.inner_mut() {
                             Transaction::Sqlite(tx) => {
                                 sqlx::query_as(include_str!("entries.sqlite.sql"))
                                     .bind(&key.kind)
@@ -794,7 +820,13 @@ impl ControlService {
                         };
                         let mut candidates: Vec<(EntryRow, Option<(SpaceId, String)>)> =
                             Vec::with_capacity(batch_len);
-                        for row in batch {
+                        for qrow in batch {
+                            let row = EntryRow {
+                                kind: qrow.kind,
+                                space: qrow.space,
+                                entity: qrow.entity,
+                                rank: qrow.rank,
+                            };
                             next_after = EntryRow {
                                 kind: row.kind.clone(),
                                 space: row.space.clone(),
@@ -803,28 +835,48 @@ impl ControlService {
                             };
                             match row.kind.as_str() {
                                 "set" => {
-                                    let set_id = ContextSetId::parse(&row.entity)?;
-                                    let Some(bundle_row) =
-                                        sets::bundle(tx.inner_mut(), &set_id, false).await?
-                                    else {
+                                    let _set_id = ContextSetId::parse(&row.entity)?;
+                                    let home = SpaceId::parse(&qrow.set_home)?;
+                                    let Some(grant) = current.auth().spaces().get(&home) else {
                                         continue;
                                     };
-                                    match self
-                                        .check_bundle_attachment_db(
-                                            tx.inner_mut(),
-                                            &current,
-                                            &bundle_row,
-                                        )
-                                        .await
-                                    {
-                                        Ok(()) => {
-                                            let home = SpaceId::parse(&bundle_row.home_space)?;
-                                            candidates
-                                                .push((row, Some((home, bundle_row.owner_id))));
-                                        }
-                                        Err(error) if hidden(&error) => continue,
-                                        Err(error) => return Err(error),
+                                    if grant.read_classes.is_empty() {
+                                        continue;
                                     }
+                                    if let Some(root) = &grant.project_root {
+                                        let expected_target = serde_json::to_string(&FolderRef {
+                                            space_id: home.clone(),
+                                            folder_id: root.clone(),
+                                        })
+                                        .map_err(|_| invalid(ValidationReason::InvalidState))?;
+                                        if !(key.kind == "project"
+                                            && key.id == expected_target
+                                            && qrow.target_space == home.as_str())
+                                        {
+                                            let bundle_row = ContextSetsRow {
+                                                set_id: row.entity.clone(),
+                                                owner_id: qrow.set_owner.clone(),
+                                                home_space: qrow.set_home.clone(),
+                                                name: String::new(),
+                                                note_refs: String::new(),
+                                                revision: 0,
+                                                created_at: 0,
+                                            };
+                                            match self
+                                                .check_bundle_attachment_db(
+                                                    tx.inner_mut(),
+                                                    &current,
+                                                    &bundle_row,
+                                                )
+                                                .await
+                                            {
+                                                Ok(()) => {}
+                                                Err(error) if hidden(&error) => continue,
+                                                Err(error) => return Err(error),
+                                            }
+                                        }
+                                    }
+                                    candidates.push((row, Some((home, qrow.set_owner))));
                                 }
                                 "note" => {
                                     let space_id = SpaceId::parse(&row.space)?;
@@ -851,7 +903,6 @@ impl ControlService {
             let (batch_len, next_after, candidates) = batch_result?;
             scanned = scanned.saturating_add(batch_len);
             after = next_after;
-            let mut set_space_cache: BTreeMap<SpaceId, Option<SpaceKind>> = BTreeMap::new();
             for (row, set_home) in candidates {
                 let entry = match row.kind.as_str() {
                     "set" => {

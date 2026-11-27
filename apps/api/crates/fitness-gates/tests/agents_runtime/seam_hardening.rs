@@ -28633,12 +28633,19 @@ async fn verify_part_j_cross_space_role_and_validation_hardening(
         )
         .await
         .unwrap();
+    let post_purge_owner = fresh_owner(fixture).await;
+    let post_purge_pers_sc = SpaceContext::new(
+        post_purge_owner.auth().clone(),
+        personal_history.clone(),
+        budget(),
+    )
+    .unwrap();
     let post_purge_read = fixture
         .canonical
         .read_chat(
-            pers_sc,
+            post_purge_pers_sc,
             ChatRead {
-                thread: cross_tid,
+                thread: cross_tid.clone(),
                 leaf: appended_cross.seq,
                 before: None,
                 max_entries: PageLimit::new(10).unwrap(),
@@ -28648,9 +28655,242 @@ async fn verify_part_j_cross_space_role_and_validation_hardening(
         .unwrap();
     assert_eq!(
         post_purge_read.entries[0].referenced_notes,
-        vec![s2_enc_ref],
+        vec![s2_enc_ref.clone()],
         "read_chat must scrub hard-purged cross-space referenced_notes"
     );
+    // 4. Replay of append_chat with a hard-purged cross-space referenced_note must fail
+    //    ResourceNotFound rather than disclosing the purged NoteRef via ReplayPolicy::Chat.
+    let replay_after_purge = fixture
+        .canonical
+        .append_chat(
+            cross_pers_sc,
+            Mutation {
+                identity: CommandIdentity {
+                    scope: personal_history.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([
+                        0xD8, 15, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xDC; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: AppendChat {
+                    thread: cross_tid,
+                    parent: ThreadEntrySeq::ZERO,
+                    kind: ChatEntryKind::Human,
+                    body: ChatInputBody::Text("cross-space refs".into()),
+                    referenced_notes: vec![
+                        NoteRef {
+                            space_id: s2_history.space_id.clone(),
+                            note_id: NoteId::from_bytes([
+                                0xD8, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                            ]),
+                        },
+                        s2_enc_ref,
+                    ],
+                    tainted: true,
+                    tool_calls: Vec::new(),
+                    provenance: None,
+                    interruption: None,
+                    proposed_diff: None,
+                    proposed_effect: None,
+                },
+            },
+        )
+        .await;
+    assert!(
+        matches!(
+            replay_after_purge,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ),
+        "append_chat replay after cross-space referenced note purge must return ResourceNotFound, got {replay_after_purge:?}"
+    );
+
+    // 5. create_notes must enforce validate_content on note_type and tags (no JSON-escaped C0 bypass).
+    let bad_batch_ctrl = call_mcp(
+        &fixture.registry,
+        owner,
+        [0xD8, 17, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "create_notes",
+        json!({
+            "project": proj_handle,
+            "notes": [{
+                "title": "Batch Ctrl Check",
+                "body": "Clean body.",
+                "type": "spec\u{0007}",
+                "tags": ["bad\u{0000}tag"],
+            }]
+        }),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    assert_eq!(
+        bad_batch_ctrl["results"][0]["ok"],
+        json!(false),
+        "create_notes with C0 control chars in type/tags must reject item, got {bad_batch_ctrl}"
+    );
+    assert_eq!(
+        bad_batch_ctrl["results"][0]["error"],
+        json!("validation_failed"),
+        "create_notes C0 control char error must be validation_failed, got {bad_batch_ctrl}"
+    );
+
+    // 6. Space-level Keeper (project: None) must be space-narrowed and denied episode reads/oracles.
+    let owner_personal_ep = fixture
+        .control
+        .start_or_resume_episode(
+            owner.clone(),
+            AccountMutation {
+                identity: identity(fixture, owner, 0xDB).await,
+                input: StartEpisode {
+                    selector: EpisodeSelector::New {
+                        requested: EpisodeId::from_bytes([
+                            0xD8, 18, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                        ]),
+                        name: Some("keeper-hidden-personal-ep".into()),
+                    },
+                    project_hint: None,
+                    guard: EpisodeRevisionGuard::Account,
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    let EpisodeStartResult::New(owner_personal_ep) = owner_personal_ep else {
+        panic!("expected new personal episode");
+    };
+    let s2_keeper_auth = owner
+        .auth()
+        .for_keeper(
+            AgentRunId::from_bytes([0xD8, 19, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+            s2_history.space_id.clone(),
+            None,
+            BTreeSet::new(),
+        )
+        .unwrap();
+    assert!(
+        s2_keeper_auth.is_space_narrowed(),
+        "space-level Keeper must always have is_space_narrowed() == true"
+    );
+    let s2_keeper_ctx = AccountContext::new(s2_keeper_auth, budget());
+    assert!(matches!(
+        fixture
+            .control
+            .get_episode(s2_keeper_ctx.clone(), owner_personal_ep.id.clone())
+            .await,
+        Err(PortError::Domain(DomainError::ResourceNotFound))
+    ));
+    assert!(matches!(
+        fixture
+            .control
+            .bootstrap_context(
+                s2_keeper_ctx.clone(),
+                owner_personal_ep.id.clone(),
+                None,
+                ControlPageRequest::new(10, None).unwrap(),
+            )
+            .await,
+        Err(PortError::Domain(DomainError::ResourceNotFound))
+    ));
+    assert_eq!(
+        fixture
+            .control
+            .named_episode_project_hint(s2_keeper_ctx, "keeper-hidden-personal-ep".into(),)
+            .await
+            .unwrap(),
+        NamedEpisodePreview::NoMatch,
+        "space-level Keeper must not probe owner's Personal episodes by name"
+    );
+
+    // 7. Disabled OwnedProject role selected via exact ref with project: None must collapse to
+    //    ResourceNotFound (never InvalidState oracle).
+    let AbilityResolution::Resolved(proj_role_desc) = fixture
+        .control
+        .resolve_ability(
+            owner.clone(),
+            AbilitySelection::Name {
+                name: "proj-only-role".into(),
+                kind: AbilityKind::Role,
+                project: Some(FolderRef {
+                    space_id: s2_history.space_id.clone(),
+                    folder_id: proj_role_dir,
+                }),
+            },
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("expected proj-only-role to resolve inside its owning project");
+    };
+    fixture
+        .control
+        .set_ability_preference(
+            owner.clone(),
+            AccountMutation {
+                identity: identity(fixture, owner, 0xDC).await,
+                input: AbilityPreferenceChange {
+                    preference: AbilityPreferenceUpdate {
+                        ability: proj_role_desc.reference,
+                        enabled: false,
+                    },
+                    expected: AbilityPreferenceGuard::Account,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let disabled_out_of_proj = call_mcp(
+        &fixture.registry,
+        owner,
+        [0xD8, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "use_role",
+        json!({ "role": proj_role_ref }),
+    )
+    .await;
+    assert!(
+        matches!(
+            disabled_out_of_proj,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ),
+        "disabled OwnedProject role with no active project must return ResourceNotFound, got {:?}",
+        disabled_out_of_proj.err()
+    );
+
+    // 8. start_session with valid deliveryReceipt + invalid project must fail deterministically
+    //    (ResourceNotFound) rather than collapsing into CommitEffect::Unknown / RetrySameCommand.
+    let seeded_session = call_mcp(
+        &fixture.registry,
+        owner,
+        [0xD8, 21, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "start_session",
+        json!({ "session": { "name": "delivery-receipt-seed" } }),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    if let Some(receipt) = seeded_session["delta"]["deliveryReceipt"].as_str() {
+        let bad_with_receipt = call_mcp(
+            &fixture.registry,
+            owner,
+            [0xD8, 22, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+            "start_session",
+            json!({
+                "deliveryReceipt": receipt,
+                "project": "no-such-space/no-such-proj",
+            }),
+        )
+        .await;
+        assert!(
+            matches!(
+                bad_with_receipt,
+                Err(PortError::Domain(DomainError::ResourceNotFound))
+            ),
+            "start_session with deliveryReceipt + missing project must return deterministic ResourceNotFound, got {:?}",
+            bad_with_receipt.err()
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

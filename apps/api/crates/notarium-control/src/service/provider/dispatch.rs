@@ -552,11 +552,15 @@ impl ProviderService {
                         call_id: progress.call.to_string(),
                         owner_id: snapshot.resource.owner_id.clone(),
                         principal: validated.auth.principal().to_string(),
-                        run_id: match validated.auth.kind() {
-                            PrincipalKind::AgentRun(run) | PrincipalKind::Keeper(run) => {
-                                Some(run.to_string())
+                        run_id: if validated.disclosed_classes.is_empty() {
+                            None
+                        } else {
+                            match validated.auth.kind() {
+                                PrincipalKind::AgentRun(run) | PrincipalKind::Keeper(run) => {
+                                    Some(run.to_string())
+                                }
+                                _ => None,
                             }
-                            _ => None,
                         },
                         scope_id: scope_key,
                         intent_key: job.intent().to_string(),

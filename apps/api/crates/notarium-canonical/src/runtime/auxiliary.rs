@@ -281,8 +281,6 @@ impl CanonicalStore {
             // The owner keeps the active lease past a canceled waiter and
             // while the connection acknowledges COMMIT or ROLLBACK.
             let operation_effect = active.clone();
-            let entered_commit = Arc::new(AtomicBool::new(false));
-            let entered_commit_tx = Arc::clone(&entered_commit);
             let result = store
                 .with_visibility_write_tx(
                     Some(space),
@@ -305,17 +303,16 @@ impl CanonicalStore {
                                     "caller left before commit",
                                 ));
                             }
-                            entered_commit_tx.store(true, Ordering::Release);
                             Ok(result)
                         })
                     },
                     after_commit,
                 )
                 .await;
-            if result.is_err() && !entered_commit.load(Ordering::Acquire) {
+            drop(active);
+            if result.is_err() {
                 on_pre_commit_abort().await;
             }
-            drop(active);
             result
         });
         let mut pending = PendingWrite {

@@ -454,6 +454,11 @@ async fn authorize_resource(
         | ReplayResource::Create(note, ..)
         | ReplayResource::Move(note, ..) => note,
     };
+    if matches!(target, ReplayResource::Read(_) | ReplayResource::View(_))
+        && crate::runtime::is_note_purge_fenced_tx(tx, &srec.space.id, note.as_str()).await?
+    {
+        return Err(DomainError::ResourceNotFound.into());
+    }
     let head = load_note_head_row_opt_tx(tx, &srec.space.id, note).await?;
     if let Some((parent, class)) = destination(target, head.as_ref().map(|h| h.doc_class)) {
         let (facts, ancestry) = build_resource_facts_tx(
@@ -514,6 +519,11 @@ pub(crate) fn authorize_head(
 ) -> Result<(), PortError> {
     if matches!(target, ReplayResource::View(_))
         && lifecycle != notarium_core::model::Lifecycle::Active
+    {
+        return Err(DomainError::ResourceNotFound.into());
+    }
+    if matches!(target, ReplayResource::Read(_))
+        && lifecycle == notarium_core::model::Lifecycle::Purged
     {
         return Err(DomainError::ResourceNotFound.into());
     }
