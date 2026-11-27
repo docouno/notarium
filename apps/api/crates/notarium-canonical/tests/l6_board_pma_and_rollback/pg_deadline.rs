@@ -14,7 +14,7 @@ async fn wait_for_blocked_session(db: &mut sqlx::PgConnection) {
 }
 
 #[tokio::test]
-async fn postgres_rollback_deadline_covers_safe_point_pool_and_commit_ack() {
+async fn postgres_rollback_deadline_covers_safe_point_and_replay() {
     let fixtures = StorageTestFixtures::load_required();
     let schema = fixtures.fresh_pg_schema();
     let root = TempDataRoot::new("l6-rollback-deadline");

@@ -22,20 +22,20 @@ INSERT INTO collab_sessions VALUES ('space','clean','closed'), ('space','active'
 INSERT INTO collab_checkpoints VALUES ('space','dirty',1);
 INSERT INTO collab_update_log VALUES ('space','pending',1,1);";
 
-type State = (String, bool, Option<bool>);
+type State = (String, bool, Option<i32>);
 
 fn assert_states(mut rows: Vec<State>) {
     rows.sort();
     let expected = [
-        ("active", false, Some(true)),
-        ("clean", false, Some(false)),
-        ("dirty", false, Some(true)),
-        ("fenced", false, Some(true)),
+        ("active", false, Some(1)),
+        ("clean", false, Some(0)),
+        ("dirty", false, Some(1)),
+        ("fenced", false, Some(2)),
         ("missing", false, None),
-        ("pending", false, Some(true)),
+        ("pending", false, Some(1)),
         ("purged", true, None),
     ]
-    .map(|(id, purged, blocked)| (id.to_owned(), purged, blocked));
+    .map(|(id, purged, status)| (id.to_owned(), purged, status));
     assert_eq!(rows, expected);
 }
 

@@ -434,8 +434,7 @@ same example against an isolated prefix.
   `IdempotencyKeyReused`. An older receipt may supply an omitted revision from
   immutable command history. A supplied room lease or lineage needs a matching
   stored fingerprint. Old ambiguous rename titles require the recorded operation.
-  An old rollback receipt also requires a unique typed interpretation of the
-  entity and board IDs in each record. See the mutation preconditions in
+  See the mutation preconditions in
   [Core contracts](core-contracts.md#mutation-preconditions).
   A batch note edit uses its requested base digest and the head visible at its
   savepoint. Link appends derive their base from the current source. `link_many`
@@ -489,7 +488,8 @@ same example against an isolated prefix.
   locks and descendant document classes before validating depth. Same-depth and
   upward moves check the two ancestor paths; moving deeper also probes indexed
   children until the first path that would exceed 256 levels. `move_board_card`
-  is restricted to human callers and maintains `<= 16`-byte `sort_rank_lexo`
+  is restricted to non-agent callers (humans and bearer tokens) and maintains
+  `<= 16`-byte `sort_rank_lexo`
   keys via windowed Packed Memory Array (PMA) rebalancing that updates physical
   `rank_rev_id` without overwriting semantic `placement_revision` provenance.
   Agent runs move cards across columns by editing note frontmatter directly, so

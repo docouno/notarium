@@ -33,9 +33,8 @@ use crate::{
     domain::{
         common::{
             CommandDeadline, StoredCommittedBoardMoveV1, build_resource_facts_tx,
-            check_collab_preconditions_tx, derive_command_identity_spec,
-            extract_agent_run_from_auth, is_note_room_active_tx, load_current_space_schema_tx,
-            load_note_head_row_tx, note_rank_version_digest, upsert_agent_run_head_tx,
+            check_collab_preconditions_tx, derive_command_identity_spec, is_note_room_active_tx,
+            load_current_space_schema_tx, load_note_head_row_tx, note_rank_version_digest,
             validate_mutation_identity,
         },
         notes::{
@@ -1422,8 +1421,6 @@ impl CanonicalStore {
                         neighbor_final_ranks.insert(nid, (r, was_already_overlay));
                     }
 
-                    let run_opt = extract_agent_run_from_auth(&auth);
-
                     // Count total SpaceSeq allocations for this atomic command:
                     // (optional 1 for carrier revision) + (N neighbor rank revisions) + (1 target rank revision).
                     let seq_count = u64::from(prepared_info_opt.is_some())
@@ -1576,7 +1573,7 @@ impl CanonicalStore {
                             Some(digest),
                             &meta,
                             auth.principal(),
-                            run_opt.as_ref(),
+                            None,
                             now_ts,
                         )
                         .await?;
@@ -1621,7 +1618,7 @@ impl CanonicalStore {
                             &pl_actor,
                             pl_run.as_ref(),
                             auth.principal(),
-                            run_opt.as_ref(),
+                            None,
                             *is_pma,
                             nbr_seq,
                             visibility_seq,
@@ -1676,9 +1673,9 @@ impl CanonicalStore {
                         prior_target_ov.as_ref().map(|o| &o.rank_rev_id),
                         &target_placement_rev,
                         auth.principal(),
-                        run_opt.as_ref(),
+                        None,
                         auth.principal(),
-                        run_opt.as_ref(),
+                        None,
                         false,
                         target_rank_seq,
                         visibility_seq,
@@ -1695,21 +1692,7 @@ impl CanonicalStore {
                         doc_class: Some(head.doc_class),
                     });
 
-                    // 4. Bump `agent_run_heads` if executed by an agent run (at `visibility_seq` in `revisions`).
-                    if let Some(ref run_id) = run_opt {
-                        upsert_agent_run_head_tx(
-                            tx,
-                            &scope_cl,
-                            run_id,
-                            auth.principal(),
-                            visibility_seq,
-                            visibility_seq,
-                            now_ts,
-                        )
-                        .await?;
-                    }
-
-                    // 5. Build receipt & change effect payload.
+                    // 4. Build receipt & change effect payload.
                     let command_id = new_prefixed_hex_id("cmd_")?;
                     let extra_digest = format!(
                         "{}:{}:{}",

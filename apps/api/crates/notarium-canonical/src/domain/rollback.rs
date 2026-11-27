@@ -189,7 +189,8 @@ struct RoomPlanDiscovery {
     actual_run_rev: RevisionId,
     expected_heads: BTreeMap<NoteId, RevisionId>,
     candidates: BTreeMap<NoteId, RevisionId>,
-    durable_active_rooms: BTreeSet<NoteId>,
+    durable_blocked_rooms: BTreeSet<NoteId>,
+    durable_fenced_rooms: BTreeSet<NoteId>,
 }
 
 fn rollback_needs_room_planning(store: &CanonicalStore, space: &SpaceId) -> bool {
@@ -264,10 +265,6 @@ async fn execute_room_planned_rollback(
     idemp: crate::writer::CommandIdentitySpec,
     deadline: Instant,
 ) -> Result<Committed<RollbackResult>, PortError> {
-    let active_effect = match ctx.canonical_effect() {
-        Some(effect) => Some(effect.begin().await?),
-        None => None,
-    };
     ctx.budget.remaining = rollback_time_left(&ctx.budget, deadline)?;
     if let Some(replayed) = rollback_wait(
         &ctx.budget,
@@ -281,16 +278,15 @@ async fn execute_room_planned_rollback(
     )
     .await??
     {
-        if let Some(lease) = &active_effect {
-            lease.check()?;
-        }
         return Ok(replayed.into_committed());
     }
-    drop(active_effect);
 
     let mut attempt = 0;
     let mut replanned_after_recovery = false;
     while attempt < MAX_PLANNER_RETRIES {
+        if let Some(effect) = ctx.canonical_effect() {
+            effect.check()?;
+        }
         ctx.budget.remaining = rollback_time_left(&ctx.budget, deadline)?;
         let scope_read = ctx.scope().clone();
         let auth_read = ctx.auth().clone();
@@ -337,16 +333,23 @@ async fn execute_room_planned_rollback(
         let space_id = ctx.scope().space_id.clone();
 
         for (nid, current_rev) in &discovery.candidates {
-            let was_blocked = discovery.durable_active_rooms.contains(nid);
+            let was_fenced = discovery.durable_fenced_rooms.contains(nid);
+            let was_blocked = was_fenced || discovery.durable_blocked_rooms.contains(nid);
+            // A durably fenced room must always flow through `interceptor.reserve_rollback`
+            // so clean fenced recovery does not get misclassified as `skipped_room_active`.
             if was_blocked
                 && (interceptor.is_none()
-                    || (!fences.is_room_fenced(&space_id, nid)
+                    || (!was_fenced
+                        && !fences.is_room_fenced(&space_id, nid)
                         && fences
                             .fenced_recovery_revision(&space_id, nid, current_rev)
                             .is_none()))
             {
                 skipped_room_active.insert(nid.clone());
                 continue;
+            }
+            if let Some(effect) = ctx.canonical_effect() {
+                effect.check()?;
             }
             ctx.budget.remaining = rollback_time_left(&ctx.budget, deadline)?;
             let reservation = rollback_wait(&ctx.budget, deadline, async {
@@ -465,10 +468,18 @@ async fn discover_room_plan_tx(
     let heads_map = load_note_heads_batch_tx(tx, &scope.space_id, &touched).await?;
     let mut folder_cache = FolderAncestryCache::default();
     let mut expected_heads = BTreeMap::new();
-    let mut candidates = BTreeMap::new();
-    let mut durable_active_rooms = BTreeSet::new();
 
-    for (nid, history) in &histories {
+    if touched.is_empty() {
+        auth.can_view_folder(
+            &srec.space,
+            &srec.root_folder_id,
+            std::slice::from_ref(&srec.root_folder_id),
+        )?;
+    }
+
+    // Authorize every touched note before inspecting ability publication state so
+    // unauthorized/purged notes always fail with ResourceNotFound first.
+    for nid in &touched {
         let head = heads_map.get(nid).ok_or(DomainError::ResourceNotFound)?;
         let (rfacts, anc) = folder_cache
             .build_resource_facts_tx(
@@ -486,7 +497,14 @@ async fn discover_room_plan_tx(
         auth.can_view_resource(&rfacts)?;
         auth.authorize_direct_write(&rfacts, &rfacts)?;
         expected_heads.insert(nid.clone(), head.head_rev_id.clone());
+    }
 
+    let mut candidates = BTreeMap::new();
+    let mut durable_blocked_rooms = BTreeSet::new();
+    let mut durable_fenced_rooms = BTreeSet::new();
+
+    for (nid, history) in &histories {
+        let head = heads_map.get(nid).ok_or(DomainError::ResourceNotFound)?;
         if history.foreign_edit {
             continue;
         }
@@ -503,8 +521,14 @@ async fn discover_room_plan_tx(
         {
             continue;
         }
-        if states.rooms.get(nid) == Some(&true) {
-            durable_active_rooms.insert(nid.clone());
+        match states.rooms.get(nid).copied() {
+            Some(DurableRoomStatus::Fenced) => {
+                durable_fenced_rooms.insert(nid.clone());
+            }
+            Some(DurableRoomStatus::Blocked) => {
+                durable_blocked_rooms.insert(nid.clone());
+            }
+            Some(DurableRoomStatus::Clean) | None => {}
         }
         candidates.insert(nid.clone(), head.head_rev_id.clone());
     }
@@ -514,7 +538,8 @@ async fn discover_room_plan_tx(
         actual_run_rev,
         expected_heads,
         candidates,
-        durable_active_rooms,
+        durable_blocked_rooms,
+        durable_fenced_rooms,
     })
 }
 
@@ -640,6 +665,14 @@ async fn execute_unified_rollback_tx(
 
     let mut heads_map = load_note_heads_batch_tx(tx, &scope_cl.space_id, &touched).await?;
 
+    if touched.is_empty() {
+        auth.can_view_folder(
+            &item_ctx.space,
+            &item_ctx.root_folder_id,
+            std::slice::from_ref(&item_ctx.root_folder_id),
+        )?;
+    }
+
     for nid in &touched {
         let head = heads_map.get(nid).ok_or(DomainError::ResourceNotFound)?;
         let (rfacts, anc) = folder_cache
@@ -703,7 +736,10 @@ async fn execute_unified_rollback_tx(
                 skipped_room_active.push(nid);
                 continue;
             }
-        } else if collab_states.get(&nid) == Some(&true) {
+        } else if collab_states
+            .get(&nid)
+            .is_some_and(|status| status.is_blocked())
+        {
             skipped_room_active.push(nid);
             continue;
         }
@@ -769,6 +805,24 @@ async fn execute_unified_rollback_tx(
 
     // Lock per-note fences in ascending NoteId order before collision checks so no room can open/close
     // concurrently and any PathConflict drops the guards without bumping fence epochs.
+    let planned = room_plan.is_some();
+    let map_planned_stale = |err: PortError| -> PortError {
+        if planned
+            && matches!(
+                err,
+                PortError::Domain(DomainError::ValidationFailed {
+                    diagnostic: Diagnostic {
+                        reason: ValidationReason::SourceMismatch,
+                        ..
+                    },
+                })
+            )
+        {
+            DomainError::validation(ValidationReason::CursorStale).into()
+        } else {
+            err
+        }
+    };
     let mut final_eligible: BTreeMap<NoteId, CandidateAction> = BTreeMap::new();
     let mut locked_fences = Vec::with_capacity(eligible_notes.len());
     if let Some(plan) = room_plan.as_mut() {
@@ -776,9 +830,14 @@ async fn execute_unified_rollback_tx(
             let Some(mut res) = plan.reservations.remove(&nid) else {
                 return Err(DomainError::validation(ValidationReason::CursorStale).into());
             };
-            let guard = room_fences.lock_for_consume(&scope_cl, &nid, &mut res)?;
-            if collab_states.get(&nid) == Some(&true) {
-                return Err(DomainError::validation(ValidationReason::InvalidState).into());
+            let guard = room_fences
+                .lock_for_consume(&scope_cl, &nid, &mut res)
+                .map_err(map_planned_stale)?;
+            if collab_states
+                .get(&nid)
+                .is_some_and(|status| status.is_blocked())
+            {
+                return Err(DomainError::validation(ValidationReason::CursorStale).into());
             }
             locked_fences.push((guard, res));
             final_eligible.insert(nid, action);
@@ -867,7 +926,7 @@ async fn execute_unified_rollback_tx(
     )
     .await?;
 
-    stage_rollback_fences(item_ctx, locked_fences, &req_id)?;
+    stage_rollback_fences(item_ctx, locked_fences, &req_id).map_err(map_planned_stale)?;
 
     let current_schema = if read_schema {
         load_current_space_schema_tx(tx, &scope_cl.space_id).await?
@@ -1397,6 +1456,14 @@ pub(crate) async fn authorize_rollback_run_replay_tx(
     if rows.iter().any(|row| row.purged) {
         return Err(DomainError::ResourceNotFound.into());
     }
+    if rows.iter().all(|row| row.note_id.is_none()) {
+        auth.can_view_folder(
+            &record.space,
+            &record.root_folder_id,
+            std::slice::from_ref(&record.root_folder_id),
+        )?;
+        return Ok(());
+    }
     let mut folders = FolderAncestryCache::default();
     for row in rows {
         let Some(_) = row.note_id else {
@@ -1842,11 +1909,24 @@ async fn upsert_agent_run_head_row_only_tx(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DurableRoomStatus {
+    Clean,
+    Blocked,
+    Fenced,
+}
+
+impl DurableRoomStatus {
+    fn is_blocked(self) -> bool {
+        !matches!(self, Self::Clean)
+    }
+}
+
 #[derive(Default)]
 struct RollbackNoteStates {
     purged: BTreeSet<NoteId>,
     // No entry means no durable session. A clean closed session still needs a lineage bump.
-    rooms: HashMap<NoteId, bool>,
+    rooms: HashMap<NoteId, DurableRoomStatus>,
 }
 
 const SQLITE_ROLLBACK_NOTE_STATES: &str = concat!(
@@ -1867,7 +1947,7 @@ async fn load_rollback_note_states(
     if notes.is_empty() {
         return Ok(states);
     }
-    let rows: Vec<(String, bool, Option<bool>)> = match tx {
+    let rows: Vec<(String, bool, Option<i32>)> = match tx {
         BackendConn::Sqlite(conn) => {
             let ids = serde_json::to_string(&notes)
                 .map_err(|e| internal_not_committed("sqlite_rollback_note_ids", e.to_string()))?;
@@ -1885,13 +1965,24 @@ async fn load_rollback_note_states(
             .await
             .map_err(|e| crate::runtime::pg_read_error("pg_rollback_note_states", e))?,
     };
-    for (id, purged, blocked) in rows {
+    for (id, purged, status) in rows {
         let note = NoteId::parse(&id)?;
         if purged {
             states.purged.insert(note.clone());
         }
-        if let Some(blocked) = blocked {
-            states.rooms.insert(note, blocked);
+        if let Some(code) = status {
+            let parsed = match code {
+                0 => DurableRoomStatus::Clean,
+                1 => DurableRoomStatus::Blocked,
+                2 => DurableRoomStatus::Fenced,
+                _ => {
+                    return Err(internal_not_committed(
+                        "corrupt_room_status",
+                        format!("unexpected rollback room_status code {code}"),
+                    ));
+                }
+            };
+            states.rooms.insert(note, parsed);
         }
     }
     Ok(states)

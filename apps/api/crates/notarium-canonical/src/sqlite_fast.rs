@@ -2728,8 +2728,6 @@ fn execute_single_fast_item(
                 status: in_batch.status.clone(),
                 response_blob: in_batch.response_blob.clone(),
             };
-            authorize_rollback_disclosures_rusqlite(conn, &meta.scope, idemp, &receipt)
-                .map_err(FastItemExecError::PreWrite)?;
             Some(receipt)
         } else if plan.phase1_receipt_checked_at_gen() == Some(current_writer_gen) {
             None
@@ -4302,29 +4300,6 @@ fn authorize_replay_rusqlite(
     authorize_replay_targets_rusqlite(conn, &srec, auth, targets)
 }
 
-fn authorize_rollback_disclosures_rusqlite(
-    conn: &rusqlite::Connection,
-    scope: &HistoryScope,
-    idemp: &CommandIdentitySpec,
-    receipt: &StoredReceiptRow,
-) -> Result<(), PortError> {
-    use crate::writer::replay::ReplayResource;
-    let disclosed = idemp.rollback_disclosures(scope, receipt)?;
-    if disclosed.is_empty() {
-        return Ok(());
-    }
-    let srec = load_space_record_rusqlite(conn, &scope.space_id)?;
-    let auth = &idemp.authority.as_ref().expect("rollback authority").auth;
-    let mut targets = Vec::with_capacity(disclosed.len());
-    for note in disclosed {
-        if is_note_purge_fenced_rusqlite(conn, &scope.space_id, note.as_str())? {
-            return Err(DomainError::ResourceNotFound.into());
-        }
-        targets.push(ReplayResource::Read(note));
-    }
-    authorize_replay_targets_rusqlite(conn, &srec, auth, &targets)
-}
-
 fn authorize_replay_targets_rusqlite(
     conn: &rusqlite::Connection,
     srec: &SpaceRecord,
@@ -4527,7 +4502,6 @@ fn lookup_command_receipt_rusqlite(
         status,
         response_blob: effective_blob,
     };
-    authorize_rollback_disclosures_rusqlite(conn, scope, idemp, &receipt)?;
     Ok(Some(receipt))
 }
 
