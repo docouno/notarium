@@ -1709,6 +1709,7 @@ impl CanonicalStore {
                                 raw_fields: info.raw_fields,
                                 evaluated_fields: eval_fields,
                                 diagnostics: info.diagnostics,
+                                logical_updated_at: None,
                             },
                         ))
                         .encode()?;

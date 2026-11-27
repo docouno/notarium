@@ -207,6 +207,14 @@ impl AgentRunSupervisor {
                 return Err(invalid(ValidationReason::SourceMismatch));
             }
             let abilities_ctx = run.context(budget.remaining())?;
+            let abilities_ctx = SpaceContext::new(
+                abilities_ctx
+                    .auth()
+                    .clone()
+                    .with_chat_episode(episode.clone()),
+                abilities_ctx.scope().clone(),
+                abilities_ctx.budget,
+            )?;
             let abilities =
                 runtime_abilities::interactive(registry, &abilities_ctx, &selection, &episode)
                     .await?;
@@ -611,7 +619,7 @@ impl AgentRunSupervisor {
         let args = Value::Object(call.arguments.into_iter().collect());
         let result = if run.kind == ChatThreadKind::Personal {
             registry
-                .call_personal_tool(
+                .call_personal_tool_for_runtime(
                     invocation,
                     PersonalToolInvocation {
                         source: run.scope.clone(),
@@ -624,12 +632,14 @@ impl AgentRunSupervisor {
                 )
                 .await
         } else {
-            registry.call_tool(invocation, &call.name, args).await
+            registry
+                .call_tool_for_runtime(invocation, &call.name, args)
+                .await
         };
-        if let Err(error) = &result
-            && queue::unknown_commit(error)
+        if let Err(failure) = &result
+            && queue::unknown_commit(&failure.error)
         {
-            return Err(error.clone());
+            return Err(failure.error.clone());
         }
         run.context(budget.remaining())?;
         match result {
@@ -646,9 +656,9 @@ impl AgentRunSupervisor {
                 }),
                 proof: result.provenance,
             }),
-            Err(error) => Ok(ToolReply {
-                display: json!({"error":error.code()}).to_string(),
-                proof: ChatProvenance::default(),
+            Err(failure) => Ok(ToolReply {
+                display: json!({"error":failure.error.code()}).to_string(),
+                proof: failure.provenance,
                 proposal: None,
             }),
         }

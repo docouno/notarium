@@ -469,7 +469,7 @@ impl KeeperTurn<'_> {
         let ctx = self.context(budget)?;
         let result = self
             .registry
-            .call_tool(
+            .call_tool_for_runtime(
                 McpInvocationContext {
                     account: AccountContext::new(ctx.auth().clone(), ctx.budget),
                     target: EgressTarget::InAppProvider {
@@ -483,10 +483,10 @@ impl KeeperTurn<'_> {
                 Value::Object(call.arguments.into_iter().collect()),
             )
             .await;
-        if let Err(error) = &result
-            && unknown(error)
+        if let Err(failure) = &result
+            && unknown(&failure.error)
         {
-            return Err(error.clone());
+            return Err(failure.error.clone());
         }
         self.lease.check()?;
         match result {
@@ -499,9 +499,9 @@ impl KeeperTurn<'_> {
                 result.provenance,
             )),
             Ok(_) => Err(invalid(ValidationReason::InvalidAuthority)),
-            Err(error) => Ok((
-                json!({"error":error.code()}).to_string(),
-                ChatProvenance::default(),
+            Err(failure) => Ok((
+                json!({"error":failure.error.code()}).to_string(),
+                failure.provenance,
             )),
         }
     }

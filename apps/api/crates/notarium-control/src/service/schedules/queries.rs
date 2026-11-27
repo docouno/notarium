@@ -2,6 +2,8 @@ use super::*;
 
 pub(crate) const DUE_SCHEDULES_SQLITE_SQL: &str = "SELECT * FROM agent_schedules WHERE deleted_at IS NULL AND paused_reason IS NULL AND next_slot_utc_ms<=$1 AND (next_slot_utc_ms,schedule_id)>($2,$3) ORDER BY next_slot_utc_ms,schedule_id LIMIT $4";
 pub(crate) const EXPIRED_SCHEDULE_RUNS_SQLITE_SQL: &str = "SELECT * FROM agent_schedule_runs WHERE status IN ('claimed','running') AND expires_at<=$1 AND (expires_at,run_id)>($2,$3) ORDER BY expires_at,run_id LIMIT $4";
+pub(crate) const LIST_SCHEDULES_LIVE_SQLITE_SQL: &str = "SELECT * FROM agent_schedules WHERE owner_id=$1 AND space_id=$2 AND deleted_at IS NULL AND schedule_id>$3 ORDER BY schedule_id LIMIT $4";
+pub(crate) const LIST_SCHEDULES_PROJECT_LIVE_SQLITE_SQL: &str = "SELECT * FROM agent_schedules WHERE owner_id=$1 AND space_id=$2 AND deleted_at IS NULL AND project_folder_id=$3 AND schedule_id>$4 ORDER BY schedule_id LIMIT $5";
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -140,18 +142,71 @@ impl ControlService {
                     let mut items = Vec::with_capacity(target);
                     let mut has_more = false;
                     let mut scanned = 0usize;
+                    let grant = current.auth().spaces().get(&ctx.scope().space_id);
+                    let space_readable =
+                        grant.is_some_and(|grant| !grant.read_classes.is_empty());
+                    let pinned_project = grant.and_then(|grant| grant.project_root.as_ref());
+                    let keeper_schedule_filter = match current.auth().kind() {
+                        PrincipalKind::AgentRun(_) | PrincipalKind::SearchIndexing => {
+                            return Ok((current, scope, items, has_more));
+                        }
+                        PrincipalKind::Keeper(run) => match current.auth().credential() {
+                            Some(AuthenticatedCredential::ScheduledRun {
+                                schedule,
+                                run: verified,
+                                ..
+                            }) if verified == run => Some(schedule.as_str()),
+                            _ => return Ok((current, scope, items, has_more)),
+                        },
+                        PrincipalKind::DirectHuman
+                        | PrincipalKind::Pat
+                        | PrincipalKind::OAuth { .. } => None,
+                    };
+                    if !space_readable {
+                        return Ok((current, scope, items, has_more));
+                    }
                     loop {
-                        let batch = rows!(
-                            tx.inner_mut(),
-                            AgentSchedulesRow,
-                            fetch_all,
-                            "SELECT * FROM agent_schedules WHERE owner_id=$1 AND space_id=$2 AND deleted_at IS NULL AND schedule_id>$3 ORDER BY schedule_id LIMIT $4",
-                            "SELECT * FROM v1_control.agent_schedules WHERE owner_id=$1 AND space_id=$2 AND deleted_at IS NULL AND schedule_id COLLATE \"C\">$3 ORDER BY schedule_id COLLATE \"C\" LIMIT $4";
-                            current.auth().principal().as_str(),
-                            ctx.scope().space_id.as_str(),
-                            &after,
-                            batch_limit
-                        )?;
+                        let batch = if let Some(exact_schedule) = keeper_schedule_filter {
+                            if !after.is_empty() && exact_schedule <= after.as_str() {
+                                Vec::new()
+                            } else {
+                                rows!(
+                                    tx.inner_mut(),
+                                    AgentSchedulesRow,
+                                    fetch_all,
+                                    "SELECT * FROM agent_schedules WHERE owner_id=$1 AND space_id=$2 AND deleted_at IS NULL AND schedule_id=$3",
+                                    "SELECT * FROM v1_control.agent_schedules WHERE owner_id=$1 AND space_id=$2 AND deleted_at IS NULL AND schedule_id=$3";
+                                    current.auth().principal().as_str(),
+                                    ctx.scope().space_id.as_str(),
+                                    exact_schedule
+                                )?
+                            }
+                        } else if let Some(project_root) = pinned_project {
+                            rows!(
+                                tx.inner_mut(),
+                                AgentSchedulesRow,
+                                fetch_all,
+                                LIST_SCHEDULES_PROJECT_LIVE_SQLITE_SQL,
+                                "SELECT * FROM v1_control.agent_schedules WHERE owner_id=$1 AND space_id=$2 AND deleted_at IS NULL AND project_folder_id=$3 AND schedule_id COLLATE \"C\">$4 ORDER BY schedule_id COLLATE \"C\" LIMIT $5";
+                                current.auth().principal().as_str(),
+                                ctx.scope().space_id.as_str(),
+                                project_root.as_str(),
+                                &after,
+                                batch_limit
+                            )?
+                        } else {
+                            rows!(
+                                tx.inner_mut(),
+                                AgentSchedulesRow,
+                                fetch_all,
+                                LIST_SCHEDULES_LIVE_SQLITE_SQL,
+                                "SELECT * FROM v1_control.agent_schedules WHERE owner_id=$1 AND space_id=$2 AND deleted_at IS NULL AND schedule_id COLLATE \"C\">$3 ORDER BY schedule_id COLLATE \"C\" LIMIT $4";
+                                current.auth().principal().as_str(),
+                                ctx.scope().space_id.as_str(),
+                                &after,
+                                batch_limit
+                            )?
+                        };
                         let batch_len = batch.len();
                         for row in batch {
                             scanned = scanned.saturating_add(1);
@@ -168,7 +223,9 @@ impl ControlService {
                                 Err(e) => return Err(e),
                             }
                         }
-                        if has_more || batch_len < usize::try_from(batch_limit).unwrap_or(usize::MAX)
+                        if keeper_schedule_filter.is_some()
+                            || has_more
+                            || batch_len < usize::try_from(batch_limit).unwrap_or(usize::MAX)
                         {
                             break;
                         }
@@ -373,6 +430,11 @@ impl ControlService {
         let result = budget
             .run(
                 async {
+                    if let Some((auth, _)) = &owner
+                        && matches!(auth.kind(), PrincipalKind::Keeper(current) if current != &run)
+                    {
+                        return Err(DomainError::ResourceNotFound.into());
+                    }
                     let row = rows!(tx.inner_mut(),AgentScheduleRunsRow,fetch_optional,"SELECT * FROM agent_schedule_runs WHERE schedule_id=$1 AND run_id=$2","SELECT * FROM v1_control.agent_schedule_runs WHERE schedule_id=$1 AND run_id=$2";schedule_id.as_str(),run.as_str())?
                         .ok_or(DomainError::ResourceNotFound)?;
                     match &owner {
@@ -486,7 +548,13 @@ impl ControlService {
                     };
                     let cursor = cursor(&page, scope)?;
                     let slot = cursor.as_ref().map_or(i64::MIN, |c| c.slot);
-                    let rows = rows!(tx.inner_mut(),AgentScheduleRunsRow,fetch_all,"SELECT * FROM agent_schedule_runs WHERE schedule_id=$1 AND slot_utc_ms>$2 ORDER BY slot_utc_ms LIMIT $3","SELECT * FROM v1_control.agent_schedule_runs WHERE schedule_id=$1 AND slot_utc_ms>$2 ORDER BY slot_utc_ms LIMIT $3";schedule_id.as_str(),slot,i64::from(page.limit())+1)?;
+                    let rows = if let Some((auth, _)) = &revalidated_owner
+                        && let PrincipalKind::Keeper(current) = auth.kind()
+                    {
+                        rows!(tx.inner_mut(),AgentScheduleRunsRow,fetch_all,"SELECT * FROM agent_schedule_runs WHERE schedule_id=$1 AND run_id=$2 AND slot_utc_ms>$3 ORDER BY slot_utc_ms LIMIT $4","SELECT * FROM v1_control.agent_schedule_runs WHERE schedule_id=$1 AND run_id=$2 AND slot_utc_ms>$3 ORDER BY slot_utc_ms LIMIT $4";schedule_id.as_str(),current.as_str(),slot,i64::from(page.limit())+1)?
+                    } else {
+                        rows!(tx.inner_mut(),AgentScheduleRunsRow,fetch_all,"SELECT * FROM agent_schedule_runs WHERE schedule_id=$1 AND slot_utc_ms>$2 ORDER BY slot_utc_ms LIMIT $3","SELECT * FROM v1_control.agent_schedule_runs WHERE schedule_id=$1 AND slot_utc_ms>$2 ORDER BY slot_utc_ms LIMIT $3";schedule_id.as_str(),slot,i64::from(page.limit())+1)?
+                    };
                     let has_more = rows.len() > usize::from(page.limit());
                     let selected: Vec<_> =
                         rows.into_iter().take(usize::from(page.limit())).collect();

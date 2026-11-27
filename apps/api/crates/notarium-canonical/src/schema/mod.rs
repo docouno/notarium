@@ -425,6 +425,8 @@ BEGIN
             r.space_seq,
             r.content_blake3,
             r.metadata_msgpack,
+            r.created_at_sec,
+            r.created_at_nsec,
             MIN(r.space_seq) FILTER (WHERE r.agent_run_id = p_run_id) OVER (PARTITION BY r.entity_key) AS first_run_seq,
             MAX(r.space_seq) FILTER (WHERE r.agent_run_id IS DISTINCT FROM p_run_id) OVER (PARTITION BY r.entity_key) AS max_other_seq
         FROM sp_row sp
@@ -459,7 +461,21 @@ BEGIN
                  AND rw.space_seq < rw.first_run_seq
                 THEN rw.metadata_msgpack
                 ELSE NULL
-            END AS pre_meta
+            END AS pre_meta,
+            CASE
+                WHEN rw.first_run_seq IS NOT NULL
+                 AND NOT (rw.max_other_seq IS NOT NULL AND rw.max_other_seq > rw.first_run_seq)
+                 AND rw.space_seq < rw.first_run_seq
+                THEN rw.created_at_sec
+                ELSE NULL
+            END AS pre_created_at_sec,
+            CASE
+                WHEN rw.first_run_seq IS NOT NULL
+                 AND NOT (rw.max_other_seq IS NOT NULL AND rw.max_other_seq > rw.first_run_seq)
+                 AND rw.space_seq < rw.first_run_seq
+                THEN rw.created_at_nsec
+                ELSE NULL
+            END AS pre_created_at_nsec
         FROM rev_win rw
         ORDER BY
             rw.entity_key,
@@ -497,11 +513,11 @@ BEGIN
     UNION ALL
     SELECT
         1::INT4,
-        entity_key, pre_rev_id, CASE WHEN pre_rev_id IS NULL AND NOT has_foreign THEN source_rev_id END, NULL::TEXT, NULL::TEXT, NULL::TEXT,
+        entity_key, pre_rev_id, CASE WHEN pre_rev_id IS NULL AND NOT has_foreign THEN source_rev_id END, pre_created_at_nsec::TEXT, NULL::TEXT, NULL::TEXT,
         NULL::TEXT, NULL::TEXT, NULL::TEXT, NULL::TEXT, NULL::TEXT,
         NULL::TEXT, NULL::TEXT, NULL::TEXT,
         NULL::TEXT, NULL::TEXT, NULL::TEXT, NULL::TEXT,
-        COALESCE(first_run_seq, -1)::BIGINT, 0::BIGINT, (CASE WHEN has_foreign THEN 1 ELSE 0 END)::INT4,
+        COALESCE(first_run_seq, -1)::BIGINT, COALESCE(pre_created_at_sec, 0)::BIGINT, (CASE WHEN has_foreign THEN 1 ELSE 0 END)::INT4,
         pre_digest, pre_meta, CASE WHEN pre_rev_id IS NULL AND NOT has_foreign THEN source_meta END
     FROM note_revs
     UNION ALL
@@ -706,10 +722,15 @@ BEGIN
             lifecycle_state = m.lifecycle_state,
             visibility_mask = m.vis_mask,
             updated_seq = p_vis_seq,
-            updated_at_sec = p_sec,
-            updated_at_nsec = p_nsec,
+            updated_at_sec = COALESCE(pr.created_at_sec, p_sec),
+            updated_at_nsec = COALESCE(pr.created_at_nsec, p_nsec),
             last_actor_id = p_actor_id
         FROM muts m
+        LEFT JOIN revisions pr
+          ON m.op_kind = 'restore'
+         AND m.restored_rev IS NOT NULL
+         AND pr.space_id = p_space_id
+         AND pr.rev_id = m.restored_rev
         WHERE (NOT (p_has_full AND p_has_trash) OR m.op_kind <> 'trash')
           AND nh.space_id = p_space_id
           AND nh.note_id = m.nid
@@ -859,6 +880,8 @@ SELECT s.root_folder_id, s.space_kind, h.note_id, h.slug, h.slug_fold,
        ) END AS created_metadata,
        r.first_seq, prior.space_seq, prior.rev_id,
        CASE WHEN prior.space_seq < r.first_seq THEN prior.metadata_msgpack END AS prior_metadata,
+       CASE WHEN prior.space_seq < r.first_seq THEN prior.created_at_sec END AS prior_created_sec,
+       CASE WHEN prior.space_seq < r.first_seq THEN prior.created_at_nsec END AS prior_created_nsec,
        b.content_blake3 AS publication_digest, b.current_publication_id,
        cs.lease_epoch AS room_lease, cs.lineage_epoch AS room_lineage,
        (cs.note_id IS NULL OR (cs.room_state = 'closed' AND cs.owner_id IS NULL
@@ -873,7 +896,7 @@ JOIN LATERAL (
 LEFT JOIN collab_sessions cs ON cs.space_id = s.space_id AND cs.note_id = h.note_id
 LEFT JOIN collab_checkpoints ck ON ck.space_id = cs.space_id AND ck.note_id = cs.note_id
 LEFT JOIN LATERAL (
-    SELECT v.space_seq, v.rev_id, v.metadata_msgpack, v.content_blake3
+    SELECT v.space_seq, v.rev_id, v.metadata_msgpack, v.content_blake3, v.created_at_sec, v.created_at_nsec
     FROM revisions v
     WHERE v.space_id = $1 AND v.entity_type = 'note' AND v.entity_key = r.entity_key
       AND v.agent_run_id IS DISTINCT FROM $2
@@ -1225,11 +1248,14 @@ BEGIN
             byte_size = u.bs,
             visibility_mask = u.vm,
             updated_seq = v_vis_seq,
-            updated_at_sec = p_sec,
-            updated_at_nsec = p_nsec,
+            updated_at_sec = COALESCE(pr.created_at_sec, p_sec),
+            updated_at_nsec = COALESCE(pr.created_at_nsec, p_nsec),
             last_actor_id = p_actor_id
         FROM UNNEST(p_hot_nids, p_hot_t, p_hot_tf, p_hot_revs, p_hot_digs, p_hot_bs, p_hot_vm)
              AS u(nid, t, tf, rev, dig, bs, vm)
+        LEFT JOIN UNNEST(p_m_nids, p_m_rest_revs) AS m(nid, rrev) ON m.nid = u.nid
+        LEFT JOIN revisions pr
+          ON m.rrev IS NOT NULL AND pr.space_id = p_space_id AND pr.rev_id = m.rrev
         WHERE nh.space_id = p_space_id AND nh.note_id = u.nid;
     END IF;
 
@@ -1248,11 +1274,14 @@ BEGIN
             lifecycle_state = u.lc,
             visibility_mask = u.vm,
             updated_seq = v_vis_seq,
-            updated_at_sec = p_sec,
-            updated_at_nsec = p_nsec,
+            updated_at_sec = COALESCE(pr.created_at_sec, p_sec),
+            updated_at_nsec = COALESCE(pr.created_at_nsec, p_nsec),
             last_actor_id = p_actor_id
         FROM UNNEST(p_fl_nids, p_fl_pf, p_fl_s, p_fl_sf, p_fl_t, p_fl_tf, p_fl_revs, p_fl_digs, p_fl_bs, p_fl_lc, p_fl_vm)
              AS u(nid, pf, s, sf, t, tf, rev, dig, bs, lc, vm)
+        LEFT JOIN UNNEST(p_m_nids, p_m_rest_revs) AS m(nid, rrev) ON m.nid = u.nid
+        LEFT JOIN revisions pr
+          ON m.rrev IS NOT NULL AND pr.space_id = p_space_id AND pr.rev_id = m.rrev
         WHERE nh.space_id = p_space_id AND nh.note_id = u.nid;
     END IF;
 

@@ -438,6 +438,7 @@ async fn prepare_links(
     call: &ToolCallContext<'_>,
     provider: Option<&ToolCallContext<'_>>,
     scope: &SpaceContext,
+    source_project: Option<&FolderId>,
     draft: &PreparedDraft,
 ) -> Result<Vec<PreparedLink>, PortError> {
     let mut links = Vec::with_capacity(draft.draft.links.len());
@@ -446,6 +447,8 @@ async fn prepare_links(
             call,
             provider,
             scope,
+            DocClass::UserDoc,
+            source_project,
             link.to.as_deref(),
             link.to_title.as_deref(),
         )
@@ -517,10 +520,11 @@ fn carrier_with_links(
 async fn prepare_links_journaled(
     call: &ToolCallContext<'_>,
     scope: &SpaceContext,
+    source_project: Option<&FolderId>,
     draft: &PreparedDraft,
 ) -> Result<Vec<PreparedLink>, PortError> {
     if !draft.draft.links.iter().any(|link| link.to.is_some()) {
-        return prepare_links(call, None, scope, draft).await;
+        return prepare_links(call, None, scope, source_project, draft).await;
     }
     let mut replayed = true;
     let targets: Vec<NoteId> = call
@@ -530,7 +534,7 @@ async fn prepare_links_journaled(
             draft.command.hash,
             || async {
                 replayed = false;
-                let resolved = prepare_links(call, None, scope, draft).await?;
+                let resolved = prepare_links(call, None, scope, source_project, draft).await?;
                 Ok(resolved
                     .into_iter()
                     .filter_map(|link| match link.target {
@@ -554,7 +558,17 @@ async fn prepare_links_journaled(
                     return Err(invalid(ValidationReason::SourceMismatch));
                 }
                 if replayed {
-                    match organize::resolve_target(call, None, scope, Some(raw), None).await {
+                    match organize::resolve_target(
+                        call,
+                        None,
+                        scope,
+                        DocClass::UserDoc,
+                        source_project,
+                        Some(raw),
+                        None,
+                    )
+                    .await
+                    {
                         Ok((target, _)) => target,
                         Err(PortError::Domain(DomainError::ResourceNotFound)) => {
                             let created_meta = super::metadata_snapshot(
@@ -592,8 +606,16 @@ async fn prepare_links_journaled(
                 }
             }
             (None, Some(title)) => {
-                let (target, _) =
-                    organize::resolve_target(call, None, scope, None, Some(title)).await?;
+                let (target, _) = organize::resolve_target(
+                    call,
+                    None,
+                    scope,
+                    DocClass::UserDoc,
+                    source_project,
+                    None,
+                    Some(title),
+                )
+                .await?;
                 target
             }
             _ => return Err(invalid(ValidationReason::InvalidQuery)),
@@ -613,12 +635,13 @@ async fn prepare_carrier(
     call: &ToolCallContext<'_>,
     provider: Option<&ToolCallContext<'_>>,
     scope: &SpaceContext,
+    source_project: Option<&FolderId>,
     draft: &PreparedDraft,
 ) -> Result<String, PortError> {
     let links = if provider.is_none() {
-        prepare_links_journaled(call, scope, draft).await?
+        prepare_links_journaled(call, scope, source_project, draft).await?
     } else {
-        prepare_links(call, provider, scope, draft).await?
+        prepare_links(call, provider, scope, source_project, draft).await?
     };
     let (carrier, _) = carrier_with_links(&draft.carrier, link_lines(&links, &BTreeMap::new())?)?;
     Ok(carrier)
@@ -710,7 +733,14 @@ pub(super) async fn create_one(
     let _ = validate_draft_syntax(&input.draft, input.folder_page)?;
     let placement = placement(call, &input.project).await?;
     let prepared = PreparedDraft::new(call, &placement, input.draft, input.folder_page, 0, None)?;
-    let carrier = prepare_carrier(call, None, &placement.read_scope, &prepared).await?;
+    let carrier = prepare_carrier(
+        call,
+        None,
+        &placement.read_scope,
+        Some(&placement.project.reference.folder_id),
+        &prepared,
+    )
+    .await?;
     let mut committed_any = false;
     let (committed, parent) =
         execute(call, &placement, &prepared, carrier, &mut committed_any).await?;
@@ -738,7 +768,13 @@ async fn create_draft(
     let bytes = serde_json::to_vec(&raw).map_err(|_| invalid(ValidationReason::InvalidQuery))?;
     let hash = derive_digest("notarium.mcp.create-note-item-arguments.v1", &[&bytes]);
     let prepared = PreparedDraft::new(call, placement, decode(raw)?, false, index, Some(hash))?;
-    let links = prepare_links_journaled(call, &placement.read_scope, &prepared).await?;
+    let links = prepare_links_journaled(
+        call,
+        &placement.read_scope,
+        Some(&placement.project.reference.folder_id),
+        &prepared,
+    )
+    .await?;
     let (carrier, link_block) =
         carrier_with_links(&prepared.carrier, link_lines(&links, &BTreeMap::new())?)?;
     let (committed, parent) =

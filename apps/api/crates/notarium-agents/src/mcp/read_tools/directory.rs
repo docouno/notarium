@@ -122,6 +122,7 @@ pub(super) async fn list(call: &mut ToolCallContext<'_>, args: Value) -> Result<
             }
         }
     }
+    let alias_base_scope = scope.clone();
     if let Some(project) = &target.project {
         scope = match scope.restrict_to_project(project) {
             Ok(narrowed) => narrowed,
@@ -141,6 +142,11 @@ pub(super) async fn list(call: &mut ToolCallContext<'_>, args: Value) -> Result<
     } else {
         scope.with_preflight_taint()
     };
+    let alias_preflight_scope = if external {
+        alias_base_scope
+    } else {
+        alias_base_scope.with_preflight_taint()
+    };
     if let Some(previous) = &previous
         && let Err(error) = scope.scope().check(&previous.scope)
     {
@@ -155,7 +161,15 @@ pub(super) async fn list(call: &mut ToolCallContext<'_>, args: Value) -> Result<
         call.auth.taint().mark_external_read();
     }
     let has_previous = previous.is_some();
-    let folder = match directory(call, &target, &preflight_scope, &cleaned_path).await {
+    let folder = match directory(
+        call,
+        &target,
+        &preflight_scope,
+        &alias_preflight_scope,
+        &cleaned_path,
+    )
+    .await
+    {
         Ok(Some(folder)) => folder,
         Ok(None) => {
             if foreign_space && (args.path.is_some() || (targeted_project && has_previous)) {
@@ -520,6 +534,7 @@ async fn directory(
     call: &ToolCallContext<'_>,
     target: &ReadTarget,
     scope: &SpaceContext,
+    alias_scope: &SpaceContext,
     path: &str,
 ) -> Result<Option<FolderSnapshot>, PortError> {
     let engine = &call.registry.engine;
@@ -548,14 +563,16 @@ async fn directory(
             .await;
     }
 
-    // A whole-Space credential can also follow an older Space-relative alias.
-    if scope
+    // A whole-Space credential can also follow an older Space-relative alias
+    // (e.g. a renamed project's former slug), provided the resolved folder
+    // belongs to the selected project and all subsequent reads stay narrowed.
+    if alias_scope
         .auth()
         .spaces()
         .get(&project.space_id)
         .is_some_and(|grant| grant.project_root.is_none())
         && let Some(folder) = engine
-            .resolve_folder_path(scope.clone(), None, path.to_owned())
+            .resolve_folder_path(alias_scope.clone(), None, path.to_owned())
             .await?
         && folder.project.as_ref() == Some(&project.folder_id)
     {

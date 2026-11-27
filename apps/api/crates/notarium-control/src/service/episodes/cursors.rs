@@ -225,7 +225,7 @@ impl ControlService {
                     owner_row.personal_space_id.as_deref(),
                     super::stored_project_ref(&row)?.as_ref(),
                     row.name.as_deref(),
-                    false,
+                    None,
                 ) {
                     return Err(DomainError::ResourceNotFound.into());
                 }

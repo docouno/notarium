@@ -282,7 +282,7 @@ CREATE TABLE IF NOT EXISTS ability_packages (
 );
 
 CREATE INDEX IF NOT EXISTS idx_ability_packages_active_slug
-    ON ability_packages (space_id, slug_fold)
+    ON ability_packages (space_id, slug_fold, ability_id COLLATE "C")
     WHERE lifecycle_state = 'active';
 
 CREATE INDEX IF NOT EXISTS idx_ability_packages_entrypoint

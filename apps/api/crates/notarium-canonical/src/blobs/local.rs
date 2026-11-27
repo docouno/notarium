@@ -45,6 +45,7 @@ pub struct DeferredLocalStaging {
     raw_size: u64,
     compressed_frame: Arc<[u8]>,
     presynced: Option<Arc<Mutex<Option<PreparedLocalStagingEntry>>>>,
+    guard: Option<Arc<LocalSharedGuard>>,
 }
 
 impl std::fmt::Debug for DeferredLocalStaging {
@@ -64,6 +65,7 @@ impl DeferredLocalStaging {
         digest: ContentDigest,
         raw_size: u64,
         compressed_frame: Arc<[u8]>,
+        guard: Arc<LocalSharedGuard>,
     ) -> Self {
         Self {
             local,
@@ -72,6 +74,7 @@ impl DeferredLocalStaging {
             raw_size,
             compressed_frame,
             presynced: None,
+            guard: Some(guard),
         }
     }
 
@@ -82,6 +85,7 @@ impl DeferredLocalStaging {
         raw_size: u64,
         compressed_frame: Arc<[u8]>,
         entry: PreparedLocalStagingEntry,
+        guard: Arc<LocalSharedGuard>,
     ) -> Self {
         Self {
             local,
@@ -90,6 +94,7 @@ impl DeferredLocalStaging {
             raw_size,
             compressed_frame,
             presynced: Some(Arc::new(Mutex::new(Some(entry)))),
+            guard: Some(guard),
         }
     }
 
@@ -130,6 +135,7 @@ impl DeferredLocalStaging {
                 digest,
                 item_dirs,
                 temp_file,
+                _guard: item.guard,
             });
         }
         Ok(entries)
@@ -151,6 +157,7 @@ pub struct PreparedLocalStagingEntry {
     pub digest: ContentDigest,
     pub item_dirs: PendingDirSyncs,
     pub temp_file: Option<DeferredLocalTempFile>,
+    pub _guard: Option<Arc<LocalSharedGuard>>,
 }
 
 #[derive(Debug)]

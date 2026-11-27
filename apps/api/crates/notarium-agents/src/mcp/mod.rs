@@ -300,6 +300,17 @@ impl ToolRegistry {
         name: &str,
         args: Value,
     ) -> Result<McpToolResult, PortError> {
+        Box::pin(self.call(ctx, name, args, None))
+            .await
+            .map_err(|failure| failure.error)
+    }
+
+    pub(crate) async fn call_tool_for_runtime(
+        &self,
+        ctx: McpInvocationContext,
+        name: &str,
+        args: Value,
+    ) -> Result<McpToolResult, Box<ToolCallFailure>> {
         Box::pin(self.call(ctx, name, args, None)).await
     }
 
@@ -311,6 +322,18 @@ impl ToolRegistry {
         name: &str,
         args: Value,
     ) -> Result<McpToolResult, PortError> {
+        Box::pin(self.call(ctx, name, args, Some(binding)))
+            .await
+            .map_err(|failure| failure.error)
+    }
+
+    pub(crate) async fn call_personal_tool_for_runtime(
+        &self,
+        ctx: McpInvocationContext,
+        binding: PersonalToolInvocation,
+        name: &str,
+        args: Value,
+    ) -> Result<McpToolResult, Box<ToolCallFailure>> {
         Box::pin(self.call(ctx, name, args, Some(binding))).await
     }
 
@@ -338,32 +361,44 @@ impl ToolRegistry {
         name: &str,
         mut args: Value,
         personal: Option<PersonalToolInvocation>,
-    ) -> Result<McpToolResult, PortError> {
-        let tool = ToolName::parse(name).ok_or(DomainError::ResourceNotFound)?;
+    ) -> Result<McpToolResult, Box<ToolCallFailure>> {
+        let pre = |error: PortError| {
+            Box::new(ToolCallFailure {
+                error,
+                provenance: ChatProvenance::default(),
+            })
+        };
+        let tool =
+            ToolName::parse(name).ok_or_else(|| pre(DomainError::ResourceNotFound.into()))?;
         let deadline = Instant::now() + ctx.account.budget.remaining;
-        let auth = self.control.revalidate_auth(ctx.account.clone()).await?;
-        check_target(&auth, &ctx.target)?;
+        let auth = self
+            .control
+            .revalidate_auth(ctx.account.clone())
+            .await
+            .map_err(pre)?;
+        check_target(&auth, &ctx.target).map_err(pre)?;
         if tool.ability_write()
             && matches!(
                 auth.kind(),
                 PrincipalKind::AgentRun(_) | PrincipalKind::Keeper(_)
             )
         {
-            return Err(DomainError::AbilityWriteForbidden.into());
+            return Err(pre(DomainError::AbilityWriteForbidden.into()));
         }
         if !allowed(&auth, tool) {
-            return Err(DomainError::AccessDenied.into());
+            return Err(pre(DomainError::AccessDenied.into()));
         }
         if tool.ability_write() {
-            auth.authorize_ability_mutation()?;
+            auth.authorize_ability_mutation()
+                .map_err(|e| pre(e.into()))?;
         }
-        tool.validate(&mut args)?;
+        tool.validate(&mut args).map_err(pre)?;
         let encoded =
-            serde_json::to_vec(&args).map_err(|_| invalid(ValidationReason::InvalidQuery))?;
+            serde_json::to_vec(&args).map_err(|_| pre(invalid(ValidationReason::InvalidQuery)))?;
         if encoded.len() > MAX_ARGUMENT_BYTES {
-            return Err(invalid(ValidationReason::BudgetExceeded));
+            return Err(pre(invalid(ValidationReason::BudgetExceeded)));
         }
-        let call_id = new_request_id()?;
+        let call_id = new_request_id().map_err(pre)?;
         let caller_key = if matches!(ctx.target, EgressTarget::ExternalMcp) {
             args.get("idempotencyKey")
                 .and_then(Value::as_str)
@@ -389,7 +424,8 @@ impl ToolRegistry {
             .get("session")
             .and_then(Value::as_str)
             .map(EpisodeId::parse)
-            .transpose()?;
+            .transpose()
+            .map_err(|e| pre(e.into()))?;
         let transport = match ctx.target {
             EgressTarget::ExternalMcp => AgentTransport::Mcp,
             EgressTarget::InAppProvider { .. } => AgentTransport::Internal,
@@ -407,7 +443,7 @@ impl ToolRegistry {
             call_id,
             deadline,
             cancellation,
-            provenance: ChatProvenance::default(),
+            provenance: std::sync::Mutex::new(ChatProvenance::default()),
             policies: corpus::CandidatePolicies::default(),
             confirmed_proposal: false,
         };
@@ -428,7 +464,8 @@ impl ToolRegistry {
                     input_bytes: encoded.len() as u64,
                 },
             )
-            .await?;
+            .await
+            .map_err(pre)?;
 
         #[inline(never)]
         fn box_tool<'a, T, Fut>(
@@ -442,12 +479,12 @@ impl ToolRegistry {
 
         let result = async {
             if let Some(binding) = &personal
-                && proposals::needs_proposal(&call, binding, &args).await?
+                && Box::pin(proposals::needs_proposal(&call, binding, &args)).await?
             {
                 let draft =
                     box_tool(|| proposals::prepare(&mut call, binding, &ctx.request_key, args))
                         .await?;
-                return McpToolResult::proposed(tool, draft, std::mem::take(&mut call.provenance));
+                return McpToolResult::proposed(tool, draft, call.take_provenance());
             }
             if tool.writes() {
                 if call.auth.taint().is_tainted() {
@@ -501,7 +538,7 @@ impl ToolRegistry {
                     box_tool(|| organize::handle(&mut call, tool, args)).await?
                 }
             };
-            McpToolResult::new(tool, payload, display, std::mem::take(&mut call.provenance))
+            McpToolResult::new(tool, payload, display, call.take_provenance())
         }
         .await;
         if result.is_ok() && call.auth.taint().is_tainted() {
@@ -527,7 +564,7 @@ impl ToolRegistry {
                     },
                 },
                 FinishAgentCall {
-                    call: call.call_id,
+                    call: call.call_id.clone(),
                     outcome,
                     failure,
                     output_bytes,
@@ -538,8 +575,18 @@ impl ToolRegistry {
         if let Err(error) = telemetry {
             tracing::warn!(code = error.code(), "agent telemetry completion failed");
         }
-        result
+        result.map_err(|error| {
+            Box::new(ToolCallFailure {
+                error,
+                provenance: call.take_provenance(),
+            })
+        })
     }
+}
+
+pub(crate) struct ToolCallFailure {
+    pub(crate) error: PortError,
+    pub(crate) provenance: ChatProvenance,
 }
 
 fn check_target(auth: &EngineAuthContext, target: &EgressTarget) -> Result<(), PortError> {
@@ -600,7 +647,7 @@ struct ToolCallContext<'a> {
     call_id: RequestId,
     deadline: Instant,
     cancellation: Cancellation,
-    provenance: ChatProvenance,
+    provenance: std::sync::Mutex<ChatProvenance>,
     policies: corpus::CandidatePolicies,
     confirmed_proposal: bool,
 }
@@ -635,7 +682,7 @@ impl<'a> ToolCallContext<'a> {
             call_id: self.call_id.clone(),
             deadline: self.deadline,
             cancellation: self.cancellation.clone(),
-            provenance: ChatProvenance::default(),
+            provenance: std::sync::Mutex::new(ChatProvenance::default()),
             policies: corpus::CandidatePolicies::default(),
             confirmed_proposal: false,
         }
@@ -661,7 +708,7 @@ impl<'a> ToolCallContext<'a> {
             call_id: new_request_id()?,
             deadline: Instant::now() + budget.remaining,
             cancellation: budget.cancellation,
-            provenance: ChatProvenance::default(),
+            provenance: std::sync::Mutex::new(ChatProvenance::default()),
             policies: corpus::CandidatePolicies::default(),
             confirmed_proposal: true,
         })
@@ -853,8 +900,33 @@ impl<'a> ToolCallContext<'a> {
         Ok(Some(selection))
     }
 
+    fn take_provenance(&self) -> ChatProvenance {
+        let mut guard = self
+            .provenance
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        std::mem::take(&mut *guard)
+    }
+
+    fn provenance_checkpoint(&self) -> (usize, usize) {
+        let guard = self
+            .provenance
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        (guard.origins.len(), guard.projects.len())
+    }
+
+    fn rollback_provenance(&self, checkpoint: (usize, usize)) {
+        let mut guard = self
+            .provenance
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        guard.origins.truncate(checkpoint.0);
+        guard.projects.truncate(checkpoint.1);
+    }
+
     fn record_origin(
-        &mut self,
+        &self,
         origin: ProviderOrigin,
         project: Option<FolderRef>,
     ) -> Result<(), PortError> {
@@ -872,29 +944,33 @@ impl<'a> ToolCallContext<'a> {
                 .pinned_write_space()
                 .is_some_and(|pin| candidate.space_id().is_some_and(|space| space != pin))
         };
-        let has_foreign = || {
-            self.auth.taint().is_tainted()
-                || is_foreign_origin(&origin)
-                || self.provenance.origins.iter().any(is_foreign_origin)
-        };
-        if !self.provenance.origins.contains(&origin) {
-            if self.provenance.origins.len() >= ChatProvenance::MAX_ORIGINS {
-                if has_foreign() {
+        let mut provenance = self
+            .provenance
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let has_foreign = self.auth.taint().is_tainted()
+            || is_foreign_origin(&origin)
+            || provenance.origins.iter().any(is_foreign_origin);
+        if !provenance.origins.contains(&origin) {
+            if provenance.origins.len() >= ChatProvenance::MAX_ORIGINS {
+                drop(provenance);
+                if has_foreign {
                     self.commit_external_read();
                 }
                 return Err(invalid(ValidationReason::BudgetExceeded));
             }
-            self.provenance.origins.push(origin);
+            provenance.origins.push(origin);
         }
         if let Some(project) = project
             && self.auth.pinned_write_space() != Some(&project.space_id)
-            && !self.provenance.projects.contains(&project)
+            && !provenance.projects.contains(&project)
         {
-            if self.provenance.projects.len() >= MAX_PROVIDER_SECONDARY_PROJECTS {
+            if provenance.projects.len() >= MAX_PROVIDER_SECONDARY_PROJECTS {
+                drop(provenance);
                 self.commit_external_read();
                 return Err(invalid(ValidationReason::BudgetExceeded));
             }
-            self.provenance.projects.push(project);
+            provenance.projects.push(project);
         }
         Ok(())
     }

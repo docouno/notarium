@@ -587,9 +587,17 @@ pub(in crate::mcp) async fn preflight_proposal(
                 provider,
                 &provider_scope,
                 &destination.anchor,
-                dest_project,
+                dest_project.clone(),
                 &destination.ancestors,
                 note.facts.class,
+            )
+            .await
+            .map_err(collapse)?;
+            corpus::record_folder_origin(
+                provider,
+                &provider_scope,
+                &destination.anchor,
+                dest_project,
             )
             .await
             .map_err(collapse)?;
@@ -683,9 +691,17 @@ pub(in crate::mcp) async fn plan_proposal(
                 provider,
                 &provider_scope,
                 &destination.anchor,
-                dest_project,
+                dest_project.clone(),
                 &destination.ancestors,
                 class,
+            )
+            .await
+            .map_err(collapse)?;
+            corpus::record_folder_origin(
+                provider,
+                &provider_scope,
+                &destination.anchor,
+                dest_project,
             )
             .await
             .map_err(collapse)?;

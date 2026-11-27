@@ -571,8 +571,9 @@ impl Input {
             Self::Boolean => ProviderToolSchema::Boolean,
             Self::True => ProviderToolSchema::ConstBool(true),
             Self::Null => ProviderToolSchema::Null,
-            Self::Array { item, max, .. } => ProviderToolSchema::Array {
+            Self::Array { item, min, max } => ProviderToolSchema::Array {
                 items: Box::new(item.provider_schema()),
+                minimum: (*min > 0).then_some(*min as u32),
                 maximum: *max as u32,
             },
             Self::Object(fields) => ProviderToolSchema::Object {

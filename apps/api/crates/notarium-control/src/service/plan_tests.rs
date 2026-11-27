@@ -12,7 +12,10 @@ use super::{
         admission::CALL_RUN_EPOCHS_SQLITE_SQL,
         offers::{LIST_OFFERS_PROJECT_PINNED_SQLITE_SQL, LIST_OFFERS_SPACE_SQLITE_SQL},
     },
-    schedules::queries::{DUE_SCHEDULES_SQLITE_SQL, EXPIRED_SCHEDULE_RUNS_SQLITE_SQL},
+    schedules::queries::{
+        DUE_SCHEDULES_SQLITE_SQL, EXPIRED_SCHEDULE_RUNS_SQLITE_SQL, LIST_SCHEDULES_LIVE_SQLITE_SQL,
+        LIST_SCHEDULES_PROJECT_LIVE_SQLITE_SQL,
+    },
     telemetry::cleanup::{
         DELETE_SCHEDULE_RUNS_RETENTION_SQLITE_SQL, DELETE_SCHEDULES_RETENTION_SQLITE_SQL,
     },
@@ -602,6 +605,41 @@ async fn sqlite_hot_control_queries_use_indexes_before_and_after_analyze() {
                 .any(|d| d.starts_with("SCAN ") && !d.starts_with("SCAN entries")
                     || d.contains("ANY(")),
             "{phase} context_entries must avoid base-table scans and skip-scans, got:\n{entry_joined}"
+        );
+
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "EXPLAIN QUERY PLAN {LIST_SCHEDULES_LIVE_SQLITE_SQL}"
+        )))
+        .bind(&first_uid)
+        .bind(&first_space)
+        .bind("")
+        .bind(32i64)
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+        check_plan(
+            phase,
+            "list_schedules_live",
+            "USING INDEX schedule_owner_live",
+            &rows,
+        );
+
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "EXPLAIN QUERY PLAN {LIST_SCHEDULES_PROJECT_LIVE_SQLITE_SQL}"
+        )))
+        .bind(&first_uid)
+        .bind(&first_space)
+        .bind("fld_proj_01")
+        .bind("")
+        .bind(32i64)
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+        check_plan(
+            phase,
+            "list_schedules_project_live",
+            "USING INDEX schedule_owner_project_live",
+            &rows,
         );
     }
 

@@ -491,6 +491,50 @@ pub(super) async fn create(
     }
     let carrier = created_carrier(&args, kind, &format_attachments(attachments, &plan.skills)?)?;
     const CREATE_LABEL: &str = "notarium.mcp.create-ability.v1";
+    if !plan_replayed {
+        // Pre-check active ability slug conflicts in the target placement BEFORE
+        // creating `.abilities/` or the entrypoint note so a conflicting active
+        // package outside `.abilities/` fails cleanly without leaving an orphan note.
+        let slot_project = match &plan.home.placement {
+            AbilityPlacement::OwnedProject(project) => Some(project.clone()),
+            _ => None,
+        };
+        let mut cursor = None;
+        loop {
+            let existing_same_slug = call
+                .registry
+                .catalog
+                .abilities(
+                    call.account(),
+                    AbilityQuery {
+                        page: ControlPageRequest::new(200, cursor)?,
+                        project: slot_project.clone(),
+                        kind: None,
+                        name: Some(slug.clone()),
+                        authoring: true,
+                    },
+                )
+                .await?;
+            if existing_same_slug
+                .items
+                .iter()
+                .any(|item| item.reference.placement == plan.home.placement)
+            {
+                return Err(DomainError::PathConflict {
+                    target: notarium_core::model::PathTarget {
+                        space_id: plan.home.scope.space_id.clone(),
+                        parent: plan.home.parent.clone(),
+                        component: slug.clone(),
+                    },
+                }
+                .into());
+            }
+            let Some(next) = existing_same_slug.continuation else {
+                break;
+            };
+            cursor = Some(next);
+        }
+    }
     let ensured_parent = ensure_ability_folder_journaled(
         call,
         &plan.home.scope,
@@ -535,9 +579,9 @@ pub(super) async fn create(
         .registry
         .engine
         .publish_ability_package(
-            writer(call, &plan.home.scope).await.map_err(|error| {
-                super::super::note_tools::batch_operational_error(CREATE_LABEL, error, true)
-            })?,
+            writer(call, &plan.home.scope)
+                .await
+                .map_err(|error| post_commit_ability_error(CREATE_LABEL, error))?,
             Mutation {
                 identity: call.command_identity(&plan.home.scope, "publish-ability-package", 0),
                 preconditions: Preconditions::default(),
@@ -557,9 +601,7 @@ pub(super) async fn create(
             },
         )
         .await
-        .map_err(|error| {
-            super::super::note_tools::batch_operational_error(CREATE_LABEL, error, true)
-        })?;
+        .map_err(|error| post_commit_ability_error(CREATE_LABEL, error))?;
     let reference = AbilityRef {
         id: ability_id,
         placement: plan.home.placement,
@@ -842,6 +884,10 @@ fn is_partial_step_error(error: &PortError) -> bool {
                 | DomainError::PathConflict { .. }
                 | DomainError::ValidationFailed { .. }
                 | DomainError::ResourceNotFound
+                | DomainError::AccessDenied
+                | DomainError::SpaceReadOnly
+                | DomainError::AbilityWriteForbidden
+                | DomainError::CrossSpaceTainted
         )
     )
 }

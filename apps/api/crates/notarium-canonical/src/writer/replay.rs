@@ -22,6 +22,7 @@ use crate::{
 #[derive(Clone, Debug)]
 pub(crate) enum ReplayResource {
     Write(NoteId),
+    WriteUnpurged(NoteId),
     Read(NoteId),
     View(NoteId),
     RollbackView(NoteId),
@@ -451,11 +452,14 @@ async fn authorize_resource(
         }
         ReplayResource::Read(note)
         | ReplayResource::Write(note)
+        | ReplayResource::WriteUnpurged(note)
         | ReplayResource::Create(note, ..)
         | ReplayResource::Move(note, ..) => note,
     };
-    if matches!(target, ReplayResource::Read(_) | ReplayResource::View(_))
-        && crate::runtime::is_note_purge_fenced_tx(tx, &srec.space.id, note.as_str()).await?
+    if matches!(
+        target,
+        ReplayResource::Read(_) | ReplayResource::View(_) | ReplayResource::WriteUnpurged(_)
+    ) && crate::runtime::is_note_purge_fenced_tx(tx, &srec.space.id, note.as_str()).await?
     {
         return Err(DomainError::ResourceNotFound.into());
     }
@@ -522,8 +526,10 @@ pub(crate) fn authorize_head(
     {
         return Err(DomainError::ResourceNotFound.into());
     }
-    if matches!(target, ReplayResource::Read(_))
-        && lifecycle == notarium_core::model::Lifecycle::Purged
+    if matches!(
+        target,
+        ReplayResource::Read(_) | ReplayResource::WriteUnpurged(_)
+    ) && lifecycle == notarium_core::model::Lifecycle::Purged
     {
         return Err(DomainError::ResourceNotFound.into());
     }

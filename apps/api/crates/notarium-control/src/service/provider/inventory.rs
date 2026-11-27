@@ -235,8 +235,11 @@ impl ProviderService {
                             }
                             collected.push(row);
                         }
-                        if has_more || !batch.has_more || batch_len == 0 || scanned >= MAX_SCAN {
+                        if has_more || !batch.has_more || batch_len == 0 {
                             break;
+                        }
+                        if scanned >= MAX_SCAN {
+                            return Err(invalid(ValidationReason::BudgetExceeded));
                         }
                     }
                     Ok::<_, PortError>((collected, has_more))

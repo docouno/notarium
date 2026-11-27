@@ -225,6 +225,7 @@ pub struct EngineAuthContext {
     ability_write: bool,
     write_space: Option<SpaceId>,
     chat_audience: Option<ChatAudience>,
+    chat_episode: Option<EpisodeId>,
     taint: BranchTaint,
     readonly_abilities: BTreeSet<AbilityId>,
     keeper_log: Option<ChatThreadId>,
@@ -264,6 +265,7 @@ impl EngineAuthContext {
             ability_write: verified.human_management && verified.ability_write,
             write_space: None,
             chat_audience: None,
+            chat_episode: None,
             taint: BranchTaint::default(),
             readonly_abilities: BTreeSet::new(),
             keeper_log: None,
@@ -309,6 +311,7 @@ impl EngineAuthContext {
             proposal_read: false,
             write_space: None,
             chat_audience: None,
+            chat_episode: None,
             taint: BranchTaint::default(),
             readonly_abilities: BTreeSet::new(),
             keeper_log: None,
@@ -350,6 +353,7 @@ impl EngineAuthContext {
             ability_write: false,
             write_space: None,
             chat_audience: None,
+            chat_episode: None,
             taint: BranchTaint::default(),
             readonly_abilities: BTreeSet::new(),
             keeper_log: None,
@@ -418,6 +422,7 @@ impl EngineAuthContext {
         derived.kind = PrincipalKind::AgentRun(run);
         derived.write_space = Some(thread_space);
         derived.chat_audience = Some(effective_audience);
+        derived.chat_episode = None;
         if self.kind == PrincipalKind::DirectHuman {
             let taint = BranchTaint::default();
             taint.merge(&self.taint);
@@ -432,6 +437,14 @@ impl EngineAuthContext {
         project_root: Option<FolderId>,
         readonly_abilities: BTreeSet<AbilityId>,
     ) -> DomainResult<Self> {
+        if self.keeper_log.is_some()
+            || matches!(
+                &self.credential,
+                Some(AuthenticatedCredential::ScheduledRun { run: cred_run, .. }) if cred_run != &run
+            )
+        {
+            return Err(DomainError::validation(ValidationReason::ScopeMismatch));
+        }
         if self.is_search_indexing() {
             return Err(DomainError::AccessDenied);
         }
@@ -745,6 +758,17 @@ impl EngineAuthContext {
     }
     pub fn chat_audience(&self) -> Option<ChatAudience> {
         self.chat_audience
+    }
+    pub fn chat_episode(&self) -> Option<&EpisodeId> {
+        self.chat_episode.as_ref()
+    }
+    /// Bind an `AgentRun` context to the exact chat-thread episode opened by
+    /// the supervisor so Shared-Space runs can only read their own episode.
+    pub fn with_chat_episode(mut self, episode: EpisodeId) -> Self {
+        if matches!(self.kind, PrincipalKind::AgentRun(_)) && self.chat_episode.is_none() {
+            self.chat_episode = Some(episode);
+        }
+        self
     }
     pub fn grant(&self) -> &GrantId {
         &self.grant

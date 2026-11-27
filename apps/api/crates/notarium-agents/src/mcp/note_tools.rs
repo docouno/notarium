@@ -100,6 +100,11 @@ pub(super) async fn observe_note(
     if current.metadata.lifecycle() != Lifecycle::Active {
         return Err(DomainError::ResourceNotFound.into());
     }
+    if matches!(call.target, EgressTarget::InAppProvider { .. })
+        && call.tool != ToolName::DeleteNote
+    {
+        corpus::note_metadata(call, &scope, &current.metadata).await?;
+    }
     let revision = current.metadata.revision().clone();
     if expected.is_some_and(|expected| expected != &revision) {
         return Err(DomainError::RevisionConflict {
@@ -341,6 +346,28 @@ fn preconditions(route: &NoteRoute) -> Preconditions {
 async fn delete(call: &mut ToolCallContext<'_>, input: NoteInput) -> Result<Value, PortError> {
     let route = route_for_delete(call, &input.note).await?;
     let scope = call.space(route.scope.clone())?;
+    if matches!(call.target, EgressTarget::InAppProvider { .. })
+        && let Ok(observed) = metadata_snapshot(
+            call,
+            &scope,
+            &route.note,
+            None,
+            CausalBasis::Await(Default::default()),
+        )
+        .await
+        && let Some(parent_id) = observed.parent
+    {
+        let parent_ref = FolderRef {
+            space_id: scope.scope().space_id.clone(),
+            folder_id: parent_id,
+        };
+        let project = observed.metadata.current_project();
+        if let Err(error) = corpus::record_folder_origin(call, &scope, &parent_ref, project).await
+            && !corpus::hidden(&error)
+        {
+            return Err(error);
+        }
+    }
     let command = Mutation {
         identity: call.command_identity(&route.scope, "trash_note", 0),
         preconditions: preconditions(&route),

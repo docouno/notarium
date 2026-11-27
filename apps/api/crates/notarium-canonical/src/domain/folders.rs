@@ -1786,7 +1786,7 @@ async fn subtree_reaches_depth_tx(
                 .bind(depth)
                 .fetch_one(&mut **conn)
                 .await
-                .map_err(|err| internal_not_committed("pg_subtree_depth", err.to_string()))
+                .map_err(|err| crate::runtime::pg_read_error("pg_subtree_depth", err))
         }
     }
 }

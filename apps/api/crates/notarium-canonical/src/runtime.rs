@@ -163,6 +163,8 @@ pub(crate) struct CanonicalInner {
     >,
     pub retirement_workers: crate::blobs::retirement_worker::RetirementWorkers,
     pub backup_cleanups: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    pub backup_cleanups_closed: AtomicBool,
+    pub aux_workers: Arc<tokio::sync::RwLock<()>>,
     pub last_backup_memory_stats:
         std::sync::Mutex<Option<crate::backup::BackupExporterMemoryStats>>,
     pub backup_step_delay_us: std::sync::atomic::AtomicU64,
@@ -618,6 +620,8 @@ impl CanonicalRuntime {
             lease_recoveries: Default::default(),
             retirement_workers: Default::default(),
             backup_cleanups: std::sync::Mutex::new(Vec::new()),
+            backup_cleanups_closed: AtomicBool::new(false),
+            aux_workers: Arc::new(tokio::sync::RwLock::new(())),
             last_backup_memory_stats: std::sync::Mutex::new(None),
             backup_step_delay_us: std::sync::atomic::AtomicU64::new(0),
             sqlite_writer_commit_gen: std::sync::atomic::AtomicU64::new(0),
@@ -725,11 +729,14 @@ impl CanonicalRuntime {
         if let Some(coord) = self.inner.writer_coord.get() {
             coord.drain_and_shutdown().await;
         }
-        if let Some(wal) = self.inner.wal_coord.get() {
-            wal.shutdown().await;
-        }
-        // Drain any post-rollback local CAS orphan cleanup tasks spawned by final batches
-        // before marking shutdown and closing SQL pools.
+        // Reject new auxiliary writers and wait for every in-flight auxiliary worker
+        // (including post-rollback `on_pre_commit_abort` hooks) to finish before closing
+        // local CAS cleanup admission.
+        let _aux_drained = self.inner.aux_workers.write().await;
+        // Close cleanup admission under `backup_cleanups` lock and drain all pending
+        // local CAS orphan cleanup tasks BEFORE shutting down WAL / SQL pools and
+        // releasing `DataRootOwnerLock`, so every cleanup task sees an open read gate
+        // and no physical `delete_physical_file` thread can outlive ownership.
         loop {
             let pending = {
                 let mut tasks = self
@@ -737,6 +744,9 @@ impl CanonicalRuntime {
                     .backup_cleanups
                     .lock()
                     .expect("backup cleanups mutex");
+                self.inner
+                    .backup_cleanups_closed
+                    .store(true, Ordering::SeqCst);
                 std::mem::take(&mut *tasks)
             };
             if pending.is_empty() {
@@ -745,6 +755,9 @@ impl CanonicalRuntime {
             for task in pending {
                 let _ = task.await;
             }
+        }
+        if let Some(wal) = self.inner.wal_coord.get() {
+            wal.shutdown().await;
         }
         self.inner.shutting_down.store(true, Ordering::SeqCst);
         match &self.inner.sql {

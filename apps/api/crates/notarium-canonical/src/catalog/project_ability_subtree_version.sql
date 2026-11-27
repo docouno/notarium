@@ -17,10 +17,11 @@ FROM (
         MAX(ap.updated_seq) AS max_ap_seq,
         COUNT(*) AS cnt,
         MAX(nh.updated_seq) AS max_nh_seq
-    FROM ability_packages ap
+    FROM sub
     CROSS JOIN note_heads nh
-    WHERE ap.space_id = $1
-      AND nh.space_id = ap.space_id
-      AND nh.note_id = ap.entrypoint_note_id
-      AND nh.parent_folder_id IN (SELECT folder_id FROM sub)
+    CROSS JOIN ability_packages ap
+    WHERE nh.space_id = $1
+      AND nh.parent_folder_id = sub.folder_id
+      AND ap.space_id = nh.space_id
+      AND ap.entrypoint_note_id = nh.note_id
 ) pkg

@@ -445,12 +445,73 @@ pub(super) async fn note_metadata_origin(
 }
 
 pub(super) async fn note_metadata(
-    call: &mut ToolCallContext<'_>,
+    call: &ToolCallContext<'_>,
     scope: &SpaceContext,
     metadata: &ClassifiedMetadata,
 ) -> Result<(), PortError> {
     let (origin, project) = admit_metadata(call, scope, metadata).await?;
     call.record_origin(origin, project)
+}
+
+pub(super) async fn record_note_origin_by_id(
+    call: &ToolCallContext<'_>,
+    scope: &SpaceContext,
+    note: &NoteId,
+) -> Result<(), PortError> {
+    if matches!(call.target, EgressTarget::ExternalMcp) {
+        return Ok(());
+    }
+    let observed = call
+        .registry
+        .engine
+        .get_note_metadata(
+            scope.with_preflight_taint(),
+            notarium_core::ports::GetNote {
+                note: note.clone(),
+                revision: None,
+                causal: notarium_core::receipt::CausalBasis::Await(Default::default()),
+            },
+        )
+        .await?;
+    note_metadata(call, scope, &observed.metadata).await
+}
+
+pub(super) async fn record_folder_origin(
+    call: &ToolCallContext<'_>,
+    scope: &SpaceContext,
+    folder: &FolderRef,
+    project: Option<FolderRef>,
+) -> Result<(), PortError> {
+    if matches!(call.target, EgressTarget::ExternalMcp) {
+        return Ok(());
+    }
+    let proof = call
+        .registry
+        .catalog
+        .disclosure(
+            call.account().with_preflight_taint(),
+            CatalogDisclosure::Folder(folder.clone()),
+        )
+        .await?;
+    if !matches!(
+        proof.current(),
+        ProviderCurrentContent::Folder {
+            reference,
+            history,
+            ..
+        } if reference == folder && history == scope.scope()
+    ) {
+        return Err(DomainError::ResourceNotFound.into());
+    }
+    if let Some(selection) = source_policy(call, scope, project, Some(&call.policies), |project| {
+        proof.current().in_project(project)
+    })
+    .await?
+    {
+        ClassEgressFence::provider_metadata(proof.clone(), scope.auth(), &selection.policy)?;
+        call.record_origin(proof.current().origin(), selection.project_only)?;
+    }
+    Ok(())
 }
 
 pub(super) async fn note_document(

@@ -2801,7 +2801,14 @@ async fn save_active_role(
                 }),
             },
         )
-        .await?;
+        .await
+        .map_err(|error| {
+            super::note_tools::batch_operational_error(
+                "notarium.mcp.activate-role.v1",
+                error,
+                false,
+            )
+        })?;
     Ok(())
 }
 

@@ -1235,6 +1235,33 @@ async fn role_placement_scope_and_run_inspection_access(pg: bool) {
         .unwrap();
     assert_eq!(run_receipt.run, claimed_run);
 
+    // A Keeper auth context pinned to a different AgentRunId for the same schedule
+    // must NOT read another run's receipt.
+    let foreign_run_keeper_auth = ctx
+        .auth()
+        .for_keeper(
+            AgentRunId::from_bytes([74; 16]),
+            shared_a.space.id.clone(),
+            Some(project_a1.folder_id.clone()),
+            BTreeSet::new(),
+        )
+        .unwrap();
+    let foreign_run_err = control
+        .get_schedule_run(
+            ScheduleRunContext::Owner(Box::new(AccountContext::new(
+                foreign_run_keeper_auth,
+                budget(),
+            ))),
+            good_sched_id.clone(),
+            claimed_run.clone(),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        foreign_run_err,
+        PortError::Domain(DomainError::ResourceNotFound)
+    ));
+
     let pat_shared_b = ctx
         .auth()
         .for_pat(BTreeMap::from([(
@@ -1495,12 +1522,56 @@ async fn role_placement_scope_and_run_inspection_access(pg: bool) {
         panic!("reapproved run was not claimed");
     };
     assert_ne!(context.auth().keeper_log(), Some(&log_a1));
-    let old = control
-        .get_schedule_run(
+    assert!(matches!(
+        control
+            .get_schedule_run(
+                ScheduleRunContext::Owner(Box::new(AccountContext::new(
+                    context.auth().clone(),
+                    budget(),
+                ))),
+                id.clone(),
+                run.clone(),
+            )
+            .await,
+        Err(PortError::Domain(DomainError::ResourceNotFound))
+    ));
+    let keeper_runs = control
+        .list_schedule_runs(
             ScheduleRunContext::Owner(Box::new(AccountContext::new(
                 context.auth().clone(),
                 budget(),
             ))),
+            id.clone(),
+            ControlPageRequest::new(10, None).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        keeper_runs
+            .items
+            .iter()
+            .map(|r| r.run.clone())
+            .collect::<Vec<_>>(),
+        vec![second.clone()],
+        "Keeper run listing must only return its own run"
+    );
+    let mut project_a2_grant = interactive
+        .auth()
+        .spaces()
+        .get(&shared_a.space.id)
+        .unwrap()
+        .clone();
+    project_a2_grant.project_root = Some(project_a2.folder_id.clone());
+    let project_a2_pat = interactive
+        .auth()
+        .for_pat(BTreeMap::from([(
+            shared_a.space.id.clone(),
+            project_a2_grant,
+        )]))
+        .unwrap();
+    let old = control
+        .get_schedule_run(
+            ScheduleRunContext::Owner(Box::new(AccountContext::new(project_a2_pat, budget()))),
             id,
             run,
         )

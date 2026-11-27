@@ -3309,6 +3309,7 @@ impl SqliteSyncItemPlan for CreateNoteFastPlan {
                 raw_fields: info.raw_fields.clone(),
                 evaluated_fields: eval_fields,
                 diagnostics: info.diagnostics.clone(),
+                logical_updated_at: None,
             }))
             .encode()
             .map_err(FastItemExecError::PreWrite)?;
@@ -3577,6 +3578,7 @@ pub(crate) fn build_carrier_replacement_fast_intent(
             raw_fields: info.raw_fields.clone(),
             evaluated_fields: eval_fields.clone(),
             diagnostics: info.diagnostics.clone(),
+            logical_updated_at: None,
         }))
         .encode()
         .ok()
@@ -3892,6 +3894,7 @@ impl SqliteSyncItemPlan for CarrierReplacementFastPlan {
                     raw_fields: info.raw_fields.clone(),
                     evaluated_fields: eval_fields.clone(),
                     diagnostics: info.diagnostics.clone(),
+                    logical_updated_at: None,
                 }))
                 .encode()
                 .map_err(FastItemExecError::PreWrite)?;
@@ -4458,13 +4461,16 @@ fn authorize_replay_targets_rusqlite(
                 continue;
             }
             ReplayResource::Write(note)
+            | ReplayResource::WriteUnpurged(note)
             | ReplayResource::Read(note)
             | ReplayResource::View(note)
             | ReplayResource::Create(note, ..)
             | ReplayResource::Move(note, ..) => note,
         };
-        if matches!(target, ReplayResource::Read(_) | ReplayResource::View(_))
-            && is_note_purge_fenced_rusqlite(conn, &srec.space.id, note.as_str())?
+        if matches!(
+            target,
+            ReplayResource::Read(_) | ReplayResource::View(_) | ReplayResource::WriteUnpurged(_)
+        ) && is_note_purge_fenced_rusqlite(conn, &srec.space.id, note.as_str())?
         {
             return Err(DomainError::ResourceNotFound.into());
         }
@@ -6493,7 +6499,9 @@ impl SqliteSyncItemPlan for RollbackDirectSqliteFastPlan {
                         FROM note_heads h JOIN revisions r ON r.space_id = h.space_id AND r.rev_id = h.head_rev_id
                         WHERE h.space_id = ?1 AND h.note_id = t.entity_key
                           AND r.entity_type = 'note' AND r.entity_key = t.entity_key
-                    ) END
+                    ) END,
+                    CASE WHEN pre.space_seq < t.first_run_seq THEN pre.created_at_sec END,
+                    CASE WHEN pre.space_seq < t.first_run_seq THEN pre.created_at_nsec END
              FROM touched t
              LEFT JOIN collab_sessions s ON s.space_id = ?1 AND s.note_id = t.entity_key
              LEFT JOIN collab_checkpoints c USING (space_id, note_id)
@@ -6584,6 +6592,20 @@ impl SqliteSyncItemPlan for RollbackDirectSqliteFastPlan {
                     rollback_fallback_cover_change_err(),
                 ));
             }
+            let pre_sec: Option<i64> = row.get(7).map_err(map_history_error)?;
+            let pre_nsec: Option<i32> = row.get(8).map_err(map_history_error)?;
+            let pre_rev_ts = pre_sec
+                .zip(pre_nsec)
+                .map(|(s, ns)| {
+                    crate::codec::decode_timestamp_parts(s, ns).map_err(|_| {
+                        FastItemExecError::PreWrite(internal_not_committed(
+                            "sqlite_rollback_pre_ts",
+                            "invalid timestamp",
+                        ))
+                    })
+                })
+                .transpose()?;
+            let pre_updated_at = pre_meta.logical_updated_at.or(pre_rev_ts);
             let head_unchanged_placement = head.lifecycle == pre_meta.lifecycle
                 && head.parent_folder_id == pre_meta.parent_folder_id
                 && head.slug == pre_meta.slug
@@ -6597,7 +6619,7 @@ impl SqliteSyncItemPlan for RollbackDirectSqliteFastPlan {
                     pre_rev_id,
                     pre_meta: Box::new(pre_meta),
                     pre_carrier: None,
-                    pre_updated_at: None,
+                    pre_updated_at,
                     needs_note_mutation,
                     head_unchanged_placement,
                     current_cover_parent: None,
@@ -7098,6 +7120,7 @@ impl SqliteSyncItemPlan for RollbackDirectSqliteFastPlan {
                     current_rev,
                     pre_rev_id,
                     pre_meta,
+                    pre_updated_at,
                     needs_note_mutation,
                     head_unchanged_placement,
                     ..
@@ -7130,6 +7153,9 @@ impl SqliteSyncItemPlan for RollbackDirectSqliteFastPlan {
                     .content_digest
                     .as_ref()
                     .map(|d| d.as_bytes().as_slice());
+                let (head_updated_sec, head_updated_nsec) = pre_updated_at
+                    .map(crate::codec::encode_timestamp_parts)
+                    .unwrap_or((sec, nsec));
 
                 if *head_unchanged_placement {
                     restore_inplace_stmt
@@ -7143,8 +7169,8 @@ impl SqliteSyncItemPlan for RollbackDirectSqliteFastPlan {
                             pre_meta.byte_size as i64,
                             i64::from(pre_meta.visibility_mask),
                             vis_i64,
-                            sec,
-                            nsec,
+                            head_updated_sec,
+                            head_updated_nsec,
                             actor_str,
                             scope_cl.space_id.as_str(),
                             nid.as_str(),
@@ -7171,8 +7197,8 @@ impl SqliteSyncItemPlan for RollbackDirectSqliteFastPlan {
                             lifecycle_to_db(pre_meta.lifecycle),
                             i64::from(pre_meta.visibility_mask),
                             vis_i64,
-                            sec,
-                            nsec,
+                            head_updated_sec,
+                            head_updated_nsec,
                             actor_str,
                             scope_cl.space_id.as_str(),
                             nid.as_str(),
@@ -7195,7 +7221,10 @@ impl SqliteSyncItemPlan for RollbackDirectSqliteFastPlan {
                     pre_meta,
                     original_metadata.remove(nid).map(Into::into),
                     is_root_child,
-                    RollbackRevision::Restore(current_schema.as_deref()),
+                    RollbackRevision::Restore {
+                        schema: current_schema.as_deref(),
+                        logical_updated_at: *pre_updated_at,
+                    },
                 )
                 .map_err(FastItemExecError::PostWrite)?;
 

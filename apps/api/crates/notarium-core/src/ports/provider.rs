@@ -364,6 +364,8 @@ pub enum ProviderToolSchema {
     Null,
     Array {
         items: Box<ProviderToolSchema>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        minimum: Option<u32>,
         maximum: u32,
     },
     Object {

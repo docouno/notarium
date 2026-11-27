@@ -31,7 +31,7 @@ impl ControlService {
                         owner_row.personal_space_id.as_deref(),
                         project.as_ref(),
                         row.name.as_deref(),
-                        true,
+                        Some(id),
                     ) {
                         return Err(DomainError::ResourceNotFound.into());
                     }

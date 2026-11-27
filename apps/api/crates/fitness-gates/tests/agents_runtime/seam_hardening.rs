@@ -2224,6 +2224,118 @@ async fn remote_embedding_sqlite_search_and_probes(
         projection: proj.clone(),
         search: search.clone(),
     });
+    let emb_registry = ToolRegistry::new(
+        Arc::new(ControlPlane::new(provider_svc.as_ref().clone())),
+        catalog,
+        Arc::new(TestEngine(fixture.canonical.clone(), emb_projections)),
+        fixture.control.clone(),
+    )
+    .with_vector_search(true);
+    box_step(|| {
+        remote_embedding_index_and_tool_probes(
+            fixture,
+            personal,
+            owner,
+            actor,
+            scope,
+            &root,
+            &search,
+            &emb_registry,
+            emb_hits,
+            wide_run_ctx,
+            chat_wide_res,
+            chat_wide_model,
+            chat_narrow_res,
+            chat_narrow_model,
+        )
+    })
+    .await;
+
+    let probe_agent_auth = owner
+        .auth()
+        .for_agent_run(
+            AgentRunId::from_bytes([0x7A, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]),
+            scope.space_id.clone(),
+            ChatAudience::Personal,
+            owner.auth().spaces().clone(),
+        )
+        .unwrap();
+    let probe_agent_account = AccountContext::new(probe_agent_auth, budget());
+    box_step(|| {
+        unconsented_slug_and_component_oracle_probes(
+            &emb_shared.slug,
+            &emb_registry,
+            &probe_agent_account,
+            chat_narrow_res,
+            chat_narrow_model,
+        )
+    })
+    .await;
+
+    // (e) Cross-space BranchTaint and degradation isolation (boxed helper to keep debug frame compact).
+    box_step(|| {
+        unconsented_space_taint_isolation_probes(
+            fixture,
+            owner,
+            actor,
+            &emb_shared.history,
+            &emb_registry,
+            &probe_agent_account,
+            chat_narrow_res,
+            chat_narrow_model,
+        )
+    })
+    .await;
+    let (space_udoc, user_doc_note) = box_step(|| {
+        real_search_preflight_setup_and_class_exclusion_probes(
+            fixture,
+            personal,
+            &provider_svc,
+            &search,
+            &root,
+            &emb_registry,
+            chat_narrow_res,
+            chat_narrow_model,
+        )
+    })
+    .await;
+    box_step(|| {
+        real_search_preflight_taint_limit_and_engine_probes(
+            fixture,
+            personal,
+            &search,
+            &root,
+            &emb_registry,
+            chat_narrow_res,
+            chat_narrow_model,
+            &space_udoc,
+            &user_doc_note,
+        )
+    })
+    .await;
+
+    search.shutdown().await;
+    projector.shutdown().await.unwrap();
+}
+
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+async fn remote_embedding_index_and_tool_probes(
+    fixture: &RuntimeFixture,
+    personal: &SpaceContext,
+    owner: &AccountContext,
+    actor: &PrincipalId,
+    scope: &HistoryScope,
+    root: &DataRoot,
+    search: &Arc<SearchEngine>,
+    emb_registry: &ToolRegistry,
+    emb_hits: &AtomicUsize,
+    wide_run_ctx: SpaceContext,
+    chat_wide_res: &ProviderResourceId,
+    chat_wide_model: &ModelProfileId,
+    chat_narrow_res: &ProviderResourceId,
+    chat_narrow_model: &ModelProfileId,
+) {
     let doc_id = NoteId::from_bytes([0x7F; 16]);
     let root_folder = fixture
         .canonical
@@ -2255,7 +2367,7 @@ async fn remote_embedding_sqlite_search_and_probes(
         )
         .await
         .unwrap();
-    let layout = SearchLayout::open(&root, scope.clone()).unwrap();
+    let layout = SearchLayout::open(root, scope.clone()).unwrap();
     let mut probe_attempt = 0_u8;
     timeout(Duration::from_secs(15), async {
         loop {
@@ -2362,13 +2474,6 @@ async fn remote_embedding_sqlite_search_and_probes(
 
     // (b) Unlogged AgentRun calling MCP `search` through InAppProvider(chat_wide_res)
     //     must STILL be blocked by SearchRecipient::query_source_classes().
-    let emb_registry = ToolRegistry::new(
-        Arc::new(ControlPlane::new(provider_svc.as_ref().clone())),
-        catalog,
-        Arc::new(TestEngine(fixture.canonical.clone(), emb_projections)),
-        fixture.control.clone(),
-    )
-    .with_vector_search(true);
     let personal_only_grants = std::collections::BTreeMap::from([(
         scope.space_id.clone(),
         owner.auth().spaces()[&scope.space_id].clone(),
@@ -2452,22 +2557,17 @@ async fn remote_embedding_sqlite_search_and_probes(
         "narrow UserDoc-only InAppProvider search must reach the UserDoc-only embedder (content={})",
         narrow_tool_res.structured_content
     );
+}
 
-    // (d) Unconsented Space/Project slug existence oracle: an InAppProvider AgentRun
-    //     whose auth includes an unconsented Shared Space (`emb_shared`) must see
-    //     ResourceNotFound (matching a bogus handle) on list_abilities, use_role,
-    //     and list_notes when passing that project handle, without tainting auth.
-    let probe_agent_auth = owner
-        .auth()
-        .for_agent_run(
-            AgentRunId::from_bytes([0x7A, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]),
-            scope.space_id.clone(),
-            ChatAudience::Personal,
-            owner.auth().spaces().clone(),
-        )
-        .unwrap();
-    let probe_agent_account = AccountContext::new(probe_agent_auth, budget());
-    let unconsented_handle = format!("{}/emb-proj-a", emb_shared.slug);
+#[inline(never)]
+async fn unconsented_slug_and_component_oracle_probes(
+    emb_shared_slug: &str,
+    emb_registry: &ToolRegistry,
+    probe_agent_account: &AccountContext,
+    chat_narrow_res: &ProviderResourceId,
+    chat_narrow_model: &ModelProfileId,
+) {
+    let unconsented_handle = format!("{emb_shared_slug}/emb-proj-a");
     for (idx, (tool, args)) in [
         (
             "list_abilities",
@@ -2524,11 +2624,8 @@ async fn remote_embedding_sqlite_search_and_probes(
         !probe_agent_account.auth().taint().is_tainted(),
         "rejected unconsented project probes must not taint caller"
     );
-    // Invalid project component (`<space>/..`) must fail syntactically before
-    // Space slug lookup so an existing unconsented Space slug and a missing
-    // Space slug produce the exact same ValidationFailed error.
     for (idx, handle) in [
-        format!("{}/..", emb_shared.slug),
+        format!("{emb_shared_slug}/.."),
         "missing-space/..".to_owned(),
     ]
     .into_iter()
@@ -2588,51 +2685,6 @@ async fn remote_embedding_sqlite_search_and_probes(
             );
         }
     }
-
-    // (e) Cross-space BranchTaint and degradation isolation (boxed helper to keep debug frame compact).
-    box_step(|| {
-        unconsented_space_taint_isolation_probes(
-            fixture,
-            owner,
-            actor,
-            &emb_shared.history,
-            &emb_registry,
-            &probe_agent_account,
-            chat_narrow_res,
-            chat_narrow_model,
-        )
-    })
-    .await;
-    let (space_udoc, user_doc_note) = box_step(|| {
-        real_search_preflight_setup_and_class_exclusion_probes(
-            fixture,
-            personal,
-            &provider_svc,
-            &search,
-            &root,
-            &emb_registry,
-            chat_narrow_res,
-            chat_narrow_model,
-        )
-    })
-    .await;
-    box_step(|| {
-        real_search_preflight_taint_limit_and_engine_probes(
-            fixture,
-            personal,
-            &search,
-            &root,
-            &emb_registry,
-            chat_narrow_res,
-            chat_narrow_model,
-            &space_udoc,
-            &user_doc_note,
-        )
-    })
-    .await;
-
-    search.shutdown().await;
-    projector.shutdown().await.unwrap();
 }
 
 #[inline(never)]
@@ -28891,6 +28943,1098 @@ async fn verify_part_j_cross_space_role_and_validation_hardening(
             bad_with_receipt.err()
         );
     }
+
+    box_step(|| {
+        verify_part_k_provenance_link_isolation_and_failover(
+            fixture,
+            owner,
+            personal_history,
+            s2_history,
+            s2_slug,
+        )
+    })
+    .await;
+}
+
+#[inline(never)]
+async fn verify_part_k_provenance_link_isolation_and_failover(
+    fixture: &RuntimeFixture,
+    owner: &AccountContext,
+    personal_history: &HistoryScope,
+    s2_history: &HistoryScope,
+    s2_slug: &str,
+) {
+    use notarium_core::classes::ProviderOrigin;
+    let actor = owner.auth().principal().clone();
+    let s2_sc = SpaceContext::new(owner.auth().clone(), s2_history.clone(), budget()).unwrap();
+    let pers_sc =
+        SpaceContext::new(owner.auth().clone(), personal_history.clone(), budget()).unwrap();
+    let s2_epoch = fixture
+        .canonical
+        .read_space(&s2_history.space_id)
+        .await
+        .unwrap()
+        .active_epoch;
+    let pers_epoch = fixture
+        .canonical
+        .read_space(&personal_history.space_id)
+        .await
+        .unwrap()
+        .active_epoch;
+    let pers_root = fixture
+        .canonical
+        .read_space(&personal_history.space_id)
+        .await
+        .unwrap()
+        .root_folder_id;
+
+    // 1. Shared-Space AgentRun must NOT read or begin_agent_call against owner's unnamed Personal
+    //    episodes unless explicitly bound via `with_chat_episode(own_ep)`.
+    let mut id_unnamed = identity(fixture, owner, 0x61).await;
+    id_unnamed.key = CommandKey::from_bytes([0xD9, 0x91, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    let EpisodeStartResult::New(unnamed_personal_ep) = fixture
+        .control
+        .start_or_resume_episode(
+            owner.clone(),
+            AccountMutation {
+                identity: id_unnamed,
+                input: StartEpisode {
+                    selector: EpisodeSelector::New {
+                        requested: EpisodeId::from_bytes([
+                            0xD9, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                        ]),
+                        name: None,
+                    },
+                    project_hint: None,
+                    guard: EpisodeRevisionGuard::Account,
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value
+    else {
+        panic!("expected unnamed personal episode");
+    };
+    let mut id_shared_own = identity(fixture, owner, 0x62).await;
+    id_shared_own.key =
+        CommandKey::from_bytes([0xD9, 0x92, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    let EpisodeStartResult::New(shared_own_ep) = fixture
+        .control
+        .start_or_resume_episode(
+            owner.clone(),
+            AccountMutation {
+                identity: id_shared_own,
+                input: StartEpisode {
+                    selector: EpisodeSelector::New {
+                        requested: EpisodeId::from_bytes([
+                            0xD9, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                        ]),
+                        name: None,
+                    },
+                    project_hint: None,
+                    guard: EpisodeRevisionGuard::Account,
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value
+    else {
+        panic!("expected second unnamed episode");
+    };
+    let s2_only_grants = std::collections::BTreeMap::from([(
+        s2_history.space_id.clone(),
+        owner.auth().spaces()[&s2_history.space_id].clone(),
+    )]);
+    let shared_agent_unbound = owner
+        .auth()
+        .for_agent_run(
+            AgentRunId::from_bytes([0xD9, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+            s2_history.space_id.clone(),
+            ChatAudience::Shared,
+            s2_only_grants.clone(),
+        )
+        .unwrap();
+    let shared_unbound_ctx = AccountContext::new(shared_agent_unbound.clone(), budget());
+    assert!(matches!(
+        fixture
+            .control
+            .get_episode(shared_unbound_ctx.clone(), unnamed_personal_ep.id.clone())
+            .await,
+        Err(PortError::Domain(DomainError::ResourceNotFound))
+    ));
+    assert!(matches!(
+        fixture
+            .control
+            .begin_agent_call(
+                shared_unbound_ctx,
+                BeginAgentCall {
+                    call: RequestId::from_bytes([
+                        0xD9, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1
+                    ]),
+                    request: RequestId::from_bytes([
+                        0xD9, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
+                    ]),
+                    episode: Some(unnamed_personal_ep.id.clone()),
+                    operation: AgentOperation::Read,
+                    transport: AgentTransport::Internal,
+                    effect: AgentEffect::Read,
+                    input_bytes: 2,
+                },
+            )
+            .await,
+        Err(PortError::Domain(DomainError::ResourceNotFound))
+    ));
+    let shared_bound_ctx = AccountContext::new(
+        shared_agent_unbound.with_chat_episode(shared_own_ep.id.clone()),
+        budget(),
+    );
+    assert_eq!(
+        fixture
+            .control
+            .get_episode(shared_bound_ctx.clone(), shared_own_ep.id.clone())
+            .await
+            .unwrap()
+            .id,
+        shared_own_ep.id
+    );
+    assert!(matches!(
+        fixture
+            .control
+            .get_episode(shared_bound_ctx, unnamed_personal_ep.id)
+            .await,
+        Err(PortError::Domain(DomainError::ResourceNotFound))
+    ));
+
+    // 2. Setup projects & notes for link laundering, non-EditNote proposal provenance,
+    //    renamed-project list_notes alias, create_ability orphan guard, and start_session failover.
+    let s2_proj_a = FolderId::from_bytes([0xD9, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    let s2_proj_b = FolderId::from_bytes([0xD9, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    for (fid, slug) in [(&s2_proj_a, "k-proj-a"), (&s2_proj_b, "k-proj-b")] {
+        fixture
+            .canonical
+            .create_folder(CreateFolderSpec {
+                scope: s2_history.clone(),
+                active_epoch: s2_epoch,
+                folder_id: fid.clone(),
+                parent: None,
+                slug: slug.into(),
+                display_name: slug.into(),
+                is_project: true,
+                project_slug: Some(slug.into()),
+                actor: actor.clone(),
+                timestamp: None,
+            })
+            .await
+            .unwrap();
+    }
+    let pers_proj_1 = FolderId::from_bytes([0xD9, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    let pers_proj_2 = FolderId::from_bytes([0xD9, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    for (fid, slug) in [(&pers_proj_1, "kp-one"), (&pers_proj_2, "kp-two")] {
+        fixture
+            .canonical
+            .create_folder(CreateFolderSpec {
+                scope: personal_history.clone(),
+                active_epoch: pers_epoch,
+                folder_id: fid.clone(),
+                parent: None,
+                slug: slug.into(),
+                display_name: slug.into(),
+                is_project: true,
+                project_slug: Some(slug.into()),
+                actor: actor.clone(),
+                timestamp: None,
+            })
+            .await
+            .unwrap();
+    }
+    let s2_note = NoteId::from_bytes([0xD9, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    fixture
+        .canonical
+        .create_note(
+            s2_sc.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: s2_history.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([
+                        0xD9, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xD9; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: CreateNote {
+                    note: s2_note.clone(),
+                    parent: Some(s2_proj_a.clone()),
+                    slug: "s2-target".into(),
+                    class: DocClass::UserDoc,
+                    carrier: "# Shared Target\n\nBody.\n".into(),
+                    folder_page: false,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let p1_note = NoteId::from_bytes([0xD9, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    let p2_note = NoteId::from_bytes([0xD9, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    let p1_trash_note = NoteId::from_bytes([0xD9, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    for (idx, (nid, parent, slug, title)) in [
+        (&p1_note, &pers_proj_1, "p1-source", "Project One Source"),
+        (
+            &p2_note,
+            &pers_proj_2,
+            "p2-secret",
+            "Confidential Project Two Title",
+        ),
+        (&p1_trash_note, &pers_proj_1, "p1-trash", "Trashable Note"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        fixture
+            .canonical
+            .create_note(
+                pers_sc.clone(),
+                Mutation {
+                    identity: CommandIdentity {
+                        scope: personal_history.clone(),
+                        actor: actor.clone(),
+                        key: CommandKey::from_bytes([
+                            0xD9,
+                            10 + idx as u8,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            2,
+                        ]),
+                        hash: ContentDigest::from_bytes([0xDA; 32]),
+                    },
+                    preconditions: Preconditions::default(),
+                    input: CreateNote {
+                        note: nid.clone(),
+                        parent: Some(parent.clone()),
+                        slug: slug.into(),
+                        class: DocClass::UserDoc,
+                        carrier: format!("---\ntitle: {title}\n---\n# {title}\n\nBody.\n"),
+                        folder_page: false,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+    }
+    let mem_res = call_mcp(
+        &fixture.registry,
+        owner,
+        [0xD9, 13, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "remember_about_user",
+        json!({
+            "category": "secret-prefs",
+            "observation": "Prefers zero title leaks.",
+        }),
+    )
+    .await
+    .unwrap();
+    let mem_note_id =
+        NoteId::parse(mem_res.structured_content["noteId"].as_str().unwrap()).unwrap();
+
+    // 3. Canonical link defense-in-depth rejects explicit `target_title` across DocClass or Project.
+    let cross_class_title_err = fixture
+        .canonical
+        .link(
+            pers_sc.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: personal_history.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([
+                        0xD9, 14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xDB; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: Link {
+                    source: p1_note.clone(),
+                    target: LinkTarget::Note(mem_note_id.clone()),
+                    relation: "mentions".into(),
+                    target_title: Some("Leaked Memory Title".into()),
+                },
+            },
+        )
+        .await;
+    assert!(
+        matches!(
+            cross_class_title_err,
+            Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
+                if diagnostic.reason == ValidationReason::ClassEgressForbidden
+        ),
+        "canonical link with target_title across DocClass must fail ClassEgressForbidden, got {cross_class_title_err:?}"
+    );
+    let cross_proj_title_err = fixture
+        .canonical
+        .link(
+            pers_sc.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: personal_history.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([
+                        0xD9, 15, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xDC; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: Link {
+                    source: p1_note.clone(),
+                    target: LinkTarget::Note(p2_note.clone()),
+                    relation: "mentions".into(),
+                    target_title: Some("Leaked Project Two Title".into()),
+                },
+            },
+        )
+        .await;
+    assert!(
+        matches!(
+            cross_proj_title_err,
+            Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
+                if diagnostic.reason == ValidationReason::ScopeMismatch
+        ),
+        "canonical link with target_title across projects must fail ScopeMismatch, got {cross_proj_title_err:?}"
+    );
+
+    // 4. InAppProvider: cross-Space non-EditNote proposals + link target provenance & no alias +
+    //    delete_note parent-folder provenance.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local = loopback_provider(fixture, owner, &listener, 0x30, true).await;
+    let all_classes: BTreeSet<DocClass> =
+        [DocClass::UserDoc, DocClass::AgentMemory, DocClass::Skill].into();
+    approve_disclosure(
+        fixture,
+        owner,
+        &local,
+        0x32,
+        ProviderAttachmentTarget::Personal {
+            owner: actor.clone(),
+            space: personal_history.space_id.clone(),
+        },
+        all_classes.clone(),
+    )
+    .await;
+    approve_disclosure(
+        fixture,
+        owner,
+        &local,
+        0x33,
+        ProviderAttachmentTarget::Personal {
+            owner: actor.clone(),
+            space: s2_history.space_id.clone(),
+        },
+        all_classes.clone(),
+    )
+    .await;
+    approve_disclosure(
+        fixture,
+        owner,
+        &local,
+        0x34,
+        ProviderAttachmentTarget::Space(s2_history.space_id.clone()),
+        all_classes,
+    )
+    .await;
+
+    let run_id = AgentRunId::from_bytes([0xD9, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    let chat_tid = ChatThreadId::from_bytes([0xD9, 17, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    fixture
+        .canonical
+        .create_chat(
+            pers_sc.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: personal_history.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([
+                        0xD9, 17, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xDD; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: CreateChat {
+                    thread: chat_tid.clone(),
+                    kind: ChatThreadKind::Personal,
+                    owner: actor.clone(),
+                    project_folder: None,
+                    title: "Part K Proposal Provenance".into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let agent_auth = owner
+        .auth()
+        .for_agent_run(
+            run_id.clone(),
+            personal_history.space_id.clone(),
+            ChatAudience::Personal,
+            owner.auth().spaces().clone(),
+        )
+        .unwrap();
+    let agent_pers_sc =
+        SpaceContext::new(agent_auth.clone(), personal_history.clone(), budget()).unwrap();
+    fixture
+        .canonical
+        .claim_active_run(
+            agent_pers_sc,
+            ClaimChatRun {
+                thread: chat_tid.clone(),
+                run: run_id.clone(),
+                expected_leaf: ThreadEntrySeq::ZERO,
+                previous_run: None,
+            },
+        )
+        .await
+        .unwrap();
+    let target = EgressTarget::InAppProvider {
+        provider: local.resource.id.clone(),
+        model: local.model.clone(),
+        primary_project: None,
+    };
+
+    // 4a. Direct InAppProvider MCP `link` across projects & across DocClass records target
+    //     provenance and omits target title alias (`[[<id>]]` with NO `|Title]]`).
+    for (idx, target_note, forbidden_substr) in [
+        (19u8, &p2_note, "Confidential Project Two Title"),
+        (20u8, &mem_note_id, "secret-prefs"),
+    ] {
+        let link_res = local
+            .registry
+            .call_tool(
+                McpInvocationContext {
+                    account: AccountContext::new(agent_auth.clone(), budget()),
+                    target: target.clone(),
+                    request_key: CommandKey::from_bytes([
+                        0xD9, idx, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                    ]),
+                },
+                "link",
+                json!({
+                    "from": p1_note,
+                    "relation": "references",
+                    "to": target_note,
+                }),
+            )
+            .await
+            .expect("cross-project / cross-class MCP link must succeed without alias");
+        assert!(
+            link_res.provenance.origins.iter().any(|o| matches!(
+                o,
+                ProviderOrigin::Note { reference, .. } if reference.note_id == *target_note
+            )),
+            "MCP link must record target note ProviderOrigin, got {:?}",
+            link_res.provenance.origins
+        );
+        let body = fixture
+            .canonical
+            .get_note(
+                pers_sc.clone(),
+                GetNote {
+                    note: p1_note.clone(),
+                    revision: None,
+                    causal: CausalBasis::Await(Default::default()),
+                },
+            )
+            .await
+            .unwrap()
+            .document
+            .explicit_read(pers_sc.auth())
+            .unwrap()
+            .to_owned();
+        assert!(
+            body.contains(&format!("[[{target_note}]]")),
+            "cross-boundary link must write bare [[{target_note}]], body={body}"
+        );
+        assert!(
+            !body.contains(forbidden_substr),
+            "cross-boundary link must never launder target title `{forbidden_substr}` into source note: {body}"
+        );
+    }
+
+    // 4b. Direct InAppProvider `delete_note` records parent folder origin (NOT trashed note origin).
+    let del_res = local
+        .registry
+        .call_tool(
+            McpInvocationContext {
+                account: AccountContext::new(agent_auth.clone(), budget()),
+                target: target.clone(),
+                request_key: CommandKey::from_bytes([
+                    0xD9, 21, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                ]),
+            },
+            "delete_note",
+            json!({ "ref": p1_trash_note }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(del_res.structured_content["outcome"], "trashed");
+    assert!(
+        del_res.provenance.origins.iter().any(|o| matches!(
+            o,
+            ProviderOrigin::Folder { reference, .. } if reference.folder_id == pers_proj_1
+        )),
+        "InAppProvider delete_note must record parent folder origin, got {:?}",
+        del_res.provenance.origins
+    );
+    assert!(
+        !del_res.provenance.origins.iter().any(|o| matches!(
+            o,
+            ProviderOrigin::Note { reference, .. } if reference.note_id == p1_trash_note
+        )),
+        "InAppProvider delete_note must not record trashed Note origin that breaks Turn 2"
+    );
+
+    // 4c. Cross-Space non-EditNote proposals (`delete_note`, `move_note`, `create_note`) record
+    //     target provenance in `McpToolResult.provenance`.
+    let binding = PersonalToolInvocation {
+        source: personal_history.clone(),
+        thread: chat_tid.clone(),
+        leaf: ThreadEntrySeq::ZERO,
+        owner: owner.clone(),
+    };
+    let s2_proj_a_handle = format!("{s2_slug}/k-proj-a");
+    let s2_proj_b_handle = format!("{s2_slug}/k-proj-b");
+    for (idx, tool, args) in [
+        (22u8, "delete_note", json!({ "ref": s2_note })),
+        (
+            23u8,
+            "move_note",
+            json!({ "ref": s2_note, "toFolder": "k-proj-a/sub" }),
+        ),
+        (
+            24u8,
+            "create_note",
+            json!({ "project": s2_proj_a_handle, "title": "Prop Note", "body": "Body." }),
+        ),
+    ] {
+        let prop_res = local
+            .registry
+            .call_personal_tool(
+                McpInvocationContext {
+                    account: AccountContext::new(agent_auth.clone(), budget()),
+                    target: target.clone(),
+                    request_key: CommandKey::from_bytes([
+                        0xD9, idx, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                    ]),
+                },
+                binding.clone(),
+                tool,
+                args,
+            )
+            .await
+            .expect("cross-space proposal must succeed");
+        assert!(prop_res.proposal().is_some(), "{tool} must emit proposal");
+        assert!(
+            prop_res
+                .provenance
+                .origins
+                .iter()
+                .any(|o| o.space_id() == Some(&s2_history.space_id)),
+            "cross-space {tool} proposal must record foreign-space ProviderOrigin, got {:?}",
+            prop_res.provenance.origins
+        );
+    }
+
+    // 4d. Real AgentRunSupervisor turn where `edit_note` fails with `findReplace` miss after
+    //     reading note content must persist `ProviderOrigin::Note` on the Tool entry (never drop
+    //     provenance to empty default on tool error).
+    let err_tid = ChatThreadId::from_bytes([0xD9, 37, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    fixture
+        .canonical
+        .create_chat(
+            pers_sc.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: personal_history.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([
+                        0xD9, 37, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xE6; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: CreateChat {
+                    thread: err_tid.clone(),
+                    kind: ChatThreadKind::Personal,
+                    owner: actor.clone(),
+                    project_folder: None,
+                    title: "Tool Error Provenance".into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let supervisor = AgentRunSupervisor::new_local(
+        local.registry.clone(),
+        fixture.revocations.clone(),
+        ExclusiveDataRoot::attest_open_writer(),
+    );
+    let err_opts = ChatRunOptions {
+        provider: Some(local.resource.id.clone()),
+        model: Some(local.model.clone()),
+        limits: RunLimits {
+            max_steps: 3,
+            max_tokens: 64_000,
+            timeout_ms: 15_000,
+        },
+        ..ChatRunOptions::default()
+    };
+    supervisor
+        .enqueue_input(
+            owner.clone(),
+            SubmitUserChatInput {
+                identity: CommandIdentity {
+                    scope: personal_history.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([
+                        0xD9, 38, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xE7; 32]),
+                },
+                id: PendingInputId::from_bytes([
+                    0xD9, 38, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                ]),
+                thread: err_tid.clone(),
+                expected_leaf: ThreadEntrySeq::ZERO,
+                body: "Try replacing missing needle.".into(),
+                mentions_agent: false,
+            },
+            err_opts,
+        )
+        .await
+        .unwrap();
+    let (mut wire1, _) = timeout(Duration::from_secs(12), read_request(&listener))
+        .await
+        .expect("Turn 1 provider request must arrive");
+    send_ollama(
+        &mut wire1,
+        json!({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "function": {
+                    "name": "edit_note",
+                    "arguments": {
+                        "ref": p1_note,
+                        "operation": "findReplace",
+                        "find": "NON_EXISTENT_NEEDLE_9999",
+                        "content": "replacement",
+                    }
+                }
+            }]
+        }),
+        "tool_calls",
+    )
+    .await;
+    let (mut wire2, _) = timeout(Duration::from_secs(12), read_request(&listener))
+        .await
+        .expect("Turn 2 provider request must arrive after edit_note error");
+    send_ollama(
+        &mut wire2,
+        json!({"role": "assistant", "content": "Noted failure."}),
+        "stop",
+    )
+    .await;
+    let head_after_turn1 = idle_leaf(fixture, &pers_sc, &err_tid).await;
+    assert!(
+        head_after_turn1.get() >= 3,
+        "Turn 1 with failed edit_note must complete and advance thread head"
+    );
+    // Revoke `DocClass::UserDoc` consent on `local` for `personal_history` and send a follow-up
+    // message on the same branch. Because the failed `edit_note` persisted `ProviderOrigin::Note(p1_note)`,
+    // Turn 2 must fail closed WITHOUT sending any HTTP request to `listener`.
+    let pers_att = local
+        .provider
+        .list_attachments(
+            owner.clone(),
+            local.resource.id.clone(),
+            ControlPageRequest::new(50, None).unwrap(),
+        )
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .find(|att| att.id == RequestId::from_bytes([0x32; 16]))
+        .expect("personal attachment 0x32 must exist");
+    let mut narrow_att_id = identity(fixture, owner, 0x39).await;
+    narrow_att_id.key =
+        CommandKey::from_bytes([0xD9, 0x93, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    local
+        .provider
+        .request_attachment(
+            owner.clone(),
+            AccountMutation {
+                identity: narrow_att_id,
+                input: RequestProviderAttachment {
+                    id: pers_att.id,
+                    expected: Some(pers_att.revision),
+                    resource: local.resource.id.clone(),
+                    resource_consent_epoch: local.resource.consent_epoch,
+                    credential_consent_epoch: None,
+                    target: ProviderAttachmentTarget::Personal {
+                        owner: actor.clone(),
+                        space: personal_history.space_id.clone(),
+                    },
+                    consent: ProviderDisclosureConsent::attest_checked(ProviderDisclosure {
+                        classes: [DocClass::Skill, DocClass::AgentMemory].into(),
+                    }),
+                    expires_at_ms: None,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let err_opts2 = ChatRunOptions {
+        provider: Some(local.resource.id.clone()),
+        model: Some(local.model.clone()),
+        limits: RunLimits {
+            max_steps: 2,
+            max_tokens: 64_000,
+            timeout_ms: 15_000,
+        },
+        ..ChatRunOptions::default()
+    };
+    let followup = supervisor
+        .enqueue_input(
+            owner.clone(),
+            SubmitUserChatInput {
+                identity: CommandIdentity {
+                    scope: personal_history.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([
+                        0xD9, 39, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xE9; 32]),
+                },
+                id: PendingInputId::from_bytes([
+                    0xD9, 39, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                ]),
+                thread: err_tid.clone(),
+                expected_leaf: head_after_turn1,
+                body: "Follow up after UserDoc revocation.".into(),
+                mentions_agent: false,
+            },
+            err_opts2,
+        )
+        .await;
+    if followup.is_ok() {
+        let head_after_turn2 = idle_leaf(fixture, &pers_sc, &err_tid).await;
+        assert!(
+            head_after_turn2 > head_after_turn1,
+            "follow-up turn after UserDoc revocation must terminate cleanly"
+        );
+    }
+    assert!(
+        timeout(Duration::from_millis(400), read_request(&listener))
+            .await
+            .is_err(),
+        "revoked UserDoc provenance from failed edit_note must block any follow-up provider HTTP egress"
+    );
+
+    // 5. `start_session` with `deliveryReceipt` + named session conflicting `project` must fail
+    //    `ScopeMismatch` before advancing ACK, AND failover replay on a fresh `ToolRegistry`
+    //    (empty in-memory bootstrap cache) must succeed idempotently.
+    let seeded_named = call_mcp(
+        &fixture.registry,
+        owner,
+        [0xD9, 25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "start_session",
+        json!({
+            "project": s2_proj_a_handle,
+            "session": { "name": "part-k-failover-ep" },
+        }),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    if let Some(receipt) = seeded_named["delta"]["deliveryReceipt"].as_str() {
+        let conflict = call_mcp(
+            &fixture.registry,
+            owner,
+            [0xD9, 26, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+            "start_session",
+            json!({
+                "deliveryReceipt": receipt,
+                "project": s2_proj_b_handle,
+                "session": { "name": "part-k-failover-ep" },
+            }),
+        )
+        .await;
+        assert!(
+            matches!(
+                conflict,
+                Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
+                    if diagnostic.reason == ValidationReason::ScopeMismatch
+            ),
+            "start_session with deliveryReceipt + conflicting named session project must fail ScopeMismatch, got {:?}",
+            conflict.err()
+        );
+        let failover_key = [0xD9, 27, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let first_ok = call_mcp(
+            &fixture.registry,
+            owner,
+            failover_key,
+            "start_session",
+            json!({
+                "deliveryReceipt": receipt,
+                "session": { "name": "part-k-failover-ep" },
+            }),
+        )
+        .await
+        .expect("start_session with preserved deliveryReceipt must succeed after rejected ScopeMismatch")
+        .structured_content;
+        let replayed_ok = call_mcp(
+            &local.registry,
+            owner,
+            failover_key,
+            "start_session",
+            json!({
+                "deliveryReceipt": receipt,
+                "session": { "name": "part-k-failover-ep" },
+            }),
+        )
+        .await
+        .expect("replaying journaled start_session with deliveryReceipt on a fresh ToolRegistry (failover) must succeed")
+        .structured_content;
+        assert_eq!(replayed_ok["session"]["id"], first_ok["session"]["id"]);
+    }
+
+    // 6. `list_notes` with renamed project's new handle + old path (`alias-old/docs`) resolves alias.
+    let alias_proj = FolderId::from_bytes([0xD9, 28, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    fixture
+        .canonical
+        .create_folder(CreateFolderSpec {
+            scope: s2_history.clone(),
+            active_epoch: s2_epoch,
+            folder_id: alias_proj.clone(),
+            parent: None,
+            slug: "alias-old".into(),
+            display_name: "alias-old".into(),
+            is_project: true,
+            project_slug: Some("alias-old".into()),
+            actor: actor.clone(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+    let created_alias_note = call_mcp(
+        &fixture.registry,
+        owner,
+        [0xD9, 29, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "create_note",
+        json!({
+            "project": format!("{s2_slug}/alias-old"),
+            "path": "docs",
+            "title": "Alias Guide",
+            "body": "Guide body.",
+        }),
+    )
+    .await
+    .unwrap();
+    let alias_note_id = created_alias_note.structured_content["noteId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    call_mcp(
+        &fixture.registry,
+        owner,
+        [0xD9, 30, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "rename_project",
+        json!({
+            "project": format!("{s2_slug}/alias-old"),
+            "slug": "alias-new",
+            "displayName": "Alias New",
+        }),
+    )
+    .await
+    .unwrap();
+    let listed_alias = call_mcp(
+        &fixture.registry,
+        owner,
+        [0xD9, 31, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "list_notes",
+        json!({
+            "project": format!("{s2_slug}/alias-new"),
+            "path": "alias-old/docs",
+        }),
+    )
+    .await
+    .expect("list_notes with new project handle and old project folder path must resolve historical alias")
+    .structured_content;
+    assert_eq!(
+        listed_alias["folderPage"]["folderPath"],
+        json!("alias-new/docs"),
+        "list_notes via renamed project alias must resolve alias-old/docs to canonical alias-new/docs, got {listed_alias}"
+    );
+    assert!(
+        listed_alias["folderPage"]["folderId"].is_string(),
+        "list_notes via renamed project alias must resolve real docs folderId, got {listed_alias}"
+    );
+    let _ = alias_note_id;
+
+    // 7. `create_ability` with an active slug whose entrypoint was moved outside `.abilities/`
+    //    must reject `PathConflict` WITHOUT creating an orphan `.abilities/<slug>.md` note.
+    let created_ab = call_mcp(
+        &fixture.registry,
+        owner,
+        [0xD9, 32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "create_ability",
+        json!({
+            "kind": "role",
+            "name": "orphan-guard-role",
+            "description": "Original role",
+            "instructions": "Original instructions.",
+            "placement": { "home": "project", "project": s2_proj_b_handle },
+        }),
+    )
+    .await
+    .unwrap();
+    let _ = created_ab;
+    let abilities_dir = fixture
+        .canonical
+        .resolve_folder_path(s2_sc.clone(), Some(s2_proj_b.clone()), ".abilities".into())
+        .await
+        .unwrap()
+        .expect(".abilities folder exists from first ability");
+    let ab_note_id = fixture
+        .canonical
+        .resolve_note_target(
+            s2_sc.clone(),
+            Some(abilities_dir.reference.folder_id.clone()),
+            "orphan-guard-role".into(),
+        )
+        .await
+        .unwrap()
+        .expect("created role entrypoint note exists in .abilities")
+        .note_id;
+    let alt_dir = FolderId::from_bytes([0xD9, 33, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    fixture
+        .canonical
+        .create_folder(CreateFolderSpec {
+            scope: s2_history.clone(),
+            active_epoch: s2_epoch,
+            folder_id: alt_dir.clone(),
+            parent: Some(s2_proj_b.clone()),
+            slug: "moved-abilities".into(),
+            display_name: "moved-abilities".into(),
+            is_project: false,
+            project_slug: None,
+            actor: actor.clone(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+    fixture
+        .canonical
+        .move_note(
+            s2_sc.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: s2_history.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([
+                        0xD9, 34, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xDF; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: MoveNote {
+                    note: ab_note_id.clone(),
+                    parent: Some(alt_dir.clone()),
+                    slug: "orphan-guard-role".into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let last_seq_before_dup = fixture
+        .canonical
+        .space(budget(), s2_history.space_id.clone())
+        .await
+        .unwrap()
+        .last_seq;
+    let dup_ab = call_mcp(
+        &fixture.registry,
+        owner,
+        [0xD9, 35, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "create_ability",
+        json!({
+            "kind": "role",
+            "name": "orphan-guard-role",
+            "description": "Duplicate role",
+            "instructions": "Should fail before creating orphan note.",
+            "placement": { "home": "project", "project": s2_proj_b_handle },
+        }),
+    )
+    .await;
+    assert!(
+        matches!(
+            dup_ab,
+            Err(PortError::Domain(DomainError::PathConflict { .. }))
+        ),
+        "duplicate active ability slug moved outside .abilities/ must fail PathConflict, got {:?}",
+        dup_ab.err()
+    );
+    let last_seq_after_dup = fixture
+        .canonical
+        .space(budget(), s2_history.space_id.clone())
+        .await
+        .unwrap()
+        .last_seq;
+    assert_eq!(
+        last_seq_after_dup, last_seq_before_dup,
+        "failed create_ability must not commit any canonical mutation (no orphan note or folder)"
+    );
+    let resolved_in_abilities = fixture
+        .canonical
+        .resolve_note_target(
+            s2_sc.clone(),
+            Some(abilities_dir.reference.folder_id),
+            "orphan-guard-role".into(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resolved_in_abilities.as_ref().map(|r| &r.note_id),
+        Some(&ab_note_id),
+        "resolving old .abilities/ path must only follow the historical alias to the moved note, not a new orphan note"
+    );
+    let moved_meta = fixture
+        .canonical
+        .get_note_metadata(
+            s2_sc,
+            GetNote {
+                note: ab_note_id,
+                revision: None,
+                causal: CausalBasis::Await(Default::default()),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        moved_meta.parent,
+        Some(alt_dir),
+        "original ability entrypoint must remain in moved-abilities/"
+    );
+    let _ = pers_root;
 }
 
 #[allow(clippy::too_many_arguments)]

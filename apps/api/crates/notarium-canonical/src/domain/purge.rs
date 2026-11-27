@@ -692,7 +692,7 @@ pub(crate) async fn mint_and_purge_impl(
         ctx.auth(),
         crate::writer::replay::ReplayPolicy::Documents(vec![
             crate::writer::replay::ReplayResource::Write(request.input.old_note.clone()),
-            crate::writer::replay::ReplayResource::Write(request.input.new_note.clone()),
+            crate::writer::replay::ReplayResource::WriteUnpurged(request.input.new_note.clone()),
         ]),
     );
 
@@ -718,12 +718,12 @@ pub(crate) async fn mint_and_purge_impl(
                     return Ok(Some(receipt));
                 }
                 let head = load_note_head_row_tx(tx, &space.scope.space_id, &old_note).await?;
-                authorize_mint_placement_tx(tx, &space, &head, preflight.auth()).await?;
                 if head.lifecycle == Lifecycle::Purged
                     || is_note_purge_fenced_tx(tx, &space.scope.space_id, old_note.as_str()).await?
                 {
                     return Err(DomainError::ResourceNotFound.into());
                 }
+                authorize_mint_placement_tx(tx, &space, &head, preflight.auth()).await?;
                 let collision = super::common::authorized_collision_revision_tx(
                     tx,
                     &space.space,
@@ -1051,6 +1051,7 @@ pub(crate) async fn mint_and_purge_impl(
                         raw_fields: None,
                         evaluated_fields: Default::default(),
                         diagnostics: Vec::new(),
+                        logical_updated_at: None,
                     },
                 ))
                 .encode()?;
@@ -1126,9 +1127,18 @@ pub(crate) async fn mint_and_purge_impl(
                         note: input.new_note.clone(),
                         revision: new_note_rev.clone(),
                     },
+                    receipt: receipt.clone(),
+                };
+                let detail_bytes = CanonicalStore::encode_command_outcome(&stored_resp)?;
+                let scrubbed_resp = StoredCommittedMintAndPurgeV1 {
+                    old_note: input.old_note.clone(),
+                    new_note: NoteRevision {
+                        note: input.new_note.clone(),
+                        revision: RevisionId::from_bytes([0u8; 16]),
+                    },
                     receipt,
                 };
-                let sanitized_bytes = CanonicalStore::encode_command_outcome(&stored_resp)?;
+                let sanitized_bytes = CanonicalStore::encode_command_outcome(&scrubbed_resp)?;
 
                 insert_pending_purge_row_tx(
                     tx,
@@ -1140,7 +1150,7 @@ pub(crate) async fn mint_and_purge_impl(
                     Some(&new_note_rev),
                     visibility_seq,
                     &retirement_ids,
-                    &sanitized_bytes,
+                    &detail_bytes,
                     now_ms,
                 )
                 .await?;
@@ -1184,10 +1194,10 @@ pub(crate) async fn mint_and_purge_impl(
                     command_kind: "mint_and_purge".to_owned(),
                     events,
                     change_payload: Some(cp),
-                    receipt_detail_blob: None,
-                    receipt_sanitized_blob: sanitized_bytes.clone(),
+                    receipt_detail_blob: Some(detail_bytes.clone()),
+                    receipt_sanitized_blob: sanitized_bytes,
                     receipt_owner_note_ids: vec![input.new_note],
-                    response_bytes: sanitized_bytes,
+                    response_bytes: detail_bytes,
                 })
             })
         }),

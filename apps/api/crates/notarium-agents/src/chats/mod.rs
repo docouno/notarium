@@ -1216,12 +1216,9 @@ impl AgentRunSupervisor {
                 Err(error) => Err(error),
             };
             match result {
-                Ok(FinishChatRunOutcome::Cleared) => {
-                    self.inner
-                        .revocations
-                        .finish_thread_pending(&run.scope, &run.thread);
-                    return ClaimSettlement::Retired;
-                }
+                // Queue is empty; do not wipe newer submissions registered on another
+                // supervisor after `active_run_id` cleared.
+                Ok(FinishChatRunOutcome::Cleared) => return ClaimSettlement::Retired,
                 Ok(FinishChatRunOutcome::Changed) => return ClaimSettlement::Changed,
                 Ok(FinishChatRunOutcome::Pending)
                     if owner_live && !self.inner.shutdown.is_cancelled() =>

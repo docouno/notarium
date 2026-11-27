@@ -3077,11 +3077,74 @@ async fn run_purge_and_mint_suite(
 
     // Idempotent retry of `mint_and_purge` replays sanitized outcome without duplicate successor!
     let minted_replay = store
-        .mint_and_purge(ctx.clone(), mint_mut)
+        .mint_and_purge(ctx.clone(), mint_mut.clone())
         .await
         .expect("idempotent replay of mint_and_purge");
     assert_eq!(minted.value, minted_replay.value);
     assert_eq!(minted.receipt, minted_replay.receipt);
+
+    // Calling `mint_and_purge` on an already-purged note with a read-only viewer context
+    // must return `ResourceNotFound` before placement write checks (no purge-existence oracle).
+    let viewer_ctx = make_human_ctx(
+        &scope,
+        owner.clone(),
+        SpaceGrant {
+            role: SpaceRole::Viewer,
+            read_classes: [DocClass::UserDoc, DocClass::EncryptedNote].into(),
+            write_classes: std::collections::BTreeSet::new(),
+            project_root: None,
+        },
+        false,
+        false,
+    );
+    let purged_probe = store
+        .mint_and_purge(
+            viewer_ctx,
+            next_mutation(
+                &scope,
+                &owner,
+                MintAndPurge {
+                    old_note: old_plain.clone(),
+                    expected_revision: minted.value.new_note.revision.clone(),
+                    new_note: sample_note_id(78),
+                    new_slug: None,
+                    encrypted_carrier: valid_encrypted_carrier("Probe"),
+                },
+            ),
+        )
+        .await;
+    assert!(
+        matches!(
+            purged_probe,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ),
+        "mint_and_purge on already-purged note must return ResourceNotFound before placement auth, got {purged_probe:?}"
+    );
+
+    // Hard-purging the minted successor must invalidate idempotent replay of `mint_mut`
+    // (never disclose a purged successor's NoteRevision via receipt replay).
+    store
+        .delete_note(
+            ctx.clone(),
+            next_mutation(
+                &scope,
+                &owner,
+                DeleteNote {
+                    note: successor.clone(),
+                    disposition: DeleteDisposition::Purge,
+                },
+            ),
+        )
+        .await
+        .expect("hard-purge minted successor");
+    let replay_after_successor_purge = store.mint_and_purge(ctx.clone(), mint_mut).await;
+    assert!(
+        matches!(
+            replay_after_successor_purge,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ),
+        "replaying mint_and_purge after hard-purging new_note must return ResourceNotFound, got {replay_after_successor_purge:?}"
+    );
 
     // Execute Step-1 SQL erasure of `note_crash` and simulate process crash right before Step-2/3 CAS retirement!
     let note_crash = sample_note_id(75);

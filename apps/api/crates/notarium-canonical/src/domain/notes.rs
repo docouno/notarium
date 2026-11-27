@@ -1056,6 +1056,7 @@ pub(crate) fn build_create_note_intent(
                         raw_fields: info.raw_fields,
                         evaluated_fields: eval_fields,
                         diagnostics: info.diagnostics,
+                        logical_updated_at: None,
                     },
                 ))
                 .encode()?;
@@ -1898,6 +1899,7 @@ pub(crate) fn build_carrier_replacement_intent(
                         raw_fields: info.raw_fields,
                         evaluated_fields: eval_fields,
                         diagnostics: info.diagnostics,
+                        logical_updated_at: None,
                     },
                 ))
                 .encode()?;
@@ -2460,6 +2462,7 @@ fn build_trash_or_restore_intent(
                         raw_fields: prev.raw_fields,
                         evaluated_fields: prev.evaluated_fields,
                         diagnostics: prev.diagnostics,
+                        logical_updated_at: None,
                     },
                 ))
                 .encode()?;
@@ -3141,6 +3144,7 @@ fn build_move_note_intent(
                         raw_fields: prev_raw_fields,
                         evaluated_fields: prev_eval_fields,
                         diagnostics: prev_diags,
+                        logical_updated_at: None,
                     },
                 ))
                 .encode()?;
@@ -4354,6 +4358,7 @@ fn build_batch_edit_intent(
                         raw_fields: info.raw_fields,
                         evaluated_fields: eval_fields,
                         diagnostics: info.diagnostics,
+                        logical_updated_at: None,
                     },
                 ))
                 .encode()?;
@@ -4581,7 +4586,9 @@ async fn authorize_link_target_tx(
     space: &crate::SpaceRecord,
     auth: &notarium_core::auth::EngineAuthContext,
     source_class: DocClass,
+    source_project: Option<&notarium_core::ids::FolderId>,
     target: &LinkTarget,
+    has_target_title: bool,
 ) -> Result<(), PortError> {
     match target {
         LinkTarget::Note(target_nid) => {
@@ -4602,6 +4609,16 @@ async fn authorize_link_target_tx(
             )
             .await?;
             auth.authorize_read(&tfacts)?;
+            if has_target_title {
+                if target_head.doc_class != source_class {
+                    return Err(
+                        DomainError::validation(ValidationReason::ClassEgressForbidden).into(),
+                    );
+                }
+                if tfacts.project.as_ref() != source_project {
+                    return Err(DomainError::validation(ValidationReason::ScopeMismatch).into());
+                }
+            }
         }
         LinkTarget::Folder(target_fid) => {
             let fanc = load_folder_ancestry_tx(tx, &space.scope.space_id, target_fid, true).await?;
@@ -4621,20 +4638,31 @@ async fn authorize_link_target_tx(
     Ok(())
 }
 
-async fn prepare_link_intent(
+struct PreparedLinkUnstaged {
+    space_rec: crate::runtime::SpaceRecord,
+    request: Mutation<Link>,
+    idemp: crate::writer::CommandIdentitySpec,
+    base_digest: ContentDigest,
+    info: PreparedCarrierInfo,
+}
+
+async fn prepare_link_unstaged(
     store: &CanonicalStore,
     ctx: &SpaceContext,
     request: Mutation<Link>,
     link_line: &str,
     idemp: crate::writer::CommandIdentitySpec,
     expected_epoch: Option<notarium_core::ids::LeaseEpoch>,
-) -> Result<PreparedWriteIntent, PortError> {
+) -> Result<PreparedLinkUnstaged, PortError> {
     let (space_rec, base_head) = read_active_note_for_mutation(
         store,
         ctx,
         &request.input.source,
         &request.preconditions,
-        NoteMutationAccess::Link(request.input.target.clone()),
+        NoteMutationAccess::Link(
+            request.input.target.clone(),
+            request.input.target_title.is_some(),
+        ),
     )
     .await?;
     if expected_epoch.is_some_and(|epoch| epoch != space_rec.active_epoch) {
@@ -4667,24 +4695,43 @@ async fn prepare_link_intent(
         &base_head.slug,
         store.blob_codec(),
     )?;
+    Ok(PreparedLinkUnstaged {
+        space_rec,
+        request,
+        idemp,
+        base_digest,
+        info,
+    })
+}
+
+async fn prepare_link_intent(
+    store: &CanonicalStore,
+    ctx: &SpaceContext,
+    request: Mutation<Link>,
+    link_line: &str,
+    idemp: crate::writer::CommandIdentitySpec,
+    expected_epoch: Option<notarium_core::ids::LeaseEpoch>,
+) -> Result<PreparedWriteIntent, PortError> {
+    let unstaged =
+        prepare_link_unstaged(store, ctx, request, link_line, idemp, expected_epoch).await?;
     let ticket = store
         .stage_blob_for_batch(
-            &space_rec.scope,
-            space_rec.active_epoch,
-            &info.prepared_blob,
+            &unstaged.space_rec.scope,
+            unstaged.space_rec.active_epoch,
+            &unstaged.info.prepared_blob,
         )
         .await?;
 
     Ok(build_link_item_intent(
         store,
-        &space_rec.scope,
-        space_rec.active_epoch,
-        Some(idemp),
+        &unstaged.space_rec.scope,
+        unstaged.space_rec.active_epoch,
+        Some(unstaged.idemp),
         ctx.auth().clone(),
-        request.preconditions,
-        request.input,
-        base_digest,
-        info,
+        unstaged.request.preconditions,
+        unstaged.request.input,
+        unstaged.base_digest,
+        unstaged.info,
         ticket,
     ))
 }
@@ -4805,7 +4852,7 @@ pub(crate) async fn link_many_impl(
     let mut high_watermark = space.last_seq;
     while pending.peek().is_some() {
         let mut sources = HashSet::new();
-        let mut intents = Vec::new();
+        let mut prepared_steps = Vec::new();
         while let Some(next) = pending.peek() {
             // Appending a link has an implicit base. Only a repeated source needs
             // the preceding savepoint's durable result before it can stage its bytes.
@@ -4815,15 +4862,75 @@ pub(crate) async fn link_many_impl(
             let item = pending.next().expect("peeked");
             let result = deadline
                 .wait(&budget, || {
-                    prepare_link_batch_item(store, &ctx, &space, item, &receipts)
+                    prepare_link_batch_item_unstaged(store, &ctx, &space, item, &receipts)
                 })
                 .await
                 .map_err(|error| batch_error(error, outcomes.iter().any(has_commit_outcome)))?;
-            intents.push(match result {
-                Ok(intent) => intent,
-                Err(error) => build_failing_item_intent(&space.scope, space.active_epoch, error),
+            prepared_steps.push(match result {
+                Ok(step) => step,
+                Err(error) => PreparedLinkBatchStep::Immediate(Box::new(
+                    build_failing_item_intent(&space.scope, space.active_epoch, error),
+                )),
             });
         }
+        // Stage all prepared blobs for this wave in one deduplicated, canonical
+        // ascending-digest pass after all `read_verified_blob` calls have released
+        // their shared guards, preventing same-digest and AB/BA RwLock deadlocks.
+        let blobs_to_stage: Vec<&crate::blobs::PreparedBlobSource> = prepared_steps
+            .iter()
+            .filter_map(|step| match step {
+                PreparedLinkBatchStep::Ready(unstaged) => Some(&unstaged.info.prepared_blob),
+                PreparedLinkBatchStep::Immediate(_) => None,
+            })
+            .collect();
+        let mut staged_tickets = if blobs_to_stage.is_empty() {
+            HashMap::new()
+        } else {
+            deadline
+                .wait(&budget, || {
+                    store.stage_blobs_for_batch_sorted(
+                        &space.scope,
+                        space.active_epoch,
+                        &blobs_to_stage,
+                    )
+                })
+                .await
+                .map_err(|error| batch_error(error, outcomes.iter().any(has_commit_outcome)))?
+                .map_err(|error| batch_error(error, outcomes.iter().any(has_commit_outcome)))?
+        };
+        let mut intents = Vec::with_capacity(prepared_steps.len());
+        for step in prepared_steps {
+            match step {
+                PreparedLinkBatchStep::Immediate(intent) => intents.push(*intent),
+                PreparedLinkBatchStep::Ready(unstaged) => {
+                    let ticket = staged_tickets
+                        .get(&unstaged.info.prepared_blob.digest)
+                        .cloned()
+                        .ok_or_else(|| {
+                            batch_error(
+                                internal_not_committed(
+                                    "missing_staged_link_ticket",
+                                    "sorted batch staging omitted a prepared link digest",
+                                ),
+                                outcomes.iter().any(has_commit_outcome),
+                            )
+                        })?;
+                    intents.push(build_link_item_intent(
+                        store,
+                        &unstaged.space_rec.scope,
+                        unstaged.space_rec.active_epoch,
+                        Some(unstaged.idemp),
+                        ctx.auth().clone(),
+                        unstaged.request.preconditions,
+                        unstaged.request.input,
+                        unstaged.base_digest,
+                        unstaged.info,
+                        ticket,
+                    ));
+                }
+            }
+        }
+        staged_tickets.clear();
         ctx.budget.remaining = deadline
             .remaining(&budget)
             .map_err(|error| batch_error(error, outcomes.iter().any(has_commit_outcome)))?;
@@ -4849,13 +4956,18 @@ pub(crate) async fn link_many_impl(
     )
 }
 
-async fn prepare_link_batch_item(
+enum PreparedLinkBatchStep {
+    Immediate(Box<PreparedWriteIntent>),
+    Ready(Box<PreparedLinkUnstaged>),
+}
+
+async fn prepare_link_batch_item_unstaged(
     store: &CanonicalStore,
     ctx: &SpaceContext,
     space: &crate::runtime::SpaceRecord,
     item: Mutation<Link>,
     receipts: &HashMap<String, Vec<u8>>,
-) -> Result<PreparedWriteIntent, PortError> {
+) -> Result<PreparedLinkBatchStep, PortError> {
     super::common::validate_confirmable_mutation_identity(ctx, &item.identity)?;
     let line = validate_and_format_link_line(&item.input)?;
     let spec = link_identity(ctx, &item, &line);
@@ -4872,10 +4984,10 @@ async fn prepare_link_batch_item(
             DomainError::ResourceNotFound.into(),
         );
         replay.idempotency = Some(spec);
-        return Ok(replay);
+        return Ok(PreparedLinkBatchStep::Immediate(Box::new(replay)));
     }
     Ok(
-        match prepare_link_intent(
+        match prepare_link_unstaged(
             store,
             ctx,
             item,
@@ -4885,11 +4997,11 @@ async fn prepare_link_batch_item(
         )
         .await
         {
-            Ok(intent) => intent,
+            Ok(unstaged) => PreparedLinkBatchStep::Ready(Box::new(unstaged)),
             Err(error) => {
                 let mut failed = build_failing_item_intent(&space.scope, space.active_epoch, error);
                 failed.idempotency = Some(spec);
-                failed
+                PreparedLinkBatchStep::Immediate(Box::new(failed))
             }
         },
     )
@@ -4990,8 +5102,16 @@ fn build_link_item_intent(
                 .await?;
                 auth.authorize_direct_write(&facts, &facts)?;
 
-                authorize_link_target_tx(tx, &live_space, &auth, head.doc_class, &link.target)
-                    .await?;
+                authorize_link_target_tx(
+                    tx,
+                    &live_space,
+                    &auth,
+                    head.doc_class,
+                    facts.project.as_ref(),
+                    &link.target,
+                    link.target_title.is_some(),
+                )
+                .await?;
                 if head.doc_class == DocClass::EncryptedNote {
                     return Err(DomainError::UnsafePlaintextOutsideAgeFence.into());
                 }
@@ -5136,6 +5256,7 @@ fn build_link_item_intent(
                         raw_fields: info.raw_fields,
                         evaluated_fields: eval_fields,
                         diagnostics: info.diagnostics,
+                        logical_updated_at: None,
                     },
                 ))
                 .encode()?;
@@ -6064,6 +6185,7 @@ fn build_observation_intent(
                         raw_fields: info.raw_fields,
                         evaluated_fields: eval_fields,
                         diagnostics: info.diagnostics,
+                        logical_updated_at: None,
                     },
                 ))
                 .encode()?;
@@ -6702,6 +6824,7 @@ pub(crate) async fn update_space_schema_impl(
                         raw_fields: info.raw_fields,
                         evaluated_fields: eval_fields,
                         diagnostics: info.diagnostics,
+                        logical_updated_at: None,
                     },
                 ))
                 .encode()?;
@@ -7508,7 +7631,7 @@ struct SearchMetadataPlan {
 enum NoteMutationAccess {
     Current,
     Move(Option<notarium_core::ids::FolderId>),
-    Link(LinkTarget),
+    Link(LinkTarget, bool),
 }
 
 pub(super) async fn authorize_note_placement_tx(
@@ -7574,9 +7697,19 @@ async fn read_active_note_for_mutation(
                     }
                     _ => &head.parent_folder_id,
                 };
-                authorize_note_placement_tx(tx, &srec, &auth, &head, destination).await?;
-                if let NoteMutationAccess::Link(target) = &access {
-                    authorize_link_target_tx(tx, &srec, &auth, head.doc_class, target).await?;
+                let ancestry =
+                    authorize_note_placement_tx(tx, &srec, &auth, &head, destination).await?;
+                if let NoteMutationAccess::Link(target, has_target_title) = &access {
+                    authorize_link_target_tx(
+                        tx,
+                        &srec,
+                        &auth,
+                        head.doc_class,
+                        ancestry.project.as_ref(),
+                        target,
+                        *has_target_title,
+                    )
+                    .await?;
                 }
                 if let Some(expected_rev) = &prec.revision
                     && *expected_rev != head.head_rev_id

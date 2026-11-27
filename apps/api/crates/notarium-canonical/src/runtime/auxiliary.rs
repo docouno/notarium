@@ -267,6 +267,13 @@ impl CanonicalStore {
             Ok(())
         };
         check()?;
+        let Ok(aux_permit) = Arc::clone(&self.inner.aux_workers).try_read_owned() else {
+            return Err(crate::codec::unavailable_retryable(
+                "canonical_shutting_down",
+                "canonical runtime is shutting down",
+                std::time::Duration::from_millis(100),
+            ));
+        };
         let store = self.clone();
         let permission = Arc::new(AtomicBool::new(true));
         let commit = Arc::clone(&permission);
@@ -277,6 +284,7 @@ impl CanonicalStore {
             })
         }));
         let task = self.inner.backup_executor.spawn(async move {
+            let _aux_permit = aux_permit;
             check()?;
             // The owner keeps the active lease past a canceled waiter and
             // while the connection acknowledges COMMIT or ROLLBACK.

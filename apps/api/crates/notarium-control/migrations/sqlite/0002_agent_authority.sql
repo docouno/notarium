@@ -73,6 +73,10 @@ CREATE INDEX schedule_due ON agent_schedules(next_slot_utc_ms,schedule_id)
 CREATE INDEX schedule_deleted ON agent_schedules(deleted_at,schedule_id)
     WHERE deleted_at IS NOT NULL;
 CREATE INDEX schedule_owner ON agent_schedules(owner_id,space_id,schedule_id);
+CREATE INDEX schedule_owner_live ON agent_schedules(owner_id,space_id,schedule_id)
+    WHERE deleted_at IS NULL;
+CREATE INDEX schedule_owner_project_live ON agent_schedules(owner_id,space_id,project_folder_id,schedule_id)
+    WHERE deleted_at IS NULL;
 CREATE INDEX schedule_run_status ON agent_schedule_runs(schedule_id,status,slot_utc_ms,run_id);
 CREATE INDEX schedule_run_retention ON agent_schedule_runs(finished_at,run_id)
     WHERE status IN ('succeeded','failed','unknown') AND finished_at IS NOT NULL;

@@ -51,6 +51,10 @@ pub(super) async fn exercise(store: &CanonicalStore, runtime: &ProjectorRuntime)
     ))
     .await;
     Box::pin(rollback_case_7g_clear_overlay_ordering(store, runtime)).await;
+    Box::pin(rollback_preserves_updated_at_sort_and_pre_run_manual_order(
+        store, runtime,
+    ))
+    .await;
     Box::pin(keeper_readonly_abilities_isolation_on_changes_events_and_graph(store, runtime)).await;
 }
 
@@ -6178,5 +6182,514 @@ async fn keeper_readonly_abilities_isolation_on_changes_events_and_graph(
             Err(PortError::Domain(DomainError::ResourceNotFound))
         ),
         "Keeper must not plan moves on a board sourcing DocClass::Skill, got {move_err:?}"
+    );
+}
+
+async fn rollback_preserves_updated_at_sort_and_pre_run_manual_order(
+    store: &CanonicalStore,
+    runtime: &ProjectorRuntime,
+) {
+    use notarium_core::ports::{DeleteDisposition, DeleteNote, RankNeighbor};
+
+    let (scope, owner) = open_space(store).await;
+    let engine = runtime.engine();
+
+    // Case A: Same-group run materialization + returning unranked card (`title ASC`).
+    // Agent moves `C` before `B` (materializing `B` & `C` with `placement_run_id = None` on `B`),
+    // then moves `A` to `doing`. Rollback must restore `[A, B, C]` with ZERO synthetic overlays.
+    let proj_a = folder(store, &owner, None, "rb-same-grp-mat", true)
+        .await
+        .unwrap();
+    let (va, va_rev) = create_view(
+        store,
+        &owner,
+        &proj_a,
+        "rb-same-grp-board",
+        "board",
+        "{scope: project}",
+        "group_by: status\nfilter: {exists: status}\nsort: [{field: title, type: string, direction: asc}]\n",
+    )
+    .await;
+    let a_card = create_note(
+        store,
+        &owner,
+        Some(proj_a.clone()),
+        "a-card",
+        "---\nstatus: todo\ntitle: Alpha\n---\n".into(),
+    )
+    .await;
+    let b_card = create_note(
+        store,
+        &owner,
+        Some(proj_a.clone()),
+        "b-card",
+        "---\nstatus: todo\ntitle: Beta\n---\n".into(),
+    )
+    .await;
+    let c_card = create_note(
+        store,
+        &owner,
+        Some(proj_a),
+        "c-card",
+        "---\nstatus: todo\ntitle: Gamma\n---\n".into(),
+    )
+    .await;
+    sync(store, runtime, &scope).await;
+
+    let run_a = AgentRunId::from_bytes(random_bytes());
+    let agent_a = super::agent(&owner, run_a.clone(), ChatAudience::Personal);
+    store
+        .move_board_card(
+            agent_a.clone(),
+            mutation(
+                &agent_a,
+                MoveBoardCard {
+                    view: va.clone(),
+                    note: c_card.note.clone(),
+                    group: group("todo"),
+                    before: Some(RankNeighbor {
+                        note: b_card.note.clone(),
+                        expected_rank: RankExpectation::Absent,
+                    }),
+                    after: None,
+                    fields: BTreeMap::new(),
+                    expected_note: c_card.revision.clone(),
+                    expected_view: va_rev.revision.clone(),
+                    expected_rank: RankExpectation::Absent,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    sync(store, runtime, &scope).await;
+    let a_mat_rank = store
+        .inspect_view_overlays_for_test(&scope.space_id, &va)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|ov| ov.0 == a_card.note)
+        .expect("moving C before B in todo materializes A's rank overlay")
+        .1
+        .rank_rev_id;
+    store
+        .move_board_card(
+            agent_a.clone(),
+            mutation(
+                &agent_a,
+                MoveBoardCard {
+                    view: va.clone(),
+                    note: a_card.note.clone(),
+                    group: group("doing"),
+                    before: None,
+                    after: None,
+                    fields: BTreeMap::from([(
+                        "status".into(),
+                        Some(YamlValue::String("doing".into())),
+                    )]),
+                    expected_note: a_card.revision.clone(),
+                    expected_view: va_rev.revision.clone(),
+                    expected_rank: RankExpectation::Existing(a_mat_rank),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    sync(store, runtime, &scope).await;
+
+    let prep_a = store
+        .prepare_agent_run_rollback(owner.clone(), run_a)
+        .await
+        .unwrap();
+    store
+        .rollback_agent_run(owner.clone(), mutation(&owner, prep_a))
+        .await
+        .unwrap();
+    sync(store, runtime, &scope).await;
+    let va_overlays = store
+        .inspect_view_overlays_for_test(&scope.space_id, &va)
+        .await
+        .unwrap();
+    assert!(
+        va_overlays.is_empty(),
+        "rollback of same-group run-materialized cards + returning unranked card must leave 0 overlays, got {va_overlays:?}"
+    );
+    let va_ids: Vec<NoteId> = query(&engine, owner.clone(), va)
+        .await
+        .unwrap()
+        .rows
+        .items
+        .into_iter()
+        .map(|row| row.card.document.provenance().reference().note_id.clone())
+        .collect();
+    assert_eq!(va_ids, vec![a_card.note, b_card.note, c_card.note]);
+
+    // Case B: Multi-hop move `todo -> doing -> done` where hop 2 materializes an untouched card `V`
+    // in `doing`. Rollback must leave ZERO synthetic overlays on the board.
+    let proj_b = folder(store, &owner, None, "rb-multihop-clear", true)
+        .await
+        .unwrap();
+    let (vb, vb_rev) = create_view(
+        store,
+        &owner,
+        &proj_b,
+        "rb-multihop-board",
+        "board",
+        "{scope: project}",
+        "group_by: status\nfilter: {exists: status}\nsort: [{field: title, type: string, direction: asc}]\n",
+    )
+    .await;
+    let mh_a = create_note(
+        store,
+        &owner,
+        Some(proj_b.clone()),
+        "mh-a",
+        "---\nstatus: todo\ntitle: Alpha\n---\n".into(),
+    )
+    .await;
+    let mh_u = create_note(
+        store,
+        &owner,
+        Some(proj_b.clone()),
+        "mh-u",
+        "---\nstatus: todo\ntitle: Beta\n---\n".into(),
+    )
+    .await;
+    let mh_v = create_note(
+        store,
+        &owner,
+        Some(proj_b),
+        "mh-v",
+        "---\nstatus: doing\ntitle: DoingCard\n---\n".into(),
+    )
+    .await;
+    sync(store, runtime, &scope).await;
+
+    let run_b = AgentRunId::from_bytes(random_bytes());
+    let agent_b = super::agent(&owner, run_b.clone(), ChatAudience::Personal);
+    let mh_a_hop1 = store
+        .move_board_card(
+            agent_b.clone(),
+            mutation(
+                &agent_b,
+                MoveBoardCard {
+                    view: vb.clone(),
+                    note: mh_a.note.clone(),
+                    group: group("doing"),
+                    before: Some(RankNeighbor {
+                        note: mh_v.note.clone(),
+                        expected_rank: RankExpectation::Absent,
+                    }),
+                    after: None,
+                    fields: BTreeMap::from([(
+                        "status".into(),
+                        Some(YamlValue::String("doing".into())),
+                    )]),
+                    expected_note: mh_a.revision.clone(),
+                    expected_view: vb_rev.revision.clone(),
+                    expected_rank: RankExpectation::Absent,
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .value;
+    store
+        .move_board_card(
+            agent_b.clone(),
+            mutation(
+                &agent_b,
+                MoveBoardCard {
+                    view: vb.clone(),
+                    note: mh_a.note.clone(),
+                    group: group("done"),
+                    before: None,
+                    after: None,
+                    fields: BTreeMap::from([(
+                        "status".into(),
+                        Some(YamlValue::String("done".into())),
+                    )]),
+                    expected_note: mh_a_hop1.revision.revision,
+                    expected_view: vb_rev.revision.clone(),
+                    expected_rank: RankExpectation::Existing(mh_a_hop1.rank_revision),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    sync(store, runtime, &scope).await;
+
+    let prep_b = store
+        .prepare_agent_run_rollback(owner.clone(), run_b)
+        .await
+        .unwrap();
+    store
+        .rollback_agent_run(owner.clone(), mutation(&owner, prep_b))
+        .await
+        .unwrap();
+    sync(store, runtime, &scope).await;
+    let vb_overlays = store
+        .inspect_view_overlays_for_test(&scope.space_id, &vb)
+        .await
+        .unwrap();
+    assert!(
+        !vb_overlays.contains_key(&mh_v.note)
+            && vb_overlays.values().all(|ov| ov.group != group("doing")),
+        "rollback of multi-hop move must clear run-materialized overlay on untouched card V in doing, got {vb_overlays:?}"
+    );
+    let vb_rows = query(&engine, owner.clone(), vb).await.unwrap().rows.items;
+    let vb_todo: Vec<NoteId> = vb_rows
+        .iter()
+        .filter(|row| row.group == group("todo"))
+        .map(|row| row.card.document.provenance().reference().note_id.clone())
+        .collect();
+    let vb_doing: Vec<NoteId> = vb_rows
+        .iter()
+        .filter(|row| row.group == group("doing"))
+        .map(|row| row.card.document.provenance().reference().note_id.clone())
+        .collect();
+    assert_eq!(vb_todo, vec![mh_a.note, mh_u.note]);
+    assert_eq!(vb_doing, vec![mh_v.note]);
+
+    // Case C: Human manually ranks `[Second, First]` before agent run; agent moves `First` to `doing`;
+    // human trashes board `V`, rolls back agent run, and restores `V` from trash.
+    // Rollback MUST preserve human's pre-run manual rank `[Second, First]` instead of deleting it!
+    let proj_c = folder(store, &owner, None, "rb-trashed-preserve-manual", true)
+        .await
+        .unwrap();
+    let (vc, vc_rev) = create_view(
+        store,
+        &owner,
+        &proj_c,
+        "rb-manual-trash-board",
+        "board",
+        "{scope: project}",
+        "group_by: status\nfilter: {exists: status}\nsort: [{field: title, type: string, direction: asc}]\n",
+    )
+    .await;
+    let mc_first = create_note(
+        store,
+        &owner,
+        Some(proj_c.clone()),
+        "mc-first",
+        "---\nstatus: todo\ntitle: First\n---\n".into(),
+    )
+    .await;
+    let mc_second = create_note(
+        store,
+        &owner,
+        Some(proj_c),
+        "mc-second",
+        "---\nstatus: todo\ntitle: Second\n---\n".into(),
+    )
+    .await;
+    sync(store, runtime, &scope).await;
+    // Human manually pins `Second` before `First`.
+    let human_pin = store
+        .move_board_card(
+            owner.clone(),
+            mutation(
+                &owner,
+                MoveBoardCard {
+                    view: vc.clone(),
+                    note: mc_second.note.clone(),
+                    group: group("todo"),
+                    before: Some(RankNeighbor {
+                        note: mc_first.note.clone(),
+                        expected_rank: RankExpectation::Absent,
+                    }),
+                    after: None,
+                    fields: BTreeMap::new(),
+                    expected_note: mc_second.revision.clone(),
+                    expected_view: vc_rev.revision.clone(),
+                    expected_rank: RankExpectation::Absent,
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .value;
+    sync(store, runtime, &scope).await;
+    let first_rank_rev = store
+        .inspect_view_overlays_for_test(&scope.space_id, &vc)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|ov| ov.0 == mc_first.note)
+        .expect(
+            "First must have a materialized manual overlay after human ranked Second before First",
+        )
+        .1
+        .rank_rev_id;
+    let _ = human_pin;
+
+    let run_c = AgentRunId::from_bytes(random_bytes());
+    let agent_c = super::agent(&owner, run_c.clone(), ChatAudience::Personal);
+    store
+        .move_board_card(
+            agent_c.clone(),
+            mutation(
+                &agent_c,
+                MoveBoardCard {
+                    view: vc.clone(),
+                    note: mc_first.note.clone(),
+                    group: group("doing"),
+                    before: None,
+                    after: None,
+                    fields: BTreeMap::from([(
+                        "status".into(),
+                        Some(YamlValue::String("doing".into())),
+                    )]),
+                    expected_note: mc_first.revision.clone(),
+                    expected_view: vc_rev.revision.clone(),
+                    expected_rank: RankExpectation::Existing(first_rank_rev),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    store
+        .delete_note(
+            owner.clone(),
+            mutation(
+                &owner,
+                DeleteNote {
+                    note: vc_rev.note.clone(),
+                    disposition: DeleteDisposition::Trash,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    sync(store, runtime, &scope).await;
+
+    let prep_c = store
+        .prepare_agent_run_rollback(owner.clone(), run_c)
+        .await
+        .unwrap();
+    store
+        .rollback_agent_run(owner.clone(), mutation(&owner, prep_c))
+        .await
+        .unwrap();
+    store
+        .delete_note(
+            owner.clone(),
+            mutation(
+                &owner,
+                DeleteNote {
+                    note: vc_rev.note.clone(),
+                    disposition: DeleteDisposition::Restore,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    sync(store, runtime, &scope).await;
+    let vc_ids: Vec<NoteId> = query(&engine, owner.clone(), vc)
+        .await
+        .unwrap()
+        .rows
+        .items
+        .into_iter()
+        .map(|row| row.card.document.provenance().reference().note_id.clone())
+        .collect();
+    assert_eq!(
+        vc_ids,
+        vec![mc_second.note, mc_first.note],
+        "restoring human-trashed board after rollback must preserve human pre-run manual rank [Second, First]"
+    );
+
+    // Case D: Unranked board sorted by `updated_at DESC` (`[Newer, Older]`).
+    // Agent moves `Older` to `doing` (bumping its `updated_at`). Rollback must restore
+    // `Older`'s pre-run `note_heads.updated_at` so `[Newer, Older]` order is preserved.
+    let proj_d = folder(store, &owner, None, "rb-updated-at-desc", true)
+        .await
+        .unwrap();
+    let (vd, vd_rev) = create_view(
+        store,
+        &owner,
+        &proj_d,
+        "rb-updated-board",
+        "board",
+        "{scope: project}",
+        "group_by: status\nfilter: {exists: status}\nsort: [{field: updated_at, type: datetime, direction: desc}]\n",
+    )
+    .await;
+    let older = create_note(
+        store,
+        &owner,
+        Some(proj_d.clone()),
+        "u-older",
+        "---\nstatus: todo\ntitle: Older\n---\n".into(),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(15)).await;
+    let newer = create_note(
+        store,
+        &owner,
+        Some(proj_d),
+        "u-newer",
+        "---\nstatus: todo\ntitle: Newer\n---\n".into(),
+    )
+    .await;
+    sync(store, runtime, &scope).await;
+    let vd_before_ids: Vec<NoteId> = query(&engine, owner.clone(), vd.clone())
+        .await
+        .unwrap()
+        .rows
+        .items
+        .into_iter()
+        .map(|row| row.card.document.provenance().reference().note_id.clone())
+        .collect();
+    assert_eq!(vd_before_ids, vec![newer.note.clone(), older.note.clone()]);
+
+    tokio::time::sleep(Duration::from_millis(15)).await;
+    let run_d = AgentRunId::from_bytes(random_bytes());
+    let agent_d = super::agent(&owner, run_d.clone(), ChatAudience::Personal);
+    store
+        .move_board_card(
+            agent_d.clone(),
+            mutation(
+                &agent_d,
+                MoveBoardCard {
+                    view: vd.clone(),
+                    note: older.note.clone(),
+                    group: group("doing"),
+                    before: None,
+                    after: None,
+                    fields: BTreeMap::from([(
+                        "status".into(),
+                        Some(YamlValue::String("doing".into())),
+                    )]),
+                    expected_note: older.revision.clone(),
+                    expected_view: vd_rev.revision.clone(),
+                    expected_rank: RankExpectation::Absent,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    sync(store, runtime, &scope).await;
+
+    let prep_d = store
+        .prepare_agent_run_rollback(owner.clone(), run_d)
+        .await
+        .unwrap();
+    store
+        .rollback_agent_run(owner.clone(), mutation(&owner, prep_d))
+        .await
+        .unwrap();
+    sync(store, runtime, &scope).await;
+    let vd_after_ids: Vec<NoteId> = query(&engine, owner.clone(), vd)
+        .await
+        .unwrap()
+        .rows
+        .items
+        .into_iter()
+        .map(|row| row.card.document.provenance().reference().note_id.clone())
+        .collect();
+    assert_eq!(
+        vd_after_ids,
+        vec![newer.note, older.note],
+        "rollback must restore pre-run note_heads.updated_at so updated_at DESC stays [Newer, Older]"
     );
 }

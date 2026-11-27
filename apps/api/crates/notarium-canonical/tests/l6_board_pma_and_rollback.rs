@@ -1700,10 +1700,14 @@ async fn run_rollback_agent_run_suite(store: &CanonicalStore) {
         note_metadata_at(store, &scope, &rb.trashed[0], &rollback_committed.receipt).await,
         trashed_metadata
     );
-    assert_eq!(
-        note_metadata_at(store, &scope, &rb.restored[0], &rollback_committed.receipt).await,
-        restored_metadata
+    let mut actual_restored =
+        note_metadata_at(store, &scope, &rb.restored[0], &rollback_committed.receipt).await;
+    assert!(
+        actual_restored.logical_updated_at.is_some(),
+        "rollback restore revision must carry pre-run logical_updated_at"
     );
+    actual_restored.logical_updated_at = restored_metadata.logical_updated_at;
+    assert_eq!(actual_restored, restored_metadata);
     assert_eq!(rb.skipped_manual_edits, vec![n_manual]);
     assert_eq!(rb.skipped_room_active, vec![n_room.clone()]);
 
@@ -2650,7 +2654,12 @@ async fn run_note_only_rollback_suite(
     check_legacy_rollback(store, &human_ctx, &rollback, &rb, pg.is_some()).await;
     assert_eq!(rb.value.restored.len(), 1);
     assert_eq!(rb.value.trashed.len(), 2);
-    let restored = note_metadata_at(store, &scope, &rb.value.restored[0], &rb.receipt).await;
+    let mut restored = note_metadata_at(store, &scope, &rb.value.restored[0], &rb.receipt).await;
+    assert!(
+        restored.logical_updated_at.is_some(),
+        "note-only rollback restore revision must carry pre-run logical_updated_at"
+    );
+    restored.logical_updated_at = pre_meta.logical_updated_at;
     assert_eq!(restored, pre_meta);
     assert_eq!(restored.parent_folder_id, root_folder);
     assert!(restored.is_root_child);

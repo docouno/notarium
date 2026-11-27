@@ -4012,6 +4012,7 @@ async fn settle_and_update_collab_session(
                         raw_fields: info.raw_fields,
                         evaluated_fields: eval_fields,
                         diagnostics: info.diagnostics,
+                        logical_updated_at: None,
                     },
                 ))
                 .encode()?;

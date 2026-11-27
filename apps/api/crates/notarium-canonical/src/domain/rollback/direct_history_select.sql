@@ -6,6 +6,8 @@ WITH touched AS (
 SELECT t.entity_key, COALESCE(p.space_seq > t.first_seq, FALSE),
        CASE WHEN p.space_seq < t.first_seq THEN p.rev_id END,
        CASE WHEN p.space_seq < t.first_seq THEN p.metadata_msgpack END,
+       CASE WHEN p.space_seq < t.first_seq THEN p.created_at_sec END,
+       CASE WHEN p.space_seq < t.first_seq THEN p.created_at_nsec END,
        CASE WHEN p.rev_id IS NULL THEN (
            SELECT hrev.metadata_msgpack FROM note_heads h
            JOIN revisions hrev ON hrev.space_id = h.space_id AND hrev.rev_id = h.head_rev_id

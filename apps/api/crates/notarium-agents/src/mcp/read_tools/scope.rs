@@ -1,11 +1,14 @@
-use super::super::{EgressTarget, ToolCallContext, corpus, session};
+use super::super::{EgressTarget, ToolCallContext, corpus, invalid, session};
 use notarium_core::{
-    error::PortError,
+    error::{PortError, ValidationReason},
     ids::{EpisodeId, SpaceId, SpaceSeq},
     model::{FolderRef, HistoryScope},
     ports::ControlPageRequest,
     receipt::{AwaitWatermarks, CausalBasis},
 };
+
+const MAX_PROJECT_CANDIDATES: usize = 4096;
+const PROJECT_PAGE_LIMIT: u16 = 100;
 
 pub(super) struct ReadTarget {
     pub scope: HistoryScope,
@@ -42,6 +45,7 @@ pub(super) async fn targets(
     if all_spaces {
         let in_app = matches!(call.target, EgressTarget::InAppProvider { .. });
         let mut out = Vec::new();
+        let mut scanned_projects = 0usize;
         for space in session::readable_spaces(call).await?.into_values() {
             let grant_project = call
                 .auth
@@ -102,14 +106,26 @@ pub(super) async fn targets(
                 }
                 Err(error) if corpus::hidden(&error) => {
                     // No Space-wide consent; emit targets only for individually
-                    // consented projects in this Space.
-                    let mut continuation = None;
-                    loop {
+                    // consented projects in this Space, enforcing the same global
+                    // project-candidate budget and cursor-progress checks used by
+                    // ordinary project traversal.
+                    let mut continuation: Option<String> = None;
+                    for _ in 0..=MAX_PROJECT_CANDIDATES {
                         let page = call
                             .registry
                             .catalog
-                            .projects(scope.clone(), ControlPageRequest::new(100, continuation)?)
+                            .projects(
+                                scope.clone(),
+                                ControlPageRequest::new(PROJECT_PAGE_LIMIT, continuation.clone())?,
+                            )
                             .await?;
+                        if page.items.len() > usize::from(PROJECT_PAGE_LIMIT) {
+                            return Err(invalid(ValidationReason::InvalidState));
+                        }
+                        scanned_projects = scanned_projects.saturating_add(page.items.len());
+                        if scanned_projects > MAX_PROJECT_CANDIDATES {
+                            return Err(invalid(ValidationReason::BudgetExceeded));
+                        }
                         for item in page.items {
                             match call
                                 .provider_selection(&scope, Some(item.folder.clone()))
@@ -134,9 +150,17 @@ pub(super) async fn targets(
                             }
                         }
                         match page.continuation {
-                            Some(next) => continuation = Some(next),
+                            Some(next) => {
+                                if continuation.as_ref() == Some(&next) {
+                                    return Err(invalid(ValidationReason::InvalidState));
+                                }
+                                continuation = Some(next);
+                            }
                             None => break,
                         }
+                    }
+                    if continuation.is_some() {
+                        return Err(invalid(ValidationReason::BudgetExceeded));
                     }
                 }
                 Err(error) => return Err(error),

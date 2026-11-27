@@ -97,7 +97,7 @@ pub(super) async fn handle(
                 _ => projects(call).await,
             }
         }
-        ToolName::StartSession => start(call, decode(args)?).await,
+        ToolName::StartSession => Box::pin(start(call, decode(args)?)).await,
         _ => Err(invalid(ValidationReason::InvalidQuery)),
     }
 }
@@ -509,22 +509,28 @@ async fn start(call: &mut ToolCallContext<'_>, args: StartArgs) -> Result<Value,
     } else {
         None
     };
-    if let Some(receipt) = args.delivery_receipt.as_deref() {
-        delta::validate_delivery(call, receipt).await?;
-    }
-    let mut existing_plan: Option<StartPlan> = None;
+    let existing_plan: Option<StartPlan> = if validated_selector.is_some() {
+        call.lookup_journal::<StartPlan>("start-episode").await?
+    } else {
+        None
+    };
     let mut preflight_plan: Option<StartPlan> = None;
+    let mut committed_any = existing_plan.is_some();
     if let Some(sel) = &validated_selector {
-        existing_plan = call.lookup_journal::<StartPlan>("start-episode").await?;
         if existing_plan.is_none() {
-            // Validate all session-start preconditions (project, episode target/lifecycle,
-            // and role) BEFORE committing `delta::deliver` or writing the start-episode
-            // journal so deterministic domain errors never advance the delta cursor or
-            // collapse into a `CommitEffect::Unknown / RetrySameCommand` retry loop.
+            // Validate all session-start preconditions (delivery ticket, project,
+            // episode target/lifecycle, space-narrowed admission, and role) BEFORE
+            // committing `delta::deliver` or writing the start-episode journal so
+            // deterministic domain errors never advance the delta cursor or collapse
+            // into a `CommitEffect::Unknown / RetrySameCommand` retry loop.
+            if let Some(receipt) = args.delivery_receipt.as_deref() {
+                delta::validate_delivery(call, receipt).await?;
+            }
             let project = match args.project.as_deref() {
                 Some(handle) => Some(resolve_project(call, handle).await?.folder),
                 None => None,
             };
+            let mut named_preview: Option<NamedEpisodePreview> = None;
             let preflight_episode = match sel {
                 EpisodeSelector::Id(id) | EpisodeSelector::Resume(id) => {
                     let episode = call
@@ -535,8 +541,63 @@ async fn start(call: &mut ToolCallContext<'_>, args: StartArgs) -> Result<Value,
                     check_requested_project(project.as_ref(), &episode)?;
                     Some(episode)
                 }
-                _ => None,
+                EpisodeSelector::Name(name) => {
+                    let preview = call
+                        .registry
+                        .control
+                        .named_episode_project_hint(call.account(), name.clone())
+                        .await?;
+                    match &preview {
+                        NamedEpisodePreview::Unique(hint) => {
+                            if let Some(requested_project) = &project
+                                && hint.as_ref() != Some(requested_project)
+                            {
+                                return Err(invalid(ValidationReason::ScopeMismatch));
+                            }
+                        }
+                        NamedEpisodePreview::ProjectUnavailable => {
+                            return Err(DomainError::ResourceNotFound.into());
+                        }
+                        NamedEpisodePreview::NoMatch | NamedEpisodePreview::Ambiguous => {}
+                    }
+                    named_preview = Some(preview);
+                    None
+                }
+                EpisodeSelector::New { .. } => None,
             };
+            let creates_unmatched = matches!(sel, EpisodeSelector::New { .. })
+                || matches!(named_preview, Some(NamedEpisodePreview::NoMatch));
+            if creates_unmatched && project.is_none() {
+                if !call
+                    .auth
+                    .spaces()
+                    .values()
+                    .any(|grant| !grant.read_classes.is_empty())
+                    || call
+                        .auth
+                        .spaces()
+                        .values()
+                        .any(|grant| grant.project_root.is_some())
+                {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+                if call.auth.is_space_narrowed() {
+                    let personal = call
+                        .registry
+                        .control
+                        .whoami(call.account())
+                        .await?
+                        .personal_space;
+                    let admitted_personal = personal.as_ref().is_some_and(|ps| {
+                        call.auth.spaces().get(ps).is_some_and(|grant| {
+                            !grant.read_classes.is_empty() && grant.project_root.is_none()
+                        })
+                    });
+                    if !admitted_personal {
+                        return Err(DomainError::ResourceNotFound.into());
+                    }
+                }
+            }
             if let Some(project) = &project {
                 project_for_folder(call, project).await?;
             }
@@ -549,20 +610,15 @@ async fn start(call: &mut ToolCallContext<'_>, args: StartArgs) -> Result<Value,
                             selected_project_for_episode(call, None, preflight_episode.as_ref())
                                 .await?,
                         ),
-                        EpisodeSelector::Name(name) => match call
-                            .registry
-                            .control
-                            .named_episode_project_hint(call.account(), name.clone())
-                            .await?
-                        {
-                            NamedEpisodePreview::NoMatch => Some(None),
-                            NamedEpisodePreview::Unique(hint) => {
+                        EpisodeSelector::Name(_) => match named_preview.as_ref() {
+                            Some(NamedEpisodePreview::NoMatch) => Some(None),
+                            Some(NamedEpisodePreview::Unique(hint)) => {
                                 Some(selected_project_for_hint(call, None, hint.as_ref()).await?)
                             }
-                            NamedEpisodePreview::ProjectUnavailable => {
+                            Some(NamedEpisodePreview::ProjectUnavailable) => {
                                 return Err(DomainError::ResourceNotFound.into());
                             }
-                            NamedEpisodePreview::Ambiguous => None,
+                            Some(NamedEpisodePreview::Ambiguous) | None => None,
                         },
                         EpisodeSelector::New { .. } => Some(None),
                     }
@@ -588,9 +644,12 @@ async fn start(call: &mut ToolCallContext<'_>, args: StartArgs) -> Result<Value,
                 project,
             });
         }
+    } else if let Some(receipt) = args.delivery_receipt.as_deref() {
+        delta::validate_delivery(call, receipt).await?;
     }
-    let mut committed_any = false;
-    if let Some(receipt) = args.delivery_receipt.as_deref() {
+    if existing_plan.is_none()
+        && let Some(receipt) = args.delivery_receipt.as_deref()
+    {
         let acknowledged = delta::deliver(call, receipt, args.acknowledge).await?;
         committed_any |= acknowledged;
         if !new_selection {
@@ -607,63 +666,7 @@ async fn start(call: &mut ToolCallContext<'_>, args: StartArgs) -> Result<Value,
     };
     let selector = validated_selector.expect("selector validated when starting session");
     let plan: StartPlan = match existing_plan {
-        Some(plan) => {
-            if let Some(project) = &plan.project {
-                project_for_folder(call, project)
-                    .await
-                    .map_err(map_session_err)?;
-            }
-            if let Some(role_selector) = args.role.as_deref() {
-                let preview_project = if plan.project.is_some() {
-                    Some(plan.project.clone())
-                } else {
-                    match &selector {
-                        EpisodeSelector::Id(id) | EpisodeSelector::Resume(id) => {
-                            let episode = call
-                                .registry
-                                .control
-                                .get_episode(call.account(), id.clone())
-                                .await
-                                .map_err(map_session_err)?;
-                            Some(
-                                selected_project_for_episode(call, None, Some(&episode))
-                                    .await
-                                    .map_err(map_session_err)?,
-                            )
-                        }
-                        EpisodeSelector::Name(name) => match call
-                            .registry
-                            .control
-                            .named_episode_project_hint(call.account(), name.clone())
-                            .await
-                            .map_err(map_session_err)?
-                        {
-                            NamedEpisodePreview::NoMatch => Some(None),
-                            NamedEpisodePreview::Unique(project) => Some(
-                                selected_project_for_hint(call, None, project.as_ref())
-                                    .await
-                                    .map_err(map_session_err)?,
-                            ),
-                            NamedEpisodePreview::ProjectUnavailable => {
-                                return Err(map_session_err(DomainError::ResourceNotFound.into()));
-                            }
-                            NamedEpisodePreview::Ambiguous => None,
-                        },
-                        EpisodeSelector::New { .. } => Some(None),
-                    }
-                };
-                if let Some(preview_project) = preview_project {
-                    ability_tools::validate_session_role(
-                        call,
-                        role_selector,
-                        preview_project.as_ref(),
-                    )
-                    .await
-                    .map_err(map_session_err)?;
-                }
-            }
-            plan
-        }
+        Some(plan) => plan,
         None => {
             let prepared = preflight_plan.expect("preflight_plan built when not yet journaled");
             call.journal("start-episode", || async move { Ok(prepared) })

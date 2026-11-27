@@ -35,7 +35,8 @@ schedule, and lookup index authority in migration `0002`: adding bearer
 binding columns (`approved_skills`, `keeper_log_id`,
 `keeper_project_folder_id`), recreating `schedule_due`, `schedule_deleted`,
 and `schedule_run_retention` as partial indexes aligned to their scan orders,
-and adding `schedule_expired_run`, `episode_owner_name_open`,
+and adding `schedule_owner_live`, `schedule_owner_project_live`,
+`schedule_expired_run`, `episode_owner_name_open`,
 `attachment_target_approved_id`, `call_run`, `ability_trail_destination`,
 `ability_preference_placement`, `favorite_note_order`, and
 `context_order_lookup`. Existing bearers default to no

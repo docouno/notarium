@@ -46,6 +46,8 @@ macro_rules! db {
     }}
 }
 mod abilities;
+#[cfg(feature = "test-support")]
+pub use abilities::LIST_PACKAGES_SLUG_SQLITE;
 pub(crate) use abilities::{
     ability_manifest_tx, authorize_change_tx as authorize_ability_change_tx, resource_digest_tx,
 };
@@ -483,12 +485,21 @@ impl ControlCatalogPort for CanonicalStore {
                         None
                     };
                     let mut items = Vec::with_capacity(rows.len());
+                    let mut ancestry_cache = crate::domain::common::FolderAncestryCache::default();
                     for (id, _) in rows {
                         let reference = FolderRef {
                             space_id: rec.space.id.clone(),
                             folder_id: FolderId::parse(&id)?,
                         };
-                        match folder_metadata(tx, ctx.auth(), &rec, reference).await {
+                        match folder_metadata_cached(
+                            tx,
+                            ctx.auth(),
+                            &rec,
+                            reference,
+                            &mut ancestry_cache,
+                        )
+                        .await
+                        {
                             Ok((folder, row)) => items.push(project_info(folder, row)?),
                             Err(PortError::Domain(DomainError::ResourceNotFound)) => (),
                             Err(error) => return Err(error),

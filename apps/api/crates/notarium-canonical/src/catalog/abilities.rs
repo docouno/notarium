@@ -5,18 +5,44 @@ const READ_REVISION: &str =
     "SELECT metadata_msgpack, visibility_seq
     FROM revisions
     WHERE space_id=$1 AND rev_id=$2 AND history_incarnation=$3 AND entity_type='ability' AND entity_key=$4";
-const LIST_PACKAGES_SQLITE: &str = "SELECT ability_id, created_seq
+const LIST_PACKAGES_ALL_SQLITE: &str = "SELECT ability_id, created_seq, entrypoint_note_id, manifest_rev_id, lifecycle_state, slug_fold
     FROM ability_packages
-    WHERE space_id=$1 AND ability_id>$2 AND lifecycle_state='active'
-    AND ($3='' OR kind=$3)
-    AND ($4='' OR slug_fold=$4)
+    WHERE space_id=$1 AND lifecycle_state='active' AND ability_id>$2
+    ORDER BY ability_id
+    LIMIT $3";
+const LIST_PACKAGES_ALL_PG: &str = "SELECT ability_id, created_seq, entrypoint_note_id, manifest_rev_id, lifecycle_state, slug_fold
+    FROM ability_packages
+    WHERE space_id=$1 AND lifecycle_state='active' AND ability_id COLLATE \"C\" > $2
+    ORDER BY ability_id COLLATE \"C\"
+    LIMIT $3";
+const LIST_PACKAGES_KIND_SQLITE: &str = "SELECT ability_id, created_seq, entrypoint_note_id, manifest_rev_id, lifecycle_state, slug_fold
+    FROM ability_packages
+    WHERE space_id=$1 AND lifecycle_state='active' AND kind=$2 AND ability_id>$3
+    ORDER BY ability_id
+    LIMIT $4";
+const LIST_PACKAGES_KIND_PG: &str = "SELECT ability_id, created_seq, entrypoint_note_id, manifest_rev_id, lifecycle_state, slug_fold
+    FROM ability_packages
+    WHERE space_id=$1 AND lifecycle_state='active' AND kind=$2 AND ability_id COLLATE \"C\" > $3
+    ORDER BY ability_id COLLATE \"C\"
+    LIMIT $4";
+pub const LIST_PACKAGES_SLUG_SQLITE: &str = "SELECT ability_id, created_seq, entrypoint_note_id, manifest_rev_id, lifecycle_state, slug_fold
+    FROM ability_packages
+    WHERE space_id=$1 AND lifecycle_state='active' AND slug_fold=$2 AND ability_id>$3
+    ORDER BY ability_id
+    LIMIT $4";
+const LIST_PACKAGES_SLUG_PG: &str = "SELECT ability_id, created_seq, entrypoint_note_id, manifest_rev_id, lifecycle_state, slug_fold
+    FROM ability_packages
+    WHERE space_id=$1 AND lifecycle_state='active' AND slug_fold=$2 AND ability_id COLLATE \"C\" > $3
+    ORDER BY ability_id COLLATE \"C\"
+    LIMIT $4";
+const LIST_PACKAGES_SLUG_KIND_SQLITE: &str = "SELECT ability_id, created_seq, entrypoint_note_id, manifest_rev_id, lifecycle_state, slug_fold
+    FROM ability_packages
+    WHERE space_id=$1 AND lifecycle_state='active' AND slug_fold=$2 AND kind=$3 AND ability_id>$4
     ORDER BY ability_id
     LIMIT $5";
-const LIST_PACKAGES_PG: &str = "SELECT ability_id, created_seq
+const LIST_PACKAGES_SLUG_KIND_PG: &str = "SELECT ability_id, created_seq, entrypoint_note_id, manifest_rev_id, lifecycle_state, slug_fold
     FROM ability_packages
-    WHERE space_id=$1 AND ability_id COLLATE \"C\" > $2 AND lifecycle_state='active'
-    AND ($3='' OR kind=$3)
-    AND ($4='' OR slug_fold=$4)
+    WHERE space_id=$1 AND lifecycle_state='active' AND slug_fold=$2 AND kind=$3 AND ability_id COLLATE \"C\" > $4
     ORDER BY ability_id COLLATE \"C\"
     LIMIT $5";
 
@@ -63,7 +89,7 @@ async fn resolve(
     exact: Option<&RevisionId>,
     live_ancestry: &mut crate::domain::common::FolderAncestryCache,
 ) -> Result<ResolvedAbility, PortError> {
-    let (entry, tip, state, current_name): (String, String, String, String) = db!(
+    let package: (String, String, String, String) = db!(
         read tx,
         sqlx::query_as(READ_PACKAGE),
         fetch_optional,
@@ -71,6 +97,34 @@ async fn resolve(
         id.as_str()
     )?
     .ok_or(DomainError::ResourceNotFound)?;
+    let mut historical_ancestry = std::collections::BTreeMap::new();
+    resolve_with_package(
+        tx,
+        auth,
+        space,
+        id,
+        package,
+        exact,
+        live_ancestry,
+        &mut historical_ancestry,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn resolve_with_package(
+    tx: &mut BackendConn<'_>,
+    auth: &EngineAuthContext,
+    space: &SpaceRecord,
+    id: &AbilityId,
+    (entry, tip, state, current_name): (String, String, String, String),
+    exact: Option<&RevisionId>,
+    live_ancestry: &mut crate::domain::common::FolderAncestryCache,
+    historical_ancestry: &mut std::collections::BTreeMap<
+        SpaceSeq,
+        crate::domain::common::FolderAncestryCache,
+    >,
+) -> Result<ResolvedAbility, PortError> {
     if state != "active" {
         return Err(DomainError::ResourceNotFound.into());
     }
@@ -132,17 +186,19 @@ async fn resolve(
         {
             return Err(DomainError::ResourceNotFound.into());
         }
-        let (facts, ancestry) =
+        let cut_cache = historical_ancestry.entry(cutoff).or_insert_with(|| {
             crate::domain::common::FolderAncestryCache::at_cut(&space.scope, cutoff)
-                .build_resource_facts_tx(
-                    tx,
-                    &space.space,
-                    &snapshot.parent_folder_id,
-                    snapshot.doc_class,
-                    Some(id.clone()),
-                    true,
-                )
-                .await?;
+        });
+        let (facts, ancestry) = cut_cache
+            .build_resource_facts_tx(
+                tx,
+                &space.space,
+                &snapshot.parent_folder_id,
+                snapshot.doc_class,
+                Some(id.clone()),
+                true,
+            )
+            .await?;
         auth.can_view_resource(&facts)?;
         let placement = proven_placement(space, ancestry.project);
         if matches!(&placement, AbilityPlacement::OwnedPersonal(owner) if owner != auth.principal())
@@ -232,6 +288,38 @@ async fn descriptor_with_cache(
     exact: Option<&RevisionId>,
     live_ancestry: &mut crate::domain::common::FolderAncestryCache,
 ) -> Result<AbilityDescriptor, PortError> {
+    let resolved = resolve(tx, auth, space, id, exact, live_ancestry).await?;
+    Ok(descriptor_from_resolved(resolved))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn descriptor_from_package_row(
+    tx: &mut BackendConn<'_>,
+    auth: &EngineAuthContext,
+    space: &SpaceRecord,
+    id: &AbilityId,
+    package: (String, String, String, String),
+    live_ancestry: &mut crate::domain::common::FolderAncestryCache,
+    historical_ancestry: &mut std::collections::BTreeMap<
+        SpaceSeq,
+        crate::domain::common::FolderAncestryCache,
+    >,
+) -> Result<AbilityDescriptor, PortError> {
+    let resolved = resolve_with_package(
+        tx,
+        auth,
+        space,
+        id,
+        package,
+        None,
+        live_ancestry,
+        historical_ancestry,
+    )
+    .await?;
+    Ok(descriptor_from_resolved(resolved))
+}
+
+fn descriptor_from_resolved(resolved: ResolvedAbility) -> AbilityDescriptor {
     let ResolvedAbility {
         reference,
         entrypoint,
@@ -240,8 +328,8 @@ async fn descriptor_with_cache(
         entrypoint_matches_manifest,
         promoted_from,
         ..
-    } = resolve(tx, auth, space, id, exact, live_ancestry).await?;
-    Ok(AbilityDescriptor {
+    } = resolved;
+    AbilityDescriptor {
         reference,
         kind: meta.kind,
         name,
@@ -258,7 +346,7 @@ async fn descriptor_with_cache(
         attached_skills: meta.attached_skills,
         promoted_from,
         requires_explicit_binding: meta.requires_explicit_binding,
-    })
+    }
 }
 
 pub(crate) async fn authorize_change_tx(
@@ -563,6 +651,190 @@ pub(super) async fn pin_schedule(
     }))
 }
 
+async fn compute_abilities_page_scope(
+    tx: &mut BackendConn<'_>,
+    auth: &EngineAuthContext,
+    query: &AbilityQuery,
+    live: &[SpaceRecord],
+    space_caches: &mut [crate::domain::common::FolderAncestryCache],
+    space_grants: &[Option<FolderId>],
+) -> Result<String, PortError> {
+    let readonly = auth.readonly_abilities();
+    let mut versions = Vec::with_capacity(live.len());
+    for ((space, cache), project_root) in live
+        .iter()
+        .zip(space_caches.iter_mut())
+        .zip(space_grants.iter())
+    {
+        let version_digest = if matches!(auth.kind(), notarium_core::auth::PrincipalKind::Keeper(_))
+            || !readonly.is_empty()
+        {
+            let mut fingerprints = Vec::new();
+            for ability_id in readonly {
+                match descriptor_with_cache(tx, auth, space, ability_id, None, cache).await {
+                    Ok(value) => fingerprints.push((
+                        value.reference.id,
+                        value.reference.placement,
+                        value.reference.revision,
+                        value.name,
+                        value.healthy,
+                        value.entrypoint,
+                    )),
+                    Err(PortError::Domain(DomainError::ResourceNotFound)) => (),
+                    Err(e) => return Err(e),
+                }
+            }
+            digest(("readonly-abilities-v1", fingerprints))?
+        } else if let Some(root) = project_root {
+            let root_ancestry = match cache
+                .load_ancestry_tx(tx, &space.space.id, root, true)
+                .await
+            {
+                Ok(anc) => Some((anc.folder_path, anc.ancestors)),
+                Err(PortError::Domain(DomainError::ResourceNotFound)) => None,
+                Err(e) => return Err(e),
+            };
+            let subtree_version: (i64, i64, i64, i64) = if root_ancestry.is_some() {
+                db!(
+                    read tx,
+                    sqlx::query_as(include_str!("project_ability_subtree_version.sql")),
+                    fetch_one,
+                    space.space.id.as_str(),
+                    root.as_str()
+                )?
+            } else {
+                (0, 0, 0, 0)
+            };
+            digest(("project-abilities-v1", root_ancestry, subtree_version))?
+        } else {
+            let catalog_version: (i64, i64, i64, i64) = db!(
+                read tx,
+                sqlx::query_as(
+                    "SELECT \
+                        (SELECT COALESCE(MAX(updated_seq), 0) FROM ability_packages WHERE space_id = $1), \
+                        (SELECT COUNT(*) FROM ability_packages WHERE space_id = $1), \
+                        (SELECT COALESCE(MAX(nh.updated_seq), 0) \
+                         FROM ability_packages ap \
+                         JOIN note_heads nh ON nh.space_id = ap.space_id AND nh.note_id = ap.entrypoint_note_id \
+                         WHERE ap.space_id = $1), \
+                        CASE WHEN EXISTS (SELECT 1 FROM ability_packages WHERE space_id = $1) \
+                             THEN (SELECT COALESCE(MAX(updated_seq), 0) FROM folder_heads WHERE space_id = $1) \
+                             ELSE 0 END"
+                ),
+                fetch_one,
+                space.space.id.as_str()
+            )?;
+            digest(("space-abilities-v1", catalog_version))?
+        };
+        versions.push((space.scope.clone(), version_digest, project_root.clone()));
+    }
+    digest((
+        "visible-abilities-v3",
+        auth.principal(),
+        auth.grant(),
+        auth.readonly_abilities(),
+        versions,
+        &query.project,
+        query.kind,
+        &query.name,
+        query.authoring,
+    ))
+}
+
+type AbilityPackagePageRow = (String, i64, String, String, String, String);
+
+#[inline(never)]
+async fn fetch_ability_package_batch(
+    tx: &mut BackendConn<'_>,
+    space_id: &SpaceId,
+    slug: Option<&str>,
+    kind: Option<notarium_core::classes::AbilityKind>,
+    scan_after_id: &str,
+    batch_size: i64,
+) -> Result<Vec<AbilityPackagePageRow>, PortError> {
+    let map_err = |err| crate::runtime::pg_read_error("list_ability_packages", err);
+    match (slug, kind) {
+        (Some(slug), Some(kind)) => {
+            let kind_str = crate::codec::ability_kind_to_db(kind);
+            match tx {
+                BackendConn::Sqlite(conn) => sqlx::query_as(LIST_PACKAGES_SLUG_KIND_SQLITE)
+                    .bind(space_id.as_str())
+                    .bind(slug)
+                    .bind(kind_str)
+                    .bind(scan_after_id)
+                    .bind(batch_size)
+                    .fetch_all(&mut **conn)
+                    .await
+                    .map_err(map_err),
+                BackendConn::Postgres(conn) => sqlx::query_as(LIST_PACKAGES_SLUG_KIND_PG)
+                    .bind(space_id.as_str())
+                    .bind(slug)
+                    .bind(kind_str)
+                    .bind(scan_after_id)
+                    .bind(batch_size)
+                    .fetch_all(&mut **conn)
+                    .await
+                    .map_err(map_err),
+            }
+        }
+        (Some(slug), None) => match tx {
+            BackendConn::Sqlite(conn) => sqlx::query_as(LIST_PACKAGES_SLUG_SQLITE)
+                .bind(space_id.as_str())
+                .bind(slug)
+                .bind(scan_after_id)
+                .bind(batch_size)
+                .fetch_all(&mut **conn)
+                .await
+                .map_err(map_err),
+            BackendConn::Postgres(conn) => sqlx::query_as(LIST_PACKAGES_SLUG_PG)
+                .bind(space_id.as_str())
+                .bind(slug)
+                .bind(scan_after_id)
+                .bind(batch_size)
+                .fetch_all(&mut **conn)
+                .await
+                .map_err(map_err),
+        },
+        (None, Some(kind)) => {
+            let kind_str = crate::codec::ability_kind_to_db(kind);
+            match tx {
+                BackendConn::Sqlite(conn) => sqlx::query_as(LIST_PACKAGES_KIND_SQLITE)
+                    .bind(space_id.as_str())
+                    .bind(kind_str)
+                    .bind(scan_after_id)
+                    .bind(batch_size)
+                    .fetch_all(&mut **conn)
+                    .await
+                    .map_err(map_err),
+                BackendConn::Postgres(conn) => sqlx::query_as(LIST_PACKAGES_KIND_PG)
+                    .bind(space_id.as_str())
+                    .bind(kind_str)
+                    .bind(scan_after_id)
+                    .bind(batch_size)
+                    .fetch_all(&mut **conn)
+                    .await
+                    .map_err(map_err),
+            }
+        }
+        (None, None) => match tx {
+            BackendConn::Sqlite(conn) => sqlx::query_as(LIST_PACKAGES_ALL_SQLITE)
+                .bind(space_id.as_str())
+                .bind(scan_after_id)
+                .bind(batch_size)
+                .fetch_all(&mut **conn)
+                .await
+                .map_err(map_err),
+            BackendConn::Postgres(conn) => sqlx::query_as(LIST_PACKAGES_ALL_PG)
+                .bind(space_id.as_str())
+                .bind(scan_after_id)
+                .bind(batch_size)
+                .fetch_all(&mut **conn)
+                .await
+                .map_err(map_err),
+        },
+    }
+}
+
 pub(super) async fn page(
     store: &CanonicalStore,
     ctx: AccountContext,
@@ -573,8 +845,8 @@ pub(super) async fn page(
         .with_read_tx_budget(Some(&budget), move |tx| {
             Box::pin(async move {
                 let mut live = Vec::new();
-                let mut versions = Vec::new();
                 let mut space_caches: Vec<crate::domain::common::FolderAncestryCache> = Vec::new();
+                let mut space_grants: Vec<Option<FolderId>> = Vec::new();
                 let readonly = ctx.auth().readonly_abilities();
                 for (id, grant) in ctx.auth().spaces() {
                     if !grant.read_classes.contains(&DocClass::Skill) {
@@ -585,100 +857,39 @@ pub(super) async fn page(
                         Ok(_) | Err(PortError::Domain(DomainError::ResourceNotFound)) => continue,
                         Err(e) => return Err(e),
                     };
-                    let mut cache = crate::domain::common::FolderAncestryCache::default();
-                    let version_digest = if matches!(
-                        ctx.auth().kind(),
-                        notarium_core::auth::PrincipalKind::Keeper(_)
-                    ) || !readonly.is_empty()
-                    {
-                        let mut fingerprints = Vec::new();
-                        for ability_id in readonly {
-                            match descriptor_with_cache(
-                                tx,
-                                ctx.auth(),
-                                &space,
-                                ability_id,
-                                None,
-                                &mut cache,
-                            )
-                            .await
-                            {
-                                Ok(value) => fingerprints.push((
-                                    value.reference.id,
-                                    value.reference.placement,
-                                    value.reference.revision,
-                                    value.name,
-                                    value.healthy,
-                                    value.entrypoint,
-                                )),
-                                Err(PortError::Domain(DomainError::ResourceNotFound)) => (),
-                                Err(e) => return Err(e),
-                            }
-                        }
-                        digest(("readonly-abilities-v1", fingerprints))?
-                    } else if let Some(root) = &grant.project_root {
-                        let root_ancestry = match cache
-                            .load_ancestry_tx(tx, &space.space.id, root, true)
-                            .await
-                        {
-                            Ok(anc) => Some((anc.folder_path, anc.ancestors)),
-                            Err(PortError::Domain(DomainError::ResourceNotFound)) => None,
-                            Err(e) => return Err(e),
-                        };
-                        let subtree_version: (i64, i64, i64, i64) = if root_ancestry.is_some() {
-                            db!(
-                                read tx,
-                                sqlx::query_as(include_str!("project_ability_subtree_version.sql")),
-                                fetch_one,
-                                space.space.id.as_str(),
-                                root.as_str()
-                            )?
-                        } else {
-                            (0, 0, 0, 0)
-                        };
-                        digest(("project-abilities-v1", root_ancestry, subtree_version))?
-                    } else {
-                        let catalog_version: (i64, i64, i64, i64) = db!(
-                            read tx,
-                            sqlx::query_as(
-                                "SELECT \
-                                    (SELECT COALESCE(MAX(updated_seq), 0) FROM ability_packages WHERE space_id = $1), \
-                                    (SELECT COUNT(*) FROM ability_packages WHERE space_id = $1), \
-                                    (SELECT COALESCE(MAX(nh.updated_seq), 0) \
-                                     FROM ability_packages ap \
-                                     JOIN note_heads nh ON nh.space_id = ap.space_id AND nh.note_id = ap.entrypoint_note_id \
-                                     WHERE ap.space_id = $1), \
-                                    CASE WHEN EXISTS (SELECT 1 FROM ability_packages WHERE space_id = $1) \
-                                         THEN (SELECT COALESCE(MAX(updated_seq), 0) FROM folder_heads WHERE space_id = $1) \
-                                         ELSE 0 END"
-                            ),
-                            fetch_one,
-                            space.space.id.as_str()
-                        )?;
-                        digest(("space-abilities-v1", catalog_version))?
-                    };
-                    versions.push((
-                        space.scope.clone(),
-                        version_digest,
-                        grant.project_root.clone(),
-                    ));
                     live.push(space);
-                    space_caches.push(cache);
+                    space_caches.push(crate::domain::common::FolderAncestryCache::default());
+                    space_grants.push(grant.project_root.clone());
                 }
-                let scope = digest((
-                    "visible-abilities-v3",
-                    ctx.auth().principal(),
-                    ctx.auth().grant(),
-                    ctx.auth().readonly_abilities(),
-                    versions,
-                    &query.project,
-                    query.kind,
-                    &query.name,
-                    query.authoring,
-                ))?;
-                let after: Option<(SpaceId, i64)> = continuation(&query.page, &scope)?;
+                let mut cached_scope: Option<String> = None;
+                let after: Option<(SpaceId, i64)> = if query.page.continuation().is_some() {
+                    let scope = Box::pin(compute_abilities_page_scope(
+                        tx,
+                        ctx.auth(),
+                        &query,
+                        &live,
+                        &mut space_caches,
+                        &space_grants,
+                    ))
+                    .await?;
+                    let after = continuation(&query.page, &scope)?;
+                    cached_scope = Some(scope);
+                    after
+                } else {
+                    None
+                };
+                const MAX_ABILITY_SCAN: usize = 4096;
                 let cap = usize::from(query.page.limit());
                 let mut visible_items: Vec<(usize, i64, AbilityDescriptor)> = Vec::new();
+                let mut scanned = 0usize;
+                let mut historical_caches: Vec<
+                    std::collections::BTreeMap<
+                        SpaceSeq,
+                        crate::domain::common::FolderAncestryCache,
+                    >,
+                > = (0..live.len())
+                    .map(|_| std::collections::BTreeMap::new())
+                    .collect();
                 'spaces: for (index, rec) in live.iter().enumerate() {
                     let mut scan_after_id = match &after {
                         Some((sid, _)) if sid > &rec.space.id => continue,
@@ -688,51 +899,39 @@ pub(super) async fn page(
                         _ => String::new(),
                     };
                     loop {
-                        let batch_size = ((cap + 1 - visible_items.len()) * 2).clamp(32, 256) as i64;
-                        let ids: Vec<(String, i64)> = match tx {
-                            BackendConn::Sqlite(conn) => sqlx::query_as(LIST_PACKAGES_SQLITE)
-                                .bind(rec.space.id.as_str())
-                                .bind(&scan_after_id)
-                                .bind(query.kind.map_or("", crate::codec::ability_kind_to_db))
-                                .bind(query.name.as_deref().unwrap_or(""))
-                                .bind(batch_size)
-                                .fetch_all(&mut **conn)
-                                .await
-                                .map_err(|err| {
-                                    crate::runtime::pg_read_error("list_ability_packages", err)
-                                })?,
-                            BackendConn::Postgres(conn) => sqlx::query_as(LIST_PACKAGES_PG)
-                                .bind(rec.space.id.as_str())
-                                .bind(&scan_after_id)
-                                .bind(query.kind.map_or("", crate::codec::ability_kind_to_db))
-                                .bind(query.name.as_deref().unwrap_or(""))
-                                .bind(batch_size)
-                                .fetch_all(&mut **conn)
-                                .await
-                                .map_err(|err| {
-                                    crate::runtime::pg_read_error("list_ability_packages", err)
-                                })?,
-                        };
-                        if ids.is_empty() {
+                        let batch_size =
+                            ((cap + 1 - visible_items.len()) * 2).clamp(32, 256) as i64;
+                        let rows = Box::pin(fetch_ability_package_batch(
+                            tx,
+                            &rec.space.id,
+                            query.name.as_deref(),
+                            query.kind,
+                            &scan_after_id,
+                            batch_size,
+                        ))
+                        .await?;
+                        if rows.is_empty() {
                             break;
                         }
-                        let exhausted = (ids.len() as i64) < batch_size;
-                        if let Some((last_id, _)) = ids.last() {
+                        let exhausted = (rows.len() as i64) < batch_size;
+                        if let Some((last_id, _, _, _, _, _)) = rows.last() {
                             scan_after_id = last_id.clone();
                         }
-                        for (id_str, seq) in ids {
+                        for (id_str, seq, entry, tip, state, current_name) in rows {
+                            scanned = scanned.saturating_add(1);
                             let id = AbilityId::parse(&id_str)?;
                             if !readonly.is_empty() && !readonly.contains(&id) {
                                 continue;
                             }
-                            match descriptor_with_cache(
+                            match Box::pin(descriptor_from_package_row(
                                 tx,
                                 ctx.auth(),
                                 rec,
                                 &id,
-                                None,
+                                (entry, tip, state, current_name),
                                 &mut space_caches[index],
-                            )
+                                &mut historical_caches[index],
+                            ))
                             .await
                             {
                                 Ok(value) => {
@@ -761,10 +960,34 @@ pub(super) async fn page(
                         if exhausted {
                             break;
                         }
+                        if scanned >= MAX_ABILITY_SCAN {
+                            return Err(
+                                DomainError::validation(ValidationReason::BudgetExceeded).into()
+                            );
+                        }
+                    }
+                    if scanned >= MAX_ABILITY_SCAN {
+                        return Err(
+                            DomainError::validation(ValidationReason::BudgetExceeded).into()
+                        );
                     }
                 }
                 let next = if visible_items.len() > cap {
                     visible_items.pop();
+                    let scope = match cached_scope {
+                        Some(scope) => scope,
+                        None => {
+                            Box::pin(compute_abilities_page_scope(
+                                tx,
+                                ctx.auth(),
+                                &query,
+                                &live,
+                                &mut space_caches,
+                                &space_grants,
+                            ))
+                            .await?
+                        }
+                    };
                     let (index, seq, _) = visible_items.last().expect("nonempty page");
                     Some(encode_cursor(scope, (&live[*index].space.id, seq))?)
                 } else {

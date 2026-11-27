@@ -179,6 +179,9 @@ pub(in crate::mcp) async fn plan_links(
             corpus::admit_provider_note_read(provider, &provider_scope, &provider_note)
                 .await
                 .map_err(collapse)?;
+            corpus::record_note_origin_by_id(provider, &provider_scope, &source)
+                .await
+                .map_err(collapse)?;
             let scope = call.space(provider_scope.scope().clone())?;
             let source_note = corpus::note_in_space(call, &scope, &source).await?;
             scope

@@ -400,7 +400,14 @@ async fn acknowledge_page(call: &ToolCallContext<'_>, ticket: &Ticket) -> Result
                 },
             },
         )
-        .await?;
+        .await
+        .map_err(|error| {
+            super::super::note_tools::batch_operational_error(
+                "notarium.mcp.delta-ack.v1",
+                error,
+                false,
+            )
+        })?;
     Ok(())
 }
 

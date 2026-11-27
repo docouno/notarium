@@ -182,7 +182,14 @@ pub(in crate::mcp::note_tools) async fn prepare(
             let (draft, destination) = plan?;
             // Approval governs these exact create bytes. A title reference
             // stays authored until the target is known to exist.
-            let carrier = prepare_carrier(owner, Some(provider), &place.read_scope, &draft).await?;
+            let carrier = prepare_carrier(
+                owner,
+                Some(provider),
+                &place.read_scope,
+                Some(&place.project.reference.folder_id),
+                &draft,
+            )
+            .await?;
             Ok::<_, PortError>(ProposedDraft {
                 note: draft.note,
                 destination,

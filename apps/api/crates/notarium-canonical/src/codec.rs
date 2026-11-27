@@ -432,6 +432,10 @@ pub struct NoteRevisionMetadata {
     pub raw_fields: Option<BTreeMap<String, YamlValue>>,
     pub evaluated_fields: BTreeMap<String, FieldObservation<FieldValue>>,
     pub diagnostics: Vec<Diagnostic>,
+    /// Preserves the restored pre-run note `updated_at` on rollback restoration
+    /// revisions while keeping wall-clock `revisions.created_at_{sec,nsec}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logical_updated_at: Option<Timestamp>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

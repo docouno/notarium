@@ -301,12 +301,11 @@ impl AgentRunSupervisor {
                     )
                     .await?
                 {
-                    FinishChatRunOutcome::Cleared => {
-                        self.inner
-                            .revocations
-                            .finish_thread_pending(&run.scope, &run.thread);
-                        return Ok(());
-                    }
+                    // Queue is empty and every consumed/dismissed entry already retired
+                    // its own pending credential; do not clear newer submissions on the
+                    // same thread that may have raced in on another supervisor after
+                    // `active_run_id` cleared.
+                    FinishChatRunOutcome::Cleared => return Ok(()),
                     FinishChatRunOutcome::Changed => return Ok(()),
                     FinishChatRunOutcome::Pending => (),
                 }

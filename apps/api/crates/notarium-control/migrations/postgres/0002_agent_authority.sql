@@ -23,6 +23,10 @@ CREATE INDEX schedule_due ON v1_control.agent_schedules(next_slot_utc_ms,schedul
 DROP INDEX v1_control.schedule_deleted;
 CREATE INDEX schedule_deleted ON v1_control.agent_schedules(deleted_at,schedule_id)
     WHERE deleted_at IS NOT NULL;
+CREATE INDEX schedule_owner_live ON v1_control.agent_schedules(owner_id,space_id,schedule_id)
+    WHERE deleted_at IS NULL;
+CREATE INDEX schedule_owner_project_live ON v1_control.agent_schedules(owner_id,space_id,project_folder_id,schedule_id)
+    WHERE deleted_at IS NULL;
 DROP INDEX v1_control.schedule_run_retention;
 CREATE INDEX schedule_run_retention ON v1_control.agent_schedule_runs(finished_at,run_id)
     WHERE status IN ('succeeded','failed','unknown') AND finished_at IS NOT NULL;

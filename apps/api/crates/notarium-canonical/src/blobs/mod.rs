@@ -5,7 +5,7 @@ pub mod s3;
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     io::{Cursor, Read},
-    sync::Arc,
+    sync::{Arc, atomic::Ordering},
     time::Duration,
 };
 
@@ -662,11 +662,14 @@ impl crate::CanonicalStore {
             return;
         }
         let store = self.clone();
-        let handle = self.inner.backup_executor.spawn(async move {
-            store.cleanup_unretained_local_files_async(to_cleanup).await;
-        });
         if let Ok(mut tasks) = self.inner.backup_cleanups.lock() {
+            if self.inner.backup_cleanups_closed.load(Ordering::SeqCst) {
+                return;
+            }
             tasks.retain(|t| !t.is_finished());
+            let handle = self.inner.backup_executor.spawn(async move {
+                store.cleanup_unretained_local_files_async(to_cleanup).await;
+            });
             tasks.push(handle);
         }
     }
@@ -1204,6 +1207,7 @@ impl crate::CanonicalStore {
                         item.digest,
                         item.raw_size,
                         frame,
+                        Arc::clone(&guard),
                     );
                     let pub_id = match existing_pubs.get(&item.digest) {
                         Some(id) => id.clone(),
@@ -1321,7 +1325,9 @@ impl crate::CanonicalStore {
                             digest,
                             item_dirs,
                             temp_file,
+                            _guard: Some(Arc::clone(&guard)),
                         },
+                        Arc::clone(&guard),
                     )
                 } else {
                     DeferredLocalStaging::new(
@@ -1330,6 +1336,7 @@ impl crate::CanonicalStore {
                         digest,
                         raw_size,
                         frame,
+                        Arc::clone(&guard),
                     )
                 };
 
@@ -1419,7 +1426,9 @@ impl crate::CanonicalStore {
                             digest,
                             item_dirs,
                             temp_file,
+                            _guard: Some(Arc::clone(&guard)),
                         },
+                        Arc::clone(&guard),
                     )
                 } else {
                     DeferredLocalStaging::new(
@@ -1428,6 +1437,7 @@ impl crate::CanonicalStore {
                         digest,
                         raw_size,
                         frame,
+                        Arc::clone(&guard),
                     )
                 };
 

@@ -49,7 +49,7 @@ pub(super) fn episode_project_admitted(
     personal_space: Option<&str>,
     project: Option<&FolderRef>,
     episode_name: Option<&str>,
-    allow_shared_unnamed_chat: bool,
+    shared_chat_episode: Option<&EpisodeId>,
 ) -> bool {
     if matches!(auth.kind(), PrincipalKind::Keeper(_)) {
         return false;
@@ -85,7 +85,8 @@ pub(super) fn episode_project_admitted(
             {
                 return true;
             }
-            allow_shared_unnamed_chat
+            shared_chat_episode.is_some()
+                && auth.chat_episode() == shared_chat_episode
                 && episode_name.is_none()
                 && matches!(auth.kind(), PrincipalKind::AgentRun(_))
                 && auth.chat_audience() == Some(ChatAudience::Shared)
@@ -98,7 +99,7 @@ pub(super) fn episode_visible_to_narrowed(
     personal_space: Option<&str>,
     project: Option<&FolderRef>,
     episode_name: Option<&str>,
-    allow_shared_unnamed_chat: bool,
+    shared_chat_episode: Option<&EpisodeId>,
 ) -> bool {
     if matches!(auth.kind(), PrincipalKind::Keeper(_))
         || !auth
@@ -119,7 +120,7 @@ pub(super) fn episode_visible_to_narrowed(
             personal_space,
             project,
             episode_name,
-            allow_shared_unnamed_chat,
+            shared_chat_episode,
         )
     } else {
         true
@@ -224,7 +225,7 @@ impl ControlService {
             owner.personal_space_id.as_deref(),
             stored_project_ref(&row)?.as_ref(),
             row.name.as_deref(),
-            allow_shared_unnamed_chat,
+            allow_shared_unnamed_chat.then_some(id),
         ) {
             return Err(DomainError::ResourceNotFound.into());
         }
@@ -386,7 +387,7 @@ impl ControlService {
                         owner.personal_space_id.as_deref(),
                         stored_project_ref(&row)?.as_ref(),
                         row.name.as_deref(),
-                        false,
+                        None,
                     ) {
                         return Err(DomainError::ResourceNotFound.into());
                     }
@@ -517,7 +518,7 @@ impl ControlService {
                                 owner.personal_space_id.as_deref(),
                                 project.as_ref(),
                                 row.name.as_deref(),
-                                false,
+                                None,
                             ) {
                                 continue;
                             }
@@ -557,7 +558,7 @@ impl ControlService {
                     owner.personal_space_id.as_deref(),
                     stored_project_ref(&old)?.as_ref(),
                     old.name.as_deref(),
-                    false,
+                    None,
                 ) {
                     return Err(DomainError::ResourceNotFound.into());
                 }
@@ -591,7 +592,7 @@ impl ControlService {
                     owner.personal_space_id.as_deref(),
                     request.input.project_hint.as_ref(),
                     chosen_name.as_deref(),
-                    false,
+                    None,
                 ) {
                     return Err(DomainError::ResourceNotFound.into());
                 }
@@ -688,7 +689,7 @@ impl ControlService {
                                 owner.personal_space_id.as_deref(),
                                 project.as_ref(),
                                 row.name.as_deref(),
-                                false,
+                                None,
                             ) {
                                 continue;
                             }
@@ -905,7 +906,7 @@ impl ControlService {
                     owner.personal_space_id.as_deref(),
                     replayed_project.as_ref(),
                     replayed.name.as_deref(),
-                    false,
+                    None,
                 ) {
                     return Err(DomainError::ResourceNotFound.into());
                 }
@@ -923,7 +924,7 @@ impl ControlService {
                 owner.personal_space_id.as_deref(),
                 old_project.as_ref(),
                 old.name.as_deref(),
-                false,
+                None,
             ) {
                 return Err(DomainError::ResourceNotFound.into());
             }
@@ -953,7 +954,7 @@ impl ControlService {
                 owner.personal_space_id.as_deref(),
                 effective_project.as_ref(),
                 next_name_preview,
-                false,
+                None,
             ) {
                 return Err(DomainError::ResourceNotFound.into());
             }
@@ -1044,7 +1045,7 @@ impl ControlService {
                         owner.personal_space_id.as_deref(),
                         stored_project_ref(&row)?.as_ref(),
                         row.name.as_deref(),
-                        false,
+                        None,
                     ) {
                         return Err(DomainError::ResourceNotFound.into());
                     }

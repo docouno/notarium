@@ -11,7 +11,7 @@ use notarium_core::{
     DomainError,
     classes::DocClass,
     error::{PortError, ValidationReason},
-    ids::{ContentDigest, NoteId, RevisionId, SpaceId},
+    ids::{ContentDigest, FolderId, NoteId, RevisionId, SpaceId},
     model::{HistoryScope, Lifecycle},
     ports::{
         Committed, GetNote, Link, LinkBatch, LinkTarget, Mutation, NoteMetadataSnapshot,
@@ -261,6 +261,8 @@ async fn resolve(
     call: &ToolCallContext<'_>,
     provider: Option<&ToolCallContext<'_>>,
     scope: &SpaceContext,
+    source_class: DocClass,
+    source_project: Option<&FolderId>,
     to: Option<&str>,
     to_title: Option<&str>,
 ) -> Result<Target, PortError> {
@@ -294,17 +296,25 @@ async fn resolve(
             }
             let current =
                 metadata_snapshot(call, scope, &note, None, ReceiptSet::default(), false).await?;
-            corpus::note_metadata_origin(check, &check_scope, &current.metadata)
-                .await
-                .map_err(collapse)?;
-            let alias = current
-                .provenance
-                .as_ref()
-                .filter(|data| valid_title(&data.title))
-                .map(|data| TargetAlias {
-                    title: data.title.trim().to_owned(),
-                    revision: current.metadata.revision().clone(),
-                });
+            let (origin, project) =
+                corpus::note_metadata_origin(check, &check_scope, &current.metadata)
+                    .await
+                    .map_err(collapse)?;
+            check.record_origin(origin, project).map_err(collapse)?;
+            let allow_alias = target_note.facts.class == source_class
+                && target_note.facts.project.as_ref() == source_project;
+            let alias = if allow_alias {
+                current
+                    .provenance
+                    .as_ref()
+                    .filter(|data| valid_title(&data.title))
+                    .map(|data| TargetAlias {
+                        title: data.title.trim().to_owned(),
+                        revision: current.metadata.revision().clone(),
+                    })
+            } else {
+                None
+            };
             Ok(Target::Stable { note, alias })
         }
         _ => Err(invalid(ValidationReason::InvalidQuery)),
@@ -315,12 +325,22 @@ pub(in super::super) async fn resolve_target(
     call: &ToolCallContext<'_>,
     provider: Option<&ToolCallContext<'_>>,
     scope: &SpaceContext,
+    source_class: DocClass,
+    source_project: Option<&FolderId>,
     to: Option<&str>,
     to_title: Option<&str>,
 ) -> Result<(LinkTarget, Option<String>), PortError> {
-    Ok(resolve(call, provider, scope, to, to_title)
-        .await?
-        .link_parts())
+    Ok(resolve(
+        call,
+        provider,
+        scope,
+        source_class,
+        source_project,
+        to,
+        to_title,
+    )
+    .await?
+    .link_parts())
 }
 
 pub(super) fn validate_single_link(source: &NoteId, edge: &LinkArgs) -> Result<(), PortError> {
@@ -369,6 +389,8 @@ async fn plan_link_located(
         call,
         provider,
         &scope,
+        note.facts.class,
+        note.facts.project.as_ref(),
         edge.to.as_deref(),
         edge.to_title.as_deref(),
     )
@@ -537,8 +559,12 @@ async fn authorize(
                 current.metadata.listing(scope.auth())?;
                 corpus::admit_note_metadata_write(call, scope, &current.metadata).await?;
             } else {
-                corpus::note_metadata_origin(call, scope, &current.metadata).await?;
+                let (origin, project) =
+                    corpus::note_metadata_origin(call, scope, &current.metadata).await?;
+                call.record_origin(origin, project)?;
             }
+        } else if !target_trashed {
+            corpus::record_note_origin_by_id(call, scope, note).await?;
         }
     }
     Ok(source_class)

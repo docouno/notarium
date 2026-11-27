@@ -331,6 +331,7 @@ impl CanonicalStore {
                                 raw_fields,
                                 evaluated_fields: spec.fields.clone(),
                                 diagnostics,
+                                logical_updated_at: None,
                             },
                         ))
                         .encode()?;

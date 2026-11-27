@@ -95,6 +95,9 @@ async fn admit_proposal_targets(
             corpus::admit_provider_note_read(call, &scope, &note)
                 .await
                 .map_err(collapse)?;
+            corpus::record_note_origin_by_id(call, &scope, &note_id)
+                .await
+                .map_err(collapse)?;
             let owner_scope = planning.space(scope.scope().clone())?;
             let owner_note =
                 corpus::note_in_space_preflight(planning, &owner_scope, &note_id).await?;
@@ -132,6 +135,14 @@ async fn admit_proposal_targets(
             )
             .await
             .map_err(collapse)?;
+            corpus::record_folder_origin(
+                call,
+                &scope,
+                &project.folder,
+                Some(project.folder.clone()),
+            )
+            .await
+            .map_err(collapse)?;
             let owner_scope = planning.space(scope.scope().clone())?;
             let owner_write_scope = owner_scope.clone().restrict_to_project(&project.folder)?;
             let facts = notarium_core::auth::ResourceFacts {
@@ -154,6 +165,9 @@ async fn admit_proposal_targets(
                 .await
                 .map_err(collapse)?;
             corpus::admit_provider_note_read(call, &scope, &note)
+                .await
+                .map_err(collapse)?;
+            corpus::record_note_origin_by_id(call, &scope, &note_id)
                 .await
                 .map_err(collapse)?;
             let owner_scope = planning.space(scope.scope().clone())?;
@@ -194,6 +208,14 @@ async fn admit_proposal_targets(
             corpus::admit_folder_boundary(call, &scope, &folder_ref, None, &[], required_class)
                 .await
                 .map_err(collapse)?;
+            corpus::record_folder_origin(call, &scope, &folder_ref, None)
+                .await
+                .map_err(collapse)?;
+            if parsed.has_version_token() && snapshot.revision.is_some() {
+                corpus::record_note_origin_by_id(call, &scope, &snapshot.resolved.note.note_id)
+                    .await
+                    .map_err(collapse)?;
+            }
             Ok(true)
         }
         ToolName::RememberAboutProject => {
@@ -209,6 +231,9 @@ async fn admit_proposal_targets(
                 super::memory::admit_project_boundary(call, folder, parsed.has_version_token())
                     .await
                     .map_err(collapse)?;
+            corpus::record_folder_origin(call, &scope, folder, Some(folder.clone()))
+                .await
+                .map_err(collapse)?;
             let owner_scope = planning.space(scope.scope().clone())?;
             let info = call
                 .registry
@@ -251,15 +276,16 @@ pub(super) async fn prepare(
     // under detached human authority. If an existing consented foreign target
     // fails write admission (`SpaceReadOnly` / `AbilityWriteForbidden`), commit
     // external-read taint so existence/lock/role probes cannot stay untainted.
-    let _probes_foreign_corpus = match admit_proposal_targets(call, &planning, &args).await {
-        Ok(probes) => probes,
-        Err(error) => {
-            if !matches!(error, PortError::Domain(DomainError::ResourceNotFound)) {
-                call.commit_external_read();
+    let _probes_foreign_corpus =
+        match Box::pin(admit_proposal_targets(call, &planning, &args)).await {
+            Ok(probes) => probes,
+            Err(error) => {
+                if !matches!(error, PortError::Domain(DomainError::ResourceNotFound)) {
+                    call.commit_external_read();
+                }
+                return Err(error);
             }
-            return Err(error);
-        }
-    };
+        };
     // Every post-admission proposal planner inspects foreign-Space canonical
     // state under detached human authority (including link-free `create_note` /
     // `create_notes`, which probe ID collisions and folder write locks). Commit
@@ -267,19 +293,19 @@ pub(super) async fn prepare(
     // cannot leak foreign corpus or lock state while leaving the caller untainted.
     call.commit_external_read();
     let action = match call.tool {
-        ToolName::Link | ToolName::LinkMany => {
-            ProposedAction::Links(organize::plan_links(&planning, call, call.tool, args).await?)
-        }
+        ToolName::Link | ToolName::LinkMany => ProposedAction::Links(
+            Box::pin(organize::plan_links(&planning, call, call.tool, args)).await?,
+        ),
         ToolName::RememberAboutUser | ToolName::RememberAboutProject => {
-            ProposedAction::Memory(plan_memory(&planning, call.tool, args).await?)
+            ProposedAction::Memory(Box::pin(plan_memory(&planning, call, call.tool, args)).await?)
         }
         _ => ProposedAction::Notes(
-            note_tools::plan_proposal(&planning, call, call.tool, args).await?,
+            Box::pin(note_tools::plan_proposal(&planning, call, call.tool, args)).await?,
         ),
     };
     let id = proposal_id(&binding.thread, call_id, &action)?;
     let preview = if let ProposedAction::Notes(notes) = &action {
-        note_tools::preview_proposal(call, notes).await?
+        Box::pin(note_tools::preview_proposal(call, notes)).await?
     } else {
         None
     };
@@ -756,6 +782,7 @@ fn proposal_id(
 
 async fn plan_memory(
     owner: &ToolCallContext<'_>,
+    provider: &ToolCallContext<'_>,
     tool: ToolName,
     args: Value,
 ) -> Result<PreparedMemory, PortError> {
@@ -765,6 +792,19 @@ async fn plan_memory(
     let current = input
         .inspect(owner.registry.control.as_ref(), owner.account())
         .await?;
+    if input.version_token.is_some() && current.revision.is_some() {
+        let collapse = |error: PortError| {
+            if corpus::hidden(&error) {
+                DomainError::ResourceNotFound.into()
+            } else {
+                error
+            }
+        };
+        let provider_scope = provider.space(current.scope.clone()).map_err(collapse)?;
+        corpus::record_note_origin_by_id(provider, &provider_scope, &current.resolved.note.note_id)
+            .await
+            .map_err(collapse)?;
+    }
     if let Some(expected) = &input.version_token
         && current.revision.as_ref() != Some(expected)
     {

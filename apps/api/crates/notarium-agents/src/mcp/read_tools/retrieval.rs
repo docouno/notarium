@@ -232,7 +232,13 @@ pub(super) async fn retrieve(
                 if effective_classes.is_empty() {
                     continue;
                 }
-                scope = match scope.restrict_read_classes(&effective_classes) {
+                // Narrow the space auth to the completion provider's live consented
+                // classes (`allowed`), NOT `effective_classes` (the requested result
+                // filter), so `query_disclosure` sees all consented query-source
+                // classes while `SearchQuery.classes` and `Recipient::admit` still
+                // restrict all search/recall candidates and graph hops strictly to
+                // `effective_classes`.
+                scope = match scope.restrict_read_classes(&allowed) {
                     Ok(narrowed) => narrowed,
                     Err(_) => continue,
                 };
@@ -371,8 +377,7 @@ pub(super) async fn retrieve(
                 }
                 continue;
             }
-            let origin_count = call.provenance.origins.len();
-            let project_count = call.provenance.projects.len();
+            let provenance_checkpoint = call.provenance_checkpoint();
             let selection = match corpus::note_metadata_selection(call, &scope, metadata).await {
                 Ok(selection) => selection,
                 Err(error) if corpus::hidden(&error) => continue,
@@ -430,8 +435,7 @@ pub(super) async fn retrieve(
             }
             if recall {
                 if parts.is_empty() {
-                    call.provenance.origins.truncate(origin_count);
-                    call.provenance.projects.truncate(project_count);
+                    call.rollback_provenance(provenance_checkpoint);
                     continue 'candidates;
                 }
                 combined.push_str(&heading);

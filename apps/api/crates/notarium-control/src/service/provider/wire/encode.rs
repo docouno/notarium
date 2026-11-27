@@ -219,11 +219,22 @@ fn schema(
         ProviderToolSchema::Boolean => json!({"type":"boolean"}),
         ProviderToolSchema::ConstBool(expected) => json!({"type":"boolean", "const":expected}),
         ProviderToolSchema::Null => json!({"type":"null"}),
-        ProviderToolSchema::Array { items, maximum } => {
-            if *maximum > 4096 {
+        ProviderToolSchema::Array {
+            items,
+            minimum,
+            maximum,
+        } => {
+            if *maximum > 4096 || minimum.is_some_and(|min| min > *maximum) {
                 return Err(limited());
             }
-            json!({"type":"array", "items":schema(items, depth + 1, nodes, bytes)?, "maxItems":maximum})
+            let mut obj = serde_json::Map::new();
+            obj.insert("type".into(), json!("array"));
+            obj.insert("items".into(), schema(items, depth + 1, nodes, bytes)?);
+            if let Some(min) = minimum {
+                obj.insert("minItems".into(), json!(min));
+            }
+            obj.insert("maxItems".into(), json!(maximum));
+            Value::Object(obj)
         }
         ProviderToolSchema::Object {
             properties,

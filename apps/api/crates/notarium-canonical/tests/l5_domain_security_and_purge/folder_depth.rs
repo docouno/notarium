@@ -479,6 +479,31 @@ async fn wide_subtree_probes_children_by_parent_before_analyze() {
                     ])
                     .unwrap();
             }
+            // Seed 200 ability packages in a sibling project subtree of the SAME Space
+            // so ANALYZE sees skewed cardinality (3 in `source` vs 200 in `folder(1)`).
+            for i in 1..=200i64 {
+                nstmt
+                    .execute(rusqlite::params![
+                        scope.space_id.as_str(),
+                        format!("nt_sib_ab_{i:04}"),
+                        folder(1).as_str(),
+                        format!("sib-ab-note-{i:04}"),
+                        format!("rev_sib_ab_{i:04}"),
+                        digest_bytes.as_slice(),
+                        2000 + i,
+                    ])
+                    .unwrap();
+                apstmt
+                    .execute(rusqlite::params![
+                        scope.space_id.as_str(),
+                        format!("ab_sib_pkg_{i:04}"),
+                        format!("sib-pkg-{i:04}"),
+                        format!("nt_sib_ab_{i:04}"),
+                        format!("rev_sib_ab_{i:04}"),
+                        2000 + i,
+                    ])
+                    .unwrap();
+            }
             for s in 1..=20i64 {
                 let other_space = format!("sp_other_{s:02}");
                 for i in 1..=10i64 {
@@ -608,8 +633,9 @@ async fn wide_subtree_probes_children_by_parent_before_analyze() {
                 .unwrap()
                 .join("\n");
             assert!(
-                ab_details.contains("SEARCH ap USING") && ab_details.contains("SEARCH nh USING"),
-                "{phase} project ability subtree version must drive from ability_packages into note_heads PK:\n{ab_details}"
+                ab_details.contains("SEARCH nh USING INDEX idx_note_heads_parent_lifecycle")
+                    && ab_details.contains("SEARCH ap USING INDEX idx_ability_packages_entrypoint"),
+                "{phase} project ability subtree version must drive from subtree into note_heads (idx_note_heads_parent_lifecycle) and ability_packages (idx_ability_packages_entrypoint):\n{ab_details}"
             );
             assert!(
                 !ab_details.contains("SCAN note_heads")
@@ -620,6 +646,59 @@ async fn wide_subtree_probes_children_by_parent_before_analyze() {
                     && !ab_details.contains("SCAN ap")
                     && !ab_details.contains("TEMP B-TREE"),
                 "{phase} project ability subtree version must avoid table scans and temp B-trees:\n{ab_details}"
+            );
+
+            let mut rb_coll_plan = conn
+                .prepare(&format!(
+                    "EXPLAIN QUERY PLAN {}",
+                    notarium_canonical::ROLLBACK_ACTIVE_COLLISION_CHECK_SQLITE_SQL
+                ))
+                .unwrap();
+            let rb_coll_details = rb_coll_plan
+                .query_map(
+                    rusqlite::params![
+                        scope.space_id.as_str(),
+                        format!(r#"[["{}","ab-note-0001"]]"#, source.as_str()),
+                    ],
+                    |r| r.get::<_, String>(3),
+                )
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+                .join("\n");
+            assert!(
+                rb_coll_details.contains("SEARCH nh USING INDEX uq_note_heads_active_sibling"),
+                "{phase} rollback active collision probe must seek uq_note_heads_active_sibling:\n{rb_coll_details}"
+            );
+            assert!(
+                !rb_coll_details.contains("SCAN nh")
+                    && !rb_coll_details.contains("SCAN note_heads"),
+                "{phase} rollback active collision probe must not scan note_heads:\n{rb_coll_details}"
+            );
+
+            let mut slug_ab_plan = conn
+                .prepare(&format!(
+                    "EXPLAIN QUERY PLAN {}",
+                    notarium_canonical::LIST_PACKAGES_SLUG_SQLITE
+                ))
+                .unwrap();
+            let slug_ab_details = slug_ab_plan
+                .query_map(
+                    rusqlite::params![scope.space_id.as_str(), "pkg-01", "", 16i64],
+                    |r| r.get::<_, String>(3),
+                )
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+                .join("\n");
+            assert!(
+                slug_ab_details.contains("idx_ability_packages_active_slug")
+                    && !slug_ab_details.contains("USE TEMP B-TREE"),
+                "{phase} slug-filtered ability catalog query must use idx_ability_packages_active_slug without temp sort:\n{slug_ab_details}"
+            );
+            assert!(
+                !slug_ab_details.contains("SCAN ability_packages"),
+                "{phase} slug-filtered ability catalog query must not scan ability_packages:\n{slug_ab_details}"
             );
         }
     }
