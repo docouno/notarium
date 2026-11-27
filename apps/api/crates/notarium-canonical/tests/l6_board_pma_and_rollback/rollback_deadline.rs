@@ -189,6 +189,11 @@ async fn rollback_room_plan_replans_on_concurrent_open_and_clean_close_both_back
         open_raced: AtomicBool,
         clean_close_target: NoteId,
         clean_close_raced: AtomicBool,
+        swap_close_target: NoteId,
+        swap_open_target: NoteId,
+        swap_open_rev: RevisionId,
+        swap_raced: AtomicBool,
+        always_race_target: NoteId,
         reserve_calls: AtomicUsize,
     }
 
@@ -207,6 +212,55 @@ async fn rollback_room_plan_replans_on_concurrent_open_and_clean_close_both_back
         ) -> PortFuture<'_, RollbackReservation> {
             Box::pin(async move {
                 self.reserve_calls.fetch_add(1, Ordering::SeqCst);
+                if note == self.swap_open_target && !self.swap_raced.swap(true, Ordering::SeqCst) {
+                    // Close `swap_close_target` cleanly, then open `swap_open_target` BEFORE
+                    // reserving it so both notes end up in `plan.skipped_room_active` despite
+                    // never having been open simultaneously.
+                    let sess = self
+                        .store
+                        .read_collab_session(None, &self.scope, &self.swap_close_target)
+                        .await?
+                        .expect("open session on swap_close_target")
+                        .session;
+                    self.store
+                        .close_collab_session(
+                            &make_budget(),
+                            CloseCollabSession {
+                                unchanged_carrier_digest: None,
+                                scope: self.scope.clone(),
+                                note: self.swap_close_target.clone(),
+                                owner_id: sess.owner_id,
+                                expected_lease: sess.lease_epoch,
+                                expected_lineage: sess.lineage_epoch,
+                                final_yrs_snapshot: None,
+                                compacted_through_update_seq: None,
+                                carrier_settlement: None,
+                            },
+                        )
+                        .await?;
+                    self.fences
+                        .close_room(&self.scope, &self.swap_close_target)
+                        .await?;
+                    self.store
+                        .open_collab_session(
+                            &make_budget(),
+                            OpenCollabSession {
+                                scope: self.scope.clone(),
+                                note: self.swap_open_target.clone(),
+                                owner_id: "swap-racer".into(),
+                                expected_carrier_rev: self.swap_open_rev.clone(),
+                                expected_lease: None,
+                                expected_lineage: None,
+                                initial_yrs_snapshot: None,
+                                allow_fenced_recovery: false,
+                            },
+                        )
+                        .await?;
+                    self.fences
+                        .open_room(&self.scope, &self.swap_open_target)
+                        .await?;
+                    return Ok(RollbackReservation::SkippedRoomActive);
+                }
                 let res = self
                     .fences
                     .reserve_rollback(ctx.scope(), &note, identity)
@@ -235,6 +289,10 @@ async fn rollback_room_plan_replans_on_concurrent_open_and_clean_close_both_back
                 {
                     // Simulate a clean room open+close AFTER reservation and BEFORE writer TX:
                     // `head_rev_id` stays identical, but `room_fences.epoch` advances by 2.
+                    self.fences.open_room(&self.scope, &note).await?;
+                    self.fences.close_room(&self.scope, &note).await?;
+                } else if note == self.always_race_target {
+                    // Continuously race clean open+close so all planner retries exhaust.
                     self.fences.open_room(&self.scope, &note).await?;
                     self.fences.close_room(&self.scope, &note).await?;
                 }
@@ -327,6 +385,68 @@ async fn rollback_room_plan_replans_on_concurrent_open_and_clean_close_both_back
             .await
             .unwrap();
 
+        let note_d = sample_note_id(84);
+        let note_e = sample_note_id(85);
+        let note_f = sample_note_id(86);
+        let run3 = sample_run_id(83);
+        let agent3 = agent_run_ctx(&ctx, run3.clone());
+        let created_d = store
+            .create_note(
+                agent3.clone(),
+                next_mutation(
+                    &scope,
+                    &owner,
+                    CreateNote {
+                        folder_page: false,
+                        note: note_d.clone(),
+                        parent: None,
+                        slug: "race-d".into(),
+                        class: DocClass::UserDoc,
+                        carrier: "# D\n".into(),
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        let created_e = store
+            .create_note(
+                agent3,
+                next_mutation(
+                    &scope,
+                    &owner,
+                    CreateNote {
+                        folder_page: false,
+                        note: note_e.clone(),
+                        parent: None,
+                        slug: "race-e".into(),
+                        class: DocClass::UserDoc,
+                        carrier: "# E\n".into(),
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        let run4 = sample_run_id(84);
+        let agent4 = agent_run_ctx(&ctx, run4.clone());
+        store
+            .create_note(
+                agent4,
+                next_mutation(
+                    &scope,
+                    &owner,
+                    CreateNote {
+                        folder_page: false,
+                        note: note_f.clone(),
+                        parent: None,
+                        slug: "race-f".into(),
+                        class: DocClass::UserDoc,
+                        carrier: "# F\n".into(),
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+
         let rooms = Arc::new(RacingRoomInterceptor {
             store: store.clone(),
             scope: scope.clone(),
@@ -336,6 +456,11 @@ async fn rollback_room_plan_replans_on_concurrent_open_and_clean_close_both_back
             open_raced: AtomicBool::new(false),
             clean_close_target: note_c.clone(),
             clean_close_raced: AtomicBool::new(false),
+            swap_close_target: note_d.clone(),
+            swap_open_target: note_e.clone(),
+            swap_open_rev: created_e.value.revision.clone(),
+            swap_raced: AtomicBool::new(false),
+            always_race_target: note_f.clone(),
             reserve_calls: AtomicUsize::new(0),
         });
         store.register_collab_interceptor(rooms.clone()).unwrap();
@@ -382,7 +507,7 @@ async fn rollback_room_plan_replans_on_concurrent_open_and_clean_close_both_back
         // Case 2: Concurrent clean room open+close on note_c -> must replan and trash note_c (no SourceMismatch).
         let before_calls = rooms.reserve_calls.load(Ordering::SeqCst);
         let rb2 = store
-            .rollback_agent_run_by_id(ctx, next_mutation(&scope, &owner, run2))
+            .rollback_agent_run_by_id(ctx.clone(), next_mutation(&scope, &owner, run2))
             .await
             .expect(
                 "concurrent clean open+close must replan and succeed, not fail with SourceMismatch",
@@ -394,6 +519,54 @@ async fn rollback_room_plan_replans_on_concurrent_open_and_clean_close_both_back
         assert!(
             rooms.reserve_calls.load(Ordering::SeqCst) >= before_calls + 2,
             "clean open+close race must replan and reserve a second time"
+        );
+
+        // Case 3: note_d is open during discovery, closes cleanly before note_e is reserved,
+        // and note_e opens -> writer TX must detect stale skipped_room_active for note_d,
+        // replan, trash note_d, and skip only note_e.
+        store
+            .open_collab_session(
+                &make_budget(),
+                OpenCollabSession {
+                    scope: scope.clone(),
+                    note: note_d.clone(),
+                    owner_id: "swap-initial".into(),
+                    expected_carrier_rev: created_d.value.revision.clone(),
+                    expected_lease: None,
+                    expected_lineage: None,
+                    initial_yrs_snapshot: None,
+                    allow_fenced_recovery: false,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .room_fences()
+            .open_room(&scope, &note_d)
+            .await
+            .unwrap();
+        let rb3 = store
+            .rollback_agent_run_by_id(ctx.clone(), next_mutation(&scope, &owner, run3))
+            .await
+            .expect("stale skipped_room_active must trigger replan instead of skipping both notes");
+        assert!(rooms.swap_raced.load(Ordering::SeqCst));
+        assert_eq!(rb3.value.skipped_room_active, vec![note_e.clone()]);
+        assert_eq!(rb3.value.trashed.len(), 1);
+        assert_eq!(rb3.value.trashed[0].note, note_d);
+
+        // Case 4: Exhausting all planner retries returns retryable Unavailable (never raw CursorStale).
+        let exhausted = store
+            .rollback_agent_run_by_id(ctx, next_mutation(&scope, &owner, run4))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                exhausted,
+                PortError::Unavailable(ref f)
+                    if f.effect() == CommitEffect::NotCommitted
+                        && matches!(f.retry(), RetryAdvice::After(_))
+            ),
+            "planner retry exhaustion must return retryable Unavailable, got: {exhausted:?}"
         );
 
         runtime.shutdown().await.unwrap();

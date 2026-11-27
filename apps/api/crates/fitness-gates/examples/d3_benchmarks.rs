@@ -1132,8 +1132,6 @@ struct PreparedRollbackTemplate {
     scope: HistoryScope,
     owner: PrincipalId,
     run_id: AgentRunId,
-    expected_run_rev: RevisionId,
-    expected_entities: Vec<NoteRevision>,
     rooms: Vec<RollbackRoomExpectation>,
 }
 
@@ -1182,8 +1180,6 @@ async fn seed_rollback_microfixture(store: &CanonicalStore) -> PreparedRollbackT
     let human_ctx = owner_ctx(&space.scope, owner.clone());
     let foreign_ctx = owner_ctx(&space.scope, other_human.clone());
     let run_ctx = agent_run_ctx(&human_ctx, run_id.clone());
-
-    let mut expected_entities = Vec::new();
 
     // 18 pre-existing notes
     let mut edited_notes = Vec::with_capacity(18);
@@ -1295,22 +1291,17 @@ async fn seed_rollback_microfixture(store: &CanonicalStore) -> PreparedRollbackT
                 )
                 .await
                 .unwrap();
-            expected_entities.push(NoteRevision {
-                note: nid.clone(),
-                revision: man_ed.value.revision,
-            });
         } else {
             let edited = NoteRevision {
                 note: nid.clone(),
                 revision: latest_rev.unwrap(),
             };
-            expected_entities.push(edited.clone());
             room_inputs.push((edited, original.revision.clone(), original_digest));
         }
     }
 
     // Agent run trashes `deleted_nid` (`slug = "colliding-target"`) first...
-    let trashed = store
+    let _trashed = store
         .delete_note(
             run_ctx.clone(),
             next_mutation(
@@ -1324,10 +1315,6 @@ async fn seed_rollback_microfixture(store: &CanonicalStore) -> PreparedRollbackT
         )
         .await
         .unwrap();
-    expected_entities.push(NoteRevision {
-        note: deleted_nid,
-        revision: trashed.value.revision,
-    });
 
     // ...and then creates 2 new 4 KiB notes, with `c == 0` occupying `slug = "colliding-target"`
     // so rollback must trash run-created notes before restoring `deleted_nid` at its original slug.
@@ -1343,7 +1330,7 @@ async fn seed_rollback_microfixture(store: &CanonicalStore) -> PreparedRollbackT
         } else {
             format!("run-created-{c}")
         };
-        let cr = store
+        let _cr = store
             .create_note(
                 run_ctx.clone(),
                 next_mutation(
@@ -1361,22 +1348,7 @@ async fn seed_rollback_microfixture(store: &CanonicalStore) -> PreparedRollbackT
             )
             .await
             .unwrap();
-        expected_entities.push(NoteRevision {
-            note: nid,
-            revision: cr.value.revision,
-        });
     }
-
-    // Build the rollback precondition with the fixture's call budget before timing the command.
-    let expected_run_rev = store
-        .inspect_agent_run_revision_with_budget_for_test(
-            &space.scope.space_id,
-            &run_id,
-            Some(&run_ctx.budget),
-        )
-        .await
-        .unwrap()
-        .expect("agent run revision");
 
     let mut rooms = Vec::with_capacity(room_inputs.len());
     let budget = make_budget();
@@ -1437,8 +1409,6 @@ async fn seed_rollback_microfixture(store: &CanonicalStore) -> PreparedRollbackT
         scope: space.scope,
         owner,
         run_id,
-        expected_run_rev,
-        expected_entities,
         rooms,
     }
 }

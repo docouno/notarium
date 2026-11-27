@@ -2145,7 +2145,7 @@ async fn check_self_trashed_agent_memory_rollback_reopens_slot(
     // End-to-end verification: MEMORY_UNDONE_SLOT_SQL must reopen the slot for a fresh append_memory.
     let human_account = AccountContext::new(human.auth().clone(), make_budget());
     let reopened = store
-        .inspect_memory_target(human_account, target, "decisions".into())
+        .inspect_memory_target(human_account, target.clone(), "decisions".into())
         .await
         .unwrap();
     assert!(
@@ -2154,7 +2154,7 @@ async fn check_self_trashed_agent_memory_rollback_reopens_slot(
     );
     let recreated = store
         .append_memory(
-            human,
+            human.clone(),
             next_mutation(
                 scope,
                 owner,
@@ -2169,6 +2169,118 @@ async fn check_self_trashed_agent_memory_rollback_reopens_slot(
         .await
         .expect("reopened self-trashed AgentMemory slot must accept fresh append_memory");
     assert_eq!(recreated.value.outcome, MemoryAppendOutcome::Created);
+
+    // Case 2: Agent creates an AgentMemory note in `project`, moves it into a child folder,
+    // and trashes it within the same run. Rollback must restore the tombstone's parent/slug
+    // back to `project` so `inspect_memory_target` and `append_memory` can reopen the slot.
+    let child_folder = sample_folder_id(237);
+    store
+        .create_folder(notarium_canonical::CreateFolderSpec {
+            scope: scope.clone(),
+            active_epoch: LeaseEpoch::new(1).unwrap(),
+            folder_id: child_folder.clone(),
+            parent: Some(match &target {
+                MemoryTarget::Project { folder } => folder.folder_id.clone(),
+                MemoryTarget::User { .. } => unreachable!(),
+            }),
+            slug: "mem-slot-child".into(),
+            display_name: "Memory Slot Child".into(),
+            is_project: false,
+            project_slug: None,
+            actor: owner.clone(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+
+    let moved_run = sample_run_id(49);
+    let moved_agent = agent_run_ctx(&human, moved_run.clone());
+    let moved_agent_account = AccountContext::new(moved_agent.auth().clone(), make_budget());
+    let moved_snap = store
+        .inspect_memory_target(moved_agent_account, target.clone(), "architecture".into())
+        .await
+        .unwrap();
+    let moved_note = moved_snap.resolved.note.note_id.clone();
+
+    store
+        .append_memory(
+            moved_agent.clone(),
+            next_mutation(
+                scope,
+                owner,
+                AppendMemory {
+                    target: moved_snap.resolved,
+                    text: "Moved temporary note".into(),
+                    summary: Some("Moved".into()),
+                    mode: MemoryWriteMode::CreateIfMissing,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    store
+        .move_note(
+            moved_agent.clone(),
+            next_mutation(
+                scope,
+                owner,
+                notarium_core::ports::MoveNote {
+                    note: moved_note.clone(),
+                    parent: Some(child_folder),
+                    slug: "relocated-memory".into(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    store
+        .delete_note(
+            moved_agent,
+            next_mutation(
+                scope,
+                owner,
+                DeleteNote {
+                    note: moved_note.clone(),
+                    disposition: DeleteDisposition::Trash,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+
+    let moved_rolled = store
+        .rollback_agent_run_by_id(human.clone(), next_mutation(scope, owner, moved_run))
+        .await
+        .unwrap();
+    assert_eq!(moved_rolled.value.trashed.len(), 1);
+    assert_eq!(moved_rolled.value.trashed[0].note, moved_note);
+
+    let reopened_moved = store
+        .inspect_memory_target(
+            AccountContext::new(human.auth().clone(), make_budget()),
+            target.clone(),
+            "architecture".into(),
+        )
+        .await
+        .expect("moved + self-trashed AgentMemory slot must reopen at its project root");
+    assert!(reopened_moved.revision.is_none());
+    let recreated_moved = store
+        .append_memory(
+            human,
+            next_mutation(
+                scope,
+                owner,
+                AppendMemory {
+                    target: reopened_moved.resolved,
+                    text: "Recreated at project root".into(),
+                    summary: Some("Recreated".into()),
+                    mode: MemoryWriteMode::CreateIfMissing,
+                },
+            ),
+        )
+        .await
+        .expect("reopened moved AgentMemory slot must accept fresh append_memory");
+    assert_eq!(recreated_moved.value.outcome, MemoryAppendOutcome::Created);
 }
 
 async fn check_zero_note_run_rollback_isolation(
@@ -2254,6 +2366,36 @@ async fn check_zero_note_run_rollback_isolation(
     )
     .unwrap();
 
+    // Multi-space write PAT whose grant in THIS space has `write_classes = {}` (with writable
+    // classes in a second space so `bearer_scope == Some(BearerScope::Write)`) must fail with
+    // SpaceReadOnly rather than committing or replaying a zero-note rollback.
+    let mut multi_space_grants = human.auth().spaces().clone();
+    let other_space_grant = multi_space_grants.get(&scope.space_id).unwrap().clone();
+    multi_space_grants.insert(sample_space_id(239), other_space_grant);
+    let multi_space_human = EngineAuthContext::for_human(VerifiedHuman::attest(
+        owner.clone(),
+        GrantId::from_bytes([8u8; 16]),
+        multi_space_grants,
+        true,
+    ));
+    let mut ro_pat_grants = multi_space_human.spaces().clone();
+    ro_pat_grants
+        .get_mut(&scope.space_id)
+        .unwrap()
+        .write_classes
+        .clear();
+    let no_write_classes = SpaceContext::new(
+        multi_space_human.for_pat(ro_pat_grants).unwrap(),
+        scope.clone(),
+        make_budget(),
+    )
+    .unwrap();
+
+    let root_folder_id = store
+        .read_space(&scope.space_id)
+        .await
+        .unwrap()
+        .root_folder_id;
     let cmd = next_mutation(scope, owner, folder_run);
     let before = store.read_space(&scope.space_id).await.unwrap().last_seq;
     assert!(matches!(
@@ -2268,14 +2410,40 @@ async fn check_zero_note_run_rollback_isolation(
             .await,
         Err(PortError::Domain(DomainError::ResourceNotFound))
     ));
+    assert!(matches!(
+        store
+            .rollback_agent_run_by_id(no_write_classes.clone(), cmd.clone())
+            .await,
+        Err(PortError::Domain(DomainError::SpaceReadOnly))
+    ));
     assert_eq!(
         store.read_space(&scope.space_id).await.unwrap().last_seq,
         before
     );
+    // Write-locked root folder must also block zero-note rollbacks with SpaceReadOnly.
+    store
+        .set_folder_write_lock(human.clone(), root_folder_id.clone(), true)
+        .await
+        .unwrap();
+    let before_locked = store.read_space(&scope.space_id).await.unwrap().last_seq;
+    assert!(matches!(
+        store
+            .rollback_agent_run_by_id(human.clone(), cmd.clone())
+            .await,
+        Err(PortError::Domain(DomainError::SpaceReadOnly))
+    ));
+    assert_eq!(
+        store.read_space(&scope.space_id).await.unwrap().last_seq,
+        before_locked
+    );
+    store
+        .set_folder_write_lock(human.clone(), root_folder_id.clone(), false)
+        .await
+        .unwrap();
 
-    // Space-wide owner can execute the noop rollback; downgraded callers must still be denied on replay.
+    // Space-wide owner can execute the noop rollback; downgraded callers and locked roots must be denied on replay.
     let committed = store
-        .rollback_agent_run_by_id(human, cmd.clone())
+        .rollback_agent_run_by_id(human.clone(), cmd.clone())
         .await
         .expect("space-wide owner rolls back zero-note run");
     assert!(committed.value.restored.is_empty() && committed.value.trashed.is_empty());
@@ -2286,9 +2454,34 @@ async fn check_zero_note_run_rollback_isolation(
         Err(PortError::Domain(DomainError::ResourceNotFound))
     ));
     assert!(matches!(
-        store.rollback_agent_run_by_id(pinned, cmd).await,
+        store.rollback_agent_run_by_id(pinned, cmd.clone()).await,
         Err(PortError::Domain(DomainError::ResourceNotFound))
     ));
+    assert!(matches!(
+        store
+            .rollback_agent_run_by_id(no_write_classes, cmd.clone())
+            .await,
+        Err(PortError::Domain(DomainError::SpaceReadOnly))
+    ));
+    store
+        .set_folder_write_lock(human.clone(), root_folder_id.clone(), true)
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .rollback_agent_run_by_id(human.clone(), cmd.clone())
+            .await,
+        Err(PortError::Domain(DomainError::SpaceReadOnly))
+    ));
+    store
+        .set_folder_write_lock(human.clone(), root_folder_id, false)
+        .await
+        .unwrap();
+    let replayed = store
+        .rollback_agent_run_by_id(human, cmd)
+        .await
+        .expect("unlocked owner replays zero-note rollback");
+    assert_eq!(replayed.receipt, committed.receipt);
 }
 
 async fn run_note_only_rollback_suite(

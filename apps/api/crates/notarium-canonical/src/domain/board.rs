@@ -282,54 +282,6 @@ impl CanonicalStore {
         self.with_read_tx(|tx| Box::pin(async move { load_view_overlays_tx(tx, &sid, &vw).await }))
             .await
     }
-
-    #[cfg(feature = "test-support")]
-    pub async fn inspect_agent_run_revision_for_test(
-        &self,
-        space_id: &SpaceId,
-        run: &AgentRunId,
-    ) -> Result<Option<RevisionId>, PortError> {
-        self.inspect_agent_run_revision_with_budget_for_test(space_id, run, None)
-            .await
-    }
-
-    #[cfg(feature = "test-support")]
-    pub async fn inspect_agent_run_revision_with_budget_for_test(
-        &self,
-        space_id: &SpaceId,
-        run: &AgentRunId,
-        budget: Option<&notarium_core::ports::CallBudget>,
-    ) -> Result<Option<RevisionId>, PortError> {
-        let sid = space_id.clone();
-        let rid = run.clone();
-        self.with_read_tx_budget(budget, |tx| {
-            Box::pin(async move {
-                let raw: Option<String> = match tx {
-                    BackendConn::Sqlite(conn) => sqlx::query_scalar(
-                        "SELECT run_revision FROM agent_run_heads WHERE space_id = ? AND run_id = ?",
-                    )
-                    .bind(sid.as_str())
-                    .bind(rid.as_str())
-                    .fetch_optional(&mut **conn)
-                    .await
-                    .map_err(|err| internal_not_committed("sqlite_load_run_rev", err.to_string()))?,
-                    BackendConn::Postgres(conn) => sqlx::query_scalar(
-                        "SELECT run_revision FROM agent_run_heads WHERE space_id = $1 AND run_id = $2",
-                    )
-                    .bind(sid.as_str())
-                    .bind(rid.as_str())
-                    .fetch_optional(&mut **conn)
-                    .await
-                    .map_err(|err| internal_not_committed("pg_load_run_rev", err.to_string()))?,
-                };
-                match raw {
-                    Some(s) => Ok(Some(RevisionId::parse(&s)?)),
-                    None => Ok(None),
-                }
-            })
-        })
-        .await
-    }
 }
 
 type RawViewOverlayTuple = (
@@ -487,7 +439,6 @@ pub(crate) async fn upsert_overlay_and_rank_revision_tx(
     placement_actor_id: &PrincipalId,
     placement_run_id: Option<&AgentRunId>,
     mutation_actor_id: &PrincipalId,
-    mutation_run_id: Option<&AgentRunId>,
     is_pma_normalization: bool,
     space_seq: SpaceSeq,
     visibility_seq: SpaceSeq,
@@ -582,15 +533,6 @@ pub(crate) async fn upsert_overlay_and_rank_revision_tx(
         }))
         .encode()?;
 
-    // NOTE: For pure PMA neighbor normalizations, we pass `None` as `agent_run_id` on the rank
-    // revision row (while preserving `placement_run_id` inside `view_rank_overlays` and metadata)
-    // so run-history queries never misattribute a neighbor's placement to a normalizing run.
-    let recorded_run = if is_pma_normalization {
-        None
-    } else {
-        mutation_run_id
-    };
-
     insert_revision_row(
         tx,
         scope,
@@ -604,7 +546,7 @@ pub(crate) async fn upsert_overlay_and_rank_revision_tx(
         None,
         &rank_meta,
         mutation_actor_id,
-        recorded_run,
+        None,
         now_ts,
     )
     .await
@@ -1618,7 +1560,6 @@ impl CanonicalStore {
                             &pl_actor,
                             pl_run.as_ref(),
                             auth.principal(),
-                            None,
                             *is_pma,
                             nbr_seq,
                             visibility_seq,
@@ -1675,7 +1616,6 @@ impl CanonicalStore {
                         auth.principal(),
                         None,
                         auth.principal(),
-                        None,
                         false,
                         target_rank_seq,
                         visibility_seq,

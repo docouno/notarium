@@ -132,6 +132,7 @@ pub(crate) enum CandidateAction {
         doc_class: DocClass,
         parent_folder_id: FolderId,
         content_digest: Option<ContentDigest>,
+        needs_destination_auth: bool,
     },
     RestorePreExisting {
         current_rev: RevisionId,
@@ -430,7 +431,7 @@ async fn execute_room_planned_rollback(
                         reason: ValidationReason::CursorStale,
                         ..
                     },
-            })) if attempt < MAX_PLANNER_RETRIES => continue,
+            })) => continue,
             Err(err) => return Err(err),
         }
     }
@@ -470,11 +471,14 @@ async fn discover_room_plan_tx(
     let mut expected_heads = BTreeMap::new();
 
     if touched.is_empty() {
-        auth.can_view_folder(
+        authorize_zero_note_rollback_tx(
+            tx,
+            &mut folder_cache,
             &srec.space,
             &srec.root_folder_id,
-            std::slice::from_ref(&srec.root_folder_id),
-        )?;
+            auth,
+        )
+        .await?;
     }
 
     // Authorize every touched note before inspecting ability publication state so
@@ -612,7 +616,7 @@ async fn execute_unified_rollback_tx(
                 .bind(run.as_str())
                 .fetch_optional(&mut **conn)
                 .await
-                .map_err(|err| internal_not_committed("pg_rb_combined_probe", err.to_string()))?
+                .map_err(|err| crate::runtime::pg_read_error("pg_rb_combined_probe", err))?
                 .ok_or(DomainError::ResourceNotFound)?;
             (
                 row.get("has_note_states"),
@@ -666,11 +670,14 @@ async fn execute_unified_rollback_tx(
     let mut heads_map = load_note_heads_batch_tx(tx, &scope_cl.space_id, &touched).await?;
 
     if touched.is_empty() {
-        auth.can_view_folder(
+        authorize_zero_note_rollback_tx(
+            tx,
+            &mut folder_cache,
             &item_ctx.space,
             &item_ctx.root_folder_id,
-            std::slice::from_ref(&item_ctx.root_folder_id),
-        )?;
+            &auth,
+        )
+        .await?;
     }
 
     for nid in &touched {
@@ -733,6 +740,16 @@ async fn execute_unified_rollback_tx(
         }
         if let Some(plan) = &room_plan {
             if plan.skipped_room_active.contains(&nid) {
+                let still_active = collab_states
+                    .get(&nid)
+                    .is_some_and(|status| status.is_blocked())
+                    || room_fences
+                        .observed_active_lease(&scope_cl, &nid)
+                        .await
+                        .is_some();
+                if !still_active {
+                    return Err(DomainError::validation(ValidationReason::CursorStale).into());
+                }
                 skipped_room_active.push(nid);
                 continue;
             }
@@ -769,13 +786,37 @@ async fn execute_unified_rollback_tx(
                 )?;
                 metadata.folder_page |= current_cover_parent.is_some();
                 ability::retain_binding(&mut metadata, &head)?;
+                let mut parent_folder_id = head.parent_folder_id.clone();
+                let mut needs_destination_auth = false;
+                if head.doc_class == DocClass::AgentMemory {
+                    let origin_bytes = load_note_revision_metadata_at_seq_tx(
+                        tx,
+                        &scope_cl.space_id,
+                        &nid,
+                        history.first_seq,
+                    )
+                    .await?;
+                    let origin_meta = decode_rollback_note(&origin_bytes, &nid)?;
+                    if origin_meta.parent_folder_id != head.parent_folder_id {
+                        needs_destination_auth = true;
+                        parent_folder_id = origin_meta.parent_folder_id.clone();
+                        metadata.parent_folder_id = origin_meta.parent_folder_id;
+                    }
+                    if origin_meta.slug != metadata.slug
+                        || origin_meta.slug_fold != metadata.slug_fold
+                    {
+                        metadata.slug = origin_meta.slug;
+                        metadata.slug_fold = origin_meta.slug_fold;
+                    }
+                }
                 CandidateAction::TrashCreated {
                     metadata: Box::new(metadata),
                     current_rev: head.head_rev_id,
                     current_lifecycle: head.lifecycle,
                     doc_class: head.doc_class,
-                    parent_folder_id: head.parent_folder_id,
+                    parent_folder_id,
                     content_digest: head.content_digest,
+                    needs_destination_auth,
                 }
             }
             Some((pre_rev_id, meta_bytes, pre_updated_at)) => {
@@ -867,54 +908,72 @@ async fn execute_unified_rollback_tx(
     let mut restored_ability_slots = Vec::new();
 
     for (nid, action) in &final_eligible {
-        if let CandidateAction::RestorePreExisting {
-            pre_meta,
-            needs_note_mutation,
-            head_unchanged_placement,
-            ..
-        } = action
-        {
-            let anc = authorize_rollback_destination_tx(
-                tx,
-                &mut folder_cache,
-                &item_ctx.space,
-                &auth,
+        match action {
+            CandidateAction::TrashCreated {
+                metadata,
+                needs_destination_auth: true,
+                ..
+            } => {
+                authorize_rollback_destination_tx(
+                    tx,
+                    &mut folder_cache,
+                    &item_ctx.space,
+                    &auth,
+                    metadata,
+                    false,
+                )
+                .await?;
+            }
+            CandidateAction::RestorePreExisting {
                 pre_meta,
-            )
-            .await?;
-            restored_ancestries.insert(nid.clone(), anc.is_root_child);
+                needs_note_mutation,
+                head_unchanged_placement,
+                ..
+            } => {
+                let anc = authorize_rollback_destination_tx(
+                    tx,
+                    &mut folder_cache,
+                    &item_ctx.space,
+                    &auth,
+                    pre_meta,
+                    pre_meta.lifecycle == Lifecycle::Active,
+                )
+                .await?;
+                restored_ancestries.insert(nid.clone(), anc.is_root_child);
 
-            if pre_meta.lifecycle == Lifecycle::Active {
-                if *needs_note_mutation && let Some(ability) = &pre_meta.ability_id {
-                    restored_ability_slots.push((ability, &pre_meta.slug_fold, anc.project));
-                }
-                let slot_key = (
-                    pre_meta.parent_folder_id.clone(),
-                    pre_meta.slug_fold.clone(),
-                );
-                if planned_active_slots.insert(slot_key, nid.clone()).is_some() {
-                    return Err(DomainError::PathConflict {
-                        target: PathTarget {
-                            space_id: scope_cl.space_id.clone(),
-                            parent: if anc.is_root_child {
-                                None
-                            } else {
-                                Some(pre_meta.parent_folder_id.clone())
-                            },
-                            component: pre_meta.slug.clone(),
-                        },
+                if pre_meta.lifecycle == Lifecycle::Active {
+                    if *needs_note_mutation && let Some(ability) = &pre_meta.ability_id {
+                        restored_ability_slots.push((ability, &pre_meta.slug_fold, anc.project));
                     }
-                    .into());
-                }
-                if !*head_unchanged_placement {
-                    planned_collision_checks.push((
+                    let slot_key = (
                         pre_meta.parent_folder_id.clone(),
                         pre_meta.slug_fold.clone(),
-                        pre_meta.slug.clone(),
-                        anc.is_root_child,
-                    ));
+                    );
+                    if planned_active_slots.insert(slot_key, nid.clone()).is_some() {
+                        return Err(DomainError::PathConflict {
+                            target: PathTarget {
+                                space_id: scope_cl.space_id.clone(),
+                                parent: if anc.is_root_child {
+                                    None
+                                } else {
+                                    Some(pre_meta.parent_folder_id.clone())
+                                },
+                                component: pre_meta.slug.clone(),
+                            },
+                        }
+                        .into());
+                    }
+                    if !*head_unchanged_placement {
+                        planned_collision_checks.push((
+                            pre_meta.parent_folder_id.clone(),
+                            pre_meta.slug_fold.clone(),
+                            pre_meta.slug.clone(),
+                            anc.is_root_child,
+                        ));
+                    }
                 }
             }
+            CandidateAction::TrashCreated { .. } => {}
         }
     }
 
@@ -1039,7 +1098,7 @@ async fn execute_unified_rollback_tx(
         agent_run_id: Option<AgentRunId>,
     }
     let mut pending_rev_rows: Vec<PendingSingleRev> = Vec::with_capacity(final_eligible.len() + 1);
-    let mut pending_trash_heads: Vec<(NoteId, RevisionId)> =
+    let mut pending_trash_heads: Vec<TrashedHeadUpdateItem<'_>> =
         Vec::with_capacity(trash_note_count as usize);
 
     // Trash run-created notes FIRST to vacate active slugs before restoring pre-existing notes.
@@ -1073,7 +1132,13 @@ async fn execute_unified_rollback_tx(
             .load_ancestry_tx(tx, &scope_cl.space_id, parent_folder_id, false)
             .await?;
 
-        pending_trash_heads.push((nid.clone(), trev.clone()));
+        pending_trash_heads.push(TrashedHeadUpdateItem {
+            note_id: nid,
+            rev_id: trev.clone(),
+            parent_folder_id: &metadata.parent_folder_id,
+            slug: &metadata.slug,
+            slug_fold: &metadata.slug_fold,
+        });
         if let Some(ability) = &metadata.ability_id {
             changed_packages.push((nid, ability));
         }
@@ -1258,51 +1323,70 @@ async fn execute_unified_rollback_tx(
         })
         .collect();
 
-    if let BackendConn::Postgres(conn) = &mut *tx {
-        execute_pg_rollback_domain_writes_cte(
-            conn,
-            &scope_cl,
-            &run,
-            &new_run_rev,
-            vis_i64,
-            sec,
-            nsec,
-            auth.principal().as_str(),
-            &pending_restore_heads,
-            &rev_items,
-        )
-        .await?;
-    } else {
-        update_note_heads_restored_batch_tx(
-            tx,
-            &scope_cl.space_id,
-            &pending_restore_heads,
-            vis_i64,
-            auth.principal().as_str(),
-        )
-        .await?;
+    match tx {
+        BackendConn::Postgres(conn) => {
+            execute_pg_rollback_domain_writes_cte(
+                conn,
+                &scope_cl,
+                &run,
+                &new_run_rev,
+                vis_i64,
+                sec,
+                nsec,
+                auth.principal().as_str(),
+                &pending_restore_heads,
+                &rev_items,
+            )
+            .await?;
+        }
+        BackendConn::Sqlite(conn) => {
+            update_note_heads_restored_batch_sqlite_tx(
+                conn,
+                &scope_cl.space_id,
+                &pending_restore_heads,
+                vis_i64,
+                auth.principal().as_str(),
+            )
+            .await?;
 
-        let pending_blob_rebinds: Vec<_> = rev_items
-            .iter()
-            .filter(|revision| revision.entity_type == "note")
-            .filter_map(|revision| {
-                Some(ExistingBlobRefItem {
-                    owner_kind: BlobOwnerKind::NoteRevision,
-                    owner_id: revision.entity_key.to_owned(),
-                    owner_rev_id: revision.rev_id.as_str().to_owned(),
-                    resource_key: "carrier",
-                    digest: revision.content_blake3?,
-                    created_seq: revision.space_seq,
+            let pending_blob_rebinds: Vec<_> = rev_items
+                .iter()
+                .filter(|revision| revision.entity_type == "note")
+                .filter_map(|revision| {
+                    Some(ExistingBlobRefItem {
+                        owner_kind: BlobOwnerKind::NoteRevision,
+                        owner_id: revision.entity_key.to_owned(),
+                        owner_rev_id: revision.rev_id.as_str().to_owned(),
+                        resource_key: "carrier",
+                        digest: revision.content_blake3?,
+                        created_seq: revision.space_seq,
+                    })
                 })
-            })
-            .collect();
-        bind_existing_active_blob_refs_batch_tx(tx, &scope_cl.space_id, &pending_blob_rebinds)
+                .collect();
+            let mut sqlite_tx = BackendConn::Sqlite(conn);
+            bind_existing_active_blob_refs_batch_tx(
+                &mut sqlite_tx,
+                &scope_cl.space_id,
+                &pending_blob_rebinds,
+            )
             .await?;
 
-        insert_revision_rows_batch_tx(tx, &scope_cl, &rev_items).await?;
+            insert_revision_rows_batch_tx(&mut sqlite_tx, &scope_cl, &rev_items).await?;
 
-        upsert_agent_run_head_row_only_tx(tx, &scope_cl, &run, &new_run_rev, vis_i64, sec, nsec)
+            let BackendConn::Sqlite(conn) = sqlite_tx else {
+                unreachable!();
+            };
+            upsert_agent_run_head_row_only_sqlite_tx(
+                conn,
+                &scope_cl,
+                &run,
+                &new_run_rev,
+                vis_i64,
+                sec,
+                nsec,
+            )
             .await?;
+        }
     }
 
     for (note, ability) in changed_packages {
@@ -1456,15 +1540,18 @@ pub(crate) async fn authorize_rollback_run_replay_tx(
     if rows.iter().any(|row| row.purged) {
         return Err(DomainError::ResourceNotFound.into());
     }
+    let mut folders = FolderAncestryCache::default();
     if rows.iter().all(|row| row.note_id.is_none()) {
-        auth.can_view_folder(
+        authorize_zero_note_rollback_tx(
+            tx,
+            &mut folders,
             &record.space,
             &record.root_folder_id,
-            std::slice::from_ref(&record.root_folder_id),
-        )?;
+            auth,
+        )
+        .await?;
         return Ok(());
     }
-    let mut folders = FolderAncestryCache::default();
     for row in rows {
         let Some(_) = row.note_id else {
             continue;
@@ -1500,12 +1587,42 @@ pub(crate) async fn authorize_rollback_run_replay_tx(
     Ok(())
 }
 
+async fn authorize_zero_note_rollback_tx(
+    tx: &mut BackendConn<'_>,
+    cache: &mut FolderAncestryCache,
+    space: &notarium_core::auth::Space,
+    root_folder_id: &FolderId,
+    auth: &EngineAuthContext,
+) -> Result<(), PortError> {
+    auth.can_view_folder(space, root_folder_id, std::slice::from_ref(root_folder_id))?;
+    let grant = auth
+        .spaces()
+        .get(&space.id)
+        .ok_or(DomainError::ResourceNotFound)?;
+    let write_class = grant
+        .write_classes
+        .iter()
+        .copied()
+        .find(|class| *class != DocClass::Skill)
+        .or_else(|| grant.write_classes.iter().copied().next())
+        .ok_or(DomainError::SpaceReadOnly)?;
+    let (rfacts, anc) = cache
+        .build_resource_facts_tx(tx, space, root_folder_id, write_class, None, false)
+        .await?;
+    if anc.folder_lifecycle == Lifecycle::Purged {
+        return Err(DomainError::ResourceNotFound.into());
+    }
+    auth.authorize_direct_write(&rfacts, &rfacts)?;
+    Ok(())
+}
+
 async fn authorize_rollback_destination_tx(
     tx: &mut BackendConn<'_>,
     cache: &mut FolderAncestryCache,
     space: &notarium_core::auth::Space,
     auth: &EngineAuthContext,
     meta: &NoteRevisionMetadata,
+    active_only: bool,
 ) -> Result<crate::domain::common::FolderAncestryFacts, PortError> {
     let (after, anc) = cache
         .build_resource_facts_tx(
@@ -1514,7 +1631,7 @@ async fn authorize_rollback_destination_tx(
             &meta.parent_folder_id,
             meta.doc_class,
             meta.ability_id.clone(),
-            meta.lifecycle == Lifecycle::Active,
+            active_only,
         )
         .await?;
     if anc.folder_lifecycle == Lifecycle::Purged {
@@ -1522,6 +1639,45 @@ async fn authorize_rollback_destination_tx(
     }
     auth.authorize_direct_write(&after, &after)?;
     Ok(anc)
+}
+
+async fn load_note_revision_metadata_at_seq_tx(
+    tx: &mut BackendConn<'_>,
+    space_id: &SpaceId,
+    note_id: &NoteId,
+    space_seq: SpaceSeq,
+) -> Result<Vec<u8>, PortError> {
+    let seq_i64 = space_seq.get() as i64;
+    let bytes: Option<Vec<u8>> = match tx {
+        BackendConn::Sqlite(conn) => sqlx::query_scalar(
+            "SELECT metadata_msgpack FROM revisions
+             WHERE space_id = ? AND entity_type = 'note' AND entity_key = ? AND space_seq = ?
+             LIMIT 1",
+        )
+        .bind(space_id.as_str())
+        .bind(note_id.as_str())
+        .bind(seq_i64)
+        .fetch_optional(&mut **conn)
+        .await
+        .map_err(|err| internal_not_committed("sqlite_rb_origin_meta", err.to_string()))?,
+        BackendConn::Postgres(conn) => sqlx::query_scalar(
+            "SELECT metadata_msgpack FROM revisions
+             WHERE space_id = $1 AND entity_type = 'note' AND entity_key = $2 AND space_seq = $3
+             LIMIT 1",
+        )
+        .bind(space_id.as_str())
+        .bind(note_id.as_str())
+        .bind(seq_i64)
+        .fetch_optional(&mut **conn)
+        .await
+        .map_err(|err| crate::runtime::pg_read_error("pg_rb_origin_meta", err))?,
+    };
+    bytes.ok_or_else(|| {
+        internal_not_committed(
+            "rollback_missing_origin",
+            "creating note revision is missing",
+        )
+    })
 }
 
 async fn ensure_chat_run_not_active_tx(
@@ -1849,8 +2005,8 @@ async fn load_direct_rollback_histories(
         .collect()
 }
 
-async fn upsert_agent_run_head_row_only_tx(
-    tx: &mut BackendConn<'_>,
+async fn upsert_agent_run_head_row_only_sqlite_tx(
+    conn: &mut sqlx::SqliteConnection,
     scope: &HistoryScope,
     run_id: &AgentRunId,
     run_rev: &RevisionId,
@@ -1858,54 +2014,27 @@ async fn upsert_agent_run_head_row_only_tx(
     sec: i64,
     nsec: i32,
 ) -> Result<(), PortError> {
-    match tx {
-        BackendConn::Sqlite(conn) => {
-            sqlx::query(
-                "INSERT INTO agent_run_heads (
-                    space_id, history_incarnation, run_id, run_revision, last_seq, updated_at_sec, updated_at_nsec
-                 ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                 ON CONFLICT (space_id, run_id) DO UPDATE SET
-                    history_incarnation = excluded.history_incarnation,
-                    run_revision = excluded.run_revision,
-                    last_seq = excluded.last_seq,
-                    updated_at_sec = excluded.updated_at_sec,
-                    updated_at_nsec = excluded.updated_at_nsec",
-            )
-            .bind(scope.space_id.as_str())
-            .bind(scope.incarnation.as_bytes().as_slice())
-            .bind(run_id.as_str())
-            .bind(run_rev.as_str())
-            .bind(last_i64)
-            .bind(sec)
-            .bind(nsec)
-            .execute(&mut **conn)
-            .await
-            .map_err(|err| internal_not_committed("sqlite_upsert_agent_run_row", err.to_string()))?;
-        }
-        BackendConn::Postgres(conn) => {
-            sqlx::query(
-                "INSERT INTO agent_run_heads (
-                    space_id, history_incarnation, run_id, run_revision, last_seq, updated_at_sec, updated_at_nsec
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7)
-                 ON CONFLICT (space_id, run_id) DO UPDATE SET
-                    history_incarnation = EXCLUDED.history_incarnation,
-                    run_revision = EXCLUDED.run_revision,
-                    last_seq = EXCLUDED.last_seq,
-                    updated_at_sec = EXCLUDED.updated_at_sec,
-                    updated_at_nsec = EXCLUDED.updated_at_nsec",
-            )
-            .bind(scope.space_id.as_str())
-            .bind(scope.incarnation.as_bytes().as_slice())
-            .bind(run_id.as_str())
-            .bind(run_rev.as_str())
-            .bind(last_i64)
-            .bind(sec)
-            .bind(nsec)
-            .execute(&mut **conn)
-            .await
-            .map_err(|err| internal_not_committed("pg_upsert_agent_run_row", err.to_string()))?;
-        }
-    }
+    sqlx::query(
+        "INSERT INTO agent_run_heads (
+            space_id, history_incarnation, run_id, run_revision, last_seq, updated_at_sec, updated_at_nsec
+         ) VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (space_id, run_id) DO UPDATE SET
+            history_incarnation = excluded.history_incarnation,
+            run_revision = excluded.run_revision,
+            last_seq = excluded.last_seq,
+            updated_at_sec = excluded.updated_at_sec,
+            updated_at_nsec = excluded.updated_at_nsec",
+    )
+    .bind(scope.space_id.as_str())
+    .bind(scope.incarnation.as_bytes().as_slice())
+    .bind(run_id.as_str())
+    .bind(run_rev.as_str())
+    .bind(last_i64)
+    .bind(sec)
+    .bind(nsec)
+    .execute(&mut *conn)
+    .await
+    .map_err(|err| internal_not_committed("sqlite_upsert_agent_run_row", err.to_string()))?;
     Ok(())
 }
 
@@ -2143,10 +2272,18 @@ struct RestoredHeadUpdateItem<'a> {
     updated_at_nsec: i32,
 }
 
+struct TrashedHeadUpdateItem<'a> {
+    note_id: &'a NoteId,
+    rev_id: RevisionId,
+    parent_folder_id: &'a FolderId,
+    slug: &'a str,
+    slug_fold: &'a str,
+}
+
 async fn update_note_heads_trashed_batch_tx(
     tx: &mut BackendConn<'_>,
     space_id: &SpaceId,
-    items: &[(NoteId, RevisionId)],
+    items: &[TrashedHeadUpdateItem<'_>],
     vis_seq: i64,
     sec: i64,
     nsec: i32,
@@ -2157,34 +2294,45 @@ async fn update_note_heads_trashed_batch_tx(
     }
     match tx {
         BackendConn::Sqlite(conn) => {
-            for (note_id, rev_id) in items {
+            for item in items {
                 sqlx::query(
                     "UPDATE note_heads
-                     SET head_rev_id = ?, lifecycle_state = 'trashed', updated_seq = ?,
+                     SET parent_folder_id = ?, slug = ?, slug_fold = ?,
+                         head_rev_id = ?, lifecycle_state = 'trashed', updated_seq = ?,
                          updated_at_sec = ?, updated_at_nsec = ?, last_actor_id = ?
                      WHERE space_id = ? AND note_id = ?",
                 )
-                .bind(rev_id.as_str())
+                .bind(item.parent_folder_id.as_str())
+                .bind(item.slug)
+                .bind(item.slug_fold)
+                .bind(item.rev_id.as_str())
                 .bind(vis_seq)
                 .bind(sec)
                 .bind(nsec)
                 .bind(actor_str)
                 .bind(space_id.as_str())
-                .bind(note_id.as_str())
+                .bind(item.note_id.as_str())
                 .execute(&mut **conn)
                 .await
                 .map_err(|err| internal_not_committed("sqlite_rb_trash_head", err.to_string()))?;
             }
         }
         BackendConn::Postgres(conn) => {
-            let note_ids: Vec<&str> = items.iter().map(|(n, _)| n.as_str()).collect();
-            let rev_ids: Vec<&str> = items.iter().map(|(_, r)| r.as_str()).collect();
+            let note_ids: Vec<&str> = items.iter().map(|i| i.note_id.as_str()).collect();
+            let rev_ids: Vec<&str> = items.iter().map(|i| i.rev_id.as_str()).collect();
+            let parents: Vec<&str> = items.iter().map(|i| i.parent_folder_id.as_str()).collect();
+            let slugs: Vec<&str> = items.iter().map(|i| i.slug).collect();
+            let slug_folds: Vec<&str> = items.iter().map(|i| i.slug_fold).collect();
             sqlx::query(
                 "UPDATE note_heads AS nh
-                 SET head_rev_id = v.head_rev_id, lifecycle_state = 'trashed',
+                 SET parent_folder_id = v.parent_folder_id,
+                     slug = v.slug,
+                     slug_fold = v.slug_fold,
+                     head_rev_id = v.head_rev_id, lifecycle_state = 'trashed',
                      updated_seq = $2, updated_at_sec = $3, updated_at_nsec = $4,
                      last_actor_id = $5
-                 FROM UNNEST($6::TEXT[], $7::TEXT[]) AS v(note_id, head_rev_id)
+                 FROM UNNEST($6::TEXT[], $7::TEXT[], $8::TEXT[], $9::TEXT[], $10::TEXT[])
+                      AS v(note_id, head_rev_id, parent_folder_id, slug, slug_fold)
                  WHERE nh.space_id = $1 AND nh.note_id = v.note_id",
             )
             .bind(space_id.as_str())
@@ -2194,6 +2342,9 @@ async fn update_note_heads_trashed_batch_tx(
             .bind(actor_str)
             .bind(note_ids)
             .bind(rev_ids)
+            .bind(parents)
+            .bind(slugs)
+            .bind(slug_folds)
             .execute(&mut **conn)
             .await
             .map_err(|err| internal_not_committed("pg_rb_trash_head_batch", err.to_string()))?;
@@ -2202,8 +2353,8 @@ async fn update_note_heads_trashed_batch_tx(
     Ok(())
 }
 
-async fn update_note_heads_restored_batch_tx(
-    tx: &mut BackendConn<'_>,
+async fn update_note_heads_restored_batch_sqlite_tx(
+    conn: &mut sqlx::SqliteConnection,
     space_id: &SpaceId,
     items: &[RestoredHeadUpdateItem<'_>],
     vis_seq: i64,
@@ -2213,142 +2364,51 @@ async fn update_note_heads_restored_batch_tx(
         return Ok(());
     }
     let needs_vacate = items.len() > 1 && items.iter().any(|i| i.lifecycle_str == "active");
-    match tx {
-        BackendConn::Sqlite(conn) => {
-            if needs_vacate {
-                for it in items {
-                    sqlx::query(
-                        "UPDATE note_heads
-                         SET lifecycle_state = 'trashed'
-                         WHERE space_id = ? AND note_id = ? AND lifecycle_state = 'active'",
-                    )
-                    .bind(space_id.as_str())
-                    .bind(it.note_id.as_str())
-                    .execute(&mut **conn)
-                    .await
-                    .map_err(|err| {
-                        internal_not_committed("sqlite_rb_vacate_head", err.to_string())
-                    })?;
-                }
-            }
-            for it in items {
-                let digest_slice = it.content_digest.as_ref().map(|d| d.as_bytes().as_slice());
-                sqlx::query(
-                    "UPDATE note_heads
-                     SET parent_folder_id = ?, slug = ?, slug_fold = ?, title = ?, title_fold = ?,
-                         doc_class = ?, ability_id = ?, head_rev_id = ?, content_blake3 = ?,
-                         byte_size = ?, lifecycle_state = ?, visibility_mask = ?,
-                         updated_seq = ?, updated_at_sec = ?, updated_at_nsec = ?, last_actor_id = ?
-                     WHERE space_id = ? AND note_id = ?",
-                )
-                .bind(it.parent_folder_id.as_str())
-                .bind(it.slug)
-                .bind(it.slug_fold)
-                .bind(it.title)
-                .bind(&it.title_fold)
-                .bind(it.doc_class_str)
-                .bind(it.ability_id_str)
-                .bind(it.rev_id.as_str())
-                .bind(digest_slice)
-                .bind(it.byte_size as i64)
-                .bind(it.lifecycle_str)
-                .bind(i64::from(it.visibility_mask))
-                .bind(vis_seq)
-                .bind(it.updated_at_sec)
-                .bind(it.updated_at_nsec)
-                .bind(actor_str)
-                .bind(space_id.as_str())
-                .bind(it.note_id.as_str())
-                .execute(&mut **conn)
-                .await
-                .map_err(|err| internal_not_committed("sqlite_rb_restore_head", err.to_string()))?;
-            }
-        }
-        BackendConn::Postgres(conn) => {
-            let note_ids: Vec<&str> = items.iter().map(|i| i.note_id.as_str()).collect();
-            if needs_vacate {
-                sqlx::query(
-                    "UPDATE note_heads
-                     SET lifecycle_state = 'trashed'
-                     WHERE space_id = $1 AND note_id = ANY($2) AND lifecycle_state = 'active'",
-                )
-                .bind(space_id.as_str())
-                .bind(&note_ids)
-                .execute(&mut **conn)
-                .await
-                .map_err(|err| {
-                    internal_not_committed("pg_rb_vacate_head_batch", err.to_string())
-                })?;
-            }
-            let parents: Vec<&str> = items.iter().map(|i| i.parent_folder_id.as_str()).collect();
-            let slugs: Vec<&str> = items.iter().map(|i| i.slug).collect();
-            let slug_folds: Vec<&str> = items.iter().map(|i| i.slug_fold).collect();
-            let titles: Vec<&str> = items.iter().map(|i| i.title).collect();
-            let title_folds: Vec<&str> = items.iter().map(|i| i.title_fold.as_str()).collect();
-            let doc_classes: Vec<&str> = items.iter().map(|i| i.doc_class_str).collect();
-            let abilities: Vec<Option<&str>> = items.iter().map(|i| i.ability_id_str).collect();
-            let rev_ids: Vec<&str> = items.iter().map(|i| i.rev_id.as_str()).collect();
-            let digests: Vec<Option<Vec<u8>>> = items
-                .iter()
-                .map(|i| i.content_digest.map(|d| d.as_bytes().to_vec()))
-                .collect();
-            let byte_sizes: Vec<i64> = items.iter().map(|i| i.byte_size as i64).collect();
-            let lifecycles: Vec<&str> = items.iter().map(|i| i.lifecycle_str).collect();
-            let vis_masks: Vec<i32> = items.iter().map(|i| i.visibility_mask).collect();
-            let updated_secs: Vec<i64> = items.iter().map(|i| i.updated_at_sec).collect();
-            let updated_nsecs: Vec<i32> = items.iter().map(|i| i.updated_at_nsec).collect();
-
+    if needs_vacate {
+        for it in items {
             sqlx::query(
-                "UPDATE note_heads AS nh
-                 SET parent_folder_id = v.parent_folder_id,
-                     slug = v.slug,
-                     slug_fold = v.slug_fold,
-                     title = v.title,
-                     title_fold = v.title_fold,
-                     doc_class = v.doc_class,
-                     ability_id = v.ability_id,
-                     head_rev_id = v.head_rev_id,
-                     content_blake3 = v.content_blake3,
-                     byte_size = v.byte_size,
-                     lifecycle_state = v.lifecycle_state,
-                     visibility_mask = v.visibility_mask,
-                     updated_seq = $2,
-                     updated_at_sec = v.updated_at_sec,
-                     updated_at_nsec = v.updated_at_nsec,
-                     last_actor_id = $3
-                 FROM UNNEST(
-                     $4::TEXT[], $5::TEXT[], $6::TEXT[], $7::TEXT[], $8::TEXT[],
-                     $9::TEXT[], $10::TEXT[], $11::TEXT[], $12::TEXT[], $13::BYTEA[],
-                     $14::BIGINT[], $15::TEXT[], $16::INT4[], $17::BIGINT[], $18::INT4[]
-                 ) AS v(
-                     note_id, parent_folder_id, slug, slug_fold, title,
-                     title_fold, doc_class, ability_id, head_rev_id, content_blake3,
-                     byte_size, lifecycle_state, visibility_mask, updated_at_sec, updated_at_nsec
-                 )
-                 WHERE nh.space_id = $1 AND nh.note_id = v.note_id",
+                "UPDATE note_heads
+                 SET lifecycle_state = 'trashed'
+                 WHERE space_id = ? AND note_id = ? AND lifecycle_state = 'active'",
             )
             .bind(space_id.as_str())
-            .bind(vis_seq)
-            .bind(actor_str)
-            .bind(note_ids)
-            .bind(parents)
-            .bind(slugs)
-            .bind(slug_folds)
-            .bind(titles)
-            .bind(title_folds)
-            .bind(doc_classes)
-            .bind(abilities)
-            .bind(rev_ids)
-            .bind(digests)
-            .bind(byte_sizes)
-            .bind(lifecycles)
-            .bind(vis_masks)
-            .bind(updated_secs)
-            .bind(updated_nsecs)
-            .execute(&mut **conn)
+            .bind(it.note_id.as_str())
+            .execute(&mut *conn)
             .await
-            .map_err(|err| internal_not_committed("pg_rb_restore_head_batch", err.to_string()))?;
+            .map_err(|err| internal_not_committed("sqlite_rb_vacate_head", err.to_string()))?;
         }
+    }
+    for it in items {
+        let digest_slice = it.content_digest.as_ref().map(|d| d.as_bytes().as_slice());
+        sqlx::query(
+            "UPDATE note_heads
+             SET parent_folder_id = ?, slug = ?, slug_fold = ?, title = ?, title_fold = ?,
+                 doc_class = ?, ability_id = ?, head_rev_id = ?, content_blake3 = ?,
+                 byte_size = ?, lifecycle_state = ?, visibility_mask = ?,
+                 updated_seq = ?, updated_at_sec = ?, updated_at_nsec = ?, last_actor_id = ?
+             WHERE space_id = ? AND note_id = ?",
+        )
+        .bind(it.parent_folder_id.as_str())
+        .bind(it.slug)
+        .bind(it.slug_fold)
+        .bind(it.title)
+        .bind(&it.title_fold)
+        .bind(it.doc_class_str)
+        .bind(it.ability_id_str)
+        .bind(it.rev_id.as_str())
+        .bind(digest_slice)
+        .bind(it.byte_size as i64)
+        .bind(it.lifecycle_str)
+        .bind(i64::from(it.visibility_mask))
+        .bind(vis_seq)
+        .bind(it.updated_at_sec)
+        .bind(it.updated_at_nsec)
+        .bind(actor_str)
+        .bind(space_id.as_str())
+        .bind(it.note_id.as_str())
+        .execute(&mut *conn)
+        .await
+        .map_err(|err| internal_not_committed("sqlite_rb_restore_head", err.to_string()))?;
     }
     Ok(())
 }
