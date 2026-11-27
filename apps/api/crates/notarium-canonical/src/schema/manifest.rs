@@ -128,6 +128,7 @@ pub const CANONICAL_TABLES: &[TableSpec] = &[
         indexes: &[
             "idx_folder_aliases_lookup",
             "idx_folder_aliases_projection_seq",
+            "idx_folder_aliases_parent_seq",
         ],
     },
     TableSpec {
@@ -162,6 +163,7 @@ pub const CANONICAL_TABLES: &[TableSpec] = &[
             "idx_note_heads_parent_lifecycle",
             "idx_note_heads_created_seq",
             "idx_note_heads_keyset",
+            "idx_note_heads_space_title_fold",
         ],
     },
     TableSpec {
@@ -253,7 +255,7 @@ pub const CANONICAL_TABLES: &[TableSpec] = &[
             col("created_at_sec", Int, false),
             col("created_at_nsec", Int, false),
         ],
-        indexes: &[],
+        indexes: &["idx_revision_purge_fences_seq"],
     },
     TableSpec {
         name: "ability_packages",
@@ -274,6 +276,7 @@ pub const CANONICAL_TABLES: &[TableSpec] = &[
             "idx_ability_packages_active_slug",
             "idx_ability_packages_entrypoint",
             "idx_ability_packages_keyset",
+            "idx_ability_packages_space_kind",
         ],
     },
     TableSpec {

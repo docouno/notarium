@@ -704,6 +704,54 @@ impl crate::CanonicalStore {
         &self,
         to_cleanup: Vec<(SpaceId, ContentDigest)>,
     ) {
+        self.cleanup_unretained_local_files_inner(to_cleanup, false)
+            .await;
+    }
+
+    pub(crate) async fn sweep_deferred_local_orphans_async(&self, wait_for_lock: bool) {
+        let BlobBackendDriver::Local(local) = &self.inner.blobs else {
+            return;
+        };
+        let (items, overflow_spaces) = {
+            let mut deferred = self
+                .inner
+                .deferred_local_orphan_cleanups
+                .lock()
+                .expect("deferred local orphan cleanups mutex");
+            deferred.release_gen = deferred.release_gen.wrapping_add(1);
+            let items: Vec<_> = std::mem::take(&mut deferred.items).into_iter().collect();
+            let overflow_spaces: Vec<_> = std::mem::take(&mut deferred.overflow_spaces)
+                .into_iter()
+                .collect();
+            (items, overflow_spaces)
+        };
+        if !items.is_empty() {
+            self.cleanup_unretained_local_files_inner(items, wait_for_lock)
+                .await;
+        }
+        for space_id in overflow_spaces {
+            let local_cl = Arc::clone(local);
+            let space_enum = space_id.clone();
+            let digests =
+                tokio::task::spawn_blocking(move || local_cl.list_space_digests(&space_enum))
+                    .await
+                    .unwrap_or_default();
+            if !digests.is_empty() {
+                let candidates = digests
+                    .into_iter()
+                    .map(|digest| (space_id.clone(), digest))
+                    .collect();
+                self.cleanup_unretained_local_files_inner(candidates, wait_for_lock)
+                    .await;
+            }
+        }
+    }
+
+    async fn cleanup_unretained_local_files_inner(
+        &self,
+        to_cleanup: Vec<(SpaceId, ContentDigest)>,
+        wait_for_lock: bool,
+    ) {
         if to_cleanup.is_empty() {
             return;
         }
@@ -715,73 +763,105 @@ impl crate::CanonicalStore {
             if !seen.insert((space_id.clone(), digest)) {
                 continue;
             }
-            let guard = local.acquire_exclusive_guard(&space_id, digest).await;
-            let space_chk = space_id.clone();
+            let guard = if wait_for_lock {
+                local.acquire_exclusive_guard(&space_id, digest).await
+            } else {
+                let Some(guard) = local.try_acquire_exclusive_guard(&space_id, digest) else {
+                    // An active writer/reader currently holds the shared guard on this digest;
+                    // if that writer aborts, its own cleanup path will reconcile the file.
+                    continue;
+                };
+                guard
+            };
             enum OrphanOutcome {
                 Delete,
                 Keep,
                 HoldActive,
             }
-            let outcome = self
-                .with_read_tx(|tx| {
-                    Box::pin(async move {
-                        let hold_active = has_backup_holds_tx(tx, &space_chk).await?;
-                        ensure_zero_reachable_refs_tx(tx, &space_chk, digest).await?;
-                        let cataloged: Option<i64> = match tx {
-                            BackendConn::Sqlite(conn) => sqlx::query_scalar(
-                                "SELECT 1 FROM blob_catalog WHERE space_id = ? AND content_blake3 = ? AND blob_state <> 'retired' LIMIT 1",
-                            )
-                            .bind(space_chk.as_str())
-                            .bind(digest.as_bytes().as_slice())
-                            .fetch_optional(&mut **conn)
-                            .await
-                            .map_err(|err| {
-                                internal_not_committed("sqlite_check_orphan_catalog", err.to_string())
-                            })?,
-                            BackendConn::Postgres(conn) => sqlx::query_scalar(
-                                "SELECT 1::BIGINT FROM blob_catalog WHERE space_id = $1 AND content_blake3 = $2 AND blob_state <> 'retired' LIMIT 1",
-                            )
-                            .bind(space_chk.as_str())
-                            .bind(digest.as_bytes().as_slice())
-                            .fetch_optional(&mut **conn)
-                            .await
-                            .map_err(|err| {
-                                crate::runtime::pg_read_error("pg_check_orphan_catalog", err)
-                            })?,
-                        };
-                        Ok(if cataloged.is_some() {
-                            OrphanOutcome::Keep
-                        } else if hold_active {
-                            OrphanOutcome::HoldActive
-                        } else {
-                            OrphanOutcome::Delete
+            let mut guard_opt = Some(guard);
+            for _attempt in 0..4 {
+                let gen_before = self
+                    .inner
+                    .deferred_local_orphan_cleanups
+                    .lock()
+                    .expect("deferred local orphan cleanups mutex")
+                    .release_gen;
+                let space_chk = space_id.clone();
+                let outcome = self
+                    .with_read_tx_during_shutdown(|tx| {
+                        Box::pin(async move {
+                            let hold_active = has_backup_holds_tx(tx, &space_chk).await?;
+                            ensure_zero_reachable_refs_tx(tx, &space_chk, digest).await?;
+                            let cataloged: Option<i64> = match tx {
+                                BackendConn::Sqlite(conn) => sqlx::query_scalar(
+                                    "SELECT 1 FROM blob_catalog WHERE space_id = ? AND content_blake3 = ? AND blob_state <> 'retired' LIMIT 1",
+                                )
+                                .bind(space_chk.as_str())
+                                .bind(digest.as_bytes().as_slice())
+                                .fetch_optional(&mut **conn)
+                                .await
+                                .map_err(|err| {
+                                    internal_not_committed("sqlite_check_orphan_catalog", err.to_string())
+                                })?,
+                                BackendConn::Postgres(conn) => sqlx::query_scalar(
+                                    "SELECT 1::BIGINT FROM blob_catalog WHERE space_id = $1 AND content_blake3 = $2 AND blob_state <> 'retired' LIMIT 1",
+                                )
+                                .bind(space_chk.as_str())
+                                .bind(digest.as_bytes().as_slice())
+                                .fetch_optional(&mut **conn)
+                                .await
+                                .map_err(|err| {
+                                    crate::runtime::pg_read_error("pg_check_orphan_catalog", err)
+                                })?,
+                            };
+                            Ok(if cataloged.is_some() {
+                                OrphanOutcome::Keep
+                            } else if hold_active {
+                                OrphanOutcome::HoldActive
+                            } else {
+                                OrphanOutcome::Delete
+                            })
                         })
                     })
-                })
-                .await
-                .unwrap_or(OrphanOutcome::Keep);
-            match outcome {
-                OrphanOutcome::Delete => {
-                    let local_cl = Arc::clone(local);
-                    let space_del = space_id.clone();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        let _guard = guard;
-                        let _ = local_cl.delete_physical_file(&space_del, digest);
-                    })
-                    .await;
-                }
-                OrphanOutcome::HoldActive => {
-                    drop(guard);
-                    let mut deferred = self
-                        .inner
-                        .deferred_local_orphan_cleanups
-                        .lock()
-                        .expect("deferred local orphan cleanups mutex");
-                    if deferred.len() < 4096 && !deferred.contains(&(space_id.clone(), digest)) {
-                        deferred.push((space_id, digest));
+                    .await
+                    .unwrap_or(OrphanOutcome::Keep);
+                match outcome {
+                    OrphanOutcome::Delete => {
+                        let local_cl = Arc::clone(local);
+                        let space_del = space_id.clone();
+                        let guard = guard_opt.take().expect("exclusive guard held");
+                        let _ = tokio::task::spawn_blocking(move || {
+                            let _guard = guard;
+                            let _ = local_cl.delete_physical_file(&space_del, digest);
+                        })
+                        .await;
+                        break;
                     }
+                    OrphanOutcome::HoldActive => {
+                        let retry_now = {
+                            let mut deferred = self
+                                .inner
+                                .deferred_local_orphan_cleanups
+                                .lock()
+                                .expect("deferred local orphan cleanups mutex");
+                            if deferred.release_gen != gen_before {
+                                true
+                            } else {
+                                if deferred.items.len() < 4096 {
+                                    deferred.items.insert((space_id.clone(), digest));
+                                } else {
+                                    deferred.overflow_spaces.insert(space_id.clone());
+                                }
+                                false
+                            }
+                        };
+                        if retry_now {
+                            continue;
+                        }
+                        break;
+                    }
+                    OrphanOutcome::Keep => break,
                 }
-                OrphanOutcome::Keep => {}
             }
         }
     }

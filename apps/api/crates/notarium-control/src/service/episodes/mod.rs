@@ -54,6 +54,32 @@ pub(super) fn episode_project_admitted(
     if matches!(auth.kind(), PrincipalKind::Keeper(_)) {
         return false;
     }
+    if matches!(auth.kind(), PrincipalKind::AgentRun(_))
+        && auth.chat_audience() == Some(ChatAudience::Shared)
+    {
+        return shared_chat_episode.is_some()
+            && auth.chat_episode() == shared_chat_episode
+            && match project {
+                Some(reference) => auth.spaces().get(&reference.space_id).is_some_and(|grant| {
+                    !grant.read_classes.is_empty()
+                        && grant
+                            .project_root
+                            .as_ref()
+                            .is_none_or(|root| root == &reference.folder_id)
+                }),
+                None => {
+                    !auth
+                        .spaces()
+                        .values()
+                        .any(|grant| grant.project_root.is_some())
+                        && auth
+                            .spaces()
+                            .values()
+                            .any(|grant| !grant.read_classes.is_empty())
+                        && episode_name.is_none()
+                }
+            };
+    }
     match project {
         Some(reference) => auth.spaces().get(&reference.space_id).is_some_and(|grant| {
             !grant.read_classes.is_empty()
@@ -85,11 +111,7 @@ pub(super) fn episode_project_admitted(
             {
                 return true;
             }
-            shared_chat_episode.is_some()
-                && auth.chat_episode() == shared_chat_episode
-                && episode_name.is_none()
-                && matches!(auth.kind(), PrincipalKind::AgentRun(_))
-                && auth.chat_audience() == Some(ChatAudience::Shared)
+            false
         }
     }
 }
@@ -114,6 +136,8 @@ pub(super) fn episode_visible_to_narrowed(
             .spaces()
             .values()
             .any(|grant| grant.project_root.is_some())
+        || (matches!(auth.kind(), PrincipalKind::AgentRun(_))
+            && auth.chat_audience() == Some(ChatAudience::Shared))
     {
         episode_project_admitted(
             auth,
@@ -220,7 +244,7 @@ impl ControlService {
             return Err(DomainError::ResourceNotFound.into());
         }
         let owner = user_read(tx, ctx.auth().principal().as_str()).await?;
-        if !episode_project_admitted(
+        if !episode_visible_to_narrowed(
             ctx.auth(),
             owner.personal_space_id.as_deref(),
             stored_project_ref(&row)?.as_ref(),
@@ -382,7 +406,7 @@ impl ControlService {
                 let mut choices = Vec::with_capacity(ids.len());
                 for id in ids {
                     let row = episode(tx, ctx.auth().principal(), &id).await?;
-                    if !episode_project_admitted(
+                    if !episode_visible_to_narrowed(
                         ctx.auth(),
                         owner.personal_space_id.as_deref(),
                         stored_project_ref(&row)?.as_ref(),
@@ -418,6 +442,14 @@ impl ControlService {
             .await
     }
     pub async fn start_or_resume_episode(
+        &self,
+        ctx: AccountContext,
+        request: AccountMutation<StartEpisode>,
+    ) -> Result<ControlCommit<EpisodeStartResult>, PortError> {
+        Box::pin(self.start_or_resume_episode_inner(ctx, request)).await
+    }
+
+    async fn start_or_resume_episode_inner(
         &self,
         ctx: AccountContext,
         request: AccountMutation<StartEpisode>,
@@ -555,7 +587,7 @@ impl ControlService {
                 },
             };
             let started = if let Some(mut old) = existing {
-                if !episode_project_admitted(
+                if !episode_visible_to_narrowed(
                     current.auth(),
                     owner.personal_space_id.as_deref(),
                     stored_project_ref(&old)?.as_ref(),
@@ -612,7 +644,7 @@ impl ControlService {
             command.save(tx.inner_mut(), revision, &saved, now).await?;
             Ok((revision, current, Some(saved.value), None))
         }, CommitEffect::NotCommitted).await?;
-        budget.run_commit(tx.commit()).await?;
+        budget.commit_tx(tx).await?;
         let value = async {
             let loaded = match replayed_loaded {
                 Some(loaded) => loaded,
@@ -910,7 +942,7 @@ impl ControlService {
             if let Some((revision, saved)) = command.replay::<EpisodeId>(tx.inner_mut()).await? {
                 let replayed = episode(tx.inner_mut(), current.auth().principal(), &saved.value).await?;
                 let replayed_project = stored_project_ref(&replayed)?;
-                if !episode_project_admitted(
+                if !episode_visible_to_narrowed(
                     current.auth(),
                     owner.personal_space_id.as_deref(),
                     replayed_project.as_ref(),
@@ -928,7 +960,7 @@ impl ControlService {
             }
             let old = episode(tx.inner_mut(), current.auth().principal(), &episode_id).await?;
             let old_project = stored_project_ref(&old)?;
-            if !episode_project_admitted(
+            if !episode_visible_to_narrowed(
                 current.auth(),
                 owner.personal_space_id.as_deref(),
                 old_project.as_ref(),
@@ -999,7 +1031,7 @@ impl ControlService {
             command.save(tx.inner_mut(), revision, &saved, now).await?;
             Ok((revision, current, saved.value))
         }, CommitEffect::NotCommitted).await?;
-        budget.run_commit(tx.commit()).await?;
+        budget.commit_tx(tx).await?;
         let value = async {
             let mut rtx = self.store.read(budget.clone()).await?;
             let loaded = budget
@@ -1049,7 +1081,7 @@ impl ControlService {
                     }
                     let owner = user_read(tx.inner_mut(), auth.principal().as_str()).await?;
                     let row = episode(tx.inner_mut(), auth.principal(), &id).await?;
-                    if !episode_project_admitted(
+                    if !episode_visible_to_narrowed(
                         &auth,
                         owner.personal_space_id.as_deref(),
                         stored_project_ref(&row)?.as_ref(),
@@ -1066,7 +1098,7 @@ impl ControlService {
                 CommitEffect::NotCommitted,
             )
             .await?;
-        budget.run_commit(tx.commit()).await
+        budget.commit_tx(tx).await
     }
 }
 

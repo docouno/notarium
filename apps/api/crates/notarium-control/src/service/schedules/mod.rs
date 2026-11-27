@@ -19,7 +19,7 @@ use crate::{
         target::*,
     },
 };
-use approvals::{ScheduleScope, package_ids};
+use approvals::{ScheduleScope, package_ids, system_package_ids};
 use calendar::Calendar;
 pub use calendar::compute_next_slot;
 pub(crate) use calendar::validate_stored_calendar;
@@ -454,6 +454,7 @@ impl ControlService {
                 &source,
                 run.clone(),
                 package_ids(&info.definition.approved_role, &skills),
+                system_package_ids(&info.definition.approved_role, &skills),
             )?
             .with_verified_keeper_log(log)?;
         let history: HistoryScope = parse(&running.history_scope)?;

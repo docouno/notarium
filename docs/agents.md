@@ -36,7 +36,8 @@ preconditions when an unrelated account change advances the account revision.
 `create_note` requires an unused destination and accepts the legacy optional
 `versionToken`. `create_notes` commits each item independently and returns
 outcomes in input order. A `toTitle` link becomes a stable ID when exactly one
-committed item matches the title. Otherwise, the link remains authored by
+other committed item matches the title (a self-reference to the note being
+created remains authored by title). Otherwise, the link remains authored by
 title. The tool journals each item's link decision before the edit, so retries
 recover the same receipt even when another item later succeeds. Operational or
 rate-limit failures during link upgrades propagate with `CommitEffect::Unknown`
@@ -46,13 +47,16 @@ link upgrade.
 Confirmed creation proposals persist the title links shown during review.
 
 `start_session` opens an episode by starting, resuming or forking it. Pass the
-returned `session.id` on subsequent calls to keep the episode active.
+returned `session.id` on subsequent non-continuation calls to keep the episode
+active; when draining a bootstrap delta, pass `delta.nextAction.arguments`
+as-is (without adding `session`).
 Folder listing, moves and renames resolve relative paths using the explicit
 project, then the project bound to the episode. Follow `delta.nextAction` to
 drain the bootstrap delta. Bootstrap continuations bind the caller, episode and
 original Space cuts (`cursor_stale` on expiry or failover), while `list_notes`
 cursors bind the caller, folder, filter criteria and cut (`cursor_scope_mismatch`
-on scope mismatch, `cursor_stale` on expiry or failover); both live in bounded
+on same-Space scope mismatch, `ResourceNotFound` when the target resolves in a
+different Space, `cursor_stale` on expiry or failover); both live in bounded
 per-instance memory with per-principal quotas inside the global cap.
 Multi-instance MCP deployments should use sticky session routing; when a
 continuation or cursor misses after failover or expiry, callers receive

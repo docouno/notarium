@@ -235,9 +235,7 @@ impl ControlService {
                 async {
                     let owner =
                         user_read(rtx.inner_mut(), current.auth().principal().as_str()).await?;
-                    let loaded_ep = self
-                        .load_episode_db_strict(rtx.inner_mut(), &current, &id)
-                        .await?;
+                    let loaded_ep = self.load_episode_db(rtx.inner_mut(), &current, &id).await?;
                     let owner_ack_rows = self
                         .acknowledgement_rows(rtx.inner_mut(), &current, None)
                         .await?;

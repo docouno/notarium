@@ -641,12 +641,17 @@ async fn supervised_turn_survives_disconnect_and_stops_cleanly(
         )
         .await
         .unwrap();
+    let tainted_viewer = AccountContext::new(owner.auth().with_staged_taint(), budget());
     let tainted_stream = supervisor
-        .subscribe(owner.clone(), scope.clone(), thread.clone(), None)
+        .subscribe(tainted_viewer.clone(), scope.clone(), thread.clone(), None)
         .await
         .unwrap()
         .expect("retained failed run stream on tainted sleeping episode");
     let events = stream_events(tainted_stream).await;
+    assert!(
+        tainted_viewer.auth().taint().is_tainted(),
+        "subscribing to a cross-space tainted Personal run stream must propagate BranchTaint to viewer"
+    );
     let failed = events
         .iter()
         .find(|event| event["type"] == "run_failed")

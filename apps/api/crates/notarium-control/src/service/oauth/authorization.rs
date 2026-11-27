@@ -332,7 +332,7 @@ impl OAuthService {
             execute!(tx.inner_mut(),"UPDATE users SET revision=$1 WHERE user_id=$2","UPDATE v1_control.users SET revision=$1 WHERE user_id=$2";revision,&user.user_id)?;
             Ok(IssuedAuthorizationCode {code:code.secret,redirect_uri:intent.redirect,expires_at_ms:expires,grant:intent.grant})
         },CommitEffect::NotCommitted).await?;
-        budget.run_commit(tx.commit()).await?;
+        budget.commit_tx(tx).await?;
         Ok(result)
     }
 }

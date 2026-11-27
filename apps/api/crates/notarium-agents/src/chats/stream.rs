@@ -6,6 +6,7 @@ use std::{
 
 use notarium_core::{
     DomainError, DomainResult,
+    auth::BranchTaint,
     error::ValidationReason,
     ids::{AgentRunId, ChatThreadId, CommandKey, ContentDigest, ThreadEntrySeq},
     ports::{ChatEntry, ChatEntryKind, ProviderToolCall},
@@ -117,12 +118,17 @@ pub struct StreamFrame {
     pub start_offset: u64,
     pub end_offset: u64,
     payload: Arc<[u8]>,
+    tainted: bool,
 }
 
 impl StreamFrame {
     /// Complete UTF-8 JSON, before any SSE framing. Event-ID is end_offset.
     pub fn payload(&self) -> &[u8] {
         &self.payload
+    }
+
+    pub(crate) fn is_tainted(&self) -> bool {
+        self.tainted
     }
 }
 
@@ -178,7 +184,7 @@ impl State {
         self.visibility_floor = self.end;
     }
 
-    fn frame(&self, payload: Vec<u8>) -> DomainResult<StreamFrame> {
+    fn frame(&self, payload: Vec<u8>, tainted: bool) -> DomainResult<StreamFrame> {
         let end = self
             .end
             .checked_add(payload.len() as u64)
@@ -187,6 +193,7 @@ impl State {
             start_offset: self.end,
             end_offset: end,
             payload: payload.into(),
+            tainted,
         })
     }
 
@@ -223,16 +230,28 @@ fn lock(state: &Mutex<State>) -> MutexGuard<'_, State> {
 pub(crate) struct StepStreamBuffer {
     run: AgentRunId,
     thread: ChatThreadId,
+    taint: BranchTaint,
     state: Arc<Mutex<State>>,
     changed: watch::Sender<u64>,
 }
 
 impl StepStreamBuffer {
+    #[cfg(test)]
     pub fn new(run: AgentRunId, thread: ChatThreadId, initial_leaf: ThreadEntrySeq) -> Self {
+        Self::new_with_taint(run, thread, initial_leaf, BranchTaint::default())
+    }
+
+    pub fn new_with_taint(
+        run: AgentRunId,
+        thread: ChatThreadId,
+        initial_leaf: ThreadEntrySeq,
+        taint: BranchTaint,
+    ) -> Self {
         let (changed, _) = watch::channel(0);
         Self {
             run,
             thread,
+            taint,
             state: Arc::new(Mutex::new(State {
                 frames: VecDeque::new(),
                 retained: 0,
@@ -246,6 +265,10 @@ impl StepStreamBuffer {
             })),
             changed,
         }
+    }
+
+    pub(crate) fn is_tainted(&self) -> bool {
+        self.taint.is_tainted()
     }
 
     pub fn begin_step(&self, step: u32) -> DomainResult<()> {
@@ -394,12 +417,15 @@ impl StepStreamBuffer {
         boundary: Option<TransientStep>,
         superseded: bool,
     ) -> DomainResult<bool> {
-        let frame = state.frame(self.encode(AgentRunEvent::Committed {
-            entry_seq: entry.seq,
-            step,
-            transient_start: boundary.map(|boundary| boundary.start),
-            transient_end: boundary.map(|_| state.end),
-        })?)?;
+        let frame = state.frame(
+            self.encode(AgentRunEvent::Committed {
+                entry_seq: entry.seq,
+                step,
+                transient_start: boundary.map(|boundary| boundary.start),
+                transient_end: boundary.map(|_| state.end),
+            })?,
+            self.taint.is_tainted() || entry.tainted,
+        )?;
         let contiguous =
             !superseded && entry.parent.unwrap_or(ThreadEntrySeq::ZERO) == state.committed_leaf;
         state.committed_leaf = state.committed_leaf.max(entry.seq);
@@ -486,7 +512,7 @@ impl StepStreamBuffer {
         }
     }
 
-    pub(super) fn pause_for_redaction(self: &Arc<Self>) -> StreamRedaction {
+    pub(crate) fn pause_for_redaction(self: &Arc<Self>) -> StreamRedaction {
         lock(&self.state).redaction_pending = true;
         StreamRedaction {
             buffer: self.clone(),
@@ -496,12 +522,13 @@ impl StepStreamBuffer {
 
     fn append_step(&self, step: u32, event: AgentRunEvent<'_>) -> DomainResult<()> {
         let payload = self.encode(event)?;
+        let tainted = self.taint.is_tainted();
         let mut state = lock(&self.state);
         if state.visibility_floor != 0 {
             return Ok(());
         }
         state.require_step(step)?;
-        let frame = state.frame(payload)?;
+        let frame = state.frame(payload, tainted)?;
         self.insert(&mut state, frame);
         Ok(())
     }
@@ -512,12 +539,13 @@ impl StepStreamBuffer {
         event: AgentRunEvent<'_>,
     ) -> DomainResult<()> {
         let payload = self.encode(event)?;
+        let tainted = self.taint.is_tainted();
         let mut state = lock(&self.state);
         if state.visibility_floor != 0 {
             return Ok(());
         }
         state.require_committed(entry)?;
-        let frame = state.frame(payload)?;
+        let frame = state.frame(payload, tainted)?;
         self.insert(&mut state, frame);
         Ok(())
     }
@@ -528,6 +556,7 @@ impl StepStreamBuffer {
             RunTerminal::Failed { code } => AgentRunEvent::RunFailed { code },
         };
         let payload = self.encode(event)?;
+        let tainted = self.taint.is_tainted();
         let mut state = lock(&self.state);
         if state.terminal == Some(terminal) {
             return Ok(());
@@ -536,7 +565,7 @@ impl StepStreamBuffer {
         if terminal == RunTerminal::Finished && state.transient.is_some() {
             return Err(invalid_state());
         }
-        let frame = state.frame(payload)?;
+        let frame = state.frame(payload, tainted)?;
         state.terminal = Some(terminal);
         state.transient = None;
         self.insert(&mut state, frame);
@@ -575,13 +604,13 @@ impl StepStreamBuffer {
     }
 }
 
-pub(super) struct StreamRedaction {
+pub(crate) struct StreamRedaction {
     buffer: Arc<StepStreamBuffer>,
     discard: bool,
 }
 
 impl StreamRedaction {
-    pub(super) fn keep_history(&mut self) {
+    pub(crate) fn keep_history(&mut self) {
         self.discard = false;
     }
 }

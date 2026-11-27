@@ -1,6 +1,6 @@
 //! Versioned target rows used by offline migration and backup. No source-version parsing.
 use crate::{
-    error::{database, invalid},
+    error::{database_not_committed, invalid},
     store::Transaction,
 };
 use notarium_core::{
@@ -328,7 +328,7 @@ macro_rules! target_tables {
             }
 
             pub(crate) async fn insert(&self, tx: &mut Transaction) -> Result<(), PortError> {
-                self.insert_raw(tx).await.map_err(database)
+                self.insert_raw(tx).await.map_err(database_not_committed)
             }
 
             pub(crate) async fn insert_or_conflict(
@@ -866,6 +866,8 @@ target_tables! {
             validate_index(r.resource_id.len() + r.target_space.len())?;
             validate_index(r.resource_id.len() + r.target_space.len() + r.target_project.as_ref().map_or(0, String::len))?;
             validate_index(r.target_space.len() + r.state.len() + r.resource_id.len())?;
+            validate_index(r.target_space.len() + r.id.len())?;
+            validate_index(r.target_space.len() + r.target_project.as_ref().map_or(0, String::len) + r.id.len())?;
         })
     },
     ProviderPreferences (ProviderPreferencesRow, "provider_preferences") {
@@ -948,6 +950,7 @@ target_tables! {
             validate_index(r.principal.len() + r.scope_id.len() + r.intent_key.len())?;
             validate_index(r.owner_id.len() + 8 + r.call_id.len())?;
             validate_index(r.delivery_state.len() + 8 + r.call_id.len())?;
+            validate_index(r.run_id.as_ref().map_or(0, String::len) + r.call_id.len())?;
         })
     },
     AbilityAvailability (AbilityAvailabilityRow, "ability_availability") {

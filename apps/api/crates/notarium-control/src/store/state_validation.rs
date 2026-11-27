@@ -330,15 +330,18 @@ pub(super) fn validate(record: &TargetRecord) -> Result<(), PortError> {
             let _: AbilityRef = parse(approved_role)?;
             skill_pins(approved_skills)?;
             let limits: RunLimits = parse(budgets)?;
+            let title_invalid = if deleted_at.is_some() {
+                title.len() > 512 || title.chars().count() > 128
+            } else {
+                title.is_empty() || title.len() > 512 || title.chars().count() > 128
+            };
             let prompt_invalid = if deleted_at.is_some() {
                 init_prompt.len() > 32768
             } else {
                 init_prompt.is_empty() || init_prompt.len() > 32768
             };
             if !limits.fits(RunLimits::HARD_CEILING)
-                || title.is_empty()
-                || title.len() > 512
-                || title.chars().count() > 128
+                || title_invalid
                 || prompt_invalid
                 || cron_expr.len() > 256
                 || timezone.len() > 128

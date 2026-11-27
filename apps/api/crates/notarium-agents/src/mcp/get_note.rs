@@ -247,11 +247,39 @@ async fn describe_view(
     let mut projected_seq = head;
     let mut canonical_seq = head;
     let mut groups = None;
+    let mut query_scope = call.space(ctx.scope().clone())?;
+    if !external {
+        let project_opt = call
+            .auth
+            .spaces()
+            .get(&ctx.scope().space_id)
+            .and_then(|grant| grant.project_root.as_ref())
+            .map(|folder_id| notarium_core::model::FolderRef {
+                space_id: ctx.scope().space_id.clone(),
+                folder_id: folder_id.clone(),
+            });
+        match call.provider_selection(&query_scope, project_opt).await {
+            Ok(Some(selection)) => {
+                query_scope =
+                    query_scope.restrict_read_classes(&selection.policy.allowed_classes)?;
+                if let Some(required) = selection.project_only {
+                    query_scope = query_scope.restrict_to_project(&required)?;
+                }
+            }
+            Ok(None) => {}
+            Err(error) if corpus::hidden(&error) => {
+                item["status"] = json!("ready");
+                item["rows"] = Value::Array(Vec::new());
+                return Ok(item);
+            }
+            Err(error) => return Err(error),
+        }
+    }
     for page_idx in 0..MAX_VIEW_SCAN_PAGES {
         let result = call
             .registry
             .engine
-            .query_view(call.space(ctx.scope().clone())?, request)
+            .query_view(query_scope.clone(), request)
             .await;
         let page = match result {
             Ok(page) => page,

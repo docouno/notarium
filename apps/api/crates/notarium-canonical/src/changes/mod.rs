@@ -1037,9 +1037,10 @@ impl CanonicalStore {
                 let after_i64 = after.after.get() as i64;
                 let through_i64 = validated_through.get() as i64;
 
+                let preload_revisions = space_auth.is_some() || with_provenance;
                 let raw_rows: Vec<RawChangeLogRow> = match tx {
                     BackendConn::Sqlite(conn) => {
-                        let rows = sqlx::query(
+                        let sql = if preload_revisions {
                             "SELECT cl.space_seq, cl.command_first_seq, cl.command_last_seq,
                                     cl.entity_type, cl.entity_id, cl.op_kind, cl.rev_id,
                                     cl.lifecycle_state, cl.doc_class, cl.payload_id,
@@ -1066,18 +1067,42 @@ impl CanonicalStore {
                              WHERE cl.space_id = ? AND cl.history_incarnation = ?
                                AND cl.space_seq > ? AND cl.space_seq <= ?
                              ORDER BY cl.space_seq ASC
-                             LIMIT ?",
-                        )
-                        .bind(after.scope.space_id.as_str())
-                        .bind(after.scope.incarnation.as_bytes().as_slice())
-                        .bind(after_i64)
-                        .bind(through_i64)
-                        .bind(fetch_cap)
-                        .fetch_all(&mut **conn)
-                        .await
-                        .map_err(|err| {
-                            internal_not_committed("sqlite_read_change_log", err.to_string())
-                        })?;
+                             LIMIT ?"
+                        } else {
+                            "SELECT cl.space_seq, cl.command_first_seq, cl.command_last_seq,
+                                    cl.entity_type, cl.entity_id, cl.op_kind, cl.rev_id,
+                                    cl.lifecycle_state, cl.doc_class, cl.payload_id,
+                                    cp.codec AS cp_codec, cp.erased_by_purge AS cp_erased,
+                                    cp.effect_msgpack AS cp_msgpack,
+                                    CAST(NULL AS TEXT) AS rev_hit_id,
+                                    CAST(NULL AS INTEGER) AS rev_space_seq,
+                                    CAST(NULL AS INTEGER) AS rev_vis_seq,
+                                    CAST(NULL AS BLOB) AS rev_blake3,
+                                    CAST(NULL AS BLOB) AS rev_meta,
+                                    CAST(NULL AS TEXT) AS rev_actor,
+                                    CAST(NULL AS TEXT) AS rev_run_id,
+                                    CAST(NULL AS TEXT) AS rev_restored,
+                                    CAST(NULL AS INTEGER) AS rev_sec,
+                                    CAST(NULL AS INTEGER) AS rev_nsec
+                             FROM change_log cl
+                             LEFT JOIN change_payloads cp
+                               ON cp.space_id = cl.space_id AND cp.payload_id = cl.payload_id
+                             WHERE cl.space_id = ? AND cl.history_incarnation = ?
+                               AND cl.space_seq > ? AND cl.space_seq <= ?
+                             ORDER BY cl.space_seq ASC
+                             LIMIT ?"
+                        };
+                        let rows = sqlx::query(sql)
+                            .bind(after.scope.space_id.as_str())
+                            .bind(after.scope.incarnation.as_bytes().as_slice())
+                            .bind(after_i64)
+                            .bind(through_i64)
+                            .bind(fetch_cap)
+                            .fetch_all(&mut **conn)
+                            .await
+                            .map_err(|err| {
+                                internal_not_committed("sqlite_read_change_log", err.to_string())
+                            })?;
 
                         rows.into_iter()
                             .map(|r| {
@@ -1124,7 +1149,7 @@ impl CanonicalStore {
                             .collect()
                     }
                     BackendConn::Postgres(conn) => {
-                        let rows = sqlx::query(
+                        let sql = if preload_revisions {
                             "SELECT cl.space_seq, cl.command_first_seq, cl.command_last_seq,
                                     cl.entity_type, cl.entity_id, cl.op_kind, cl.rev_id,
                                     cl.lifecycle_state, cl.doc_class, cl.payload_id,
@@ -1151,16 +1176,42 @@ impl CanonicalStore {
                              WHERE cl.space_id = $1 AND cl.history_incarnation = $2
                                AND cl.space_seq > $3 AND cl.space_seq <= $4
                              ORDER BY cl.space_seq ASC
-                             LIMIT $5",
-                        )
-                        .bind(after.scope.space_id.as_str())
-                        .bind(after.scope.incarnation.as_bytes().as_slice())
-                        .bind(after_i64)
-                        .bind(through_i64)
-                        .bind(fetch_cap)
-                        .fetch_all(&mut **conn)
-                        .await
-                        .map_err(|err| crate::runtime::pg_read_error("pg_read_change_log", err))?;
+                             LIMIT $5"
+                        } else {
+                            "SELECT cl.space_seq, cl.command_first_seq, cl.command_last_seq,
+                                    cl.entity_type, cl.entity_id, cl.op_kind, cl.rev_id,
+                                    cl.lifecycle_state, cl.doc_class, cl.payload_id,
+                                    cp.codec AS cp_codec, cp.erased_by_purge AS cp_erased,
+                                    cp.effect_msgpack AS cp_msgpack,
+                                    NULL::TEXT AS rev_hit_id,
+                                    NULL::BIGINT AS rev_space_seq,
+                                    NULL::BIGINT AS rev_vis_seq,
+                                    NULL::BYTEA AS rev_blake3,
+                                    NULL::BYTEA AS rev_meta,
+                                    NULL::TEXT AS rev_actor,
+                                    NULL::TEXT AS rev_run_id,
+                                    NULL::TEXT AS rev_restored,
+                                    NULL::BIGINT AS rev_sec,
+                                    NULL::INTEGER AS rev_nsec
+                             FROM change_log cl
+                             LEFT JOIN change_payloads cp
+                               ON cp.space_id = cl.space_id AND cp.payload_id = cl.payload_id
+                             WHERE cl.space_id = $1 AND cl.history_incarnation = $2
+                               AND cl.space_seq > $3 AND cl.space_seq <= $4
+                             ORDER BY cl.space_seq ASC
+                             LIMIT $5"
+                        };
+                        let rows = sqlx::query(sql)
+                            .bind(after.scope.space_id.as_str())
+                            .bind(after.scope.incarnation.as_bytes().as_slice())
+                            .bind(after_i64)
+                            .bind(through_i64)
+                            .bind(fetch_cap)
+                            .fetch_all(&mut **conn)
+                            .await
+                            .map_err(|err| {
+                                crate::runtime::pg_read_error("pg_read_change_log", err)
+                            })?;
 
                         rows.into_iter()
                             .map(|r| {

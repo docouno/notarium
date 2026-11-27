@@ -1585,3 +1585,51 @@ fn agent_run_cannot_derive_pat_or_oauth_and_retains_chat_episode() {
     assert_eq!(nested.chat_episode(), Some(&ep1));
     assert_eq!(nested.with_chat_episode(ep2).chat_episode(), Some(&ep1));
 }
+
+#[test]
+fn preflight_taint_drops_write_roles_and_project_only_abilities_stay_confined() {
+    let owner = human(SpaceRole::Owner, true);
+    let s1 = SpaceId::from_bytes([1; 16]);
+    let s2 = SpaceId::from_bytes([2; 16]);
+    let preflight = owner.with_preflight_taint();
+    assert_eq!(preflight.spaces()[&s1].role, SpaceRole::Viewer);
+    assert_eq!(preflight.spaces()[&s2].role, SpaceRole::Viewer);
+    assert!(preflight.spaces()[&s1].write_classes.is_empty());
+    let doc = facts(1, DocClass::UserDoc);
+    assert_eq!(
+        preflight.authorize_direct_write(&doc, &doc),
+        Err(DomainError::SpaceReadOnly)
+    );
+
+    let proj_a = FolderId::from_bytes([0x31; 16]);
+    let proj_b = FolderId::from_bytes([0x32; 16]);
+    let ab = AbilityId::from_bytes([0x99; 16]);
+    let mut scoped_grants = grants(SpaceRole::Owner);
+    scoped_grants.get_mut(&s1).unwrap().project_root = Some(proj_a.clone());
+    let pinned_owner = EngineAuthContext::for_human(VerifiedHuman::attest(
+        PrincipalId::from_bytes([1; 16]),
+        GrantId::from_bytes([2; 16]),
+        scoped_grants,
+        true,
+    ));
+    let approved = pinned_owner
+        .for_keeper(
+            AgentRunId::from_bytes([0x98; 16]),
+            s1,
+            Some(proj_a.clone()),
+            [ab.clone()].into(),
+        )
+        .unwrap();
+    let mut in_a = facts(1, DocClass::Skill);
+    in_a.ancestor_folders = vec![proj_a];
+    in_a.ability_package = Some(ab.clone());
+    assert!(approved.authorize_read(&in_a).is_ok());
+
+    let mut in_b = facts(1, DocClass::Skill);
+    in_b.ancestor_folders = vec![proj_b];
+    in_b.ability_package = Some(ab);
+    assert_eq!(
+        approved.authorize_read(&in_b),
+        Err(DomainError::ResourceNotFound)
+    );
+}

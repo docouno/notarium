@@ -1789,6 +1789,18 @@ async fn exact_causal_graph_and_control_replay_seams(
             .for_agent_run(
                 AgentRunId::from_bytes([137; 16]),
                 personal_space.clone(),
+                ChatAudience::Personal,
+                owner.auth().spaces().clone(),
+            )
+            .unwrap(),
+        budget(),
+    );
+    let unbound_shared_run_ctx = AccountContext::new(
+        owner
+            .auth()
+            .for_agent_run(
+                AgentRunId::from_bytes([139; 16]),
+                personal_space.clone(),
                 ChatAudience::Shared,
                 owner.auth().spaces().clone(),
             )
@@ -1858,6 +1870,27 @@ async fn exact_causal_graph_and_control_replay_seams(
             .await
             .unwrap();
     }
+    assert!(
+        matches!(
+            fixture
+                .control
+                .begin_agent_call(
+                    unbound_shared_run_ctx,
+                    BeginAgentCall {
+                        call: RequestId::from_bytes([139u8; 16]),
+                        request: RequestId::from_bytes([139u8; 16]),
+                        episode: Some(ep_id.clone()),
+                        operation: AgentOperation::Context,
+                        transport: AgentTransport::Mcp,
+                        effect: AgentEffect::Read,
+                        input_bytes: 0,
+                    },
+                )
+                .await,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ),
+        "Shared AgentRun not bound to ep_id must fail ResourceNotFound on begin_agent_call"
+    );
     assert!(
         matches!(
             fixture
@@ -2565,15 +2598,9 @@ async fn contract_and_seams_regressions(fixture: &RuntimeFixture, personal: &Spa
         );
     }
 
-    let ep_started = call(
-        fixture,
-        &owner,
-        225,
-        "start_session",
-        json!({"task": "shared-use-role-check"}),
-    )
-    .await
-    .unwrap();
+    let ep_started = call(fixture, &owner, 225, "start_session", json!({}))
+        .await
+        .unwrap();
     let shared_ep = EpisodeId::parse(
         ep_started.structured_content["session"]["id"]
             .as_str()
@@ -2588,7 +2615,8 @@ async fn contract_and_seams_regressions(fixture: &RuntimeFixture, personal: &Spa
             ChatAudience::Shared,
             owner.auth().spaces().clone(),
         )
-        .unwrap();
+        .unwrap()
+        .with_chat_episode(shared_ep.clone());
     let shared_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let shared_local = loopback_provider(fixture, &owner, &shared_listener, 228, true).await;
     approve_disclosure(

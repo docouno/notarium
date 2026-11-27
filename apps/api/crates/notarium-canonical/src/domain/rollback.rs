@@ -614,6 +614,7 @@ async fn execute_general_rollback(
             run_board_moves,
             active_view_notes,
             package_cut,
+            observed_max_bmh_seq,
         ) = match rollback_wait(
             &ctx.budget,
             deadline,
@@ -932,6 +933,7 @@ async fn execute_general_rollback(
                 active_after_rollback_views,
                 rb_facts_opt,
                 run_board_moves.clone(),
+                observed_max_bmh_seq,
             ),
         };
 
@@ -1782,7 +1784,9 @@ fn materialize_working_group(
                             && !same_group_run_materialized.contains_key(other_id)
                             && overlays.get(other_id).is_some_and(|other_ov| {
                                 &other_ov.group == group
-                                    && other_ov.sort_rank_lexo > ov.sort_rank_lexo
+                                    && (other_ov.sort_rank_lexo > ov.sort_rank_lexo
+                                        || (other_ov.placement_run_id.is_some()
+                                            && !moved_targets_on_view.contains(other_id)))
                             })
                     }) || stale_in_group
                         .iter()
@@ -1898,52 +1902,100 @@ fn materialize_working_group(
     Ok(working_groups.len() - 1)
 }
 
+async fn load_run_visibility_seqs_tx(
+    tx: &mut BackendConn<'_>,
+    scope: &HistoryScope,
+    run: &AgentRunId,
+) -> Result<std::collections::HashSet<i64>, PortError> {
+    const RUN_VIS_SEQS_SQLITE_SQL: &str = include_str!("rollback/run_vis_seqs.sqlite.sql");
+    let rows: Vec<i64> = match tx {
+        BackendConn::Sqlite(conn) => sqlx::query_scalar(RUN_VIS_SEQS_SQLITE_SQL)
+            .bind(scope.space_id.as_str())
+            .bind(scope.incarnation.as_bytes().as_slice())
+            .bind(run.as_str())
+            .fetch_all(&mut **conn)
+            .await
+            .map_err(|err| internal_not_committed("sqlite_run_vis_seqs", err.to_string()))?,
+        BackendConn::Postgres(conn) => sqlx::query_scalar(
+            "SELECT DISTINCT visibility_seq FROM revisions
+             WHERE space_id = $1
+               AND history_incarnation = $2
+               AND agent_run_id IS NOT NULL
+               AND agent_run_id = $3",
+        )
+        .bind(scope.space_id.as_str())
+        .bind(scope.incarnation.as_bytes().as_slice())
+        .bind(run.as_str())
+        .fetch_all(&mut **conn)
+        .await
+        .map_err(|err| crate::runtime::pg_read_error("pg_run_vis_seqs", err))?,
+    };
+    Ok(rows.into_iter().collect())
+}
+
 async fn load_latest_prerun_rank_meta_tx(
     tx: &mut BackendConn<'_>,
     scope: &HistoryScope,
     view: &ViewRef,
     target: &NoteId,
     run: &AgentRunId,
+    run_vis_seqs: &std::collections::HashSet<i64>,
     before_seq: SpaceSeq,
 ) -> Result<Option<crate::codec::RankRevisionMetadata>, PortError> {
+    use futures_util::TryStreamExt;
     const PRERUN_RANK_SQLITE_SQL: &str = include_str!("rollback/prerun_rank.sqlite.sql");
     let key = super::board::rank_entity_key(&view.note, &view.key, target);
     let before_i64 = before_seq.get() as i64;
-    let bytes_opt: Option<Vec<u8>> = match tx {
-        BackendConn::Sqlite(conn) => sqlx::query_scalar(PRERUN_RANK_SQLITE_SQL)
-            .bind(scope.space_id.as_str())
-            .bind(scope.incarnation.as_bytes().as_slice())
-            .bind(&key)
-            .bind(run.as_str())
-            .bind(before_i64)
-            .fetch_optional(&mut **conn)
-            .await
-            .map_err(|err| internal_not_committed("sqlite_prerun_rank_meta", err.to_string()))?,
-        BackendConn::Postgres(conn) => sqlx::query_scalar(
-            "SELECT metadata_msgpack FROM revisions
-             WHERE space_id = $1 AND history_incarnation = $2
-               AND entity_type = 'rank' AND entity_key = $3
-               AND (agent_run_id IS NULL OR agent_run_id != $4)
-               AND space_seq < $5
-               AND NOT EXISTS (
-                   SELECT 1 FROM revisions r2
-                   WHERE r2.space_id = revisions.space_id
-                     AND r2.history_incarnation = revisions.history_incarnation
-                     AND r2.visibility_seq = revisions.visibility_seq
-                     AND r2.agent_run_id = $4
-               )
-             ORDER BY visibility_seq DESC, space_seq DESC
-             LIMIT 1",
-        )
-        .bind(scope.space_id.as_str())
-        .bind(scope.incarnation.as_bytes().as_slice())
-        .bind(&key)
-        .bind(run.as_str())
-        .bind(before_i64)
-        .fetch_optional(&mut **conn)
-        .await
-        .map_err(|err| crate::runtime::pg_read_error("pg_prerun_rank_meta", err))?,
-    };
+    let bytes_opt: Option<Vec<u8>> =
+        match tx {
+            BackendConn::Sqlite(conn) => {
+                let mut found = None;
+                let mut stream = sqlx::query_as::<_, (i64, Vec<u8>)>(PRERUN_RANK_SQLITE_SQL)
+                    .bind(scope.space_id.as_str())
+                    .bind(scope.incarnation.as_bytes().as_slice())
+                    .bind(&key)
+                    .bind(run.as_str())
+                    .bind(before_i64)
+                    .fetch(&mut **conn);
+                while let Some((vis_seq, bytes)) = stream.try_next().await.map_err(|err| {
+                    internal_not_committed("sqlite_prerun_rank_meta", err.to_string())
+                })? {
+                    if !run_vis_seqs.contains(&vis_seq) {
+                        found = Some(bytes);
+                        break;
+                    }
+                }
+                found
+            }
+            BackendConn::Postgres(conn) => {
+                let mut found = None;
+                let mut stream = sqlx::query_as::<_, (i64, Vec<u8>)>(
+                    "SELECT visibility_seq, metadata_msgpack FROM revisions
+                 WHERE space_id = $1 AND history_incarnation = $2
+                   AND entity_type = 'rank' AND entity_key = $3
+                   AND (agent_run_id IS NULL OR agent_run_id != $4)
+                   AND space_seq < $5
+                 ORDER BY visibility_seq DESC, space_seq DESC",
+                )
+                .bind(scope.space_id.as_str())
+                .bind(scope.incarnation.as_bytes().as_slice())
+                .bind(&key)
+                .bind(run.as_str())
+                .bind(before_i64)
+                .fetch(&mut **conn);
+                while let Some((vis_seq, bytes)) = stream
+                    .try_next()
+                    .await
+                    .map_err(|err| crate::runtime::pg_read_error("pg_prerun_rank_meta", err))?
+                {
+                    if !run_vis_seqs.contains(&vis_seq) {
+                        found = Some(bytes);
+                        break;
+                    }
+                }
+                found
+            }
+        };
     let Some(bytes) = bytes_opt else {
         return Ok(None);
     };
@@ -1954,6 +2006,363 @@ async fn load_latest_prerun_rank_meta_tx(
             "rank revision metadata has unexpected payload variant",
         )),
     }
+}
+
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn plan_inactive_view_rollbacks_tx<'a>(
+    tx: &'a mut BackendConn<'_>,
+    scope_cl: &'a HistoryScope,
+    run: &'a AgentRunId,
+    run_moves_cl: &'a [RunBoardMoveRow],
+    eligible_notes: &'a BTreeMap<NoteId, CandidateAction>,
+    eligible_all_ids: &'a BTreeSet<NoteId>,
+    retired_note_ids: &'a BTreeSet<NoteId>,
+    active_after_rollback_views: &'a BTreeSet<ViewRef>,
+    affected_views_set: &'a BTreeSet<ViewRef>,
+    rb_facts_opt: &'a Option<notarium_core::ports::RollbackBoardFacts>,
+    run_vis_seqs: &'a std::collections::HashSet<i64>,
+    planned_overlay_deletes: &'a mut Vec<PlannedOverlayDelete>,
+    planned_target_restores: &'a mut Vec<PlannedTargetRankRestore>,
+    planned_neighbor_updates: &'a mut Vec<PlannedNeighborRankUpdate>,
+    preloaded_view_overlays: &'a mut BTreeMap<
+        ViewRef,
+        HashMap<NoteId, crate::domain::board::OverlayRow>,
+    >,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), PortError>> + Send + 'a>> {
+    Box::pin(async move {
+        let inactive_or_retired_views: BTreeSet<ViewRef> = run_moves_cl
+            .iter()
+            .map(|bmh| &bmh.view)
+            .filter(|view| {
+                !retired_note_ids.contains(&view.note)
+                    && (!active_after_rollback_views.contains(*view)
+                        || (affected_views_set.contains(*view)
+                            && rb_facts_opt
+                                .as_ref()
+                                .is_none_or(|facts| !facts.views().contains_key(*view))))
+            })
+            .cloned()
+            .collect();
+        for view in &inactive_or_retired_views {
+            let overlays = load_view_overlays_tx(tx, &scope_cl.space_id, view).await?;
+            let mut earliest_bmh_for_target: HashMap<NoteId, &RunBoardMoveRow> = HashMap::new();
+            for bmh in run_moves_cl {
+                if &bmh.view == view
+                    && eligible_all_ids.contains(&bmh.target_note_id)
+                    && !retired_note_ids.contains(&bmh.target_note_id)
+                {
+                    earliest_bmh_for_target.insert(bmh.target_note_id.clone(), bmh);
+                }
+            }
+            let view_has_rollback_effect =
+                eligible_all_ids.contains(&view.note) || !earliest_bmh_for_target.is_empty();
+            let mut run_mat_seqs: BTreeMap<NoteId, SpaceSeq> = BTreeMap::new();
+            if view_has_rollback_effect {
+                for (nid, ov) in &overlays {
+                    if !retired_note_ids.contains(nid)
+                        && ov.placement_run_id.is_none()
+                        && let Some(seq) = run_materialized_overlay_seq_tx(
+                            tx,
+                            &scope_cl.space_id,
+                            &ov.placement_revision,
+                            run,
+                        )
+                        .await?
+                    {
+                        run_mat_seqs.insert(nid.clone(), seq);
+                    }
+                }
+            }
+            let mut overlay_ids: Vec<NoteId> = overlays.keys().cloned().collect();
+            overlay_ids.sort();
+            let mut prerun_restores: Vec<(NoteId, crate::codec::RankRevisionMetadata)> = Vec::new();
+            let mut pending_mat_deletes: Vec<(NoteId, GroupKey, String)> = Vec::new();
+            let mut cleared_run_owned: BTreeSet<NoteId> = BTreeSet::new();
+            let mut cleared_to_unranked: Vec<(NoteId, GroupKey, Option<NoteId>, Option<NoteId>)> =
+                Vec::new();
+            for nid in overlay_ids {
+                if retired_note_ids.contains(&nid) {
+                    continue;
+                }
+                let ov = &overlays[&nid];
+                if ov.placement_run_id.as_ref() == Some(run) {
+                    let Some(earliest_bmh) = earliest_bmh_for_target.get(&nid) else {
+                        continue;
+                    };
+                    let mut cutoff_seq = earliest_bmh.command_end_seq;
+                    if let Some(CandidateAction::RestorePreExisting { first_run_seq, .. }) =
+                        eligible_notes.get(&nid)
+                    {
+                        cutoff_seq = cutoff_seq.min(*first_run_seq);
+                    }
+                    match &earliest_bmh.before_placement {
+                        StoredSemanticPlacementV1::Ineligible => {
+                            cleared_run_owned.insert(nid.clone());
+                            planned_overlay_deletes.push(PlannedOverlayDelete {
+                                view: view.clone(),
+                                target_note: nid,
+                            });
+                        }
+                        StoredSemanticPlacementV1::InGroup {
+                            group: expected_before_grp,
+                            predecessor,
+                            successor,
+                        } => {
+                            let prerun = load_latest_prerun_rank_meta_tx(
+                                tx,
+                                scope_cl,
+                                view,
+                                &nid,
+                                run,
+                                run_vis_seqs,
+                                cutoff_seq,
+                            )
+                            .await?;
+                            if let Some(meta) = prerun
+                                && !meta.removed
+                                && &meta.group_key == expected_before_grp
+                            {
+                                prerun_restores.push((nid, meta));
+                            } else {
+                                cleared_run_owned.insert(nid.clone());
+                                cleared_to_unranked.push((
+                                    nid,
+                                    expected_before_grp.clone(),
+                                    predecessor.clone(),
+                                    successor.clone(),
+                                ));
+                            }
+                        }
+                    }
+                } else if let Some(&mat_seq) = run_mat_seqs.get(&nid) {
+                    let restored_fields = match eligible_notes.get(&nid) {
+                        Some(CandidateAction::RestorePreExisting {
+                            needs_note_mutation,
+                            first_run_seq,
+                            ..
+                        }) if *needs_note_mutation => Some(*first_run_seq),
+                        _ => None,
+                    };
+                    let cutoff_seq = restored_fields.map_or(mat_seq, |first| first.min(mat_seq));
+                    let prerun = load_latest_prerun_rank_meta_tx(
+                        tx,
+                        scope_cl,
+                        view,
+                        &nid,
+                        run,
+                        run_vis_seqs,
+                        cutoff_seq,
+                    )
+                    .await?;
+                    if let Some(meta) = prerun
+                        && !meta.removed
+                        && (restored_fields.is_some() || meta.group_key == ov.group)
+                    {
+                        prerun_restores.push((nid, meta));
+                    } else if restored_fields.is_some() {
+                        cleared_run_owned.insert(nid.clone());
+                        planned_overlay_deletes.push(PlannedOverlayDelete {
+                            view: view.clone(),
+                            target_note: nid,
+                        });
+                    } else {
+                        pending_mat_deletes.push((
+                            nid,
+                            ov.group.clone(),
+                            ov.sort_rank_lexo.clone(),
+                        ));
+                    }
+                }
+            }
+            let mut deleted_mat_ids: BTreeSet<NoteId> = BTreeSet::new();
+            for (nid, grp, rank) in pending_mat_deletes {
+                let has_surviving_ranked_below = overlays.iter().any(|(other_id, other_ov)| {
+                    other_id != &nid
+                        && other_ov.group == grp
+                        && !retired_note_ids.contains(other_id)
+                        && !run_mat_seqs.contains_key(other_id)
+                        && !cleared_run_owned.contains(other_id)
+                        && !prerun_restores.iter().any(|(rid, _)| rid == other_id)
+                        && (other_ov.sort_rank_lexo > rank
+                            || other_ov.placement_run_id.as_ref() == Some(run))
+                }) || prerun_restores.iter().any(|(rid, meta)| {
+                    rid != &nid && meta.group_key == grp && meta.sort_rank_lexo > rank
+                });
+                if !has_surviving_ranked_below {
+                    deleted_mat_ids.insert(nid.clone());
+                    planned_overlay_deletes.push(PlannedOverlayDelete {
+                        view: view.clone(),
+                        target_note: nid,
+                    });
+                }
+            }
+            let mut surviving_by_group: BTreeMap<Vec<u8>, Vec<ExistingRankedItem>> =
+                BTreeMap::new();
+            for (nid, ov) in &overlays {
+                if retired_note_ids.contains(nid)
+                    || cleared_run_owned.contains(nid)
+                    || deleted_mat_ids.contains(nid)
+                    || prerun_restores.iter().any(|(rid, _)| rid == nid)
+                {
+                    continue;
+                }
+                let gkey = encode_msgpack(&ov.group)?;
+                surviving_by_group
+                    .entry(gkey)
+                    .or_default()
+                    .push(ExistingRankedItem {
+                        note_id: nid.clone(),
+                        rank: ov.sort_rank_lexo.clone(),
+                    });
+            }
+            for items in surviving_by_group.values_mut() {
+                items.sort_by(|a, b| a.rank.cmp(&b.rank).then_with(|| a.note_id.cmp(&b.note_id)));
+            }
+            let mut inactive_neighbor_updates: BTreeMap<NoteId, (GroupKey, String, bool)> =
+                BTreeMap::new();
+            let mut settled_prerun: BTreeMap<NoteId, PlannedTargetRankRestore> = BTreeMap::new();
+            prerun_restores.sort_by(|a, b| {
+                a.1.sort_rank_lexo
+                    .cmp(&b.1.sort_rank_lexo)
+                    .then_with(|| a.0.cmp(&b.0))
+            });
+            for (nid, meta) in prerun_restores {
+                let gkey = encode_msgpack(&meta.group_key)?;
+                let items = surviving_by_group.entry(gkey).or_default();
+                let collides = items.iter().any(|it| it.rank == meta.sort_rank_lexo);
+                let settled_rank = if !collides {
+                    let pos = items
+                        .iter()
+                        .position(|it| it.rank > meta.sort_rank_lexo)
+                        .unwrap_or(items.len());
+                    items.insert(
+                        pos,
+                        ExistingRankedItem {
+                            note_id: nid.clone(),
+                            rank: meta.sort_rank_lexo.clone(),
+                        },
+                    );
+                    meta.sort_rank_lexo
+                } else {
+                    let pos = items
+                        .iter()
+                        .position(|it| it.rank >= meta.sort_rank_lexo)
+                        .unwrap_or(items.len());
+                    let computed = compute_rank_placement(items, &nid, pos)?;
+                    for (pn, pr) in computed.pma_neighbor_updates {
+                        if let Some(it) = items.iter_mut().find(|i| i.note_id == pn) {
+                            it.rank = pr.clone();
+                        }
+                        if let Some(prev) = settled_prerun.get_mut(&pn) {
+                            prev.rank = pr;
+                        } else {
+                            let is_pma =
+                                overlays.get(&pn).is_some_and(|o| o.group == meta.group_key)
+                                    && !run_mat_seqs.contains_key(&pn);
+                            inactive_neighbor_updates
+                                .insert(pn, (meta.group_key.clone(), pr, is_pma));
+                        }
+                    }
+                    items.insert(
+                        pos,
+                        ExistingRankedItem {
+                            note_id: nid.clone(),
+                            rank: computed.target_rank.clone(),
+                        },
+                    );
+                    computed.target_rank
+                };
+                settled_prerun.insert(
+                    nid.clone(),
+                    PlannedTargetRankRestore {
+                        view: view.clone(),
+                        target_note: nid,
+                        group: meta.group_key,
+                        rank: settled_rank,
+                        restored_placement_revision: Some(meta.placement_revision),
+                        restored_placement_actor: Some(meta.placement_actor_id),
+                        restored_placement_run: meta.placement_run_id,
+                    },
+                );
+            }
+            for (nid, grp, pred, succ) in cleared_to_unranked {
+                let gkey = encode_msgpack(&grp)?;
+                let has_anchored_surviving = surviving_by_group.get(&gkey).is_some_and(|items| {
+                    !items.is_empty()
+                        && (pred
+                            .as_ref()
+                            .is_some_and(|p| items.iter().any(|it| &it.note_id == p))
+                            || succ
+                                .as_ref()
+                                .is_some_and(|s| items.iter().any(|it| &it.note_id == s)))
+                });
+                if !has_anchored_surviving {
+                    planned_overlay_deletes.push(PlannedOverlayDelete {
+                        view: view.clone(),
+                        target_note: nid,
+                    });
+                    continue;
+                }
+                let items = surviving_by_group.entry(gkey).or_default();
+                let lo = pred
+                    .as_ref()
+                    .and_then(|p| items.iter().position(|it| &it.note_id == p).map(|i| i + 1))
+                    .unwrap_or(0);
+                let hi = succ
+                    .as_ref()
+                    .and_then(|s| items.iter().position(|it| &it.note_id == s))
+                    .unwrap_or(items.len());
+                let ins_idx = if hi >= lo { hi } else { lo.min(items.len()) };
+                let computed = compute_rank_placement(items, &nid, ins_idx)?;
+                for (pn, pr) in computed.pma_neighbor_updates {
+                    if let Some(it) = items.iter_mut().find(|i| i.note_id == pn) {
+                        it.rank = pr.clone();
+                    }
+                    if let Some(prev) = settled_prerun.get_mut(&pn) {
+                        prev.rank = pr;
+                    } else {
+                        let is_pma = overlays.get(&pn).is_some_and(|o| o.group == grp)
+                            && !run_mat_seqs.contains_key(&pn);
+                        inactive_neighbor_updates.insert(pn, (grp.clone(), pr, is_pma));
+                    }
+                }
+                items.insert(
+                    ins_idx,
+                    ExistingRankedItem {
+                        note_id: nid.clone(),
+                        rank: computed.target_rank.clone(),
+                    },
+                );
+                settled_prerun.insert(
+                    nid.clone(),
+                    PlannedTargetRankRestore {
+                        view: view.clone(),
+                        target_note: nid,
+                        group: grp,
+                        rank: computed.target_rank,
+                        restored_placement_revision: None,
+                        restored_placement_actor: None,
+                        restored_placement_run: None,
+                    },
+                );
+            }
+            for restore in settled_prerun.into_values() {
+                planned_target_restores.push(restore);
+            }
+            for (nbr_id, (grp, rnk, is_pma)) in inactive_neighbor_updates {
+                planned_neighbor_updates.push(PlannedNeighborRankUpdate {
+                    view: view.clone(),
+                    neighbor_note: nbr_id,
+                    group: grp,
+                    rank: rnk,
+                    is_pma,
+                });
+            }
+            preloaded_view_overlays.insert(view.clone(), overlays);
+        }
+        Ok(())
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1971,6 +2380,7 @@ fn build_rollback_execute_fn(
     active_after_rollback_views: BTreeSet<ViewRef>,
     rb_facts_opt: Option<notarium_core::ports::RollbackBoardFacts>,
     run_moves_cl: Vec<RunBoardMoveRow>,
+    observed_max_bmh_seq: i64,
 ) -> crate::writer::ItemExecuteFn {
     Box::new(move |tx, item_ctx| {
         Box::pin(async move {
@@ -1988,6 +2398,14 @@ fn build_rollback_execute_fn(
                 &mut folder_cache,
             )
             .await?;
+            // Intra-column board moves advance `board_move_history` without changing `note_heads.head_rev_id`.
+            // Replan if any board move committed between discovery and write execution so confirmed
+            // manual card reorderings are classified into `skipped_manual_edits`.
+            if !eligible_notes.is_empty()
+                && load_max_board_move_seq_tx(tx, &scope_cl.space_id).await? != observed_max_bmh_seq
+            {
+                return Err(DomainError::validation(ValidationReason::CursorStale).into());
+            }
 
             // 2. Lock all closed-room reservations in ascending NoteId order.
             let mut locked_fences = Vec::with_capacity(eligible_reservations.len());
@@ -2084,6 +2502,11 @@ fn build_rollback_execute_fn(
                 HashMap<NoteId, crate::domain::board::OverlayRow>,
             > = BTreeMap::new();
 
+            let run_vis_seqs = if rb_facts_opt.is_some() || !run_moves_cl.is_empty() {
+                load_run_visibility_seqs_tx(tx, &scope_cl, &input.run).await?
+            } else {
+                std::collections::HashSet::new()
+            };
             if let Some(ref rb_facts) = rb_facts_opt {
                 let current_schema = load_current_space_schema_tx(tx, &scope_cl.space_id).await?;
                 let cur_schema_rev = current_schema.as_ref().map(|s| &s.schema_revision);
@@ -2306,6 +2729,7 @@ fn build_rollback_execute_fn(
                                         view,
                                         &nid,
                                         &input.run,
+                                        &run_vis_seqs,
                                         stale_before,
                                     )
                                     .await?
@@ -2368,7 +2792,13 @@ fn build_rollback_execute_fn(
                         let same_group = current_group.as_ref() == Some(&ov.group);
                         if let Some(post_grp) = current_group {
                             let prerun = load_latest_prerun_rank_meta_tx(
-                                tx, &scope_cl, view, &nid, &input.run, mat_seq,
+                                tx,
+                                &scope_cl,
+                                view,
+                                &nid,
+                                &input.run,
+                                &run_vis_seqs,
+                                mat_seq,
                             )
                             .await?;
                             if let Some(meta) = prerun
@@ -2490,6 +2920,7 @@ fn build_rollback_execute_fn(
                                             view,
                                             target,
                                             &input.run,
+                                            &run_vis_seqs,
                                             prerun_before,
                                         )
                                         .await?;
@@ -2878,6 +3309,7 @@ fn build_rollback_execute_fn(
                                         view,
                                         target,
                                         &input.run,
+                                        &run_vis_seqs,
                                         bmh.command_end_seq,
                                     )
                                     .await?
@@ -3253,7 +3685,9 @@ fn build_rollback_execute_fn(
                                         && !retired_note_ids.contains(other_id)
                                         && !moved_targets_on_view.contains(other_id)
                                         && !same_group_run_materialized.contains_key(other_id)
-                                        && other_ov.sort_rank_lexo.as_str() > rank
+                                        && (other_ov.sort_rank_lexo.as_str() > rank
+                                            || other_ov.placement_run_id.as_ref()
+                                                == Some(&input.run))
                                 })
                             });
                         if !group_has_surviving_ranked_below {
@@ -3276,137 +3710,24 @@ fn build_rollback_execute_fn(
             // Delete run-owned overlays on views that are inactive, human-trashed, or
             // no longer valid board views after rollback so rolled-back agent ordering
             // cannot survive or resurrect if a trashed view or ancestor folder is restored.
-            let inactive_or_retired_views: BTreeSet<ViewRef> = run_moves_cl
-                .iter()
-                .map(|bmh| &bmh.view)
-                .filter(|view| {
-                    !retired_note_ids.contains(&view.note)
-                        && (!active_after_rollback_views.contains(*view)
-                            || (affected_views_set.contains(*view)
-                                && rb_facts_opt
-                                    .as_ref()
-                                    .is_none_or(|facts| !facts.views().contains_key(*view))))
-                })
-                .cloned()
-                .collect();
-            for view in &inactive_or_retired_views {
-                let overlays = load_view_overlays_tx(tx, &scope_cl.space_id, view).await?;
-                let touched_on_view: BTreeSet<&NoteId> = run_moves_cl
-                    .iter()
-                    .filter(|bmh| {
-                        &bmh.view == view
-                            && eligible_all_ids.contains(&bmh.target_note_id)
-                            && !retired_note_ids.contains(&bmh.target_note_id)
-                    })
-                    .map(|bmh| &bmh.target_note_id)
-                    .collect();
-                let view_has_rollback_effect = eligible_all_ids.contains(&view.note)
-                    || run_moves_cl.iter().any(|bmh| {
-                        &bmh.view == view && eligible_all_ids.contains(&bmh.target_note_id)
-                    });
-                let mut run_mat_seqs: BTreeMap<NoteId, SpaceSeq> = BTreeMap::new();
-                if view_has_rollback_effect {
-                    for (nid, ov) in &overlays {
-                        if !retired_note_ids.contains(nid)
-                            && ov.placement_run_id.is_none()
-                            && let Some(seq) = run_materialized_overlay_seq_tx(
-                                tx,
-                                &scope_cl.space_id,
-                                &ov.placement_revision,
-                                &input.run,
-                            )
-                            .await?
-                        {
-                            run_mat_seqs.insert(nid.clone(), seq);
-                        }
-                    }
-                }
-                let mut restored_prerun_in_view: Vec<(NoteId, GroupKey, String)> = Vec::new();
-                let mut pending_mat_deletes: Vec<(NoteId, GroupKey, String)> = Vec::new();
-                let mut cleared_run_owned: BTreeSet<NoteId> = BTreeSet::new();
-                for (nid, ov) in &overlays {
-                    if retired_note_ids.contains(nid) {
-                        continue;
-                    }
-                    let (is_run_mat, cutoff_seq) = if ov.placement_run_id.as_ref()
-                        == Some(&input.run)
-                    {
-                        if touched_on_view.contains(nid) {
-                            (
-                                false,
-                                run_moves_cl
-                                    .iter()
-                                    .filter(|bmh| &bmh.view == view && &bmh.target_note_id == nid)
-                                    .map(|bmh| bmh.command_end_seq)
-                                    .min(),
-                            )
-                        } else {
-                            (false, None)
-                        }
-                    } else if let Some(&seq) = run_mat_seqs.get(nid) {
-                        (true, Some(seq))
-                    } else {
-                        (false, None)
-                    };
-                    if let Some(before_seq) = cutoff_seq {
-                        if let Some(meta) = load_latest_prerun_rank_meta_tx(
-                            tx, &scope_cl, view, nid, &input.run, before_seq,
-                        )
-                        .await?
-                            && !meta.removed
-                        {
-                            restored_prerun_in_view.push((
-                                nid.clone(),
-                                meta.group_key.clone(),
-                                meta.sort_rank_lexo.clone(),
-                            ));
-                            planned_target_restores.push(PlannedTargetRankRestore {
-                                view: view.clone(),
-                                target_note: nid.clone(),
-                                group: meta.group_key,
-                                rank: meta.sort_rank_lexo,
-                                restored_placement_revision: Some(meta.placement_revision),
-                                restored_placement_actor: Some(meta.placement_actor_id),
-                                restored_placement_run: meta.placement_run_id,
-                            });
-                        } else if is_run_mat {
-                            pending_mat_deletes.push((
-                                nid.clone(),
-                                ov.group.clone(),
-                                ov.sort_rank_lexo.clone(),
-                            ));
-                        } else {
-                            cleared_run_owned.insert(nid.clone());
-                            planned_overlay_deletes.push(PlannedOverlayDelete {
-                                view: view.clone(),
-                                target_note: nid.clone(),
-                            });
-                        }
-                    }
-                }
-                for (nid, grp, rank) in pending_mat_deletes {
-                    let has_surviving_ranked_below = overlays.iter().any(|(other_id, other_ov)| {
-                        other_id != &nid
-                            && other_ov.group == grp
-                            && !retired_note_ids.contains(other_id)
-                            && !run_mat_seqs.contains_key(other_id)
-                            && !cleared_run_owned.contains(other_id)
-                            && !restored_prerun_in_view
-                                .iter()
-                                .any(|(rid, _, _)| rid == other_id)
-                            && other_ov.sort_rank_lexo > rank
-                    }) || restored_prerun_in_view
-                        .iter()
-                        .any(|(rid, rgrp, rrank)| rid != &nid && rgrp == &grp && rrank > &rank);
-                    if !has_surviving_ranked_below {
-                        planned_overlay_deletes.push(PlannedOverlayDelete {
-                            view: view.clone(),
-                            target_note: nid,
-                        });
-                    }
-                }
-                preloaded_view_overlays.insert(view.clone(), overlays);
-            }
+            plan_inactive_view_rollbacks_tx(
+                tx,
+                &scope_cl,
+                &input.run,
+                &run_moves_cl,
+                &eligible_notes,
+                &eligible_all_ids,
+                &retired_note_ids,
+                &active_after_rollback_views,
+                &affected_views_set,
+                &rb_facts_opt,
+                &run_vis_seqs,
+                &mut planned_overlay_deletes,
+                &mut planned_target_restores,
+                &mut planned_neighbor_updates,
+                &mut preloaded_view_overlays,
+            )
+            .await?;
 
             // 5. Count exact SpaceSeq allocations before executing SQL mutations.
             let trash_note_count = eligible_notes
@@ -4076,6 +4397,7 @@ async fn discover_rollback_state_tx(
         Vec<RunBoardMoveRow>,
         BTreeSet<NoteId>,
         Option<SpaceSeq>,
+        i64,
     ),
     PortError,
 > {
@@ -4109,8 +4431,8 @@ async fn discover_rollback_state_tx(
 
     let mut rev_histories =
         load_notes_revision_histories_batch_tx(tx, &srec.scope.space_id, &touched_sorted).await?;
-    let space_has_bmh =
-        !run_moves.is_empty() || has_any_board_moves_in_space_tx(tx, &srec.scope.space_id).await?;
+    let observed_max_bmh_seq = load_max_board_move_seq_tx(tx, &srec.scope.space_id).await?;
+    let space_has_bmh = !run_moves.is_empty() || observed_max_bmh_seq > 0;
 
     let mut skipped_manual_edits = Vec::new();
     let mut candidates = BTreeMap::new();
@@ -4284,6 +4606,7 @@ async fn discover_rollback_state_tx(
         run_moves,
         active_views,
         package_cut,
+        observed_max_bmh_seq,
     ))
 }
 
@@ -5415,28 +5738,36 @@ async fn load_rollback_note_states(
     Ok(states)
 }
 
-async fn has_any_board_moves_in_space_tx(
+async fn load_max_board_move_seq_tx(
     tx: &mut BackendConn<'_>,
     space_id: &SpaceId,
-) -> Result<bool, PortError> {
+) -> Result<i64, PortError> {
     match tx {
         BackendConn::Sqlite(conn) => {
-            let found: Option<i64> =
-                sqlx::query_scalar("SELECT 1 FROM board_move_history WHERE space_id = ? LIMIT 1")
-                    .bind(space_id.as_str())
-                    .fetch_optional(&mut **conn)
-                    .await
-                    .map_err(|err| internal_not_committed("sqlite_has_bmh", err.to_string()))?;
-            Ok(found.is_some())
+            let max_seq: Option<i64> = sqlx::query_scalar(
+                "SELECT command_end_seq FROM board_move_history
+                 WHERE space_id = ?
+                 ORDER BY command_end_seq DESC
+                 LIMIT 1",
+            )
+            .bind(space_id.as_str())
+            .fetch_optional(&mut **conn)
+            .await
+            .map_err(|err| internal_not_committed("sqlite_max_bmh_seq", err.to_string()))?;
+            Ok(max_seq.unwrap_or(0))
         }
         BackendConn::Postgres(conn) => {
-            let found: Option<i32> =
-                sqlx::query_scalar("SELECT 1 FROM board_move_history WHERE space_id = $1 LIMIT 1")
-                    .bind(space_id.as_str())
-                    .fetch_optional(&mut **conn)
-                    .await
-                    .map_err(|err| crate::runtime::pg_read_error("pg_has_bmh", err))?;
-            Ok(found.is_some())
+            let max_seq: Option<i64> = sqlx::query_scalar(
+                "SELECT command_end_seq FROM board_move_history
+                 WHERE space_id = $1
+                 ORDER BY command_end_seq DESC
+                 LIMIT 1",
+            )
+            .bind(space_id.as_str())
+            .fetch_optional(&mut **conn)
+            .await
+            .map_err(|err| crate::runtime::pg_read_error("pg_max_bmh_seq", err))?;
+            Ok(max_seq.unwrap_or(0))
         }
     }
 }

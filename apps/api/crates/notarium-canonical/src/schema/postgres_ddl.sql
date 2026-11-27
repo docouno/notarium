@@ -114,6 +114,9 @@ CREATE INDEX IF NOT EXISTS idx_folder_aliases_lookup
 CREATE INDEX IF NOT EXISTS idx_folder_aliases_projection_seq
     ON folder_aliases (space_id, created_seq);
 
+CREATE INDEX IF NOT EXISTS idx_folder_aliases_parent_seq
+    ON folder_aliases (space_id, old_parent_folder_id, created_seq);
+
 CREATE TABLE IF NOT EXISTS note_heads (
     space_id TEXT NOT NULL,
     note_id TEXT NOT NULL,
@@ -158,6 +161,10 @@ CREATE INDEX IF NOT EXISTS idx_note_heads_created_seq
 
 CREATE INDEX IF NOT EXISTS idx_note_heads_keyset
     ON note_heads (space_id, note_id COLLATE "C", created_seq);
+
+CREATE INDEX IF NOT EXISTS idx_note_heads_space_title_fold
+    ON note_heads (space_id, title_fold, note_id COLLATE "C")
+    WHERE lifecycle_state = 'active';
 
 CREATE TABLE IF NOT EXISTS note_aliases (
     space_id TEXT NOT NULL,
@@ -266,6 +273,9 @@ CREATE TABLE IF NOT EXISTS revision_purge_fences (
     FOREIGN KEY (space_id) REFERENCES spaces (space_id)
 );
 
+CREATE INDEX IF NOT EXISTS idx_revision_purge_fences_seq
+    ON revision_purge_fences (space_id, history_incarnation, purge_seq);
+
 CREATE TABLE IF NOT EXISTS ability_packages (
     space_id TEXT NOT NULL,
     ability_id TEXT NOT NULL,
@@ -290,6 +300,10 @@ CREATE INDEX IF NOT EXISTS idx_ability_packages_entrypoint
 
 CREATE INDEX IF NOT EXISTS idx_ability_packages_keyset
     ON ability_packages (space_id, ability_id COLLATE "C")
+    WHERE lifecycle_state = 'active';
+
+CREATE INDEX IF NOT EXISTS idx_ability_packages_space_kind
+    ON ability_packages (space_id, kind, ability_id COLLATE "C")
     WHERE lifecycle_state = 'active';
 
 CREATE TABLE IF NOT EXISTS view_rank_overlays (

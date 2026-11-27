@@ -196,6 +196,10 @@ async fn both_dialects_have_the_same_schema_and_constraints() {
             true,
         ),
         ("UPDATE provider_budget_buckets SET tpm_reserved=-1", false),
+        (
+            "INSERT INTO provider_resources(id,owner_id,name,wire,base_url,headers,credential_id,consent_epoch,runtime_epoch,timeouts,revision) VALUES ('res_check','principal_A','r','openai','https://api.openai.com/v1','{}',NULL,1,1,'{}',1)",
+            true,
+        ),
     ] {
         assert_eq!(
             sqlx::query(sql).execute(&mut local).await.is_ok(),
@@ -212,6 +216,49 @@ async fn both_dialects_have_the_same_schema_and_constraints() {
             "PostgreSQL: {sql}"
         );
     }
+    let long_id = "a".repeat(1500);
+    let long_proj = "b".repeat(600);
+    let zero_hash = [0u8; 32];
+    let att_sql = "INSERT INTO provider_attachments(id,resource_id,target_kind,target_owner,target_space,target_project,resource_epoch,credential_epoch,state,disclosure,expires_at,revision) VALUES ($1,'res_check','project',NULL,'space',$2,1,NULL,'approved','{}',NULL,1)";
+    assert!(
+        sqlx::query(att_sql)
+            .bind(&long_id)
+            .bind(&long_proj)
+            .execute(&mut local)
+            .await
+            .is_err(),
+        "SQLite must enforce 2048B composite index bound on provider_attachments"
+    );
+    assert!(
+        sqlx::query(att_sql)
+            .bind(&long_id)
+            .bind(&long_proj)
+            .execute(&mut cloud)
+            .await
+            .is_err(),
+        "PostgreSQL must enforce 2048B composite index bound on provider_attachments"
+    );
+    let call_sql = "INSERT INTO provider_call_log(call_id,owner_id,principal,run_id,scope_id,intent_key,request_hash,resource_id,credential_id,policy_epochs,participating_spaces,model_id,reserved_tokens,bucket_keys,delivery_state,outcome,usage_source,input_tokens,output_tokens,diagnostic,dispatch_owner,created_at,settled_at) VALUES ($1,'principal_A','principal_A',$2,'sc','ik',$3,'res_check',NULL,'{}','[]',NULL,1,'[]','settled','completed','exact',1,1,NULL,NULL,10,20)";
+    assert!(
+        sqlx::query(call_sql)
+            .bind(&long_id)
+            .bind(&long_proj)
+            .bind(&zero_hash[..])
+            .execute(&mut local)
+            .await
+            .is_err(),
+        "SQLite must enforce 2048B composite index bound on provider_call_log(run_id, call_id)"
+    );
+    assert!(
+        sqlx::query(call_sql)
+            .bind(&long_id)
+            .bind(&long_proj)
+            .bind(&zero_hash[..])
+            .execute(&mut cloud)
+            .await
+            .is_err(),
+        "PostgreSQL must enforce 2048B composite index bound on provider_call_log(run_id, call_id)"
+    );
     let names = sqlx::query("SELECT username FROM v1_control.users")
         .fetch_one(&mut cloud)
         .await

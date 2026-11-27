@@ -614,6 +614,7 @@ impl SqliteBackupWorkerHandle {
     fn spawn(
         src_path: PathBuf,
         tmp_path: PathBuf,
+        backup_shutdown: Cancellation,
         finished: tokio::sync::oneshot::Sender<()>,
     ) -> Result<Self, PortError> {
         // Pre-create private `0600` destination file before opening SQLite on it.
@@ -631,7 +632,14 @@ impl SqliteBackupWorkerHandle {
             .name("notarium-sqlite-backup".to_owned())
             .spawn(move || {
                 let _finished = finished;
-                sqlite_backup_worker_loop(src_path, tmp_cl, cancel_cl, init_tx, cmd_rx);
+                sqlite_backup_worker_loop(
+                    src_path,
+                    tmp_cl,
+                    cancel_cl,
+                    backup_shutdown,
+                    init_tx,
+                    cmd_rx,
+                );
             })
             .map_err(|err| {
                 remove_tmp_artifacts_best_effort(&tmp_path);
@@ -742,6 +750,7 @@ fn sqlite_backup_worker_loop(
     src_path: PathBuf,
     tmp_path: PathBuf,
     cancel_flag: Arc<AtomicBool>,
+    backup_shutdown: Cancellation,
     init_tx: mpsc::SyncSender<Result<rusqlite::InterruptHandle, PortError>>,
     cmd_rx: mpsc::Receiver<SqliteWorkerCmd>,
 ) {
@@ -816,9 +825,13 @@ fn sqlite_backup_worker_loop(
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         } else {
-            match cmd_rx.recv() {
+            if backup_shutdown.is_cancelled() {
+                break;
+            }
+            match cmd_rx.recv_timeout(Duration::from_millis(5)) {
                 Ok(cmd) => cmd,
-                Err(_) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         };
         match cmd {
@@ -2070,6 +2083,12 @@ fn spool_tables(schema_version: u32) -> impl Iterator<Item = TableSpec> + Clone 
                             "idx_folder_heads_cover",
                         ];
                     }
+                    "folder_aliases" => {
+                        table.indexes = &[
+                            "idx_folder_aliases_lookup",
+                            "idx_folder_aliases_projection_seq",
+                        ];
+                    }
                     "command_receipts" => {
                         table.indexes = &[
                             "idx_command_receipts_expires",
@@ -2077,6 +2096,7 @@ fn spool_tables(schema_version: u32) -> impl Iterator<Item = TableSpec> + Clone 
                         ];
                     }
                     "note_heads" => table.indexes = &table.indexes[..3],
+                    "revision_purge_fences" => table.indexes = &[],
                     "ability_packages" => {
                         table.indexes = &[
                             "uq_ability_packages_active_slug",
@@ -3259,22 +3279,13 @@ impl PreparedBackup for CanonicalPreparedBackup {
                     )
                     .await;
                     drop(owner);
-                    if result.is_ok() {
-                        let deferred = {
-                            let mut pending = cleanup_store
-                                .inner
-                                .deferred_local_orphan_cleanups
-                                .lock()
-                                .expect("deferred local orphan cleanups mutex");
-                            std::mem::take(&mut *pending)
-                        };
-                        if !deferred.is_empty() {
-                            cleanup_store
-                                .cleanup_unretained_local_files_async(deferred)
-                                .await;
-                        }
-                    }
+                    let released_ok = result.is_ok();
+                    // Notify `hold.release().await` immediately once the SQL hold row is deleted
+                    // so releasing a hold never deadlocks on any caller holding a `StagedBlobTicket`.
                     let _ = done.send(result);
+                    if released_ok {
+                        cleanup_store.sweep_deferred_local_orphans_async(false).await;
+                    }
                 });
                 if !registered {
                     let mut owner = proof.owner.lock().await.take().expect("hold owns session");
@@ -3460,14 +3471,19 @@ impl CanonicalStore {
                         "backup shutting down",
                     ));
                 }
+                let worker_shutdown = store.inner.backup_shutdown.clone();
                 wait_for_phase(
                     remaining,
                     &ctx.budget.cancellation,
                     &store.inner.backup_shutdown,
                     async move {
                         tokio::task::spawn_blocking(move || {
-                            let worker =
-                                SqliteBackupWorkerHandle::spawn(src_path, tmp_path, finished)?;
+                            let worker = SqliteBackupWorkerHandle::spawn(
+                                src_path,
+                                tmp_path,
+                                worker_shutdown,
+                                finished,
+                            )?;
                             Ok((PreparedBackendDriver::Sqlite(worker), artifact_lease))
                         })
                         .await

@@ -741,11 +741,18 @@ async fn raw_reference_for_call(
         .locate_ability(discover_account, id.clone())
         .await?;
     if allow_unpinned_projects && project.is_none() {
-        for (space_id, grant) in call.auth.spaces() {
-            if allowed.contains(space_id) || !grant.read_classes.contains(&DocClass::Skill) {
-                continue;
-            }
-            let scoped = AccountContext::new(call.auth.restrict_to_space(space_id)?, call.budget());
+        let extra_spaces: BTreeSet<SpaceId> = call
+            .auth
+            .spaces()
+            .iter()
+            .filter(|(space_id, grant)| {
+                !allowed.contains(*space_id) && grant.read_classes.contains(&DocClass::Skill)
+            })
+            .map(|(space_id, _)| space_id.clone())
+            .collect();
+        if !extra_spaces.is_empty() {
+            let scoped =
+                AccountContext::new(call.auth.restrict_to_spaces(&extra_spaces), call.budget());
             for candidate in call
                 .registry
                 .catalog
@@ -1010,13 +1017,8 @@ struct AbilityBody {
 
 #[derive(Clone, Debug)]
 enum AbilityTaintCommit {
-    Resource {
-        scope: SpaceContext,
-        resource: Box<ClassifiedAbilityResource>,
-        selection: Option<Box<ProviderSelection>>,
-    },
     ForeignProject {
-        scope: SpaceContext,
+        scope: Box<SpaceContext>,
     },
     ForeignBranch {
         taint: notarium_core::auth::BranchTaint,
@@ -1051,7 +1053,7 @@ fn commit_deferred_taints_on_error(call: &ToolCallContext<'_>, taints: &[Ability
 impl AbilityTaintCommit {
     fn would_taint_branch(&self) -> bool {
         match self {
-            Self::Resource { scope, .. } | Self::ForeignProject { scope } => scope
+            Self::ForeignProject { scope } => scope
                 .auth()
                 .pinned_write_space()
                 .is_some_and(|pin| pin != &scope.scope().space_id),
@@ -1061,20 +1063,6 @@ impl AbilityTaintCommit {
 
     fn commit(self) -> Result<(), PortError> {
         match self {
-            Self::Resource {
-                scope,
-                resource,
-                selection: Some(selection),
-            } => {
-                ClassEgressFence::ability(*resource, scope.auth(), &selection.policy)?;
-            }
-            Self::Resource {
-                scope,
-                resource,
-                selection: None,
-            } => {
-                ClassEgressFence::mcp_ability(&resource, scope.auth())?;
-            }
             Self::ForeignProject { scope } => {
                 if scope
                     .auth()
@@ -1304,28 +1292,20 @@ async fn read_owned_resource_inner(
     };
     let (text, deferred_taint) = match selection {
         Some(selection) => {
-            if commit_taint {
-                let admitted = ClassEgressFence::ability(body, &fence_auth, &selection.policy)?;
-                (admitted.text().to_owned(), None)
-            } else {
-                let admitted =
-                    ClassEgressFence::ability(body.clone(), &fence_auth, &selection.policy)?;
-                (
-                    admitted.text().to_owned(),
-                    Some(AbilityTaintCommit::Resource {
-                        scope,
-                        resource: Box::new(body),
-                        selection: Some(Box::new(selection)),
-                    }),
-                )
-            }
+            let admitted = ClassEgressFence::ability(body, &fence_auth, &selection.policy)?;
+            let deferred = (!commit_taint && fence_auth.taint().is_tainted()).then(|| {
+                AbilityTaintCommit::ForeignBranch {
+                    taint: scope.auth().taint().clone(),
+                }
+            });
+            (admitted.text().to_owned(), deferred)
         }
         None => {
             let text = ClassEgressFence::mcp_ability(&body, &fence_auth)?.to_owned();
-            let deferred = (!commit_taint).then_some(AbilityTaintCommit::Resource {
-                scope,
-                resource: Box::new(body),
-                selection: None,
+            let deferred = (!commit_taint && fence_auth.taint().is_tainted()).then(|| {
+                AbilityTaintCommit::ForeignBranch {
+                    taint: scope.auth().taint().clone(),
+                }
             });
             (text, deferred)
         }
@@ -1538,7 +1518,9 @@ async fn list(
         && foreign_project
     {
         let proj_scope = session::space(call, &proj.space_id).await?;
-        deferred_taints.push(AbilityTaintCommit::ForeignProject { scope: proj_scope });
+        deferred_taints.push(AbilityTaintCommit::ForeignProject {
+            scope: Box::new(proj_scope),
+        });
     }
     let mut origin_records = Vec::new();
     let next_inner = if external {
@@ -1671,7 +1653,26 @@ async fn list(
         let mut resume_cursor: Option<String> = None;
         let mut has_more = false;
         let mut reached_end = false;
+        type PlacementKey = (u8, Option<String>, Option<String>);
+        let placement_key = |placement: &AbilityPlacement| -> PlacementKey {
+            match placement {
+                AbilityPlacement::OwnedProject(project) => (
+                    0,
+                    Some(project.space_id.as_str().to_owned()),
+                    Some(project.folder_id.as_str().to_owned()),
+                ),
+                AbilityPlacement::OwnedSpace(space) => (1, Some(space.as_str().to_owned()), None),
+                AbilityPlacement::OwnedPersonal(owner) => {
+                    (2, Some(owner.as_str().to_owned()), None)
+                }
+                AbilityPlacement::System => (3, None, None),
+            }
+        };
         let mut runtime_winner_cache: BTreeMap<String, RuntimeWinners> = BTreeMap::new();
+        let mut placement_visible_cache: BTreeMap<
+            (PlacementKey, Option<SpaceId>, Option<PlacementKey>),
+            bool,
+        > = BTreeMap::new();
         'scan: for page_idx in 0..MAX_PROVIDER_ABILITY_SCAN_PAGES {
             let mut page_start_cursor = control_cursor.clone();
             let page = match call
@@ -1771,11 +1772,27 @@ async fn list(
                     continue;
                 }
                 if use_provider_runtime_overlay {
-                    let visible = provider_placement_visible(call, descriptor, project.as_ref())
-                        .await
-                        .inspect_err(|_| {
-                            commit_deferred_taints_on_error(call, &deferred_taints);
-                        })?;
+                    let vis_key = (
+                        placement_key(&descriptor.reference.placement),
+                        descriptor.entrypoint.as_ref().map(|e| e.space_id.clone()),
+                        descriptor
+                            .promoted_from
+                            .as_ref()
+                            .map(|p| placement_key(&p.placement)),
+                    );
+                    let visible = match placement_visible_cache.get(&vis_key) {
+                        Some(&cached) => cached,
+                        None => {
+                            let computed =
+                                provider_placement_visible(call, descriptor, project.as_ref())
+                                    .await
+                                    .inspect_err(|_| {
+                                        commit_deferred_taints_on_error(call, &deferred_taints);
+                                    })?;
+                            placement_visible_cache.insert(vis_key, computed);
+                            computed
+                        }
+                    };
                     if !descriptor.enabled || !descriptor.healthy || !visible {
                         continue;
                     }
@@ -1963,7 +1980,9 @@ async fn get(call: &mut ToolCallContext<'_>, args: GetArgs) -> Result<Value, Por
             .is_some_and(|pin| pin != &proj.space_id)
     {
         let proj_scope = session::space(call, &proj.space_id).await?;
-        deferred_taints.push(AbilityTaintCommit::ForeignProject { scope: proj_scope });
+        deferred_taints.push(AbilityTaintCommit::ForeignProject {
+            scope: Box::new(proj_scope),
+        });
     }
     let inspection = match inspect_with_project(call, &args.reference, project.as_ref())
         .await
@@ -2272,10 +2291,31 @@ pub async fn bind_chat_role(
     // abilities neither shadow consented roles nor leak Disabled/Stale states
     // or durably bind a role unreachable to `runtime_abilities`.
     let shared_primary = matches!(selection.policy.audience, ProviderAudience::Shared { .. });
+    let mut exact_ar1_ref: Option<AbilityRef> = None;
+    let ar1_target_space: Option<Option<SpaceId>> = if selector.starts_with("ar1:") {
+        let reference: AbilityRef = parse_token(selector, "ar1:", MAX_TOKEN_BYTES)?;
+        let target = match &reference.placement {
+            AbilityPlacement::System => Some(None),
+            AbilityPlacement::OwnedSpace(space) => Some(Some(space.clone())),
+            AbilityPlacement::OwnedProject(folder) => Some(Some(folder.space_id.clone())),
+            AbilityPlacement::OwnedPersonal(_) => None,
+        };
+        exact_ar1_ref = Some(reference);
+        target
+    } else {
+        None
+    };
     let mut allowed_selections: BTreeMap<SpaceId, ProviderSelection> = BTreeMap::new();
     for (space_id, grant) in run_auth.spaces() {
         if !grant.read_classes.contains(&DocClass::Skill) {
             continue;
+        }
+        if let Some(ref target) = ar1_target_space {
+            match target {
+                None => continue,
+                Some(only_space) if space_id != only_space => continue,
+                Some(_) => {}
+            }
         }
         if space_id == &primary.scope().space_id {
             if selection.policy.allowed_classes.contains(&DocClass::Skill) {
@@ -2298,6 +2338,13 @@ pub async fn bind_chat_role(
             Err(error) => return Err(error),
         };
         if live.space.lifecycle != notarium_core::auth::SpaceLifecycle::Active {
+            continue;
+        }
+        if exact_ar1_ref
+            .as_ref()
+            .is_some_and(|r| matches!(r.placement, AbilityPlacement::OwnedPersonal(_)))
+            && live.space.kind != notarium_core::auth::SpaceKind::Personal
+        {
             continue;
         }
         if let Some(active) = project
@@ -2335,9 +2382,7 @@ pub async fn bind_chat_role(
         primary.budget.clone(),
     );
     let resolve_project = project.filter(|p| allowed.contains(&p.space_id)).cloned();
-    let mut exact_ar1_ref: Option<AbilityRef> = None;
-    let resolution = if selector.starts_with("ar1:") {
-        let reference: AbilityRef = parse_token(selector, "ar1:", MAX_TOKEN_BYTES)?;
+    let resolution = if let Some(reference) = exact_ar1_ref.clone() {
         match &reference.placement {
             AbilityPlacement::System => {
                 if !selection.policy.allowed_classes.contains(&DocClass::Skill) {
@@ -2359,7 +2404,6 @@ pub async fn bind_chat_role(
                 // admission on the resolved descriptor below.
             }
         }
-        exact_ar1_ref = Some(reference.clone());
         registry
             .control
             .resolve_ability(
@@ -2610,9 +2654,7 @@ async fn use_ability(
             .await?
     {
         const ROLE_LABEL: &str = "notarium.mcp.activate-role.v1";
-        replay_active_role_plan(call, &plan)
-            .await
-            .map_err(|error| super::note_tools::post_commit_error(ROLE_LABEL, error))?;
+        replay_active_role_plan(call, &plan).await?;
         let descriptor = call
             .registry
             .control
@@ -2623,9 +2665,10 @@ async fn use_ability(
             )
             .await
             .map_err(|error| {
-                super::note_tools::post_commit_error(
+                super::note_tools::batch_operational_error(
                     ROLE_LABEL,
                     collapse_provider_error(call, error),
+                    true,
                 )
             })?;
         let (rendered, deferred_taints) = activation(
@@ -2635,11 +2678,11 @@ async fn use_ability(
             args.budget_tokens.unwrap_or(DEFAULT_ACTIVATION_TOKENS),
         )
         .await
-        .map_err(|error| super::note_tools::post_commit_error(ROLE_LABEL, error))?;
+        .map_err(|error| super::note_tools::batch_operational_error(ROLE_LABEL, error, true))?;
         for taint in deferred_taints {
-            taint
-                .commit()
-                .map_err(|error| super::note_tools::post_commit_error(ROLE_LABEL, error))?;
+            taint.commit().map_err(|error| {
+                super::note_tools::batch_operational_error(ROLE_LABEL, error, true)
+            })?;
         }
         return Ok(rendered);
     }
@@ -2654,7 +2697,9 @@ async fn use_ability(
             .is_some_and(|pin| pin != &proj.space_id)
     {
         let proj_scope = session::space(call, &proj.space_id).await?;
-        Some(AbilityTaintCommit::ForeignProject { scope: proj_scope })
+        Some(AbilityTaintCommit::ForeignProject {
+            scope: Box::new(proj_scope),
+        })
     } else {
         None
     };
@@ -2714,7 +2759,43 @@ async fn use_ability(
         {
             return Err(DomainError::CrossSpaceTainted.into());
         }
-        save_active_role(call, episode, &descriptor.reference, project).await?;
+        if let Some(replayed_plan) =
+            save_active_role(call, episode, &descriptor.reference, project.clone()).await?
+            && (replayed_plan.active_role != descriptor.reference
+                || replayed_plan.project_hint != project)
+        {
+            const ROLE_LABEL: &str = "notarium.mcp.activate-role.v1";
+            let replayed_desc = call
+                .registry
+                .control
+                .get_ability(
+                    call.account(),
+                    replayed_plan.active_role.clone(),
+                    replayed_plan.project_hint.clone(),
+                )
+                .await
+                .map_err(|error| {
+                    super::note_tools::batch_operational_error(
+                        ROLE_LABEL,
+                        collapse_provider_error(call, error),
+                        true,
+                    )
+                })?;
+            let (replayed_rendered, replayed_taints) = activation(
+                call,
+                &replayed_desc,
+                replayed_plan.project_hint.as_ref(),
+                args.budget_tokens.unwrap_or(DEFAULT_ACTIVATION_TOKENS),
+            )
+            .await
+            .map_err(|error| super::note_tools::batch_operational_error(ROLE_LABEL, error, true))?;
+            for taint in replayed_taints {
+                taint.commit().map_err(|error| {
+                    super::note_tools::batch_operational_error(ROLE_LABEL, error, true)
+                })?;
+            }
+            return Ok(replayed_rendered);
+        }
     }
     for taint in deferred_taints {
         taint.commit()?;
@@ -2833,7 +2914,47 @@ pub(super) async fn activate_session_role(
         {
             return Err(DomainError::CrossSpaceTainted.into());
         }
-        save_active_role(call, episode, &descriptor.reference, project).await?;
+        if let Some(replayed_plan) =
+            save_active_role(call, episode, &descriptor.reference, project.clone()).await?
+            && (replayed_plan.active_role != descriptor.reference
+                || replayed_plan.project_hint != project)
+        {
+            let replayed_desc = call
+                .registry
+                .control
+                .get_ability(
+                    call.account(),
+                    replayed_plan.active_role.clone(),
+                    replayed_plan.project_hint.clone(),
+                )
+                .await
+                .map_err(|error| collapse_provider_error(call, error))?;
+            let replayed_body = read_body_inner(
+                call,
+                &replayed_desc,
+                replayed_plan.project_hint.as_ref(),
+                false,
+            )
+            .await
+            .map_err(|error| collapse_provider_error(call, error))?;
+            let replayed_budget = if replayed_body.instructions.len() <= MAX_ACTIVATION_TOKENS {
+                DEFAULT_ACTIVATION_TOKENS.max(replayed_body.instructions.len())
+            } else {
+                return Err(invalid(ValidationReason::BudgetExceeded));
+            };
+            let (replayed_rendered, replayed_taints) = activation_with_body(
+                call,
+                &replayed_desc,
+                replayed_plan.project_hint.as_ref(),
+                replayed_body,
+                replayed_budget,
+            )
+            .await?;
+            for taint in replayed_taints {
+                taint.commit()?;
+            }
+            return Ok(Some(replayed_rendered));
+        }
     }
     for taint in deferred_taints {
         taint.commit()?;
@@ -2849,6 +2970,8 @@ struct EpisodeRolePlan {
     expected: ControlRevision,
     active_role: AbilityRef,
     project_hint: Option<FolderRef>,
+    #[serde(default)]
+    already_active: bool,
 }
 
 async fn replay_active_role_plan(
@@ -2865,6 +2988,20 @@ async fn replay_active_role_plan(
     }
     if call.auth.taint().is_tainted() {
         return Err(DomainError::CrossSpaceTainted.into());
+    }
+    if plan.already_active {
+        call.registry
+            .control
+            .get_episode(call.account(), plan.episode.clone())
+            .await
+            .map_err(|error| {
+                super::note_tools::batch_operational_error(
+                    "notarium.mcp.activate-role.v1",
+                    error,
+                    false,
+                )
+            })?;
+        return Ok(());
     }
     call.registry
         .control
@@ -2896,7 +3033,7 @@ async fn save_active_role(
     episode: &AgentEpisode,
     role: &AbilityRef,
     project: Option<FolderRef>,
-) -> Result<(), PortError> {
+) -> Result<Option<EpisodeRolePlan>, PortError> {
     if matches!(
         call.auth.kind(),
         PrincipalKind::AgentRun(_) | PrincipalKind::Keeper(_)
@@ -2912,14 +3049,14 @@ async fn save_active_role(
         .lookup_journal::<EpisodeRolePlan>("activate-role")
         .await?
     {
-        return replay_active_role_plan(call, &plan).await;
+        replay_active_role_plan(call, &plan).await?;
+        return Ok(Some(plan));
     }
     if episode.lifecycle == notarium_core::ports::EpisodeLifecycle::Closed {
         return Err(invalid(ValidationReason::InvalidState));
     }
-    if episode.active_role.as_ref() == Some(role) && episode.project_hint == project {
-        return Ok(());
-    }
+    let already_active =
+        episode.active_role.as_ref() == Some(role) && episode.project_hint == project;
     let plan: EpisodeRolePlan = call
         .journal("activate-role", || async {
             Ok(EpisodeRolePlan {
@@ -2928,13 +3065,12 @@ async fn save_active_role(
                 expected: episode.revision,
                 active_role: role.clone(),
                 project_hint: project.clone(),
+                already_active,
             })
         })
         .await?;
-    if plan.episode != episode.id || &plan.active_role != role || plan.project_hint != project {
-        return Err(invalid(ValidationReason::SourceMismatch));
-    }
-    replay_active_role_plan(call, &plan).await
+    replay_active_role_plan(call, &plan).await?;
+    Ok(Some(plan))
 }
 
 async fn activation(

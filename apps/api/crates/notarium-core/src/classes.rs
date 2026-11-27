@@ -344,6 +344,9 @@ impl ClassifiedDocument {
     pub fn lifecycle(&self) -> Lifecycle {
         self.lifecycle
     }
+    pub fn content_bytes(&self) -> usize {
+        self.content.len()
+    }
     pub fn listing(&self, auth: &EngineAuthContext) -> DomainResult<ListedDocument> {
         self.metadata().listing(auth)
     }
@@ -442,6 +445,9 @@ impl ClassifiedAbilityResource {
     }
     pub fn lifecycle(&self) -> Lifecycle {
         self.lifecycle
+    }
+    pub fn content_bytes(&self) -> usize {
+        self.content.len()
     }
     pub fn explicit_read<'a>(&'a self, auth: &EngineAuthContext) -> DomainResult<&'a str> {
         if self.lifecycle == Lifecycle::Purged {

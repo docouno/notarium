@@ -1,3 +1,7 @@
+DROP INDEX IF EXISTS idx_ability_packages_space_kind;
+DROP INDEX IF EXISTS idx_revision_purge_fences_seq;
+DROP INDEX IF EXISTS idx_note_heads_space_title_fold;
+DROP INDEX IF EXISTS idx_folder_aliases_parent_seq;
 DROP INDEX IF EXISTS idx_chat_entries_tainted;
 DROP INDEX IF EXISTS idx_command_receipts_seq;
 DROP INDEX IF EXISTS idx_folder_heads_space_updated;

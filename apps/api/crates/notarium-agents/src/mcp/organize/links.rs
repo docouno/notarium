@@ -740,16 +740,18 @@ async fn many(call: &mut ToolCallContext<'_>, inputs: Vec<LinkInput>) -> Result<
     for (index, input) in inputs.into_iter().enumerate() {
         let ordinal = u16::try_from(index).map_err(|_| invalid(ValidationReason::InvalidLimit))?;
         let label = format!("link-route-{ordinal}");
-        let mut replayed = true;
+        let mut replayed = false;
         let planned = async {
+            let mut invoked_fresh = false;
             let journaled: JournaledLinkPlan = call
                 .journal(&label, || async {
-                    replayed = false;
+                    invoked_fresh = true;
                     let source = NoteId::parse(&input.source)?;
                     let plan = plan_link(call, None, source, &input.edge, false).await?;
                     Ok(plan.to_journaled())
                 })
                 .await?;
+            replayed = !invoked_fresh;
             let scope = call.space(journaled.scope.clone())?;
             let plan = hydrate_journaled(call, &scope, journaled, &input.edge).await?;
             authorize(call, &scope, &plan, replayed).await?;
@@ -776,7 +778,7 @@ async fn many(call: &mut ToolCallContext<'_>, inputs: Vec<LinkInput>) -> Result<
             }
         }
     }
-    let mut committed_any = false;
+    let mut committed_any = any_replayed;
     for batch in batches.into_values() {
         let prepared_batch = async {
             let scope = call.space(batch[0].plan.scope.clone())?;

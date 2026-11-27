@@ -23,7 +23,7 @@ CREATE TABLE agent_schedules (
     CHECK (instr(owner_id,char(0))=0),
     CHECK (instr(space_id,char(0))=0),
     CHECK (instr(project_folder_id,char(0))=0),
-    CHECK (instr(title,char(0))=0 AND length(CAST(title AS BLOB)) BETWEEN 1 AND 512),
+    CHECK (instr(title,char(0))=0 AND ((deleted_at IS NULL AND length(CAST(title AS BLOB)) BETWEEN 1 AND 512) OR (deleted_at IS NOT NULL AND length(CAST(title AS BLOB)) <= 512))),
     CHECK (instr(init_prompt,char(0))=0 AND ((deleted_at IS NULL AND length(CAST(init_prompt AS BLOB)) BETWEEN 1 AND 32768) OR (deleted_at IS NOT NULL AND length(CAST(init_prompt AS BLOB)) <= 32768))),
     CHECK (instr(cron_expr,char(0))=0),
     CHECK (instr(timezone,char(0))=0),
@@ -84,8 +84,87 @@ CREATE INDEX schedule_expired_run ON agent_schedule_runs(expires_at,run_id)
     WHERE status IN ('claimed','running');
 CREATE INDEX episode_owner_name_open ON agent_episodes(owner_id,name,episode_id)
     WHERE lifecycle <> 'closed';
+ALTER TABLE provider_attachments RENAME TO provider_attachments_v1;
+CREATE TABLE provider_attachments (
+    id TEXT NOT NULL PRIMARY KEY, resource_id TEXT NOT NULL REFERENCES provider_resources(id),
+    target_kind TEXT NOT NULL CHECK (target_kind IN ('personal','space','project')),
+    target_owner TEXT, target_space TEXT NOT NULL, target_project TEXT,
+    resource_epoch INTEGER NOT NULL CHECK (resource_epoch>=0), credential_epoch INTEGER CHECK (credential_epoch>=0),
+    state TEXT NOT NULL CHECK (state IN ('pending','approved','revoked')),
+    disclosure TEXT NOT NULL, expires_at INTEGER, revision INTEGER NOT NULL CHECK (revision>=0),
+    CHECK ((target_kind='personal')=(target_owner IS NOT NULL)),
+    CHECK ((target_kind='project')=(target_project IS NOT NULL)),
+    CHECK (instr(id,char(0))=0),
+    CHECK (instr(resource_id,char(0))=0),
+    CHECK (instr(target_kind,char(0))=0),
+    CHECK (instr(target_owner,char(0))=0),
+    CHECK (instr(target_space,char(0))=0),
+    CHECK (instr(target_project,char(0))=0),
+    CHECK (instr(state,char(0))=0),
+    CHECK (instr(disclosure,char(0))=0),
+    CHECK (coalesce(length(CAST(id AS BLOB)),0) <= 2048),
+    CHECK (coalesce(length(CAST(resource_id AS BLOB)),0) + coalesce(length(CAST(id AS BLOB)),0) <= 2048),
+    CHECK (coalesce(length(CAST(resource_id AS BLOB)),0) + coalesce(length(CAST(target_owner AS BLOB)),0) + coalesce(length(CAST(target_space AS BLOB)),0) <= 2048),
+    CHECK (coalesce(length(CAST(resource_id AS BLOB)),0) + coalesce(length(CAST(target_space AS BLOB)),0) <= 2048),
+    CHECK (coalesce(length(CAST(resource_id AS BLOB)),0) + coalesce(length(CAST(target_space AS BLOB)),0) + coalesce(length(CAST(target_project AS BLOB)),0) <= 2048),
+    CHECK (coalesce(length(CAST(target_space AS BLOB)),0) + coalesce(length(CAST(state AS BLOB)),0) + coalesce(length(CAST(resource_id AS BLOB)),0) <= 2048),
+    CHECK (coalesce(length(CAST(target_space AS BLOB)),0) + coalesce(length(CAST(id AS BLOB)),0) <= 2048),
+    CHECK (coalesce(length(CAST(target_space AS BLOB)),0) + coalesce(length(CAST(target_project AS BLOB)),0) + coalesce(length(CAST(id AS BLOB)),0) <= 2048)
+) STRICT;
+INSERT INTO provider_attachments(id,resource_id,target_kind,target_owner,target_space,target_project,resource_epoch,credential_epoch,state,disclosure,expires_at,revision)
+SELECT id,resource_id,target_kind,target_owner,target_space,target_project,resource_epoch,credential_epoch,state,disclosure,expires_at,revision FROM provider_attachments_v1;
+DROP TABLE provider_attachments_v1;
+CREATE UNIQUE INDEX attachment_personal ON provider_attachments(resource_id,target_owner,target_space) WHERE target_kind='personal';
+CREATE UNIQUE INDEX attachment_space ON provider_attachments(resource_id,target_space) WHERE target_kind='space';
+CREATE UNIQUE INDEX attachment_project ON provider_attachments(resource_id,target_space,target_project) WHERE target_kind='project';
+CREATE INDEX attachment_target ON provider_attachments(target_space,state,resource_id);
+CREATE INDEX attachment_resource ON provider_attachments(resource_id,id);
 CREATE INDEX attachment_target_approved_id ON provider_attachments(target_space,id)
     WHERE state = 'approved';
+CREATE INDEX attachment_target_project_approved_id ON provider_attachments(target_space,target_project,id)
+    WHERE state = 'approved' AND target_kind = 'project';
+
+ALTER TABLE provider_call_log RENAME TO provider_call_log_v1;
+CREATE TABLE provider_call_log (
+    call_id TEXT NOT NULL PRIMARY KEY, owner_id TEXT NOT NULL, principal TEXT NOT NULL, run_id TEXT,
+    scope_id TEXT NOT NULL, intent_key TEXT NOT NULL, request_hash BLOB NOT NULL CHECK (length(request_hash)=32),
+    resource_id TEXT NOT NULL, credential_id TEXT, policy_epochs TEXT NOT NULL, participating_spaces TEXT NOT NULL,
+    model_id TEXT, reserved_tokens INTEGER NOT NULL CHECK (reserved_tokens>=0), bucket_keys TEXT NOT NULL,
+    delivery_state TEXT NOT NULL CHECK (delivery_state IN ('intent','sending','settled')),
+    outcome TEXT CHECK (outcome IN ('completed','not_sent','unknown','failed','cancelled')),
+    usage_source TEXT NOT NULL CHECK (usage_source IN ('exact','unknown','estimate')),
+    input_tokens INTEGER CHECK (input_tokens>=0), output_tokens INTEGER CHECK (output_tokens>=0),
+    diagnostic TEXT, dispatch_owner TEXT, created_at INTEGER NOT NULL, settled_at INTEGER,
+    UNIQUE(principal,scope_id,intent_key),
+    CHECK (instr(call_id,char(0))=0),
+    CHECK (instr(owner_id,char(0))=0),
+    CHECK (instr(principal,char(0))=0),
+    CHECK (instr(run_id,char(0))=0),
+    CHECK (instr(scope_id,char(0))=0),
+    CHECK (instr(intent_key,char(0))=0),
+    CHECK (instr(resource_id,char(0))=0),
+    CHECK (instr(credential_id,char(0))=0),
+    CHECK (instr(policy_epochs,char(0))=0),
+    CHECK (instr(participating_spaces,char(0))=0),
+    CHECK (instr(model_id,char(0))=0),
+    CHECK (instr(bucket_keys,char(0))=0),
+    CHECK (instr(delivery_state,char(0))=0),
+    CHECK (instr(outcome,char(0))=0),
+    CHECK (instr(usage_source,char(0))=0),
+    CHECK (instr(diagnostic,char(0))=0),
+    CHECK (instr(dispatch_owner,char(0))=0),
+    CHECK (coalesce(length(CAST(call_id AS BLOB)),0) <= 2048),
+    CHECK (coalesce(length(CAST(principal AS BLOB)),0) + coalesce(length(CAST(scope_id AS BLOB)),0) + coalesce(length(CAST(intent_key AS BLOB)),0) <= 2048),
+    CHECK (coalesce(length(CAST(owner_id AS BLOB)),0) + 8 + coalesce(length(CAST(call_id AS BLOB)),0) <= 2048),
+    CHECK (coalesce(length(CAST(delivery_state AS BLOB)),0) + 8 + coalesce(length(CAST(call_id AS BLOB)),0) <= 2048),
+    CHECK (coalesce(length(CAST(run_id AS BLOB)),0) + coalesce(length(CAST(call_id AS BLOB)),0) <= 2048)
+) STRICT;
+INSERT INTO provider_call_log(call_id,owner_id,principal,run_id,scope_id,intent_key,request_hash,resource_id,credential_id,policy_epochs,participating_spaces,model_id,reserved_tokens,bucket_keys,delivery_state,outcome,usage_source,input_tokens,output_tokens,diagnostic,dispatch_owner,created_at,settled_at)
+SELECT call_id,owner_id,principal,run_id,scope_id,intent_key,request_hash,resource_id,credential_id,policy_epochs,participating_spaces,model_id,reserved_tokens,bucket_keys,delivery_state,outcome,usage_source,input_tokens,output_tokens,diagnostic,dispatch_owner,created_at,settled_at FROM provider_call_log_v1;
+DROP TABLE provider_call_log_v1;
+CREATE INDEX call_owner ON provider_call_log(owner_id,created_at,call_id);
+CREATE INDEX call_pending ON provider_call_log(delivery_state,created_at,call_id);
+CREATE INDEX call_settled ON provider_call_log(delivery_state,settled_at,call_id);
 CREATE INDEX call_run ON provider_call_log(run_id,call_id);
 CREATE INDEX ability_trail_destination ON ability_placement_trail(destination_placement,destination_id);
 CREATE INDEX ability_preference_placement ON ability_preferences(placement,ability_id,owner_id);

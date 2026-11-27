@@ -601,19 +601,30 @@ fn pack(
     };
     let mut truncated = false;
     for ((hit, mask), source) in hits.iter().zip(&mut selected).zip(&mut source_remaining) {
-        if let Some(part) = hit.chunks.first() {
-            truncated |= !choose(
+        let mut admitted = false;
+        for (idx, part) in hit.chunks.iter().enumerate() {
+            if choose(
                 part,
                 framing(hit, true),
-                &mut mask[0],
+                &mut mask[idx],
                 &mut remaining,
                 source,
-            );
+            ) {
+                admitted = true;
+                break;
+            }
+            truncated = true;
+        }
+        if !admitted && !hit.chunks.is_empty() {
+            truncated = true;
         }
     }
     let mut tail = Vec::new();
     for (note_rank, hit) in hits.iter().enumerate() {
-        for rank in 1..hit.chunks.len() {
+        for (rank, &chosen) in selected[note_rank].iter().enumerate() {
+            if chosen {
+                continue;
+            }
             tail.push((hit.score / (rank + 1) as f64, note_rank, rank));
         }
     }
@@ -661,4 +672,143 @@ fn choose(
     *source -= cost;
     *selected = true;
     true
+}
+
+#[cfg(test)]
+mod pack_tests {
+    use super::*;
+    use notarium_core::{
+        auth::{
+            EngineAuthContext, ResourceFacts, Space, SpaceGrant, SpaceKind, SpaceLifecycle,
+            SpaceRole, VerifiedHuman,
+        },
+        classes::{ClassifiedMetadata, DocClass},
+        document::ChunkDescriptor,
+        ids::{ContentDigest, GrantId, ModelProfileId, PrincipalId, RevisionId, SpaceId},
+        model::{Lifecycle, NoteRef},
+        span::ByteSpan,
+    };
+    use std::collections::BTreeSet;
+
+    fn make_hit(tag: u8, score: f64, token_sizes: &[u32]) -> SearchHit {
+        let space_id = SpaceId::from_bytes([1; 16]);
+        let note_id = NoteId::from_bytes([tag; 16]);
+        let revision = RevisionId::from_bytes([tag; 16]);
+        let reference = NoteRef {
+            space_id: space_id.clone(),
+            note_id: note_id.clone(),
+        };
+        let facts = ResourceFacts {
+            space: Space {
+                id: space_id.clone(),
+                kind: SpaceKind::Personal,
+                lifecycle: SpaceLifecycle::Active,
+            },
+            class: DocClass::UserDoc,
+            project: None,
+            ancestor_folders: vec![],
+            folder_write_locked: false,
+            ability_package: None,
+        };
+        let content = "alpha beta gamma delta".to_owned();
+        let digest = ContentDigest::from_bytes(*blake3::hash(content.as_bytes()).as_bytes());
+        let doc = Arc::new(
+            ClassifiedDocument::from_canonical(
+                reference.clone(),
+                revision.clone(),
+                facts.clone(),
+                Lifecycle::Active,
+                content,
+                digest,
+            )
+            .unwrap(),
+        );
+        let meta = ClassifiedMetadata::from_canonical(
+            reference,
+            revision,
+            facts,
+            Lifecycle::Active,
+            digest,
+        )
+        .unwrap();
+        let auth = EngineAuthContext::for_human(VerifiedHuman::attest(
+            PrincipalId::from_bytes([9; 16]),
+            GrantId::from_bytes([9; 16]),
+            BTreeMap::from([(
+                space_id,
+                SpaceGrant {
+                    role: SpaceRole::Owner,
+                    read_classes: BTreeSet::from([DocClass::UserDoc]),
+                    write_classes: BTreeSet::from([DocClass::UserDoc]),
+                    project_root: None,
+                },
+            )]),
+            false,
+        ));
+        let card = NoteCard {
+            document: ClassEgressFence::search_metadata(meta, &auth).unwrap(),
+            title: format!("Note {tag}"),
+            path: format!("note-{tag}"),
+            preview: String::new(),
+        };
+        let model = ModelProfileId::from_bytes([1; 16]);
+        let chunks = token_sizes
+            .iter()
+            .enumerate()
+            .map(|(idx, &tokens)| {
+                let part = ContentPart::from_chunk(
+                    doc.clone(),
+                    ChunkDescriptor {
+                        source: digest,
+                        model: model.clone(),
+                        key: ContentDigest::from_bytes([tag.wrapping_add(idx as u8); 32]),
+                        tokens,
+                        text: "alpha".into(),
+                        context: vec![],
+                        spans: vec![ByteSpan::new(0, 5).unwrap()],
+                    },
+                )
+                .unwrap();
+                ClassEgressFence::search_part(part, &auth).unwrap()
+            })
+            .collect();
+        SearchHit {
+            card,
+            score,
+            chunks,
+        }
+    }
+
+    #[test]
+    fn pack_pass_one_scans_past_oversized_lead_chunk_and_preserves_title_only_hit() {
+        let mut hits = vec![
+            make_hit(1, 10.0, &[160]),
+            make_hit(2, 9.0, &[180, 40]),
+            make_hit(3, 8.0, &[]),
+        ];
+        let truncated = pack(
+            &mut hits,
+            Recall {
+                graph_depth: 1,
+                tokens: 210,
+                max_per_source: Some(200),
+            },
+            None,
+        );
+        assert!(truncated);
+        assert_eq!(
+            hits.len(),
+            3,
+            "title-only hit and fallback chunk hit must survive"
+        );
+        assert_eq!(hits[0].chunks.len(), 1);
+        assert_eq!(hits[0].chunks[0].part().tokens(), 160);
+        assert_eq!(hits[1].chunks.len(), 1);
+        assert_eq!(
+            hits[1].chunks[0].part().tokens(),
+            40,
+            "Pass 1 must admit second chunk when lead chunk exceeds remaining budget"
+        );
+        assert!(hits[2].chunks.is_empty());
+    }
 }

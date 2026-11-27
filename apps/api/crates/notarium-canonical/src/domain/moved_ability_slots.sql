@@ -7,14 +7,13 @@ WITH RECURSIVE moved_folders(folder_id) AS (
 ),
 moved_names(slug_fold) AS (
     SELECT DISTINCT package.slug_fold
-    FROM moved_folders AS moved
+    FROM ability_packages AS package
     CROSS JOIN note_heads AS note
-    CROSS JOIN ability_packages AS package
-    WHERE note.space_id = $1
-      AND note.parent_folder_id = moved.folder_id
-      AND package.space_id = note.space_id
-      AND package.entrypoint_note_id = note.note_id
+    WHERE package.space_id = $1
       AND package.lifecycle_state = 'active'
+      AND note.space_id = package.space_id
+      AND note.note_id = package.entrypoint_note_id
+      AND note.parent_folder_id IN (SELECT folder_id FROM moved_folders)
 ),
 ancestry(ability_id, slug_fold, folder_id, parent_folder_id, is_project) AS (
     SELECT package.ability_id, package.slug_fold, folder.folder_id, folder.parent_folder_id, folder.is_project

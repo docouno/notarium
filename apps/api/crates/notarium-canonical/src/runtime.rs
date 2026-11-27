@@ -163,7 +163,7 @@ pub(crate) struct CanonicalInner {
     >,
     pub retirement_workers: crate::blobs::retirement_worker::RetirementWorkers,
     pub backup_cleanups: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
-    pub deferred_local_orphan_cleanups: std::sync::Mutex<Vec<(SpaceId, ContentDigest)>>,
+    pub deferred_local_orphan_cleanups: std::sync::Mutex<DeferredLocalOrphans>,
     pub backup_cleanups_closed: AtomicBool,
     pub aux_workers: Arc<tokio::sync::RwLock<()>>,
     pub last_backup_memory_stats:
@@ -188,6 +188,13 @@ pub(crate) struct CanonicalInner {
     pub sqlite_has_any_collab_sessions: AtomicBool,
     pub shutting_down: AtomicBool,
     pub owner_locks: Mutex<Vec<DataRootOwnerLock>>,
+}
+
+#[derive(Default)]
+pub(crate) struct DeferredLocalOrphans {
+    pub items: std::collections::BTreeSet<(SpaceId, ContentDigest)>,
+    pub overflow_spaces: std::collections::BTreeSet<SpaceId>,
+    pub release_gen: u64,
 }
 
 /// RAII seqlock guard around every SQLite `COMMIT`.
@@ -621,7 +628,7 @@ impl CanonicalRuntime {
             lease_recoveries: Default::default(),
             retirement_workers: Default::default(),
             backup_cleanups: std::sync::Mutex::new(Vec::new()),
-            deferred_local_orphan_cleanups: std::sync::Mutex::new(Vec::new()),
+            deferred_local_orphan_cleanups: std::sync::Mutex::new(DeferredLocalOrphans::default()),
             backup_cleanups_closed: AtomicBool::new(false),
             aux_workers: Arc::new(tokio::sync::RwLock::new(())),
             last_backup_memory_stats: std::sync::Mutex::new(None),
@@ -737,21 +744,11 @@ impl CanonicalRuntime {
         let _aux_drained = self.inner.aux_workers.write().await;
         // Sweep any local CAS orphans whose deletion was deferred by an earlier
         // backup hold that may have been released before shutdown.
-        let deferred_orphans = {
-            let mut deferred = self
-                .inner
-                .deferred_local_orphan_cleanups
-                .lock()
-                .expect("deferred local orphan cleanups mutex");
-            std::mem::take(&mut *deferred)
-        };
-        if !deferred_orphans.is_empty() {
-            CanonicalStore {
-                inner: self.inner.clone(),
-            }
-            .cleanup_unretained_local_files_async(deferred_orphans)
-            .await;
+        CanonicalStore {
+            inner: self.inner.clone(),
         }
+        .sweep_deferred_local_orphans_async(true)
+        .await;
         // Close cleanup admission under `backup_cleanups` lock and drain all pending
         // local CAS orphan cleanup tasks BEFORE shutting down WAL / SQL pools and
         // releasing `DataRootOwnerLock`, so every cleanup task sees an open read gate
@@ -1027,6 +1024,17 @@ impl CanonicalStore {
         Ok(())
     }
 
+    pub(crate) fn ensure_not_terminating(&self) -> Result<(), PortError> {
+        if self.inner.shutting_down.load(Ordering::SeqCst) {
+            return Err(unavailable_retryable(
+                "canonical_shutting_down",
+                "canonical runtime is shutting down",
+                Duration::from_millis(100),
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) async fn with_write_tx<F, T>(&self, op: F) -> Result<T, PortError>
     where
         F: for<'c> FnOnce(&'c mut BackendConn<'_>) -> crate::BoxFuture<'c, Result<T, PortError>>,
@@ -1045,6 +1053,18 @@ impl CanonicalStore {
         self.with_visibility_write_tx(space, None, op, Ok).await
     }
 
+    pub(crate) async fn with_write_tx_for_space_during_shutdown<F, T>(
+        &self,
+        space: Option<SpaceId>,
+        op: F,
+    ) -> Result<T, PortError>
+    where
+        F: for<'c> FnOnce(&'c mut BackendConn<'_>) -> crate::BoxFuture<'c, Result<T, PortError>>,
+    {
+        self.with_visibility_write_tx_inner(space, None, op, Ok, true)
+            .await
+    }
+
     pub(crate) async fn with_visibility_write_tx<F, T, R>(
         &self,
         space: Option<SpaceId>,
@@ -1055,7 +1075,26 @@ impl CanonicalStore {
     where
         F: for<'c> FnOnce(&'c mut BackendConn<'_>) -> crate::BoxFuture<'c, Result<T, PortError>>,
     {
-        self.ensure_open()?;
+        self.with_visibility_write_tx_inner(space, visible_space, op, after_commit, false)
+            .await
+    }
+
+    async fn with_visibility_write_tx_inner<F, T, R>(
+        &self,
+        space: Option<SpaceId>,
+        visible_space: Option<SpaceId>,
+        op: F,
+        after_commit: impl FnOnce(T) -> Result<R, PortError>,
+        allow_during_shutdown: bool,
+    ) -> Result<R, PortError>
+    where
+        F: for<'c> FnOnce(&'c mut BackendConn<'_>) -> crate::BoxFuture<'c, Result<T, PortError>>,
+    {
+        if allow_during_shutdown {
+            self.ensure_not_terminating()?;
+        } else {
+            self.ensure_open()?;
+        }
         // Never hold the writer safe point or a database connection while waiting
         // for a provider that has already pinned this Space.
         let _space;
@@ -1071,8 +1110,13 @@ impl CanonicalStore {
         } else {
             None
         };
-        self.with_write_tx_unfenced(visible_space.map(|space| vec![space]), op, after_commit)
-            .await
+        self.with_write_tx_unfenced_inner(
+            visible_space.map(|space| vec![space]),
+            op,
+            after_commit,
+            allow_during_shutdown,
+        )
+        .await
     }
 
     pub(crate) async fn with_write_tx_unfenced<F, T, R>(
@@ -1084,7 +1128,25 @@ impl CanonicalStore {
     where
         F: for<'c> FnOnce(&'c mut BackendConn<'_>) -> crate::BoxFuture<'c, Result<T, PortError>>,
     {
-        self.ensure_open()?;
+        self.with_write_tx_unfenced_inner(spaces, op, after_commit, false)
+            .await
+    }
+
+    async fn with_write_tx_unfenced_inner<F, T, R>(
+        &self,
+        spaces: Option<Vec<SpaceId>>,
+        op: F,
+        after_commit: impl FnOnce(T) -> Result<R, PortError>,
+        allow_during_shutdown: bool,
+    ) -> Result<R, PortError>
+    where
+        F: for<'c> FnOnce(&'c mut BackendConn<'_>) -> crate::BoxFuture<'c, Result<T, PortError>>,
+    {
+        if allow_during_shutdown {
+            self.ensure_not_terminating()?;
+        } else {
+            self.ensure_open()?;
+        }
         let mut visibility = match spaces {
             Some(spaces) => Some(self.inner.live_visibility.for_write(spaces).await),
             None => None,
@@ -1445,6 +1507,14 @@ impl CanonicalStore {
         self.with_read_tx_budget(None, op).await
     }
 
+    pub(crate) async fn with_read_tx_during_shutdown<F, T>(&self, op: F) -> Result<T, PortError>
+    where
+        F: for<'c> FnOnce(&'c mut BackendConn<'_>) -> crate::BoxFuture<'c, Result<T, PortError>>,
+    {
+        self.execute_read_transaction_inner(None, None, op, true)
+            .await
+    }
+
     pub(crate) async fn with_read_tx_budget<F, T>(
         &self,
         budget: Option<&CallBudget>,
@@ -1474,7 +1544,7 @@ impl CanonicalStore {
                 .projection_read_metrics
                 .measure(std::any::type_name::<F>());
             let result = self
-                .execute_read_transaction(budget, extra_pg_sql, op)
+                .execute_read_transaction_inner(budget, extra_pg_sql, op, false)
                 .await;
             if let Some(measurement) = &mut measurement {
                 measurement.complete(result.as_ref().err().map(PortError::code));
@@ -1482,20 +1552,25 @@ impl CanonicalStore {
             result
         }
         #[cfg(not(feature = "test-support"))]
-        self.execute_read_transaction(budget, extra_pg_sql, op)
+        self.execute_read_transaction_inner(budget, extra_pg_sql, op, false)
             .await
     }
 
-    async fn execute_read_transaction<F, T>(
+    async fn execute_read_transaction_inner<F, T>(
         &self,
         budget: Option<&CallBudget>,
         extra_pg_sql: Option<&'static str>,
         op: F,
+        allow_during_shutdown: bool,
     ) -> Result<T, PortError>
     where
         F: for<'c> FnOnce(&'c mut BackendConn<'_>) -> crate::BoxFuture<'c, Result<T, PortError>>,
     {
-        self.ensure_open()?;
+        if allow_during_shutdown {
+            self.ensure_not_terminating()?;
+        } else {
+            self.ensure_open()?;
+        }
         match &self.inner.sql {
             SqlDriverState::Sqlite { read_pool, .. } => {
                 let wal = self.inner.wal_coord.get().ok_or_else(|| {

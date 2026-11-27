@@ -279,12 +279,18 @@ impl<'a> Reader<'a> {
         reference: &AbilityRef,
         kind: AbilityKind,
     ) -> Result<AbilityDescriptor, PortError> {
-        if !self
-            .primary
-            .auth()
-            .readonly_abilities()
-            .contains(&reference.id)
-        {
+        let is_approved = if reference.placement == AbilityPlacement::System {
+            self.primary
+                .auth()
+                .readonly_system_abilities()
+                .contains(&reference.id)
+        } else {
+            self.primary
+                .auth()
+                .readonly_abilities()
+                .contains(&reference.id)
+        };
+        if !is_approved {
             return Err(DomainError::ResourceNotFound.into());
         }
         let current = self

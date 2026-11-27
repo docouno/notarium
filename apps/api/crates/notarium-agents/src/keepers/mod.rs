@@ -2,7 +2,7 @@
 mod turn;
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -101,7 +101,13 @@ struct SchedulerState {
     parallelism: Arc<Semaphore>,
 }
 
-type LocalSlots = Arc<Mutex<BTreeSet<ScheduleId>>>;
+#[derive(Default)]
+struct LocalSlotState {
+    active: BTreeMap<ScheduleId, Option<AgentRunId>>,
+    reconciling: BTreeSet<AgentRunId>,
+}
+
+type LocalSlots = Arc<Mutex<LocalSlotState>>;
 
 enum Coordination {
     Local(LocalSlots),
@@ -124,21 +130,68 @@ impl Drop for LocalSlot {
         self.slots
             .lock()
             .unwrap_or_else(|error| error.into_inner())
+            .active
             .remove(&self.schedule);
     }
 }
 
+struct LocalReconcileSlot {
+    slots: LocalSlots,
+    run: AgentRunId,
+}
+
+impl RevocationLease for LocalReconcileSlot {
+    fn check(&self) -> Result<(), PortError> {
+        Ok(())
+    }
+}
+
+impl Drop for LocalReconcileSlot {
+    fn drop(&mut self) {
+        self.slots
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .reconciling
+            .remove(&self.run);
+    }
+}
+
 fn acquire_local(slots: &LocalSlots, schedule: ScheduleId) -> Option<Box<dyn RevocationLease>> {
-    slots
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .insert(schedule.clone())
-        .then(|| {
-            Box::new(LocalSlot {
-                slots: Arc::clone(slots),
-                schedule,
-            }) as Box<dyn RevocationLease>
-        })
+    let mut state = slots.lock().unwrap_or_else(|error| error.into_inner());
+    if state.active.contains_key(&schedule) {
+        return None;
+    }
+    state.active.insert(schedule.clone(), None);
+    Some(Box::new(LocalSlot {
+        slots: Arc::clone(slots),
+        schedule,
+    }) as Box<dyn RevocationLease>)
+}
+
+fn bind_local_run(slots: &LocalSlots, schedule: &ScheduleId, run: &AgentRunId) {
+    let mut state = slots.lock().unwrap_or_else(|error| error.into_inner());
+    if let Some(slot) = state.active.get_mut(schedule) {
+        *slot = Some(run.clone());
+    }
+}
+
+fn acquire_local_reconcile(
+    slots: &LocalSlots,
+    run: AgentRunId,
+) -> Option<Box<dyn RevocationLease>> {
+    let mut state = slots.lock().unwrap_or_else(|error| error.into_inner());
+    if state
+        .active
+        .values()
+        .any(|active| active.as_ref() == Some(&run))
+        || !state.reconciling.insert(run.clone())
+    {
+        return None;
+    }
+    Some(Box::new(LocalReconcileSlot {
+        slots: Arc::clone(slots),
+        run,
+    }) as Box<dyn RevocationLease>)
 }
 
 enum SlotAttempt {
@@ -479,6 +532,9 @@ impl KeeperScheduler {
                 context,
                 schedule,
             }) => {
+                if let Coordination::Local(slots) = &self.inner.coordination {
+                    bind_local_run(slots, &schedule.id, &run);
+                }
                 let mut context = *context;
                 let turn_cancellation = Cancellation::default();
                 if cancellation.is_cancelled() {
@@ -657,7 +713,7 @@ impl KeeperScheduler {
     ) -> Result<bool, PortError> {
         let request = request_id("reconcile", receipt.slot, receipt.run.as_str().as_bytes());
         let fence = match &self.inner.coordination {
-            Coordination::Local(slots) => acquire_local(slots, receipt.schedule.clone()),
+            Coordination::Local(slots) => acquire_local_reconcile(slots, receipt.run.clone()),
             Coordination::Clustered(authority) => {
                 authority
                     .fence_orphan(

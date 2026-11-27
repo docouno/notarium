@@ -914,7 +914,7 @@ async fn postgres_schedule_claims_and_authority() {
 
 async fn role_placement_scope_and_run_inspection_access(pg: bool) {
     let _serial = AUTH_TEST_LOCK.lock().await;
-    let fixture = Fixture::new(pg, "schedules_role_scope").await;
+    let mut fixture = Fixture::new(pg, "schedules_role_scope").await;
     let control = fixture.service(AuthenticationMode::Password).await.unwrap();
     let boot = control
         .bootstrap(
@@ -1602,7 +1602,7 @@ async fn role_placement_scope_and_run_inspection_access(pg: bool) {
         .record_schedule_result(
             scheduler(),
             ScheduleResult {
-                schedule: second.schedule,
+                schedule: second.schedule.clone(),
                 run: second.run,
                 lease: second.lease,
                 outcome: ScheduleOutcome::Unknown,
@@ -1610,6 +1610,211 @@ async fn role_placement_scope_and_run_inspection_access(pg: bool) {
         )
         .await
         .unwrap();
+
+    // 1. Delete must scrub schedule `title` and `init_prompt` to empty strings.
+    let del_rev = control
+        .get_schedule(
+            SpaceContext::new(
+                interactive.auth().clone(),
+                shared_a.history.clone(),
+                budget(),
+            )
+            .unwrap(),
+            second.schedule.clone(),
+        )
+        .await
+        .unwrap()
+        .revision;
+    let del_acct_rev = control
+        .account(interactive.clone(), interactive.auth().principal().clone())
+        .await
+        .unwrap()
+        .revision;
+    control
+        .delete_schedule(
+            interactive.clone(),
+            AccountMutation {
+                identity: command(
+                    interactive.auth().principal(),
+                    interactive.auth().principal(),
+                    94,
+                    del_acct_rev,
+                ),
+                input: DeleteSchedule {
+                    schedule: second.schedule,
+                    expected: del_rev,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture
+            .observer
+            .count(
+                "SELECT count(*) FROM agent_schedules WHERE deleted_at IS NOT NULL AND (title <> '' OR init_prompt <> '')"
+            )
+            .await,
+        0,
+        "delete_schedule must scrub both title and init_prompt on soft-deleted schedules"
+    );
+
+    // 2. Project-pinned owner must be able to review and approve a role inside their own project.
+    let proj_a1_role = seed_role(
+        &shared_a.space,
+        AbilityPlacement::OwnedProject(project_a1.clone()),
+        66,
+        "proj-a1-role",
+        vec![project_a1.folder_id.clone()],
+    );
+    let proj_a1_auth = interactive.auth().restrict_to_project(&project_a1).unwrap();
+    let pinned_candidate = control
+        .schedule_ability_candidate(
+            AccountContext::new(proj_a1_auth.clone(), budget()),
+            ScheduleAbilitySelection {
+                space: shared_a.space.id.clone(),
+                project: Some(project_a1.clone()),
+                role: proj_a1_role.identity(),
+            },
+        )
+        .await
+        .expect("project-pinned owner must approve a role living inside their project");
+    assert_eq!(pinned_candidate.approved_role, proj_a1_role);
+
+    // 3. Narrowed caller missing `DocClass::UserDoc` read class must not mint a wider ScheduledRun.
+    let narrow_read_auth = proj_a1_auth
+        .restrict_read_classes(&shared_a.space.id, &BTreeSet::from([DocClass::AgentMemory]))
+        .unwrap();
+    let narrow_acct_rev = control
+        .account(interactive.clone(), interactive.auth().principal().clone())
+        .await
+        .unwrap()
+        .revision;
+    let narrow_create = control
+        .create_schedule(
+            AccountContext::new(narrow_read_auth, budget()),
+            AccountMutation {
+                identity: command(
+                    interactive.auth().principal(),
+                    interactive.auth().principal(),
+                    95,
+                    narrow_acct_rev,
+                ),
+                input: CreateSchedule {
+                    id: ScheduleId::from_bytes([79; 16]),
+                    definition: ScheduleDefinition {
+                        space: shared_a.space.id.clone(),
+                        project: Some(project_a1.clone()),
+                        title: "Narrow mint blocked".into(),
+                        init_prompt: "Blocked".into(),
+                        cron: "0 */5 * * * *".into(),
+                        timezone: "UTC".into(),
+                        approved_role: proj_a1_role,
+                        limits: RunLimits::default(),
+                    },
+                    approved_skills: vec![],
+                    next_slot: Timestamp::parse("2023-11-14T22:35:00Z").unwrap(),
+                    paused: false,
+                },
+            },
+        )
+        .await;
+    assert!(
+        narrow_create.is_err(),
+        "narrowed read_classes caller must not mint wider ScheduledRun, got {narrow_create:?}"
+    );
+
+    // 4. Claiming a schedule with a System role must NOT insert that System AbilityId
+    // into `readonly_abilities`, preventing accidental exemption of a colliding owned package ID.
+    let sys_role = AbilityRef {
+        id: AbilityId::from_bytes([67; 16]),
+        placement: AbilityPlacement::System,
+        revision: RevisionId::from_bytes([67; 16]),
+    };
+    fixture
+        .catalog
+        .ability_entries
+        .lock()
+        .unwrap()
+        .push(AbilityDescriptor {
+            reference: sys_role.clone(),
+            kind: AbilityKind::Role,
+            name: "sys-role-collision-check".into(),
+            description: None,
+            enabled: true,
+            healthy: true,
+            lifecycle: Lifecycle::Active,
+            entrypoint: None,
+            auxiliary_files: vec![],
+            attached_skills: vec![],
+            promoted_from: None,
+            requires_explicit_binding: false,
+        });
+    let sys_acct_rev = control
+        .account(interactive.clone(), interactive.auth().principal().clone())
+        .await
+        .unwrap()
+        .revision;
+    let sys_slot = Timestamp::parse("2023-11-14T22:40:00Z").unwrap();
+    let sys_next = Timestamp::parse("2023-11-14T22:45:00Z").unwrap();
+    let sys_sched_id = ScheduleId::from_bytes([80; 16]);
+    let sys_sched = control
+        .create_schedule(
+            interactive.clone(),
+            AccountMutation {
+                identity: command(
+                    interactive.auth().principal(),
+                    interactive.auth().principal(),
+                    96,
+                    sys_acct_rev,
+                ),
+                input: CreateSchedule {
+                    id: sys_sched_id.clone(),
+                    definition: ScheduleDefinition {
+                        space: shared_a.space.id.clone(),
+                        project: Some(project_a1.clone()),
+                        title: "System role isolation".into(),
+                        init_prompt: "Run".into(),
+                        cron: "0 */5 * * * *".into(),
+                        timezone: "UTC".into(),
+                        approved_role: sys_role.clone(),
+                        limits: RunLimits::default(),
+                    },
+                    approved_skills: vec![],
+                    next_slot: sys_slot,
+                    paused: false,
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    fixture
+        .clock
+        .0
+        .store(sys_slot.unix_seconds() * 1000, Ordering::SeqCst);
+    let ScheduleClaim::Claimed {
+        context: sys_ctx, ..
+    } = control
+        .claim_schedule(
+            scheduler(),
+            ClaimSchedule {
+                schedule: sys_sched_id,
+                slot: sys_slot,
+                next_slot: Some(sys_next),
+                current_role: sys_role.clone(),
+                expected: sys_sched.revision,
+            },
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("system-role schedule was not claimed");
+    };
+    assert!(
+        !sys_ctx.auth().readonly_abilities().contains(&sys_role.id),
+        "System AbilityPlacement must never be inserted into readonly_abilities"
+    );
 
     drop(control);
     fixture.close().await;

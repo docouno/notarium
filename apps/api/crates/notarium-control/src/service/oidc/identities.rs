@@ -156,7 +156,7 @@ impl OidcService {
                 CommitEffect::Unknown,
             )
             .await?;
-        budget.run_commit(tx.commit()).await?;
+        budget.commit_tx(tx).await?;
         Ok(result)
     }
     pub(super) async fn bind_identity(
@@ -206,7 +206,7 @@ impl OidcService {
                 CommitEffect::NotCommitted,
             )
             .await?;
-        budget.run_commit(tx.commit()).await?;
+        budget.commit_tx(tx).await?;
         Ok(ControlCommit {
             revision,
             value: saved.value,
@@ -244,7 +244,7 @@ impl OidcService {
             let saved=SavedResult {value:(),events:vec![]};command.save(tx.inner_mut(),revision,&saved,now).await?;
             Ok((revision,saved))
         },CommitEffect::NotCommitted).await?;
-        budget.run_commit(tx.commit()).await?;
+        budget.commit_tx(tx).await?;
         Ok(ControlCommit {
             revision,
             value: (),

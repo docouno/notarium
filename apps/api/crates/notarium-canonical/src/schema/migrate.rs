@@ -367,6 +367,10 @@ macro_rules! upgrade {
                     "CREATE INDEX IF NOT EXISTS idx_folder_heads_active_projects_id",
                     "CREATE INDEX IF NOT EXISTS idx_folder_heads_space_updated",
                     "CREATE INDEX IF NOT EXISTS idx_command_receipts_seq",
+                    "CREATE INDEX IF NOT EXISTS idx_folder_aliases_parent_seq",
+                    "CREATE INDEX IF NOT EXISTS idx_note_heads_space_title_fold",
+                    "CREATE INDEX IF NOT EXISTS idx_revision_purge_fences_seq",
+                    "CREATE INDEX IF NOT EXISTS idx_ability_packages_space_kind",
                 ] {
                     sqlx::query(sqlx::AssertSqlSafe(baseline_statement($ddl, prefix)?))
                         .execute(&mut *conn)

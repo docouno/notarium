@@ -155,7 +155,7 @@ async fn load_page(
     let sql = "SELECT entry_seq, CASE WHEN checkpoint_stale<>0 THEN 'redacted' ELSE kind END,
         inline_text, payload_blake3, CAST(ext_space_tainted AS INTEGER), provenance_json
         FROM chat_entries WHERE space_id=$1 AND thread_id=$2 AND entry_seq>$3 AND entry_seq<=$4
-        AND (entry_seq=$4 OR provenance_json IS NULL OR length(provenance_json)<=4096)
+        AND (entry_seq=$4 OR provenance_json IS NULL OR octet_length(provenance_json)<=4096)
         AND EXISTS (SELECT 1 FROM chat_threads t JOIN spaces s ON s.space_id=t.space_id
             WHERE t.space_id=$1 AND t.thread_id=$2 AND t.head_rev_id=$5 AND s.history_incarnation=$6)
         ORDER BY entry_seq";

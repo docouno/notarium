@@ -206,7 +206,9 @@ impl ProviderService {
                     let mut scanned = 0usize;
                     const MAX_SCAN: usize = 2048;
                     loop {
-                        let batch_size = (limit + 1).clamp(16, 200);
+                        let batch_size = (limit + 1)
+                            .clamp(16, 200)
+                            .min((MAX_SCAN + 1).saturating_sub(scanned).max(1));
                         let batch = page_rows!(
                             tx.inner_mut(),
                             ProviderAttachmentsRow,
@@ -222,7 +224,10 @@ impl ProviderService {
                         let batch_len = batch.rows.len();
                         for row in batch.rows {
                             after = row.id.clone();
-                            scanned += 1;
+                            scanned = scanned.saturating_add(1);
+                            if scanned > MAX_SCAN {
+                                return Err(invalid(ValidationReason::BudgetExceeded));
+                            }
                             if !owns_resource || ctx.auth().is_space_narrowed() {
                                 let space = SpaceId::parse(&row.target_space)?;
                                 if !ctx.auth().spaces().contains_key(&space) {
@@ -237,9 +242,6 @@ impl ProviderService {
                         }
                         if has_more || !batch.has_more || batch_len == 0 {
                             break;
-                        }
-                        if scanned >= MAX_SCAN {
-                            return Err(invalid(ValidationReason::BudgetExceeded));
                         }
                     }
                     Ok::<_, PortError>((collected, has_more))

@@ -9,6 +9,26 @@ ALTER TABLE v1_control.agent_schedules
     ALTER COLUMN next_slot_utc_ms DROP NOT NULL,
     ADD COLUMN approved_skills TEXT COLLATE "C" NOT NULL DEFAULT '[]'
         CHECK (octet_length(approved_skills)<=65536);
+DO $$
+DECLARE
+    constraint_name TEXT;
+BEGIN
+    SELECT c.conname INTO constraint_name
+    FROM pg_catalog.pg_constraint c
+    WHERE c.conrelid = 'v1_control.agent_schedules'::regclass
+      AND c.contype = 'c'
+      AND pg_catalog.pg_get_constraintdef(c.oid) LIKE '%octet_length(title)%';
+    IF constraint_name IS NOT NULL THEN
+        EXECUTE format('ALTER TABLE v1_control.agent_schedules DROP CONSTRAINT %I', constraint_name);
+    END IF;
+END $$;
+ALTER TABLE v1_control.agent_schedules
+    ADD CHECK ((deleted_at IS NULL AND octet_length(title) BETWEEN 1 AND 512) OR (deleted_at IS NOT NULL AND octet_length(title) <= 512));
+ALTER TABLE v1_control.provider_call_log
+    ADD CHECK (coalesce(octet_length(run_id),0) + coalesce(octet_length(call_id),0) <= 2048);
+ALTER TABLE v1_control.provider_attachments
+    ADD CHECK (coalesce(octet_length(target_space),0) + coalesce(octet_length(id),0) <= 2048),
+    ADD CHECK (coalesce(octet_length(target_space),0) + coalesce(octet_length(target_project),0) + coalesce(octet_length(id),0) <= 2048);
 ALTER TABLE v1_control.agent_schedule_runs
     ALTER COLUMN reserved_next_slot DROP NOT NULL,
     ADD COLUMN approved_skills TEXT COLLATE "C" NOT NULL DEFAULT '[]'
@@ -36,6 +56,8 @@ CREATE INDEX episode_owner_name_open ON v1_control.agent_episodes(owner_id,name,
     WHERE lifecycle <> 'closed';
 CREATE INDEX attachment_target_approved_id ON v1_control.provider_attachments(target_space,id)
     WHERE state = 'approved';
+CREATE INDEX attachment_target_project_approved_id ON v1_control.provider_attachments(target_space,target_project,id)
+    WHERE state = 'approved' AND target_kind = 'project';
 CREATE INDEX call_run ON v1_control.provider_call_log(run_id,call_id);
 CREATE INDEX ability_trail_destination ON v1_control.ability_placement_trail(destination_placement,destination_id);
 CREATE INDEX ability_preference_placement ON v1_control.ability_preferences(placement,ability_id,owner_id);

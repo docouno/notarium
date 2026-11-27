@@ -316,7 +316,7 @@ impl ControlService {
             command.save(tx.inner_mut(), revision, &saved, self.clock.now_ms()?).await?;
             Ok((revision, saved))
         }, CommitEffect::NotCommitted).await?;
-        budget.run_commit(tx.commit()).await?;
+        budget.commit_tx(tx).await?;
         Ok(ControlCommit {
             revision,
             value: saved.value,

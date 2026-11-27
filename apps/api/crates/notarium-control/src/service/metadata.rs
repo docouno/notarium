@@ -369,7 +369,19 @@ impl ControlService {
         let mut items = Vec::new();
         let mut next: Option<ProjectCursor> = None;
         let mut checked_spaces = 0usize;
+        let target_limit = usize::from(page.limit());
         for idx in start_idx..spaces.len() {
+            let remaining = target_limit.saturating_sub(items.len());
+            if remaining == 0 {
+                next = Some(ProjectCursor {
+                    version: 1,
+                    scope,
+                    space: spaces[idx].clone(),
+                    inner: None,
+                });
+                break;
+            }
+            let req_limit = u16::try_from(remaining).unwrap_or(page.limit());
             let space = &spaces[idx];
             let catalog = budget
                 .run(
@@ -386,12 +398,12 @@ impl ControlService {
                             catalog.history,
                             budget.context(ctx.budget.request.clone()),
                         )?,
-                        ControlPageRequest::new(page.limit(), current_inner.clone())?,
+                        ControlPageRequest::new(req_limit, current_inner.clone())?,
                     ),
                     CommitEffect::NotCommitted,
                 )
                 .await?;
-            if result.items.len() > usize::from(page.limit())
+            if result.items.len() > usize::from(req_limit)
                 || result.continuation.as_ref().is_some_and(|next_tok| {
                     next_tok.is_empty()
                         || next_tok.len() > 2048
@@ -424,7 +436,7 @@ impl ControlService {
                 });
                 break;
             }
-            if !items.is_empty() || checked_spaces >= MAX_SPACES_PER_CALL {
+            if items.len() >= target_limit || checked_spaces >= MAX_SPACES_PER_CALL {
                 next = spaces.get(idx + 1).map(|next_space| ProjectCursor {
                     version: 1,
                     scope,

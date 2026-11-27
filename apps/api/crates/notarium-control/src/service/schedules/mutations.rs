@@ -195,6 +195,22 @@ impl ControlService {
                         if row.owner_id != owner.user_id || row.deleted_at.is_some() {
                             return Err(DomainError::ResourceNotFound.into());
                         }
+                        let row_space = SpaceId::parse(&row.space_id)?;
+                        let row_project = row
+                            .project_folder_id
+                            .as_deref()
+                            .map(|folder| {
+                                Ok::<_, PortError>(FolderRef {
+                                    space_id: row_space.clone(),
+                                    folder_id: FolderId::parse(folder)?,
+                                })
+                            })
+                            .transpose()?;
+                        ScheduleScope {
+                            space: &row_space,
+                            project: row_project.as_ref(),
+                        }
+                        .check_existing(current.auth())?;
                         Some(schedule_info(&row)?)
                     }
                     (StoredScheduleResult::Legacy(id), Change::Update(_)) => {
@@ -217,7 +233,7 @@ impl ControlService {
                 Change::Create(input) => {
                     validate(&input.definition,Some(input.next_slot),self.config.schedule_limits,false)?;
                     let scope = ScheduleScope::from(&input.definition);
-                    scope.check(current.auth())?;
+                    scope.check_mint(current.auth(), owner.personal_space_id.as_deref())?;
                     let descriptors = approved
                         .as_ref()
                         .map_err(Clone::clone)?
@@ -265,6 +281,7 @@ impl ControlService {
                     let calendar_unchanged = input.definition.cron == previous.definition.cron
                         && input.definition.timezone == previous.definition.timezone;
                     if !pause_only(&input, &previous) {
+                        scope.check_mint(current.auth(), owner.personal_space_id.as_deref())?;
                         // Only a claim can exhaust a calendar. Ordinary
                         // updates may preserve its already exhausted state.
                         if input.next_slot.is_none() && (previous.next_slot.is_some() || !calendar_unchanged) {
@@ -333,7 +350,7 @@ impl ControlService {
                     let row = locked_row.expect("delete pre-locked schedule");
                     if row.owner_id!=owner.user_id || row.deleted_at.is_some() {return Err(DomainError::ResourceNotFound.into());}
                     expect(&row,input.expected)?;
-                    execute!(tx.inner_mut(),"UPDATE agent_schedules SET init_prompt='',deleted_at=$1,revision=$2,config_revision=$3,updated_at=$1 WHERE schedule_id=$4","UPDATE v1_control.agent_schedules SET init_prompt='',deleted_at=$1,revision=$2,config_revision=$3,updated_at=$1 WHERE schedule_id=$4";now,next(row.revision)?,next(row.config_revision)?,input.schedule.as_str())?;
+                    execute!(tx.inner_mut(),"UPDATE agent_schedules SET title='',init_prompt='',deleted_at=$1,revision=$2,config_revision=$3,updated_at=$1 WHERE schedule_id=$4","UPDATE v1_control.agent_schedules SET title='',init_prompt='',deleted_at=$1,revision=$2,config_revision=$3,updated_at=$1 WHERE schedule_id=$4";now,next(row.revision)?,next(row.config_revision)?,input.schedule.as_str())?;
                     (input.schedule, None, true)
                 }
             };

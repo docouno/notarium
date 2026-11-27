@@ -21,6 +21,7 @@ use tokio::time::Instant;
 use crate::mcp::derive_digest;
 
 const HISTORY_WINDOW: u16 = 200;
+const HYDRATE_BATCH_ENTRIES: usize = 16;
 
 const COMPACTION_ENTRIES: usize = 80;
 const MAX_SUMMARY_TOKENS: u32 = 2048;
@@ -317,7 +318,7 @@ pub(crate) async fn load_history_after(
             branch.next_ancestor = None;
         }
     }
-    let (hydrated, has_tail) = if branch.next_ancestor.is_some() {
+    let (messages, groups, has_tail) = if branch.next_ancestor.is_some() {
         let prefix = engine
             .read_chat_compaction_prefix(remaining_context(ctx, deadline)?, read)
             .await?;
@@ -330,31 +331,21 @@ pub(crate) async fn load_history_after(
             return Err(invalid(ValidationReason::SourceMismatch));
         }
         branch = prefix.branch;
-        (prefix.contents, prefix.has_tail)
+        let (messages, groups, cut_early) =
+            assemble_bounded(ctx, &mut branch, prefix.contents, selection)?;
+        (messages, groups, prefix.has_tail || cut_early)
     } else {
-        let entries: Vec<_> = branch
-            .entries
-            .iter()
-            .filter(|entry| entry.kind != ChatEntryKind::Redacted)
-            .map(|entry| entry.seq)
-            .collect();
-        let contents = if entries.is_empty() {
-            Vec::new()
-        } else {
-            engine
-                .read_chat_contents(
-                    remaining_context(ctx, deadline)?,
-                    ChatContentRead {
-                        thread: thread.clone(),
-                        leaf,
-                        entries,
-                    },
-                )
-                .await?
-        };
-        (contents, false)
+        Box::pin(hydrate_and_assemble_bounded(
+            engine,
+            ctx,
+            deadline,
+            thread,
+            leaf,
+            &mut branch,
+            selection,
+        ))
+        .await?
     };
-    let (messages, groups) = assemble(ctx, &branch, hydrated, selection)?;
     Ok(History {
         branch,
         messages,
@@ -363,20 +354,230 @@ pub(crate) async fn load_history_after(
     })
 }
 
-fn assemble(
+fn partition_entry_groups(
+    entries: &[notarium_core::ports::ChatEntry],
+) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut i = 0;
+    while i < entries.len() {
+        match &entries[i].kind {
+            ChatEntryKind::Redacted => {
+                i += 1;
+            }
+            ChatEntryKind::Model => {
+                let start = i;
+                i += 1;
+                while i < entries.len() && matches!(entries[i].kind, ChatEntryKind::Tool { .. }) {
+                    i += 1;
+                }
+                ranges.push(start..i);
+            }
+            ChatEntryKind::Human | ChatEntryKind::Compaction | ChatEntryKind::Tool { .. } => {
+                ranges.push(i..i + 1);
+                i += 1;
+            }
+        }
+    }
+    ranges
+}
+
+fn json_value_wire_len(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Null => 4,
+        serde_json::Value::Bool(true) => 4,
+        serde_json::Value::Bool(false) => 5,
+        serde_json::Value::Number(n) => n.to_string().len(),
+        serde_json::Value::String(s) => s.len().saturating_add(2),
+        serde_json::Value::Array(items) => items.iter().fold(2usize, |acc, item| {
+            acc.saturating_add(json_value_wire_len(item))
+                .saturating_add(1)
+        }),
+        serde_json::Value::Object(map) => map.iter().fold(2usize, |acc, (k, v)| {
+            acc.saturating_add(k.len())
+                .saturating_add(json_value_wire_len(v))
+                .saturating_add(4)
+        }),
+    }
+}
+
+fn message_wire_lower_bound(message: &CompletionMessage) -> usize {
+    let mut bytes = 64usize;
+    if let Some(instruction) = &message.instruction {
+        bytes = bytes.saturating_add(instruction.text().len());
+    }
+    for part in &message.parts {
+        bytes = bytes.saturating_add(part.text().len()).saturating_add(32);
+    }
+    for call in &message.tool_calls {
+        let args_len = call.arguments.iter().fold(2usize, |acc, (k, v)| {
+            acc.saturating_add(k.len())
+                .saturating_add(json_value_wire_len(v))
+                .saturating_add(4)
+        });
+        bytes = bytes
+            .saturating_add(call.name.len())
+            .saturating_add(args_len)
+            .saturating_add(48);
+    }
+    bytes
+}
+
+fn should_stop_hydrating(
+    groups: &[HistoryGroup],
+    accumulated_wire_bytes: usize,
+    has_remaining_groups: bool,
+) -> bool {
+    if !has_remaining_groups || accumulated_wire_bytes <= WIRE_CEILING_BYTES || groups.len() < 2 {
+        return false;
+    }
+    let has_valid_cut = groups[..groups.len() - 1]
+        .iter()
+        .enumerate()
+        .any(|(idx, group)| !group.checkpoint && !groups[idx + 1].starts_with_tool);
+    has_valid_cut || accumulated_wire_bytes > WIRE_CEILING_BYTES.saturating_add(2 * 1024 * 1024)
+}
+
+async fn hydrate_and_assemble_bounded(
+    engine: &dyn ChatPort,
     ctx: &SpaceContext,
-    branch: &ChatBranch,
-    hydrated: Vec<HydratedChatEntry>,
+    deadline: Instant,
+    thread: &ChatThreadId,
+    leaf: ThreadEntrySeq,
+    branch: &mut ChatBranch,
     selection: &ProviderSelection,
-) -> Result<(Vec<CompletionMessage>, Vec<HistoryGroup>), PortError> {
-    // A retained answer may still rely on an erased source. Check visible
-    // dependencies before choosing a prefix from only part of this history.
+) -> Result<(Vec<CompletionMessage>, Vec<HistoryGroup>, bool), PortError> {
     let redacted: BTreeSet<_> = branch
         .entries
         .iter()
         .filter(|entry| entry.kind == ChatEntryKind::Redacted)
         .map(|entry| entry.seq)
         .collect();
+    let group_ranges = partition_entry_groups(&branch.entries);
+    if group_ranges.is_empty() {
+        return Ok((Vec::new(), Vec::new(), false));
+    }
+    let mut output = Vec::new();
+    let mut groups = Vec::new();
+    let mut accumulated_wire_bytes = 0usize;
+    let mut cut_at_entry_end: Option<usize> = None;
+    let mut group_idx = 0usize;
+    while group_idx < group_ranges.len() {
+        let batch_start = group_idx;
+        let mut batch_entries = Vec::new();
+        while group_idx < group_ranges.len() {
+            let range = &group_ranges[group_idx];
+            if !batch_entries.is_empty()
+                && batch_entries.len().saturating_add(range.len()) > HYDRATE_BATCH_ENTRIES
+            {
+                break;
+            }
+            for entry in &branch.entries[range.clone()] {
+                batch_entries.push(entry.seq);
+            }
+            group_idx += 1;
+        }
+        let hydrated = engine
+            .read_chat_contents(
+                remaining_context(ctx, deadline)?,
+                ChatContentRead {
+                    thread: thread.clone(),
+                    leaf,
+                    entries: batch_entries,
+                },
+            )
+            .await?;
+        let mut content = collect_hydrated(branch, &redacted, hydrated)?;
+        for (offset, range) in group_ranges[batch_start..group_idx].iter().enumerate() {
+            let abs_group_idx = batch_start + offset;
+            let before_len = output.len();
+            assemble_group(
+                ctx,
+                &branch.entries[range.clone()],
+                &mut content,
+                selection,
+                &mut output,
+                &mut groups,
+            )?;
+            for msg in &output[before_len..] {
+                accumulated_wire_bytes =
+                    accumulated_wire_bytes.saturating_add(message_wire_lower_bound(msg));
+            }
+            let has_remaining = abs_group_idx + 1 < group_ranges.len();
+            if should_stop_hydrating(&groups, accumulated_wire_bytes, has_remaining) {
+                cut_at_entry_end = Some(range.end);
+                break;
+            }
+        }
+        if cut_at_entry_end.is_some() {
+            break;
+        }
+        if !content.is_empty() {
+            return Err(invalid(ValidationReason::SourceMismatch));
+        }
+    }
+    if let Some(end_idx) = cut_at_entry_end {
+        branch.entries.truncate(end_idx);
+        Ok((output, groups, true))
+    } else {
+        Ok((output, groups, false))
+    }
+}
+
+fn assemble_bounded(
+    ctx: &SpaceContext,
+    branch: &mut ChatBranch,
+    hydrated: Vec<HydratedChatEntry>,
+    selection: &ProviderSelection,
+) -> Result<(Vec<CompletionMessage>, Vec<HistoryGroup>, bool), PortError> {
+    let redacted: BTreeSet<_> = branch
+        .entries
+        .iter()
+        .filter(|entry| entry.kind == ChatEntryKind::Redacted)
+        .map(|entry| entry.seq)
+        .collect();
+    let group_ranges = partition_entry_groups(&branch.entries);
+    let mut content = collect_hydrated(branch, &redacted, hydrated)?;
+    let mut output = Vec::new();
+    let mut groups = Vec::new();
+    let mut accumulated_wire_bytes = 0usize;
+    let mut cut_at_entry_end: Option<usize> = None;
+    for (idx, range) in group_ranges.iter().enumerate() {
+        let before_len = output.len();
+        assemble_group(
+            ctx,
+            &branch.entries[range.clone()],
+            &mut content,
+            selection,
+            &mut output,
+            &mut groups,
+        )?;
+        for msg in &output[before_len..] {
+            accumulated_wire_bytes =
+                accumulated_wire_bytes.saturating_add(message_wire_lower_bound(msg));
+        }
+        let has_remaining = idx + 1 < group_ranges.len();
+        if should_stop_hydrating(&groups, accumulated_wire_bytes, has_remaining) {
+            cut_at_entry_end = Some(range.end);
+            break;
+        }
+    }
+    if let Some(end_idx) = cut_at_entry_end {
+        branch.entries.truncate(end_idx);
+        return Ok((output, groups, true));
+    }
+    if !content.is_empty() {
+        return Err(invalid(ValidationReason::SourceMismatch));
+    }
+    Ok((output, groups, false))
+}
+
+fn collect_hydrated(
+    branch: &ChatBranch,
+    redacted: &BTreeSet<ThreadEntrySeq>,
+    hydrated: Vec<HydratedChatEntry>,
+) -> Result<BTreeMap<ThreadEntrySeq, HydratedChatEntry>, PortError> {
+    // A retained answer may still rely on an erased source. Check visible
+    // dependencies before choosing a prefix from only part of this history.
     let mut content = BTreeMap::new();
     for item in hydrated {
         if !redacted.is_empty()
@@ -399,6 +600,17 @@ fn assemble(
             return Err(invalid(ValidationReason::SourceMismatch));
         }
     }
+    Ok(content)
+}
+
+fn assemble_group(
+    ctx: &SpaceContext,
+    group_entries: &[notarium_core::ports::ChatEntry],
+    content: &mut BTreeMap<ThreadEntrySeq, HydratedChatEntry>,
+    selection: &ProviderSelection,
+    output: &mut Vec<CompletionMessage>,
+    groups: &mut Vec<HistoryGroup>,
+) -> Result<(), PortError> {
     let typed = |item: HydratedChatEntry| -> Result<ProviderMessage, PortError> {
         let part = ProviderMessage::Chat(ClassEgressFence::chat(
             item.content,
@@ -414,89 +626,78 @@ fn assemble(
         }
         Ok(part)
     };
-    let mut output = Vec::new();
-    let mut groups = Vec::new();
-    let mut entries = branch.entries.iter().peekable();
-    while let Some(entry) = entries.next() {
-        let item = content.remove(&entry.seq);
-        let mut through = entry.seq;
-
-        match &entry.kind {
-            // Retained entries still carry their original proofs, including
-            // any revoked dependency.
-            ChatEntryKind::Redacted => continue,
-            ChatEntryKind::Tool { .. } => {
-                let item = item.ok_or_else(|| invalid(ValidationReason::SourceMismatch))?;
-                output.push(unpaired_tool_output(typed(item)?)?);
-            }
-            ChatEntryKind::Compaction | ChatEntryKind::Human => {
-                let item = item.ok_or_else(|| invalid(ValidationReason::SourceMismatch))?;
-                let role = if entry.kind == ChatEntryKind::Human {
-                    CompletionRole::User
-                } else {
-                    CompletionRole::Assistant
-                };
-                output.push(message(role, typed(item)?));
-            }
-            ChatEntryKind::Model => {
-                let mut model = item.ok_or_else(|| invalid(ValidationReason::SourceMismatch))?;
-                let calls = std::mem::take(&mut model.tool_calls);
-                let mut assistant = message(CompletionRole::Assistant, typed(model)?);
-                let mut results = vec![None; calls.len()];
-                let mut unpaired = Vec::new();
-                while let Some(candidate) = entries.peek() {
-                    let ChatEntryKind::Tool { call_id } = &candidate.kind else {
-                        break;
-                    };
-                    let candidate = entries.next().expect("peeked tool result");
-                    through = candidate.seq;
-                    let item = content
-                        .remove(&candidate.seq)
-                        .ok_or_else(|| invalid(ValidationReason::SourceMismatch))?;
-                    let part = typed(item)?;
-                    if candidate.run == entry.run
-                        && let Some(index) = calls
-                            .iter()
-                            .position(|call| call.id.as_str() == call_id.as_str())
-                        && results[index].is_none()
-                    {
-                        let mut result = message(CompletionRole::Tool, part);
-                        result.result_for = Some(calls[index].id.clone());
-                        results[index] = Some(result);
-                    } else {
-                        unpaired.push(unpaired_tool_output(part)?);
-                    }
-                }
-                // Cancellation can leave a proper subset of results. Only
-                // replay pairs that really exist, in the original call order.
-                let mut paired = Vec::new();
-                for (call, result) in calls.into_iter().zip(results) {
-                    if let Some(result) = result {
-                        assistant.tool_calls.push(call);
-                        paired.push(result);
-                    }
-                }
-                if assistant.tool_calls.is_empty() && assistant.parts[0].text().is_empty() {
-                    assistant.instruction = Some(ProviderInstruction::from_orchestrator(
-                        "[Recorded assistant turn with no text]".into(),
-                    )?);
-                }
-                output.push(assistant);
-                output.extend(paired);
-                output.extend(unpaired);
-            }
+    let entry = &group_entries[0];
+    let item = content.remove(&entry.seq);
+    let mut through = entry.seq;
+    match &entry.kind {
+        ChatEntryKind::Redacted => return Ok(()),
+        ChatEntryKind::Tool { .. } => {
+            let item = item.ok_or_else(|| invalid(ValidationReason::SourceMismatch))?;
+            output.push(unpaired_tool_output(typed(item)?)?);
         }
-        groups.push(HistoryGroup {
-            end: output.len(),
-            through,
-            checkpoint: entry.kind == ChatEntryKind::Compaction,
-            starts_with_tool: matches!(entry.kind, ChatEntryKind::Tool { .. }),
-        });
+        ChatEntryKind::Compaction | ChatEntryKind::Human => {
+            let item = item.ok_or_else(|| invalid(ValidationReason::SourceMismatch))?;
+            let role = if entry.kind == ChatEntryKind::Human {
+                CompletionRole::User
+            } else {
+                CompletionRole::Assistant
+            };
+            output.push(message(role, typed(item)?));
+        }
+        ChatEntryKind::Model => {
+            let mut model = item.ok_or_else(|| invalid(ValidationReason::SourceMismatch))?;
+            let calls = std::mem::take(&mut model.tool_calls);
+            let mut assistant = message(CompletionRole::Assistant, typed(model)?);
+            let mut results = vec![None; calls.len()];
+            let mut unpaired = Vec::new();
+            for candidate in &group_entries[1..] {
+                let ChatEntryKind::Tool { call_id } = &candidate.kind else {
+                    return Err(invalid(ValidationReason::SourceMismatch));
+                };
+                through = candidate.seq;
+                let item = content
+                    .remove(&candidate.seq)
+                    .ok_or_else(|| invalid(ValidationReason::SourceMismatch))?;
+                let part = typed(item)?;
+                if candidate.run == entry.run
+                    && let Some(index) = calls
+                        .iter()
+                        .position(|call| call.id.as_str() == call_id.as_str())
+                    && results[index].is_none()
+                {
+                    let mut result = message(CompletionRole::Tool, part);
+                    result.result_for = Some(calls[index].id.clone());
+                    results[index] = Some(result);
+                } else {
+                    unpaired.push(unpaired_tool_output(part)?);
+                }
+            }
+            // Cancellation can leave a proper subset of results. Only
+            // replay pairs that really exist, in the original call order.
+            let mut paired = Vec::new();
+            for (call, result) in calls.into_iter().zip(results) {
+                if let Some(result) = result {
+                    assistant.tool_calls.push(call);
+                    paired.push(result);
+                }
+            }
+            if assistant.tool_calls.is_empty() && assistant.parts[0].text().is_empty() {
+                assistant.instruction = Some(ProviderInstruction::from_orchestrator(
+                    "[Recorded assistant turn with no text]".into(),
+                )?);
+            }
+            output.push(assistant);
+            output.extend(paired);
+            output.extend(unpaired);
+        }
     }
-    if !content.is_empty() {
-        return Err(invalid(ValidationReason::SourceMismatch));
-    }
-    Ok((output, groups))
+    groups.push(HistoryGroup {
+        end: output.len(),
+        through,
+        checkpoint: entry.kind == ChatEntryKind::Compaction,
+        starts_with_tool: matches!(entry.kind, ChatEntryKind::Tool { .. }),
+    });
+    Ok(())
 }
 
 pub(crate) fn system_prompt(

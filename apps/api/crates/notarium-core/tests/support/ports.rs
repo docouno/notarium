@@ -439,6 +439,12 @@ impl ControlPort for RejectingPorts {
             ctx: SpaceContext,
             request: SelectProvider,
         ) -> PortFuture<'_, ProviderSelection>;
+    fn list_provider_project_targets(
+            &self,
+            ctx: SpaceContext,
+            resource: ProviderResourceId,
+            page: ControlPageRequest,
+        ) -> PortFuture<'_, ControlPage<FolderRef>>;
     fn update_provider_preference(
             &self,
             ctx: AccountContext,

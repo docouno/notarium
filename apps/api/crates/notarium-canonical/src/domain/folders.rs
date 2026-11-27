@@ -560,7 +560,23 @@ pub(crate) async fn rename_folder_impl(
                     }
                 }
 
-                if new_slug_fold != folder_row.slug_fold {
+                if let Some(old_project_slug_fold) = folder_row.project_slug_fold.as_deref()
+                    && new_slug_fold != old_project_slug_fold
+                {
+                    insert_folder_alias_tx(
+                        tx,
+                        &scope.space_id,
+                        &parent_id,
+                        old_project_slug_fold,
+                        &input.folder,
+                        seq,
+                    )
+                    .await?;
+                }
+                if new_slug_fold != folder_row.slug_fold
+                    && folder_row.project_slug_fold.as_deref()
+                        != Some(folder_row.slug_fold.as_str())
+                {
                     insert_folder_alias_tx(
                         tx,
                         &scope.space_id,
@@ -881,7 +897,23 @@ pub(crate) async fn rename_project_impl(
                     }
                 }
 
-                if new_slug_fold != folder_row.slug_fold {
+                if let Some(old_project_slug_fold) = folder_row.project_slug_fold.as_deref()
+                    && new_slug_fold != old_project_slug_fold
+                {
+                    insert_folder_alias_tx(
+                        tx,
+                        &scope.space_id,
+                        &parent_id,
+                        old_project_slug_fold,
+                        &input.folder,
+                        seq,
+                    )
+                    .await?;
+                }
+                if new_slug_fold != folder_row.slug_fold
+                    && folder_row.project_slug_fold.as_deref()
+                        != Some(folder_row.slug_fold.as_str())
+                {
                     insert_folder_alias_tx(
                         tx,
                         &scope.space_id,
@@ -1640,7 +1672,74 @@ pub(crate) async fn is_note_live_readable_tx(
     Ok(auth.authorize_read(&facts).is_ok())
 }
 
-pub(crate) const FOLDER_SUBTREE_AUTH_SQL_WITH_ROOT: &str = "WITH RECURSIVE subtree(folder_id, locked) AS (
+pub(crate) const FOLDER_SUBTREE_AUTH_SQL_WITH_ROOT: &str = FOLDER_SUBTREE_AUTH_SQLITE_WITH_ROOT;
+
+const FOLDER_SUBTREE_AUTH_SQLITE_WITH_ROOT: &str = "WITH RECURSIVE subtree(folder_id, locked) AS (
+        SELECT folder_id,
+               CASE WHEN lifecycle_state != 'purged' AND write_lock_json IS NOT NULL THEN 1 ELSE 0 END
+        FROM folder_heads
+        WHERE space_id = $1 AND folder_id = $2
+        UNION
+        SELECT child.folder_id,
+               CASE WHEN child.lifecycle_state != 'purged' AND child.write_lock_json IS NOT NULL THEN 1 ELSE 0 END
+        FROM subtree AS parent
+        CROSS JOIN folder_heads AS child
+        WHERE child.space_id = $1
+          AND child.parent_folder_id = parent.folder_id
+          AND child.lifecycle_state != 'purged'
+    )
+    SELECT CAST(
+        COALESCE((SELECT MAX(locked) FROM subtree), 0)
+        + COALESCE((
+            SELECT
+                MAX(CASE WHEN nh.doc_class = 'skill' OR nh.ability_id IS NOT NULL THEN 2 ELSE 0 END)
+                + MAX(CASE WHEN nh.doc_class = 'user-doc' THEN 4 ELSE 0 END)
+                + MAX(CASE WHEN nh.doc_class = 'agent-memory' THEN 8 ELSE 0 END)
+                + MAX(CASE WHEN nh.doc_class = 'skill' THEN 16 ELSE 0 END)
+                + MAX(CASE WHEN nh.doc_class = 'encrypted-note' THEN 32 ELSE 0 END)
+                + MAX(CASE WHEN nh.doc_class = 'profile' THEN 64 ELSE 0 END)
+                + MAX(CASE WHEN nh.doc_class NOT IN ('user-doc', 'agent-memory', 'skill', 'encrypted-note', 'profile') THEN 128 ELSE 0 END)
+            FROM subtree AS s
+            CROSS JOIN note_heads AS nh INDEXED BY idx_note_heads_parent_lifecycle
+            WHERE nh.space_id = $1
+              AND nh.parent_folder_id = s.folder_id
+              AND nh.lifecycle_state != 'purged'
+        ), 0)
+    AS BIGINT)";
+
+const FOLDER_SUBTREE_AUTH_SQLITE_WITHOUT_ROOT: &str = "WITH RECURSIVE subtree(folder_id, locked) AS (
+        SELECT folder_id, 0
+        FROM folder_heads
+        WHERE space_id = $1 AND folder_id = $2
+        UNION
+        SELECT child.folder_id,
+               CASE WHEN child.lifecycle_state != 'purged' AND child.write_lock_json IS NOT NULL THEN 1 ELSE 0 END
+        FROM subtree AS parent
+        CROSS JOIN folder_heads AS child
+        WHERE child.space_id = $1
+          AND child.parent_folder_id = parent.folder_id
+          AND child.lifecycle_state != 'purged'
+    )
+    SELECT CAST(
+        COALESCE((SELECT MAX(locked) FROM subtree), 0)
+        + COALESCE((
+            SELECT
+                MAX(CASE WHEN nh.doc_class = 'skill' OR nh.ability_id IS NOT NULL THEN 2 ELSE 0 END)
+                + MAX(CASE WHEN nh.doc_class = 'user-doc' THEN 4 ELSE 0 END)
+                + MAX(CASE WHEN nh.doc_class = 'agent-memory' THEN 8 ELSE 0 END)
+                + MAX(CASE WHEN nh.doc_class = 'skill' THEN 16 ELSE 0 END)
+                + MAX(CASE WHEN nh.doc_class = 'encrypted-note' THEN 32 ELSE 0 END)
+                + MAX(CASE WHEN nh.doc_class = 'profile' THEN 64 ELSE 0 END)
+                + MAX(CASE WHEN nh.doc_class NOT IN ('user-doc', 'agent-memory', 'skill', 'encrypted-note', 'profile') THEN 128 ELSE 0 END)
+            FROM subtree AS s
+            CROSS JOIN note_heads AS nh INDEXED BY idx_note_heads_parent_lifecycle
+            WHERE nh.space_id = $1
+              AND nh.parent_folder_id = s.folder_id
+              AND nh.lifecycle_state != 'purged'
+        ), 0)
+    AS BIGINT)";
+
+const FOLDER_SUBTREE_AUTH_PG_WITH_ROOT: &str = "WITH RECURSIVE subtree(folder_id, locked) AS (
         SELECT folder_id,
                CASE WHEN lifecycle_state != 'purged' AND write_lock_json IS NOT NULL THEN 1 ELSE 0 END
         FROM folder_heads
@@ -1673,7 +1772,7 @@ pub(crate) const FOLDER_SUBTREE_AUTH_SQL_WITH_ROOT: &str = "WITH RECURSIVE subtr
         ), 0)
     AS BIGINT)";
 
-const FOLDER_SUBTREE_AUTH_SQL_WITHOUT_ROOT: &str = "WITH RECURSIVE subtree(folder_id, locked) AS (
+const FOLDER_SUBTREE_AUTH_PG_WITHOUT_ROOT: &str = "WITH RECURSIVE subtree(folder_id, locked) AS (
         SELECT folder_id, 0
         FROM folder_heads
         WHERE space_id = $1 AND folder_id = $2
@@ -1741,25 +1840,35 @@ pub(crate) async fn authorize_folder_subtree_tx(
     auth: &notarium_core::auth::EngineAuthContext,
     include_root_lock: bool,
 ) -> Result<(), PortError> {
-    let sql = if include_root_lock {
-        FOLDER_SUBTREE_AUTH_SQL_WITH_ROOT
-    } else {
-        FOLDER_SUBTREE_AUTH_SQL_WITHOUT_ROOT
-    };
-
     let mask: i64 = match tx {
-        BackendConn::Sqlite(conn) => sqlx::query_scalar(sql)
-            .bind(space_id.as_str())
-            .bind(root_folder.as_str())
-            .fetch_one(&mut **conn)
-            .await
-            .map_err(|err| internal_not_committed("sqlite_folder_subtree_auth", err.to_string()))?,
-        BackendConn::Postgres(conn) => sqlx::query_scalar(sql)
-            .bind(space_id.as_str())
-            .bind(root_folder.as_str())
-            .fetch_one(&mut **conn)
-            .await
-            .map_err(|err| crate::runtime::pg_read_error("pg_folder_subtree_auth", err))?,
+        BackendConn::Sqlite(conn) => {
+            let sql = if include_root_lock {
+                FOLDER_SUBTREE_AUTH_SQLITE_WITH_ROOT
+            } else {
+                FOLDER_SUBTREE_AUTH_SQLITE_WITHOUT_ROOT
+            };
+            sqlx::query_scalar(sql)
+                .bind(space_id.as_str())
+                .bind(root_folder.as_str())
+                .fetch_one(&mut **conn)
+                .await
+                .map_err(|err| {
+                    internal_not_committed("sqlite_folder_subtree_auth", err.to_string())
+                })?
+        }
+        BackendConn::Postgres(conn) => {
+            let sql = if include_root_lock {
+                FOLDER_SUBTREE_AUTH_PG_WITH_ROOT
+            } else {
+                FOLDER_SUBTREE_AUTH_PG_WITHOUT_ROOT
+            };
+            sqlx::query_scalar(sql)
+                .bind(space_id.as_str())
+                .bind(root_folder.as_str())
+                .fetch_one(&mut **conn)
+                .await
+                .map_err(|err| crate::runtime::pg_read_error("pg_folder_subtree_auth", err))?
+        }
     };
     authorize_folder_subtree_mask(space_id, auth, mask)
 }

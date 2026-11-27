@@ -808,9 +808,12 @@ impl WriteTransaction {
             .await
             .map_err(|_| unavailable("control rollback worker", CommitEffect::Unknown))?
     }
-    pub(crate) async fn commit(mut self) -> Result<(), PortError> {
+    pub(crate) fn spawn_commit(mut self) -> tokio::task::JoinHandle<Result<(), PortError>> {
         let resources = self.resources.take().expect("live write transaction");
         tokio::spawn(resources.commit())
+    }
+    pub(crate) async fn commit(self) -> Result<(), PortError> {
+        self.spawn_commit()
             .await
             .map_err(|_| unavailable("control commit worker", CommitEffect::Unknown))?
     }

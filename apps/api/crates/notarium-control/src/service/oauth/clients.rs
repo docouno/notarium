@@ -220,7 +220,7 @@ impl OAuthService {
                 CommitEffect::NotCommitted,
             )
             .await?;
-        budget.run_commit(tx.commit()).await?;
+        budget.commit_tx(tx).await?;
         Ok(result)
     }
     pub(super) async fn client(
@@ -398,7 +398,7 @@ impl OAuthService {
                 CommitEffect::NotCommitted,
             )
             .await?;
-        budget.run_commit(tx.commit()).await?;
+        budget.commit_tx(tx).await?;
         Ok(result)
     }
 }

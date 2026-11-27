@@ -227,41 +227,69 @@ async fn latest_compaction_candidates_tx(
     .map_err(|error| crate::runtime::pg_read_error("chat_compaction_candidates", error))
 }
 
-pub const THREAD_TAINTED_RANGE_SQL: &str = "SELECT 1 FROM chat_entries
+pub const THREAD_TAINTED_RANGE_SQL: &str =
+    "SELECT entry_seq, CAST(branch_depth AS INTEGER) FROM chat_entries
                        WHERE space_id = $1 AND thread_id = $2
                          AND ext_space_tainted <> 0
                          AND entry_seq > $3 AND entry_seq <= $4
-                       LIMIT 1";
+                       LIMIT 65";
 
-async fn thread_has_tainted_in_range_tx(
+enum BranchTaintCheck {
+    Clean,
+    TaintedOnBranch,
+    NeedsFullScan,
+}
+
+async fn check_branch_tainted_in_range_tx(
     tx: &mut BackendConn<'_>,
     space_id: &SpaceId,
     thread_id: &ChatThreadId,
     min_exclusive: ThreadEntrySeq,
-    max_inclusive: ThreadEntrySeq,
-) -> Result<bool, PortError> {
-    let found: Option<i32> = match tx {
+    leaf: ThreadEntrySeq,
+    leaf_depth: i32,
+) -> Result<BranchTaintCheck, PortError> {
+    let rows: Vec<(i64, i32)> = match tx {
         BackendConn::Sqlite(conn) => {
-            sqlx::query_scalar(THREAD_TAINTED_RANGE_SQL)
+            sqlx::query_as(THREAD_TAINTED_RANGE_SQL)
                 .bind(space_id.as_str())
                 .bind(thread_id.as_str())
                 .bind(min_exclusive.get() as i64)
-                .bind(max_inclusive.get() as i64)
-                .fetch_optional(&mut **conn)
+                .bind(leaf.get() as i64)
+                .fetch_all(&mut **conn)
                 .await
         }
         BackendConn::Postgres(conn) => {
-            sqlx::query_scalar(THREAD_TAINTED_RANGE_SQL)
+            sqlx::query_as(THREAD_TAINTED_RANGE_SQL)
                 .bind(space_id.as_str())
                 .bind(thread_id.as_str())
                 .bind(min_exclusive.get() as i64)
-                .bind(max_inclusive.get() as i64)
-                .fetch_optional(&mut **conn)
+                .bind(leaf.get() as i64)
+                .fetch_all(&mut **conn)
                 .await
         }
     }
     .map_err(|error| crate::runtime::pg_read_error("chat_compaction_taint_check", error))?;
-    Ok(found.is_some())
+    if rows.is_empty() {
+        return Ok(BranchTaintCheck::Clean);
+    }
+    for &(tainted_seq, tainted_depth) in rows.iter().take(64) {
+        if tainted_depth > leaf_depth {
+            continue;
+        }
+        if tainted_seq == leaf.get() as i64 {
+            return Ok(BranchTaintCheck::TaintedOnBranch);
+        }
+        if let Some(ancestor_seq) =
+            jump_to_depth_tx(tx, space_id, thread_id, leaf, tainted_depth).await?
+            && ancestor_seq == tainted_seq
+        {
+            return Ok(BranchTaintCheck::TaintedOnBranch);
+        }
+    }
+    if rows.len() > 64 {
+        return Ok(BranchTaintCheck::NeedsFullScan);
+    }
+    Ok(BranchTaintCheck::Clean)
 }
 
 async fn scan_prefix_chain_tx(
@@ -726,15 +754,27 @@ async fn oldest_prefix(
                         } else {
                             (ThreadEntrySeq::ZERO, -1)
                         };
-                        let need_full_taint_scan = !any_tainted
-                            && thread_has_tainted_in_range_tx(
+                        let need_full_taint_scan = if any_tainted {
+                            false
+                        } else {
+                            match check_branch_tainted_in_range_tx(
                                 tx,
                                 &scope.space_id,
                                 &request.thread,
                                 through,
                                 request.leaf,
+                                leaf_depth,
                             )
-                            .await?;
+                            .await?
+                            {
+                                BranchTaintCheck::Clean => false,
+                                BranchTaintCheck::TaintedOnBranch => {
+                                    any_tainted = true;
+                                    false
+                                }
+                                BranchTaintCheck::NeedsFullScan => true,
+                            }
+                        };
                         if need_full_taint_scan {
                             checkpoint = None;
                             None

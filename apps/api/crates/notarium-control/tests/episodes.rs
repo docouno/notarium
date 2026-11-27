@@ -454,7 +454,7 @@ async fn exercise(pg: bool) {
 
     // Space-narrowed replay of Started::Ambiguous must not disclose episodes
     // from excluded Spaces, and acknowledge_delta replay must survive episode close.
-    let amb_space = service
+    let amb_space_commit = service
         .create_space(
             ctx.clone(),
             AccountMutation {
@@ -467,8 +467,8 @@ async fn exercise(pg: bool) {
             },
         )
         .await
-        .unwrap()
-        .value;
+        .unwrap();
+    let amb_space = amb_space_commit.value;
     let amb_ctx = AccountContext::new(
         service
             .resolve(evidence(AuthEvidenceKind::Session, token.expose()))
@@ -508,7 +508,7 @@ async fn exercise(pg: bool) {
             .unwrap()
             .value,
     );
-    let _e_shared = result(
+    let e_shared_a = result(
         service
             .start_or_resume_episode(
                 amb_ctx.clone(),
@@ -519,7 +519,7 @@ async fn exercise(pg: bool) {
                             requested: EpisodeId::parse("ses_AmbShar00002").unwrap(),
                             name: Some("dup-name".into()),
                         },
-                        project_hint: Some(amb_proj),
+                        project_hint: Some(amb_proj.clone()),
                         guard: EpisodeRevisionGuard::Account,
                     },
                 },
@@ -577,19 +577,248 @@ async fn exercise(pg: bool) {
     )
     .await;
     let ack_2 = service
-        .acknowledge_delta(amb_ctx, ack_mut)
+        .acknowledge_delta(amb_ctx.clone(), ack_mut)
         .await
         .expect("acknowledge_delta replay must succeed after episode close");
     assert_eq!(ack_2.value.seq, ack_1.value.seq);
 
+    Box::pin(exercise_shared_isolation_and_revoked_space(
+        &service,
+        &amb_ctx,
+        &amb_space.history,
+        &amb_proj,
+        &e_shared_a,
+        &other.id,
+        other_session.token.expose(),
+    ))
+    .await;
+
     drop(service);
     fixture.close().await;
 }
+
+#[allow(clippy::too_many_arguments)]
+async fn exercise_shared_isolation_and_revoked_space(
+    service: &ControlService,
+    amb_ctx: &AccountContext,
+    amb_space_history: &HistoryScope,
+    amb_proj: &FolderRef,
+    e_shared_a: &AgentEpisode,
+    other_id: &PrincipalId,
+    other_session_token: &str,
+) {
+    // Shared AgentRun bound to episode A in `amb_proj` must not read, bootstrap,
+    // touch, or update sibling episode B in the exact same project; an unbound
+    // Shared AgentRun must not access either episode.
+    let e_shared_b = result(
+        service
+            .start_or_resume_episode(
+                amb_ctx.clone(),
+                AccountMutation {
+                    identity: identity(service, amb_ctx, 50).await,
+                    input: StartEpisode {
+                        selector: EpisodeSelector::New {
+                            requested: EpisodeId::parse("ses_AmbShar00003").unwrap(),
+                            name: Some("sibling-shared".into()),
+                        },
+                        project_hint: Some(amb_proj.clone()),
+                        guard: EpisodeRevisionGuard::Account,
+                    },
+                },
+            )
+            .await
+            .unwrap()
+            .value,
+    );
+    let mut shared_grants = std::collections::BTreeMap::new();
+    let mut g = amb_ctx.auth().spaces()[&amb_space_history.space_id].clone();
+    g.project_root = Some(amb_proj.folder_id.clone());
+    shared_grants.insert(amb_space_history.space_id.clone(), g);
+    let unbound_shared_run = amb_ctx
+        .auth()
+        .for_agent_run(
+            AgentRunId::from_bytes([0x91; 16]),
+            amb_space_history.space_id.clone(),
+            ChatAudience::Shared,
+            shared_grants.clone(),
+        )
+        .unwrap();
+    not_found(
+        service
+            .get_episode(
+                AccountContext::new(unbound_shared_run.clone(), budget()),
+                e_shared_a.id.clone(),
+            )
+            .await,
+    );
+    not_found(
+        service
+            .get_episode(
+                AccountContext::new(unbound_shared_run, budget()),
+                e_shared_b.id.clone(),
+            )
+            .await,
+    );
+    let bound_shared_run = amb_ctx
+        .auth()
+        .for_agent_run(
+            AgentRunId::from_bytes([0x92; 16]),
+            amb_space_history.space_id.clone(),
+            ChatAudience::Shared,
+            shared_grants,
+        )
+        .unwrap()
+        .with_chat_episode(e_shared_a.id.clone());
+    let bound_ctx = AccountContext::new(bound_shared_run, budget());
+    assert_eq!(
+        service
+            .get_episode(bound_ctx.clone(), e_shared_a.id.clone())
+            .await
+            .unwrap()
+            .id,
+        e_shared_a.id
+    );
+    not_found(
+        service
+            .get_episode(bound_ctx.clone(), e_shared_b.id.clone())
+            .await,
+    );
+    not_found(
+        service
+            .bootstrap_context(
+                bound_ctx.clone(),
+                e_shared_b.id.clone(),
+                None,
+                ControlPageRequest::new(5, None).unwrap(),
+            )
+            .await,
+    );
+    assert!(matches!(
+        service
+            .touch_episode(bound_ctx.clone(), e_shared_b.id.clone())
+            .await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+    assert!(matches!(
+        service
+            .update_episode(
+                bound_ctx,
+                AccountMutation {
+                    identity: identity(service, amb_ctx, 51).await,
+                    input: EpisodeMutation::Full(EpisodeUpdate {
+                        episode: e_shared_b.id.clone(),
+                        expected: e_shared_b.revision,
+                        name: Some("hijack".into()),
+                        active_role: None,
+                        project_hint: Some(amb_proj.clone()),
+                        lifecycle: EpisodeLifecycle::Active,
+                    }),
+                },
+            )
+            .await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+
+    // Unnarrowed, unpinned owner whose membership in the hinted Space is later
+    // revoked must still be able to inspect (`ProjectUnavailable`), clear
+    // `project_hint`, and close their own episode.
+    let amb_space_ctx =
+        SpaceContext::new(amb_ctx.auth().clone(), amb_space_history.clone(), budget()).unwrap();
+    let added_rev = service
+        .change_membership(
+            amb_space_ctx.clone(),
+            MembershipChange {
+                command: CommandKey::from_bytes([52; 16]),
+                member: other_id.clone(),
+                role: Some(SpaceRole::Editor),
+                expected: ControlRevision::ZERO,
+            },
+        )
+        .await
+        .unwrap()
+        .revision;
+    let other_member_ctx = AccountContext::new(
+        service
+            .resolve(evidence(AuthEvidenceKind::Session, other_session_token))
+            .await
+            .unwrap(),
+        budget(),
+    );
+    let other_ep = result(
+        service
+            .start_or_resume_episode(
+                other_member_ctx.clone(),
+                AccountMutation {
+                    identity: identity(service, &other_member_ctx, 53).await,
+                    input: StartEpisode {
+                        selector: EpisodeSelector::New {
+                            requested: EpisodeId::parse("ses_OthRev000001").unwrap(),
+                            name: Some("revoked-space-ep".into()),
+                        },
+                        project_hint: Some(amb_proj.clone()),
+                        guard: EpisodeRevisionGuard::Account,
+                    },
+                },
+            )
+            .await
+            .unwrap()
+            .value,
+    );
+    service
+        .change_membership(
+            amb_space_ctx,
+            MembershipChange {
+                command: CommandKey::from_bytes([54; 16]),
+                member: other_id.clone(),
+                role: None,
+                expected: added_rev,
+            },
+        )
+        .await
+        .unwrap();
+    let other_after_ctx = AccountContext::new(
+        service
+            .resolve(evidence(AuthEvidenceKind::Session, other_session_token))
+            .await
+            .unwrap(),
+        budget(),
+    );
+    let inspected = service
+        .get_episode(other_after_ctx.clone(), other_ep.id.clone())
+        .await
+        .expect("unnarrowed owner must inspect episode after Space removal");
+    assert!(inspected.project_hint.is_none());
+    assert!(
+        inspected
+            .diagnostics
+            .contains(&EpisodeDiagnostic::ProjectUnavailable)
+    );
+    let closed_after_leave = service
+        .update_episode(
+            other_after_ctx.clone(),
+            AccountMutation {
+                identity: identity(service, &other_after_ctx, 55).await,
+                input: EpisodeMutation::Full(EpisodeUpdate {
+                    episode: inspected.id.clone(),
+                    expected: inspected.revision,
+                    name: inspected.name.clone(),
+                    active_role: inspected.active_role.clone(),
+                    project_hint: None,
+                    lifecycle: EpisodeLifecycle::Closed,
+                }),
+            },
+        )
+        .await
+        .expect("unnarrowed owner must close episode after Space removal")
+        .value;
+    assert_eq!(closed_after_leave.lifecycle, EpisodeLifecycle::Closed);
+    assert!(closed_after_leave.project_hint.is_none());
+}
 #[tokio::test]
 async fn sqlite_episode_state_and_authority() {
-    exercise(false).await;
+    Box::pin(exercise(false)).await;
 }
 #[tokio::test]
 async fn postgres_episode_state_and_authority() {
-    exercise(true).await;
+    Box::pin(exercise(true)).await;
 }

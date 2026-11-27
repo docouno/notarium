@@ -25,6 +25,26 @@ impl ScheduleScope<'_> {
         self.check_inner(auth, true)
     }
 
+    pub(super) fn check_mint(
+        self,
+        auth: &EngineAuthContext,
+        owner_personal_space: Option<&str>,
+    ) -> Result<(), PortError> {
+        self.check_inner(auth, false)?;
+        let grant = auth
+            .spaces()
+            .get(self.space)
+            .ok_or(DomainError::ResourceNotFound)?;
+        let mut required = DocClass::all();
+        if owner_personal_space != Some(self.space.as_str()) {
+            required.remove(&DocClass::Profile);
+        }
+        if !required.is_subset(&grant.read_classes) {
+            return Err(access_denied());
+        }
+        Ok(())
+    }
+
     fn check_inner(
         self,
         auth: &EngineAuthContext,
@@ -66,13 +86,15 @@ impl ScheduleScope<'_> {
         auth: &EngineAuthContext,
         run: AgentRunId,
         ability_ids: BTreeSet<AbilityId>,
+        system_ability_ids: BTreeSet<AbilityId>,
     ) -> Result<EngineAuthContext, PortError> {
         self.check(auth)?;
-        Ok(auth.for_keeper(
+        Ok(auth.for_keeper_with_abilities(
             run,
             self.space.clone(),
             self.project.map(|p| p.folder_id.clone()),
             ability_ids,
+            system_ability_ids,
         )?)
     }
 
@@ -100,8 +122,18 @@ impl ScheduleScope<'_> {
 }
 
 pub(super) fn package_ids(role: &AbilityRef, skills: &[AbilityRef]) -> BTreeSet<AbilityId> {
-    std::iter::once(role.id.clone())
-        .chain(skills.iter().map(|skill| skill.id.clone()))
+    std::iter::once(role)
+        .chain(skills.iter())
+        .filter(|ability| ability.placement != AbilityPlacement::System)
+        .map(|ability| ability.id.clone())
+        .collect()
+}
+
+pub(super) fn system_package_ids(role: &AbilityRef, skills: &[AbilityRef]) -> BTreeSet<AbilityId> {
+    std::iter::once(role)
+        .chain(skills.iter())
+        .filter(|ability| ability.placement == AbilityPlacement::System)
+        .map(|ability| ability.id.clone())
         .collect()
 }
 
@@ -169,7 +201,13 @@ impl ControlService {
             return Err(DomainError::ResourceNotFound.into());
         }
         let run = AgentRunId::from_bytes([0; 16]);
-        let role_auth = scope.keeper(&auth, run.clone(), [selection.role.id.clone()].into())?;
+        let (initial_owned, initial_system) =
+            if selection.role.placement == AbilityPlacement::System {
+                (BTreeSet::new(), BTreeSet::from([selection.role.id.clone()]))
+            } else {
+                (BTreeSet::from([selection.role.id.clone()]), BTreeSet::new())
+            };
+        let role_auth = scope.keeper(&auth, run.clone(), initial_owned, initial_system)?;
         let role_ctx = AccountContext::new(role_auth, budget.context(ctx.budget.request.clone()));
         let (role, skills, mut lease) = budget
             .run(
@@ -185,6 +223,7 @@ impl ControlService {
                         &auth,
                         run,
                         package_ids(&role.reference, &role.attached_skills),
+                        system_package_ids(&role.reference, &role.attached_skills),
                     )?;
                     let reviewer =
                         AccountContext::new(reviewer, budget.context(ctx.budget.request.clone()));
@@ -366,6 +405,7 @@ impl ControlService {
             &auth,
             AgentRunId::from_bytes([0; 16]),
             package_ids(&definition.approved_role, skills),
+            system_package_ids(&definition.approved_role, skills),
         )?;
         let limited = AccountContext::new(keeper, budget.context(ctx.budget.request.clone()));
         budget

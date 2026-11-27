@@ -438,7 +438,7 @@ async fn wide_subtree_probes_children_by_parent_before_analyze() {
         const COMPACTION_CANDIDATES_SQL: &str =
             include_str!("../../src/chats/latest_compaction_candidates.sqlite.sql");
         const PROJECT_ABILITY_SUBTREE_SQL: &str =
-            include_str!("../../src/catalog/project_ability_subtree_version.sql");
+            include_str!("../../src/catalog/project_ability_subtree_version.sqlite.sql");
         conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
         {
             let mut nstmt = conn
@@ -586,9 +586,8 @@ async fn wide_subtree_probes_children_by_parent_before_analyze() {
                 .unwrap()
                 .join("\n");
             assert!(
-                rank_details.contains("idx_revisions_entity_vis_seq")
-                    && rank_details.contains("idx_revisions_agent_run"),
-                "{phase} pre-run rank query must use idx_revisions_entity_vis_seq and idx_revisions_agent_run:\n{rank_details}"
+                rank_details.contains("idx_revisions_entity_vis_seq"),
+                "{phase} pre-run rank query must use idx_revisions_entity_vis_seq:\n{rank_details}"
             );
             assert!(
                 !rank_details.contains("SCAN ")
@@ -633,9 +632,10 @@ async fn wide_subtree_probes_children_by_parent_before_analyze() {
                 .unwrap()
                 .join("\n");
             assert!(
-                ab_details.contains("SEARCH nh USING INDEX idx_note_heads_parent_lifecycle")
-                    && ab_details.contains("SEARCH ap USING INDEX idx_ability_packages_entrypoint"),
-                "{phase} project ability subtree version must drive from subtree into note_heads (idx_note_heads_parent_lifecycle) and ability_packages (idx_ability_packages_entrypoint):\n{ab_details}"
+                ab_details.contains("SEARCH ap USING INDEX idx_ability_packages_entrypoint (space_id=?)")
+                    && (ab_details.contains("SEARCH nh USING INDEX sqlite_autoindex_note_heads_1 (space_id=? AND note_id=?)")
+                        || ab_details.contains("SEARCH nh USING INDEX idx_note_heads_keyset (space_id=? AND note_id=?)")),
+                "{phase} project ability subtree version must drive from ability_packages (idx_ability_packages_entrypoint) into note_heads exact key lookup without scanning note_heads:\n{ab_details}"
             );
             assert!(
                 !ab_details.contains("SCAN note_heads")
@@ -808,10 +808,33 @@ async fn wide_subtree_probes_children_by_parent_before_analyze() {
                 .join("\n");
             assert!(
                 prerun_details.contains("idx_revisions_entity_vis_seq")
-                    && prerun_details.contains("idx_revisions_agent_run")
                     && !prerun_details.contains("SCAN revisions")
                     && !prerun_details.contains("TEMP B-TREE FOR ORDER BY"),
-                "{phase} prerun_rank must seek idx_revisions_entity_vis_seq and idx_revisions_agent_run without temp sort:\n{prerun_details}"
+                "{phase} prerun_rank must seek idx_revisions_entity_vis_seq without temp sort:\n{prerun_details}"
+            );
+
+            const RUN_VIS_SEQS_SQL: &str =
+                include_str!("../../src/domain/rollback/run_vis_seqs.sqlite.sql");
+            let mut run_vis_plan = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {RUN_VIS_SEQS_SQL}"))
+                .unwrap();
+            let run_vis_details = run_vis_plan
+                .query_map(
+                    rusqlite::params![
+                        scope.space_id.as_str(),
+                        scope.incarnation.as_bytes().as_slice(),
+                        "run_0001",
+                    ],
+                    |r| r.get::<_, String>(3),
+                )
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+                .join("\n");
+            assert!(
+                run_vis_details.contains("idx_revisions_agent_run")
+                    && !run_vis_details.contains("SCAN revisions"),
+                "{phase} run_vis_seqs must seek idx_revisions_agent_run:\n{run_vis_details}"
             );
         }
     }

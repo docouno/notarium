@@ -169,7 +169,7 @@ impl ControlService {
             let revision=ControlRevision::new(revision as u64)?;
             let saved=SavedResult{value:TelemetrySettings{revision:ControlRevision::new(version as u64)?,..input},events:vec![]};command.save(tx.inner_mut(),revision,&saved,now).await?;Ok((revision,saved))
         },CommitEffect::NotCommitted).await?;
-        budget.run_commit(tx.commit()).await?;
+        budget.commit_tx(tx).await?;
         Ok(ControlCommit {
             revision,
             value: saved.value,

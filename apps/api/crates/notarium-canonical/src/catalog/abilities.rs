@@ -559,12 +559,7 @@ pub(super) async fn locate(
                         continue;
                     }
                     match descriptor(tx, ctx.auth(), &space, &id, None).await {
-                        Ok(desc) => {
-                            found.push(desc);
-                            if found.len() >= 200 {
-                                break;
-                            }
-                        }
+                        Ok(desc) => found.push(desc),
                         Err(PortError::Domain(DomainError::ResourceNotFound)) => continue,
                         Err(err) => return Err(err),
                     }
@@ -695,13 +690,31 @@ async fn compute_abilities_page_scope(
                 Err(e) => return Err(e),
             };
             let subtree_version: (i64, i64, i64, i64) = if root_ancestry.is_some() {
-                db!(
-                    read tx,
-                    sqlx::query_as(include_str!("project_ability_subtree_version.sql")),
-                    fetch_one,
-                    space.space.id.as_str(),
-                    root.as_str()
-                )?
+                match tx {
+                    BackendConn::Sqlite(conn) => {
+                        sqlx::query_as(include_str!("project_ability_subtree_version.sqlite.sql"))
+                            .bind(space.space.id.as_str())
+                            .bind(root.as_str())
+                            .fetch_one(&mut **conn)
+                            .await
+                            .map_err(|err| {
+                                internal_not_committed(
+                                    "sqlite_project_ability_subtree",
+                                    err.to_string(),
+                                )
+                            })?
+                    }
+                    BackendConn::Postgres(conn) => {
+                        sqlx::query_as(include_str!("project_ability_subtree_version.sql"))
+                            .bind(space.space.id.as_str())
+                            .bind(root.as_str())
+                            .fetch_one(&mut **conn)
+                            .await
+                            .map_err(|err| {
+                                crate::runtime::pg_read_error("pg_project_ability_subtree", err)
+                            })?
+                    }
+                }
             } else {
                 (0, 0, 0, 0)
             };
@@ -749,10 +762,75 @@ async fn fetch_ability_package_batch(
     space_id: &SpaceId,
     slug: Option<&str>,
     kind: Option<notarium_core::classes::AbilityKind>,
+    project_scope: Option<Option<&FolderId>>,
     scan_after_id: &str,
     batch_size: i64,
 ) -> Result<Vec<AbilityPackagePageRow>, PortError> {
     let map_err = |err| crate::runtime::pg_read_error("list_ability_packages", err);
+    if let Some(target_project) = project_scope {
+        let project_id = target_project.map(FolderId::as_str).unwrap_or("");
+        let kind_str = kind.map(crate::codec::ability_kind_to_db);
+        const LIST_PACKAGES_SCOPED_SQLITE: &str = "WITH RECURSIVE allowed_folders(folder_id) AS (
+            SELECT folder_id FROM folder_heads
+            WHERE space_id=$1 AND (is_root=1 OR ($2 <> '' AND folder_id=$2))
+            UNION ALL
+            SELECT fh.folder_id FROM allowed_folders af
+            CROSS JOIN folder_heads fh
+            WHERE fh.space_id=$1 AND fh.parent_folder_id=af.folder_id AND fh.is_project=0
+        )
+        SELECT ap.ability_id, ap.created_seq, ap.entrypoint_note_id, ap.manifest_rev_id, ap.lifecycle_state, ap.slug_fold
+        FROM ability_packages ap
+        CROSS JOIN note_heads nh
+        WHERE ap.space_id=$1 AND ap.lifecycle_state='active'
+          AND ($3 IS NULL OR ap.slug_fold=$3)
+          AND ($4 IS NULL OR ap.kind=$4)
+          AND ap.ability_id>$5
+          AND nh.space_id=ap.space_id AND nh.note_id=ap.entrypoint_note_id
+          AND nh.parent_folder_id IN (SELECT folder_id FROM allowed_folders)
+        ORDER BY ap.ability_id
+        LIMIT $6";
+        const LIST_PACKAGES_SCOPED_PG: &str = "WITH RECURSIVE allowed_folders(folder_id) AS (
+            SELECT folder_id FROM folder_heads
+            WHERE space_id=$1 AND (is_root=1 OR ($2 <> '' AND folder_id=$2))
+            UNION ALL
+            SELECT fh.folder_id FROM allowed_folders af
+            CROSS JOIN folder_heads fh
+            WHERE fh.space_id=$1 AND fh.parent_folder_id=af.folder_id AND fh.is_project=0
+        )
+        SELECT ap.ability_id, ap.created_seq, ap.entrypoint_note_id, ap.manifest_rev_id, ap.lifecycle_state, ap.slug_fold
+        FROM ability_packages ap
+        CROSS JOIN note_heads nh
+        WHERE ap.space_id=$1 AND ap.lifecycle_state='active'
+          AND ($3::TEXT IS NULL OR ap.slug_fold=$3)
+          AND ($4::TEXT IS NULL OR ap.kind=$4)
+          AND ap.ability_id COLLATE \"C\" > $5
+          AND nh.space_id=ap.space_id AND nh.note_id=ap.entrypoint_note_id
+          AND nh.parent_folder_id IN (SELECT folder_id FROM allowed_folders)
+        ORDER BY ap.ability_id COLLATE \"C\"
+        LIMIT $6";
+        return match tx {
+            BackendConn::Sqlite(conn) => sqlx::query_as(LIST_PACKAGES_SCOPED_SQLITE)
+                .bind(space_id.as_str())
+                .bind(project_id)
+                .bind(slug)
+                .bind(kind_str)
+                .bind(scan_after_id)
+                .bind(batch_size)
+                .fetch_all(&mut **conn)
+                .await
+                .map_err(map_err),
+            BackendConn::Postgres(conn) => sqlx::query_as(LIST_PACKAGES_SCOPED_PG)
+                .bind(space_id.as_str())
+                .bind(project_id)
+                .bind(slug)
+                .bind(kind_str)
+                .bind(scan_after_id)
+                .bind(batch_size)
+                .fetch_all(&mut **conn)
+                .await
+                .map_err(map_err),
+        };
+    }
     match (slug, kind) {
         (Some(slug), Some(kind)) => {
             let kind_str = crate::codec::ability_kind_to_db(kind);
@@ -891,6 +969,19 @@ pub(super) async fn page(
                     .map(|_| std::collections::BTreeMap::new())
                     .collect();
                 'spaces: for (index, rec) in live.iter().enumerate() {
+                    let project_scope = if query.authoring && query.project.is_none() {
+                        None
+                    } else if let Some(project) = &query.project {
+                        if rec.space.id == project.space_id {
+                            Some(Some(&project.folder_id))
+                        } else if rec.space.kind == SpaceKind::Personal {
+                            Some(None)
+                        } else {
+                            continue;
+                        }
+                    } else {
+                        Some(None)
+                    };
                     let mut scan_after_id = match &after {
                         Some((sid, _)) if sid > &rec.space.id => continue,
                         Some((sid, seq)) if sid == &rec.space.id => {
@@ -908,6 +999,7 @@ pub(super) async fn page(
                             &rec.space.id,
                             query.name.as_deref(),
                             query.kind,
+                            project_scope,
                             &scan_after_id,
                             batch_size,
                         ))

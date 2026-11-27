@@ -37,7 +37,8 @@ binding columns (`approved_skills`, `keeper_log_id`,
 and `schedule_run_retention` as partial indexes aligned to their scan orders,
 and adding `schedule_owner_live`, `schedule_owner_project_live`,
 `schedule_expired_run`, `episode_owner_name_open`,
-`attachment_target_approved_id`, `call_run`, `ability_trail_destination`,
+`attachment_target_approved_id`, `attachment_target_project_approved_id`,
+`call_run`, `ability_trail_destination`,
 `ability_preference_placement`, `favorite_note_order`, and
 `context_order_lookup`. Existing bearers default to no
 ability-authoring opt-in. Existing schedules with unverified skill approvals

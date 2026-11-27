@@ -91,7 +91,7 @@ impl ControlService {
             command.save(tx.inner_mut(), revision, &SavedResult { value: (), events: vec![] }, self.clock.now_ms()?).await?;
             Ok(revision)
         }, CommitEffect::NotCommitted).await?;
-        budget.run_commit(tx.commit()).await?;
+        budget.commit_tx(tx).await?;
         Ok(ControlCommit {
             revision,
             value: (),
@@ -140,6 +140,7 @@ impl ControlService {
         let target = usize::from(page.limit());
         let batch_limit = i64::from(page.limit()).saturating_add(1).max(16);
         let mut items = Vec::with_capacity(target);
+        let mut seen = std::collections::BTreeSet::new();
         let mut last_visible: Option<Cursor> = None;
         let mut has_more = false;
         let mut scanned = 0usize;
@@ -209,6 +210,13 @@ impl ControlService {
                     kind: row_cursor.kind.clone(),
                     entity: row_cursor.entity.clone(),
                 });
+                if !seen.insert((
+                    row.space_id.clone(),
+                    row.entity_kind.clone(),
+                    row.entity_id.clone(),
+                )) {
+                    continue;
+                }
                 if current
                     .auth()
                     .spaces()

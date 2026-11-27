@@ -241,7 +241,8 @@ async fn whoami(call: &mut ToolCallContext<'_>) -> Result<Value, PortError> {
             } else {
                 let ctx = call.space(card.history)?;
                 let source = CatalogDisclosure::Space(ctx.scope().clone());
-                let Some((proof, taint)) = project_metadata(call, ctx, source, None).await? else {
+                let Some((proof, taint)) = project_metadata(call, ctx, source, None, true).await?
+                else {
                     continue;
                 };
                 if let Some(taint) = taint {
@@ -295,6 +296,8 @@ async fn projects(call: &mut ToolCallContext<'_>) -> Result<Value, PortError> {
     let external = matches!(call.target, EgressTarget::ExternalMcp);
     let mut items = Vec::new();
     let mut pending_taints = Vec::new();
+    let mut space_wide_consented: std::collections::BTreeMap<notarium_core::ids::SpaceId, bool> =
+        std::collections::BTreeMap::new();
     let collected: Result<(), PortError> = async {
         for card in visible_projects(call).await? {
             let Some(space) = spaces.get(&card.folder.space_id) else {
@@ -304,13 +307,48 @@ async fn projects(call: &mut ToolCallContext<'_>) -> Result<Value, PortError> {
                 (space.slug.clone(), card.project_slug, card.name)
             } else {
                 let scope = call.space(space.history.clone())?;
+                let space_wide = match space_wide_consented.get(&card.folder.space_id) {
+                    Some(&flag) => flag,
+                    None => {
+                        let flag = match call.provider_selection(&scope, None).await {
+                            Ok(Some(sel)) if sel.project_only.is_none() => {
+                                match project_metadata(
+                                    call,
+                                    scope.clone(),
+                                    CatalogDisclosure::Space(space.history.clone()),
+                                    None,
+                                    true,
+                                )
+                                .await?
+                                {
+                                    Some((_, taint)) => {
+                                        if let Some(taint) = taint {
+                                            pending_taints.push(taint);
+                                        }
+                                        true
+                                    }
+                                    None => false,
+                                }
+                            }
+                            Ok(_) => false,
+                            Err(PortError::Domain(DomainError::Provider {
+                                error: ProviderErrorCode::Unavailable,
+                            })) => false,
+                            Err(error) if corpus::hidden(&error) => false,
+                            Err(error) => return Err(error),
+                        };
+                        space_wide_consented.insert(card.folder.space_id.clone(), flag);
+                        flag
+                    }
+                };
                 let source = CatalogDisclosure::Folder(card.folder.clone());
                 let Some((proof, taint)) =
-                    project_metadata(call, scope, source, Some(card.folder.clone())).await?
+                    project_metadata(call, scope, source, Some(card.folder.clone()), !space_wide)
+                        .await?
                 else {
                     continue;
                 };
-                if let Some(taint) = taint {
+                if !space_wide && let Some(taint) = taint {
                     pending_taints.push(taint);
                 }
                 (
@@ -379,6 +417,7 @@ async fn project_metadata(
     scope: SpaceContext,
     source: CatalogDisclosure,
     project: Option<FolderRef>,
+    record_origin: bool,
 ) -> Result<Option<(Value, Option<PendingMetadataTaint>)>, PortError> {
     let auth = call.account();
     let foreign_space = auth
@@ -436,7 +475,9 @@ async fn project_metadata(
                 Err(error)
             };
         }
-        if let Err(error) = call.record_origin(proof.current().origin(), selection.project_only) {
+        if record_origin
+            && let Err(error) = call.record_origin(proof.current().origin(), selection.project_only)
+        {
             if foreign_space {
                 call.commit_external_read();
             }
@@ -486,10 +527,14 @@ async fn start(call: &mut ToolCallContext<'_>, args: StartArgs) -> Result<Value,
         || args.project.is_some()
         || args.role.is_some()
         || args.task.is_some();
+    if args.continuation.is_some() && new_selection {
+        return Err(invalid(ValidationReason::InvalidQuery));
+    }
+    // Bind the transport idempotency key to the normalized start_session arguments
+    // before branching across continuation, deliveryReceipt, and episode start so
+    // a single key cannot execute two distinct sub-operations.
+    call.journal("invocation", || async { Ok(true) }).await?;
     if let Some(continuation) = args.continuation.as_deref() {
-        if new_selection {
-            return Err(invalid(ValidationReason::InvalidQuery));
-        }
         return Ok(json!({
             "delta": delta::resume(call, continuation, args.delivery_receipt.as_deref(), args.acknowledge).await?
         }));
@@ -656,6 +701,7 @@ async fn start(call: &mut ToolCallContext<'_>, args: StartArgs) -> Result<Value,
     }
     const SESSION_LABEL: &str = "notarium.mcp.start-session.v1";
     let selector = validated_selector.expect("selector validated when starting session");
+    let plan_replayed = existing_plan.is_some();
     let plan: StartPlan = match existing_plan {
         Some(plan) => plan,
         None => {
@@ -689,7 +735,9 @@ async fn start(call: &mut ToolCallContext<'_>, args: StartArgs) -> Result<Value,
             },
         )
         .await
-        .map_err(|error| super::note_tools::batch_operational_error(SESSION_LABEL, error, false))?;
+        .map_err(|error| {
+            super::note_tools::batch_operational_error(SESSION_LABEL, error, plan_replayed)
+        })?;
     let (episode, state) = match opened.value {
         EpisodeStartResult::New(episode) => (episode, "new"),
         EpisodeStartResult::Resumed(episode) => (episode, "resumed"),
@@ -705,6 +753,12 @@ async fn start(call: &mut ToolCallContext<'_>, args: StartArgs) -> Result<Value,
     async {
         if let Some(pending) = &plan.pending_ack {
             delta::acknowledge_prepared(call, pending).await?;
+            if state == "forked"
+                && pending.is_for_parent(episode.parent.as_ref())
+            {
+                let child_pending = pending.for_episode(episode.id.clone());
+                delta::acknowledge_prepared(call, &child_pending).await?;
+            }
         }
         check_committed_project(plan.project.as_ref(), &episode)?;
         if let Some(project) = &episode.project_hint {

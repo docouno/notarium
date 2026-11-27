@@ -16,7 +16,7 @@ use std::{
 
 use notarium_core::{
     DomainError,
-    auth::{ChatAudience, EngineAuthContext, PrincipalKind, ProposalHumanAccess},
+    auth::{BranchTaint, ChatAudience, EngineAuthContext, PrincipalKind, ProposalHumanAccess},
     classes::DocClass,
     error::{CommitEffect, OperationalFailure, PortError, RetryAdvice, ValidationReason},
     ids::*,
@@ -65,6 +65,7 @@ pub struct ChatSubscription {
     stream: StepSubscription,
     cancellation: Cancellation,
     expires_at: Option<Instant>,
+    viewer_taint: BranchTaint,
     _revocation: ViewerRevocationLease,
     _buffer: Arc<StepStreamBuffer>,
 }
@@ -89,6 +90,15 @@ impl ChatSubscription {
         {
             StreamRead::Closed
         } else {
+            match &next {
+                StreamRead::Frame(frame) if frame.is_tainted() => {
+                    self.viewer_taint.mark_external_read();
+                }
+                StreamRead::CatchUpRequired(_) if self._buffer.is_tainted() => {
+                    self.viewer_taint.mark_external_read();
+                }
+                _ => {}
+            }
             next
         }
     }
@@ -381,6 +391,7 @@ impl AgentRunSupervisor {
             &scope.space_id,
             cancellation.clone(),
         )?;
+        let viewer_taint = account.auth().taint().clone();
         let (auth, expires_at) = self
             .inner
             .registry
@@ -401,6 +412,7 @@ impl AgentRunSupervisor {
                 stream: run.stream.subscribe(cursor),
                 cancellation,
                 expires_at: expires_at.map(Instant::from_std),
+                viewer_taint,
                 _revocation: revocation,
                 _buffer: run.stream.clone(),
             }))
@@ -664,20 +676,12 @@ impl AgentRunSupervisor {
                 .await?;
             let can_change = current.thread.revision == request.input.expected_thread_revision;
             let mut holds = Vec::new();
-            if can_change
-                && let Some(streams) = service
-                    .inner
-                    .threads
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .streams
-                    .get(&(scope.clone(), thread.clone()))
-            {
+            if can_change {
                 holds.extend(
-                    streams
-                        .iter()
-                        .filter_map(Weak::upgrade)
-                        .map(|stream| stream.pause_for_redaction()),
+                    service
+                        .inner
+                        .revocations
+                        .pause_thread_streams(&scope, &thread),
                 );
             }
             let result = match route.as_ref().map_or(Ok(()), |lease| lease.check()) {
@@ -692,6 +696,10 @@ impl AgentRunSupervisor {
                 Err(error) => Err(error),
             };
             if can_change && (result.is_ok() || result.as_ref().is_err_and(queue::unknown_commit)) {
+                service
+                    .inner
+                    .revocations
+                    .cancel_thread_runs(&scope, &thread);
                 if let Some(active) = service.active(&scope, &thread)
                     && active.scope == scope
                 {
@@ -1074,6 +1082,7 @@ impl AgentRunSupervisor {
             .await?;
         owner.check()?;
         lease.check()?;
+        let launch_deadline = deadline_from(account.budget.remaining);
         let key = (request.scope.space_id.clone(), request.thread.clone());
         let state = Arc::new(ActiveRun {
             id: run.clone(),
@@ -1089,10 +1098,11 @@ impl AgentRunSupervisor {
             request: admission.request.clone(),
             options: request.options,
             started: Instant::now(),
-            stream: Arc::new(StepStreamBuffer::new(
+            stream: Arc::new(StepStreamBuffer::new_with_taint(
                 run.clone(),
                 request.thread.clone(),
                 request.expected_leaf,
+                ctx.auth().taint().clone(),
             )),
             cancellation,
             lease,
@@ -1109,12 +1119,40 @@ impl AgentRunSupervisor {
             if self.inner.shutdown.is_cancelled() {
                 return Ok(LaunchOutcome::Settled(owner_unavailable()));
             }
+            self.inner.revocations.register_thread_stream(
+                request.scope.clone(),
+                request.thread.clone(),
+                Arc::downgrade(&state.stream),
+            );
             threads
                 .streams
                 .entry((request.scope.clone(), request.thread.clone()))
                 .or_default()
                 .push(Arc::downgrade(&state.stream));
             threads.active.insert(key.clone(), state.clone())
+        };
+        struct ActiveCandidateGuard<'a> {
+            supervisor: &'a AgentRunSupervisor,
+            key: ThreadKey,
+            run: Arc<ActiveRun>,
+            previous: Option<Arc<ActiveRun>>,
+            disarmed: bool,
+        }
+        impl Drop for ActiveCandidateGuard<'_> {
+            fn drop(&mut self) {
+                if !self.disarmed {
+                    self.run.cancellation.cancel();
+                    self.supervisor
+                        .restore_predecessor(self.key.clone(), self.previous.take());
+                }
+            }
+        }
+        let mut candidate_guard = ActiveCandidateGuard {
+            supervisor: self,
+            key: key.clone(),
+            run: Arc::clone(&state),
+            previous,
+            disarmed: false,
         };
         drop(registration);
         let claim_request = ClaimChatRun {
@@ -1145,6 +1183,7 @@ impl AgentRunSupervisor {
                 if let Err(error) = state.owner.check().and_then(|_| state.lease.check()) {
                     error
                 } else {
+                    candidate_guard.disarmed = true;
                     state.admitted.store(true, Ordering::Release);
                     self.spawn_run(state, RunTaskStart::Admitted(request.expected_leaf));
                     return Ok(LaunchOutcome::Started(run));
@@ -1152,26 +1191,31 @@ impl AgentRunSupervisor {
             }
             Err(error) if queue::unknown_commit(&error) => error,
             Ok(ClaimChatRunOutcome::Busy(_) | ClaimChatRunOutcome::Changed) => {
-                self.restore_predecessor(key, previous);
+                candidate_guard.disarmed = true;
+                self.restore_predecessor(key, candidate_guard.previous.take());
                 return Ok(LaunchOutcome::Settled(owner_unavailable()));
             }
             Err(error) => {
-                self.restore_predecessor(key, previous);
+                candidate_guard.disarmed = true;
+                self.restore_predecessor(key, candidate_guard.previous.take());
                 return Err(error);
             }
         };
 
         state.cancellation.cancel();
-        match self.settle_unpublished_claim(&state).await {
+        match self.settle_unpublished_claim(&state, launch_deadline).await {
             ClaimSettlement::Pending => {
+                candidate_guard.disarmed = true;
                 self.spawn_run(state, RunTaskStart::DrainOnly(error.clone()));
                 Ok(LaunchOutcome::Draining(error))
             }
             ClaimSettlement::Changed => {
-                self.restore_predecessor(key, previous);
+                candidate_guard.disarmed = true;
+                self.restore_predecessor(key, candidate_guard.previous.take());
                 Ok(LaunchOutcome::Settled(error))
             }
             ClaimSettlement::Retired => {
+                candidate_guard.disarmed = true;
                 self.remove_run(&state);
                 Ok(LaunchOutcome::Settled(error))
             }
@@ -1200,9 +1244,14 @@ impl AgentRunSupervisor {
     }
 
     /// The thread gate remains held until an uncertain candidate is either
-    /// cleared or has proved its claim. The canonical writer decides whether
-    /// an exact close can proceed even if the application route was lost.
-    async fn settle_unpublished_claim(&self, run: &ActiveRun) -> ClaimSettlement {
+    /// cleared or has proved its claim, bounded by the caller's deadline so
+    /// unfinished cleanup is handed off to the detached drain worker instead of
+    /// blocking the thread gate past caller budget.
+    async fn settle_unpublished_claim(
+        &self,
+        run: &ActiveRun,
+        deadline: Instant,
+    ) -> ClaimSettlement {
         let engine = self.inner.registry.engine();
         let request = ChatRunRequest {
             thread: run.thread.clone(),
@@ -1211,7 +1260,15 @@ impl AgentRunSupervisor {
         let mut delay = Duration::from_millis(25);
         loop {
             let owner_live = run.owner.check().is_ok();
-            let result = match run.settlement_context() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return if owner_live && !self.inner.shutdown.is_cancelled() {
+                    ClaimSettlement::Pending
+                } else {
+                    ClaimSettlement::Retired
+                };
+            }
+            let result = match run.settlement_context_bounded(remaining) {
                 Ok(ctx) => engine.finish_run_if_queue_empty(ctx, request.clone()).await,
                 Err(error) => Err(error),
             };
@@ -1234,8 +1291,16 @@ impl AgentRunSupervisor {
                 }
                 _ => (),
             }
+            let wait = delay.min(deadline.saturating_duration_since(Instant::now()));
+            if wait.is_zero() {
+                return if owner_live && !self.inner.shutdown.is_cancelled() {
+                    ClaimSettlement::Pending
+                } else {
+                    ClaimSettlement::Retired
+                };
+            }
             tokio::select! {
-                () = tokio::time::sleep(delay) => (),
+                () = tokio::time::sleep(wait) => (),
                 () = self.inner.shutdown.cancelled() => return ClaimSettlement::Retired,
             }
             delay = (delay * 2).min(Duration::from_secs(2));
@@ -1352,10 +1417,16 @@ impl ActiveRun {
     }
 
     fn settlement_context(&self) -> Result<SpaceContext, PortError> {
+        self.settlement_context_bounded(MAINTENANCE_BUDGET)
+    }
+
+    fn settlement_context_bounded(&self, remaining: Duration) -> Result<SpaceContext, PortError> {
+        let mut budget = cleanup_budget(&self.request);
+        budget.remaining = budget.remaining.min(remaining);
         Ok(SpaceContext::new(
             self.auth.clone(),
             self.scope.clone(),
-            cleanup_budget(&self.request),
+            budget,
         )?)
     }
 

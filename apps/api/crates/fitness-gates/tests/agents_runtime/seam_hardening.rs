@@ -222,6 +222,18 @@ async fn postgres_control_replay_and_taint_hardening() {
     box_step(|| run_control_replay_and_taint_hardening(true)).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sqlite_mcp_chat_replay_and_isolation_seams() {
+    let _guard = support::AUTH_TEST_LOCK.lock().await;
+    box_step(|| run_mcp_chat_replay_and_isolation_seams(false)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_mcp_chat_replay_and_isolation_seams() {
+    let _guard = support::AUTH_TEST_LOCK.lock().await;
+    box_step(|| run_mcp_chat_replay_and_isolation_seams(true)).await;
+}
+
 async fn run_centralized_control_and_delta_taint_isolation(pg: bool) {
     let fixture = RuntimeFixture::open_named(pg, "centralized_control_delta_taint").await;
     let personal = fixture.personal_scope().await;
@@ -7137,10 +7149,17 @@ async fn tainted_personal_chat_in_shared_space_releases_claim_cleanly(
         branch_after_taint.entries
     );
 
-    // Follow-up clean turn on the exact same thread MUST succeed!
+    // Reading the tainted stream propagated cross-space BranchTaint onto `owner`'s
+    // request context; verify that taint is set, then start a clean follow-up turn
+    // with a fresh request context on the exact same thread!
+    assert!(
+        owner.auth().taint().is_tainted(),
+        "reading frames from a cross-space tainted Personal chat stream must propagate BranchTaint"
+    );
+    let clean_owner = fresh_owner(fixture).await;
     let clean_run = supervisor
         .start(
-            owner.clone(),
+            clean_owner,
             StartChatRun {
                 scope: shared.history.clone(),
                 thread: tid.clone(),
@@ -24229,7 +24248,7 @@ async fn hardened_schedule_and_legacy_replay_seams(
         .observer
         .execute(
             "UPDATE control_commands \
-             SET safe_result = '{\"value\":\"' || (SELECT schedule_id FROM agent_schedules WHERE title='SECRET-SCHED-TITLE-UPD-HARD' LIMIT 1) || '\",\"events\":[]}' \
+             SET safe_result = '{\"value\":\"' || (SELECT schedule_id FROM agent_schedules WHERE deleted_at IS NOT NULL ORDER BY deleted_at DESC LIMIT 1) || '\",\"events\":[]}' \
              WHERE target='delete-schedule' \
                AND result_revision = (SELECT MAX(result_revision) FROM control_commands WHERE target='delete-schedule')",
         )
@@ -30440,4 +30459,503 @@ async fn verify_out_of_project_schedule_update_not_found(
             Err(PortError::Domain(DomainError::ResourceNotFound))
         ));
     }
+}
+
+async fn run_mcp_chat_replay_and_isolation_seams(pg: bool) {
+    let fixture = RuntimeFixture::open_named(pg, "mcp_chat_replay_isolation").await;
+    let personal = fixture.personal_scope().await;
+    let owner = fresh_owner(&fixture).await;
+    let actor = owner.auth().principal().clone();
+    let scope = personal.scope().clone();
+
+    // 1. `edit_ability` promote + instructions conflict must fail BEFORE mutating
+    // the source project role's instructions, leaving it intact and `healthy = true`.
+    let shared_promote = fixture
+        .control
+        .create_space(
+            owner.clone(),
+            AccountMutation {
+                identity: identity(&fixture, &owner, 0xE0).await,
+                input: CreateSpace {
+                    id: SpaceId::from_bytes([0xE0; 16]),
+                    kind: SpaceKind::Shared,
+                    name: "Promote Guard Shared".into(),
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    let owner = fresh_owner(&fixture).await;
+    let _proj_p = create_project_folder(
+        &fixture,
+        &shared_promote.history,
+        &actor,
+        FolderId::from_bytes([0xE1; 16]),
+        "promote-target",
+    )
+    .await;
+    let proj_handle = format!("{}/promote-target", shared_promote.slug);
+    let _space_role = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xE1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "create_ability",
+        json!({
+            "kind": "role",
+            "name": "promote-guard",
+            "description": "Existing Space role",
+            "instructions": "Existing Space instructions.",
+            "placement": { "home": "space", "space": shared_promote.slug },
+        }),
+    )
+    .await
+    .unwrap();
+    let proj_role = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xE1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "create_ability",
+        json!({
+            "kind": "role",
+            "name": "promote-guard",
+            "description": "Project role",
+            "instructions": "Original project instructions.",
+            "placement": { "home": "project", "project": proj_handle },
+        }),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    let proj_role_ref = proj_role["ref"].as_str().unwrap().to_owned();
+    let proj_role_ver = proj_role["versionToken"].as_str().unwrap().to_owned();
+    let promote_err = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xE1, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "edit_ability",
+        json!({
+            "ref": proj_role_ref,
+            "versionToken": proj_role_ver,
+            "instructions": "Mutated instructions that must not commit.",
+            "home": { "home": "space" },
+        }),
+    )
+    .await;
+    assert!(
+        matches!(
+            promote_err,
+            Err(PortError::Domain(DomainError::PathConflict { .. }))
+        ),
+        "conflicting promote+edit must fail PathConflict, got {:?}",
+        promote_err.err()
+    );
+    let proj_role_after = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xE1, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "get_ability",
+        json!({ "ref": proj_role_ref }),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    assert_eq!(
+        proj_role_after["instructions"],
+        json!("Original project instructions."),
+        "failed promote+edit must not mutate source project role instructions"
+    );
+    assert_eq!(proj_role_after["healthy"], json!(true));
+
+    // 2. `use_role` replay with `already_active` must NOT revert episode `active_role`
+    // from role B back to role A after switching A -> B.
+    let role_a = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xE1, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "create_ability",
+        json!({
+            "kind": "role",
+            "name": "replay-role-a",
+            "description": "Role A",
+            "instructions": "Role A instructions.",
+            "placement": { "home": "personal" },
+        }),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    let role_b = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xE1, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "create_ability",
+        json!({
+            "kind": "role",
+            "name": "replay-role-b",
+            "description": "Role B",
+            "instructions": "Role B instructions.",
+            "placement": { "home": "personal" },
+        }),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    let ep_start = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xE1, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "start_session",
+        json!({ "task": "use-role-replay-check" }),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    let ep_id = EpisodeId::parse(ep_start["session"]["id"].as_str().unwrap()).unwrap();
+    let activate_a_args = json!({
+        "session": ep_id.as_str(),
+        "role": role_a["ref"].as_str().unwrap(),
+    });
+    call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xE1, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "use_role",
+        activate_a_args.clone(),
+    )
+    .await
+    .unwrap();
+    // Second call with a fresh key while role A is ALREADY active records `already_active = true`.
+    let already_active_key = [0xE1, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    call_mcp(
+        &fixture.registry,
+        &owner,
+        already_active_key,
+        "use_role",
+        activate_a_args.clone(),
+    )
+    .await
+    .unwrap();
+    // Switch episode to role B.
+    call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xE1, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "use_role",
+        json!({
+            "session": ep_id.as_str(),
+            "role": role_b["ref"].as_str().unwrap(),
+        }),
+    )
+    .await
+    .unwrap();
+    let expected_b = fixture
+        .control
+        .get_episode(owner.clone(), ep_id.clone())
+        .await
+        .unwrap()
+        .active_role
+        .clone();
+    // Replaying `already_active_key` must succeed WITHOUT reverting active_role to A.
+    call_mcp(
+        &fixture.registry,
+        &owner,
+        already_active_key,
+        "use_role",
+        activate_a_args,
+    )
+    .await
+    .unwrap();
+    let after_replay = fixture
+        .control
+        .get_episode(owner.clone(), ep_id.clone())
+        .await
+        .unwrap()
+        .active_role;
+    assert_eq!(
+        after_replay, expected_b,
+        "replaying already-active use_role must not revert active_role from B back to A"
+    );
+
+    // 3. `start_session` single idempotency key must reject a mismatched `deliveryReceipt`.
+    let mismatch_key = [0xE1, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    let first_start = call_mcp(
+        &fixture.registry,
+        &owner,
+        mismatch_key,
+        "start_session",
+        json!({ "task": "receipt-conflict-check" }),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    let first_receipt = first_start["delta"]["deliveryReceipt"]
+        .as_str()
+        .unwrap_or("bogus-receipt");
+    let conflict_err = call_mcp(
+        &fixture.registry,
+        &owner,
+        mismatch_key,
+        "start_session",
+        json!({
+            "task": "receipt-conflict-check",
+            "deliveryReceipt": format!("{first_receipt}-different"),
+        }),
+    )
+    .await;
+    assert!(
+        matches!(
+            conflict_err,
+            Err(PortError::Domain(DomainError::IdempotencyKeyReused))
+        ),
+        "reusing start_session key with mismatched deliveryReceipt must fail IdempotencyKeyReused, got {:?}",
+        conflict_err.err()
+    );
+
+    // 4. Space-wide AgentRun must be rejected from `create_chat`, `fork_chat`, and
+    // `redact_chat_entry`; `with_preflight_taint()` must be rejected from `submit_user_chat_input`.
+    let thread_id = ChatThreadId::from_bytes([0xE2; 16]);
+    let created_thread = fixture
+        .canonical
+        .create_chat(
+            personal.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: scope.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([
+                        0xE2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xE2; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: CreateChat {
+                    thread: thread_id.clone(),
+                    kind: ChatThreadKind::Personal,
+                    owner: actor.clone(),
+                    project_folder: None,
+                    title: "Isolation thread".into(),
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    let first_entry = fixture
+        .canonical
+        .append_chat(
+            personal.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: scope.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([
+                        0xE2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xE3; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: AppendChat {
+                    thread: created_thread.id.clone(),
+                    parent: ThreadEntrySeq::ZERO,
+                    kind: ChatEntryKind::Human,
+                    body: ChatInputBody::Text("hello".into()),
+                    tool_calls: vec![],
+                    provenance: None,
+                    interruption: None,
+                    proposed_diff: None,
+                    proposed_effect: None,
+                    referenced_notes: vec![],
+                    tainted: false,
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    let space_wide_agent_auth = owner
+        .auth()
+        .for_agent_run(
+            AgentRunId::from_bytes([0xE3; 16]),
+            scope.space_id.clone(),
+            ChatAudience::Personal,
+            owner.auth().spaces().clone(),
+        )
+        .unwrap();
+    let space_wide_agent_ctx =
+        SpaceContext::new(space_wide_agent_auth, scope.clone(), budget()).unwrap();
+    assert!(matches!(
+        fixture
+            .canonical
+            .create_chat(
+                space_wide_agent_ctx.clone(),
+                Mutation {
+                    identity: CommandIdentity {
+                        scope: scope.clone(),
+                        actor: actor.clone(),
+                        key: CommandKey::from_bytes([
+                            0xE2, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1
+                        ]),
+                        hash: ContentDigest::from_bytes([0xE4; 32]),
+                    },
+                    preconditions: Preconditions::default(),
+                    input: CreateChat {
+                        thread: ChatThreadId::from_bytes([0xE4; 16]),
+                        kind: ChatThreadKind::Personal,
+                        owner: actor.clone(),
+                        project_folder: None,
+                        title: "Blocked agent create".into(),
+                    },
+                },
+            )
+            .await,
+        Err(PortError::Domain(
+            DomainError::SpaceReadOnly | DomainError::AccessDenied
+        ))
+    ));
+    assert!(matches!(
+        fixture
+            .canonical
+            .fork_chat(
+                space_wide_agent_ctx.clone(),
+                Mutation {
+                    identity: CommandIdentity {
+                        scope: scope.clone(),
+                        actor: actor.clone(),
+                        key: CommandKey::from_bytes([
+                            0xE2, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1
+                        ]),
+                        hash: ContentDigest::from_bytes([0xE5; 32]),
+                    },
+                    preconditions: Preconditions::default(),
+                    input: ForkChat {
+                        thread: created_thread.id.clone(),
+                        parent: first_entry.seq,
+                    },
+                },
+            )
+            .await,
+        Err(PortError::Domain(
+            DomainError::SpaceReadOnly | DomainError::AccessDenied
+        ))
+    ));
+    assert!(matches!(
+        fixture
+            .canonical
+            .redact_chat_entry(
+                space_wide_agent_ctx,
+                Mutation {
+                    identity: CommandIdentity {
+                        scope: scope.clone(),
+                        actor: actor.clone(),
+                        key: CommandKey::from_bytes([
+                            0xE2, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1
+                        ]),
+                        hash: ContentDigest::from_bytes([0xE6; 32]),
+                    },
+                    preconditions: Preconditions::default(),
+                    input: RedactChatEntry {
+                        thread: created_thread.id.clone(),
+                        entry: first_entry.seq,
+                        expected_thread_revision: created_thread.revision.clone(),
+                    },
+                },
+            )
+            .await,
+        Err(PortError::Domain(
+            DomainError::SpaceReadOnly | DomainError::AccessDenied
+        ))
+    ));
+    let preflight_ctx = personal.with_preflight_taint();
+    assert!(matches!(
+        fixture
+            .canonical
+            .submit_user_chat_input(
+                preflight_ctx,
+                SubmitUserChatInput {
+                    identity: CommandIdentity {
+                        scope: scope.clone(),
+                        actor: actor.clone(),
+                        key: CommandKey::from_bytes([
+                            0xE2, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1
+                        ]),
+                        hash: ContentDigest::from_bytes([0xE7; 32]),
+                    },
+                    id: PendingInputId::from_bytes([0xE7; 16]),
+                    thread: created_thread.id.clone(),
+                    expected_leaf: first_entry.seq,
+                    body: "blocked preflight submit".into(),
+                    mentions_agent: false,
+                },
+            )
+            .await,
+        Err(PortError::Domain(
+            DomainError::SpaceReadOnly | DomainError::AccessDenied
+        ))
+    ));
+
+    // 5. `get_my_projects` via `InAppProvider` must succeed on 260 projects inside a
+    // single Space-wide consented Space (1 `ProviderOrigin::Space`, not 260 origins).
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_provider = loopback_provider(&fixture, &owner, &listener, 0xE8, true).await;
+    approve_disclosure(
+        &fixture,
+        &owner,
+        &local_provider,
+        0xF0,
+        ProviderAttachmentTarget::Personal {
+            owner: actor.clone(),
+            space: scope.space_id.clone(),
+        },
+        [DocClass::UserDoc, DocClass::AgentMemory].into(),
+    )
+    .await;
+    for idx in 0..260u16 {
+        let mut fid = [0u8; 16];
+        fid[0] = 0xEA;
+        fid[14..16].copy_from_slice(&idx.to_be_bytes());
+        let folder_id = FolderId::from_bytes(fid);
+        let slug = format!("bulk-proj-{idx:03}");
+        create_project_folder(&fixture, &scope, &actor, folder_id, &slug).await;
+    }
+    let in_app_agent_auth = owner
+        .auth()
+        .for_agent_run(
+            AgentRunId::from_bytes([0xEB; 16]),
+            scope.space_id.clone(),
+            ChatAudience::Personal,
+            owner.auth().spaces().clone(),
+        )
+        .unwrap();
+    let in_app_projects = local_provider
+        .registry
+        .call_tool(
+            McpInvocationContext {
+                account: AccountContext::new(in_app_agent_auth, budget()),
+                target: EgressTarget::InAppProvider {
+                    provider: local_provider.resource.id.clone(),
+                    model: local_provider.model.clone(),
+                    primary_project: None,
+                },
+                request_key: CommandKey::from_bytes([
+                    0xEB, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                ]),
+            },
+            "get_my_projects",
+            json!({}),
+        )
+        .await
+        .expect("get_my_projects must succeed on 260 projects in one Space-wide consented Space")
+        .structured_content;
+    assert!(
+        in_app_projects["projects"]
+            .as_array()
+            .is_some_and(|items| items.len() >= 260),
+        "expected >= 260 projects, got {}",
+        in_app_projects["projects"]
+            .as_array()
+            .map_or(0, std::vec::Vec::len)
+    );
+
+    fixture.close().await;
 }

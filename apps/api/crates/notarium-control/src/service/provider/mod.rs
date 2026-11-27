@@ -10,7 +10,7 @@ pub(crate) mod offers;
 mod ports;
 mod records;
 mod recovery;
-mod selection;
+pub(crate) mod selection;
 pub use selection::ResolvedSearchEmbeddingModel;
 pub(super) use selection::SearchDefaultWitness;
 mod wire;

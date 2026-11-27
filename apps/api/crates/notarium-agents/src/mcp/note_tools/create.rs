@@ -72,6 +72,8 @@ struct NoteDraft {
 pub(super) struct CreateProject {
     pub(super) reference: FolderRef,
     pub(super) scope: HistoryScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) project_path: Option<String>,
 }
 
 struct CreatePlacement {
@@ -79,6 +81,7 @@ struct CreatePlacement {
     read_scope: SpaceContext,
     write_scope: SpaceContext,
     path: String,
+    replayed: bool,
 }
 
 struct PreparedDraft {
@@ -99,9 +102,14 @@ pub(super) async fn observe_project(
 ) -> Result<CreateProject, PortError> {
     let project = session::resolve_project_for_direct_write(call, handle).await?;
     let scope = session::space(call, &project.folder.space_id).await?;
+    let write_scope = scope.clone().restrict_to_project(&project.folder)?;
+    let project_path = folder_base(call, &write_scope, &project.folder.folder_id)
+        .await?
+        .path;
     Ok(CreateProject {
         reference: project.folder,
         scope: scope.scope().clone(),
+        project_path: Some(project_path),
     })
 }
 
@@ -214,7 +222,9 @@ async fn project_placement(
         ability_package: None,
     };
     write_scope.auth().authorize_direct_write(&facts, &facts)?;
-    let path = if is_trashed_replay {
+    let path = if let Some(saved_path) = project.project_path.clone() {
+        saved_path
+    } else if is_trashed_replay {
         String::new()
     } else {
         folder_base(call, &write_scope, &project.reference.folder_id)
@@ -226,6 +236,7 @@ async fn project_placement(
         read_scope,
         write_scope,
         path,
+        replayed: allow_trashed_replay,
     })
 }
 
@@ -991,7 +1002,7 @@ pub(super) async fn create_many(
     let placement = placement(call, &input.project).await?;
     let mut titles: BTreeMap<String, BTreeSet<NoteId>> = BTreeMap::new();
     let mut created = Vec::with_capacity(input.notes.len());
-    let mut committed_any = false;
+    let mut committed_any = placement.replayed;
     // Commit independently before treating any generated ID as a valid target.
     for (index, raw) in input.notes.into_iter().enumerate() {
         match create_draft(call, &placement, index as u16, raw, &mut committed_any).await {

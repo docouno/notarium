@@ -152,6 +152,7 @@ pub(super) async fn retrieve(
     let targeted_project = resolved.targeted_project;
     let mut candidates = Vec::new();
     let mut candidate_bytes = 0usize;
+    let mut seen_doc_bytes: BTreeSet<usize> = BTreeSet::new();
     let mut truncated = false;
     let mut own_degradation = BTreeSet::new();
     let mut foreign_degradation = BTreeSet::new();
@@ -206,11 +207,17 @@ pub(super) async fn retrieve(
                         .filter(|project| project.space_id == target.scope.space_id)
                         .cloned()
                 });
-                let selection = match call.provider_selection(&scope, selection_project).await {
-                    Ok(Some(selection)) => selection,
-                    Ok(None) => continue,
-                    Err(error) if corpus::hidden(&error) => continue,
-                    Err(error) => return Err(error),
+                let selection = if let Some(cached) = &target.provider_selection
+                    && selection_project == target.project
+                {
+                    cached.clone()
+                } else {
+                    match call.provider_selection(&scope, selection_project).await {
+                        Ok(Some(selection)) => selection,
+                        Ok(None) => continue,
+                        Err(error) if corpus::hidden(&error) => continue,
+                        Err(error) => return Err(error),
+                    }
                 };
                 let allowed: BTreeSet<DocClass> = selection
                     .policy
@@ -232,6 +239,15 @@ pub(super) async fn retrieve(
                     // when class intersection leaves no searchable classes or zero hits.
                     call.auth.taint().mark_external_read();
                     observed_foreign = true;
+                    if let Some(proj) = &effective_project {
+                        corpus::record_folder_origin(
+                            call,
+                            &scope,
+                            proj,
+                            selection.project_only.clone(),
+                        )
+                        .await?;
+                    }
                 }
                 if effective_classes.is_empty() {
                     continue;
@@ -291,7 +307,16 @@ pub(super) async fn retrieve(
                 source_classes,
                 source_project,
             };
+            let multi_target = targets.len() > 1;
             let result = if recall {
+                let (recall_budget, recall_max_per_source) = if multi_target {
+                    // Across multiple Spaces, avoid premature per-Space budget
+                    // pruning so global Pass-1/Pass-2 packing below sees every
+                    // candidate's eligible chunks.
+                    (131_072, None)
+                } else {
+                    (budget, max_per_source)
+                };
                 call.registry
                     .engine
                     .recall_for(
@@ -299,8 +324,8 @@ pub(super) async fn retrieve(
                         RecallQuery {
                             query,
                             graph_depth: args.depth.unwrap_or(1),
-                            token_budget: budget,
-                            max_per_source,
+                            token_budget: recall_budget,
+                            max_per_source: recall_max_per_source,
                         },
                         Some(&recipient),
                     )
@@ -316,7 +341,9 @@ pub(super) async fn retrieve(
             if result.hits.len() > usize::from(top_k.get()) {
                 return Err(invalid(ValidationReason::InvalidState));
             }
-            truncated |= result.truncated;
+            if !multi_target || result.truncated {
+                truncated |= result.truncated;
+            }
             if let Some(reason) = result.degraded {
                 if foreign_space {
                     foreign_degradation.insert(degraded(reason));
@@ -336,10 +363,20 @@ pub(super) async fn retrieve(
                     continue;
                 }
                 if !external {
-                    let hit_bytes = hit
-                        .card
-                        .title
-                        .len()
+                    let doc_bytes: usize = hit
+                        .chunks
+                        .iter()
+                        .map(|chunk| {
+                            let doc = chunk.provenance();
+                            if seen_doc_bytes.insert(std::ptr::from_ref(doc) as usize) {
+                                doc.content_bytes()
+                            } else {
+                                0
+                            }
+                        })
+                        .fold(0usize, usize::saturating_add);
+                    let hit_bytes = doc_bytes
+                        .saturating_add(hit.card.title.len())
                         .saturating_add(hit.card.path.len())
                         .saturating_add(
                             hit.chunks
@@ -376,7 +413,7 @@ pub(super) async fn retrieve(
                 selection: Option<super::super::ProviderSelection>,
                 source_remaining: u32,
                 parts: Vec<(usize, String)>,
-                next_chunk_idx: usize,
+                first_chunk_idx: Option<usize>,
             }
 
             // Pass 1: admit up to `limit` distinct notes in global score order,
@@ -396,15 +433,17 @@ pub(super) async fn retrieve(
                 if seen.contains(&key) {
                     continue;
                 }
-                if !hit.chunks.iter().any(|chunk| {
-                    let tokens = chunk.part().tokens();
-                    tokens <= source_budget
-                        && tokens.saturating_add(framing_tokens(&reference.note_id, true))
-                            <= remaining
-                }) {
-                    if !hit.chunks.is_empty() {
+                let header_charge = framing_tokens(&reference.note_id, true);
+                if hit.chunks.is_empty() {
+                    if header_charge > remaining {
                         truncated = true;
+                        continue;
                     }
+                } else if !hit.chunks.iter().any(|chunk| {
+                    let tokens = chunk.part().tokens();
+                    tokens <= source_budget && tokens.saturating_add(header_charge) <= remaining
+                }) {
+                    truncated = true;
                     continue;
                 }
                 let provenance_checkpoint = call.provenance_checkpoint();
@@ -414,6 +453,20 @@ pub(super) async fn retrieve(
                     Err(error) if corpus::hidden(&error) => continue,
                     Err(error) => return Err(error),
                 };
+                if hit.chunks.is_empty() {
+                    remaining -= header_charge;
+                    best.get_or_insert(hit.score);
+                    seen.insert(key);
+                    recalled.push(RecalledNote {
+                        hit,
+                        scope,
+                        selection,
+                        source_remaining: source_budget,
+                        parts: Vec::new(),
+                        first_chunk_idx: None,
+                    });
+                    continue;
+                }
                 let mut first_part = None;
                 for (chunk_idx, chunk) in hit.chunks.iter().enumerate() {
                     if chunk.provenance().reference() != reference
@@ -423,7 +476,7 @@ pub(super) async fn retrieve(
                         return Err(invalid(ValidationReason::SourceMismatch));
                     }
                     let tokens = chunk.part().tokens();
-                    let charge = tokens + framing_tokens(&reference.note_id, true);
+                    let charge = tokens + header_charge;
                     if tokens > source_budget || charge > remaining {
                         truncated = true;
                         continue;
@@ -442,10 +495,10 @@ pub(super) async fn retrieve(
                         Err(error) => return Err(error),
                     };
                     remaining -= charge;
-                    first_part = Some((chunk_idx, text, source_budget - tokens, chunk_idx + 1));
+                    first_part = Some((chunk_idx, text, source_budget - tokens));
                     break;
                 }
-                let Some((first_idx, text, source_remaining, next_chunk_idx)) = first_part else {
+                let Some((first_idx, text, source_remaining)) = first_part else {
                     call.rollback_provenance(provenance_checkpoint);
                     continue;
                 };
@@ -457,21 +510,21 @@ pub(super) async fn retrieve(
                     selection,
                     source_remaining,
                     parts: vec![(first_idx, text)],
-                    next_chunk_idx,
+                    first_chunk_idx: Some(first_idx),
                 });
             }
 
             // Pass 2: pack secondary chunks across all admitted notes in global
-            // rank-decayed score order (`score / (rank_within_note + 1)`), matching
+            // rank-decayed score order (`score / (chunk_idx + 1)`), matching
             // single-Space hydration so note #1 does not drain the budget ahead of
             // stronger secondary chunks from other admitted notes.
             let mut secondary: Vec<(usize, usize, f64)> = Vec::new();
             for (note_idx, entry) in recalled.iter().enumerate() {
-                for (offset, chunk_idx) in
-                    (entry.next_chunk_idx..entry.hit.chunks.len()).enumerate()
-                {
-                    let rank_within_note = offset + 1;
-                    let decayed = entry.hit.score / ((rank_within_note + 1) as f64);
+                for (chunk_idx, _) in entry.hit.chunks.iter().enumerate() {
+                    if entry.first_chunk_idx == Some(chunk_idx) {
+                        continue;
+                    }
+                    let decayed = entry.hit.score / ((chunk_idx + 1) as f64);
                     secondary.push((note_idx, chunk_idx, decayed));
                 }
             }

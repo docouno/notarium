@@ -69,23 +69,28 @@ impl Runtime {
         self.check(effect)?;
         Ok(result)
     }
-    pub async fn run_commit<T>(
+    pub async fn await_commit_handle(
         &self,
-        operation: impl Future<Output = Result<T, PortError>>,
-    ) -> Result<T, PortError> {
-        self.check(CommitEffect::NotCommitted)?;
-        let result = self
-            .budget
-            .run_commit(async {
-                tokio::select! {
-                    biased;
-                    () = self.cancelled.cancelled() => Err(cancelled(CommitEffect::Unknown)),
-                    value = operation => value,
-                }
-            })
+        pending: &mut Option<tokio::task::JoinHandle<Result<(), PortError>>>,
+    ) -> Result<(), PortError> {
+        self.budget
+            .run(
+                async {
+                    let handle = pending.as_mut().expect("spawned commit handle");
+                    tokio::select! {
+                        biased;
+                        () = self.cancelled.cancelled() => Err(cancelled(CommitEffect::Unknown)),
+                        value = handle => {
+                            *pending = None;
+                            value.map_err(|_| crate::error::unavailable("control commit worker", CommitEffect::Unknown))?
+                        }
+                    }
+                },
+                CommitEffect::Unknown,
+            )
             .await?;
         self.check(CommitEffect::Unknown)?;
-        Ok(result)
+        Ok(())
     }
     pub fn context(&self) -> CallBudget {
         self.budget.context(self.request.clone())

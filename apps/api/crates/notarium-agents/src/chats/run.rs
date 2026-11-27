@@ -44,7 +44,10 @@ impl AgentRunSupervisor {
                     }
                     // A failed drain can leave this exact claim in storage. Recheck
                     // it before releasing ownership, even after a known rollback.
-                    Err(error) => match self.settle_unpublished_claim(&run).await {
+                    Err(error) => match self
+                        .settle_unpublished_claim(&run, deadline_from(MAINTENANCE_BUDGET))
+                        .await
+                    {
                         ClaimSettlement::Pending if pending_stalls < 3 => {
                             pending_stalls += 1;
                             drop(admission);
@@ -77,7 +80,11 @@ impl AgentRunSupervisor {
                             }
                             if !self.inner.shutdown.is_cancelled()
                                 && matches!(
-                                    self.settle_unpublished_claim(&run).await,
+                                    self.settle_unpublished_claim(
+                                        &run,
+                                        deadline_from(MAINTENANCE_BUDGET),
+                                    )
+                                    .await,
                                     ClaimSettlement::Pending
                                 )
                                 && pending_stalls < 6

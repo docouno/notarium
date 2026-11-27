@@ -3,14 +3,18 @@ use super::{
         ABILITY_PREFS_MOVE_DELETE_SQLITE_SQL, ABILITY_PREFS_MOVE_UPDATE_SQLITE_SQL,
         ABILITY_TRAIL_BY_DEST_SQLITE_SQL,
     },
-    context_state::selection::{
-        BOOTSTRAP_FAVORITES_AFTER_SQLITE_SQL, BOOTSTRAP_FAVORITES_FIRST_SQLITE_SQL,
-        BOOTSTRAP_SCOPE_PINS_SQLITE_SQL, BOOTSTRAP_SCOPE_SETS_SQLITE_SQL,
+    context_state::{
+        selection::{
+            BOOTSTRAP_FAVORITES_AFTER_SQLITE_SQL, BOOTSTRAP_FAVORITES_FIRST_SQLITE_SQL,
+            BOOTSTRAP_SCOPE_PINS_SQLITE_SQL, BOOTSTRAP_SCOPE_SETS_SQLITE_SQL,
+        },
+        sets::LIST_CONTEXT_SETS_PROJECT_SQLITE_SQL,
     },
     episodes::OPEN_EPISODES_BY_NAME_SQLITE_SQL,
     provider::{
         admission::CALL_RUN_EPOCHS_SQLITE_SQL,
         offers::{LIST_OFFERS_PROJECT_PINNED_SQLITE_SQL, LIST_OFFERS_SPACE_SQLITE_SQL},
+        selection::LIST_PROVIDER_PROJECT_TARGETS_SQLITE_SQL,
     },
     schedules::queries::{
         DUE_SCHEDULES_SQLITE_SQL, EXPIRED_SCHEDULE_RUNS_SQLITE_SQL, LIST_SCHEDULES_LIVE_SQLITE_SQL,
@@ -467,7 +471,7 @@ async fn sqlite_hot_control_queries_use_indexes_before_and_after_analyze() {
         check_plan(
             phase,
             "list_offers_project_pinned",
-            "USING INDEX attachment_target_approved_id",
+            "USING INDEX attachment_target_project_approved_id",
             &rows,
         );
 
@@ -687,6 +691,42 @@ async fn sqlite_hot_control_queries_use_indexes_before_and_after_analyze() {
             phase,
             "whoami_provider_personal",
             "SEARCH a USING INDEX",
+            &rows,
+        );
+
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "EXPLAIN QUERY PLAN {LIST_CONTEXT_SETS_PROJECT_SQLITE_SQL}"
+        )))
+        .bind(&first_space)
+        .bind("")
+        .bind("{\"space_id\":\"s\",\"folder_id\":\"f\"}")
+        .bind(32i64)
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+        check_plan(
+            phase,
+            "list_context_sets_project",
+            "SEARCH a USING INDEX context_attachment_target",
+            &rows,
+        );
+
+        let first_res = ProviderResourceId::from_bytes([0x30; 16]).to_string();
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "EXPLAIN QUERY PLAN {LIST_PROVIDER_PROJECT_TARGETS_SQLITE_SQL}"
+        )))
+        .bind(&first_res)
+        .bind(&first_space)
+        .bind("")
+        .bind(0i64)
+        .bind(32i64)
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+        check_plan(
+            phase,
+            "list_provider_project_targets",
+            "USING INDEX attachment_project",
             &rows,
         );
     }

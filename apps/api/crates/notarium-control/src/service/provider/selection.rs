@@ -301,6 +301,8 @@ impl SearchDefaultWitness {
     }
 }
 
+pub(crate) const LIST_PROVIDER_PROJECT_TARGETS_SQLITE_SQL: &str = "SELECT target_project FROM provider_attachments INDEXED BY attachment_project WHERE resource_id=$1 AND target_space=$2 AND target_kind='project' AND target_project>$3 AND state='approved' AND (expires_at IS NULL OR expires_at>$4) ORDER BY target_project LIMIT $5";
+
 pub(super) async fn search_default(
     tx: &mut Transaction,
     space: &Space,
@@ -852,6 +854,75 @@ impl ProviderService {
             }
         }
         Ok(space)
+    }
+    pub async fn list_provider_project_targets(
+        &self,
+        ctx: SpaceContext,
+        resource: ProviderResourceId,
+        page: ControlPageRequest,
+    ) -> Result<ControlPage<FolderRef>, PortError> {
+        self.control.reject_search_indexing(ctx.auth())?;
+        let budget = OperationBudget::new(ctx.budget.clone());
+        let (mut tx, auth) = self
+            .control
+            .open_revalidated_read(&budget, &ctx.budget.request, ctx.auth())
+            .await?;
+        let result = budget
+            .run(
+                async {
+                    let grant = auth
+                        .spaces()
+                        .get(&ctx.scope().space_id)
+                        .ok_or(DomainError::ResourceNotFound)?;
+                    if grant.read_classes.is_empty() {
+                        return Err(DomainError::ResourceNotFound.into());
+                    }
+                    let after = page.continuation().unwrap_or("");
+                    if after.len() > 2048 || after.contains('\0') {
+                        return Err(invalid(ValidationReason::CursorStale));
+                    }
+                    let now = self.control.clock.now_ms()?;
+                    let limit = i64::from(page.limit());
+                    let fetched = rows!(
+                        tx.inner_mut(),
+                        (String,),
+                        fetch_all,
+                        LIST_PROVIDER_PROJECT_TARGETS_SQLITE_SQL,
+                        "SELECT target_project FROM v1_control.provider_attachments WHERE resource_id=$1 AND target_space=$2 AND target_kind='project' AND target_project>$3 AND state='approved' AND (expires_at IS NULL OR expires_at>$4) ORDER BY target_project LIMIT $5";
+                        resource.as_str(),
+                        ctx.scope().space_id.as_str(),
+                        after,
+                        now,
+                        limit + 1
+                    )?;
+                    let has_more = fetched.len() > usize::from(page.limit());
+                    let mut items = Vec::with_capacity(fetched.len().min(usize::from(page.limit())));
+                    let mut last: Option<String> = None;
+                    for (proj,) in fetched.into_iter().take(usize::from(page.limit())) {
+                        let folder_id = FolderId::parse(&proj)?;
+                        last = Some(proj);
+                        if grant
+                            .project_root
+                            .as_ref()
+                            .is_some_and(|root| root != &folder_id)
+                        {
+                            continue;
+                        }
+                        items.push(FolderRef {
+                            space_id: ctx.scope().space_id.clone(),
+                            folder_id,
+                        });
+                    }
+                    Ok::<_, PortError>(ControlPage {
+                        items,
+                        continuation: if has_more { last } else { None },
+                    })
+                },
+                CommitEffect::NotCommitted,
+            )
+            .await;
+        budget.run(tx.finish(), CommitEffect::NotCommitted).await?;
+        result
     }
     pub async fn select_provider(
         &self,

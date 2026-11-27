@@ -1122,7 +1122,9 @@ async fn thread_has_redaction_or_compaction_after_tx(
 ) -> Result<bool, PortError> {
     const REDACTION_SQL: &str = "SELECT EXISTS (SELECT 1 FROM chat_entries
         WHERE space_id = $1 AND redacted_at_seq IS NOT NULL AND redacted_at_seq > $2 AND thread_id = $3)";
-    const COMPACTION_SQL: &str = "SELECT EXISTS (SELECT 1 FROM chat_entries
+    const COMPACTION_SQLITE_SQL: &str = "SELECT EXISTS (SELECT 1 FROM chat_entries INDEXED BY idx_chat_entries_compaction
+        WHERE space_id = $1 AND thread_id = $2 AND kind = 'compaction' AND created_space_seq > $3 AND created_space_seq <= $4)";
+    const COMPACTION_PG_SQL: &str = "SELECT EXISTS (SELECT 1 FROM chat_entries
         WHERE space_id = $1 AND thread_id = $2 AND kind = 'compaction' AND created_space_seq > $3 AND created_space_seq <= $4)";
     let after_seq = after.get() as i64;
     let redacted: bool = match tx {
@@ -1147,7 +1149,7 @@ async fn thread_has_redaction_or_compaction_after_tx(
         return Ok(true);
     }
     match tx {
-        BackendConn::Sqlite(conn) => sqlx::query_scalar(COMPACTION_SQL)
+        BackendConn::Sqlite(conn) => sqlx::query_scalar(COMPACTION_SQLITE_SQL)
             .bind(space_id.as_str())
             .bind(thread.as_str())
             .bind(after_seq)
@@ -1157,7 +1159,7 @@ async fn thread_has_redaction_or_compaction_after_tx(
             .map_err(|err| {
                 internal_not_committed("sqlite_search_chat_delta_compact", err.to_string())
             }),
-        BackendConn::Postgres(conn) => sqlx::query_scalar(COMPACTION_SQL)
+        BackendConn::Postgres(conn) => sqlx::query_scalar(COMPACTION_PG_SQL)
             .bind(space_id.as_str())
             .bind(thread.as_str())
             .bind(after_seq)

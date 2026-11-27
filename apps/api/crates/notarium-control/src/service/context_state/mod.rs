@@ -2,7 +2,7 @@
 mod favorites;
 mod scopes;
 pub(in super::super) mod selection;
-mod sets;
+pub(in super::super) mod sets;
 use super::{
     ControlService,
     authority::*,

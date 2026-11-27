@@ -1,6 +1,8 @@
 use super::*;
 use crate::store::statements::read_rows;
 
+pub(crate) const LIST_CONTEXT_SETS_PROJECT_SQLITE_SQL: &str = "SELECT s.* FROM context_set_attachments a INDEXED BY context_attachment_target CROSS JOIN context_sets s WHERE a.target_kind='project' AND a.target_id=$3 AND a.target_space=$1 AND a.set_id>$2 AND s.set_id=a.set_id AND s.home_space=$1 ORDER BY a.set_id LIMIT $4";
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Cursor {
@@ -271,13 +273,35 @@ impl ControlService {
             let batch_result = budget
                 .run(
                     async {
+                        let batch_auth = self.revalidate_read(tx.inner_mut(), ctx.auth()).await?;
+                        let batch_grant = batch_auth
+                            .spaces()
+                            .get(&home)
+                            .ok_or(DomainError::ResourceNotFound)?;
+                        if batch_grant.read_classes.is_empty() {
+                            return Err(DomainError::ResourceNotFound.into());
+                        }
+                        let batch_project_target = batch_grant
+                            .project_root
+                            .as_ref()
+                            .map(|root| {
+                                serde_json::to_string(&FolderRef {
+                                    space_id: home.clone(),
+                                    folder_id: root.clone(),
+                                })
+                                .map_err(|_| invalid(ValidationReason::InvalidState))
+                            })
+                            .transpose()?;
+                        if batch_project_target != project_target {
+                            return Err(DomainError::ResourceNotFound.into());
+                        }
                         let values = if let Some(target_proj) = &project_target {
                             rows!(
                                 tx.inner_mut(),
                                 ContextSetsRow,
                                 fetch_all,
-                                "SELECT s.* FROM context_sets s WHERE s.home_space=$1 AND s.set_id>$2 AND EXISTS (SELECT 1 FROM context_set_attachments a WHERE a.set_id=s.set_id AND a.target_kind='project' AND a.target_id=$3 AND a.target_space=$1) ORDER BY s.set_id LIMIT $4",
-                                "SELECT s.* FROM v1_control.context_sets s WHERE s.home_space=$1 AND s.set_id>$2 AND EXISTS (SELECT 1 FROM v1_control.context_set_attachments a WHERE a.set_id=s.set_id AND a.target_kind='project' AND a.target_id=$3 AND a.target_space=$1) ORDER BY s.set_id LIMIT $4";
+                                LIST_CONTEXT_SETS_PROJECT_SQLITE_SQL,
+                                "SELECT s.* FROM v1_control.context_set_attachments a JOIN v1_control.context_sets s ON s.set_id=a.set_id WHERE a.target_kind='project' AND a.target_id=$3 AND a.target_space=$1 AND a.set_id>$2 AND s.home_space=$1 ORDER BY a.set_id LIMIT $4";
                                 home.as_str(),
                                 &after,
                                 target_proj,
@@ -545,7 +569,7 @@ impl ControlService {
             command.save(tx.inner_mut(), revision, &SavedResult { value: StoredContextSetResult::Meta(meta.clone()), events: vec![] }, self.clock.now_ms()?).await?;
             Ok((revision, ctx.clone(), meta, false))
         }, CommitEffect::NotCommitted).await?;
-        budget.run_commit(tx.commit()).await?;
+        budget.commit_tx(tx).await?;
         let value = if !replayed {
             ContextSetInfo {
                 id: request.input.id,
@@ -652,7 +676,7 @@ impl ControlService {
             command.save(tx.inner_mut(), revision, &SavedResult { value: (), events: vec![] }, self.clock.now_ms()?).await?;
             Ok(revision)
         }, CommitEffect::NotCommitted).await?;
-        budget.run_commit(tx.commit()).await?;
+        budget.commit_tx(tx).await?;
         Ok(ControlCommit {
             revision,
             value: (),

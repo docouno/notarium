@@ -133,30 +133,42 @@ async fn next_lease_tx(
     // The cursor is an opaque hexadecimal ID. Its bounds and ordering must
     // use the same byte ordering in every database locale.
     macro_rules! outstanding {
-        ($conn:expr, $collation:literal) => {
+        ($conn:expr, $collation:literal, $owner_expr:literal) => {
             sqlx::query_as::<_, (String, i64)>(concat!(
-                "SELECT lease_key, raw_size FROM (
-                   SELECT r.owner_rev_id COLLATE ", $collation, " AS lease_key, c.raw_size
-                   FROM blob_references r JOIN blob_catalog c
-                     ON c.space_id=r.space_id AND c.content_blake3=r.content_blake3
-                   WHERE r.space_id=$1 AND r.owner_kind='staged_chat' AND r.owner_id=$2
-                     AND r.resource_key=$3 AND r.content_blake3=$4
-                     AND c.blob_state='active' AND c.admission_state='open'
-                 ) AS grants WHERE lease_key>$5 AND lease_key<$6 ORDER BY lease_key LIMIT 1"
+                "SELECT r.owner_rev_id COLLATE ",
+                $collation,
+                " AS lease_key, c.raw_size
+                 FROM blob_references r
+                 CROSS JOIN blob_catalog c
+                 WHERE c.space_id=r.space_id AND c.content_blake3=r.content_blake3
+                   AND r.space_id=$1 AND r.owner_kind='staged_chat' AND ",
+                $owner_expr,
+                "=$2
+                   AND r.resource_key=$3 AND r.content_blake3=$4
+                   AND r.owner_rev_id COLLATE ",
+                $collation,
+                ">$5
+                   AND r.owner_rev_id COLLATE ",
+                $collation,
+                "<$6
+                   AND c.blob_state='active' AND c.admission_state='open'
+                 ORDER BY r.owner_rev_id COLLATE ",
+                $collation,
+                " LIMIT 1"
             ))
-                .bind(space.scope.space_id.as_str())
-                .bind(ctx.auth().principal().as_str())
-                .bind(&key)
-                .bind(digest.as_bytes().as_slice())
-                .bind(&start)
-                .bind(&end)
-                .fetch_optional(&mut **$conn)
-                .await
+            .bind(space.scope.space_id.as_str())
+            .bind(ctx.auth().principal().as_str())
+            .bind(&key)
+            .bind(digest.as_bytes().as_slice())
+            .bind(&start)
+            .bind(&end)
+            .fetch_optional(&mut **$conn)
+            .await
         };
     }
     let row = match tx {
-        BackendConn::Sqlite(c) => outstanding!(c, "BINARY"),
-        BackendConn::Postgres(c) => outstanding!(c, r#""C""#),
+        BackendConn::Sqlite(c) => outstanding!(c, "BINARY", "r.owner_id || ''"),
+        BackendConn::Postgres(c) => outstanding!(c, r#""C""#, "r.owner_id"),
     }
     .map_err(|err| internal_not_committed("recover_chat_stage", err.to_string()))?;
     let Some((key, bytes)) = row else {
@@ -254,7 +266,7 @@ impl Drop for UndeliveredLease {
                 }
                 attempted = true;
                 let result = store
-                    .with_write_tx_for_space(Some(scope.space_id.clone()), |tx| {
+                    .with_write_tx_for_space_during_shutdown(Some(scope.space_id.clone()), |tx| {
                         let scope = scope.clone();
                         let staged = staged.clone();
                         let lease = lease.clone();

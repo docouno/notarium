@@ -557,10 +557,12 @@ async fn directory(
     if path.is_empty() {
         return Ok(Some(home));
     }
-    if let Some(relative) = corpus::strip_folder_prefix(path, &home.path) {
-        return engine
-            .resolve_folder_path(scope.clone(), base, relative)
-            .await;
+    if let Some(relative) = corpus::strip_folder_prefix(path, &home.path)
+        && let Some(folder) = engine
+            .resolve_folder_path(scope.clone(), base.clone(), relative)
+            .await?
+    {
+        return Ok(Some(folder));
     }
 
     // Resolve project-relative paths first so live subfolders inside the

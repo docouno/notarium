@@ -16,12 +16,15 @@ use notarium_core::{
 };
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
     time::Duration,
 };
 use tokio::{sync::watch, time::Instant};
 
-use crate::chats::ChatRunOptions;
+use crate::chats::{
+    ChatRunOptions,
+    stream::{StepStreamBuffer, StreamRedaction},
+};
 
 type Selectors = BTreeSet<RevocationSelector>;
 type RegistrationId = u64;
@@ -50,6 +53,7 @@ struct State {
     viewers: BTreeMap<RegistrationId, Registered>,
     fences: BTreeMap<RegistrationId, Selectors>,
     pending: BTreeMap<PendingCredentialKey, PendingCredential>,
+    thread_streams: BTreeMap<(HistoryScope, ChatThreadId), Vec<Weak<StepStreamBuffer>>>,
     events: BTreeMap<RequestId, EventDelivery>,
     event_order: VecDeque<RequestId>,
 }
@@ -96,6 +100,7 @@ pub(crate) struct PendingCredential {
     command_key: CommandKey,
     command_hash: ContentDigest,
     selectors: Selectors,
+    submitters: usize,
 }
 
 impl PendingCredential {
@@ -118,7 +123,6 @@ impl PendingCredential {
 pub(crate) struct PendingRegistration {
     key: PendingCredentialKey,
     id: RegistrationId,
-    inserted: bool,
 }
 
 impl State {
@@ -464,7 +468,7 @@ impl RevocationHub {
             let expired = state.sweep_expired_pending(now);
             let outcome = if state.fenced(&selectors) {
                 Err(revocation_unavailable())
-            } else if let Some(existing) = state.pending.get(&key) {
+            } else if let Some(existing) = state.pending.get_mut(&key) {
                 if existing.command_key != identity.key
                     || existing.command_hash != identity.hash
                     || existing.options != options
@@ -474,10 +478,10 @@ impl RevocationHub {
                 {
                     Err(DomainError::IdempotencyKeyReused.into())
                 } else {
+                    existing.submitters = existing.submitters.saturating_add(1);
                     Ok(PendingRegistration {
                         key,
                         id: existing.registration,
-                        inserted: false,
                     })
                 }
             } else if state.pending.len() >= MAX_PENDING_CREDENTIALS {
@@ -496,12 +500,12 @@ impl RevocationHub {
                         registered_at: now,
                         cancellation: Cancellation::default(),
                         handoff: Arc::default(),
+                        submitters: 1,
                     },
                 );
                 Ok(PendingRegistration {
                     key,
                     id: registration,
-                    inserted: true,
                 })
             };
             (expired, outcome)
@@ -581,9 +585,7 @@ impl RevocationHub {
     }
 
     pub(crate) fn finish_registered_pending(&self, registration: PendingRegistration) {
-        self.remove_pending_when(&registration.key, |entry| {
-            entry.registration == registration.id
-        });
+        self.rollback_pending(registration);
     }
 
     fn remove_pending_when(
@@ -605,9 +607,84 @@ impl RevocationHub {
     }
 
     pub(crate) fn rollback_pending(&self, registration: PendingRegistration) {
-        if registration.inserted {
-            self.finish_registered_pending(registration);
+        let removed = {
+            let mut state = self.inner.lock();
+            if let Some(entry) = state.pending.get_mut(&registration.key)
+                && entry.registration == registration.id
+            {
+                entry.submitters = entry.submitters.saturating_sub(1);
+                if entry.submitters == 0 {
+                    state.pending.remove(&registration.key)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        if let Some(entry) = removed {
+            entry.cancellation.cancel();
         }
+    }
+
+    pub(crate) fn register_thread_stream(
+        &self,
+        scope: HistoryScope,
+        thread: ChatThreadId,
+        stream: Weak<StepStreamBuffer>,
+    ) {
+        let mut state = self.inner.lock();
+        let entry = state.thread_streams.entry((scope, thread)).or_default();
+        entry.retain(|existing| existing.strong_count() > 0);
+        entry.push(stream);
+    }
+
+    pub(crate) fn pause_thread_streams(
+        &self,
+        scope: &HistoryScope,
+        thread: &ChatThreadId,
+    ) -> Vec<StreamRedaction> {
+        let streams = {
+            let mut state = self.inner.lock();
+            let key = (scope.clone(), thread.clone());
+            let mut live = Vec::new();
+            if let Some(entries) = state.thread_streams.get_mut(&key) {
+                entries.retain(|weak| {
+                    if let Some(stream) = weak.upgrade() {
+                        live.push(stream);
+                        true
+                    } else {
+                        false
+                    }
+                });
+                if entries.is_empty() {
+                    state.thread_streams.remove(&key);
+                }
+            }
+            live
+        };
+        streams
+            .into_iter()
+            .map(|stream| stream.pause_for_redaction())
+            .collect()
+    }
+
+    pub(crate) fn cancel_thread_runs(&self, scope: &HistoryScope, thread: &ChatThreadId) {
+        let cancellations: Vec<Cancellation> = {
+            let state = self.inner.lock();
+            state
+                .runs
+                .values()
+                .filter(|entry| {
+                    entry
+                        .thread
+                        .as_ref()
+                        .is_some_and(|(s, t)| s == scope && t == thread)
+                })
+                .map(|entry| entry.cancellation.clone())
+                .collect()
+        };
+        cancel_all(cancellations);
     }
 
     /// Fence, cancel, and wait for any local in-flight chat or Keeper run

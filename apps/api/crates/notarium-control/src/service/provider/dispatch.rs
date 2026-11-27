@@ -115,6 +115,7 @@ impl Leases {
 struct Progress {
     call: RequestId,
     reserved: bool,
+    pending_commit: Option<tokio::task::JoinHandle<Result<(), PortError>>>,
     submitted: bool,
     mismatch: bool,
     usage: ProviderUsage,
@@ -256,6 +257,7 @@ impl ProviderService {
         let mut progress = Progress {
             call: RequestId::from_bytes(crate::auth::token::random()?),
             reserved: false,
+            pending_commit: None,
             submitted: false,
             mismatch: false,
             usage: ProviderUsage::Unknown,
@@ -275,6 +277,12 @@ impl ProviderService {
             let _ = lease.close().await;
         }
         drop(progress.leases);
+        if let Some(handle) = progress.pending_commit.take() {
+            // Wait (bounded) for any spawned reserve/sending COMMIT task to
+            // finish before `finalize` runs so PostgreSQL does not race ahead
+            // of the in-flight COMMIT and miss the inserted row.
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+        }
         if progress.reserved {
             let outcome = match &result {
                 Ok(_) => ProviderOutcome::Completed,
@@ -592,13 +600,24 @@ impl ProviderService {
                         self.control.clock.now_ms()?,
                     )
                     .await?;
-                    progress.reserved = true;
                     Ok(())
                 },
                 CommitEffect::NotCommitted,
             )
             .await?;
-        runtime.run_commit(tx.commit()).await?;
+        runtime.check(CommitEffect::NotCommitted)?;
+        progress.reserved = true;
+        progress.pending_commit = Some(tx.spawn_commit());
+        let reserve_commit = runtime
+            .await_commit_handle(&mut progress.pending_commit)
+            .await;
+        if let Err(ref err) = reserve_commit
+            && progress.pending_commit.is_none()
+            && !is_unknown_effect(err)
+        {
+            progress.reserved = false;
+        }
+        reserve_commit?;
         let mut material = runtime
             .run(
                 self.headers(&runtime.budget, &progress.call, &snapshot),
@@ -642,7 +661,11 @@ impl ProviderService {
                 CommitEffect::NotCommitted,
             )
             .await?;
-        runtime.run_commit(tx.commit()).await?;
+        runtime.check(CommitEffect::NotCommitted)?;
+        progress.pending_commit = Some(tx.spawn_commit());
+        runtime
+            .await_commit_handle(&mut progress.pending_commit)
+            .await?;
         progress.leases.check()?;
         let kind = wire(&snapshot.resource.wire)?;
         material

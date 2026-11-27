@@ -102,7 +102,9 @@ impl HoldOwnership {
         F: for<'c> FnOnce(&'c mut BackendConn<'_>) -> crate::BoxFuture<'c, Result<T, PortError>>,
     {
         let Self::Postgres { connection, .. } = self else {
-            return store.with_write_tx(op).await;
+            return store
+                .with_write_tx_for_space_during_shutdown(None, op)
+                .await;
         };
         let _gate = store.inner.writer()?.acquire_commit_read_guard().await;
         let mut backend = BackendConn::Postgres(connection);
@@ -349,7 +351,7 @@ async fn reconcile(
     _lock: File,
 ) -> Result<(), PortError> {
     let lookup = id.clone();
-    let ready: bool = store.with_read_tx(|tx| Box::pin(async move {
+    let ready: bool = store.with_read_tx_during_shutdown(|tx| Box::pin(async move {
         match tx {
             BackendConn::Sqlite(conn) => sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM backup_artifacts WHERE artifact_id = ? AND state = 'ready')")
                 .bind(lookup.as_str()).fetch_one(&mut **conn).await.map_err(|e|internal_not_committed("recover_sqlite_artifact", e.to_string())),

@@ -441,84 +441,88 @@ pub(super) async fn create(
         }
     }
     load_episode(call, args.session.as_ref()).await?;
-    let mut plan_replayed = true;
-    let plan: CreatePlan = call
-        .journal("create-ability-plan", || async {
-            plan_replayed = false;
-            let home = new_home(call, &args.placement).await?;
-            if let AbilityPlacement::OwnedProject(project) = &home.placement {
-                session::project_for_folder(call, project).await?;
-            }
-            let skills = resolve_skills(call, attachments).await?;
-            let availability =
-                select_projects(call, args.availability.as_ref(), &home.scope.space_id).await?;
-            // Pre-check active ability slug conflicts in the target placement
-            // BEFORE journaling the plan or creating `.abilities/` / the
-            // entrypoint note, so a deterministic `PathConflict` never persists
-            // a journal record that would skip the pre-check on retry.
-            let slot_project = match &home.placement {
-                AbilityPlacement::OwnedProject(project) => Some(project.clone()),
-                _ => None,
-            };
-            let space_account = notarium_core::ports::AccountContext::new(
-                call.auth.restrict_to_space(&home.scope.space_id)?,
-                call.budget(),
-            );
-            const MAX_SLUG_CHECK_PAGES: usize = 64;
-            let mut cursor: Option<String> = None;
-            for _ in 0..MAX_SLUG_CHECK_PAGES {
-                let existing_same_slug = call
-                    .registry
-                    .catalog
-                    .abilities(
-                        space_account.clone(),
-                        AbilityQuery {
-                            page: ControlPageRequest::new(200, cursor.clone())?,
-                            project: slot_project.clone(),
-                            kind: None,
-                            name: Some(slug.clone()),
-                            authoring: true,
-                        },
-                    )
-                    .await?;
-                if existing_same_slug
-                    .items
-                    .iter()
-                    .any(|item| item.reference.placement == home.placement)
-                {
-                    return Err(DomainError::PathConflict {
-                        target: notarium_core::model::PathTarget {
-                            space_id: home.scope.space_id.clone(),
-                            parent: home.parent.clone(),
-                            component: slug.clone(),
-                        },
-                    }
-                    .into());
+    let (plan, plan_replayed): (CreatePlan, bool) = {
+        let mut invoked_fresh = false;
+        let plan = call
+            .journal("create-ability-plan", || async {
+                invoked_fresh = true;
+                let home = new_home(call, &args.placement).await?;
+                if let AbilityPlacement::OwnedProject(project) = &home.placement {
+                    session::project_for_folder(call, project).await?;
                 }
-                match existing_same_slug.continuation {
-                    Some(next) => {
-                        if cursor.as_ref() == Some(&next) {
-                            return Err(invalid(ValidationReason::InvalidState));
+                let skills = resolve_skills(call, attachments).await?;
+                let availability =
+                    select_projects(call, args.availability.as_ref(), &home.scope.space_id).await?;
+                // Pre-check active ability slug conflicts in the target placement
+                // BEFORE journaling the plan or creating `.abilities/` / the
+                // entrypoint note, so a deterministic `PathConflict` never persists
+                // a journal record that would skip the pre-check on retry.
+                let slot_project = match &home.placement {
+                    AbilityPlacement::OwnedProject(project) => Some(project.clone()),
+                    _ => None,
+                };
+                let space_account = notarium_core::ports::AccountContext::new(
+                    call.auth.restrict_to_space(&home.scope.space_id)?,
+                    call.budget(),
+                );
+                const MAX_SLUG_CHECK_PAGES: usize = 64;
+                let mut cursor: Option<String> = None;
+                for _ in 0..MAX_SLUG_CHECK_PAGES {
+                    let existing_same_slug = call
+                        .registry
+                        .catalog
+                        .abilities(
+                            space_account.clone(),
+                            AbilityQuery {
+                                page: ControlPageRequest::new(200, cursor.clone())?,
+                                project: slot_project.clone(),
+                                kind: None,
+                                name: Some(slug.clone()),
+                                authoring: true,
+                            },
+                        )
+                        .await?;
+                    if existing_same_slug
+                        .items
+                        .iter()
+                        .any(|item| item.reference.placement == home.placement)
+                    {
+                        return Err(DomainError::PathConflict {
+                            target: notarium_core::model::PathTarget {
+                                space_id: home.scope.space_id.clone(),
+                                parent: home.parent.clone(),
+                                component: slug.clone(),
+                            },
                         }
-                        cursor = Some(next);
+                        .into());
                     }
-                    None => {
-                        cursor = None;
-                        break;
+                    match existing_same_slug.continuation {
+                        Some(next) => {
+                            if cursor.as_ref() == Some(&next) {
+                                return Err(invalid(ValidationReason::InvalidState));
+                            }
+                            cursor = Some(next);
+                        }
+                        None => {
+                            cursor = None;
+                            break;
+                        }
                     }
                 }
-            }
-            if cursor.is_some() {
-                return Err(invalid(ValidationReason::BudgetExceeded));
-            }
-            Ok(CreatePlan {
-                home,
-                skills,
-                availability,
-                account_revision: ControlRevision::ZERO,
+                if cursor.is_some() {
+                    return Err(invalid(ValidationReason::BudgetExceeded));
+                }
+                Ok(CreatePlan {
+                    home,
+                    skills,
+                    availability,
+                    account_revision: ControlRevision::ZERO,
+                })
             })
-        })
-        .await?;
+            .await?;
+        (plan, !invoked_fresh)
+    };
+    const CREATE_LABEL: &str = "notarium.mcp.create-ability.v1";
     if plan_replayed && let AbilityPlacement::OwnedProject(project) = &plan.home.placement {
         let live_opt = match call
             .registry
@@ -528,7 +532,13 @@ pub(super) async fn create(
         {
             Ok(folder) => Some(folder),
             Err(PortError::Domain(DomainError::ResourceNotFound)) => None,
-            Err(error) => return Err(error),
+            Err(error) => {
+                return Err(super::super::note_tools::batch_operational_error(
+                    CREATE_LABEL,
+                    error,
+                    true,
+                ));
+            }
         };
         if let Some(folder) = live_opt {
             if folder.reference != *project
@@ -541,14 +551,16 @@ pub(super) async fn create(
                 .registry
                 .catalog
                 .trashed_folder_ancestry(call.account(), project.clone())
-                .await?;
+                .await
+                .map_err(|error| {
+                    super::super::note_tools::batch_operational_error(CREATE_LABEL, error, true)
+                })?;
             if trashed.reference != *project {
                 return Err(DomainError::ResourceNotFound.into());
             }
         }
     }
     let carrier = created_carrier(&args, kind, &format_attachments(attachments, &plan.skills)?)?;
-    const CREATE_LABEL: &str = "notarium.mcp.create-ability.v1";
     let ensured_parent = ensure_ability_folder_journaled(
         call,
         &plan.home.scope,
@@ -556,9 +568,13 @@ pub(super) async fn create(
         "create-ability-folder",
         CREATE_LABEL,
     )
-    .await?;
+    .await
+    .map_err(|error| {
+        super::super::note_tools::batch_operational_error(CREATE_LABEL, error, plan_replayed)
+    })?;
     let parent = ensured_parent.folder();
     let folder_created = ensured_parent.created();
+    let prior_committed = plan_replayed || folder_created;
     let note_id = NoteId::from_bytes(stable_id(call, "ability-entrypoint-id"));
     let ability_id = AbilityId::from_bytes(stable_id(call, "ability-package-id"));
     let entrypoint = call
@@ -569,7 +585,7 @@ pub(super) async fn create(
                 super::super::note_tools::batch_operational_error(
                     CREATE_LABEL,
                     error,
-                    folder_created,
+                    prior_committed,
                 )
             })?,
             Mutation {
@@ -587,7 +603,7 @@ pub(super) async fn create(
         )
         .await
         .map_err(|error| {
-            super::super::note_tools::batch_operational_error(CREATE_LABEL, error, folder_created)
+            super::super::note_tools::batch_operational_error(CREATE_LABEL, error, prior_committed)
         })?;
     let created = call
         .registry
@@ -948,13 +964,16 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
         }
     }
     load_episode(call, args.session.as_ref()).await?;
-    let mut plan_replayed = true;
-    let plan: EditPlan = call
-        .journal("edit-ability-plan", || async {
-            plan_replayed = false;
-            edit_plan(call, &args).await
-        })
-        .await?;
+    let (plan, plan_replayed): (EditPlan, bool) = {
+        let mut invoked_fresh = false;
+        let plan = call
+            .journal("edit-ability-plan", || async {
+                invoked_fresh = true;
+                edit_plan(call, &args).await
+            })
+            .await?;
+        (plan, !invoked_fresh)
+    };
     let mut reference = plan.original.clone();
     let mut steps = Vec::new();
     let mut authored_changed = false;
@@ -1057,7 +1076,7 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
                 return Err(invalid(ValidationReason::DuplicateKey));
             }
             let mut note_revision = plan.previous_note.clone();
-            if authored {
+            let pending_patch = if authored {
                 let scope = call.space(plan.scope.clone())?;
                 let snapshot = call
                     .registry
@@ -1070,40 +1089,41 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
                 let source = if trashed_replay {
                     snapshot.document.explicit_read(scope.auth())?
                 } else {
+                    if plan.promote {
+                        // Verify source carrier writability (including folder write-locks)
+                        // before promote creates a Space-root `.abilities` folder.
+                        snapshot
+                            .document
+                            .metadata()
+                            .authorize_current_write(scope.auth())?;
+                    }
                     ClassEgressFence::mcp_note(&snapshot.document, scope.auth())?
                 };
                 let patch =
                     authored_patch(source, &args, plan.kind.into(), attachments.as_deref())?;
                 authored_changed = !patch.edits.is_empty() || skills != orig_attached_skills;
-                if !patch.edits.is_empty() {
-                    let edited = call
+                (!patch.edits.is_empty()).then_some(patch)
+            } else {
+                None
+            };
+            if plan.promote {
+                phase = "home";
+                if !authored && !trashed_replay {
+                    let scope = call.space(plan.scope.clone())?;
+                    let live = call
                         .registry
                         .engine
-                        .edit_note(
-                            writer(call, &plan.scope).await?,
-                            Mutation {
-                                identity: call.command_identity(
-                                    &plan.scope,
-                                    "edit-ability-carrier",
-                                    0,
-                                ),
-                                preconditions: Preconditions {
-                                    revision: Some(note_revision),
-                                    ..Default::default()
-                                },
-                                input: EditNote {
-                                    note: plan.entrypoint.clone(),
-                                    plan: patch,
-                                },
+                        .get_note_metadata(
+                            scope.clone(),
+                            GetNote {
+                                note: plan.entrypoint.clone(),
+                                revision: None,
+                                causal: CausalBasis::Await(Default::default()),
                             },
                         )
                         .await?;
-                    note_revision = edited.value.revision;
-                    carrier_edited = true;
+                    live.metadata.authorize_current_write(scope.auth())?;
                 }
-            }
-            if plan.promote {
-                phase = "home";
                 let journaled_parent = if plan_replayed {
                     call.lookup_journal_with_key::<JournaledAbilityFolder>(
                         "edit-ability-promote-folder",
@@ -1175,6 +1195,32 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
                     .await?;
                 note_revision = settled.value.revision;
                 carrier_moved = true;
+            }
+            if let Some(patch) = pending_patch {
+                phase = "authored";
+                let edited = call
+                    .registry
+                    .engine
+                    .edit_note(
+                        writer(call, &plan.scope).await?,
+                        Mutation {
+                            identity: call.command_identity(&plan.scope, "edit-ability-carrier", 0),
+                            preconditions: Preconditions {
+                                revision: Some(note_revision),
+                                ..Default::default()
+                            },
+                            input: EditNote {
+                                note: plan.entrypoint.clone(),
+                                plan: patch,
+                            },
+                        },
+                    )
+                    .await?;
+                note_revision = edited.value.revision;
+                carrier_edited = true;
+                if plan.promote {
+                    phase = "home";
+                }
             }
             if authored_changed || plan.promote {
                 if trashed_replay && plan.has_auxiliary_files {
@@ -1265,7 +1311,7 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
             return Err(post_commit_step_error(
                 EDIT_LABEL,
                 error,
-                partial_package || folder_ensured,
+                partial_package || folder_ensured || plan_replayed,
             ));
         }
         let uncommitted_promotion = plan.promote && promotion.is_none();
@@ -1369,7 +1415,11 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
             }
             Err(error) => {
                 if !applied_any || !is_partial_step_error(&error) {
-                    return Err(post_commit_step_error(EDIT_LABEL, error, applied_any));
+                    return Err(post_commit_step_error(
+                        EDIT_LABEL,
+                        error,
+                        applied_any || plan_replayed,
+                    ));
                 }
                 steps.push(change_step("availability", "failed", Some(&error)));
                 steps.push(change_step("enabled", "skipped", None));
@@ -1429,7 +1479,11 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
             }
             Err(error) => {
                 if !applied_any || !is_partial_step_error(&error) {
-                    return Err(post_commit_step_error(EDIT_LABEL, error, applied_any));
+                    return Err(post_commit_step_error(
+                        EDIT_LABEL,
+                        error,
+                        applied_any || plan_replayed,
+                    ));
                 }
                 steps.push(change_step("enabled", "failed", Some(&error)));
                 return edit_result(&reference, committed_binding_rev, steps, Some(&error));

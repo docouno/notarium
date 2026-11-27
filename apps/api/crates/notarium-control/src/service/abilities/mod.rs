@@ -503,10 +503,12 @@ fn authorize_ability_placement_auth(
     personal_space: Option<&SpaceId>,
 ) -> Result<(), PortError> {
     let is_pinned = auth.readonly_abilities().contains(ability_id);
+    let is_pinned_system = auth.readonly_system_abilities().contains(ability_id);
+    let may_bypass_project_root = is_pinned && !auth.readonly_abilities_in_project_only();
     let is_keeper = matches!(auth.kind(), notarium_core::auth::PrincipalKind::Keeper(_));
     match placement {
         AbilityPlacement::System => {
-            if is_keeper && !is_pinned {
+            if is_keeper && !is_pinned_system {
                 return Err(DomainError::ResourceNotFound.into());
             }
             Ok(())
@@ -522,7 +524,7 @@ fn authorize_ability_placement_auth(
                 .ok_or(DomainError::ResourceNotFound)?;
             if !grant.read_classes.contains(&DocClass::Skill)
                 || (is_keeper && !is_pinned)
-                || (grant.project_root.is_some() && !is_pinned)
+                || (grant.project_root.is_some() && !may_bypass_project_root)
             {
                 return Err(DomainError::ResourceNotFound.into());
             }
@@ -535,7 +537,7 @@ fn authorize_ability_placement_auth(
                 .ok_or(DomainError::ResourceNotFound)?;
             if !grant.read_classes.contains(&DocClass::Skill)
                 || (is_keeper && !is_pinned)
-                || (grant.project_root.is_some() && !is_pinned)
+                || (grant.project_root.is_some() && !may_bypass_project_root)
             {
                 return Err(DomainError::ResourceNotFound.into());
             }
@@ -552,7 +554,7 @@ fn authorize_ability_placement_auth(
                     .project_root
                     .as_ref()
                     .is_some_and(|root| root != &project.folder_id)
-                    && !is_pinned)
+                    && !may_bypass_project_root)
             {
                 return Err(DomainError::ResourceNotFound.into());
             }

@@ -132,6 +132,28 @@ impl FolderRoute {
     }
 }
 
+fn visible_ancestors<'a>(
+    scope: &SpaceContext,
+    ancestors: &'a [FolderId],
+    self_id: &FolderId,
+) -> Vec<&'a FolderId> {
+    let project_root = scope
+        .auth()
+        .spaces()
+        .get(&scope.scope().space_id)
+        .and_then(|grant| grant.project_root.as_ref());
+    let mut out = Vec::new();
+    for ancestor in ancestors {
+        if ancestor != self_id {
+            out.push(ancestor);
+        }
+        if project_root == Some(ancestor) {
+            break;
+        }
+    }
+    out
+}
+
 async fn capture_ancestor_revisions(
     call: &ToolCallContext<'_>,
     scope: &SpaceContext,
@@ -147,8 +169,8 @@ async fn capture_ancestor_revisions(
     {
         revs.push((parent.reference.folder_id.clone(), parent.revision.clone()));
     }
-    for ancestor in ancestors {
-        if ancestor == self_id || !seen.insert(ancestor.clone()) {
+    for ancestor in visible_ancestors(scope, ancestors, self_id) {
+        if !seen.insert(ancestor.clone()) {
             continue;
         }
         let snap = snapshot_by_id(call, scope, ancestor).await?;
@@ -163,11 +185,13 @@ async fn ancestors_unchanged(
     current: &FolderSnapshot,
     expected: &[(FolderId, RevisionId)],
 ) -> Result<bool, PortError> {
-    let live_ancestors: std::collections::BTreeSet<&FolderId> = current
-        .ancestor_folders
-        .iter()
-        .filter(|id| *id != &current.reference.folder_id)
-        .collect();
+    let live_ancestors: std::collections::BTreeSet<&FolderId> = visible_ancestors(
+        scope,
+        &current.ancestor_folders,
+        &current.reference.folder_id,
+    )
+    .into_iter()
+    .collect();
     if live_ancestors.len() != expected.len() {
         return Ok(false);
     }
@@ -243,17 +267,38 @@ impl FolderAddress {
         path: &str,
     ) -> Result<FolderSnapshot, PortError> {
         let path = path.trim_matches('/');
-        let (base, relative) = match &self.project {
-            Some(project) => {
-                if let Some(suffix) = corpus::strip_folder_prefix(path, &project.path) {
-                    (Some(project.reference.folder_id.clone()), suffix)
-                } else {
-                    (Some(project.reference.folder_id.clone()), path.to_owned())
-                }
-            }
-            None => (None, path.to_owned()),
+        let Some(project) = &self.project else {
+            return resolve_snapshot(call, &self.scope, None, path).await;
         };
-        resolve_snapshot(call, &self.scope, base, &relative).await
+        let base = Some(project.reference.folder_id.clone());
+        if let Some(suffix) = corpus::strip_folder_prefix(path, &project.path) {
+            match resolve_snapshot(call, &self.scope, base.clone(), &suffix).await {
+                Ok(folder) => return Ok(folder),
+                Err(PortError::Domain(DomainError::ResourceNotFound)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        match resolve_snapshot(call, &self.scope, base, path).await {
+            Ok(folder) => return Ok(folder),
+            Err(PortError::Domain(DomainError::ResourceNotFound)) => {}
+            Err(error) => return Err(error),
+        }
+        // A whole-Space credential can fall back to an older Space-relative alias
+        // (e.g. a renamed project's former slug), provided the resolved folder
+        // belongs to the selected project.
+        if self
+            .scope
+            .auth()
+            .spaces()
+            .get(&project.reference.space_id)
+            .is_some_and(|grant| grant.project_root.is_none())
+        {
+            let folder = resolve_snapshot(call, &self.scope, None, path).await?;
+            if folder.project.as_ref() == Some(&project.reference.folder_id) {
+                return Ok(folder);
+            }
+        }
+        Err(DomainError::ResourceNotFound.into())
     }
 }
 

@@ -278,7 +278,7 @@ pub(super) async fn open(
         if start.batch.episode != episode || start.batch.project != project {
             return Err(stale());
         }
-        revalidate(call, &start.batch).await?;
+        revalidate(call, &start.batch, Some(0), None).await?;
         return page(call, start.opened, start.batch, next_space(0), acknowledge).await;
     }
     let batch = Arc::new(Batch {
@@ -297,7 +297,12 @@ pub(super) async fn open(
     page(call, start.opened, start.batch, next_space(0), acknowledge).await
 }
 
-async fn revalidate(call: &ToolCallContext<'_>, batch: &Batch) -> Result<(), PortError> {
+async fn revalidate(
+    call: &ToolCallContext<'_>,
+    batch: &Batch,
+    active_space_index: Option<usize>,
+    ack_space: Option<&SpaceId>,
+) -> Result<(), PortError> {
     if authority(call.account().auth())? != batch.authority {
         return Err(stale());
     }
@@ -312,11 +317,39 @@ async fn revalidate(call: &ToolCallContext<'_>, batch: &Batch) -> Result<(), Por
     if let Some(project) = &batch.project {
         project_for_folder(call, project).await?;
     }
-    let live = readable_spaces(call).await?;
-    for window in &batch.windows {
-        let current = live
-            .get(&window.baseline.scope.space_id)
-            .ok_or_else(stale)?;
+    // Validate only the Space window(s) actively being read or acknowledged in
+    // this call rather than re-reading all S Spaces on every pagination hop;
+    // any membership or grant change across any Space is already caught in O(1)
+    // by `batch.authority` above.
+    let mut checked = std::collections::BTreeSet::new();
+    if let Some(idx) = active_space_index
+        && let Some(window) = batch.windows.get(idx)
+    {
+        checked.insert(&window.baseline.scope.space_id);
+        let current = super::readable_space(call, &window.baseline.scope.space_id)
+            .await
+            .map_err(|err| match err {
+                PortError::Domain(DomainError::ResourceNotFound) => stale(),
+                other => other,
+            })?;
+        current.history.check(&window.baseline.scope)?;
+        if current.last_seq < window.cutoff {
+            return Err(stale());
+        }
+    }
+    if let Some(space_id) = ack_space
+        && checked.insert(space_id)
+        && let Some(window) = batch
+            .windows
+            .iter()
+            .find(|w| &w.baseline.scope.space_id == space_id)
+    {
+        let current = super::readable_space(call, space_id)
+            .await
+            .map_err(|err| match err {
+                PortError::Domain(DomainError::ResourceNotFound) => stale(),
+                other => other,
+            })?;
         current.history.check(&window.baseline.scope)?;
         if current.last_seq < window.cutoff {
             return Err(stale());
@@ -341,35 +374,26 @@ pub(super) async fn resume(
     let existing_ack = call
         .lookup_journal::<Option<PendingDeliveryAck>>("delta-resume-ack")
         .await?;
-    let prior_may_have_acked = existing_ack.as_ref().is_some_and(Option::is_some);
-    let ticket = match call.registry.bootstrap.find(token, CONTINUATION_PREFIX) {
-        Ok(ticket) => ticket,
-        Err(error) => {
-            return Err(if prior_may_have_acked {
-                super::super::note_tools::post_commit_error(LABEL, error)
-            } else {
-                error
-            });
-        }
-    };
-    let position = match ticket.position.clone() {
-        Some(position) => position,
-        None => {
-            let err = stale();
-            return Err(if prior_may_have_acked {
-                super::super::note_tools::post_commit_error(LABEL, err)
-            } else {
-                err
-            });
-        }
-    };
-    revalidate(call, &ticket.batch).await.map_err(|error| {
-        if prior_may_have_acked {
-            super::super::note_tools::post_commit_error(LABEL, error)
-        } else {
-            error
-        }
-    })?;
+    let mut acked = false;
+    if let Some(Some(pending)) = &existing_ack {
+        // Replay any already-journaled delivery acknowledgement BEFORE looking
+        // up the process-local continuation ticket so failover replays still
+        // commit the durable ACK even if the continuation ticket has moved/expired.
+        acknowledge_prepared(call, pending).await.map_err(|error| {
+            super::super::note_tools::batch_operational_error(LABEL, error, true)
+        })?;
+        acked = true;
+    }
+    let ticket = call.registry.bootstrap.find(token, CONTINUATION_PREFIX)?;
+    let position = ticket.position.clone().ok_or_else(stale)?;
+    revalidate(
+        call,
+        &ticket.batch,
+        Some(position.space_index),
+        ticket.safe_ack.as_ref().map(|c| &c.scope.space_id),
+    )
+    .await
+    .map_err(|error| super::super::note_tools::batch_operational_error(LABEL, error, acked))?;
     let acknowledge = ticket.acknowledge && allow_ack;
     let pending = match existing_ack {
         Some(saved) => saved,
@@ -389,27 +413,13 @@ pub(super) async fn resume(
                 .await?
         }
     };
-    let acked = if let Some(pending) = &pending {
-        acknowledge_prepared(call, pending).await.map_err(|error| {
-            if prior_may_have_acked {
-                super::super::note_tools::post_commit_error(LABEL, error)
-            } else {
-                error
-            }
-        })?;
-        true
-    } else {
-        false
-    };
+    if !acked && let Some(pending) = &pending {
+        acknowledge_prepared(call, pending).await?;
+        acked = true;
+    }
     page(call, Instant::now(), ticket.batch, position, acknowledge)
         .await
-        .map_err(|error| {
-            if acked {
-                super::super::note_tools::post_commit_error(LABEL, error)
-            } else {
-                super::super::note_tools::batch_operational_error(LABEL, error, false)
-            }
-        })
+        .map_err(|error| super::super::note_tools::batch_operational_error(LABEL, error, acked))
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -419,13 +429,32 @@ pub(super) struct PendingDeliveryAck {
     delivered: ChangeCursor,
 }
 
+impl PendingDeliveryAck {
+    pub(super) fn is_for_parent(&self, parent: Option<&EpisodeId>) -> bool {
+        matches!(&self.owner, AckOwner::Episode(acked) if parent == Some(acked))
+    }
+
+    pub(super) fn for_episode(&self, episode: EpisodeId) -> Self {
+        Self {
+            owner: AckOwner::Episode(episode),
+            delivered: self.delivered.clone(),
+        }
+    }
+}
+
 pub(super) async fn prepare_delivery(
     call: &ToolCallContext<'_>,
     token: &str,
     allow_ack: bool,
 ) -> Result<Option<PendingDeliveryAck>, PortError> {
     let ticket = call.registry.bootstrap.find(token, DELIVERY_PREFIX)?;
-    revalidate(call, &ticket.batch).await?;
+    revalidate(
+        call,
+        &ticket.batch,
+        None,
+        ticket.safe_ack.as_ref().map(|c| &c.scope.space_id),
+    )
+    .await?;
     if !allow_ack || !ticket.acknowledge {
         return Ok(None);
     }
@@ -441,24 +470,21 @@ pub(super) async fn deliver_journaled(
     allow_ack: bool,
 ) -> Result<bool, PortError> {
     const LABEL: &str = "notarium.mcp.delta-ack.v1";
-    let mut replayed = true;
+    let mut invoked_fresh = false;
     let pending: Option<PendingDeliveryAck> = call
         .journal("delivery-ack", || async {
-            replayed = false;
+            invoked_fresh = true;
             prepare_delivery(call, token, allow_ack).await
         })
         .await?;
+    let replayed = !invoked_fresh;
     let Some(pending) = pending else {
         return Ok(false);
     };
     acknowledge_prepared(call, &pending)
         .await
         .map_err(|error| {
-            if replayed {
-                super::super::note_tools::post_commit_error(LABEL, error)
-            } else {
-                error
-            }
+            super::super::note_tools::batch_operational_error(LABEL, error, replayed)
         })?;
     Ok(true)
 }

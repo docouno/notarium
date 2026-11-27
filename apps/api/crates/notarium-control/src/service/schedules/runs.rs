@@ -46,6 +46,7 @@ impl ControlService {
             &auth,
             probe_run,
             package_ids(&info.definition.approved_role, &info.approved_skills),
+            system_package_ids(&info.definition.approved_role, &info.approved_skills),
         )?;
         let current = AccountContext::new(keeper, budget.context(ctx.budget.request.clone()));
         budget
@@ -232,6 +233,7 @@ impl ControlService {
                             let keeper = scope.keeper(
                                 &auth, run.clone(),
                                 package_ids(&info.definition.approved_role, &info.approved_skills),
+                                system_package_ids(&info.definition.approved_role, &info.approved_skills),
                             )?.with_verified_keeper_log(log_id.clone())?;
                             let current = AccountContext::new(keeper.clone(), budget.context(ctx.budget.request.clone()));
                             if self.verify_schedule_approval_db(tx.inner_mut(), &current, scope, abilities).await? {

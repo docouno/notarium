@@ -696,6 +696,7 @@ impl ControlCatalogPort for CanonicalStore {
                         }
                     }
                     .map_err(|err| crate::runtime::pg_read_error("locate_note", err))?;
+                    let mut visible: Option<CatalogNote> = None;
                     for raw_space in matched {
                         let space_id = SpaceId::parse(&raw_space)?;
                         let rec = match load_space_record(tx, &space_id).await {
@@ -708,12 +709,20 @@ impl ControlCatalogPort for CanonicalStore {
                             note_id: note.clone(),
                         };
                         match note_metadata(tx, ctx.auth(), &rec, reference).await {
-                            Ok(found) => return Ok(found),
+                            Ok(found) => {
+                                if visible.is_some() {
+                                    return Err(DomainError::validation(
+                                        ValidationReason::ScopeMismatch,
+                                    )
+                                    .into());
+                                }
+                                visible = Some(found);
+                            }
                             Err(PortError::Domain(DomainError::ResourceNotFound)) => continue,
                             Err(err) => return Err(err),
                         }
                     }
-                    Err(DomainError::ResourceNotFound.into())
+                    visible.ok_or_else(|| DomainError::ResourceNotFound.into())
                 })
             })
             .await

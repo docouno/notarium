@@ -423,7 +423,7 @@ impl ControlService {
             command.save(tx.inner_mut(),revision,&saved,now).await?;
             Ok((revision,saved))
         },CommitEffect::NotCommitted).await?;
-        budget.run_commit(tx.commit()).await?;
+        budget.commit_tx(tx).await?;
         let current = self
             .finish_space_operation(&budget, &saved.value.operation)
             .await?;

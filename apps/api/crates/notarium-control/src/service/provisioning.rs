@@ -262,7 +262,7 @@ impl ControlService {
                 execute!(tx.inner_mut(),"UPDATE control_operations SET state='committed',canonical_receipt=$1,next_action='done',updated_at=$2 WHERE operation_id=$3","UPDATE v1_control.control_operations SET state='committed',canonical_receipt=$1,next_action='done',updated_at=$2 WHERE operation_id=$3";&receipt,self.clock.now_ms()?,id.as_str())?;
                 Ok(())
             },CommitEffect::Unknown).await?;
-            budget.run_commit(tx.commit()).await?;
+            budget.commit_tx(tx).await?;
             Ok(catalog)
         }.await;
         work.map_err(|_: PortError| {
@@ -328,7 +328,7 @@ impl ControlService {
             let operation=stage_personal(tx.inner_mut(),&row,row.created_at).await?;
             Ok((account_info(&row)?,operation,row.auth_version,row.password_hash))
         },CommitEffect::NotCommitted).await?;
-        budget.run_commit(tx.commit()).await?;
+        budget.commit_tx(tx).await?;
         self.finish_space_operation(&budget, &operation).await?;
         let session = if matches!(self.config.authentication, AuthenticationMode::Password) {
             let work = async {
@@ -348,7 +348,7 @@ impl ControlService {
                         CommitEffect::Unknown,
                     )
                     .await?;
-                budget.run_commit(tx.commit()).await?;
+                budget.commit_tx(tx).await?;
                 Ok(issued)
             }
             .await;
@@ -400,7 +400,7 @@ impl ControlService {
             command.save(tx.inner_mut(),revision,&saved,now).await?;
             Ok((revision,saved))
         },CommitEffect::NotCommitted).await?;
-        budget.run_commit(tx.commit()).await?;
+        budget.commit_tx(tx).await?;
         let space = saved
             .value
             .personal_space

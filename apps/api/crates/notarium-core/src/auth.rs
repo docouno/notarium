@@ -213,6 +213,16 @@ impl BranchTaint {
     }
 }
 
+static EMPTY_ABILITIES: BTreeSet<AbilityId> = BTreeSet::new();
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct KeeperAuthScope {
+    readonly_abilities: BTreeSet<AbilityId>,
+    readonly_system_abilities: BTreeSet<AbilityId>,
+    readonly_abilities_in_project_only: bool,
+    keeper_log: Option<ChatThreadId>,
+}
+
 #[derive(Clone, Debug)]
 pub struct EngineAuthContext {
     principal: PrincipalId,
@@ -227,8 +237,7 @@ pub struct EngineAuthContext {
     chat_audience: Option<ChatAudience>,
     chat_episode: Option<EpisodeId>,
     taint: BranchTaint,
-    readonly_abilities: BTreeSet<AbilityId>,
-    keeper_log: Option<ChatThreadId>,
+    keeper: Option<Box<KeeperAuthScope>>,
     credential: Option<AuthenticatedCredential>,
     bearer_scope: Option<BearerScope>,
 }
@@ -267,8 +276,7 @@ impl EngineAuthContext {
             chat_audience: None,
             chat_episode: None,
             taint: BranchTaint::default(),
-            readonly_abilities: BTreeSet::new(),
-            keeper_log: None,
+            keeper: None,
             credential: verified.credential,
             bearer_scope: None,
         }
@@ -313,8 +321,7 @@ impl EngineAuthContext {
             chat_audience: None,
             chat_episode: None,
             taint: BranchTaint::default(),
-            readonly_abilities: BTreeSet::new(),
-            keeper_log: None,
+            keeper: None,
             credential: Some(credential),
             bearer_scope: Some(verified.scope),
         }
@@ -355,8 +362,7 @@ impl EngineAuthContext {
             chat_audience: None,
             chat_episode: None,
             taint: BranchTaint::default(),
-            readonly_abilities: BTreeSet::new(),
-            keeper_log: None,
+            keeper: None,
             bearer_scope: None,
             credential: Some(AuthenticatedCredential::SearchIndexing { space, provider }),
         }
@@ -375,7 +381,7 @@ impl EngineAuthContext {
         audience: ChatAudience,
         requested: BTreeMap<SpaceId, SpaceGrant>,
     ) -> DomainResult<Self> {
-        if matches!(self.kind, PrincipalKind::Keeper(_)) || self.keeper_log.is_some() {
+        if matches!(self.kind, PrincipalKind::Keeper(_)) || self.keeper_log().is_some() {
             return Err(DomainError::validation(ValidationReason::ScopeMismatch));
         }
         self.for_agent_run_inner(run, thread_space, audience, requested)
@@ -387,7 +393,7 @@ impl EngineAuthContext {
         audience: ChatAudience,
         requested: BTreeMap<SpaceId, SpaceGrant>,
     ) -> DomainResult<Self> {
-        if self.keeper_log.is_some() {
+        if self.keeper_log().is_some() {
             return Err(DomainError::validation(ValidationReason::ScopeMismatch));
         }
         if self.is_search_indexing() {
@@ -437,10 +443,26 @@ impl EngineAuthContext {
         project_root: Option<FolderId>,
         readonly_abilities: BTreeSet<AbilityId>,
     ) -> DomainResult<Self> {
+        self.for_keeper_with_abilities(
+            run,
+            space,
+            project_root,
+            readonly_abilities,
+            BTreeSet::new(),
+        )
+    }
+    pub fn for_keeper_with_abilities(
+        &self,
+        run: AgentRunId,
+        space: SpaceId,
+        project_root: Option<FolderId>,
+        readonly_abilities: BTreeSet<AbilityId>,
+        readonly_system_abilities: BTreeSet<AbilityId>,
+    ) -> DomainResult<Self> {
         if matches!(self.kind, PrincipalKind::AgentRun(_))
             || self.chat_episode.is_some()
             || (!matches!(self.kind, PrincipalKind::Keeper(_)) && self.chat_audience.is_some())
-            || self.keeper_log.is_some()
+            || self.keeper_log().is_some()
             || matches!(
                 &self.credential,
                 Some(AuthenticatedCredential::ScheduledRun { run: cred_run, .. }) if cred_run != &run
@@ -459,8 +481,10 @@ impl EngineAuthContext {
         if grant.project_root.is_some() && grant.project_root != project_root {
             return Err(DomainError::validation(ValidationReason::ScopeMismatch));
         }
-        let may_pin_dependencies =
+        let may_pin_outside_project =
             self.kind == PrincipalKind::DirectHuman && grant.project_root.is_none();
+        let may_pin_in_project =
+            !matches!(self.kind, PrincipalKind::Keeper(_)) && grant.project_root.is_some();
         grant.project_root = project_root;
         grant
             .write_classes
@@ -473,16 +497,35 @@ impl EngineAuthContext {
         )?;
         derived.kind = PrincipalKind::Keeper(run);
         derived.spaces_narrowed = true;
-        derived.readonly_abilities = if may_pin_dependencies {
-            readonly_abilities
+        let (owned, in_project_only) = if may_pin_outside_project {
+            (readonly_abilities, false)
+        } else if may_pin_in_project {
+            (readonly_abilities, true)
         } else {
             // A delegated run can retain an approved package exception, never
             // create a new exception to its parent's project boundary.
-            readonly_abilities
-                .intersection(&self.readonly_abilities)
+            (
+                readonly_abilities
+                    .intersection(self.readonly_abilities())
+                    .cloned()
+                    .collect(),
+                self.readonly_abilities_in_project_only(),
+            )
+        };
+        let system = if !matches!(self.kind, PrincipalKind::Keeper(_)) {
+            readonly_system_abilities
+        } else {
+            readonly_system_abilities
+                .intersection(self.readonly_system_abilities())
                 .cloned()
                 .collect()
         };
+        derived.keeper = Some(Box::new(KeeperAuthScope {
+            readonly_abilities: owned,
+            readonly_system_abilities: system,
+            readonly_abilities_in_project_only: in_project_only,
+            keeper_log: self.keeper_log().cloned(),
+        }));
         Ok(derived)
     }
     pub fn for_oauth(
@@ -493,7 +536,7 @@ impl EngineAuthContext {
         if matches!(
             self.kind,
             PrincipalKind::Keeper(_) | PrincipalKind::AgentRun(_)
-        ) || self.keeper_log.is_some()
+        ) || self.keeper_log().is_some()
             || self.chat_audience.is_some()
         {
             return Err(DomainError::validation(ValidationReason::ScopeMismatch));
@@ -522,7 +565,7 @@ impl EngineAuthContext {
         if matches!(
             self.kind,
             PrincipalKind::Keeper(_) | PrincipalKind::AgentRun(_)
-        ) || self.keeper_log.is_some()
+        ) || self.keeper_log().is_some()
             || self.chat_audience.is_some()
         {
             return Err(DomainError::validation(ValidationReason::ScopeMismatch));
@@ -609,6 +652,7 @@ impl EngineAuthContext {
         }
         let mut spaces = self.spaces.clone();
         for grant in spaces.values_mut() {
+            grant.role = SpaceRole::Viewer;
             grant.write_classes.clear();
         }
         Self {
@@ -719,7 +763,7 @@ impl EngineAuthContext {
             || self.grant != current.grant
             || self.credential != current.credential
             || self.credential.is_none()
-            || self.keeper_log != current.keeper_log
+            || self.keeper_log() != current.keeper_log()
             || (self.kind == PrincipalKind::SearchIndexing)
                 != (current.kind == PrincipalKind::SearchIndexing)
         {
@@ -741,12 +785,22 @@ impl EngineAuthContext {
             })
             .collect();
         let mut result = self.narrow(requested)?;
-        if matches!(self.kind, PrincipalKind::Keeper(_)) || self.keeper_log.is_some() {
-            result.readonly_abilities = self
-                .readonly_abilities
-                .intersection(&current.readonly_abilities)
-                .cloned()
-                .collect();
+        if matches!(self.kind, PrincipalKind::Keeper(_)) || self.keeper_log().is_some() {
+            result.keeper = Some(Box::new(KeeperAuthScope {
+                readonly_abilities: self
+                    .readonly_abilities()
+                    .intersection(current.readonly_abilities())
+                    .cloned()
+                    .collect(),
+                readonly_system_abilities: self
+                    .readonly_system_abilities()
+                    .intersection(current.readonly_system_abilities())
+                    .cloned()
+                    .collect(),
+                readonly_abilities_in_project_only: self.readonly_abilities_in_project_only()
+                    || current.readonly_abilities_in_project_only(),
+                keeper_log: self.keeper_log().cloned(),
+            }));
         }
         result.spaces_narrowed = self.spaces_narrowed
             || current.spaces_narrowed
@@ -801,10 +855,22 @@ impl EngineAuthContext {
         &self.kind
     }
     pub fn readonly_abilities(&self) -> &BTreeSet<AbilityId> {
-        &self.readonly_abilities
+        self.keeper
+            .as_deref()
+            .map_or(&EMPTY_ABILITIES, |k| &k.readonly_abilities)
+    }
+    pub fn readonly_system_abilities(&self) -> &BTreeSet<AbilityId> {
+        self.keeper
+            .as_deref()
+            .map_or(&EMPTY_ABILITIES, |k| &k.readonly_system_abilities)
+    }
+    pub fn readonly_abilities_in_project_only(&self) -> bool {
+        self.keeper
+            .as_deref()
+            .is_some_and(|k| k.readonly_abilities_in_project_only)
     }
     pub fn keeper_log(&self) -> Option<&ChatThreadId> {
-        self.keeper_log.as_ref()
+        self.keeper.as_deref().and_then(|k| k.keeper_log.as_ref())
     }
     /// Bind the log from a verified schedule-run record at the control boundary.
     pub fn with_verified_keeper_log(mut self, thread: ChatThreadId) -> DomainResult<Self> {
@@ -813,13 +879,14 @@ impl EngineAuthContext {
             (PrincipalKind::Keeper(run), Some(AuthenticatedCredential::ScheduledRun { run: verified, .. }))
                 if run == verified
         ) || self
-            .keeper_log
-            .as_ref()
+            .keeper_log()
             .is_some_and(|existing| existing != &thread)
         {
             return Err(DomainError::AuthenticationFailed);
         }
-        self.keeper_log = Some(thread);
+        self.keeper
+            .get_or_insert_with(|| Box::new(KeeperAuthScope::default()))
+            .keeper_log = Some(thread);
         Ok(self)
     }
     pub fn spaces(&self) -> &BTreeMap<SpaceId, SpaceGrant> {
@@ -1017,7 +1084,7 @@ impl EngineAuthContext {
         let is_pinned_ability = resource
             .ability_package
             .as_ref()
-            .is_some_and(|id| self.readonly_abilities.contains(id));
+            .is_some_and(|id| self.readonly_abilities().contains(id));
         if matches!(self.kind, PrincipalKind::Keeper(_))
             && resource.class == DocClass::Skill
             && !is_pinned_ability
@@ -1028,7 +1095,7 @@ impl EngineAuthContext {
             .project_root
             .as_ref()
             .is_some_and(|root| !resource.ancestor_folders.contains(root))
-            && !is_pinned_ability
+            && !(is_pinned_ability && !self.readonly_abilities_in_project_only())
         {
             return Err(DomainError::ResourceNotFound);
         }
@@ -1069,7 +1136,7 @@ impl EngineAuthContext {
     ) -> DomainResult<()> {
         if self.chat_audience == Some(ChatAudience::Shared)
             || matches!(self.kind, PrincipalKind::Keeper(_))
-            || self.keeper_log.is_some()
+            || self.keeper_log().is_some()
         {
             return Err(DomainError::ResourceNotFound);
         }
@@ -1096,9 +1163,9 @@ impl EngineAuthContext {
         if kind == ChatThreadKind::KeeperLog && self.chat_audience == Some(ChatAudience::Shared) {
             return Err(DomainError::ResourceNotFound);
         }
-        if (matches!(self.kind, PrincipalKind::Keeper(_)) || self.keeper_log.is_some())
+        if (matches!(self.kind, PrincipalKind::Keeper(_)) || self.keeper_log().is_some())
             && (kind != ChatThreadKind::KeeperLog
-                || self.keeper_log.as_ref() != Some(thread)
+                || self.keeper_log() != Some(thread)
                 || self
                     .spaces
                     .get(&space.id)
@@ -1216,7 +1283,7 @@ impl EngineAuthContext {
             let is_pinned_ability = resource
                 .ability_package
                 .as_ref()
-                .is_some_and(|id| self.readonly_abilities.contains(id));
+                .is_some_and(|id| self.readonly_abilities().contains(id));
             if resource.space.lifecycle == SpaceLifecycle::Active
                 && (grant
                     .project_root

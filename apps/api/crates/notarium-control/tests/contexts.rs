@@ -414,7 +414,7 @@ async fn exercise_owner_context(
         ctx.auth().spaces()[&shared.space.id].clone(),
     )]
     .into();
-    let narrowed = ctx
+    let narrowed_unbound = ctx
         .auth()
         .for_agent_run(
             AgentRunId::from_bytes([50; 16]),
@@ -423,7 +423,18 @@ async fn exercise_owner_context(
             grants,
         )
         .unwrap();
-    let shared_ctx = AccountContext::new(narrowed, budget());
+    assert!(matches!(
+        service
+            .bootstrap_context(
+                AccountContext::new(narrowed_unbound.clone(), budget()),
+                id.clone(),
+                None,
+                ControlPageRequest::new(1, None).unwrap(),
+            )
+            .await,
+        Err(PortError::Domain(DomainError::ResourceNotFound))
+    ));
+    let shared_ctx = AccountContext::new(narrowed_unbound.with_chat_episode(id.clone()), budget());
     let (pinned, favorites, unavailable) = collect(service, &shared_ctx, &id).await;
     assert_eq!(pinned, vec![a.clone(), b.clone()]);
     assert_eq!(favorites, vec![d.clone()]);
@@ -1272,6 +1283,91 @@ fn exercise_hidden_bundle_and_order_isolation<'a>(
                 Err(PortError::Domain(DomainError::ResourceNotFound))
             ),
             "set_context_order on hidden Personal pinned note must fail ResourceNotFound, got {order_hidden_pin:?}"
+        );
+
+        // `list_context_sets` must revalidate Space membership on every read
+        // batch and confine project-pinned callers to sets attached to their project.
+        let shared_list_set = service
+            .put_context_set(
+                ctx.clone(),
+                AccountMutation {
+                    identity: identity(service, ctx, 58).await,
+                    input: PutContextSet {
+                        id: ContextSetId::from_bytes([66; 16]),
+                        home: shared.space.id.clone(),
+                        name: "Live membership check bundle".into(),
+                        notes: vec![leaked_shared_note.clone()],
+                        expected: None,
+                    },
+                },
+            )
+            .await
+            .unwrap()
+            .value;
+        let proj_c = FolderRef {
+            space_id: shared.space.id.clone(),
+            folder_id: FolderId::from_bytes([0x6B; 16]),
+        };
+        fixture.catalog.project_entries.lock().unwrap().insert(
+            (proj_c.space_id.clone(), proj_c.folder_id.clone()),
+            ProjectInfo {
+                folder: proj_c.clone(),
+                name: "Proj C".into(),
+                project_slug: "proj-c".into(),
+            },
+        );
+        attach(
+            service,
+            ctx,
+            ContextScope::Project(proj_c.clone()),
+            &shared_list_set,
+            59,
+        )
+        .await;
+        let pinned_c =
+            AccountContext::new(ctx.auth().restrict_to_project(&proj_c).unwrap(), budget());
+        let proj_sets = service
+            .list_context_sets(
+                pinned_c,
+                shared.space.id.clone(),
+                ControlPageRequest::new(10, None).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            proj_sets
+                .items
+                .iter()
+                .map(|s| s.id.clone())
+                .collect::<Vec<_>>(),
+            vec![shared_list_set.id]
+        );
+        let shared_rev_before_kick = scope_revision(service, ctx, scope).await;
+        service
+            .change_membership(
+                SpaceContext::new(ctx.auth().clone(), shared.history.clone(), budget()).unwrap(),
+                MembershipChange {
+                    command: CommandKey::from_bytes([60; 16]),
+                    member: other_id.clone(),
+                    role: None,
+                    expected: shared_rev_before_kick,
+                },
+            )
+            .await
+            .unwrap();
+        let revoked_sets = service
+            .list_context_sets(
+                other_editor,
+                shared.space.id.clone(),
+                ControlPageRequest::new(10, None).unwrap(),
+            )
+            .await;
+        assert!(
+            matches!(
+                revoked_sets,
+                Err(PortError::Domain(DomainError::ResourceNotFound))
+            ),
+            "list_context_sets must reject revoked member even with pre-revocation AccountContext, got {revoked_sets:?}"
         );
     })
 }

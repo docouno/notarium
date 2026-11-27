@@ -133,7 +133,7 @@ impl ControlService {
             fence.check()?;
             tx.hold_revocation_fence(fence);
         }
-        budget.run_commit(tx.commit()).await
+        budget.commit_tx(tx).await
     }
     pub(super) async fn flush_event(
         &self,
@@ -171,7 +171,15 @@ impl ControlService {
         let has_more = rows.len() > usize::from(limit);
         let mut delivered = 0;
         for event in rows.into_iter().take(usize::from(limit)) {
-            self.deliver_revocation(&budget, event).await?;
+            self.deliver_revocation(&budget, event)
+                .await
+                .map_err(|err| {
+                    if delivered > 0 {
+                        unknown_after_revocation(err, "control revocation drain")
+                    } else {
+                        err
+                    }
+                })?;
             delivered += 1;
         }
         Ok(RevocationDrain {
@@ -198,7 +206,7 @@ impl ControlService {
             "UPDATE revocation_events SET attempts=attempts+1 WHERE event_id=$1 AND delivered_at IS NULL",
             "UPDATE v1_control.revocation_events SET attempts=attempts+1 WHERE event_id=$1 AND delivered_at IS NULL"; &event.event_id)
         },CommitEffect::NotCommitted).await?;
-        budget.run_commit(tx.commit()).await?;
+        budget.commit_tx(tx).await?;
         if changed == 0 {
             return Ok(());
         }
@@ -216,12 +224,45 @@ impl ControlService {
             )
             .await
             .map_err(|_| unavailable("control revocation delivery", CommitEffect::Unknown))?;
-        let mut tx = self.store.write(budget.clone()).await?;
-        let now = self.clock.now_ms()?;
-        budget.run(async {execute!(tx.inner_mut(),
-            "UPDATE revocation_events SET delivered_at=$1 WHERE event_id=$2 AND delivered_at IS NULL",
-            "UPDATE v1_control.revocation_events SET delivered_at=$1 WHERE event_id=$2 AND delivered_at IS NULL"; now,&event.event_id)
-        },CommitEffect::NotCommitted).await?;
-        budget.run_commit(tx.commit()).await
+        async {
+            let mut tx = self.store.write(budget.clone()).await?;
+            let now = self.clock.now_ms()?;
+            budget.run(async {execute!(tx.inner_mut(),
+                "UPDATE revocation_events SET delivered_at=$1 WHERE event_id=$2 AND delivered_at IS NULL",
+                "UPDATE v1_control.revocation_events SET delivered_at=$1 WHERE event_id=$2 AND delivered_at IS NULL"; now,&event.event_id)
+            },CommitEffect::Unknown).await?;
+            budget.commit_tx(tx).await
+        }
+        .await
+        .map_err(|err| unknown_after_revocation(err, "control revocation mark delivered"))
+    }
+}
+
+fn unknown_after_revocation(error: PortError, label: &'static str) -> PortError {
+    let make = || {
+        notarium_core::error::OperationalFailure::new(
+            notarium_core::ids::ContentDigest::from_bytes(
+                *blake3::hash(label.as_bytes()).as_bytes(),
+            ),
+            CommitEffect::Unknown,
+            notarium_core::error::RetryAdvice::Never,
+            false,
+        )
+        .expect("non-retryable failure")
+    };
+    match error {
+        PortError::Cancelled(f) if f.effect() == CommitEffect::Unknown => PortError::Cancelled(f),
+        PortError::DeadlineExceeded(f) if f.effect() == CommitEffect::Unknown => {
+            PortError::DeadlineExceeded(f)
+        }
+        PortError::Unavailable(f) if f.effect() == CommitEffect::Unknown => {
+            PortError::Unavailable(f)
+        }
+        PortError::Internal(f) if f.effect() == CommitEffect::Unknown => PortError::Internal(f),
+        PortError::Cancelled(_) => PortError::Cancelled(make()),
+        PortError::DeadlineExceeded(_) => PortError::DeadlineExceeded(make()),
+        PortError::Unavailable(_) => PortError::Unavailable(make()),
+        PortError::Internal(_) => PortError::Internal(make()),
+        PortError::Domain(_) => unavailable(label, CommitEffect::Unknown),
     }
 }

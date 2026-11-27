@@ -484,7 +484,9 @@ impl ToolRegistry {
                 let draft =
                     box_tool(|| proposals::prepare(&mut call, binding, &ctx.request_key, args))
                         .await?;
-                return McpToolResult::proposed(tool, draft, call.take_provenance());
+                let proposed = McpToolResult::proposed(tool, draft, call.clone_provenance())?;
+                let _ = call.take_provenance();
+                return Ok(proposed);
             }
             if tool.writes() {
                 if call.auth.taint().is_tainted() {
@@ -538,7 +540,9 @@ impl ToolRegistry {
                     box_tool(|| organize::handle(&mut call, tool, args)).await?
                 }
             };
-            McpToolResult::new(tool, payload, display, call.take_provenance())
+            let output = McpToolResult::new(tool, payload, display, call.clone_provenance())?;
+            let _ = call.take_provenance();
+            Ok(output)
         }
         .await;
         if result.is_ok() && call.auth.taint().is_tainted() {
@@ -923,6 +927,13 @@ impl<'a> ToolCallContext<'a> {
             .unwrap_or_else(|err| err.into_inner());
         guard.origins.truncate(checkpoint.0);
         guard.projects.truncate(checkpoint.1);
+    }
+
+    fn clone_provenance(&self) -> ChatProvenance {
+        self.provenance
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone()
     }
 
     fn record_origin(

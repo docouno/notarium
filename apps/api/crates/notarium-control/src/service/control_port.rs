@@ -339,6 +339,17 @@ impl ControlPort for ControlPlane {
     ) -> PortFuture<'_, ProviderSelection> {
         Box::pin(self.provider.select_provider(ctx, request))
     }
+    fn list_provider_project_targets(
+        &self,
+        ctx: SpaceContext,
+        resource: ProviderResourceId,
+        page: ControlPageRequest,
+    ) -> PortFuture<'_, ControlPage<FolderRef>> {
+        Box::pin(
+            self.provider
+                .list_provider_project_targets(ctx, resource, page),
+        )
+    }
     fn update_provider_preference(
         &self,
         ctx: AccountContext,

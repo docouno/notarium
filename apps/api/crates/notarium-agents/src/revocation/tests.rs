@@ -515,3 +515,84 @@ async fn stop_and_drain_run_respects_caller_cancellation_and_zero_budget_without
     assert!(run_cancel.is_cancelled());
     drop(running);
 }
+
+#[tokio::test]
+async fn thread_stream_pause_discards_unread_frames_and_pending_submitters_refcount() {
+    use crate::chats::stream::{StepStreamBuffer, StreamRead};
+    use notarium_core::ids::{ChatThreadId, HistoryIncarnation, PendingInputId, ThreadEntrySeq};
+    use notarium_core::model::HistoryScope;
+
+    let hub = RevocationHub::new_local();
+    let space = SpaceId::from_bytes([0x51; 16]);
+    let scope = HistoryScope {
+        space_id: space.clone(),
+        incarnation: HistoryIncarnation::from_bytes([0x52; 16]),
+    };
+    let thread = ChatThreadId::from_bytes([0x53; 16]);
+    let run = AgentRunId::from_bytes([0x54; 16]);
+
+    let buffer = Arc::new(StepStreamBuffer::new(
+        run,
+        thread.clone(),
+        ThreadEntrySeq::ZERO,
+    ));
+    hub.register_thread_stream(scope.clone(), thread.clone(), Arc::downgrade(&buffer));
+    let mut sub = buffer.subscribe(None);
+    buffer.begin_step(1).unwrap();
+    buffer.text_delta(1, "secret before redaction").unwrap();
+    // Pause via the shared RevocationHub (simulating redaction on another supervisor).
+    hub.pause_thread_streams(&scope, &thread);
+    match sub.next().await {
+        StreamRead::CatchUpRequired(_) => {}
+        StreamRead::Frame(_) => {
+            panic!("unread pre-redaction frame must be discarded")
+        }
+        StreamRead::Closed => panic!("expected CatchUpRequired, not Closed"),
+    }
+
+    // Ref-counted pending credentials survive rollback of one duplicate submitter.
+    let key = PendingCredentialKey {
+        scope: scope.clone(),
+        thread,
+        input: PendingInputId::from_bytes([0x55; 16]),
+    };
+    let auth = caller(
+        0x56,
+        &space,
+        AuthenticatedCredential::Session(AuthSessionId::from_bytes([0x57; 16])),
+    );
+    let idemp = CommandIdentity {
+        scope,
+        actor: auth.principal().clone(),
+        key: CommandKey::from_bytes([0x58; 16]),
+        hash: ContentDigest::from_bytes([0x58; 32]),
+    };
+    let reg_a = hub
+        .register_pending(
+            context(1),
+            key.clone(),
+            auth.clone(),
+            &idemp,
+            crate::chats::ChatRunOptions::default(),
+        )
+        .unwrap();
+    let reg_b = hub
+        .register_pending(
+            context(2),
+            key.clone(),
+            auth,
+            &idemp,
+            crate::chats::ChatRunOptions::default(),
+        )
+        .unwrap();
+    hub.rollback_pending(reg_a);
+    assert!(
+        hub.pending(&key).is_some(),
+        "rolling back one duplicate submitter must not erase the surviving submitter's pending credential"
+    );
+    hub.rollback_pending(reg_b);
+    assert!(
+        hub.pending(&key).is_none(),
+        "rolling back the final submitter must clear the pending credential"
+    );
+}

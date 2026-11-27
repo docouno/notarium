@@ -220,7 +220,7 @@ impl ControlService {
             let episode_row = if let AckOwner::Episode(id) = &request.input.owner {
                 let owner_row = user_read(tx.inner_mut(), auth.principal().as_str()).await?;
                 let row = episode(tx.inner_mut(), auth.principal(), id).await?;
-                if !super::episode_project_admitted(
+                if !super::episode_visible_to_narrowed(
                     &auth,
                     owner_row.personal_space_id.as_deref(),
                     super::stored_project_ref(&row)?.as_ref(),
@@ -273,7 +273,7 @@ impl ControlService {
             command.save(tx.inner_mut(), revision, &saved, now).await?;
             Ok((revision, saved))
         }, CommitEffect::NotCommitted).await?;
-        budget.run_commit(tx.commit()).await?;
+        budget.commit_tx(tx).await?;
         Ok(ControlCommit {
             revision,
             value: AcknowledgedCursor {
@@ -491,7 +491,7 @@ impl ControlService {
                 CommitEffect::NotCommitted,
             )
             .await?;
-        budget.run_commit(tx.commit()).await?;
+        budget.commit_tx(tx).await?;
         Ok(hit)
     }
 }

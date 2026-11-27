@@ -63,13 +63,17 @@ pub(super) async fn recent(
                 allowed_classes: None,
             };
             if !external {
-                let selection = match call
-                    .provider_selection(&read_scope, target.project.clone())
-                    .await
-                {
-                    Ok(selection) => selection,
-                    Err(error) if corpus::hidden(&error) => continue,
-                    Err(error) => return Err(error),
+                let selection = if let Some(cached) = &target.provider_selection {
+                    Some(cached.clone())
+                } else {
+                    match call
+                        .provider_selection(&read_scope, target.project.clone())
+                        .await
+                    {
+                        Ok(selection) => selection,
+                        Err(error) if corpus::hidden(&error) => continue,
+                        Err(error) => return Err(error),
+                    }
                 };
                 if let Some(sel) = selection {
                     if let Some(required) = sel.project_only {

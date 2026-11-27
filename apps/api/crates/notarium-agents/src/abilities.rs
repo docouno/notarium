@@ -90,7 +90,10 @@ fn get_builtin(
 
 fn visible(ctx: &AccountContext, builtin: &Builtin) -> bool {
     match ctx.auth().kind() {
-        PrincipalKind::Keeper(_) => ctx.auth().readonly_abilities().contains(&builtin.id()),
+        PrincipalKind::Keeper(_) => ctx
+            .auth()
+            .readonly_system_abilities()
+            .contains(&builtin.id()),
         _ => true,
     }
 }

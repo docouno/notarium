@@ -1101,6 +1101,13 @@ fn forbid_keeper_chat_mutation(auth: &EngineAuthContext) -> Result<(), PortError
     Ok(())
 }
 
+fn forbid_agent_run_chat_mutation(auth: &EngineAuthContext) -> Result<(), PortError> {
+    if matches!(auth.kind(), PrincipalKind::AgentRun(_)) {
+        return Err(DomainError::SpaceReadOnly.into());
+    }
+    Ok(())
+}
+
 /// Change listings have no selected leaf, so use the live thread audit state.
 pub(crate) async fn can_view_live_thread_tx(
     tx: &mut BackendConn<'_>,
@@ -3143,6 +3150,7 @@ async fn create_chat_impl(
         })
         .await?;
     space_rec.scope.check(ctx.scope())?;
+    forbid_agent_run_chat_mutation(ctx.auth())?;
     forbid_project_agent_run(ctx.auth(), &space_rec.space)?;
 
     let mut fp = blake3::Hasher::new();
@@ -3181,6 +3189,7 @@ async fn create_chat_impl(
             Box::pin(async move {
                 let live_space = load_space_record(tx, &scope.space_id).await?;
                 authorize_chat_write_on_space(&auth, &live_space.space)?;
+                forbid_agent_run_chat_mutation(&auth)?;
                 forbid_project_agent_run(&auth, &live_space.space)?;
 
                 let tainted = auth.taint().is_tainted();
@@ -3399,6 +3408,7 @@ async fn fork_chat_impl(
         })
         .await?;
     space_rec.scope.check(ctx.scope())?;
+    forbid_agent_run_chat_mutation(ctx.auth())?;
     forbid_project_agent_run(ctx.auth(), &space_rec.space)?;
 
     let fp = format!(
@@ -3431,6 +3441,7 @@ async fn fork_chat_impl(
             Box::pin(async move {
                 let live_space = load_space_record(tx, &scope.space_id).await?;
                 authorize_chat_write_on_space(&auth, &live_space.space)?;
+                forbid_agent_run_chat_mutation(&auth)?;
                 forbid_project_agent_run(&auth, &live_space.space)?;
 
                 let th = load_thread_head_tx(tx, &scope.space_id, &input.thread).await?;
@@ -4478,6 +4489,7 @@ async fn queue_chat_input_impl(
         })
         .await?;
     space_rec.scope.check(ctx.scope())?;
+    forbid_agent_run_chat_mutation(ctx.auth())?;
     forbid_project_agent_run(ctx.auth(), &space_rec.space)?;
 
     let mut fp = blake3::Hasher::new();
@@ -5485,6 +5497,7 @@ async fn redact_chat_entry_impl(
         })
         .await?;
     space_rec.scope.check(ctx.scope())?;
+    forbid_agent_run_chat_mutation(ctx.auth())?;
     forbid_project_agent_run(ctx.auth(), &space_rec.space)?;
 
     let fp = format!(
@@ -5557,6 +5570,7 @@ async fn redact_chat_entry_impl(
             Box::pin(async move {
                 let live_space = load_space_record(tx, &scope.space_id).await?;
                 authorize_chat_write_on_space(&auth, &live_space.space)?;
+                forbid_agent_run_chat_mutation(&auth)?;
                 forbid_project_agent_run(&auth, &live_space.space)?;
 
                 let th = load_thread_head_tx(tx, &scope.space_id, &input.thread).await?;
