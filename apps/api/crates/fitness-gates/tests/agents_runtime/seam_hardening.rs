@@ -30257,6 +30257,148 @@ async fn verify_part_k_provenance_link_isolation_and_failover(
         json!(nested_note_id),
         "list_notes must return the folder page inside alias-new-2/alias-old-2: {listed_nested}"
     );
+
+    // Part 10: `recall` at MCP schema boundary `budgetTokens` (32000 and 200) with omitted `maxPerSource`
+    // must succeed cleanly.
+    fixture.projections.install(ProjectionFixture {
+        view_owner: NoteRef {
+            space_id: personal_history.space_id.clone(),
+            note_id: p1_note.clone(),
+        },
+        notes: vec![p1_note.clone()],
+    });
+    let pers_slug = fixture
+        .control
+        .list_spaces(owner.clone(), ControlPageRequest::new(50, None).unwrap())
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .find(|s| s.space.id == personal_history.space_id)
+        .unwrap()
+        .slug;
+    let pers_p1_handle = format!("{pers_slug}/kp-one");
+    for boundary_budget in [32_000u32, 200u32] {
+        let recalled = call_mcp(
+            &fixture.registry,
+            owner,
+            [
+                0xD9,
+                if boundary_budget == 200 { 46 } else { 47 },
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                1,
+            ],
+            "recall",
+            json!({
+                "project": pers_p1_handle,
+                "query": "Inside Nested Old",
+                "budgetTokens": boundary_budget,
+            }),
+        )
+        .await
+        .expect("recall at boundary budgetTokens with default maxPerSource must succeed")
+        .structured_content;
+        assert!(
+            recalled.get("sources").is_some(),
+            "recall at budgetTokens={boundary_budget} must return structured sources: {recalled}"
+        );
+    }
+
+    // Part 11: `start_session` with a `deliveryReceipt` targeting an `Ambiguous` named session
+    // must return `recentSessions` WITHOUT advancing the account delivery cursor.
+    let ambig_a = call_mcp(
+        &fixture.registry,
+        owner,
+        [0xD9, 48, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "start_session",
+        json!({ "task": "ambig-ack-check" }),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    let ambig_id_a = EpisodeId::parse(ambig_a["session"]["id"].as_str().unwrap()).unwrap();
+    // Fork via named start_session while active so two open episodes share "ambig-ack-check".
+    let _ambig_b = call_mcp(
+        &fixture.registry,
+        owner,
+        [0xD9, 49, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "start_session",
+        json!({ "session": { "name": "ambig-ack-check" } }),
+    )
+    .await
+    .unwrap();
+    let _ = ambig_id_a;
+    // Start a third session to obtain a fresh unacknowledged deliveryReceipt.
+    let fresh_start = call_mcp(
+        &fixture.registry,
+        owner,
+        [0xD9, 50, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "start_session",
+        json!({ "task": "ambig-ack-source" }),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    if let Some(receipt) = fresh_start["delta"]["deliveryReceipt"].as_str() {
+        let fresh_ep_id = EpisodeId::parse(fresh_start["session"]["id"].as_str().unwrap()).unwrap();
+        let before_acks = fixture
+            .control
+            .bootstrap_context(
+                owner.clone(),
+                fresh_ep_id.clone(),
+                None,
+                ControlPageRequest::new(10, None).unwrap(),
+            )
+            .await
+            .unwrap()
+            .owner_acknowledgements;
+        let ambig_res = call_mcp(
+            &fixture.registry,
+            owner,
+            [0xD9, 51, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+            "start_session",
+            json!({
+                "session": { "name": "ambig-ack-check" },
+                "deliveryReceipt": receipt,
+                "acknowledge": true,
+            }),
+        )
+        .await
+        .unwrap()
+        .structured_content;
+        assert!(
+            ambig_res["recentSessions"]
+                .as_array()
+                .is_some_and(|arr| arr.len() >= 2),
+            "expected Ambiguous recentSessions, got {ambig_res}"
+        );
+        let after_boot = fixture
+            .control
+            .bootstrap_context(
+                owner.clone(),
+                fresh_ep_id,
+                None,
+                ControlPageRequest::new(10, None).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            after_boot.owner_acknowledgements, before_acks,
+            "Ambiguous start_session must not advance owner delta acknowledgements"
+        );
+    }
     let _ = pers_root;
 }
 

@@ -3,8 +3,8 @@ use super::*;
 const MAX_BOOTSTRAP_SCOPE_ROWS: usize = 4096;
 const MAX_BOOTSTRAP_SCOPE_ITEMS: usize = 8192;
 
-pub(crate) const BOOTSTRAP_SCOPE_PINS_SQLITE_SQL: &str = "SELECT coalesce(o.rank,0) AS rank, p.note_space, p.note_id FROM context_scope_pins p LEFT JOIN context_order o ON o.target_kind=p.target_kind AND o.target_id=p.target_id AND o.entry_kind='note' AND o.entry_ref=('{\"space_id\":\"' || p.note_space || '\",\"note_id\":\"' || p.note_id || '\"}') WHERE p.target_kind=$1 AND p.target_id=$2 LIMIT 4097";
-pub(crate) const BOOTSTRAP_SCOPE_SETS_SQLITE_SQL: &str = "SELECT coalesce(o.rank,0) AS rank, a.target_space, s.set_id, s.owner_id, s.home_space, s.name, s.note_refs, s.revision FROM context_set_attachments a JOIN context_sets s ON s.set_id=a.set_id LEFT JOIN context_order o ON o.target_kind=a.target_kind AND o.target_id=a.target_id AND o.entry_kind='set' AND o.entry_ref=a.set_id WHERE a.target_kind=$1 AND a.target_id=$2 LIMIT 4097";
+pub(crate) const BOOTSTRAP_SCOPE_PINS_SQLITE_SQL: &str = "SELECT coalesce(o.rank,0) AS rank, p.note_space, p.note_id FROM context_scope_pins p INDEXED BY context_pin_target LEFT JOIN context_order o ON o.target_kind=p.target_kind AND o.target_id=p.target_id AND o.entry_kind='note' AND o.entry_ref=('{\"space_id\":\"' || p.note_space || '\",\"note_id\":\"' || p.note_id || '\"}') WHERE p.target_kind=$1 AND p.target_id=$2 LIMIT 4097";
+pub(crate) const BOOTSTRAP_SCOPE_SETS_SQLITE_SQL: &str = "SELECT coalesce(o.rank,0) AS rank, a.target_space, s.set_id, s.owner_id, s.home_space, s.name, s.note_refs, s.revision FROM context_set_attachments a INDEXED BY context_attachment_target CROSS JOIN context_sets s LEFT JOIN context_order o ON o.target_kind=a.target_kind AND o.target_id=a.target_id AND o.entry_kind='set' AND o.entry_ref=a.set_id WHERE s.set_id=a.set_id AND a.target_kind=$1 AND a.target_id=$2 LIMIT 4097";
 pub(crate) const BOOTSTRAP_FAVORITES_FIRST_SQLITE_SQL: &str = "SELECT rank, space_id, entity_id FROM favorites WHERE owner_id=$1 AND entity_kind='note' ORDER BY rank,space_id,entity_id LIMIT $2";
 pub(crate) const BOOTSTRAP_FAVORITES_AFTER_SQLITE_SQL: &str = "SELECT rank, space_id, entity_id FROM favorites WHERE owner_id=$1 AND entity_kind='note' AND (rank,space_id,entity_id)>($2,$3,$4) ORDER BY rank,space_id,entity_id LIMIT $5";
 
@@ -596,6 +596,11 @@ impl ControlService {
         let mut has_more = false;
         let mut scanned = 0usize;
         loop {
+            let fetch_limit = batch_limit.min(
+                i64::try_from((MAX_SCAN + 1).saturating_sub(scanned))
+                    .unwrap_or(1)
+                    .max(1),
+            );
             let mut ftx = self.store.read(budget.clone()).await?;
             let batch_res = budget
                 .run(
@@ -608,7 +613,7 @@ impl ControlService {
                                 BOOTSTRAP_FAVORITES_FIRST_SQLITE_SQL,
                                 "SELECT rank, space_id, entity_id FROM v1_control.favorites WHERE owner_id=$1 AND entity_kind='note' ORDER BY rank,space_id,entity_id LIMIT $2";
                                 owner_id,
-                                batch_limit
+                                fetch_limit
                             )?,
                             Some(prev) => rows!(
                                 ftx.inner_mut(),
@@ -620,7 +625,7 @@ impl ControlService {
                                 prev.rank,
                                 prev.space.as_str(),
                                 prev.note.as_str(),
-                                batch_limit
+                                fetch_limit
                             )?,
                         };
                         Ok::<_, PortError>(favs)
@@ -696,14 +701,8 @@ impl ControlService {
                     CommitEffect::NotCommitted,
                 )
                 .await?;
-            if scanned > MAX_SCAN {
-                return Err(invalid(ValidationReason::BudgetExceeded));
-            }
-            if has_more || batch_len < usize::try_from(batch_limit).unwrap_or(usize::MAX) {
+            if has_more || batch_len < usize::try_from(fetch_limit).unwrap_or(usize::MAX) {
                 break;
-            }
-            if scanned >= MAX_SCAN {
-                return Err(invalid(ValidationReason::BudgetExceeded));
             }
         }
         Ok((favorites, unavailable, has_more, last_fav_cursor))
@@ -785,6 +784,11 @@ impl ControlService {
         let mut scanned = 0usize;
         let mut set_space_cache: BTreeMap<SpaceId, Option<SpaceKind>> = BTreeMap::new();
         loop {
+            let fetch_limit = batch_limit.min(
+                i64::try_from((MAX_SCAN + 1).saturating_sub(scanned))
+                    .unwrap_or(1)
+                    .max(1),
+            );
             let mut tx = self.store.read(budget.clone()).await?;
             let batch_result = budget
                 .run(
@@ -798,7 +802,7 @@ impl ControlService {
                                     .bind(&after.kind)
                                     .bind(&after.space)
                                     .bind(&after.entity)
-                                    .bind(batch_limit)
+                                    .bind(fetch_limit)
                                     .fetch_all(&mut **tx)
                                     .await
                                     .map_err(crate::error::database_not_committed)?
@@ -811,7 +815,7 @@ impl ControlService {
                                     .bind(&after.kind)
                                     .bind(&after.space)
                                     .bind(&after.entity)
-                                    .bind(batch_limit)
+                                    .bind(fetch_limit)
                                     .fetch_all(&mut **tx)
                                     .await
                                     .map_err(crate::error::database_not_committed)?
@@ -824,8 +828,8 @@ impl ControlService {
                             entity: after.entity.clone(),
                             rank: after.rank,
                         };
-                        let mut candidates: Vec<(EntryRow, Option<(SpaceId, String)>)> =
-                            Vec::with_capacity(batch_len);
+                        let mut candidates = Vec::with_capacity(batch_len);
+                        let mut skipped_since_last = 0usize;
                         for qrow in batch {
                             let row = EntryRow {
                                 kind: qrow.kind,
@@ -844,9 +848,11 @@ impl ControlService {
                                     let _set_id = ContextSetId::parse(&row.entity)?;
                                     let home = SpaceId::parse(&qrow.set_home)?;
                                     let Some(grant) = current.auth().spaces().get(&home) else {
+                                        skipped_since_last += 1;
                                         continue;
                                     };
                                     if grant.read_classes.is_empty() {
+                                        skipped_since_last += 1;
                                         continue;
                                     }
                                     if let Some(root) = &grant.project_root {
@@ -877,12 +883,20 @@ impl ControlService {
                                                 .await
                                             {
                                                 Ok(()) => {}
-                                                Err(error) if hidden(&error) => continue,
+                                                Err(error) if hidden(&error) => {
+                                                    skipped_since_last += 1;
+                                                    continue;
+                                                }
                                                 Err(error) => return Err(error),
                                             }
                                         }
                                     }
-                                    candidates.push((row, Some((home, qrow.set_owner))));
+                                    candidates.push((
+                                        skipped_since_last,
+                                        row,
+                                        Some((home, qrow.set_owner)),
+                                    ));
+                                    skipped_since_last = 0;
                                 }
                                 "note" => {
                                     let space_id = SpaceId::parse(&row.space)?;
@@ -892,13 +906,16 @@ impl ControlService {
                                         .get(&space_id)
                                         .is_some_and(|grant| !grant.read_classes.is_empty())
                                     {
-                                        candidates.push((row, None));
+                                        candidates.push((skipped_since_last, row, None));
+                                        skipped_since_last = 0;
+                                    } else {
+                                        skipped_since_last += 1;
                                     }
                                 }
                                 _ => return Err(invalid(ValidationReason::InvalidState)),
                             }
                         }
-                        Ok::<_, PortError>((batch_len, next_after, candidates))
+                        Ok::<_, PortError>((batch_len, next_after, candidates, skipped_since_last))
                     },
                     CommitEffect::NotCommitted,
                 )
@@ -906,10 +923,13 @@ impl ControlService {
             budget
                 .run(tx.rollback(), CommitEffect::NotCommitted)
                 .await?;
-            let (batch_len, next_after, candidates) = batch_result?;
-            scanned = scanned.saturating_add(batch_len);
+            let (batch_len, next_after, candidates, trailing_skipped) = batch_result?;
             after = next_after;
-            for (row, set_home) in candidates {
+            for (skipped_before, row, set_home) in candidates {
+                scanned = scanned.saturating_add(skipped_before).saturating_add(1);
+                if scanned > MAX_SCAN {
+                    return Err(invalid(ValidationReason::BudgetExceeded));
+                }
                 let entry = match row.kind.as_str() {
                     "set" => {
                         let Some((home_space, set_owner)) = set_home else {
@@ -976,14 +996,14 @@ impl ControlService {
                 items.push(ContextEntryInfo { entry, rank });
                 last_visible = Some(row);
             }
-            if scanned > MAX_SCAN {
-                return Err(invalid(ValidationReason::BudgetExceeded));
+            if !has_more {
+                scanned = scanned.saturating_add(trailing_skipped);
+                if scanned > MAX_SCAN {
+                    return Err(invalid(ValidationReason::BudgetExceeded));
+                }
             }
-            if has_more || batch_len < usize::try_from(batch_limit).unwrap_or(usize::MAX) {
+            if has_more || batch_len < usize::try_from(fetch_limit).unwrap_or(usize::MAX) {
                 break;
-            }
-            if scanned >= MAX_SCAN {
-                return Err(invalid(ValidationReason::BudgetExceeded));
             }
         }
         let continuation = if has_more {

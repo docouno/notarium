@@ -2597,6 +2597,52 @@ async fn use_ability(
     if selector.starts_with("ar1:") {
         let _: AbilityRef = parse_token(&selector, "ar1:", MAX_TOKEN_BYTES)?;
     }
+    if kind == AbilityKind::Role
+        && args.session.is_some()
+        && !matches!(
+            call.auth.kind(),
+            PrincipalKind::AgentRun(_) | PrincipalKind::Keeper(_)
+        )
+        && call.auth.chat_audience() != Some(ChatAudience::Shared)
+        && call.auth.bearer_scope() != Some(BearerScope::Read)
+        && let Some(plan) = call
+            .lookup_journal::<EpisodeRolePlan>("activate-role")
+            .await?
+    {
+        const ROLE_LABEL: &str = "notarium.mcp.activate-role.v1";
+        replay_active_role_plan(call, &plan)
+            .await
+            .map_err(|error| super::note_tools::post_commit_error(ROLE_LABEL, error))?;
+        let descriptor = call
+            .registry
+            .control
+            .get_ability(
+                call.account(),
+                plan.active_role.clone(),
+                plan.project_hint.clone(),
+            )
+            .await
+            .map_err(|error| {
+                super::note_tools::post_commit_error(
+                    ROLE_LABEL,
+                    collapse_provider_error(call, error),
+                )
+            })?;
+        let (rendered, deferred_taints) = activation(
+            call,
+            &descriptor,
+            plan.project_hint.as_ref(),
+            args.budget_tokens.unwrap_or(DEFAULT_ACTIVATION_TOKENS),
+        )
+        .await
+        .map_err(|error| super::note_tools::post_commit_error(ROLE_LABEL, error))?;
+        for taint in deferred_taints {
+            taint
+                .commit()
+                .map_err(|error| super::note_tools::post_commit_error(ROLE_LABEL, error))?;
+        }
+        return Ok(rendered);
+    }
     let episode = load_episode(call, args.session.as_ref()).await?;
     let project =
         session::selected_project_for_episode(call, args.project.as_deref(), episode.as_ref())
@@ -2706,6 +2752,39 @@ pub(super) async fn activate_session_role(
     episode: &AgentEpisode,
     explicit: Option<&str>,
 ) -> Result<Option<Value>, PortError> {
+    if explicit.is_some()
+        && call.auth.bearer_scope() != Some(BearerScope::Read)
+        && let Some(plan) = call
+            .lookup_journal::<EpisodeRolePlan>("activate-role")
+            .await?
+    {
+        replay_active_role_plan(call, &plan).await?;
+        let descriptor = call
+            .registry
+            .control
+            .get_ability(
+                call.account(),
+                plan.active_role.clone(),
+                plan.project_hint.clone(),
+            )
+            .await
+            .map_err(|error| collapse_provider_error(call, error))?;
+        let body = read_body_inner(call, &descriptor, plan.project_hint.as_ref(), false)
+            .await
+            .map_err(|error| collapse_provider_error(call, error))?;
+        let budget = if body.instructions.len() <= MAX_ACTIVATION_TOKENS {
+            DEFAULT_ACTIVATION_TOKENS.max(body.instructions.len())
+        } else {
+            return Err(invalid(ValidationReason::BudgetExceeded));
+        };
+        let (rendered, deferred_taints) =
+            activation_with_body(call, &descriptor, plan.project_hint.as_ref(), body, budget)
+                .await?;
+        for taint in deferred_taints {
+            taint.commit()?;
+        }
+        return Ok(Some(rendered));
+    }
     let project = if explicit.is_some() {
         session::selected_project_for_episode(call, None, Some(episode)).await?
     } else {
@@ -2772,6 +2851,46 @@ struct EpisodeRolePlan {
     project_hint: Option<FolderRef>,
 }
 
+async fn replay_active_role_plan(
+    call: &ToolCallContext<'_>,
+    plan: &EpisodeRolePlan,
+) -> Result<(), PortError> {
+    if matches!(
+        call.auth.kind(),
+        PrincipalKind::AgentRun(_) | PrincipalKind::Keeper(_)
+    ) || call.auth.chat_audience() == Some(ChatAudience::Shared)
+        || call.auth.bearer_scope() == Some(BearerScope::Read)
+    {
+        return Err(DomainError::AccessDenied.into());
+    }
+    if call.auth.taint().is_tainted() {
+        return Err(DomainError::CrossSpaceTainted.into());
+    }
+    call.registry
+        .control
+        .update_episode(
+            call.account(),
+            AccountMutation {
+                identity: call.account_identity(plan.account_revision, "activate-role-effect", 0),
+                input: EpisodeMutation::BindRole(BindEpisodeRole {
+                    episode: plan.episode.clone(),
+                    expected: plan.expected,
+                    active_role: plan.active_role.clone(),
+                    project_hint: plan.project_hint.clone(),
+                }),
+            },
+        )
+        .await
+        .map_err(|error| {
+            super::note_tools::batch_operational_error(
+                "notarium.mcp.activate-role.v1",
+                error,
+                false,
+            )
+        })?;
+    Ok(())
+}
+
 async fn save_active_role(
     call: &ToolCallContext<'_>,
     episode: &AgentEpisode,
@@ -2788,6 +2907,12 @@ async fn save_active_role(
     }
     if call.auth.taint().is_tainted() {
         return Err(DomainError::CrossSpaceTainted.into());
+    }
+    if let Some(plan) = call
+        .lookup_journal::<EpisodeRolePlan>("activate-role")
+        .await?
+    {
+        return replay_active_role_plan(call, &plan).await;
     }
     if episode.lifecycle == notarium_core::ports::EpisodeLifecycle::Closed {
         return Err(invalid(ValidationReason::InvalidState));
@@ -2809,29 +2934,7 @@ async fn save_active_role(
     if plan.episode != episode.id || &plan.active_role != role || plan.project_hint != project {
         return Err(invalid(ValidationReason::SourceMismatch));
     }
-    call.registry
-        .control
-        .update_episode(
-            call.account(),
-            AccountMutation {
-                identity: call.account_identity(plan.account_revision, "activate-role-effect", 0),
-                input: EpisodeMutation::BindRole(BindEpisodeRole {
-                    episode: plan.episode,
-                    expected: plan.expected,
-                    active_role: plan.active_role,
-                    project_hint: plan.project_hint,
-                }),
-            },
-        )
-        .await
-        .map_err(|error| {
-            super::note_tools::batch_operational_error(
-                "notarium.mcp.activate-role.v1",
-                error,
-                false,
-            )
-        })?;
-    Ok(())
+    replay_active_role_plan(call, &plan).await
 }
 
 async fn activation(

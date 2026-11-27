@@ -517,7 +517,6 @@ async fn start(call: &mut ToolCallContext<'_>, args: StartArgs) -> Result<Value,
         None
     };
     let mut preflight_plan: Option<StartPlan> = None;
-    let mut committed_any = existing_plan.is_some();
     if let Some(sel) = &validated_selector {
         if existing_plan.is_none() {
             // Validate all session-start preconditions (delivery ticket, project,
@@ -652,17 +651,10 @@ async fn start(call: &mut ToolCallContext<'_>, args: StartArgs) -> Result<Value,
             });
         }
     } else if let Some(receipt) = args.delivery_receipt.as_deref() {
-        let acknowledged = delta::deliver(call, receipt, args.acknowledge).await?;
+        let acknowledged = delta::deliver_journaled(call, receipt, args.acknowledge).await?;
         return Ok(json!({ "acknowledged": acknowledged }));
     }
     const SESSION_LABEL: &str = "notarium.mcp.start-session.v1";
-    let map_session_err = |committed: bool, error: PortError| {
-        if committed {
-            super::note_tools::post_commit_error(SESSION_LABEL, error)
-        } else {
-            super::note_tools::batch_operational_error(SESSION_LABEL, error, false)
-        }
-    };
     let selector = validated_selector.expect("selector validated when starting session");
     let plan: StartPlan = match existing_plan {
         Some(plan) => plan,
@@ -670,15 +662,11 @@ async fn start(call: &mut ToolCallContext<'_>, args: StartArgs) -> Result<Value,
             let prepared = preflight_plan.expect("preflight_plan built when not yet journaled");
             call.journal("start-episode", || async move { Ok(prepared) })
                 .await
-                .map_err(|error| map_session_err(committed_any, error))?
+                .map_err(|error| {
+                    super::note_tools::batch_operational_error(SESSION_LABEL, error, false)
+                })?
         }
     };
-    if let Some(pending) = &plan.pending_ack {
-        delta::acknowledge_prepared(call, pending)
-            .await
-            .map_err(|error| map_session_err(committed_any, error))?;
-        committed_any = true;
-    }
     let selector = match selector {
         EpisodeSelector::New { name, .. } => EpisodeSelector::New {
             name,
@@ -701,7 +689,7 @@ async fn start(call: &mut ToolCallContext<'_>, args: StartArgs) -> Result<Value,
             },
         )
         .await
-        .map_err(|error| map_session_err(committed_any, error))?;
+        .map_err(|error| super::note_tools::batch_operational_error(SESSION_LABEL, error, false))?;
     let (episode, state) = match opened.value {
         EpisodeStartResult::New(episode) => (episode, "new"),
         EpisodeStartResult::Resumed(episode) => (episode, "resumed"),
@@ -715,7 +703,10 @@ async fn start(call: &mut ToolCallContext<'_>, args: StartArgs) -> Result<Value,
         }
     };
     async {
-        check_requested_project(plan.project.as_ref(), &episode)?;
+        if let Some(pending) = &plan.pending_ack {
+            delta::acknowledge_prepared(call, pending).await?;
+        }
+        check_committed_project(plan.project.as_ref(), &episode)?;
         if let Some(project) = &episode.project_hint {
             project_for_folder(call, project).await?;
         }
@@ -882,6 +873,21 @@ fn check_requested_project(
         return Err(invalid(ValidationReason::ScopeMismatch));
     }
     Ok(())
+}
+
+fn check_committed_project(
+    project: Option<&FolderRef>,
+    episode: &AgentEpisode,
+) -> Result<(), PortError> {
+    if project.is_some()
+        && episode.project_hint.is_none()
+        && episode
+            .diagnostics
+            .contains(&EpisodeDiagnostic::ProjectUnavailable)
+    {
+        return Ok(());
+    }
+    check_requested_project(project, episode)
 }
 
 async fn project_bundle(

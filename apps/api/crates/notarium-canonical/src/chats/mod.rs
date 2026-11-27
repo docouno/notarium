@@ -2900,15 +2900,15 @@ fn read_chat_rusqlite(
                          UNION ALL
                          SELECT e.entry_seq, e.branch_depth, e.parent_seq, e.anc_16_seq, e.anc_256_seq, j.hops + 1
                          FROM jump j
-                         JOIN chat_entries e
-                           ON e.space_id = ?1
-                          AND e.thread_id = ?2
-                          AND e.entry_seq = CASE
-                              WHEN j.branch_depth - ?4 >= 256 AND j.anc_256_seq IS NOT NULL THEN j.anc_256_seq
-                              WHEN j.branch_depth - ?4 >= 16 AND j.anc_16_seq IS NOT NULL THEN j.anc_16_seq
-                              ELSE j.parent_seq
-                          END
-                         WHERE j.branch_depth > ?4 AND j.hops < 100000
+                         CROSS JOIN chat_entries e
+                         WHERE e.space_id = ?1
+                           AND e.thread_id = ?2
+                           AND e.entry_seq = CASE
+                               WHEN j.branch_depth - ?4 >= 256 AND j.anc_256_seq IS NOT NULL THEN j.anc_256_seq
+                               WHEN j.branch_depth - ?4 >= 16 AND j.anc_16_seq IS NOT NULL THEN j.anc_16_seq
+                               ELSE j.parent_seq
+                           END
+                           AND j.branch_depth > ?4 AND j.hops < 100000
                      )
                      SELECT entry_seq FROM jump WHERE branch_depth = ?4 LIMIT 1",
                 )
@@ -2962,9 +2962,9 @@ fn read_chat_rusqlite(
                         e.agent_run_id, e.inline_text, e.payload_blake3, e.referenced_notes_json,
                         e.ext_space_tainted, e.is_chain_node, e.branch_depth, e.anc_16_seq, e.anc_256_seq, w.n + 1
                  FROM win w
-                 JOIN chat_entries e
-                   ON e.space_id = ?1 AND e.thread_id = ?2 AND e.entry_seq = w.parent_seq
-                 WHERE w.parent_seq IS NOT NULL AND w.n < ?4
+                 CROSS JOIN chat_entries e
+                 WHERE e.space_id = ?1 AND e.thread_id = ?2 AND e.entry_seq = w.parent_seq
+                   AND w.parent_seq IS NOT NULL AND w.n < ?4
              )
              SELECT entry_seq, parent_seq, kind, tool_call_id, author_id,
                     agent_run_id, inline_text, payload_blake3, referenced_notes_json,
@@ -6049,8 +6049,8 @@ async fn mark_descendant_compactions_stale_tx(
                  UNION ALL
                  SELECT c.entry_seq, c.kind
                  FROM desc_tree d
-                 JOIN chat_entries c
-                   ON c.space_id = ? AND c.thread_id = ? AND c.parent_seq = d.entry_seq
+                 CROSS JOIN chat_entries c
+                 WHERE c.space_id = ? AND c.thread_id = ? AND c.parent_seq = d.entry_seq
              )
              SELECT entry_seq FROM desc_tree WHERE kind = 'compaction' ORDER BY entry_seq ASC",
         )
@@ -6070,8 +6070,8 @@ async fn mark_descendant_compactions_stale_tx(
                  UNION ALL
                  SELECT c.entry_seq, c.kind
                  FROM desc_tree d
-                 JOIN chat_entries c
-                   ON c.space_id = $1 AND c.thread_id = $2 AND c.parent_seq = d.entry_seq
+                 CROSS JOIN chat_entries c
+                 WHERE c.space_id = $1 AND c.thread_id = $2 AND c.parent_seq = d.entry_seq
              )
              SELECT entry_seq FROM desc_tree WHERE kind = 'compaction' ORDER BY entry_seq ASC",
         )

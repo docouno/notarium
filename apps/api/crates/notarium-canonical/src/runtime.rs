@@ -163,6 +163,7 @@ pub(crate) struct CanonicalInner {
     >,
     pub retirement_workers: crate::blobs::retirement_worker::RetirementWorkers,
     pub backup_cleanups: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    pub deferred_local_orphan_cleanups: std::sync::Mutex<Vec<(SpaceId, ContentDigest)>>,
     pub backup_cleanups_closed: AtomicBool,
     pub aux_workers: Arc<tokio::sync::RwLock<()>>,
     pub last_backup_memory_stats:
@@ -620,6 +621,7 @@ impl CanonicalRuntime {
             lease_recoveries: Default::default(),
             retirement_workers: Default::default(),
             backup_cleanups: std::sync::Mutex::new(Vec::new()),
+            deferred_local_orphan_cleanups: std::sync::Mutex::new(Vec::new()),
             backup_cleanups_closed: AtomicBool::new(false),
             aux_workers: Arc::new(tokio::sync::RwLock::new(())),
             last_backup_memory_stats: std::sync::Mutex::new(None),
@@ -733,6 +735,23 @@ impl CanonicalRuntime {
         // (including post-rollback `on_pre_commit_abort` hooks) to finish before closing
         // local CAS cleanup admission.
         let _aux_drained = self.inner.aux_workers.write().await;
+        // Sweep any local CAS orphans whose deletion was deferred by an earlier
+        // backup hold that may have been released before shutdown.
+        let deferred_orphans = {
+            let mut deferred = self
+                .inner
+                .deferred_local_orphan_cleanups
+                .lock()
+                .expect("deferred local orphan cleanups mutex");
+            std::mem::take(&mut *deferred)
+        };
+        if !deferred_orphans.is_empty() {
+            CanonicalStore {
+                inner: self.inner.clone(),
+            }
+            .cleanup_unretained_local_files_async(deferred_orphans)
+            .await;
+        }
         // Close cleanup admission under `backup_cleanups` lock and drain all pending
         // local CAS orphan cleanup tasks BEFORE shutting down WAL / SQL pools and
         // releasing `DataRootOwnerLock`, so every cleanup task sees an open read gate
@@ -996,7 +1015,9 @@ impl CanonicalStore {
     }
 
     pub(crate) fn ensure_open(&self) -> Result<(), PortError> {
-        if self.inner.shutting_down.load(Ordering::SeqCst) {
+        if self.inner.shutting_down.load(Ordering::SeqCst)
+            || self.inner.backup_shutdown.is_cancelled()
+        {
             return Err(unavailable_retryable(
                 "canonical_shutting_down",
                 "canonical runtime is shutting down",
@@ -1939,16 +1960,16 @@ impl CanonicalStore {
                                      SELECT folder_id, 0 FROM folder_heads
                                       WHERE space_id = ?1 AND folder_id = ?2
                                      UNION ALL
-                                     SELECT f.folder_id, s.depth + 1 FROM folder_heads f
-                                     JOIN sub s ON f.parent_folder_id = s.folder_id
-                                      WHERE f.space_id = ?1 AND s.depth < 257
+                                     SELECT f.folder_id, s.depth + 1 FROM sub s
+                                     CROSS JOIN folder_heads f
+                                      WHERE f.space_id = ?1 AND f.parent_folder_id = s.folder_id AND s.depth < 257
                                  )
                                  SELECT 1 FROM sub s
-                                 JOIN note_heads n
-                                   ON n.space_id = ?1 AND n.parent_folder_id = s.folder_id
-                                 JOIN collab_sessions c
-                                   ON c.space_id = ?1 AND c.note_id = n.note_id
-                                 WHERE c.room_state IN ('active', 'fenced')
+                                 CROSS JOIN note_heads n
+                                 CROSS JOIN collab_sessions c
+                                 WHERE n.space_id = ?1 AND n.parent_folder_id = s.folder_id
+                                   AND c.space_id = ?1 AND c.note_id = n.note_id
+                                   AND c.room_state IN ('active', 'fenced')
                                  LIMIT 1",
                             )
                             .bind(scope_cl.space_id.as_str())

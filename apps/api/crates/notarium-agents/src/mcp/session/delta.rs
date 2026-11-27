@@ -331,18 +331,72 @@ pub(super) async fn resume(
     receipt: Option<&str>,
     allow_ack: bool,
 ) -> Result<Value, PortError> {
+    const LABEL: &str = "notarium.mcp.start-session-delta.v1";
     if let Some(receipt) = receipt
         && (receipt.strip_prefix(DELIVERY_PREFIX).is_none()
             || receipt.strip_prefix(DELIVERY_PREFIX) != token.strip_prefix(CONTINUATION_PREFIX))
     {
         return Err(stale());
     }
-    let ticket = call.registry.bootstrap.find(token, CONTINUATION_PREFIX)?;
-    let position = ticket.position.clone().ok_or_else(stale)?;
-    revalidate(call, &ticket.batch).await?;
+    let existing_ack = call
+        .lookup_journal::<Option<PendingDeliveryAck>>("delta-resume-ack")
+        .await?;
+    let prior_may_have_acked = existing_ack.as_ref().is_some_and(Option::is_some);
+    let ticket = match call.registry.bootstrap.find(token, CONTINUATION_PREFIX) {
+        Ok(ticket) => ticket,
+        Err(error) => {
+            return Err(if prior_may_have_acked {
+                super::super::note_tools::post_commit_error(LABEL, error)
+            } else {
+                error
+            });
+        }
+    };
+    let position = match ticket.position.clone() {
+        Some(position) => position,
+        None => {
+            let err = stale();
+            return Err(if prior_may_have_acked {
+                super::super::note_tools::post_commit_error(LABEL, err)
+            } else {
+                err
+            });
+        }
+    };
+    revalidate(call, &ticket.batch).await.map_err(|error| {
+        if prior_may_have_acked {
+            super::super::note_tools::post_commit_error(LABEL, error)
+        } else {
+            error
+        }
+    })?;
     let acknowledge = ticket.acknowledge && allow_ack;
-    let acked = if acknowledge && ticket.safe_ack.is_some() {
-        acknowledge_page(call, &ticket).await?;
+    let pending = match existing_ack {
+        Some(saved) => saved,
+        None => {
+            let computed = if acknowledge {
+                ticket
+                    .safe_ack
+                    .as_ref()
+                    .map(|delivered| PendingDeliveryAck {
+                        owner: ticket.batch.owner.clone(),
+                        delivered: delivered.clone(),
+                    })
+            } else {
+                None
+            };
+            call.journal("delta-resume-ack", || async move { Ok(computed) })
+                .await?
+        }
+    };
+    let acked = if let Some(pending) = &pending {
+        acknowledge_prepared(call, pending).await.map_err(|error| {
+            if prior_may_have_acked {
+                super::super::note_tools::post_commit_error(LABEL, error)
+            } else {
+                error
+            }
+        })?;
         true
     } else {
         false
@@ -350,7 +404,6 @@ pub(super) async fn resume(
     page(call, Instant::now(), ticket.batch, position, acknowledge)
         .await
         .map_err(|error| {
-            const LABEL: &str = "notarium.mcp.start-session-delta.v1";
             if acked {
                 super::super::note_tools::post_commit_error(LABEL, error)
             } else {
@@ -382,15 +435,31 @@ pub(super) async fn prepare_delivery(
     }))
 }
 
-pub(super) async fn deliver(
+pub(super) async fn deliver_journaled(
     call: &ToolCallContext<'_>,
     token: &str,
     allow_ack: bool,
 ) -> Result<bool, PortError> {
-    let Some(pending) = prepare_delivery(call, token, allow_ack).await? else {
+    const LABEL: &str = "notarium.mcp.delta-ack.v1";
+    let mut replayed = true;
+    let pending: Option<PendingDeliveryAck> = call
+        .journal("delivery-ack", || async {
+            replayed = false;
+            prepare_delivery(call, token, allow_ack).await
+        })
+        .await?;
+    let Some(pending) = pending else {
         return Ok(false);
     };
-    acknowledge_prepared(call, &pending).await?;
+    acknowledge_prepared(call, &pending)
+        .await
+        .map_err(|error| {
+            if replayed {
+                super::super::note_tools::post_commit_error(LABEL, error)
+            } else {
+                error
+            }
+        })?;
     Ok(true)
 }
 
@@ -422,20 +491,6 @@ pub(super) async fn acknowledge_prepared(
             )
         })?;
     Ok(())
-}
-
-async fn acknowledge_page(call: &ToolCallContext<'_>, ticket: &Ticket) -> Result<(), PortError> {
-    let Some(delivered) = &ticket.safe_ack else {
-        return Ok(());
-    };
-    acknowledge_prepared(
-        call,
-        &PendingDeliveryAck {
-            owner: ticket.batch.owner.clone(),
-            delivered: delivered.clone(),
-        },
-    )
-    .await
 }
 
 fn ack_identity(

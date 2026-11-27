@@ -468,7 +468,7 @@ impl ProviderService {
                 CommitEffect::NotCommitted,
             )
             .await?;
-        budget.run(tx.commit(), CommitEffect::Unknown).await?;
+        budget.run_commit(tx.commit()).await?;
         Ok(status)
     }
     pub async fn inspect_call(

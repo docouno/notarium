@@ -166,6 +166,11 @@ impl ControlService {
                         return Ok((current, scope, items, has_more));
                     }
                     loop {
+                        let fetch_limit = batch_limit.min(
+                            i64::try_from((MAX_SCAN + 1).saturating_sub(scanned))
+                                .unwrap_or(1)
+                                .max(1),
+                        );
                         let batch = if let Some(exact_schedule) = keeper_schedule_filter {
                             if !after.is_empty() && exact_schedule <= after.as_str() {
                                 Vec::new()
@@ -192,7 +197,7 @@ impl ControlService {
                                 ctx.scope().space_id.as_str(),
                                 project_root.as_str(),
                                 &after,
-                                batch_limit
+                                fetch_limit
                             )?
                         } else {
                             rows!(
@@ -204,12 +209,15 @@ impl ControlService {
                                 current.auth().principal().as_str(),
                                 ctx.scope().space_id.as_str(),
                                 &after,
-                                batch_limit
+                                fetch_limit
                             )?
                         };
                         let batch_len = batch.len();
                         for row in batch {
                             scanned = scanned.saturating_add(1);
+                            if scanned > MAX_SCAN {
+                                return Err(invalid(ValidationReason::BudgetExceeded));
+                            }
                             after = row.schedule_id.clone();
                             match Self::readable_schedule_in_space(&current, &row) {
                                 Ok(value) => {
@@ -225,12 +233,9 @@ impl ControlService {
                         }
                         if keeper_schedule_filter.is_some()
                             || has_more
-                            || batch_len < usize::try_from(batch_limit).unwrap_or(usize::MAX)
+                            || batch_len < usize::try_from(fetch_limit).unwrap_or(usize::MAX)
                         {
                             break;
-                        }
-                        if scanned >= MAX_SCAN {
-                            return Err(invalid(ValidationReason::BudgetExceeded));
                         }
                     }
                     Ok((current, scope, items, has_more))

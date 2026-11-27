@@ -787,6 +787,32 @@ async fn wide_subtree_probes_children_by_parent_before_analyze() {
                     && !slot_details.contains("SCAN folder_heads"),
                 "{phase} ability_slot_check must seek idx_ability_packages_active_slug without scanning folder_heads:\n{slot_details}"
             );
+
+            let mut prerun_plan = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {PRERUN_RANK_SQL}"))
+                .unwrap();
+            let prerun_details = prerun_plan
+                .query_map(
+                    rusqlite::params![
+                        scope.space_id.as_str(),
+                        scope.incarnation.as_bytes().as_slice(),
+                        "nt_v:default:nt_t",
+                        "run_0001",
+                        9999i64,
+                    ],
+                    |r| r.get::<_, String>(3),
+                )
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+                .join("\n");
+            assert!(
+                prerun_details.contains("idx_revisions_entity_vis_seq")
+                    && prerun_details.contains("idx_revisions_agent_run")
+                    && !prerun_details.contains("SCAN revisions")
+                    && !prerun_details.contains("TEMP B-TREE FOR ORDER BY"),
+                "{phase} prerun_rank must seek idx_revisions_entity_vis_seq and idx_revisions_agent_run without temp sort:\n{prerun_details}"
+            );
         }
     }
     runtime.shutdown().await.unwrap();

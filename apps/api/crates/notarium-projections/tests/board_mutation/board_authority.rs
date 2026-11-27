@@ -6885,4 +6885,391 @@ async fn rollback_preserves_updated_at_sort_and_pre_run_manual_order(
         vec![card_x.note, card_x2.note, card_b.note, card_c.note],
         "rollback must delete synthetic run-materialized overlays on B and C when only lower-ranked manual cards X/X2 survive"
     );
+
+    // Case F: PostgreSQL root-only fast rollback must clear `folder_heads.cover_note_id`
+    // when rolling back a run-created root folder cover page (`slug == "index"`).
+    let run_f = AgentRunId::from_bytes(random_bytes());
+    let agent_f = super::agent(&owner, run_f.clone(), ChatAudience::Personal);
+    let root_cover_id = NoteId::from_bytes(random_bytes());
+    store
+        .create_note(
+            agent_f.clone(),
+            mutation(
+                &agent_f,
+                CreateNote {
+                    note: root_cover_id.clone(),
+                    parent: None,
+                    slug: "index".into(),
+                    class: DocClass::UserDoc,
+                    carrier: "---\ntitle: Root Cover\n---\nCover body\n".into(),
+                    folder_page: true,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let root_before = store
+        .resolve_folder_path(owner.clone(), None, String::new())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(root_before.cover_note.as_ref(), Some(&root_cover_id));
+    let prep_f = store
+        .prepare_agent_run_rollback(owner.clone(), run_f)
+        .await
+        .unwrap();
+    store
+        .rollback_agent_run(owner.clone(), mutation(&owner, prep_f))
+        .await
+        .unwrap();
+    let root_after = store
+        .resolve_folder_path(owner.clone(), None, String::new())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        root_after.cover_note, None,
+        "rolling back a run-created root cover page must clear folder_heads.cover_note_id"
+    );
+
+    // Case G1: Active-view rollback touching group `todo` via `materialize_working_group`
+    // must keep run-materialized neighbors [A, B] ranked when a human later ranks manual
+    // card M strictly below them (`after: B`), so rollback returning C into `todo` keeps
+    // [A, B, C, M] rather than inverting M ahead of unranked [A, B, C].
+    let proj_g1 = folder(store, &owner, None, "rb-g1-proj", true)
+        .await
+        .unwrap();
+    let (vg1, vg1_rev) = create_view(
+        store,
+        &owner,
+        &proj_g1,
+        "rb-g1-board",
+        "board",
+        "{scope: project}",
+        "group_by: status\nfilter: {exists: status}\nsort: [{field: title, type: string, direction: asc}]\n",
+    )
+    .await;
+    let g1_a = create_note(
+        store,
+        &owner,
+        Some(proj_g1.clone()),
+        "g1-a",
+        "---\nstatus: todo\ntitle: A-Card\n---\n".into(),
+    )
+    .await;
+    let g1_b = create_note(
+        store,
+        &owner,
+        Some(proj_g1.clone()),
+        "g1-b",
+        "---\nstatus: todo\ntitle: B-Card\n---\n".into(),
+    )
+    .await;
+    let g1_c = create_note(
+        store,
+        &owner,
+        Some(proj_g1.clone()),
+        "g1-c",
+        "---\nstatus: todo\ntitle: C-Card\n---\n".into(),
+    )
+    .await;
+    let g1_m = create_note(
+        store,
+        &owner,
+        Some(proj_g1),
+        "g1-m",
+        "---\nstatus: backlog\ntitle: M-Card\n---\n".into(),
+    )
+    .await;
+    sync(store, runtime, &scope).await;
+    let run_g1 = AgentRunId::from_bytes(random_bytes());
+    let agent_g1 = super::agent(&owner, run_g1.clone(), ChatAudience::Personal);
+    // Run reorders B after C (materializing A, C, B in `todo`), then moves B to `doing`.
+    let g1_b_mid = store
+        .move_board_card(
+            agent_g1.clone(),
+            mutation(
+                &agent_g1,
+                MoveBoardCard {
+                    view: vg1.clone(),
+                    note: g1_b.note.clone(),
+                    group: group("todo"),
+                    before: None,
+                    after: Some(notarium_core::ports::RankNeighbor {
+                        note: g1_c.note.clone(),
+                        expected_rank: RankExpectation::Absent,
+                    }),
+                    fields: BTreeMap::new(),
+                    expected_note: g1_b.revision.clone(),
+                    expected_view: vg1_rev.revision.clone(),
+                    expected_rank: RankExpectation::Absent,
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .value;
+    sync(store, runtime, &scope).await;
+    store
+        .move_board_card(
+            agent_g1.clone(),
+            mutation(
+                &agent_g1,
+                MoveBoardCard {
+                    view: vg1.clone(),
+                    note: g1_b.note.clone(),
+                    group: group("doing"),
+                    before: None,
+                    after: None,
+                    fields: BTreeMap::from([(
+                        "status".into(),
+                        Some(YamlValue::String("doing".into())),
+                    )]),
+                    expected_note: g1_b_mid.revision.revision.clone(),
+                    expected_view: vg1_rev.revision.clone(),
+                    expected_rank: RankExpectation::Existing(g1_b_mid.rank_revision),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    sync(store, runtime, &scope).await;
+    let ov_g1 = store
+        .inspect_view_overlays_for_test(&scope.space_id, &vg1)
+        .await
+        .unwrap();
+    // Human places M strictly below run-materialized C in `todo`.
+    store
+        .move_board_card(
+            owner.clone(),
+            mutation(
+                &owner,
+                MoveBoardCard {
+                    view: vg1.clone(),
+                    note: g1_m.note.clone(),
+                    group: group("todo"),
+                    before: None,
+                    after: Some(notarium_core::ports::RankNeighbor {
+                        note: g1_c.note.clone(),
+                        expected_rank: RankExpectation::Existing(
+                            ov_g1[&g1_c.note].rank_rev_id.clone(),
+                        ),
+                    }),
+                    fields: BTreeMap::from([(
+                        "status".into(),
+                        Some(YamlValue::String("todo".into())),
+                    )]),
+                    expected_note: g1_m.revision.clone(),
+                    expected_view: vg1_rev.revision.clone(),
+                    expected_rank: RankExpectation::Absent,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    sync(store, runtime, &scope).await;
+    let prep_g1 = store
+        .prepare_agent_run_rollback(owner.clone(), run_g1)
+        .await
+        .unwrap();
+    store
+        .rollback_agent_run(owner.clone(), mutation(&owner, prep_g1))
+        .await
+        .unwrap();
+    sync(store, runtime, &scope).await;
+    let g1_after: Vec<NoteId> = query(&engine, owner.clone(), vg1)
+        .await
+        .unwrap()
+        .rows
+        .items
+        .into_iter()
+        .filter(|row| row.group == group("todo"))
+        .map(|row| row.card.document.provenance().reference().note_id.clone())
+        .collect();
+    assert_eq!(
+        g1_after,
+        vec![g1_a.note, g1_b.note, g1_c.note, g1_m.note],
+        "active-view rollback returning B between A and C must keep materialized [A, C] above manual card M"
+    );
+
+    // Case G2: Inactive/trashed-view rollback must ALSO preserve manual card H placed
+    // between run-materialized B and C once the trashed board folder is restored.
+    let proj_g2 = folder(store, &owner, None, "rb-g2-proj", true)
+        .await
+        .unwrap();
+    let board_dir_g2 = folder(store, &owner, Some(proj_g2.clone()), "rb-g2-views", false)
+        .await
+        .unwrap();
+    let (vg2, vg2_rev) = create_view(
+        store,
+        &owner,
+        &board_dir_g2,
+        "rb-g2-board",
+        "board",
+        "{scope: project}",
+        "group_by: status\nfilter: {exists: status}\nsort: [{field: title, type: string, direction: asc}]\n",
+    )
+    .await;
+    let g2_b = create_note(
+        store,
+        &owner,
+        Some(proj_g2.clone()),
+        "g2-b",
+        "---\nstatus: todo\ntitle: B-Card\n---\n".into(),
+    )
+    .await;
+    let g2_c = create_note(
+        store,
+        &owner,
+        Some(proj_g2.clone()),
+        "g2-c",
+        "---\nstatus: todo\ntitle: C-Card\n---\n".into(),
+    )
+    .await;
+    let g2_a = create_note(
+        store,
+        &owner,
+        Some(proj_g2.clone()),
+        "g2-a",
+        "---\nstatus: doing\ntitle: A-Card\n---\n".into(),
+    )
+    .await;
+    let g2_h = create_note(
+        store,
+        &owner,
+        Some(proj_g2),
+        "g2-h",
+        "---\nstatus: backlog\ntitle: H-Card\n---\n".into(),
+    )
+    .await;
+    sync(store, runtime, &scope).await;
+    let run_g2 = AgentRunId::from_bytes(random_bytes());
+    let agent_g2 = super::agent(&owner, run_g2.clone(), ChatAudience::Personal);
+    store
+        .move_board_card(
+            agent_g2.clone(),
+            mutation(
+                &agent_g2,
+                MoveBoardCard {
+                    view: vg2.clone(),
+                    note: g2_a.note.clone(),
+                    group: group("todo"),
+                    before: Some(notarium_core::ports::RankNeighbor {
+                        note: g2_c.note.clone(),
+                        expected_rank: RankExpectation::Absent,
+                    }),
+                    after: Some(notarium_core::ports::RankNeighbor {
+                        note: g2_b.note.clone(),
+                        expected_rank: RankExpectation::Absent,
+                    }),
+                    fields: BTreeMap::from([(
+                        "status".into(),
+                        Some(YamlValue::String("todo".into())),
+                    )]),
+                    expected_note: g2_a.revision.clone(),
+                    expected_view: vg2_rev.revision.clone(),
+                    expected_rank: RankExpectation::Absent,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    sync(store, runtime, &scope).await;
+    let ov_g2 = store
+        .inspect_view_overlays_for_test(&scope.space_id, &vg2)
+        .await
+        .unwrap();
+    store
+        .move_board_card(
+            owner.clone(),
+            mutation(
+                &owner,
+                MoveBoardCard {
+                    view: vg2.clone(),
+                    note: g2_h.note.clone(),
+                    group: group("todo"),
+                    before: Some(notarium_core::ports::RankNeighbor {
+                        note: g2_c.note.clone(),
+                        expected_rank: RankExpectation::Existing(
+                            ov_g2[&g2_c.note].rank_rev_id.clone(),
+                        ),
+                    }),
+                    after: Some(notarium_core::ports::RankNeighbor {
+                        note: g2_a.note.clone(),
+                        expected_rank: RankExpectation::Existing(
+                            ov_g2[&g2_a.note].rank_rev_id.clone(),
+                        ),
+                    }),
+                    fields: BTreeMap::from([(
+                        "status".into(),
+                        Some(YamlValue::String("todo".into())),
+                    )]),
+                    expected_note: g2_h.revision.clone(),
+                    expected_view: vg2_rev.revision.clone(),
+                    expected_rank: RankExpectation::Absent,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    sync(store, runtime, &scope).await;
+    let space_epoch_g2 = store
+        .read_space(&scope.space_id)
+        .await
+        .unwrap()
+        .active_epoch;
+    let board_dir_rev = store
+        .resolve_folder_path(owner.clone(), Some(board_dir_g2.clone()), String::new())
+        .await
+        .unwrap()
+        .unwrap()
+        .revision;
+    let (trashed_board_rev, _) = store
+        .set_folder_lifecycle(
+            &scope,
+            space_epoch_g2,
+            &board_dir_g2,
+            &board_dir_rev,
+            notarium_core::model::Lifecycle::Trashed,
+            owner.auth().principal(),
+            None,
+        )
+        .await
+        .unwrap();
+    sync(store, runtime, &scope).await;
+    let prep_g2 = store
+        .prepare_agent_run_rollback(owner.clone(), run_g2)
+        .await
+        .unwrap();
+    store
+        .rollback_agent_run(owner.clone(), mutation(&owner, prep_g2))
+        .await
+        .unwrap();
+    store
+        .set_folder_lifecycle(
+            &scope,
+            space_epoch_g2,
+            &board_dir_g2,
+            &trashed_board_rev,
+            notarium_core::model::Lifecycle::Active,
+            owner.auth().principal(),
+            None,
+        )
+        .await
+        .unwrap();
+    sync(store, runtime, &scope).await;
+    let g2_after: Vec<NoteId> = query(&engine, owner.clone(), vg2)
+        .await
+        .unwrap()
+        .rows
+        .items
+        .into_iter()
+        .filter(|row| row.group == group("todo"))
+        .map(|row| row.card.document.provenance().reference().note_id.clone())
+        .collect();
+    assert_eq!(
+        g2_after,
+        vec![g2_b.note, g2_h.note, g2_c.note],
+        "trashed-view rollback must preserve manual card H between materialized B and C after restore"
+    );
 }

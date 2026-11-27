@@ -892,17 +892,11 @@ fn change_step(step: &str, outcome: &str, error: Option<&PortError>) -> Value {
 fn is_partial_step_error(error: &PortError) -> bool {
     matches!(
         error,
-        PortError::Domain(
-            DomainError::ControlRevisionConflict { .. }
-                | DomainError::RevisionConflict { .. }
-                | DomainError::PathConflict { .. }
-                | DomainError::ValidationFailed { .. }
-                | DomainError::ResourceNotFound
-                | DomainError::AccessDenied
-                | DomainError::SpaceReadOnly
-                | DomainError::AbilityWriteForbidden
-                | DomainError::CrossSpaceTainted
-        )
+        PortError::Domain(domain)
+            if !matches!(
+                domain,
+                DomainError::RateLimited { .. } | DomainError::AuthenticationFailed
+            )
     )
 }
 

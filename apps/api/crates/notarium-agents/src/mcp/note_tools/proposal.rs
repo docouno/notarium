@@ -295,21 +295,33 @@ pub(super) async fn resolve_destination(
             .engine
             .resolve_folder_path(scope.clone(), base.clone(), path)
     };
-    let (anchor, tail) = if let Some(exact) = resolve(path.to_owned()).await? {
+    let base_snap = resolve(String::new())
+        .await?
+        .ok_or(DomainError::ResourceNotFound)?;
+    let base_path = base_snap.path.clone();
+    let expected_exact = super::join_folder_path(&base_path, path);
+    let (anchor, tail) = if path.is_empty() {
+        (base_snap, String::new())
+    } else if let Some(exact) = resolve(path.to_owned()).await?
+        && super::same_folder_path(&exact.path, &expected_exact)
+    {
         (exact, String::new())
     } else {
-        // Find the nearest existing ancestor with read operations only. Its
-        // write permission must cover the creation of the missing suffix.
-        let mut nearest = resolve(String::new())
-            .await?
-            .ok_or(DomainError::ResourceNotFound)?;
+        // Find the nearest existing live ancestor with read operations only (ignoring
+        // historical folder aliases whose canonical path differs from the requested prefix).
+        // Its write permission must cover the creation of the missing suffix.
+        let mut nearest = base_snap;
         let mut edges = vec![0];
         edges.extend(path.match_indices('/').map(|(offset, _)| offset));
         edges.push(path.len());
         let (mut present, mut absent) = (0, edges.len() - 1);
         while absent - present > 1 {
             let probe = present + (absent - present) / 2;
-            if let Some(found) = resolve(path[..edges[probe]].to_owned()).await? {
+            let prefix = &path[..edges[probe]];
+            let expected_prefix = super::join_folder_path(&base_path, prefix);
+            if let Some(found) = resolve(prefix.to_owned()).await?
+                && super::same_folder_path(&found.path, &expected_prefix)
+            {
                 present = probe;
                 nearest = found;
             } else {
@@ -847,11 +859,7 @@ pub(in crate::mcp) async fn apply_proposal(
             receipt_result(owner, scope, &route.note, result, "trashed")
                 .await
                 .map_err(|error| {
-                    super::batch_operational_error(
-                        "notarium.mcp.confirmed-delete-note.v1",
-                        error,
-                        true,
-                    )
+                    super::post_commit_error("notarium.mcp.confirmed-delete-note.v1", error)
                 })
         }
         PreparedNoteAction::Move {
@@ -893,7 +901,7 @@ pub(in crate::mcp) async fn apply_proposal(
                 .map_err(|error| super::batch_operational_error(LABEL, error, creates_folder))?;
             receipt_result(owner, scope, &route.note, result, "moved")
                 .await
-                .map_err(|error| super::batch_operational_error(LABEL, error, true))
+                .map_err(|error| super::post_commit_error(LABEL, error))
         }
         PreparedNoteAction::Rename { route, slug, title } => {
             let (scope, identity) = step(&route.scope, "rename_note", 0)?;
@@ -916,11 +924,7 @@ pub(in crate::mcp) async fn apply_proposal(
             receipt_result(owner, scope, &route.note, result, "renamed")
                 .await
                 .map_err(|error| {
-                    super::batch_operational_error(
-                        "notarium.mcp.confirmed-rename-note.v1",
-                        error,
-                        true,
-                    )
+                    super::post_commit_error("notarium.mcp.confirmed-rename-note.v1", error)
                 })
         }
     }

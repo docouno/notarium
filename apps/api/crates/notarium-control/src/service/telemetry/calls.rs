@@ -123,7 +123,7 @@ impl ControlService {
             }
             Ok(())
         },CommitEffect::NotCommitted).await?;
-        budget.run(tx.commit(), CommitEffect::Unknown).await
+        budget.run_commit(tx.commit()).await
     }
     pub async fn finish_agent_call(
         &self,
@@ -155,7 +155,7 @@ impl ControlService {
                 let record=TargetRecord::from(AgentCallDetailsRow{call_id:request.call.to_string(),payload,created_at:raw_now,expires_at:expires});record.validate()?;record.insert(tx.inner_mut()).await?;
             }Ok(())
         },CommitEffect::NotCommitted).await?;
-        budget.run(tx.commit(), CommitEffect::Unknown).await
+        budget.run_commit(tx.commit()).await
     }
     pub async fn record_agent_retrieval(
         &self,
@@ -234,6 +234,6 @@ impl ControlService {
             }
             Ok(())
         },CommitEffect::NotCommitted).await?;
-        budget.run(tx.commit(), CommitEffect::Unknown).await
+        budget.run_commit(tx.commit()).await
     }
 }

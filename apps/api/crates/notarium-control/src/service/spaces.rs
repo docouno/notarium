@@ -24,7 +24,7 @@ use notarium_core::{
 };
 use serde::{Deserialize, Serialize};
 
-pub(crate) const WHOAMI_PROVIDER_SQLITE_SQL: &str = "SELECT CAST(1 AS BIGINT) FROM provider_attachments a CROSS JOIN provider_resources r CROSS JOIN provider_models m WHERE r.id=a.resource_id AND m.resource_id=r.id AND a.target_kind='personal' AND a.target_owner=$1 AND a.target_space=$2 AND a.state='approved' AND a.resource_epoch=r.consent_epoch AND (a.expires_at IS NULL OR a.expires_at>$3) AND r.disabled_at IS NULL AND m.kind='completion' LIMIT 1";
+pub(crate) const WHOAMI_PROVIDER_SQLITE_SQL: &str = "SELECT CAST(1 AS BIGINT) FROM provider_attachments a INDEXED BY attachment_target CROSS JOIN provider_resources r CROSS JOIN provider_models m WHERE r.id=a.resource_id AND m.resource_id=r.id AND a.target_kind='personal' AND a.target_owner=$1 AND a.target_space=$2 AND a.state='approved' AND a.resource_epoch=r.consent_epoch AND (a.expires_at IS NULL OR a.expires_at>$3) AND r.disabled_at IS NULL AND m.kind='completion' LIMIT 1";
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -423,7 +423,7 @@ impl ControlService {
             command.save(tx.inner_mut(),revision,&saved,now).await?;
             Ok((revision,saved))
         },CommitEffect::NotCommitted).await?;
-        budget.run(tx.commit(), CommitEffect::Unknown).await?;
+        budget.run_commit(tx.commit()).await?;
         let current = self
             .finish_space_operation(&budget, &saved.value.operation)
             .await?;

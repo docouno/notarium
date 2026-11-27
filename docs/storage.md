@@ -485,9 +485,10 @@ same example against an isolated prefix.
   pause and `reset_gate_overruns` counts closures over budget.
 - **Hierarchy, boards and semantic rollback:** `MoveFolder` updates only the
   moved folder row (`0` descendant row writes) under cycle checks and per-Space
-  serialization. Same-depth and upward moves check the two ancestor paths.
-  Moving deeper also probes indexed children until the first path that would
-  exceed 256 levels. `move_board_card` maintains `<= 16`-byte `sort_rank_lexo` keys
+  serialization. Authorization inspects the moved subtree for folder write
+  locks and descendant document classes before validating depth. Same-depth and
+  upward moves check the two ancestor paths; moving deeper also probes indexed
+  children until the first path that would exceed 256 levels. `move_board_card` maintains `<= 16`-byte `sort_rank_lexo` keys
   via windowed Packed Memory Array (PMA) rebalancing that updates physical
   `rank_rev_id` without overwriting semantic `placement_revision` provenance.
   Rollback spends one caller budget across room reservations, Board planning,

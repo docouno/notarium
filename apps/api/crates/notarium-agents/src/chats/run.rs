@@ -353,6 +353,7 @@ impl AgentRunSupervisor {
                 let result = self
                     .invoke_tool(
                         run,
+                        &episode,
                         &budget,
                         &selection,
                         leaf,
@@ -594,6 +595,7 @@ impl AgentRunSupervisor {
     async fn invoke_tool(
         &self,
         run: &ActiveRun,
+        episode: &EpisodeId,
         budget: &CompletionRunBudget,
         selection: &ProviderSelection,
         leaf: ThreadEntrySeq,
@@ -608,7 +610,10 @@ impl AgentRunSupervisor {
             .clone()
             .or_else(|| run.project.clone());
         let invocation = McpInvocationContext {
-            account: AccountContext::new(ctx.auth().clone(), ctx.budget.clone()),
+            account: AccountContext::new(
+                ctx.auth().clone().with_chat_episode(episode.clone()),
+                ctx.budget.clone(),
+            ),
             target: EgressTarget::InAppProvider {
                 provider: selection.provider.clone(),
                 model: selection.model.clone(),

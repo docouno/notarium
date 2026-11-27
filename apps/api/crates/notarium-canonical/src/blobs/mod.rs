@@ -717,14 +717,19 @@ impl crate::CanonicalStore {
             }
             let guard = local.acquire_exclusive_guard(&space_id, digest).await;
             let space_chk = space_id.clone();
-            let can_delete = self
+            enum OrphanOutcome {
+                Delete,
+                Keep,
+                HoldActive,
+            }
+            let outcome = self
                 .with_read_tx(|tx| {
                     Box::pin(async move {
-                        ensure_no_backup_holds_tx(tx, &space_chk).await?;
+                        let hold_active = has_backup_holds_tx(tx, &space_chk).await?;
                         ensure_zero_reachable_refs_tx(tx, &space_chk, digest).await?;
                         let cataloged: Option<i64> = match tx {
                             BackendConn::Sqlite(conn) => sqlx::query_scalar(
-                                "SELECT 1 FROM blob_catalog WHERE space_id = ? AND content_blake3 = ? LIMIT 1",
+                                "SELECT 1 FROM blob_catalog WHERE space_id = ? AND content_blake3 = ? AND blob_state <> 'retired' LIMIT 1",
                             )
                             .bind(space_chk.as_str())
                             .bind(digest.as_bytes().as_slice())
@@ -734,7 +739,7 @@ impl crate::CanonicalStore {
                                 internal_not_committed("sqlite_check_orphan_catalog", err.to_string())
                             })?,
                             BackendConn::Postgres(conn) => sqlx::query_scalar(
-                                "SELECT 1::BIGINT FROM blob_catalog WHERE space_id = $1 AND content_blake3 = $2 LIMIT 1",
+                                "SELECT 1::BIGINT FROM blob_catalog WHERE space_id = $1 AND content_blake3 = $2 AND blob_state <> 'retired' LIMIT 1",
                             )
                             .bind(space_chk.as_str())
                             .bind(digest.as_bytes().as_slice())
@@ -744,19 +749,39 @@ impl crate::CanonicalStore {
                                 crate::runtime::pg_read_error("pg_check_orphan_catalog", err)
                             })?,
                         };
-                        Ok(cataloged.is_none())
+                        Ok(if cataloged.is_some() {
+                            OrphanOutcome::Keep
+                        } else if hold_active {
+                            OrphanOutcome::HoldActive
+                        } else {
+                            OrphanOutcome::Delete
+                        })
                     })
                 })
                 .await
-                .unwrap_or(false);
-            if can_delete {
-                let local_cl = Arc::clone(local);
-                let space_del = space_id.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    let _guard = guard;
-                    let _ = local_cl.delete_physical_file(&space_del, digest);
-                })
-                .await;
+                .unwrap_or(OrphanOutcome::Keep);
+            match outcome {
+                OrphanOutcome::Delete => {
+                    let local_cl = Arc::clone(local);
+                    let space_del = space_id.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let _guard = guard;
+                        let _ = local_cl.delete_physical_file(&space_del, digest);
+                    })
+                    .await;
+                }
+                OrphanOutcome::HoldActive => {
+                    drop(guard);
+                    let mut deferred = self
+                        .inner
+                        .deferred_local_orphan_cleanups
+                        .lock()
+                        .expect("deferred local orphan cleanups mutex");
+                    if deferred.len() < 4096 && !deferred.contains(&(space_id.clone(), digest)) {
+                        deferred.push((space_id, digest));
+                    }
+                }
+                OrphanOutcome::Keep => {}
             }
         }
     }
@@ -2135,10 +2160,10 @@ pub(crate) fn held_retirement() -> PortError {
     )
 }
 
-pub(crate) async fn ensure_no_backup_holds_tx(
+pub(crate) async fn has_backup_holds_tx(
     tx: &mut BackendConn<'_>,
     space_id: &SpaceId,
-) -> Result<(), PortError> {
+) -> Result<bool, PortError> {
     let held: Option<i64> = match tx {
         BackendConn::Sqlite(conn) => {
             sqlx::query_scalar("SELECT 1 FROM backup_holds WHERE space_id = ? LIMIT 1")
@@ -2157,7 +2182,14 @@ pub(crate) async fn ensure_no_backup_holds_tx(
                 .map_err(|err| crate::runtime::pg_read_error("pg_check_backup_holds", err))?
         }
     };
-    if held.is_some() {
+    Ok(held.is_some())
+}
+
+pub(crate) async fn ensure_no_backup_holds_tx(
+    tx: &mut BackendConn<'_>,
+    space_id: &SpaceId,
+) -> Result<(), PortError> {
+    if has_backup_holds_tx(tx, space_id).await? {
         return Err(held_retirement());
     }
     Ok(())

@@ -323,7 +323,7 @@ impl ControlService {
             };
             Ok((revision, ability, descriptor))
         }, CommitEffect::NotCommitted).await?;
-        budget.run(tx.commit(), CommitEffect::Unknown).await?;
+        budget.run_commit(tx.commit()).await?;
         Ok((revision, reference, descriptor))
     }
     pub async fn set_ability_preference(
@@ -553,7 +553,7 @@ impl ControlService {
             command.save(tx.inner_mut(), revision, &saved, self.clock.now_ms()?).await?;
             Ok((revision, saved))
         }, CommitEffect::NotCommitted).await?;
-        budget.run(tx.commit(), CommitEffect::Unknown).await?;
+        budget.run_commit(tx.commit()).await?;
         Ok(ControlCommit {
             revision,
             value: saved.value,
@@ -860,7 +860,7 @@ impl ControlService {
             }
             Ok((revision, value))
         }, CommitEffect::NotCommitted).await?;
-        budget.run(tx.commit(), CommitEffect::Unknown).await?;
+        budget.run_commit(tx.commit()).await?;
         Ok(ControlCommit { revision, value })
     }
 }

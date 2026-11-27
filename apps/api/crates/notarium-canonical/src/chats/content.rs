@@ -1017,17 +1017,20 @@ async fn load_branch_payloads(
     if keys.is_empty() {
         return Ok(Vec::new());
     }
-    let query = format!("WITH RECURSIVE path(entry_seq, parent_seq, depth) AS (
+    let query = format!(
+        "WITH RECURSIVE path(entry_seq, parent_seq, depth) AS (
             SELECT entry_seq, parent_seq, 1 FROM chat_entries
             WHERE space_id = $1 AND thread_id = $2 AND entry_seq = $3
             UNION ALL
             SELECT e.entry_seq, e.parent_seq, p.depth + 1 FROM path p
-            JOIN chat_entries e ON e.space_id = $1 AND e.thread_id = $2 AND e.entry_seq = p.parent_seq
-            WHERE p.depth < 200
+            CROSS JOIN chat_entries e
+            WHERE e.space_id = $1 AND e.thread_id = $2 AND e.entry_seq = p.parent_seq
+              AND p.depth < 200
         )
         SELECT {COLUMNS} FROM chat_entries
         WHERE space_id = $1 AND thread_id = $2 AND entry_seq IN
-            (SELECT entry_seq FROM path WHERE entry_seq IN ({{keys}}))");
+            (SELECT entry_seq FROM path WHERE entry_seq IN ({{keys}}))"
+    );
     let rows: Vec<PayloadRow> = match tx {
         BackendConn::Sqlite(conn) => {
             let values = serde_json::to_string(&keys).map_err(|error| {

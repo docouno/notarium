@@ -516,7 +516,22 @@ impl CanonicalChangeSubscription {
                         ).bind(rec.scope.space_id.as_str()).bind(rec.scope.incarnation.as_bytes().as_slice())
                          .bind(start.get() as i64).bind(rec.last_seq.get() as i64)
                          .fetch_one(&mut **conn).await.map_err(|e| crate::runtime::pg_read_error("pg_poll_purge_notice", e))?,
-                        BackendConn::Sqlite(_) => has_erased_change_payload_in_range_tx(tx, &rec.scope, start, rec.last_seq).await?,
+                        BackendConn::Sqlite(conn) => {
+                            let has_purge: bool = sqlx::query_scalar::<_, i64>(
+                                "SELECT EXISTS (SELECT 1 FROM change_log WHERE space_id=?
+                                 AND history_incarnation=? AND space_seq>? AND space_seq<=? AND op_kind='purge')",
+                            )
+                            .bind(rec.scope.space_id.as_str())
+                            .bind(rec.scope.incarnation.as_bytes().as_slice())
+                            .bind(start.get() as i64)
+                            .bind(rec.last_seq.get() as i64)
+                            .fetch_one(&mut **conn)
+                            .await
+                            .map_err(|e| internal_not_committed("sqlite_poll_purge_notice", e.to_string()))?
+                                != 0;
+                            has_purge
+                                || has_erased_change_payload_in_range_tx(tx, &rec.scope, start, rec.last_seq).await?
+                        }
                     }
                 } else {
                     false

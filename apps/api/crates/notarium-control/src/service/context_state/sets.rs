@@ -262,6 +262,11 @@ impl ControlService {
         let mut has_more = false;
         let mut scanned = 0usize;
         loop {
+            let fetch_limit = batch_limit.min(
+                i64::try_from((MAX_SCAN + 1).saturating_sub(scanned))
+                    .unwrap_or(1)
+                    .max(1),
+            );
             let mut tx = self.store.read(budget.clone()).await?;
             let batch_result = budget
                 .run(
@@ -276,7 +281,7 @@ impl ControlService {
                                 home.as_str(),
                                 &after,
                                 target_proj,
-                                batch_limit
+                                fetch_limit
                             )?
                         } else {
                             rows!(
@@ -287,29 +292,34 @@ impl ControlService {
                                 "SELECT * FROM v1_control.context_sets WHERE home_space=$1 AND set_id>$2 ORDER BY set_id LIMIT $3";
                                 home.as_str(),
                                 &after,
-                                batch_limit
+                                fetch_limit
                             )?
                         };
                         let batch_len = values.len();
                         let mut next_after = after.clone();
                         let mut allowed_rows = Vec::with_capacity(batch_len);
+                        let mut skipped_since_last = 0usize;
                         for row in values {
                             next_after = row.set_id.clone();
                             if project_target.is_some() {
                                 // SQL already enforced `home_space = $1` and matching project attachment.
-                                allowed_rows.push(row);
+                                allowed_rows.push((skipped_since_last, row));
+                                skipped_since_last = 0;
                             } else {
                                 match self
                                     .check_bundle_attachment_db(tx.inner_mut(), &current, &row)
                                     .await
                                 {
-                                    Ok(()) => allowed_rows.push(row),
-                                    Err(error) if hidden(&error) => (),
+                                    Ok(()) => {
+                                        allowed_rows.push((skipped_since_last, row));
+                                        skipped_since_last = 0;
+                                    }
+                                    Err(error) if hidden(&error) => skipped_since_last += 1,
                                     Err(error) => return Err(error),
                                 }
                             }
                         }
-                        Ok::<_, PortError>((batch_len, next_after, allowed_rows))
+                        Ok::<_, PortError>((batch_len, next_after, allowed_rows, skipped_since_last))
                     },
                     CommitEffect::NotCommitted,
                 )
@@ -317,10 +327,13 @@ impl ControlService {
             budget
                 .run(tx.rollback(), CommitEffect::NotCommitted)
                 .await?;
-            let (batch_len, next_after, allowed_rows) = batch_result?;
-            scanned = scanned.saturating_add(batch_len);
+            let (batch_len, next_after, allowed_rows, trailing_skipped) = batch_result?;
             after = next_after;
-            for row in allowed_rows {
+            for (skipped_before, row) in allowed_rows {
+                scanned = scanned.saturating_add(skipped_before).saturating_add(1);
+                if scanned > MAX_SCAN {
+                    return Err(invalid(ValidationReason::BudgetExceeded));
+                }
                 let value = budget
                     .run(
                         async {
@@ -350,11 +363,14 @@ impl ControlService {
                 }
                 items.push(value);
             }
-            if has_more || batch_len < usize::try_from(batch_limit).unwrap_or(usize::MAX) {
-                break;
+            if !has_more {
+                scanned = scanned.saturating_add(trailing_skipped);
+                if scanned > MAX_SCAN {
+                    return Err(invalid(ValidationReason::BudgetExceeded));
+                }
             }
-            if scanned >= MAX_SCAN {
-                return Err(invalid(ValidationReason::BudgetExceeded));
+            if has_more || batch_len < usize::try_from(fetch_limit).unwrap_or(usize::MAX) {
+                break;
             }
         }
         let continuation = if has_more {
@@ -529,7 +545,7 @@ impl ControlService {
             command.save(tx.inner_mut(), revision, &SavedResult { value: StoredContextSetResult::Meta(meta.clone()), events: vec![] }, self.clock.now_ms()?).await?;
             Ok((revision, ctx.clone(), meta, false))
         }, CommitEffect::NotCommitted).await?;
-        budget.run(tx.commit(), CommitEffect::Unknown).await?;
+        budget.run_commit(tx.commit()).await?;
         let value = if !replayed {
             ContextSetInfo {
                 id: request.input.id,
@@ -636,7 +652,7 @@ impl ControlService {
             command.save(tx.inner_mut(), revision, &SavedResult { value: (), events: vec![] }, self.clock.now_ms()?).await?;
             Ok(revision)
         }, CommitEffect::NotCommitted).await?;
-        budget.run(tx.commit(), CommitEffect::Unknown).await?;
+        budget.run_commit(tx.commit()).await?;
         Ok(ControlCommit {
             revision,
             value: (),

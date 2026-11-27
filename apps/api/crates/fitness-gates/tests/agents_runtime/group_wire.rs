@@ -193,7 +193,7 @@ async fn group_turn(
     assert_eq!(&peer_entry.author, peer.auth().principal());
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let local = loopback_provider_with_output(fixture, human, &listener, tag, false, 2048).await;
+    let local = loopback_provider_with_output(fixture, human, &listener, tag, true, 2048).await;
     approve_disclosure(
         fixture,
         human,
@@ -620,13 +620,67 @@ async fn catch_up_long_group(
     for (ordinal, message) in (covered + 1..=201).zip(&messages[2..]) {
         assert_eq!(message["content"], format!("Message {ordinal}"));
     }
+    let mut ep_hash = blake3::Hasher::new_derive_key("notarium.chats.episode.v1");
+    for part in [
+        ctx.scope().space_id.as_str().as_bytes(),
+        thread.as_str().as_bytes(),
+        human.auth().principal().as_str().as_bytes(),
+    ] {
+        ep_hash.update(&(part.len() as u64).to_be_bytes());
+        ep_hash.update(part);
+    }
+    let chat_episode =
+        EpisodeId::from_bytes(ep_hash.finalize().as_bytes()[..16].try_into().unwrap());
     super::runtime_ability_cases::send_ollama(
         &mut answer,
+        json!({"role":"assistant","tool_calls":[{"function":{
+            "index":0,"name":"list_abilities","arguments":{"view":"runtime","session": chat_episode}
+        }}]}),
+        "tool_calls",
+    )
+    .await;
+    drop(answer);
+    let (mut final_answer, tool_request) =
+        match timeout(WIRE_DEADLINE, read_request(listener)).await {
+            Ok(pair) => pair,
+            Err(_) => {
+                let page = fixture
+                    .canonical
+                    .read_chat(
+                        ctx.clone(),
+                        ChatRead {
+                            thread: thread.clone(),
+                            leaf: ThreadEntrySeq::ZERO,
+                            before: None,
+                            max_entries: PageLimit::new(10).unwrap(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                panic!(
+                    "timed out waiting for SpaceGroup post-tool request; thread={:?}, entries={:?}",
+                    page.thread, page.entries
+                );
+            }
+        };
+    let tool_messages = tool_request["messages"].as_array().unwrap();
+    let tool_reply = tool_messages
+        .iter()
+        .rev()
+        .find(|m| m["role"] == "tool")
+        .expect("SpaceGroup tool call must produce a tool reply");
+    let tool_content = tool_reply["content"].as_str().unwrap_or("");
+    assert!(
+        tool_content.contains("\"items\"") && !tool_content.contains("\"error\""),
+        "SpaceGroup episode-scoped tool call must succeed with chat_episode attached, got: {tool_content}"
+    );
+    super::runtime_ability_cases::send_ollama(
+        &mut final_answer,
         json!({"role":"assistant","content":"Done."}),
         "stop",
     )
     .await;
-    drop(answer);
+    drop(final_answer);
     timeout(WIRE_DEADLINE, async {
         loop {
             let page = fixture

@@ -91,7 +91,7 @@ impl ControlService {
             command.save(tx.inner_mut(), revision, &SavedResult { value: (), events: vec![] }, self.clock.now_ms()?).await?;
             Ok(revision)
         }, CommitEffect::NotCommitted).await?;
-        budget.run(tx.commit(), CommitEffect::Unknown).await?;
+        budget.run_commit(tx.commit()).await?;
         Ok(ControlCommit {
             revision,
             value: (),
@@ -144,6 +144,11 @@ impl ControlService {
         let mut has_more = false;
         let mut scanned = 0usize;
         loop {
+            let fetch_limit = batch_limit.min(
+                i64::try_from((MAX_SCAN + 1).saturating_sub(scanned))
+                    .unwrap_or(1)
+                    .max(1),
+            );
             let mut tx = self.store.read(budget.clone()).await?;
             let batch_result = budget
                 .run(
@@ -156,7 +161,7 @@ impl ControlService {
                                 "SELECT * FROM favorites WHERE owner_id=$1 ORDER BY rank,space_id,entity_kind,entity_id LIMIT $2",
                                 "SELECT * FROM v1_control.favorites WHERE owner_id=$1 ORDER BY rank,space_id,entity_kind,entity_id LIMIT $2";
                                 current.auth().principal().as_str(),
-                                batch_limit
+                                fetch_limit
                             )?,
                             Some(cursor) => rows!(
                                 tx.inner_mut(),
@@ -169,7 +174,7 @@ impl ControlService {
                                 cursor.space.as_str(),
                                 &cursor.kind,
                                 &cursor.entity,
-                                batch_limit
+                                fetch_limit
                             )?,
                         };
                         Ok::<_, PortError>(rows)
@@ -238,11 +243,8 @@ impl ControlService {
                 });
                 last_visible = Some(row_cursor);
             }
-            if has_more || batch_len < usize::try_from(batch_limit).unwrap_or(usize::MAX) {
+            if has_more || batch_len < usize::try_from(fetch_limit).unwrap_or(usize::MAX) {
                 break;
-            }
-            if scanned >= MAX_SCAN {
-                return Err(invalid(ValidationReason::BudgetExceeded));
             }
         }
         let continuation = if has_more {

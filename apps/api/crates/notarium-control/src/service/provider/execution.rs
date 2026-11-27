@@ -69,6 +69,24 @@ impl Runtime {
         self.check(effect)?;
         Ok(result)
     }
+    pub async fn run_commit<T>(
+        &self,
+        operation: impl Future<Output = Result<T, PortError>>,
+    ) -> Result<T, PortError> {
+        self.check(CommitEffect::NotCommitted)?;
+        let result = self
+            .budget
+            .run_commit(async {
+                tokio::select! {
+                    biased;
+                    () = self.cancelled.cancelled() => Err(cancelled(CommitEffect::Unknown)),
+                    value = operation => value,
+                }
+            })
+            .await?;
+        self.check(CommitEffect::Unknown)?;
+        Ok(result)
+    }
     pub fn context(&self) -> CallBudget {
         self.budget.context(self.request.clone())
     }

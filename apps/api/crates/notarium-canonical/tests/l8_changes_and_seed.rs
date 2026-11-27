@@ -609,6 +609,24 @@ async fn run_changes_and_seed_suite(store: &CanonicalStore, seed: u8) {
         other => panic!("expected PurgeResync notice, got {other:?}"),
     }
 
+    // Subscribing from after the purged note's creation but before `purge_seq`
+    // delivers `Advanced` on both SQLite and PostgreSQL so the consumer can
+    // read the `ChangeKind::Purge` row cleanly via `catch_up`.
+    let mut sub_post_create = store
+        .subscribe(
+            maintenance_ctx(ServicePurpose::Search),
+            ChangeCursor {
+                scope: scope1.clone(),
+                after: range_huge.last_seq,
+            },
+        )
+        .await
+        .expect("subscribe over purge op_kind");
+    match sub_post_create.next().await.unwrap().unwrap() {
+        ChangeNotice::Advanced(cutoff) => assert_eq!(cutoff.after, purge_seq),
+        other => panic!("expected Advanced notice for post-create subscriber, got {other:?}"),
+    }
+
     // Verify 1..=purge_seq has ZERO holes in `change_log`!
     let all_seqs = store
         .read_all_change_log_seqs_for_test(&scope1)
@@ -957,7 +975,7 @@ async fn run_changes_and_seed_suite(store: &CanonicalStore, seed: u8) {
         )
         .await
         .expect("sub A");
-    let sub_indep_b = store
+    let mut sub_indep_b = store
         .subscribe(
             maintenance_ctx(ServicePurpose::Search),
             ChangeCursor {
@@ -1050,7 +1068,7 @@ async fn run_changes_and_seed_suite(store: &CanonicalStore, seed: u8) {
 
     // Post-cutoff purge of note 1 (which existed at cutoff 9) -> `Seed` at cutoff 9 returns `CursorStale`!
     let n1_id = note_id_seq(seed.wrapping_add(2), 1);
-    store
+    let n1_purge_seq = store
         .commit_synthetic_note_purge_for_test(&scope3, epoch, &n1_id)
         .await
         .expect("purge n1 after cutoff 9");
@@ -1065,6 +1083,16 @@ async fn run_changes_and_seed_suite(store: &CanonicalStore, seed: u8) {
         )
         .await;
     assert_validation_err(&stale_purge_res, ValidationReason::CursorStale);
+
+    // Lagged subscriber B (which opened AFTER n1 was created, then missed >4 broadcasts
+    // plus n1's purge) must receive `ChangeNotice::PurgeResync` from `durable_notice` on
+    // BOTH SQLite and PostgreSQL.
+    match sub_indep_b.next().await.unwrap().unwrap() {
+        ChangeNotice::PurgeResync { cutoff } => assert_eq!(cutoff.after, n1_purge_seq),
+        other => panic!(
+            "expected PurgeResync on lagged subscriber after post-watermark purge, got {other:?}"
+        ),
+    }
 
     // Restore default broadcast capacity.
     store.reconfigure_broadcast_capacity_for_test(1024);

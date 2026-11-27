@@ -76,6 +76,23 @@ impl OperationBudget {
             result = operation => result,
         }
     }
+    /// Runs a transaction `COMMIT` future: if the budget is already cancelled or
+    /// expired before polling `COMMIT`, nothing has been sent to the database and
+    /// `CommitEffect::NotCommitted` is preserved; once polling starts, cancellation
+    /// or timeout reports `CommitEffect::Unknown`.
+    pub async fn run_commit<T>(
+        &self,
+        operation: impl Future<Output = Result<T, PortError>>,
+    ) -> Result<T, PortError> {
+        self.check(CommitEffect::NotCommitted)?;
+        let sleep_for = self.remaining_now();
+        tokio::select! {
+            biased;
+            () = self.cancellation.cancelled() => Err(PortError::Cancelled(budget_failure(CommitEffect::Unknown))),
+            () = tokio::time::sleep(sleep_for) => Err(PortError::DeadlineExceeded(budget_failure(CommitEffect::Unknown))),
+            result = operation => result,
+        }
+    }
     pub async fn configure(&self, tx: &mut Transaction) -> Result<(), PortError> {
         // Override pool-default 250ms statement_timeout as well as idle timeout
         // so bounded cuts/imports/exports honour their explicit operation budget.

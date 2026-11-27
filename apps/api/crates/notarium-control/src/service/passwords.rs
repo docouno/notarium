@@ -93,7 +93,7 @@ impl ControlService {
             }
             mint_session(tx.inner_mut(),&current,self.clock.now_ms()?).await
         },CommitEffect::NotCommitted).await?;
-        budget.run(tx.commit(), CommitEffect::Unknown).await?;
+        budget.run_commit(tx.commit()).await?;
         Ok(issued)
     }
     pub async fn account(

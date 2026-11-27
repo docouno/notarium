@@ -344,7 +344,7 @@ async fn apply_one(
     *committed_any = true;
     let mut result = receipt_result(owner, scope, &draft.note, committed, "created")
         .await
-        .map_err(|error| batch_operational_error(LABEL, error, true))?;
+        .map_err(|error| super::super::post_commit_error(LABEL, error))?;
     if result.get("noteId").is_some() {
         result["bodyBytes"] = json!(draft.body_bytes);
         result["bodyHash"] = json!(draft.body_hash);

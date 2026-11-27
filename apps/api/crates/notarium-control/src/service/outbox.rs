@@ -133,7 +133,7 @@ impl ControlService {
             fence.check()?;
             tx.hold_revocation_fence(fence);
         }
-        budget.run(tx.commit(), CommitEffect::Unknown).await
+        budget.run_commit(tx.commit()).await
     }
     pub(super) async fn flush_event(
         &self,
@@ -198,7 +198,7 @@ impl ControlService {
             "UPDATE revocation_events SET attempts=attempts+1 WHERE event_id=$1 AND delivered_at IS NULL",
             "UPDATE v1_control.revocation_events SET attempts=attempts+1 WHERE event_id=$1 AND delivered_at IS NULL"; &event.event_id)
         },CommitEffect::NotCommitted).await?;
-        budget.run(tx.commit(), CommitEffect::Unknown).await?;
+        budget.run_commit(tx.commit()).await?;
         if changed == 0 {
             return Ok(());
         }
@@ -222,6 +222,6 @@ impl ControlService {
             "UPDATE revocation_events SET delivered_at=$1 WHERE event_id=$2 AND delivered_at IS NULL",
             "UPDATE v1_control.revocation_events SET delivered_at=$1 WHERE event_id=$2 AND delivered_at IS NULL"; now,&event.event_id)
         },CommitEffect::NotCommitted).await?;
-        budget.run(tx.commit(), CommitEffect::Unknown).await
+        budget.run_commit(tx.commit()).await
     }
 }

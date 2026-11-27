@@ -119,10 +119,6 @@ pub(super) async fn retrieve(
     };
     let limit = usize::from(args.limit.unwrap_or(if recall { 100 } else { 20 }));
     let budget = args.budget_tokens.unwrap_or(4000);
-    let source_budget = args
-        .max_per_source
-        .map_or(budget / 2, u32::from)
-        .min(budget);
     // Validate pure query/numeric limits before resolving any target Space so
     // malformed requests never act as zero-taint project-slug oracles.
     if args.query.len() > 4096 {
@@ -130,24 +126,32 @@ pub(super) async fn retrieve(
     }
     let top_k =
         PageLimit::new(u16::try_from(limit).map_err(|_| invalid(ValidationReason::InvalidLimit))?)?;
-    let max_per_source = if recall {
+    let (source_budget, max_per_source) = if recall {
         if args.depth.unwrap_or(1) > RecallQuery::MAX_GRAPH_DEPTH {
             return Err(invalid(ValidationReason::InvalidLimit));
         }
-        let source_cap =
-            u16::try_from(source_budget).map_err(|_| invalid(ValidationReason::InvalidLimit))?;
-        if !(1..=131_072).contains(&budget) || source_cap == 0 {
+        if !(1..=131_072).contains(&budget) {
             return Err(invalid(ValidationReason::TokenBudgetExceeded));
         }
-        Some(source_cap)
+        let source_budget = args
+            .max_per_source
+            .map_or_else(|| (budget / 2).max(1).min(u32::from(u16::MAX)), u32::from)
+            .min(budget);
+        let source_cap =
+            u16::try_from(source_budget).map_err(|_| invalid(ValidationReason::InvalidLimit))?;
+        if source_cap == 0 {
+            return Err(invalid(ValidationReason::TokenBudgetExceeded));
+        }
+        (source_budget, Some(source_cap))
     } else {
-        None
+        (budget, None)
     };
     let mut remaining = budget;
     let resolved = targets(call, args.project.as_deref(), args.session.as_ref(), true).await?;
     let targets = resolved.targets;
     let targeted_project = resolved.targeted_project;
     let mut candidates = Vec::new();
+    let mut candidate_bytes = 0usize;
     let mut truncated = false;
     let mut own_degradation = BTreeSet::new();
     let mut foreign_degradation = BTreeSet::new();
@@ -320,6 +324,8 @@ pub(super) async fn retrieve(
                     own_degradation.insert(degraded(reason));
                 }
             }
+            const MAX_IN_APP_CANDIDATES: usize = 4096;
+            const MAX_IN_APP_CANDIDATE_BYTES: usize = 16 * 1024 * 1024;
             for hit in result.hits {
                 let metadata = hit.card.document.provenance();
                 if metadata.reference().space_id != target.scope.space_id || !hit.score.is_finite()
@@ -328,6 +334,25 @@ pub(super) async fn retrieve(
                 }
                 if !matches_target(metadata, &classes, target.project.as_ref()) {
                     continue;
+                }
+                if !external {
+                    let hit_bytes = hit
+                        .card
+                        .title
+                        .len()
+                        .saturating_add(hit.card.path.len())
+                        .saturating_add(
+                            hit.chunks
+                                .iter()
+                                .map(|chunk| chunk.text().len())
+                                .sum::<usize>(),
+                        );
+                    candidate_bytes = candidate_bytes.saturating_add(hit_bytes);
+                    if candidates.len() >= MAX_IN_APP_CANDIDATES
+                        || candidate_bytes > MAX_IN_APP_CANDIDATE_BYTES
+                    {
+                        return Err(invalid(ValidationReason::BudgetExceeded));
+                    }
                 }
                 candidates.push(Candidate { index, hit });
             }
@@ -350,7 +375,7 @@ pub(super) async fn retrieve(
                 scope: SpaceContext,
                 selection: Option<super::super::ProviderSelection>,
                 source_remaining: u32,
-                parts: Vec<String>,
+                parts: Vec<(usize, String)>,
                 next_chunk_idx: usize,
             }
 
@@ -417,10 +442,10 @@ pub(super) async fn retrieve(
                         Err(error) => return Err(error),
                     };
                     remaining -= charge;
-                    first_part = Some((text, source_budget - tokens, chunk_idx + 1));
+                    first_part = Some((chunk_idx, text, source_budget - tokens, chunk_idx + 1));
                     break;
                 }
-                let Some((text, source_remaining, next_chunk_idx)) = first_part else {
+                let Some((first_idx, text, source_remaining, next_chunk_idx)) = first_part else {
                     call.rollback_provenance(provenance_checkpoint);
                     continue;
                 };
@@ -431,53 +456,71 @@ pub(super) async fn retrieve(
                     scope,
                     selection,
                     source_remaining,
-                    parts: vec![text],
+                    parts: vec![(first_idx, text)],
                     next_chunk_idx,
                 });
             }
 
-            // Pass 2: pack additional chunks from admitted notes in rank order
-            // while per-source and overall token budgets allow.
-            for entry in &mut recalled {
-                let metadata = entry.hit.card.document.provenance();
-                let reference = metadata.reference();
-                for chunk in &entry.hit.chunks[entry.next_chunk_idx..] {
-                    if chunk.provenance().reference() != reference
-                        || chunk.provenance().revision() != metadata.revision()
-                        || chunk.provenance().digest() != metadata.digest()
-                    {
-                        return Err(invalid(ValidationReason::SourceMismatch));
-                    }
-                    let tokens = chunk.part().tokens();
-                    let charge = tokens + framing_tokens(&reference.note_id, false);
-                    if tokens > entry.source_remaining || charge > remaining {
-                        truncated = true;
-                        continue;
-                    }
-                    let text = match corpus::search_part_with_selection(
-                        call,
-                        &entry.scope,
-                        metadata,
-                        chunk,
-                        entry.selection.as_ref(),
-                    )
-                    .await
-                    {
-                        Ok(text) => text,
-                        Err(error) if corpus::hidden(&error) => continue,
-                        Err(error) => return Err(error),
-                    };
-                    entry.source_remaining -= tokens;
-                    remaining -= charge;
-                    entry.parts.push(text);
+            // Pass 2: pack secondary chunks across all admitted notes in global
+            // rank-decayed score order (`score / (rank_within_note + 1)`), matching
+            // single-Space hydration so note #1 does not drain the budget ahead of
+            // stronger secondary chunks from other admitted notes.
+            let mut secondary: Vec<(usize, usize, f64)> = Vec::new();
+            for (note_idx, entry) in recalled.iter().enumerate() {
+                for (offset, chunk_idx) in
+                    (entry.next_chunk_idx..entry.hit.chunks.len()).enumerate()
+                {
+                    let rank_within_note = offset + 1;
+                    let decayed = entry.hit.score / ((rank_within_note + 1) as f64);
+                    secondary.push((note_idx, chunk_idx, decayed));
                 }
             }
+            secondary.sort_by(|a, b| {
+                b.2.total_cmp(&a.2)
+                    .then_with(|| a.0.cmp(&b.0))
+                    .then_with(|| a.1.cmp(&b.1))
+            });
+            for (note_idx, chunk_idx, _) in secondary {
+                let entry = &mut recalled[note_idx];
+                let metadata = entry.hit.card.document.provenance();
+                let reference = metadata.reference();
+                let chunk = &entry.hit.chunks[chunk_idx];
+                if chunk.provenance().reference() != reference
+                    || chunk.provenance().revision() != metadata.revision()
+                    || chunk.provenance().digest() != metadata.digest()
+                {
+                    return Err(invalid(ValidationReason::SourceMismatch));
+                }
+                let tokens = chunk.part().tokens();
+                let charge = tokens + framing_tokens(&reference.note_id, false);
+                if tokens > entry.source_remaining || charge > remaining {
+                    truncated = true;
+                    continue;
+                }
+                let text = match corpus::search_part_with_selection(
+                    call,
+                    &entry.scope,
+                    metadata,
+                    chunk,
+                    entry.selection.as_ref(),
+                )
+                .await
+                {
+                    Ok(text) => text,
+                    Err(error) if corpus::hidden(&error) => continue,
+                    Err(error) => return Err(error),
+                };
+                entry.source_remaining -= tokens;
+                remaining -= charge;
+                entry.parts.push((chunk_idx, text));
+            }
 
-            for entry in recalled {
+            for mut entry in recalled {
+                entry.parts.sort_by_key(|(idx, _)| *idx);
                 let metadata = entry.hit.card.document.provenance();
                 let reference = metadata.reference();
                 combined.push_str(&format!("## {}\n", reference.note_id));
-                for part in &entry.parts {
+                for (_, part) in &entry.parts {
                     combined.push_str(part);
                     combined.push_str("\n\n");
                 }

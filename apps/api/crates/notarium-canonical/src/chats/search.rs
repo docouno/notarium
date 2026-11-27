@@ -1350,19 +1350,25 @@ async fn read_chain(
     stop_at: Option<ThreadEntrySeq>,
     limit: PageLimit,
 ) -> Result<Vec<Entry>, PortError> {
-    const SQL: &str = "WITH RECURSIVE chain(entry_seq, parent_seq, hops) AS (
-        SELECT entry_seq, parent_seq, 1 FROM chat_entries
+    const SQL: &str = "WITH RECURSIVE chain(
+        entry_seq, parent_seq, branch_depth, kind, author_id, body_format,
+        inline_text, payload_blake3, checkpoint_stale, ext_space_tainted, hops
+    ) AS (
+        SELECT entry_seq, parent_seq, CAST(branch_depth AS BIGINT), kind, author_id, body_format,
+               inline_text, payload_blake3, CAST(checkpoint_stale AS BIGINT), CAST(ext_space_tainted AS BIGINT), 1
+        FROM chat_entries
         WHERE space_id = $1 AND thread_id = $2 AND entry_seq = $3 AND entry_seq <> $5
         UNION ALL
-        SELECT p.entry_seq, p.parent_seq, c.hops + 1 FROM chain c
-        JOIN chat_entries p ON p.space_id = $1 AND p.thread_id = $2 AND p.entry_seq = c.parent_seq
-        WHERE c.hops < $4 AND p.entry_seq <> $5
-    ) SELECT e.entry_seq, e.parent_seq, CAST(e.branch_depth AS BIGINT) AS branch_depth,
-        e.kind, e.author_id, e.body_format, e.inline_text, e.payload_blake3,
-        CAST(e.checkpoint_stale AS BIGINT) AS checkpoint_stale,
-        CAST(e.ext_space_tainted AS BIGINT) AS ext_space_tainted
-        FROM chain c JOIN chat_entries e ON e.space_id = $1 AND e.thread_id = $2 AND e.entry_seq = c.entry_seq
-        ORDER BY c.hops";
+        SELECT p.entry_seq, p.parent_seq, CAST(p.branch_depth AS BIGINT), p.kind, p.author_id, p.body_format,
+               p.inline_text, p.payload_blake3, CAST(p.checkpoint_stale AS BIGINT), CAST(p.ext_space_tainted AS BIGINT), c.hops + 1
+        FROM chain c
+        CROSS JOIN chat_entries p
+        WHERE c.hops < $4
+          AND p.space_id = $1 AND p.thread_id = $2 AND p.entry_seq = c.parent_seq
+          AND p.entry_seq <> $5
+    ) SELECT entry_seq, parent_seq, branch_depth, kind, author_id, body_format,
+             inline_text, payload_blake3, checkpoint_stale, ext_space_tainted
+      FROM chain";
     let stop_seq = stop_at.map_or(-1_i64, |seq| seq.get() as i64);
     match tx {
         BackendConn::Sqlite(conn) => sqlx::query_as(SQL)

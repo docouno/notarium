@@ -276,11 +276,14 @@ pub(super) async fn prepare(
     // under detached human authority. If an existing consented foreign target
     // fails write admission (`SpaceReadOnly` / `AbilityWriteForbidden`), commit
     // external-read taint so existence/lock/role probes cannot stay untainted.
+    let checkpoint = call.provenance_checkpoint();
     let _probes_foreign_corpus =
         match Box::pin(admit_proposal_targets(call, &planning, &args)).await {
             Ok(probes) => probes,
             Err(error) => {
-                if !matches!(error, PortError::Domain(DomainError::ResourceNotFound)) {
+                if matches!(error, PortError::Domain(DomainError::ResourceNotFound)) {
+                    call.rollback_provenance(checkpoint);
+                } else {
                     call.commit_external_read();
                 }
                 return Err(error);

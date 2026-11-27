@@ -1526,7 +1526,7 @@ fn agent_run_cannot_derive_pat_or_oauth_and_retains_chat_episode() {
         .unwrap()
         .with_chat_episode(ep1.clone());
 
-    // AgentRun must never mint PAT or OAuth contexts.
+    // AgentRun must never mint PAT, OAuth, or Keeper contexts.
     assert_eq!(
         agent.for_pat(grants(SpaceRole::Owner)).unwrap_err(),
         DomainError::validation(ValidationReason::ScopeMismatch)
@@ -1537,6 +1537,46 @@ fn agent_run_cannot_derive_pat_or_oauth_and_retains_chat_episode() {
             .unwrap_err(),
         DomainError::validation(ValidationReason::ScopeMismatch)
     );
+    assert_eq!(
+        agent
+            .for_keeper(
+                AgentRunId::from_bytes([0x62; 16]),
+                s1.clone(),
+                None,
+                BTreeSet::new(),
+            )
+            .unwrap_err(),
+        DomainError::validation(ValidationReason::ScopeMismatch)
+    );
+
+    // Intersecting with a Shared-audience context must keep `DocClass::Profile`
+    // stripped from read and write grants in both directions.
+    let bearer_owner = EngineAuthContext::for_bearer(VerifiedBearer::attest(
+        PrincipalId::from_bytes([1; 16]),
+        GrantId::from_bytes([1; 16]),
+        notarium_core::auth::BearerCredential::Pat(
+            notarium_core::ids::CredentialTokenId::parse("0123456789ab").unwrap(),
+        ),
+        grants(SpaceRole::Owner),
+        notarium_core::ports::BearerScope::Write,
+        true,
+    ));
+    let shared_agent = bearer_owner
+        .for_agent_run(
+            AgentRunId::from_bytes([0x63; 16]),
+            s1.clone(),
+            ChatAudience::Shared,
+            grants(SpaceRole::Owner),
+        )
+        .unwrap();
+    let revalidated_shared = shared_agent.intersect_current(&bearer_owner).unwrap();
+    let shared_grant = revalidated_shared.spaces().get(&s1).unwrap();
+    assert!(!shared_grant.read_classes.contains(&DocClass::Profile));
+    assert!(!shared_grant.write_classes.contains(&DocClass::Profile));
+    let revalidated_flipped = bearer_owner.intersect_current(&shared_agent).unwrap();
+    let flipped_grant = revalidated_flipped.spaces().get(&s1).unwrap();
+    assert!(!flipped_grant.read_classes.contains(&DocClass::Profile));
+    assert!(!flipped_grant.write_classes.contains(&DocClass::Profile));
 
     // Deriving a nested AgentRun must preserve `chat_episode` so it cannot be rebound.
     let nested = agent

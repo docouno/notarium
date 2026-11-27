@@ -195,7 +195,7 @@ impl ControlService {
                 execute!(tx.inner_mut(),"UPDATE control_operations SET state='committed',canonical_receipt=$1,next_action='done',updated_at=$2 WHERE operation_id=$3","UPDATE v1_control.control_operations SET state='committed',canonical_receipt=$1,next_action='done',updated_at=$2 WHERE operation_id=$3";&receipt,self.clock.now_ms()?,id.as_str())?;
                 Ok(())
             },CommitEffect::Unknown).await?;
-            budget.run(tx.commit(),CommitEffect::Unknown).await?;
+            budget.run_commit(tx.commit()).await?;
             Ok(result)
         }.await;
         work.map_err(|_: PortError| {

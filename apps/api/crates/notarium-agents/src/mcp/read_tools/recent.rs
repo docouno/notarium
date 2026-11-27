@@ -19,6 +19,13 @@ use std::collections::{BTreeMap, BTreeSet};
 
 const SPACE_WINDOW: u16 = 200;
 const MAX_CANDIDATES: usize = 200;
+const MAX_IN_APP_CANDIDATES: usize = 4096;
+const MAX_METADATA_PROBES: usize = 512;
+
+struct PreparedTarget {
+    project_only: Option<FolderRef>,
+    allowed_classes: Option<BTreeSet<DocClass>>,
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -39,7 +46,8 @@ pub(super) async fn recent(
     let targeted_project = resolved.targeted_project;
     let external = matches!(call.target, EgressTarget::ExternalMcp);
     let mut candidates = Vec::new();
-    let mut prepared_scopes: Vec<Option<SpaceContext>> = vec![None; targets.len()];
+    let mut prepared_targets: Vec<Option<PreparedTarget>> =
+        (0..targets.len()).map(|_| None).collect();
     let mut truncated = false;
     let mut observed_foreign = false;
     let outcome: Result<Value, PortError> = async {
@@ -50,6 +58,10 @@ pub(super) async fn recent(
                     .auth()
                     .pinned_write_space()
                     .is_some_and(|pin| pin != &target.scope.space_id);
+            let mut prepared = PreparedTarget {
+                project_only: target.project.clone(),
+                allowed_classes: None,
+            };
             if !external {
                 let selection = match call
                     .provider_selection(&read_scope, target.project.clone())
@@ -65,6 +77,7 @@ pub(super) async fn recent(
                             Ok(narrowed) => narrowed,
                             Err(_) => continue,
                         };
+                        prepared.project_only = Some(required);
                     }
                     if foreign_space && targeted_project {
                         // Targeting a consented foreign project observes that Space even
@@ -81,6 +94,7 @@ pub(super) async fn recent(
                     {
                         continue;
                     }
+                    prepared.allowed_classes = Some(sel.policy.allowed_classes);
                 }
             }
             if let Some(project) = &target.project {
@@ -88,6 +102,7 @@ pub(super) async fn recent(
                     Ok(narrowed) => narrowed,
                     Err(_) => continue,
                 };
+                prepared.project_only = Some(project.clone());
             }
             if foreign_space && targeted_project {
                 // Targeting a consented foreign project (explicitly or via episode
@@ -99,7 +114,7 @@ pub(super) async fn recent(
                 observed_foreign |= foreign_space;
                 continue;
             }
-            prepared_scopes[index] = Some(read_scope.clone());
+            prepared_targets[index] = Some(prepared);
             let after = SpaceSeq::new(
                 target
                     .last_seq
@@ -165,6 +180,9 @@ pub(super) async fn recent(
                     continue;
                 }
                 candidates.push(Candidate { index, change });
+                if !external && candidates.len() > MAX_IN_APP_CANDIDATES {
+                    return Err(invalid(ValidationReason::BudgetExceeded));
+                }
             }
             if external && candidates.len() > MAX_CANDIDATES {
                 candidates.sort_by(rank);
@@ -176,6 +194,8 @@ pub(super) async fn recent(
         let mut items = Vec::new();
         let mut handles = BTreeMap::<_, Option<String>>::new();
         let mut inactive_notes = BTreeSet::<(usize, NoteId)>::new();
+        let mut scope_cache = BTreeMap::<usize, SpaceContext>::new();
+        let mut metadata_probes = 0usize;
         for Candidate { index, change } in candidates {
             if items.len() == limit {
                 truncated = true;
@@ -188,7 +208,23 @@ pub(super) async fn recent(
                 continue;
             }
             let target = &targets[index];
-            let Some(base_scope) = prepared_scopes[index].as_ref() else {
+            let Some(prepared) = prepared_targets[index].as_ref() else {
+                continue;
+            };
+            if let std::collections::btree_map::Entry::Vacant(slot) = scope_cache.entry(index) {
+                let mut scope = call.space(target.scope.clone())?;
+                if let Some(classes) = &prepared.allowed_classes {
+                    scope = scope.restrict_read_classes(classes)?;
+                }
+                if let Some(project) = &prepared.project_only {
+                    scope = match scope.restrict_to_project(project) {
+                        Ok(narrowed) => narrowed,
+                        Err(_) => continue,
+                    };
+                }
+                slot.insert(scope);
+            }
+            let Some(base_scope) = scope_cache.get(&index) else {
                 continue;
             };
             if change.class.is_some_and(|class| {
@@ -199,6 +235,12 @@ pub(super) async fn recent(
                     .is_some_and(|grant| grant.read_classes.contains(&class))
             }) {
                 continue;
+            }
+            if !external {
+                metadata_probes += 1;
+                if metadata_probes > MAX_METADATA_PROBES {
+                    return Err(invalid(ValidationReason::BudgetExceeded));
+                }
             }
             let facts = {
                 let mut scope = base_scope.clone();

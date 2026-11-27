@@ -51,7 +51,7 @@ impl ControlService {
             execute!(tx.inner_mut(),"UPDATE users SET revision=$1 WHERE user_id=$2","UPDATE v1_control.users SET revision=$1 WHERE user_id=$2";revision,&current.user_id)?;
             Ok(ControlCommit{value:IssuedOneTime{token:token.secret,purpose:request.purpose,expires_at_ms:expires_at},revision:notarium_core::ids::ControlRevision::new(revision as u64)?})
         },CommitEffect::NotCommitted).await?;
-        budget.run(tx.commit(), CommitEffect::Unknown).await?;
+        budget.run_commit(tx.commit()).await?;
         Ok(result)
     }
     pub async fn consume_one_time(

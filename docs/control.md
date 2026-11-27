@@ -715,7 +715,8 @@ Space/project and all approved package revisions. Role or skill drift pauses the
 schedule. The unique `(schedule, slot)` run and next-slot advancement commit
 together. The next slot is computed after the current time, so a series of missed
 windows produces one catch-up run. A legacy late-fold slot advances without a run
-when its early occurrence already has a receipt under the same configuration.
+when its early occurrence already has a receipt for that schedule and UTC slot
+(including across configuration edits).
 Finite calendars issue their last due slot and store a null next slot. Only the new
 winner receives a non-deserializable ScheduledRun credential and Keeper context.
 Exact retries return `AlreadyClaimed` inspection receipts, including after restart.
@@ -724,7 +725,7 @@ catch-up. A replacement due must be unissued and at or after the current Control
 clock, including after run history expires. Retention protects receipts for a
 live schedule within the 48 hours up to and including its saved due. This covers
 both UTC occurrences of every repeated civil time, across configuration edits.
-A legacy late-fold with an earlier receipt from its current configuration
+A legacy late-fold with an earlier receipt for that schedule and UTC slot
 advances without issuing a run. If older cleanup has already removed receipts,
 Control compares previous cursor advances with retained runs. Complete history
 or a slot inside the minimum retention period still permits a catch-up run. When

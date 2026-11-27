@@ -899,8 +899,10 @@ pub(super) async fn page(
                         _ => String::new(),
                     };
                     loop {
-                        let batch_size =
-                            ((cap + 1 - visible_items.len()) * 2).clamp(32, 256) as i64;
+                        let batch_size = ((cap + 1 - visible_items.len()) * 2)
+                            .clamp(32, 256)
+                            .min((MAX_ABILITY_SCAN + 1).saturating_sub(scanned))
+                            .max(1) as i64;
                         let rows = Box::pin(fetch_ability_package_batch(
                             tx,
                             &rec.space.id,
@@ -966,16 +968,6 @@ pub(super) async fn page(
                         if exhausted {
                             break;
                         }
-                        if scanned >= MAX_ABILITY_SCAN {
-                            return Err(
-                                DomainError::validation(ValidationReason::BudgetExceeded).into()
-                            );
-                        }
-                    }
-                    if scanned >= MAX_ABILITY_SCAN && index + 1 < live.len() {
-                        return Err(
-                            DomainError::validation(ValidationReason::BudgetExceeded).into()
-                        );
                     }
                 }
                 let next = if visible_items.len() > cap {

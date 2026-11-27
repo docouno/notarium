@@ -598,7 +598,7 @@ impl ProviderService {
                 CommitEffect::NotCommitted,
             )
             .await?;
-        runtime.run(tx.commit(), CommitEffect::Unknown).await?;
+        runtime.run_commit(tx.commit()).await?;
         let mut material = runtime
             .run(
                 self.headers(&runtime.budget, &progress.call, &snapshot),
@@ -642,7 +642,7 @@ impl ProviderService {
                 CommitEffect::NotCommitted,
             )
             .await?;
-        runtime.run(tx.commit(), CommitEffect::Unknown).await?;
+        runtime.run_commit(tx.commit()).await?;
         progress.leases.check()?;
         let kind = wire(&snapshot.resource.wire)?;
         material

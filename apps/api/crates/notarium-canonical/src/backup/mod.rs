@@ -195,6 +195,25 @@ where
     true
 }
 
+/// Like `spawn_cleanup_task_if_open`, but permits registering cleanup for already-committed
+/// work (such as undelivered chat leases or backup holds) until `drain_shutdown` closes
+/// the cleanup admission queue.
+pub(crate) fn spawn_cleanup_task_unless_closed<F>(inner: &CanonicalInner, future: F) -> bool
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let mut guard = inner.backup_cleanups.lock().expect("backup cleanups mutex");
+    if inner
+        .backup_cleanups_closed
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return false;
+    }
+    guard.retain(|h| !h.is_finished());
+    guard.push(inner.backup_executor.spawn(future));
+    true
+}
+
 fn resolve_spool_dir(inner: &CanonicalInner) -> Result<PathBuf, PortError> {
     if let Some(custom) = inner
         .backup_spool_override
@@ -320,6 +339,12 @@ async fn wait_for_phase<T>(
     shutdown: &Cancellation,
     operation: impl std::future::Future<Output = Result<T, PortError>>,
 ) -> Result<T, PortError> {
+    if shutdown.is_cancelled() {
+        return Err(cancelled_not_committed(
+            "backup_shutdown",
+            "backup shutting down",
+        ));
+    }
     if cancellation.is_cancelled() {
         return Err(cancelled_not_committed(
             "backup_cancelled",
@@ -330,6 +355,7 @@ async fn wait_for_phase<T>(
         return Err(DomainError::validation(ValidationReason::BudgetExceeded).into());
     }
     tokio::select! {
+        biased;
         () = shutdown.cancelled() => Err(cancelled_not_committed("backup_shutdown", "backup shutting down")),
         () = cancellation.cancelled() => Err(cancelled_not_committed("backup_cancelled", "backup cancelled")),
         result = tokio::time::timeout(remaining, operation) => result.map_err(|_| DomainError::validation(ValidationReason::BudgetExceeded))?,
@@ -3169,14 +3195,28 @@ impl PreparedBackup for CanonicalPreparedBackup {
             let abandoned = Cancellation::default();
             let _cancel_on_drop = CancelOnDrop(abandoned.clone());
             let worker = self.store.inner.backup_executor.spawn(async move {
+                let _aux_guard = tokio::select! {
+                    biased;
+                    () = store.inner.backup_shutdown.cancelled() => {
+                        return Err(cancelled_not_committed("backup_shutdown", "backup shutting down"));
+                    }
+                    () = caller.cancelled() => {
+                        return Err(cancelled_not_committed("backup_cancelled", "backup cancelled"));
+                    }
+                    () = abandoned.cancelled() => {
+                        return Err(cancelled_not_committed("backup_hold_abandoned", "hold acquisition dropped"));
+                    }
+                    guard = store.inner.aux_workers.read() => guard,
+                };
                 let generation = mint_artifact_id()?;
                 let stop = async {
                     tokio::select! {
+                        biased;
+                        () = store.inner.backup_shutdown.cancelled() => cancelled_not_committed("backup_shutdown", "backup shutting down"),
                         () = tokio::time::sleep_until(deadline) =>
                             DomainError::validation(ValidationReason::BudgetExceeded).into(),
                         () = caller.cancelled() => cancelled_not_committed("backup_cancelled", "backup cancelled"),
                         () = abandoned.cancelled() => cancelled_not_committed("backup_hold_abandoned", "hold acquisition dropped"),
-                        () = store.inner.backup_shutdown.cancelled() => cancelled_not_committed("backup_shutdown", "backup shutting down"),
                     }
                 };
                 let (owner, witness) = acquire_owned_hold(&store, &backup_id, &generation, deadline, stop).await?;
@@ -3194,15 +3234,51 @@ impl PreparedBackup for CanonicalPreparedBackup {
                     finished,
                 };
                 let inner = Arc::clone(&store.inner);
-                let cleanup = inner.backup_executor.spawn(async move {
+                let cleanup_store = store.clone();
+                let cleanup_backup_id = backup_id.clone();
+                let cleanup_proof = proof.clone();
+                let registered = spawn_cleanup_task_unless_closed(&inner, async move {
                     tokio::select! {
-                        () = proof.release.cancelled() => {},
-                        () = store.inner.backup_shutdown.cancelled() => {},
+                        () = cleanup_proof.release.cancelled() => {},
+                        () = cleanup_store.inner.backup_shutdown.cancelled() => {},
                     }
-                    proof.release.cancel();
-                    let _drained = proof.copying.write().await;
-                    let mut owner = proof.owner.lock().await.take().expect("hold owns session");
+                    cleanup_proof.release.cancel();
+                    let _drained = cleanup_proof.copying.write().await;
+                    let mut owner = cleanup_proof
+                        .owner
+                        .lock()
+                        .await
+                        .take()
+                        .expect("hold owns session");
                     let result = delete_backup_hold_rows(
+                        &cleanup_store,
+                        &mut owner,
+                        &cleanup_backup_id,
+                        &cleanup_proof.generation,
+                        held_count,
+                    )
+                    .await;
+                    drop(owner);
+                    if result.is_ok() {
+                        let deferred = {
+                            let mut pending = cleanup_store
+                                .inner
+                                .deferred_local_orphan_cleanups
+                                .lock()
+                                .expect("deferred local orphan cleanups mutex");
+                            std::mem::take(&mut *pending)
+                        };
+                        if !deferred.is_empty() {
+                            cleanup_store
+                                .cleanup_unretained_local_files_async(deferred)
+                                .await;
+                        }
+                    }
+                    let _ = done.send(result);
+                });
+                if !registered {
+                    let mut owner = proof.owner.lock().await.take().expect("hold owns session");
+                    let _ = delete_backup_hold_rows(
                         &store,
                         &mut owner,
                         &backup_id,
@@ -3210,10 +3286,11 @@ impl PreparedBackup for CanonicalPreparedBackup {
                         held_count,
                     )
                     .await;
-                    drop(owner);
-                    let _ = done.send(result);
-                });
-                register_cleanup_task(&inner, cleanup);
+                    return Err(cancelled_not_committed(
+                        "backup_shutdown",
+                        "backup shutting down",
+                    ));
+                }
                 Ok::<_, PortError>(hold)
             });
             let hold = worker
@@ -3375,12 +3452,14 @@ impl CanonicalStore {
                 // A cancelled preparation can leave native initialization in flight.
                 // Track the thread through its last database and staging-file access.
                 let (finished, completion) = tokio::sync::oneshot::channel();
-                register_cleanup_task(
-                    &store.inner,
-                    store.inner.backup_executor.spawn(async move {
-                        let _ = completion.await;
-                    }),
-                );
+                if !spawn_cleanup_task_if_open(&store.inner, async move {
+                    let _ = completion.await;
+                }) {
+                    return Err(cancelled_not_committed(
+                        "backup_shutdown",
+                        "backup shutting down",
+                    ));
+                }
                 wait_for_phase(
                     remaining,
                     &ctx.budget.cancellation,

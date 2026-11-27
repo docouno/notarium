@@ -2084,6 +2084,7 @@ async fn load_pending_purge_for_idempotency(
                             "SELECT purge_id, command_hash, old_note_id, retirement_ids_json, sanitized_response_msgpack, canonical_seq
                              FROM pending_purges
                              WHERE space_id = ? AND history_incarnation = ? AND actor_id = ? AND idempotency_key = ?
+                               AND phase <> 'completed'
                              ORDER BY created_at_ms DESC
                              LIMIT 1",
                         )
@@ -2112,6 +2113,7 @@ async fn load_pending_purge_for_idempotency(
                             "SELECT purge_id, command_hash, old_note_id, retirement_ids_json, sanitized_response_msgpack, canonical_seq
                              FROM pending_purges
                              WHERE space_id = $1 AND history_incarnation = $2 AND actor_id = $3 AND idempotency_key = $4
+                               AND phase <> 'completed'
                              ORDER BY created_at_ms DESC
                              LIMIT 1",
                         )

@@ -424,6 +424,7 @@ async fn sqlite_hot_control_queries_use_indexes_before_and_after_analyze() {
         .bind(&first_uid)
         .bind("daily")
         .bind("")
+        .bind(64i64)
         .fetch_all(&mut conn)
         .await
         .unwrap();

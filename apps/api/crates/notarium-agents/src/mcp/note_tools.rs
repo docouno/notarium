@@ -451,11 +451,20 @@ async fn admit_destination_anchor(
     if matches!(call.target, EgressTarget::ExternalMcp) {
         return Ok(());
     }
-    let anchor = if let Some(exact) = call
+    let base_snap = call
         .registry
         .engine
-        .resolve_folder_path(scope.clone(), base.clone(), path.to_owned())
+        .resolve_folder_path(scope.clone(), base.clone(), String::new())
         .await?
+        .ok_or(DomainError::ResourceNotFound)?;
+    let expected_path = join_folder_path(&base_snap.path, path);
+    let anchor = if !path.is_empty()
+        && let Some(exact) = call
+            .registry
+            .engine
+            .resolve_folder_path(scope.clone(), base.clone(), path.to_owned())
+            .await?
+        && same_folder_path(&exact.path, &expected_path)
     {
         exact
     } else if base.is_none()
@@ -465,14 +474,11 @@ async fn admit_destination_anchor(
             .engine
             .resolve_folder_path(scope.clone(), None, first.to_owned())
             .await?
+        && same_folder_path(&top.path, first)
     {
         top
     } else {
-        call.registry
-            .engine
-            .resolve_folder_path(scope.clone(), base.clone(), String::new())
-            .await?
-            .ok_or(DomainError::ResourceNotFound)?
+        base_snap
     };
     let project = anchor.project.clone().map(|folder_id| FolderRef {
         space_id: scope.scope().space_id.clone(),
@@ -488,6 +494,17 @@ async fn admit_destination_anchor(
     )
     .await?;
     corpus::record_folder_origin(call, scope, &anchor.reference, project).await
+}
+
+pub(super) fn join_folder_path(base: &str, rel: &str) -> String {
+    let b = base.trim_matches('/');
+    let r = rel.trim_matches('/');
+    match (b.is_empty(), r.is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => r.to_owned(),
+        (false, true) => b.to_owned(),
+        (false, false) => format!("{b}/{r}"),
+    }
 }
 
 fn same_folder_path(actual: &str, expected: &str) -> bool {
@@ -850,7 +867,7 @@ async fn validate_destination(
         .await
         .map_err(map_replay_err)?;
     if trashed.reference != destination {
-        return Err(DomainError::ResourceNotFound.into());
+        return Err(map_replay_err(DomainError::ResourceNotFound.into()));
     }
     if matches!(call.target, EgressTarget::InAppProvider { .. }) {
         let project = trashed.project.map(|folder_id| FolderRef {
@@ -1108,7 +1125,7 @@ async fn move_note(call: &mut ToolCallContext<'_>, input: MoveInput) -> Result<V
         .map_err(|error| batch_operational_error(LABEL, error, created_folder))?;
     receipt_result(call, scope, &route.note, committed, "moved")
         .await
-        .map_err(|error| batch_operational_error(LABEL, error, true))
+        .map_err(|error| post_commit_error(LABEL, error))
 }
 
 fn note_slug(

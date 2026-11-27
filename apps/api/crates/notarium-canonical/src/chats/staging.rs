@@ -242,46 +242,42 @@ impl Drop for UndeliveredLease {
         let Some(staged) = self.staged.take() else {
             return;
         };
-        if self.store.inner.backup_shutdown.is_cancelled() {
-            return;
-        }
         let store = self.store.clone();
         let scope = self.scope.clone();
         let lease = std::mem::take(&mut self.owner_lease);
-        let _ = crate::backup::spawn_cleanup_task_if_open(&self.store.inner, async move {
+        let _ = crate::backup::spawn_cleanup_task_unless_closed(&self.store.inner, async move {
             let mut delay = std::time::Duration::from_millis(25);
+            let mut attempted = false;
             loop {
-                if store.inner.backup_shutdown.is_cancelled() {
+                if attempted && store.inner.backup_shutdown.is_cancelled() {
                     return;
                 }
-                let cleanup = store.with_write_tx_for_space(Some(scope.space_id.clone()), |tx| {
-                    let scope = scope.clone();
-                    let staged = staged.clone();
-                    let lease = lease.clone();
-                    let owner = store.clone();
-                    Box::pin(async move {
-                        let Some(space) =
-                            load_space_record_for_update_opt(tx, &scope.space_id).await?
-                        else {
-                            return Ok(None);
-                        };
-                        if space.scope != scope
-                            || owner
-                                .inner
-                                .check_writer_epoch(&scope.space_id, space.active_epoch)
-                                .is_err()
-                        {
-                            // A new owner can resolve the same durable request/lease.
-                            return Ok(None);
-                        }
-                        release_tx(&owner, tx, &space, &staged, &lease).await
+                attempted = true;
+                let result = store
+                    .with_write_tx_for_space(Some(scope.space_id.clone()), |tx| {
+                        let scope = scope.clone();
+                        let staged = staged.clone();
+                        let lease = lease.clone();
+                        let owner = store.clone();
+                        Box::pin(async move {
+                            let Some(space) =
+                                load_space_record_for_update_opt(tx, &scope.space_id).await?
+                            else {
+                                return Ok(None);
+                            };
+                            if space.scope != scope
+                                || owner
+                                    .inner
+                                    .check_writer_epoch(&scope.space_id, space.active_epoch)
+                                    .is_err()
+                            {
+                                // A new owner can resolve the same durable request/lease.
+                                return Ok(None);
+                            }
+                            release_tx(&owner, tx, &space, &staged, &lease).await
+                        })
                     })
-                });
-                let result = tokio::select! {
-                    biased;
-                    () = store.inner.backup_shutdown.cancelled() => return,
-                    result = cleanup => result,
-                };
+                    .await;
                 match result {
                     Ok(handoff) => {
                         drop(handoff);

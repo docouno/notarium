@@ -614,7 +614,7 @@ async fn execute_general_rollback(
             run_board_moves,
             active_view_notes,
             package_cut,
-        ) = rollback_wait(
+        ) = match rollback_wait(
             &ctx.budget,
             deadline,
             store.with_read_tx_budget(Some(&ctx.budget), |tx| {
@@ -623,7 +623,32 @@ async fn execute_general_rollback(
                 )
             }),
         )
-        .await??;
+        .await?
+        {
+            Ok(discovered) => discovered,
+            Err(
+                err @ (PortError::Domain(DomainError::RevisionConflict { .. })
+                | PortError::Domain(DomainError::ResourceNotFound)),
+            ) => {
+                ctx.budget.remaining = rollback_time_left(&ctx.budget, deadline)?;
+                if let Some(replayed) = rollback_wait(
+                    &ctx.budget,
+                    deadline,
+                    try_replay_completed_receipt::<StoredCommittedRollbackV1>(
+                        store,
+                        ctx.scope(),
+                        idemp,
+                        Some(&ctx.budget),
+                    ),
+                )
+                .await??
+                {
+                    return Ok(replayed.into_committed());
+                }
+                return Err(err);
+            }
+            Err(err) => return Err(err),
+        };
 
         // Load pre-run carriers from CAS ONLY when board views were moved by this run and require
         // `planned_carrier` in `RollbackBoardFactsRequest`.
@@ -1748,9 +1773,25 @@ fn materialize_working_group(
         working_groups.push((group.clone(), Vec::new()));
         return Ok(working_groups.len() - 1);
     }
+    let must_keep_materialized = |nid: &NoteId| {
+        same_group_run_materialized.contains_key(nid)
+            && overlays.get(nid).is_some_and(|ov| {
+                &ov.group == group
+                    && (kept_notes.iter().any(|other_id| {
+                        other_id != nid
+                            && !same_group_run_materialized.contains_key(other_id)
+                            && overlays.get(other_id).is_some_and(|other_ov| {
+                                &other_ov.group == group
+                                    && other_ov.sort_rank_lexo > ov.sort_rank_lexo
+                            })
+                    }) || stale_in_group
+                        .iter()
+                        .any(|(_, meta)| meta.sort_rank_lexo > ov.sort_rank_lexo))
+            })
+    };
     let has_true_overlay = |nid: &NoteId| {
-        !same_group_run_materialized.contains_key(nid)
-            && overlays.get(nid).map(|o| &o.group) == Some(group)
+        overlays.get(nid).map(|o| &o.group) == Some(group)
+            && (!same_group_run_materialized.contains_key(nid) || must_keep_materialized(nid))
     };
     let all_unranked =
         stale_in_group.is_empty() && kept_notes.iter().all(|nid| !has_true_overlay(nid));
@@ -1782,7 +1823,7 @@ fn materialize_working_group(
             .collect();
         ranked_only.sort_by(|a, b| a.rank.cmp(&b.rank).then_with(|| a.note_id.cmp(&b.note_id)));
         items.extend(ranked_only);
-        for (nid, meta) in stale_in_group {
+        for &(nid, meta) in &stale_in_group {
             let collides = items.iter().any(|it| it.rank == meta.sort_rank_lexo);
             if !collides {
                 let pos = items
@@ -3263,33 +3304,49 @@ fn build_rollback_execute_fn(
                     || run_moves_cl.iter().any(|bmh| {
                         &bmh.view == view && eligible_all_ids.contains(&bmh.target_note_id)
                     });
+                let mut run_mat_seqs: BTreeMap<NoteId, SpaceSeq> = BTreeMap::new();
+                if view_has_rollback_effect {
+                    for (nid, ov) in &overlays {
+                        if !retired_note_ids.contains(nid)
+                            && ov.placement_run_id.is_none()
+                            && let Some(seq) = run_materialized_overlay_seq_tx(
+                                tx,
+                                &scope_cl.space_id,
+                                &ov.placement_revision,
+                                &input.run,
+                            )
+                            .await?
+                        {
+                            run_mat_seqs.insert(nid.clone(), seq);
+                        }
+                    }
+                }
+                let mut restored_prerun_in_view: Vec<(NoteId, GroupKey, String)> = Vec::new();
+                let mut pending_mat_deletes: Vec<(NoteId, GroupKey, String)> = Vec::new();
+                let mut cleared_run_owned: BTreeSet<NoteId> = BTreeSet::new();
                 for (nid, ov) in &overlays {
                     if retired_note_ids.contains(nid) {
                         continue;
                     }
-                    let cutoff_seq = if ov.placement_run_id.as_ref() == Some(&input.run) {
+                    let (is_run_mat, cutoff_seq) = if ov.placement_run_id.as_ref()
+                        == Some(&input.run)
+                    {
                         if touched_on_view.contains(nid) {
-                            run_moves_cl
-                                .iter()
-                                .filter(|bmh| &bmh.view == view && &bmh.target_note_id == nid)
-                                .map(|bmh| bmh.command_end_seq)
-                                .min()
+                            (
+                                false,
+                                run_moves_cl
+                                    .iter()
+                                    .filter(|bmh| &bmh.view == view && &bmh.target_note_id == nid)
+                                    .map(|bmh| bmh.command_end_seq)
+                                    .min(),
+                            )
                         } else {
-                            None
+                            (false, None)
                         }
-                    } else if ov.placement_run_id.is_none() && view_has_rollback_effect {
-                        // Also restore or delete neighbor overlays newly materialized solely by
-                        // `input.run` (`placement_run_id = None` with a rank revision authored by
-                        // `input.run`).
-                        run_materialized_overlay_seq_tx(
-                            tx,
-                            &scope_cl.space_id,
-                            &ov.placement_revision,
-                            &input.run,
-                        )
-                        .await?
+                    } else if let Some(&seq) = run_mat_seqs.get(nid) {
+                        (true, Some(seq))
                     } else {
-                        None
+                        (false, None)
                     };
                     if let Some(before_seq) = cutoff_seq {
                         if let Some(meta) = load_latest_prerun_rank_meta_tx(
@@ -3298,6 +3355,11 @@ fn build_rollback_execute_fn(
                         .await?
                             && !meta.removed
                         {
+                            restored_prerun_in_view.push((
+                                nid.clone(),
+                                meta.group_key.clone(),
+                                meta.sort_rank_lexo.clone(),
+                            ));
                             planned_target_restores.push(PlannedTargetRankRestore {
                                 view: view.clone(),
                                 target_note: nid.clone(),
@@ -3307,12 +3369,40 @@ fn build_rollback_execute_fn(
                                 restored_placement_actor: Some(meta.placement_actor_id),
                                 restored_placement_run: meta.placement_run_id,
                             });
+                        } else if is_run_mat {
+                            pending_mat_deletes.push((
+                                nid.clone(),
+                                ov.group.clone(),
+                                ov.sort_rank_lexo.clone(),
+                            ));
                         } else {
+                            cleared_run_owned.insert(nid.clone());
                             planned_overlay_deletes.push(PlannedOverlayDelete {
                                 view: view.clone(),
                                 target_note: nid.clone(),
                             });
                         }
+                    }
+                }
+                for (nid, grp, rank) in pending_mat_deletes {
+                    let has_surviving_ranked_below = overlays.iter().any(|(other_id, other_ov)| {
+                        other_id != &nid
+                            && other_ov.group == grp
+                            && !retired_note_ids.contains(other_id)
+                            && !run_mat_seqs.contains_key(other_id)
+                            && !cleared_run_owned.contains(other_id)
+                            && !restored_prerun_in_view
+                                .iter()
+                                .any(|(rid, _, _)| rid == other_id)
+                            && other_ov.sort_rank_lexo > rank
+                    }) || restored_prerun_in_view
+                        .iter()
+                        .any(|(rid, rgrp, rrank)| rid != &nid && rgrp == &grp && rrank > &rank);
+                    if !has_surviving_ranked_below {
+                        planned_overlay_deletes.push(PlannedOverlayDelete {
+                            view: view.clone(),
+                            target_note: nid,
+                        });
                     }
                 }
                 preloaded_view_overlays.insert(view.clone(), overlays);
@@ -6487,6 +6577,7 @@ async fn try_execute_pg_root_rollback(
                 .is_some_and(|metadata| metadata.pre_meta.slug_fold == super::folder_cover::SLUG)
         })
     {
+        *try_pg_batch_plan = false;
         park_pg_rollback_connection(store, pooled);
         return None;
     }
@@ -6509,6 +6600,7 @@ async fn try_execute_pg_root_rollback(
             .authorize_direct_write(&root_facts, &root_facts)
             .is_err()
     {
+        *try_pg_batch_plan = false;
         park_pg_rollback_connection(store, pooled);
         return None;
     }
@@ -7808,6 +7900,12 @@ async fn execute_pg_fast_rollback_inner(
         if head.doc_class == DocClass::Skill || head.ability_id.is_some() {
             return PgFastInnerResult::Failed {
                 err: rollback_fallback_ability_slot_err(),
+                effective_cut: Some(current_effective_cut),
+            };
+        }
+        if head.slug_fold == super::folder_cover::SLUG {
+            return PgFastInnerResult::Failed {
+                err: rollback_fallback_cover_change_err(),
                 effective_cut: Some(current_effective_cut),
             };
         }

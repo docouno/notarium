@@ -437,7 +437,10 @@ impl EngineAuthContext {
         project_root: Option<FolderId>,
         readonly_abilities: BTreeSet<AbilityId>,
     ) -> DomainResult<Self> {
-        if self.keeper_log.is_some()
+        if matches!(self.kind, PrincipalKind::AgentRun(_))
+            || self.chat_episode.is_some()
+            || (!matches!(self.kind, PrincipalKind::Keeper(_)) && self.chat_audience.is_some())
+            || self.keeper_log.is_some()
             || matches!(
                 &self.credential,
                 Some(AuthenticatedCredential::ScheduledRun { run: cred_run, .. }) if cred_run != &run
@@ -763,6 +766,10 @@ impl EngineAuthContext {
                     && Self::has_writable_space(&result.spaces)));
         if current.chat_audience == Some(ChatAudience::Shared) {
             result.chat_audience = Some(ChatAudience::Shared);
+            for grant in result.spaces.values_mut() {
+                grant.read_classes.remove(&DocClass::Profile);
+                grant.write_classes.remove(&DocClass::Profile);
+            }
         }
         Ok(result)
     }

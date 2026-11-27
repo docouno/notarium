@@ -1,6 +1,6 @@
 //! Owner-bound episodes and independent per-Space delivery acknowledgements.
 mod cursors;
-pub(crate) const OPEN_EPISODES_BY_NAME_SQLITE_SQL: &str = "SELECT * FROM agent_episodes WHERE owner_id=$1 AND name=$2 AND lifecycle<>'closed' AND episode_id>$3 ORDER BY episode_id LIMIT 64";
+pub(crate) const OPEN_EPISODES_BY_NAME_SQLITE_SQL: &str = "SELECT * FROM agent_episodes WHERE owner_id=$1 AND name=$2 AND lifecycle<>'closed' AND episode_id>$3 ORDER BY episode_id LIMIT $4";
 use super::{
     ControlService,
     authority::*,
@@ -498,15 +498,17 @@ impl ControlService {
                     let mut admitted_rows: Vec<AgentEpisodesRow> = Vec::new();
                     let mut scanned = 0usize;
                     loop {
+                        let fetch_limit = 64usize.min((4096usize + 1).saturating_sub(scanned)).max(1) as i64;
                         let batch = rows!(
                             tx.inner_mut(),
                             AgentEpisodesRow,
                             fetch_all,
                             OPEN_EPISODES_BY_NAME_SQLITE_SQL,
-                            "SELECT * FROM v1_control.agent_episodes WHERE owner_id=$1 AND name=$2 AND lifecycle<>'closed' AND episode_id>$3 ORDER BY episode_id LIMIT 64";
+                            "SELECT * FROM v1_control.agent_episodes WHERE owner_id=$1 AND name=$2 AND lifecycle<>'closed' AND episode_id>$3 ORDER BY episode_id LIMIT $4";
                             &owner.user_id,
                             name,
-                            &after
+                            &after,
+                            fetch_limit
                         )?;
                         let batch_len = batch.len();
                         for row in batch {
@@ -530,11 +532,8 @@ impl ControlService {
                                 return Err(invalid(ValidationReason::BudgetExceeded));
                             }
                         }
-                        if batch_len < 64 {
+                        if batch_len < usize::try_from(fetch_limit).unwrap_or(usize::MAX) {
                             break;
-                        }
-                        if scanned >= 4096 {
-                            return Err(invalid(ValidationReason::BudgetExceeded));
                         }
                     }
                     if admitted_rows.len() > 1 {
@@ -613,7 +612,7 @@ impl ControlService {
             command.save(tx.inner_mut(), revision, &saved, now).await?;
             Ok((revision, current, Some(saved.value), None))
         }, CommitEffect::NotCommitted).await?;
-        budget.run(tx.commit(), CommitEffect::Unknown).await?;
+        budget.run_commit(tx.commit()).await?;
         let value = async {
             let loaded = match replayed_loaded {
                 Some(loaded) => loaded,
@@ -673,15 +672,17 @@ impl ControlService {
                     let mut admitted_count = 0usize;
                     let mut scanned = 0usize;
                     loop {
+                        let fetch_limit = 64usize.min((4096usize + 1).saturating_sub(scanned)).max(1) as i64;
                         let matches = rows!(
                             tx.inner_mut(),
                             AgentEpisodesRow,
                             fetch_all,
                             OPEN_EPISODES_BY_NAME_SQLITE_SQL,
-                            "SELECT * FROM v1_control.agent_episodes WHERE owner_id=$1 AND name=$2 AND lifecycle<>'closed' AND episode_id>$3 ORDER BY episode_id LIMIT 64";
+                            "SELECT * FROM v1_control.agent_episodes WHERE owner_id=$1 AND name=$2 AND lifecycle<>'closed' AND episode_id>$3 ORDER BY episode_id LIMIT $4";
                             current.auth().principal().as_str(),
                             &episode_name,
-                            &after
+                            &after,
+                            fetch_limit
                         )?;
                         let batch_len = matches.len();
                         for row in matches {
@@ -708,11 +709,8 @@ impl ControlService {
                                 return Err(invalid(ValidationReason::BudgetExceeded));
                             }
                         }
-                        if batch_len < 64 {
+                        if batch_len < usize::try_from(fetch_limit).unwrap_or(usize::MAX) {
                             break;
-                        }
-                        if scanned >= 4096 {
-                            return Err(invalid(ValidationReason::BudgetExceeded));
                         }
                     }
                     match admitted_count {
@@ -1001,7 +999,7 @@ impl ControlService {
             command.save(tx.inner_mut(), revision, &saved, now).await?;
             Ok((revision, current, saved.value))
         }, CommitEffect::NotCommitted).await?;
-        budget.run(tx.commit(), CommitEffect::Unknown).await?;
+        budget.run_commit(tx.commit()).await?;
         let value = async {
             let mut rtx = self.store.read(budget.clone()).await?;
             let loaded = budget
@@ -1068,7 +1066,7 @@ impl ControlService {
                 CommitEffect::NotCommitted,
             )
             .await?;
-        budget.run(tx.commit(), CommitEffect::Unknown).await
+        budget.run_commit(tx.commit()).await
     }
 }
 

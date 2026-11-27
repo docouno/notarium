@@ -385,6 +385,9 @@ async fn plan_link_located(
     validate_single_link(&source, edge)?;
     corpus::admit_note_write(call, &scope, &note).await?;
     super::super::note_tools::authorize_note_write(&scope, &note.facts)?;
+    if provider.is_none() {
+        corpus::record_note_origin_by_id(call, &scope, &source).await?;
+    }
     let target = resolve(
         call,
         provider,
@@ -730,13 +733,15 @@ struct Prepared {
 }
 
 async fn many(call: &mut ToolCallContext<'_>, inputs: Vec<LinkInput>) -> Result<Value, PortError> {
+    const LABEL: &str = "notarium.mcp.link-many-batch.v1";
     let mut results = vec![None; inputs.len()];
     let mut batches = BTreeMap::<SpaceId, Vec<Prepared>>::new();
+    let mut any_replayed = false;
     for (index, input) in inputs.into_iter().enumerate() {
         let ordinal = u16::try_from(index).map_err(|_| invalid(ValidationReason::InvalidLimit))?;
         let label = format!("link-route-{ordinal}");
+        let mut replayed = true;
         let planned = async {
-            let mut replayed = true;
             let journaled: JournaledLinkPlan = call
                 .journal(&label, || async {
                     replayed = false;
@@ -751,6 +756,9 @@ async fn many(call: &mut ToolCallContext<'_>, inputs: Vec<LinkInput>) -> Result<
             Ok::<_, PortError>(plan)
         }
         .await;
+        if replayed {
+            any_replayed = true;
+        }
         match planned {
             Ok(plan) => batches
                 .entry(plan.scope.space_id.clone())
@@ -759,10 +767,15 @@ async fn many(call: &mut ToolCallContext<'_>, inputs: Vec<LinkInput>) -> Result<
             Err(PortError::Domain(error)) if !matches!(error, DomainError::RateLimited { .. }) => {
                 results[index] = Some(json!({"index": index, "ok": false, "error": error.code()}));
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                return Err(super::super::note_tools::batch_operational_error(
+                    LABEL,
+                    error,
+                    any_replayed,
+                ));
+            }
         }
     }
-    const LABEL: &str = "notarium.mcp.link-many-batch.v1";
     let mut committed_any = false;
     for batch in batches.into_values() {
         let prepared_batch = async {

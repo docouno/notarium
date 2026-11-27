@@ -116,7 +116,7 @@ impl ProviderService {
                     CommitEffect::NotCommitted,
                 )
                 .await?;
-            budget.run(tx.commit(), CommitEffect::Unknown).await?;
+            budget.run_commit(tx.commit()).await?;
             settled += 1;
         }
         let continuation = if candidates.has_more {

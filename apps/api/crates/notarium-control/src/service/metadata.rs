@@ -336,21 +336,24 @@ impl ControlService {
         }) {
             return Err(invalid(ValidationReason::CursorStale));
         }
-        // One bounded canonical page per call. Empty filtered pages retain progress.
-        let start = cursor.as_ref().map(|cursor| &cursor.space);
-        let Some(space) = current
-            .auth()
-            .spaces()
-            .keys()
-            .find(|space| start.is_none_or(|start| *space >= start))
-            .cloned()
-        else {
+        // Coalesce empty Spaces within one bounded call so callers scanning many
+        // accessible Spaces do not repeat account revalidation on every empty Space.
+        const MAX_SPACES_PER_CALL: usize = 256;
+        let spaces: Vec<SpaceId> = current.auth().spaces().keys().cloned().collect();
+        let start_idx = match cursor.as_ref() {
+            Some(cursor) => spaces
+                .iter()
+                .position(|space| space >= &cursor.space)
+                .unwrap_or(spaces.len()),
+            None => 0,
+        };
+        if start_idx >= spaces.len() {
             return Ok(ControlPage {
                 items: vec![],
                 continuation: None,
             });
-        };
-        let inner = cursor
+        }
+        let mut inner = cursor
             .as_ref()
             .and_then(|cursor| cursor.inner.as_ref())
             .map(|value| {
@@ -363,67 +366,74 @@ impl ControlService {
                 String::from_utf8(bytes).map_err(|_| invalid(ValidationReason::InvalidQuery))
             })
             .transpose()?;
-        let catalog = budget
-            .run(
-                self.catalog_space(&current, &space),
-                CommitEffect::NotCommitted,
-            )
-            .await?;
-        let result = budget
-            .run(
-                self.catalog.projects(
-                    SpaceContext::new(
-                        current.auth().clone(),
-                        catalog.history,
-                        budget.context(ctx.budget.request.clone()),
-                    )?,
-                    ControlPageRequest::new(page.limit(), inner.clone())?,
-                ),
-                CommitEffect::NotCommitted,
-            )
-            .await?;
-        if result.items.len() > usize::from(page.limit())
-            || result.continuation.as_ref().is_some_and(|next| {
-                next.is_empty() || next.len() > 2048 || Some(next) == inner.as_ref()
-            })
-        {
-            return Err(invalid(ValidationReason::InvalidState));
-        }
-        let mut items = Vec::with_capacity(result.items.len());
-        for project in result.items {
-            if project.folder.space_id != space || project.name.len() > 4096 {
+        let mut items = Vec::new();
+        let mut next: Option<ProjectCursor> = None;
+        let mut checked_spaces = 0usize;
+        for idx in start_idx..spaces.len() {
+            let space = &spaces[idx];
+            let catalog = budget
+                .run(
+                    self.catalog_space(&current, space),
+                    CommitEffect::NotCommitted,
+                )
+                .await?;
+            let current_inner = inner.take();
+            let result = budget
+                .run(
+                    self.catalog.projects(
+                        SpaceContext::new(
+                            current.auth().clone(),
+                            catalog.history,
+                            budget.context(ctx.budget.request.clone()),
+                        )?,
+                        ControlPageRequest::new(page.limit(), current_inner.clone())?,
+                    ),
+                    CommitEffect::NotCommitted,
+                )
+                .await?;
+            if result.items.len() > usize::from(page.limit())
+                || result.continuation.as_ref().is_some_and(|next_tok| {
+                    next_tok.is_empty()
+                        || next_tok.len() > 2048
+                        || Some(next_tok) == current_inner.as_ref()
+                })
+            {
                 return Err(invalid(ValidationReason::InvalidState));
             }
-            match current.auth().can_view_folder(
-                &catalog.space,
-                &project.folder.folder_id,
-                std::slice::from_ref(&project.folder.folder_id),
-            ) {
-                Ok(()) => items.push(project),
-                Err(DomainError::ResourceNotFound | DomainError::AccessDenied) => (),
-                Err(error) => return Err(error.into()),
+            for project in result.items {
+                if project.folder.space_id != *space || project.name.len() > 4096 {
+                    return Err(invalid(ValidationReason::InvalidState));
+                }
+                match current.auth().can_view_folder(
+                    &catalog.space,
+                    &project.folder.folder_id,
+                    std::slice::from_ref(&project.folder.folder_id),
+                ) {
+                    Ok(()) => items.push(project),
+                    Err(DomainError::ResourceNotFound | DomainError::AccessDenied) => (),
+                    Err(error) => return Err(error.into()),
+                }
             }
-        }
-        let next = if let Some(inner) = result.continuation {
-            Some(ProjectCursor {
-                version: 1,
-                scope,
-                space,
-                inner: Some(URL_SAFE_NO_PAD.encode(inner)),
-            })
-        } else {
-            current
-                .auth()
-                .spaces()
-                .keys()
-                .find(|next| *next > &space)
-                .map(|space| ProjectCursor {
+            checked_spaces += 1;
+            if let Some(next_inner) = result.continuation {
+                next = Some(ProjectCursor {
                     version: 1,
                     scope,
                     space: space.clone(),
+                    inner: Some(URL_SAFE_NO_PAD.encode(next_inner)),
+                });
+                break;
+            }
+            if !items.is_empty() || checked_spaces >= MAX_SPACES_PER_CALL {
+                next = spaces.get(idx + 1).map(|next_space| ProjectCursor {
+                    version: 1,
+                    scope,
+                    space: next_space.clone(),
                     inner: None,
-                })
-        };
+                });
+                break;
+            }
+        }
         let continuation = next
             .map(|next| {
                 serde_json::to_string(&next).map_err(|_| invalid(ValidationReason::InvalidState))
