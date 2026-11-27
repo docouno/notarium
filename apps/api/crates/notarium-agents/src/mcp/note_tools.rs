@@ -482,11 +482,72 @@ async fn admit_destination_anchor(
         call,
         scope,
         &anchor.reference,
-        project,
+        project.clone(),
         &anchor.ancestor_folders,
         class,
     )
-    .await
+    .await?;
+    corpus::record_folder_origin(call, scope, &anchor.reference, project).await
+}
+
+fn same_folder_path(actual: &str, expected: &str) -> bool {
+    let mut a = actual
+        .trim_matches('/')
+        .split('/')
+        .filter(|s| !s.is_empty());
+    let mut e = expected
+        .trim_matches('/')
+        .split('/')
+        .filter(|s| !s.is_empty());
+    loop {
+        match (a.next(), e.next()) {
+            (Some(x), Some(y)) => {
+                if notarium_syntax::unicode::lookup_key(x)
+                    != notarium_syntax::unicode::lookup_key(y)
+                {
+                    return false;
+                }
+            }
+            (None, None) => return true,
+            _ => return false,
+        }
+    }
+}
+
+/// Returns `true` only when `(base, path)` resolves to an exact live folder path
+/// rather than a historical folder alias (where `ensure_folder_path` would still
+/// create a new live folder at `path`).
+pub(super) async fn live_folder_exists_at(
+    call: &ToolCallContext<'_>,
+    scope: &SpaceContext,
+    base: Option<&FolderId>,
+    path: &str,
+) -> Result<bool, PortError> {
+    let trimmed = path.trim_matches('/');
+    if trimmed.is_empty() {
+        return Ok(true);
+    }
+    let Some(resolved) = call
+        .registry
+        .engine
+        .resolve_folder_path(scope.clone(), base.cloned(), trimmed.to_owned())
+        .await?
+    else {
+        return Ok(false);
+    };
+    let expected = match base {
+        Some(base_id) => {
+            let base_snap = folder_base(call, scope, base_id).await?;
+            let prefix = base_snap.path.trim_matches('/');
+            if prefix.is_empty() {
+                trimmed.to_owned()
+            } else {
+                format!("{prefix}/{trimmed}")
+            }
+        }
+        None => trimmed.to_owned(),
+    };
+    Ok(same_folder_path(&resolved.path, &expected))
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -766,12 +827,15 @@ async fn validate_destination(
                 call,
                 scope,
                 &destination,
-                project,
+                project.clone(),
                 &live.ancestor_folders,
                 class,
             )
             .await
             .map_err(map_replay_err)?;
+            corpus::record_folder_origin(call, scope, &destination, project)
+                .await
+                .map_err(map_replay_err)?;
         }
         return Ok((destination, created));
     }
@@ -871,13 +935,8 @@ async fn ensure_destination(
                                 .into());
                             }
                         }
-                        let existed = path.is_empty()
-                            || call
-                                .registry
-                                .engine
-                                .resolve_folder_path(scope.clone(), base.clone(), path)
-                                .await?
-                                .is_some();
+                        let existed =
+                            live_folder_exists_at(call, scope, base.as_ref(), &path).await?;
                         Ok(DestinationPrecheck::WithStrip {
                             existed,
                             stripped_segments,

@@ -220,7 +220,7 @@ impl ControlService {
             return Err(DomainError::ResourceNotFound.into());
         }
         let owner = user_read(tx, ctx.auth().principal().as_str()).await?;
-        if !episode_visible_to_narrowed(
+        if !episode_project_admitted(
             ctx.auth(),
             owner.personal_space_id.as_deref(),
             stored_project_ref(&row)?.as_ref(),
@@ -382,7 +382,7 @@ impl ControlService {
                 let mut choices = Vec::with_capacity(ids.len());
                 for id in ids {
                     let row = episode(tx, ctx.auth().principal(), &id).await?;
-                    if !episode_visible_to_narrowed(
+                    if !episode_project_admitted(
                         ctx.auth(),
                         owner.personal_space_id.as_deref(),
                         stored_project_ref(&row)?.as_ref(),
@@ -511,6 +511,9 @@ impl ControlService {
                         let batch_len = batch.len();
                         for row in batch {
                             scanned = scanned.saturating_add(1);
+                            if scanned > 4096 {
+                                return Err(invalid(ValidationReason::BudgetExceeded));
+                            }
                             after = row.episode_id.clone();
                             let project = stored_project_ref(&row)?;
                             if !episode_project_admitted(
@@ -666,7 +669,8 @@ impl ControlService {
                     let owner =
                         user_read(tx.inner_mut(), current.auth().principal().as_str()).await?;
                     let mut after = String::new();
-                    let mut admitted: Vec<Option<FolderRef>> = Vec::with_capacity(2);
+                    let mut first_project: Option<Option<FolderRef>> = None;
+                    let mut admitted_count = 0usize;
                     let mut scanned = 0usize;
                     loop {
                         let matches = rows!(
@@ -682,6 +686,9 @@ impl ControlService {
                         let batch_len = matches.len();
                         for row in matches {
                             scanned = scanned.saturating_add(1);
+                            if scanned > 4096 {
+                                return Err(invalid(ValidationReason::BudgetExceeded));
+                            }
                             after = row.episode_id.clone();
                             let project = stored_project_ref(&row)?;
                             if !episode_project_admitted(
@@ -693,9 +700,12 @@ impl ControlService {
                             ) {
                                 continue;
                             }
-                            admitted.push(project);
-                            if admitted.len() >= 2 {
-                                return Ok(NamedEpisodePreview::Ambiguous);
+                            if first_project.is_none() {
+                                first_project = Some(project);
+                            }
+                            admitted_count = admitted_count.saturating_add(1);
+                            if admitted_count > 200 {
+                                return Err(invalid(ValidationReason::BudgetExceeded));
                             }
                         }
                         if batch_len < 64 {
@@ -705,9 +715,10 @@ impl ControlService {
                             return Err(invalid(ValidationReason::BudgetExceeded));
                         }
                     }
-                    match admitted.pop() {
-                        None => Ok(NamedEpisodePreview::NoMatch),
-                        Some(project) => Ok(NamedEpisodePreview::Unique(project)),
+                    match admitted_count {
+                        0 => Ok(NamedEpisodePreview::NoMatch),
+                        1 => Ok(NamedEpisodePreview::Unique(first_project.flatten())),
+                        _ => Ok(NamedEpisodePreview::Ambiguous),
                     }
                 },
                 CommitEffect::NotCommitted,

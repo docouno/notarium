@@ -56,11 +56,11 @@ pub(in crate::mcp) enum PreparedNoteAction {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(in crate::mcp) struct Destination {
-    anchor: FolderRef,
+    pub(super) anchor: FolderRef,
     revision: RevisionId,
     tail: String,
     path: String,
-    ancestors: Vec<FolderId>,
+    pub(super) ancestors: Vec<FolderId>,
 }
 
 impl PreparedNoteAction {
@@ -255,7 +255,7 @@ fn preview_keeps_changed_lines_and_final_newline_semantics() {
     );
 }
 
-async fn authorize_folder(
+pub(super) async fn authorize_folder(
     call: &ToolCallContext<'_>,
     scope: &SpaceContext,
     target: &FolderRef,
@@ -284,7 +284,7 @@ async fn authorize_folder(
     Ok(())
 }
 
-async fn resolve_destination(
+pub(super) async fn resolve_destination(
     call: &ToolCallContext<'_>,
     scope: &SpaceContext,
     base: Option<FolderId>,
@@ -332,18 +332,6 @@ async fn resolve_destination(
         path: anchor.path,
         ancestors: anchor.ancestor_folders,
     })
-}
-
-pub(super) async fn observe_destination(
-    call: &ToolCallContext<'_>,
-    scope: &SpaceContext,
-    base: Option<FolderId>,
-    path: &str,
-    class: DocClass,
-) -> Result<Destination, PortError> {
-    let destination = resolve_destination(call, scope, base, path).await?;
-    authorize_folder(call, scope, &destination.anchor, class).await?;
-    Ok(destination)
 }
 
 impl Destination {

@@ -51,6 +51,8 @@ pub use abilities::LIST_PACKAGES_SLUG_SQLITE;
 pub(crate) use abilities::{
     ability_manifest_tx, authorize_change_tx as authorize_ability_change_tx, resource_digest_tx,
 };
+#[cfg(feature = "test-support")]
+pub use memory::MEMORY_UNDONE_SLOT_SQL;
 mod commands;
 pub(crate) mod egress;
 pub(crate) mod memory;

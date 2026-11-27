@@ -563,7 +563,16 @@ async fn directory(
             .await;
     }
 
-    // A whole-Space credential can also follow an older Space-relative alias
+    // Resolve project-relative paths first so live subfolders inside the
+    // selected project are never shadowed by an older Space-relative alias.
+    if let Some(folder) = engine
+        .resolve_folder_path(scope.clone(), base, path.to_owned())
+        .await?
+    {
+        return Ok(Some(folder));
+    }
+
+    // A whole-Space credential can fall back to an older Space-relative alias
     // (e.g. a renamed project's former slug), provided the resolved folder
     // belongs to the selected project and all subsequent reads stay narrowed.
     if alias_scope
@@ -578,9 +587,7 @@ async fn directory(
     {
         return Ok(Some(folder));
     }
-    engine
-        .resolve_folder_path(scope.clone(), base, path.to_owned())
-        .await
+    Ok(None)
 }
 
 async fn folder_page(

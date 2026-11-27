@@ -628,6 +628,19 @@ pub(super) fn seq_from_db(seq: i64) -> Result<ThreadEntrySeq, PortError> {
     })?)?)
 }
 
+pub const OTHER_HUMAN_ON_BRANCH_SQL: &str =
+    "WITH RECURSIVE path(entry_seq, parent_seq, author_id, human_origin) AS (
+        SELECT entry_seq, parent_seq, author_id, human_origin FROM chat_entries
+        WHERE space_id = $1 AND thread_id = $2 AND entry_seq = $3
+        UNION ALL
+        SELECT e.entry_seq, e.parent_seq, e.author_id, e.human_origin FROM path p
+        CROSS JOIN chat_entries e
+        WHERE p.parent_seq > $4
+          AND e.space_id = $1 AND e.thread_id = $2 AND e.entry_seq = p.parent_seq
+    ) SELECT CAST(CASE WHEN EXISTS (
+        SELECT 1 FROM path WHERE author_id <> $5 AND COALESCE(human_origin, 1) = 1
+    ) THEN 1 ELSE 0 END AS BIGINT)";
+
 pub(super) async fn other_human_on_branch(
     tx: &mut BackendConn<'_>,
     space: &SpaceId,
@@ -641,19 +654,9 @@ pub(super) async fn other_human_on_branch(
     }
     // This is a query over the selected parent chain, never over globally newer
     // sequence numbers which can belong to sibling branches.
-    const SELECT: &str = "WITH RECURSIVE path(entry_seq, parent_seq, author_id, human_origin) AS (
-        SELECT entry_seq, parent_seq, author_id, human_origin FROM chat_entries
-        WHERE space_id = $1 AND thread_id = $2 AND entry_seq = $3
-        UNION ALL
-        SELECT e.entry_seq, e.parent_seq, e.author_id, e.human_origin FROM path p
-        JOIN chat_entries e ON e.space_id = $1 AND e.thread_id = $2 AND e.entry_seq = p.parent_seq
-        WHERE p.parent_seq > $4
-    ) SELECT CAST(CASE WHEN EXISTS (
-        SELECT 1 FROM path WHERE author_id <> $5 AND COALESCE(human_origin, 1) = 1
-    ) THEN 1 ELSE 0 END AS BIGINT)";
     let found: i64 = match tx {
         BackendConn::Sqlite(conn) => {
-            sqlx::query_scalar(SELECT)
+            sqlx::query_scalar(OTHER_HUMAN_ON_BRANCH_SQL)
                 .bind(space.as_str())
                 .bind(thread.as_str())
                 .bind(tip.get() as i64)
@@ -663,7 +666,7 @@ pub(super) async fn other_human_on_branch(
                 .await
         }
         BackendConn::Postgres(conn) => {
-            sqlx::query_scalar(SELECT)
+            sqlx::query_scalar(OTHER_HUMAN_ON_BRANCH_SQL)
                 .bind(space.as_str())
                 .bind(thread.as_str())
                 .bind(tip.get() as i64)

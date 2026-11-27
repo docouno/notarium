@@ -705,6 +705,10 @@ CREATE INDEX IF NOT EXISTS idx_chat_entries_compaction
     ON chat_entries (space_id, thread_id, entry_seq)
     WHERE kind = 'compaction';
 
+CREATE INDEX IF NOT EXISTS idx_chat_entries_tainted
+    ON chat_entries (space_id, thread_id, entry_seq)
+    WHERE ext_space_tainted <> 0;
+
 CREATE INDEX IF NOT EXISTS idx_chat_entries_projection
     ON chat_entries (space_id, thread_id, entry_seq)
     INCLUDE (revision_id, created_space_seq, redacted_at_seq, kind, checkpoint_stale);

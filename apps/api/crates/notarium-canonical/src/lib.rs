@@ -38,12 +38,14 @@ pub use backup::{
 };
 
 #[cfg(feature = "test-support")]
-pub use catalog::LIST_PACKAGES_SLUG_SQLITE;
+pub use catalog::{LIST_PACKAGES_SLUG_SQLITE, MEMORY_UNDONE_SLOT_SQL};
 pub use changes::{
     BroadcastSignal as SpaceSignal, ChangedNoteSummaryV1, CommittedTargets, EFFECT_CODEC_V1,
     EffectBodyV1, EffectEnvelopeV1, ProjectionCatalogSubscription, StoredAwaitReasonV1,
     build_effect_payload_draft,
 };
+#[cfg(feature = "test-support")]
+pub use chats::{OTHER_HUMAN_ON_BRANCH_SQL, THREAD_TAINTED_RANGE_SQL};
 pub use config::{
     BlobBackendConfig, CanonicalConfig, PgConnectConfig, PgTransport, S3AddressingStyle,
     S3BucketMode, S3BucketModePolicy, S3Config, S3Credentials, SqlBackendConfig, WriterConfig,

@@ -14,8 +14,10 @@ use super::{
     receipt_result,
 };
 use crate::mcp::{
-    ToolName,
-    note_tools::proposal::{ConfirmedStep, Destination, assert_absent_id, observe_destination},
+    ToolName, corpus,
+    note_tools::proposal::{
+        ConfirmedStep, Destination, assert_absent_id, authorize_folder, resolve_destination,
+    },
 };
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -158,16 +160,73 @@ pub(in crate::mcp::note_tools) async fn prepare(
     };
     let project = observe_project(owner, &project).await?;
     let place = project_placement(owner, project, false).await?;
+    let collapse = |error: PortError| {
+        if corpus::hidden(&error) {
+            notarium_core::DomainError::ResourceNotFound.into()
+        } else {
+            error
+        }
+    };
+    let provider_scope = provider
+        .space(place.project.scope.clone())
+        .map_err(collapse)?;
+    let project_info = owner
+        .registry
+        .catalog
+        .folder(owner.account(), place.project.reference.clone())
+        .await?;
+    corpus::admit_folder_write(
+        provider,
+        &provider_scope,
+        &place.project.reference,
+        Some(place.project.reference.clone()),
+        &project_info.ancestor_folders,
+        DocClass::UserDoc,
+    )
+    .await
+    .map_err(collapse)?;
+    corpus::record_folder_origin(
+        provider,
+        &provider_scope,
+        &place.project.reference,
+        Some(place.project.reference.clone()),
+    )
+    .await
+    .map_err(collapse)?;
     let mut draft_plans = Vec::with_capacity(drafts.len());
     for (index, draft) in drafts.into_iter().enumerate() {
         let plan = async {
             let draft = PreparedDraft::new(owner, &place, draft?, folder_page, index as u16, None)?;
             assert_absent_id(owner, &place.write_scope, &draft.note).await?;
-            let destination = observe_destination(
+            let destination = resolve_destination(
                 owner,
                 &place.write_scope,
                 Some(place.project.reference.folder_id.clone()),
                 &draft.relative_path,
+            )
+            .await?;
+            corpus::admit_folder_write(
+                provider,
+                &provider_scope,
+                &destination.anchor,
+                Some(place.project.reference.clone()),
+                &destination.ancestors,
+                DocClass::UserDoc,
+            )
+            .await
+            .map_err(collapse)?;
+            corpus::record_folder_origin(
+                provider,
+                &provider_scope,
+                &destination.anchor,
+                Some(place.project.reference.clone()),
+            )
+            .await
+            .map_err(collapse)?;
+            authorize_folder(
+                owner,
+                &place.write_scope,
+                &destination.anchor,
                 DocClass::UserDoc,
             )
             .await?;

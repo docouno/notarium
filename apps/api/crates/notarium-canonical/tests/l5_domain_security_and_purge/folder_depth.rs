@@ -700,6 +700,93 @@ async fn wide_subtree_probes_children_by_parent_before_analyze() {
                 !slug_ab_details.contains("SCAN ability_packages"),
                 "{phase} slug-filtered ability catalog query must not scan ability_packages:\n{slug_ab_details}"
             );
+
+            let mut mem_plan = conn
+                .prepare(&format!(
+                    "EXPLAIN QUERY PLAN {}",
+                    notarium_canonical::MEMORY_UNDONE_SLOT_SQL
+                ))
+                .unwrap();
+            let mem_details = mem_plan
+                .query_map(
+                    rusqlite::params![scope.space_id.as_str(), "rev_rk_0001", "nt_ab_0001"],
+                    |r| r.get::<_, String>(3),
+                )
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+                .join("\n");
+            assert!(
+                !mem_details.contains("SCAN r")
+                    && !mem_details.contains("SCAN revisions")
+                    && !mem_details.contains("SCAN child")
+                    && !mem_details.contains("SCAN creator")
+                    && !mem_details.contains("SCAN rr"),
+                "{phase} memory undone slot query must drive from chain without scanning revisions or rollback_records:\n{mem_details}"
+            );
+
+            let mut taint_plan = conn
+                .prepare(&format!(
+                    "EXPLAIN QUERY PLAN {}",
+                    notarium_canonical::THREAD_TAINTED_RANGE_SQL
+                ))
+                .unwrap();
+            let taint_details = taint_plan
+                .query_map(
+                    rusqlite::params![scope.space_id.as_str(), "thr_1", 10i64, 900i64],
+                    |r| r.get::<_, String>(3),
+                )
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+                .join("\n");
+            assert!(
+                taint_details.contains("idx_chat_entries_tainted")
+                    && !taint_details.contains("SCAN "),
+                "{phase} tainted chat entry range query must seek partial idx_chat_entries_tainted:\n{taint_details}"
+            );
+
+            let mut human_branch_plan = conn
+                .prepare(&format!(
+                    "EXPLAIN QUERY PLAN {}",
+                    notarium_canonical::OTHER_HUMAN_ON_BRANCH_SQL
+                ))
+                .unwrap();
+            let human_branch_details = human_branch_plan
+                .query_map(
+                    rusqlite::params![scope.space_id.as_str(), "thr_1", 900i64, 10i64, "act_1"],
+                    |r| r.get::<_, String>(3),
+                )
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+                .join("\n");
+            assert!(
+                !human_branch_details.contains("SCAN e")
+                    && !human_branch_details.contains("SCAN chat_entries"),
+                "{phase} other_human_on_branch recursive step must drive from path into chat_entries PK:\n{human_branch_details}"
+            );
+
+            const ABILITY_SLOT_CHECK_SQL: &str =
+                include_str!("../../src/domain/ability_slot_check.sql");
+            let mut slot_plan = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {ABILITY_SLOT_CHECK_SQL}"))
+                .unwrap();
+            let slot_details = slot_plan
+                .query_map(
+                    rusqlite::params![scope.space_id.as_str(), "pkg-01", "ab_new", source.as_str()],
+                    |r| r.get::<_, String>(3),
+                )
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+                .join("\n");
+            assert!(
+                slot_details.contains("idx_ability_packages_active_slug")
+                    && !slot_details.contains("SCAN ability_packages")
+                    && !slot_details.contains("SCAN folder_heads"),
+                "{phase} ability_slot_check must seek idx_ability_packages_active_slug without scanning folder_heads:\n{slot_details}"
+            );
         }
     }
     runtime.shutdown().await.unwrap();

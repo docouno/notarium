@@ -665,6 +665,7 @@ pub const CANONICAL_TABLES: &[TableSpec] = &[
         indexes: &[
             "idx_chat_entries_parent",
             "idx_chat_entries_compaction",
+            "idx_chat_entries_tainted",
             "idx_chat_entries_projection",
             "idx_chat_entries_created_change",
             "idx_chat_entries_redacted_change",

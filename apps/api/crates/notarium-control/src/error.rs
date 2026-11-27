@@ -21,6 +21,10 @@ pub(crate) fn database(_: sqlx::Error) -> PortError {
     unavailable("control database operation", CommitEffect::Unknown)
 }
 
+pub(crate) fn database_not_committed(_: sqlx::Error) -> PortError {
+    unavailable("control database operation", CommitEffect::NotCommitted)
+}
+
 pub(crate) fn is_unique_violation(error: &sqlx::Error) -> bool {
     let sqlx::Error::Database(db) = error else {
         return false;
@@ -32,6 +36,6 @@ pub(crate) fn database_or_conflict(error: sqlx::Error) -> PortError {
     if is_unique_violation(&error) {
         invalid(ValidationReason::DuplicateKey)
     } else {
-        database(error)
+        database_not_committed(error)
     }
 }

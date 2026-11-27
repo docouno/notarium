@@ -1,6 +1,24 @@
 use super::*;
 use notarium_core::receipt::CommandIdentity;
 
+pub const MEMORY_UNDONE_SLOT_SQL: &str = "WITH RECURSIVE source(rev_id, parent_rev_id, restored_from_rev_id, visibility_seq, agent_run_id) AS (
+    SELECT rev_id, parent_rev_id, restored_from_rev_id, visibility_seq, agent_run_id
+    FROM revisions WHERE space_id=$1 AND rev_id=$2 AND entity_type='note' AND entity_key=$3
+    UNION
+    SELECT r.rev_id, r.parent_rev_id, r.restored_from_rev_id, r.visibility_seq, r.agent_run_id
+    FROM source CROSS JOIN revisions r
+    WHERE r.space_id=$1 AND r.rev_id=source.restored_from_rev_id
+      AND r.entity_type='note' AND r.entity_key=$3
+)
+SELECT CAST(1 AS BIGINT) FROM source
+CROSS JOIN revisions parent
+CROSS JOIN revisions run
+WHERE source.restored_from_rev_id IS NULL AND source.agent_run_id IS NULL
+  AND parent.space_id=$1 AND parent.rev_id=source.parent_rev_id
+  AND run.space_id=$1 AND run.entity_type='agent_run'
+  AND run.entity_key=parent.agent_run_id AND run.visibility_seq=source.visibility_seq
+LIMIT 1";
+
 pub(crate) fn fixed_note_id(target: &MemoryTarget, category: &str) -> Result<NoteId, PortError> {
     if category.is_empty()
         || category.len() > 64
@@ -107,20 +125,7 @@ pub(crate) async fn authorized_slot(
             // A rollback that undoes creation writes a tombstone in the same atomic cut as
             // the creator run's revision. A manual trash has no such witness. Repeated
             // rollbacks may restore this same tombstone through restored_from_rev_id.
-            let sql = "WITH RECURSIVE source(rev_id, parent_rev_id, restored_from_rev_id, visibility_seq, agent_run_id) AS (
-                SELECT rev_id, parent_rev_id, restored_from_rev_id, visibility_seq, agent_run_id
-                FROM revisions WHERE space_id=$1 AND rev_id=$2 AND entity_type='note' AND entity_key=$3
-                UNION
-                SELECT r.rev_id, r.parent_rev_id, r.restored_from_rev_id, r.visibility_seq, r.agent_run_id
-                FROM source JOIN revisions r ON r.space_id=$1 AND r.rev_id=source.restored_from_rev_id
-                WHERE r.entity_type='note' AND r.entity_key=$3
-            )
-            SELECT CAST(1 AS BIGINT) FROM source
-            JOIN revisions parent ON parent.space_id=$1 AND parent.rev_id=source.parent_rev_id
-            JOIN revisions run ON run.space_id=$1 AND run.entity_type='agent_run'
-                AND run.entity_key=parent.agent_run_id AND run.visibility_seq=source.visibility_seq
-            WHERE source.restored_from_rev_id IS NULL AND source.agent_run_id IS NULL LIMIT 1";
-            let undone: Option<i64> = db!(read tx, sqlx::query_scalar(sql), fetch_optional,
+            let undone: Option<i64> = db!(read tx, sqlx::query_scalar(MEMORY_UNDONE_SLOT_SQL), fetch_optional,
                 rec.scope.space_id.as_str(), head.head_rev_id.as_str(), note.as_str())?;
             if head.lifecycle != Lifecycle::Trashed || undone.is_none() {
                 return Err(DomainError::ResourceNotFound.into());

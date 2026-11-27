@@ -1886,6 +1886,40 @@ async fn execute_sql_erasure_for_old_note_tx(
         }
     }
 
+    // 5c. Scrub any prior MintAndPurge pending_purges rows where this purged note was
+    //     recorded as the encrypted successor so neither its RevisionId nor un-scrubbed
+    //     receipt detail survives hard purge or leaks into subsequent backups.
+    match tx {
+        BackendConn::Sqlite(conn) => {
+            sqlx::query(
+                "UPDATE pending_purges
+                 SET new_note_rev_id = NULL, sanitized_response_msgpack = X''
+                 WHERE space_id = ? AND new_note_id = ?",
+            )
+            .bind(scope.space_id.as_str())
+            .bind(old_id_str)
+            .execute(&mut **conn)
+            .await
+            .map_err(|err| {
+                internal_not_committed("sqlite_scrub_successor_pending_purges", err.to_string())
+            })?;
+        }
+        BackendConn::Postgres(conn) => {
+            sqlx::query(
+                "UPDATE pending_purges
+                 SET new_note_rev_id = NULL, sanitized_response_msgpack = ''::BYTEA
+                 WHERE space_id = $1 AND new_note_id = $2",
+            )
+            .bind(scope.space_id.as_str())
+            .bind(old_id_str)
+            .execute(&mut **conn)
+            .await
+            .map_err(|err| {
+                internal_not_committed("pg_scrub_successor_pending_purges", err.to_string())
+            })?;
+        }
+    }
+
     // 6. Release CAS references for NoteRevision + CollabSnapshot, and seal zero-ref digests into `'retiring'`!
     let note_zero =
         release_owner_blob_refs_tx(tx, &scope.space_id, BlobOwnerKind::NoteRevision, old_id_str)
@@ -2206,7 +2240,9 @@ async fn mark_pending_purge_completed_tx(
                     BackendConn::Sqlite(conn) => {
                         sqlx::query(
                             "UPDATE pending_purges
-                             SET phase = 'completed', last_safe_error = NULL, updated_at_ms = ?
+                             SET phase = 'completed', last_safe_error = NULL,
+                                 new_note_rev_id = NULL, sanitized_response_msgpack = X'',
+                                 updated_at_ms = ?
                              WHERE space_id = ? AND purge_id = ?",
                         )
                         .bind(now_ms)
@@ -2236,7 +2272,9 @@ async fn mark_pending_purge_completed_tx(
                     BackendConn::Postgres(conn) => {
                         sqlx::query(
                             "UPDATE pending_purges
-                             SET phase = 'completed', last_safe_error = NULL, updated_at_ms = $1
+                             SET phase = 'completed', last_safe_error = NULL,
+                                 new_note_rev_id = NULL, sanitized_response_msgpack = ''::BYTEA,
+                                 updated_at_ms = $1
                              WHERE space_id = $2 AND purge_id = $3",
                         )
                         .bind(now_ms)

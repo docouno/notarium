@@ -270,11 +270,12 @@ async fn admit_folder_snapshot(
         call,
         scope,
         &folder.reference,
-        project,
+        project.clone(),
         &folder.ancestor_folders,
         DocClass::UserDoc,
     )
-    .await
+    .await?;
+    corpus::record_folder_origin(call, scope, &folder.reference, project).await
 }
 
 async fn resolve_snapshot(

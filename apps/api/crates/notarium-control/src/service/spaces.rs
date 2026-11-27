@@ -24,6 +24,8 @@ use notarium_core::{
 };
 use serde::{Deserialize, Serialize};
 
+pub(crate) const WHOAMI_PROVIDER_SQLITE_SQL: &str = "SELECT CAST(1 AS BIGINT) FROM provider_attachments a CROSS JOIN provider_resources r CROSS JOIN provider_models m WHERE r.id=a.resource_id AND m.resource_id=r.id AND a.target_kind='personal' AND a.target_owner=$1 AND a.target_space=$2 AND a.state='approved' AND a.resource_epoch=r.consent_epoch AND (a.expires_at IS NULL OR a.expires_at>$3) AND r.disabled_at IS NULL AND m.kind='completion' LIMIT 1";
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SpaceCursor {
@@ -103,7 +105,7 @@ pub(super) async fn admission_revisions(
             .bind(encoded)
             .fetch_all(&mut **tx)
             .await
-            .map_err(crate::error::database)?
+            .map_err(crate::error::database_not_committed)?
         }
         Transaction::Postgres(tx) => sqlx::query_as(
             "SELECT space_id, revision FROM v1_control.space_admission WHERE space_id = ANY($1)",
@@ -111,7 +113,7 @@ pub(super) async fn admission_revisions(
         .bind(&ids)
         .fetch_all(&mut **tx)
         .await
-        .map_err(crate::error::database)?,
+        .map_err(crate::error::database_not_committed)?,
     };
     let map: std::collections::BTreeMap<String, i64> = fetched.into_iter().collect();
     let mut out = Vec::with_capacity(spaces.len());
@@ -286,7 +288,7 @@ impl ControlService {
             let has_completion_provider = if let Some(space) = &personal_space {
                 let now = self.clock.now_ms()?;
                 rows!(rtx.inner_mut(),(i64,),fetch_optional,
-                    "SELECT CAST(1 AS BIGINT) FROM provider_attachments a JOIN provider_resources r ON r.id=a.resource_id JOIN provider_models m ON m.resource_id=r.id WHERE a.target_kind='personal' AND a.target_owner=$1 AND a.target_space=$2 AND a.state='approved' AND a.resource_epoch=r.consent_epoch AND (a.expires_at IS NULL OR a.expires_at>$3) AND r.disabled_at IS NULL AND m.kind='completion' LIMIT 1",
+                    WHOAMI_PROVIDER_SQLITE_SQL,
                     "SELECT CAST(1 AS BIGINT) FROM v1_control.provider_attachments a JOIN v1_control.provider_resources r ON r.id=a.resource_id JOIN v1_control.provider_models m ON m.resource_id=r.id WHERE a.target_kind='personal' AND a.target_owner=$1 AND a.target_space=$2 AND a.state='approved' AND a.resource_epoch=r.consent_epoch AND (a.expires_at IS NULL OR a.expires_at>$3) AND r.disabled_at IS NULL AND m.kind='completion' LIMIT 1";
                     auth.principal().as_str(),space.as_str(),now)?.is_some()
             } else {

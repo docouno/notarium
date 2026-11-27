@@ -603,7 +603,8 @@ same example against an isolated prefix.
   (`idx_command_receipts_seq`), active project roots
   (`idx_folder_heads_active_projects_id`), incremental folder-change scans
   (`idx_folder_heads_space_updated`), active chat-run lookup
-  (`idx_chat_threads_active_run`), consumed pending chat inputs
+  (`idx_chat_threads_active_run`), tainted chat entry scans
+  (`idx_chat_entries_tainted`), consumed pending chat inputs
   (`idx_chat_pending_inputs_consumed`), and `COLLATE "C"`-aligned keyset paging
   (`idx_note_heads_keyset`, `idx_ability_packages_keyset`, `idx_chat_threads_keyset`,
   plus `COLLATE "C"` on `idx_folder_heads_parent_lifecycle`).

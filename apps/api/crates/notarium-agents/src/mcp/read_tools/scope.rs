@@ -156,7 +156,10 @@ pub(super) async fn targets(
                                 }
                                 continuation = Some(next);
                             }
-                            None => break,
+                            None => {
+                                continuation = None;
+                                break;
+                            }
                         }
                     }
                     if continuation.is_some() {

@@ -919,6 +919,12 @@ pub(super) async fn page(
                         }
                         for (id_str, seq, entry, tip, state, current_name) in rows {
                             scanned = scanned.saturating_add(1);
+                            if scanned > MAX_ABILITY_SCAN {
+                                return Err(DomainError::validation(
+                                    ValidationReason::BudgetExceeded,
+                                )
+                                .into());
+                            }
                             let id = AbilityId::parse(&id_str)?;
                             if !readonly.is_empty() && !readonly.contains(&id) {
                                 continue;
@@ -966,7 +972,7 @@ pub(super) async fn page(
                             );
                         }
                     }
-                    if scanned >= MAX_ABILITY_SCAN {
+                    if scanned >= MAX_ABILITY_SCAN && index + 1 < live.len() {
                         return Err(
                             DomainError::validation(ValidationReason::BudgetExceeded).into()
                         );

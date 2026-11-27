@@ -631,11 +631,14 @@ impl ControlService {
             budget.run(ftx.finish(), CommitEffect::NotCommitted).await?;
             let favs = batch_res?;
             let batch_len = favs.len();
-            scanned = scanned.saturating_add(batch_len);
             budget
                 .run(
                     async {
                         for fav in favs {
+                            scanned = scanned.saturating_add(1);
+                            if scanned > MAX_SCAN {
+                                return Err(invalid(ValidationReason::BudgetExceeded));
+                            }
                             let fav_space = SpaceId::parse(&fav.space_id)?;
                             let fav_note = NoteId::parse(&fav.entity_id)?;
                             let fav_key = BootstrapFavCursor {
@@ -693,6 +696,9 @@ impl ControlService {
                     CommitEffect::NotCommitted,
                 )
                 .await?;
+            if scanned > MAX_SCAN {
+                return Err(invalid(ValidationReason::BudgetExceeded));
+            }
             if has_more || batch_len < usize::try_from(batch_limit).unwrap_or(usize::MAX) {
                 break;
             }
@@ -795,7 +801,7 @@ impl ControlService {
                                     .bind(batch_limit)
                                     .fetch_all(&mut **tx)
                                     .await
-                                    .map_err(crate::error::database)?
+                                    .map_err(crate::error::database_not_committed)?
                             }
                             Transaction::Postgres(tx) => {
                                 sqlx::query_as(include_str!("entries.postgres.sql"))
@@ -808,7 +814,7 @@ impl ControlService {
                                     .bind(batch_limit)
                                     .fetch_all(&mut **tx)
                                     .await
-                                    .map_err(crate::error::database)?
+                                    .map_err(crate::error::database_not_committed)?
                             }
                         };
                         let batch_len = batch.len();
@@ -969,6 +975,9 @@ impl ControlService {
                 let rank = row.rank;
                 items.push(ContextEntryInfo { entry, rank });
                 last_visible = Some(row);
+            }
+            if scanned > MAX_SCAN {
+                return Err(invalid(ValidationReason::BudgetExceeded));
             }
             if has_more || batch_len < usize::try_from(batch_limit).unwrap_or(usize::MAX) {
                 break;

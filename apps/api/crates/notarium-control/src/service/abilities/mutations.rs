@@ -768,7 +768,7 @@ impl ControlService {
                     .bind(ABILITY_TRAIL_LOCK)
                     .execute(&mut **inner)
                     .await
-                    .map_err(crate::error::database)?;
+                    .map_err(crate::error::database_not_committed)?;
             }
             let owner = user(tx.inner_mut(), ctx.auth().principal().as_str()).await?;
             let mut references = vec![&input.source];

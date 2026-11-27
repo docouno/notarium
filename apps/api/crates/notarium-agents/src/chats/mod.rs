@@ -1268,9 +1268,6 @@ impl AgentRunSupervisor {
             }
             recovered = engine.recover_active_run(human, recovery).await;
         }
-        if matches!(recovered, Ok(FinishChatRunOutcome::Cleared)) {
-            self.inner.revocations.finish_thread_pending(scope, thread);
-        }
         recovered
     }
 

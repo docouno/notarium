@@ -242,12 +242,18 @@ impl Drop for UndeliveredLease {
         let Some(staged) = self.staged.take() else {
             return;
         };
+        if self.store.inner.backup_shutdown.is_cancelled() {
+            return;
+        }
         let store = self.store.clone();
         let scope = self.scope.clone();
         let lease = std::mem::take(&mut self.owner_lease);
-        let task = self.store.inner.backup_executor.spawn(async move {
+        let _ = crate::backup::spawn_cleanup_task_if_open(&self.store.inner, async move {
             let mut delay = std::time::Duration::from_millis(25);
             loop {
+                if store.inner.backup_shutdown.is_cancelled() {
+                    return;
+                }
                 let cleanup = store.with_write_tx_for_space(Some(scope.space_id.clone()), |tx| {
                     let scope = scope.clone();
                     let staged = staged.clone();
@@ -273,8 +279,8 @@ impl Drop for UndeliveredLease {
                 });
                 let result = tokio::select! {
                     biased;
-                    result = cleanup => result,
                     () = store.inner.backup_shutdown.cancelled() => return,
+                    result = cleanup => result,
                 };
                 match result {
                     Ok(handoff) => {
@@ -284,12 +290,12 @@ impl Drop for UndeliveredLease {
                     Err(error) => tracing::warn!(?error, "retrying undelivered chat lease cleanup"),
                 }
                 tokio::select! {
-                    ()=store.inner.backup_shutdown.cancelled()=>return,
-                    ()=tokio::time::sleep(delay)=>{},
+                    biased;
+                    () = store.inner.backup_shutdown.cancelled() => return,
+                    () = tokio::time::sleep(delay) => {},
                 }
                 delay = (delay * 2).min(std::time::Duration::from_secs(2));
             }
         });
-        crate::backup::register_cleanup_task(&self.store.inner, task);
     }
 }

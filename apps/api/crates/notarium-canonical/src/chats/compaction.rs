@@ -227,6 +227,12 @@ async fn latest_compaction_candidates_tx(
     .map_err(|error| crate::runtime::pg_read_error("chat_compaction_candidates", error))
 }
 
+pub const THREAD_TAINTED_RANGE_SQL: &str = "SELECT 1 FROM chat_entries
+                       WHERE space_id = $1 AND thread_id = $2
+                         AND ext_space_tainted <> 0
+                         AND entry_seq > $3 AND entry_seq <= $4
+                       LIMIT 1";
+
 async fn thread_has_tainted_in_range_tx(
     tx: &mut BackendConn<'_>,
     space_id: &SpaceId,
@@ -234,14 +240,9 @@ async fn thread_has_tainted_in_range_tx(
     min_exclusive: ThreadEntrySeq,
     max_inclusive: ThreadEntrySeq,
 ) -> Result<bool, PortError> {
-    const SQL: &str = "SELECT 1 FROM chat_entries
-                       WHERE space_id = $1 AND thread_id = $2
-                         AND ext_space_tainted <> 0
-                         AND entry_seq > $3 AND entry_seq <= $4
-                       LIMIT 1";
     let found: Option<i32> = match tx {
         BackendConn::Sqlite(conn) => {
-            sqlx::query_scalar(SQL)
+            sqlx::query_scalar(THREAD_TAINTED_RANGE_SQL)
                 .bind(space_id.as_str())
                 .bind(thread_id.as_str())
                 .bind(min_exclusive.get() as i64)
@@ -250,7 +251,7 @@ async fn thread_has_tainted_in_range_tx(
                 .await
         }
         BackendConn::Postgres(conn) => {
-            sqlx::query_scalar(SQL)
+            sqlx::query_scalar(THREAD_TAINTED_RANGE_SQL)
                 .bind(space_id.as_str())
                 .bind(thread_id.as_str())
                 .bind(min_exclusive.get() as i64)
@@ -612,15 +613,22 @@ async fn oldest_prefix(
                 {
                     const CANDIDATE_PAGE: i64 = 64;
                     const MAX_FAST_CANDIDATE_PROBES: usize = 32;
+                    const MAX_FAST_CANDIDATE_PAGES: usize = 8;
                     let mut matched_cp: Option<(i64, i32)> = None;
                     let mut cursor_max = request.leaf.get() as i64;
                     let mut depth_ancestors: std::collections::BTreeMap<i32, Option<i64>> =
                         std::collections::BTreeMap::new();
                     depth_ancestors.insert(leaf_depth, Some(request.leaf.get() as i64));
                     let mut unique_probes = 0usize;
+                    let mut candidate_pages = 0usize;
                     let mut fast_aborted = false;
                     loop {
                         deadline.remaining(&budget)?;
+                        if candidate_pages >= MAX_FAST_CANDIDATE_PAGES {
+                            fast_aborted = true;
+                            break;
+                        }
+                        candidate_pages += 1;
                         let candidates = latest_compaction_candidates_tx(
                             tx,
                             &scope.space_id,

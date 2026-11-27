@@ -356,6 +356,7 @@ macro_rules! upgrade {
                     })?;
                 }
                 for prefix in [
+                    "CREATE INDEX IF NOT EXISTS idx_chat_entries_tainted",
                     "CREATE INDEX IF NOT EXISTS idx_chat_pending_inputs_consumed",
                     "CREATE INDEX IF NOT EXISTS idx_chat_threads_active_run",
                     "CREATE INDEX IF NOT EXISTS idx_chat_threads_keyset",

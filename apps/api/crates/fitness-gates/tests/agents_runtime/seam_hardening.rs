@@ -30003,6 +30003,40 @@ async fn verify_part_k_provenance_link_isolation_and_failover(
         last_seq_after_dup, last_seq_before_dup,
         "failed create_ability must not commit any canonical mutation (no orphan note or folder)"
     );
+    // Retrying `create_ability` with the EXACT SAME CommandKey after `PathConflict`
+    // must still fail `PathConflict` without skipping the pre-check or creating an orphan note.
+    let dup_ab_retry = call_mcp(
+        &fixture.registry,
+        owner,
+        [0xD9, 35, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "create_ability",
+        json!({
+            "kind": "role",
+            "name": "orphan-guard-role",
+            "description": "Duplicate role",
+            "instructions": "Should fail before creating orphan note.",
+            "placement": { "home": "project", "project": s2_proj_b_handle },
+        }),
+    )
+    .await;
+    assert!(
+        matches!(
+            dup_ab_retry,
+            Err(PortError::Domain(DomainError::PathConflict { .. }))
+        ),
+        "same-key retry of create_ability after PathConflict must still fail PathConflict, got {:?}",
+        dup_ab_retry.err()
+    );
+    let last_seq_after_dup_retry = fixture
+        .canonical
+        .space(budget(), s2_history.space_id.clone())
+        .await
+        .unwrap()
+        .last_seq;
+    assert_eq!(
+        last_seq_after_dup_retry, last_seq_before_dup,
+        "same-key retry of failed create_ability must still leave zero orphan canonical mutations"
+    );
     let resolved_in_abilities = fixture
         .canonical
         .resolve_note_target(
@@ -30020,7 +30054,7 @@ async fn verify_part_k_provenance_link_isolation_and_failover(
     let moved_meta = fixture
         .canonical
         .get_note_metadata(
-            s2_sc,
+            s2_sc.clone(),
             GetNote {
                 note: ab_note_id,
                 revision: None,
@@ -30033,6 +30067,195 @@ async fn verify_part_k_provenance_link_isolation_and_failover(
         moved_meta.parent,
         Some(alt_dir),
         "original ability entrypoint must remain in moved-abilities/"
+    );
+
+    // Part 8: Named episode resume with trashed project (`ProjectUnavailable`) must match
+    // `session: { id }` semantics (resume with `project_unavailable` when `project: None, role: None`,
+    // and return `ScopeMismatch` when an explicit different `project` is supplied).
+    let temp_proj_id = FolderId::from_bytes([0xD9, 36, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+    let (_, temp_proj_rev, _) = fixture
+        .canonical
+        .create_folder(CreateFolderSpec {
+            scope: s2_history.clone(),
+            active_epoch: s2_epoch,
+            folder_id: temp_proj_id.clone(),
+            parent: None,
+            slug: "ep-unavail-proj".into(),
+            display_name: "Ep Unavail Proj".into(),
+            is_project: true,
+            project_slug: Some("ep-unavail-proj".into()),
+            actor: actor.clone(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+    let temp_proj_handle = format!("{}/ep-unavail-proj", s2_slug);
+    let _ep_created = call_mcp(
+        &fixture.registry,
+        owner,
+        [0xD9, 37, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "start_session",
+        json!({
+            "project": temp_proj_handle,
+            "session": { "name": "unavail-named-ep" },
+        }),
+    )
+    .await
+    .unwrap();
+    fixture
+        .canonical
+        .set_folder_lifecycle(
+            s2_history,
+            s2_epoch,
+            &temp_proj_id,
+            &temp_proj_rev,
+            notarium_core::model::Lifecycle::Trashed,
+            &actor,
+            None,
+        )
+        .await
+        .unwrap();
+    let mismatch_named = call_mcp(
+        &fixture.registry,
+        owner,
+        [0xD9, 39, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "start_session",
+        json!({
+            "project": s2_proj_b_handle,
+            "session": { "name": "unavail-named-ep" },
+        }),
+    )
+    .await;
+    assert!(
+        matches!(
+            mismatch_named,
+            Err(PortError::Domain(ref err))
+                if *err == DomainError::validation(ValidationReason::ScopeMismatch)
+        ),
+        "named episode with unavailable project + explicit other project must fail ScopeMismatch, got {:?}",
+        mismatch_named.err()
+    );
+    let resumed_named = call_mcp(
+        &fixture.registry,
+        owner,
+        [0xD9, 40, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "start_session",
+        json!({
+            "session": { "name": "unavail-named-ep" },
+        }),
+    )
+    .await
+    .expect("named episode with trashed project and no explicit project/role must resume with project_unavailable")
+    .structured_content;
+    assert_eq!(
+        resumed_named["session"]["diagnostics"],
+        json!(["project_unavailable"])
+    );
+
+    // Part 9: `list_notes` with a live project-relative subfolder named after the
+    // project's former slug (`alias-old-2 -> alias-new-2`, then live `alias-new-2/alias-old-2`)
+    // must list `alias-new-2/alias-old-2` rather than being shadowed by the Space-relative alias.
+    let rename_proj_id = FolderId::from_bytes([0xD9, 41, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+    fixture
+        .canonical
+        .create_folder(CreateFolderSpec {
+            scope: s2_history.clone(),
+            active_epoch: s2_epoch,
+            folder_id: rename_proj_id.clone(),
+            parent: None,
+            slug: "alias-old-2".into(),
+            display_name: "Alias Old 2".into(),
+            is_project: true,
+            project_slug: Some("alias-old-2".into()),
+            actor: actor.clone(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+    call_mcp(
+        &fixture.registry,
+        owner,
+        [0xD9, 42, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "rename_project",
+        json!({
+            "project": format!("{s2_slug}/alias-old-2"),
+            "slug": "alias-new-2",
+            "displayName": "Alias New 2",
+        }),
+    )
+    .await
+    .unwrap();
+    let nested_old_dir = FolderId::from_bytes([0xD9, 43, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+    fixture
+        .canonical
+        .create_folder(CreateFolderSpec {
+            scope: s2_history.clone(),
+            active_epoch: s2_epoch,
+            folder_id: nested_old_dir.clone(),
+            parent: Some(rename_proj_id),
+            slug: "alias-old-2".into(),
+            display_name: "Nested Alias Old 2".into(),
+            is_project: false,
+            project_slug: None,
+            actor: actor.clone(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+    let nested_note_id = NoteId::from_bytes([0xD9, 44, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+    fixture
+        .canonical
+        .create_note(
+            s2_sc,
+            Mutation {
+                identity: CommandIdentity {
+                    scope: s2_history.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([
+                        0xD9, 44, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xE5; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: CreateNote {
+                    folder_page: true,
+                    note: nested_note_id.clone(),
+                    parent: Some(nested_old_dir.clone()),
+                    slug: "index".into(),
+                    class: DocClass::UserDoc,
+                    carrier: "---\ntitle: Inside Nested Old\n---\nBody\n".into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let listed_nested = call_mcp(
+        &fixture.registry,
+        owner,
+        [0xD9, 45, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "list_notes",
+        json!({
+            "project": format!("{s2_slug}/alias-new-2"),
+            "path": "alias-old-2",
+        }),
+    )
+    .await
+    .expect("list_notes on live subfolder matching project former slug must succeed")
+    .structured_content;
+    assert_eq!(
+        listed_nested["folderPage"]["folderPath"],
+        json!("alias-new-2/alias-old-2"),
+        "project-relative live subfolder must win over Space-relative historical alias: {listed_nested}"
+    );
+    assert_eq!(
+        listed_nested["folderPage"]["folderId"],
+        json!(nested_old_dir),
+        "list_notes must resolve the live child folderId, not the renamed project root: {listed_nested}"
+    );
+    assert_eq!(
+        listed_nested["folderPage"]["noteId"],
+        json!(nested_note_id),
+        "list_notes must return the folder page inside alias-new-2/alias-old-2: {listed_nested}"
     );
     let _ = pers_root;
 }

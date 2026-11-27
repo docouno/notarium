@@ -16,6 +16,7 @@ use notarium_core::{
     },
     receipt::{AccountCommandIdentity, AcknowledgedCursor, ChangeCursor},
 };
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -358,13 +359,27 @@ pub(super) async fn resume(
         })
 }
 
-pub(super) async fn validate_delivery(
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct PendingDeliveryAck {
+    owner: AckOwner,
+    delivered: ChangeCursor,
+}
+
+pub(super) async fn prepare_delivery(
     call: &ToolCallContext<'_>,
     token: &str,
-) -> Result<(), PortError> {
+    allow_ack: bool,
+) -> Result<Option<PendingDeliveryAck>, PortError> {
     let ticket = call.registry.bootstrap.find(token, DELIVERY_PREFIX)?;
     revalidate(call, &ticket.batch).await?;
-    Ok(())
+    if !allow_ack || !ticket.acknowledge {
+        return Ok(None);
+    }
+    Ok(ticket.safe_ack.map(|delivered| PendingDeliveryAck {
+        owner: ticket.batch.owner.clone(),
+        delivered,
+    }))
 }
 
 pub(super) async fn deliver(
@@ -372,22 +387,20 @@ pub(super) async fn deliver(
     token: &str,
     allow_ack: bool,
 ) -> Result<bool, PortError> {
-    let ticket = call.registry.bootstrap.find(token, DELIVERY_PREFIX)?;
-    revalidate(call, &ticket.batch).await?;
-    if !allow_ack || !ticket.acknowledge || ticket.safe_ack.is_none() {
+    let Some(pending) = prepare_delivery(call, token, allow_ack).await? else {
         return Ok(false);
-    }
-    acknowledge_page(call, &ticket).await?;
+    };
+    acknowledge_prepared(call, &pending).await?;
     Ok(true)
 }
 
-async fn acknowledge_page(call: &ToolCallContext<'_>, ticket: &Ticket) -> Result<(), PortError> {
-    let Some(delivered) = &ticket.safe_ack else {
-        return Ok(());
-    };
+pub(super) async fn acknowledge_prepared(
+    call: &ToolCallContext<'_>,
+    pending: &PendingDeliveryAck,
+) -> Result<(), PortError> {
     let account = call.account();
     let actor = account.auth().principal();
-    let identity = ack_identity(actor, &ticket.batch.owner, delivered)?;
+    let identity = ack_identity(actor, &pending.owner, &pending.delivered)?;
     call.registry
         .control
         .acknowledge_delta(
@@ -395,8 +408,8 @@ async fn acknowledge_page(call: &ToolCallContext<'_>, ticket: &Ticket) -> Result
             AccountMutation {
                 identity,
                 input: AcknowledgeDelta {
-                    owner: ticket.batch.owner.clone(),
-                    delivered: delivered.clone(),
+                    owner: pending.owner.clone(),
+                    delivered: pending.delivered.clone(),
                 },
             },
         )
@@ -409,6 +422,20 @@ async fn acknowledge_page(call: &ToolCallContext<'_>, ticket: &Ticket) -> Result
             )
         })?;
     Ok(())
+}
+
+async fn acknowledge_page(call: &ToolCallContext<'_>, ticket: &Ticket) -> Result<(), PortError> {
+    let Some(delivered) = &ticket.safe_ack else {
+        return Ok(());
+    };
+    acknowledge_prepared(
+        call,
+        &PendingDeliveryAck {
+            owner: ticket.batch.owner.clone(),
+            delivered: delivered.clone(),
+        },
+    )
+    .await
 }
 
 fn ack_identity(

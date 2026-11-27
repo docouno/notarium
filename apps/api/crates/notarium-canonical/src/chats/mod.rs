@@ -6,6 +6,11 @@ mod staging;
 mod submission;
 
 #[cfg(feature = "test-support")]
+pub use compaction::THREAD_TAINTED_RANGE_SQL;
+#[cfg(feature = "test-support")]
+pub use queue::OTHER_HUMAN_ON_BRANCH_SQL;
+
+#[cfg(feature = "test-support")]
 pub mod preparation_test {
     use std::{cell::Cell, future::Future, sync::Arc};
     use tokio::sync::Barrier;

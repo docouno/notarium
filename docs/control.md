@@ -663,7 +663,7 @@ Both paths enforce canonical visibility at publication and at the current locati
 before returning the descriptor or its auxiliary file names.
 Trails bind exact typed references, stop
 at 16 hops and reject cycles. Discovery preserves continuation across filtered
-pages and never emits a lower candidate as a duplicate of the selected winner.
+pages within its bounded scan budget and never emits a lower candidate as a duplicate of the selected winner.
 `ControlPort` / `ControlPlane` also exposes episode touches, ability preferences
 and trails, and `mcp_dedup` idempotency lookup/recording.
 Authoring-view discovery and `inspect_ability` require ordinary read access to the

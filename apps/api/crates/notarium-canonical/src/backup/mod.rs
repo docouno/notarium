@@ -167,8 +167,32 @@ fn decode_witness_json(raw: &str) -> Result<BackupWitness, PortError> {
 
 pub(crate) fn register_cleanup_task(inner: &CanonicalInner, handle: tokio::task::JoinHandle<()>) {
     let mut guard = inner.backup_cleanups.lock().expect("backup cleanups mutex");
+    if inner
+        .backup_cleanups_closed
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        handle.abort();
+        return;
+    }
     guard.retain(|h| !h.is_finished());
     guard.push(handle);
+}
+
+pub(crate) fn spawn_cleanup_task_if_open<F>(inner: &CanonicalInner, future: F) -> bool
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let mut guard = inner.backup_cleanups.lock().expect("backup cleanups mutex");
+    if inner
+        .backup_cleanups_closed
+        .load(std::sync::atomic::Ordering::SeqCst)
+        || inner.backup_shutdown.is_cancelled()
+    {
+        return false;
+    }
+    guard.retain(|h| !h.is_finished());
+    guard.push(inner.backup_executor.spawn(future));
+    true
 }
 
 fn resolve_spool_dir(inner: &CanonicalInner) -> Result<PathBuf, PortError> {
@@ -2037,7 +2061,16 @@ fn spool_tables(schema_version: u32) -> impl Iterator<Item = TableSpec> + Clone 
                         table.columns = &table.columns[..18];
                         table.indexes = &table.indexes[..1];
                     }
-                    "chat_entries" => table.columns = &table.columns[..20],
+                    "chat_entries" => {
+                        table.columns = &table.columns[..20];
+                        table.indexes = &[
+                            "idx_chat_entries_parent",
+                            "idx_chat_entries_compaction",
+                            "idx_chat_entries_projection",
+                            "idx_chat_entries_created_change",
+                            "idx_chat_entries_redacted_change",
+                        ];
+                    }
                     "chat_pending_inputs" => table.indexes = &table.indexes[..2],
                     _ => {}
                 }

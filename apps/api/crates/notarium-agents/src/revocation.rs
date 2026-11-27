@@ -604,20 +604,6 @@ impl RevocationHub {
         }
     }
 
-    /// The supervisor holds the thread admission gate after a durable clear.
-    pub(crate) fn finish_thread_pending(&self, scope: &HistoryScope, thread: &ChatThreadId) {
-        let mut removed = Vec::new();
-        self.inner.lock().pending.retain(|key, entry| {
-            if &key.scope == scope && &key.thread == thread {
-                removed.push(entry.cancellation.clone());
-                false
-            } else {
-                true
-            }
-        });
-        cancel_all(removed);
-    }
-
     pub(crate) fn rollback_pending(&self, registration: PendingRegistration) {
         if registration.inserted {
             self.finish_registered_pending(registration);

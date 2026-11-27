@@ -1506,3 +1506,42 @@ fn staged_taint_restrict_to_spaces_and_purged_carriers_preserve_invariants() {
         "reading purged cross-space carriers must not flip BranchTaint"
     );
 }
+
+#[test]
+fn agent_run_cannot_derive_pat_or_oauth_and_retains_chat_episode() {
+    let owner = human(SpaceRole::Owner, true);
+    let s1 = SpaceId::from_bytes([1; 16]);
+    let ep1 = EpisodeId::from_bytes([0x41; 16]);
+    let ep2 = EpisodeId::from_bytes([0x42; 16]);
+    let run1 = AgentRunId::from_bytes([0x51; 16]);
+    let run2 = AgentRunId::from_bytes([0x52; 16]);
+
+    let agent = owner
+        .for_agent_run(
+            run1,
+            s1.clone(),
+            ChatAudience::Personal,
+            grants(SpaceRole::Owner),
+        )
+        .unwrap()
+        .with_chat_episode(ep1.clone());
+
+    // AgentRun must never mint PAT or OAuth contexts.
+    assert_eq!(
+        agent.for_pat(grants(SpaceRole::Owner)).unwrap_err(),
+        DomainError::validation(ValidationReason::ScopeMismatch)
+    );
+    assert_eq!(
+        agent
+            .for_oauth(GrantId::from_bytes([0x61; 16]), grants(SpaceRole::Owner))
+            .unwrap_err(),
+        DomainError::validation(ValidationReason::ScopeMismatch)
+    );
+
+    // Deriving a nested AgentRun must preserve `chat_episode` so it cannot be rebound.
+    let nested = agent
+        .for_agent_run(run2, s1, ChatAudience::Personal, grants(SpaceRole::Owner))
+        .unwrap();
+    assert_eq!(nested.chat_episode(), Some(&ep1));
+    assert_eq!(nested.with_chat_episode(ep2).chat_episode(), Some(&ep1));
+}

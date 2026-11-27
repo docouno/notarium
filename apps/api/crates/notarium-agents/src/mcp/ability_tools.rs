@@ -524,7 +524,10 @@ async fn provider_skill_spaces(
 async fn provider_authoring_skill_spaces(
     call: &ToolCallContext<'_>,
 ) -> Result<BTreeSet<SpaceId>, PortError> {
+    const MAX_PROJECT_CANDIDATES: usize = 4096;
+    const PROJECT_PAGE_LIMIT: u16 = 100;
     let mut allowed = BTreeSet::new();
+    let mut scanned_projects = 0usize;
     for (space_id, grant) in call.auth.spaces() {
         if !grant.read_classes.contains(&DocClass::Skill) {
             continue;
@@ -541,29 +544,48 @@ async fn provider_authoring_skill_spaces(
             Err(error) if visible_error(&error) => continue,
             Err(error) => return Err(error),
         };
-        let mut continuation = None;
-        'projects: loop {
+        let mut continuation: Option<String> = None;
+        'projects: for _ in 0..=MAX_PROJECT_CANDIDATES {
             let page = call
                 .registry
                 .catalog
                 .projects(
                     scope.with_preflight_taint(),
-                    ControlPageRequest::new(100, continuation)?,
+                    ControlPageRequest::new(PROJECT_PAGE_LIMIT, continuation.clone())?,
                 )
                 .await?;
+            if page.items.len() > usize::from(PROJECT_PAGE_LIMIT) {
+                return Err(invalid(ValidationReason::InvalidState));
+            }
+            scanned_projects = scanned_projects.saturating_add(page.items.len());
+            if scanned_projects > MAX_PROJECT_CANDIDATES {
+                return Err(invalid(ValidationReason::BudgetExceeded));
+            }
             for item in page.items {
                 if corpus::skill_selection(call, space_id, Some(item.folder))
                     .await?
                     .is_some()
                 {
                     allowed.insert(space_id.clone());
+                    continuation = None;
                     break 'projects;
                 }
             }
             match page.continuation {
-                Some(next) => continuation = Some(next),
-                None => break,
+                Some(next) => {
+                    if continuation.as_ref() == Some(&next) {
+                        return Err(invalid(ValidationReason::InvalidState));
+                    }
+                    continuation = Some(next);
+                }
+                None => {
+                    continuation = None;
+                    break;
+                }
             }
+        }
+        if continuation.is_some() {
+            return Err(invalid(ValidationReason::BudgetExceeded));
         }
     }
     Ok(allowed)

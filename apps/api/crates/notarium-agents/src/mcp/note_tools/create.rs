@@ -196,6 +196,15 @@ async fn project_placement(
         DocClass::UserDoc,
     )
     .await?;
+    if !is_trashed_replay {
+        corpus::record_folder_origin(
+            call,
+            &read_scope,
+            &project.reference,
+            Some(project.reference.clone()),
+        )
+        .await?;
+    }
     let facts = ResourceFacts {
         space,
         class: DocClass::UserDoc,

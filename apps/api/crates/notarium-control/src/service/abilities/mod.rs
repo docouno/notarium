@@ -199,7 +199,7 @@ async fn load_project_bindings_batch(
             .bind(keys_json)
             .fetch_all(&mut **conn)
             .await
-            .map_err(crate::error::database)?
+            .map_err(crate::error::database_not_committed)?
         }
         Transaction::Postgres(conn) => {
             let (pls, ids): (Vec<String>, Vec<String>) = unique.into_iter().unzip();
@@ -219,7 +219,7 @@ async fn load_project_bindings_batch(
             .bind(ids)
             .fetch_all(&mut **conn)
             .await
-            .map_err(crate::error::database)?
+            .map_err(crate::error::database_not_committed)?
         }
     };
     for row in binding_rows {
@@ -264,7 +264,7 @@ impl BatchedAbilityControl {
                     .bind(&keys_json)
                     .fetch_all(&mut **conn)
                     .await
-                    .map_err(crate::error::database)?;
+                    .map_err(crate::error::database_not_committed)?;
                     let prefs = sqlx::query_as::<_, AbilityPreferencesRow>(
                         "SELECT p.owner_id, p.ability_id, p.placement, p.enabled, p.revision \
                          FROM (SELECT json_extract(value, '$[0]') AS pl, json_extract(value, '$[1]') AS id FROM json_each($2)) k \
@@ -275,7 +275,7 @@ impl BatchedAbilityControl {
                     .bind(&keys_json)
                     .fetch_all(&mut **conn)
                     .await
-                    .map_err(crate::error::database)?;
+                    .map_err(crate::error::database_not_committed)?;
                     (avail, prefs)
                 }
                 Transaction::Postgres(conn) => {
@@ -290,7 +290,7 @@ impl BatchedAbilityControl {
                     .bind(&ids)
                     .fetch_all(&mut **conn)
                     .await
-                    .map_err(crate::error::database)?;
+                    .map_err(crate::error::database_not_committed)?;
                     let prefs = sqlx::query_as::<_, AbilityPreferencesRow>(
                         "SELECT p.owner_id, p.ability_id, p.placement, p.enabled, p.revision \
                          FROM unnest($2::text[], $3::text[]) AS k(pl, id) \
@@ -302,7 +302,7 @@ impl BatchedAbilityControl {
                     .bind(&ids)
                     .fetch_all(&mut **conn)
                     .await
-                    .map_err(crate::error::database)?;
+                    .map_err(crate::error::database_not_committed)?;
                     (avail, prefs)
                 }
             };
@@ -336,7 +336,7 @@ impl BatchedAbilityControl {
                         .bind(project.folder_id.as_str())
                         .fetch_all(&mut **conn)
                         .await
-                        .map_err(crate::error::database)?
+                        .map_err(crate::error::database_not_committed)?
                     }
                     Transaction::Postgres(conn) => {
                         let (pls, ids): (Vec<String>, Vec<String>) =
@@ -354,7 +354,7 @@ impl BatchedAbilityControl {
                         .bind(project.folder_id.as_str())
                         .fetch_all(&mut **conn)
                         .await
-                        .map_err(crate::error::database)?
+                        .map_err(crate::error::database_not_committed)?
                     }
                 };
                 for row in matched_rows {
@@ -376,7 +376,7 @@ impl BatchedAbilityControl {
                     .bind(keys_json)
                     .fetch_all(&mut **conn)
                     .await
-                    .map_err(crate::error::database)?
+                    .map_err(crate::error::database_not_committed)?
                 }
                 Transaction::Postgres(conn) => {
                     let (pls, ids): (Vec<String>, Vec<String>) =
@@ -391,7 +391,7 @@ impl BatchedAbilityControl {
                     .bind(ids)
                     .fetch_all(&mut **conn)
                     .await
-                    .map_err(crate::error::database)?
+                    .map_err(crate::error::database_not_committed)?
                 }
             };
             for row in trail_rows {

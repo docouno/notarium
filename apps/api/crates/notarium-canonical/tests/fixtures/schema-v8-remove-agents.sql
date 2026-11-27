@@ -1,3 +1,4 @@
+DROP INDEX IF EXISTS idx_chat_entries_tainted;
 DROP INDEX IF EXISTS idx_command_receipts_seq;
 DROP INDEX IF EXISTS idx_folder_heads_space_updated;
 DROP INDEX IF EXISTS idx_folder_heads_active_projects_id;

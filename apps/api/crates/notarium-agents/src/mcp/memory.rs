@@ -182,6 +182,7 @@ pub(super) async fn admit_project_boundary(
         has_version_token.then_some(DocClass::AgentMemory),
     )
     .await?;
+    corpus::record_folder_origin(call, &scope, folder, Some(folder.clone())).await?;
     Ok(scope)
 }
 
@@ -251,6 +252,28 @@ pub(super) async fn handle(
             input.version_token.as_ref().map(|_| DocClass::AgentMemory),
         )
         .await?;
+        corpus::record_folder_origin(call, &scope, &folder_ref, None).await?;
+    }
+    if matches!(call.target, EgressTarget::InAppProvider { .. }) && input.version_token.is_some() {
+        match call
+            .registry
+            .engine
+            .get_note_metadata(
+                scope.with_preflight_taint(),
+                notarium_core::ports::GetNote {
+                    note: note.note_id.clone(),
+                    revision: None,
+                    causal: notarium_core::receipt::CausalBasis::Await(Default::default()),
+                },
+            )
+            .await
+        {
+            Ok(observed) => {
+                corpus::note_metadata(call, &scope, &observed.metadata).await?;
+            }
+            Err(PortError::Domain(DomainError::ResourceNotFound)) => {}
+            Err(error) => return Err(error),
+        }
     }
     let identity = call.command_identity(&snapshot.scope, "append_memory", 0);
     let mutation = input.into_mutation(

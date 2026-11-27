@@ -16,6 +16,7 @@ use super::{
         DUE_SCHEDULES_SQLITE_SQL, EXPIRED_SCHEDULE_RUNS_SQLITE_SQL, LIST_SCHEDULES_LIVE_SQLITE_SQL,
         LIST_SCHEDULES_PROJECT_LIVE_SQLITE_SQL,
     },
+    spaces::WHOAMI_PROVIDER_SQLITE_SQL,
     telemetry::cleanup::{
         DELETE_SCHEDULE_RUNS_RETENTION_SQLITE_SQL, DELETE_SCHEDULES_RETENTION_SQLITE_SQL,
     },
@@ -119,6 +120,36 @@ async fn sqlite_hot_control_queries_use_indexes_before_and_after_analyze() {
         .await
         .unwrap();
         let space_id = SpaceId::from_bytes([0x40 + u; 16]).to_string();
+        for m in 0..4u8 {
+            let (kind, dim) = if m == 0 {
+                ("completion", None)
+            } else {
+                ("embedding", Some(64i64))
+            };
+            sqlx::query(
+                "INSERT INTO provider_models(resource_id,model_id,wire_model_name,kind,tokenizer_profile,max_input,max_output,dimension,capabilities,revision)
+                 VALUES (?1,?2,?3,?4,'conservative_v1',4096,1024,?5,'{}',1)",
+            )
+            .bind(&res_id)
+            .bind(format!("mod_{u:02x}_{m:02x}"))
+            .bind(format!("wire-{m}"))
+            .bind(kind)
+            .bind(dim)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO provider_attachments(id,resource_id,target_kind,target_owner,target_space,target_project,resource_epoch,credential_epoch,state,disclosure,expires_at,revision)
+             VALUES (?1,?2,'personal',?3,?4,NULL,1,1,'approved','{}',NULL,1)",
+        )
+        .bind(format!("att_pers_{u:02x}"))
+        .bind(&res_id)
+        .bind(&uid)
+        .bind(&space_id)
+        .execute(&mut conn)
+        .await
+        .unwrap();
         for a in 0..6u8 {
             let att_id = format!("att_{u:02x}_{a:02x}");
             let state = if a % 2 == 0 { "approved" } else { "pending" };
@@ -639,6 +670,22 @@ async fn sqlite_hot_control_queries_use_indexes_before_and_after_analyze() {
             phase,
             "list_schedules_project_live",
             "USING INDEX schedule_owner_project_live",
+            &rows,
+        );
+
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "EXPLAIN QUERY PLAN {WHOAMI_PROVIDER_SQLITE_SQL}"
+        )))
+        .bind(&first_uid)
+        .bind(&first_space)
+        .bind(1i64)
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+        check_plan(
+            phase,
+            "whoami_provider_personal",
+            "SEARCH a USING INDEX",
             &rows,
         );
     }

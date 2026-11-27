@@ -422,7 +422,7 @@ impl EngineAuthContext {
         derived.kind = PrincipalKind::AgentRun(run);
         derived.write_space = Some(thread_space);
         derived.chat_audience = Some(effective_audience);
-        derived.chat_episode = None;
+        derived.chat_episode = self.chat_episode.clone();
         if self.kind == PrincipalKind::DirectHuman {
             let taint = BranchTaint::default();
             taint.merge(&self.taint);
@@ -487,7 +487,12 @@ impl EngineAuthContext {
         source: GrantId,
         requested: BTreeMap<SpaceId, SpaceGrant>,
     ) -> DomainResult<Self> {
-        if matches!(self.kind, PrincipalKind::Keeper(_)) || self.keeper_log.is_some() {
+        if matches!(
+            self.kind,
+            PrincipalKind::Keeper(_) | PrincipalKind::AgentRun(_)
+        ) || self.keeper_log.is_some()
+            || self.chat_audience.is_some()
+        {
             return Err(DomainError::validation(ValidationReason::ScopeMismatch));
         }
         if self.is_search_indexing() {
@@ -511,7 +516,12 @@ impl EngineAuthContext {
     }
     /// Personal access tokens are delegated credentials, never interactive humans.
     pub fn for_pat(&self, requested: BTreeMap<SpaceId, SpaceGrant>) -> DomainResult<Self> {
-        if matches!(self.kind, PrincipalKind::Keeper(_)) || self.keeper_log.is_some() {
+        if matches!(
+            self.kind,
+            PrincipalKind::Keeper(_) | PrincipalKind::AgentRun(_)
+        ) || self.keeper_log.is_some()
+            || self.chat_audience.is_some()
+        {
             return Err(DomainError::validation(ValidationReason::ScopeMismatch));
         }
         if self.is_search_indexing() {

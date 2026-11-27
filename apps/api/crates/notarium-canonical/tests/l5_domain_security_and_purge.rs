@@ -3145,6 +3145,17 @@ async fn run_purge_and_mint_suite(
         ),
         "replaying mint_and_purge after hard-purging new_note must return ResourceNotFound, got {replay_after_successor_purge:?}"
     );
+    let residual_purge_metadata = store
+        .execute_diagnostic_read_sql_for_test(
+            None,
+            "SELECT COUNT(*) FROM pending_purges WHERE phase = 'completed' AND (new_note_rev_id IS NOT NULL OR length(sanitized_response_msgpack) > 0)",
+        )
+        .await
+        .expect("check scrubbed pending_purges rows");
+    assert_eq!(
+        residual_purge_metadata, 0,
+        "completed pending_purges rows must scrub new_note_rev_id and sanitized_response_msgpack"
+    );
 
     // Execute Step-1 SQL erasure of `note_crash` and simulate process crash right before Step-2/3 CAS retirement!
     let note_crash = sample_note_id(75);

@@ -344,46 +344,182 @@ pub(super) async fn retrieve(
         let mut combined = String::new();
         let mut best = None;
 
-        'candidates: for Candidate { index, hit } in candidates {
-            if output.len() >= limit {
-                truncated = true;
-                break;
+        if recall {
+            struct RecalledNote {
+                hit: notarium_core::ports::SearchHit,
+                scope: SpaceContext,
+                selection: Option<super::super::ProviderSelection>,
+                source_remaining: u32,
+                parts: Vec<String>,
+                next_chunk_idx: usize,
             }
-            let target = &targets[index];
-            let scope = call.space(target.scope.clone())?;
-            let metadata = hit.card.document.provenance();
-            let reference = metadata.reference();
-            let key = (reference.space_id.clone(), reference.note_id.clone());
-            if seen.contains(&key) {
-                continue;
-            }
-            let search_parts = if matches!(args.response_format, Some(Format::Detailed)) {
-                3
-            } else {
-                1
-            };
-            let mut source_remaining = source_budget;
-            let heading = format!("## {}\n", reference.note_id);
-            if recall
-                && !hit.chunks.iter().any(|chunk| {
+
+            // Pass 1: admit up to `limit` distinct notes in global score order,
+            // taking each note's best eligible chunk first so secondary chunks of
+            // one Space cannot starve higher-scoring hits from other Spaces.
+            let mut recalled: Vec<RecalledNote> = Vec::new();
+            for Candidate { index, hit } in candidates {
+                if recalled.len() >= limit {
+                    truncated = true;
+                    break;
+                }
+                let target = &targets[index];
+                let scope = call.space(target.scope.clone())?;
+                let metadata = hit.card.document.provenance();
+                let reference = metadata.reference();
+                let key = (reference.space_id.clone(), reference.note_id.clone());
+                if seen.contains(&key) {
+                    continue;
+                }
+                if !hit.chunks.iter().any(|chunk| {
                     let tokens = chunk.part().tokens();
-                    tokens <= source_remaining
+                    tokens <= source_budget
                         && tokens.saturating_add(framing_tokens(&reference.note_id, true))
                             <= remaining
-                })
-            {
-                if !hit.chunks.is_empty() {
-                    truncated = true;
+                }) {
+                    if !hit.chunks.is_empty() {
+                        truncated = true;
+                    }
+                    continue;
                 }
-                continue;
+                let provenance_checkpoint = call.provenance_checkpoint();
+                let selection = match corpus::note_metadata_selection(call, &scope, metadata).await
+                {
+                    Ok(selection) => selection,
+                    Err(error) if corpus::hidden(&error) => continue,
+                    Err(error) => return Err(error),
+                };
+                let mut first_part = None;
+                for (chunk_idx, chunk) in hit.chunks.iter().enumerate() {
+                    if chunk.provenance().reference() != reference
+                        || chunk.provenance().revision() != metadata.revision()
+                        || chunk.provenance().digest() != metadata.digest()
+                    {
+                        return Err(invalid(ValidationReason::SourceMismatch));
+                    }
+                    let tokens = chunk.part().tokens();
+                    let charge = tokens + framing_tokens(&reference.note_id, true);
+                    if tokens > source_budget || charge > remaining {
+                        truncated = true;
+                        continue;
+                    }
+                    let text = match corpus::search_part_with_selection(
+                        call,
+                        &scope,
+                        metadata,
+                        chunk,
+                        selection.as_ref(),
+                    )
+                    .await
+                    {
+                        Ok(text) => text,
+                        Err(error) if corpus::hidden(&error) => continue,
+                        Err(error) => return Err(error),
+                    };
+                    remaining -= charge;
+                    first_part = Some((text, source_budget - tokens, chunk_idx + 1));
+                    break;
+                }
+                let Some((text, source_remaining, next_chunk_idx)) = first_part else {
+                    call.rollback_provenance(provenance_checkpoint);
+                    continue;
+                };
+                best.get_or_insert(hit.score);
+                seen.insert(key);
+                recalled.push(RecalledNote {
+                    hit,
+                    scope,
+                    selection,
+                    source_remaining,
+                    parts: vec![text],
+                    next_chunk_idx,
+                });
             }
-            let provenance_checkpoint = call.provenance_checkpoint();
-            let selection = match corpus::note_metadata_selection(call, &scope, metadata).await {
-                Ok(selection) => selection,
-                Err(error) if corpus::hidden(&error) => continue,
-                Err(error) => return Err(error),
-            };
-            if !recall {
+
+            // Pass 2: pack additional chunks from admitted notes in rank order
+            // while per-source and overall token budgets allow.
+            for entry in &mut recalled {
+                let metadata = entry.hit.card.document.provenance();
+                let reference = metadata.reference();
+                for chunk in &entry.hit.chunks[entry.next_chunk_idx..] {
+                    if chunk.provenance().reference() != reference
+                        || chunk.provenance().revision() != metadata.revision()
+                        || chunk.provenance().digest() != metadata.digest()
+                    {
+                        return Err(invalid(ValidationReason::SourceMismatch));
+                    }
+                    let tokens = chunk.part().tokens();
+                    let charge = tokens + framing_tokens(&reference.note_id, false);
+                    if tokens > entry.source_remaining || charge > remaining {
+                        truncated = true;
+                        continue;
+                    }
+                    let text = match corpus::search_part_with_selection(
+                        call,
+                        &entry.scope,
+                        metadata,
+                        chunk,
+                        entry.selection.as_ref(),
+                    )
+                    .await
+                    {
+                        Ok(text) => text,
+                        Err(error) if corpus::hidden(&error) => continue,
+                        Err(error) => return Err(error),
+                    };
+                    entry.source_remaining -= tokens;
+                    remaining -= charge;
+                    entry.parts.push(text);
+                }
+            }
+
+            for entry in recalled {
+                let metadata = entry.hit.card.document.provenance();
+                let reference = metadata.reference();
+                combined.push_str(&format!("## {}\n", reference.note_id));
+                for part in &entry.parts {
+                    combined.push_str(part);
+                    combined.push_str("\n\n");
+                }
+                let mut item = json!({
+                    "noteId": reference.note_id,
+                    "spaceId": reference.space_id,
+                    "versionToken": metadata.revision(),
+                    "title": entry.hit.card.title,
+                    "path": entry.hit.card.path,
+                    "class": metadata.class(),
+                });
+                if external {
+                    item["score"] = json!(entry.hit.score);
+                }
+                hits.push(reference.clone());
+                output.push(item);
+            }
+        } else {
+            for Candidate { index, hit } in candidates {
+                if output.len() >= limit {
+                    truncated = true;
+                    break;
+                }
+                let target = &targets[index];
+                let scope = call.space(target.scope.clone())?;
+                let metadata = hit.card.document.provenance();
+                let reference = metadata.reference();
+                let key = (reference.space_id.clone(), reference.note_id.clone());
+                if seen.contains(&key) {
+                    continue;
+                }
+                let search_parts = if matches!(args.response_format, Some(Format::Detailed)) {
+                    3
+                } else {
+                    1
+                };
+                let selection = match corpus::note_metadata_selection(call, &scope, metadata).await
+                {
+                    Ok(selection) => selection,
+                    Err(error) if corpus::hidden(&error) => continue,
+                    Err(error) => return Err(error),
+                };
                 match corpus::admit_metadata_with_selection(
                     call,
                     &scope,
@@ -396,76 +532,52 @@ pub(super) async fn retrieve(
                     Err(error) if corpus::hidden(&error) => continue,
                     Err(error) => return Err(error),
                 }
-            }
-            let mut parts = Vec::new();
-            for chunk in &hit.chunks {
-                if chunk.provenance().reference() != reference
-                    || chunk.provenance().revision() != metadata.revision()
-                    || chunk.provenance().digest() != metadata.digest()
-                {
-                    return Err(invalid(ValidationReason::SourceMismatch));
+                let mut parts = Vec::new();
+                for chunk in &hit.chunks {
+                    if chunk.provenance().reference() != reference
+                        || chunk.provenance().revision() != metadata.revision()
+                        || chunk.provenance().digest() != metadata.digest()
+                    {
+                        return Err(invalid(ValidationReason::SourceMismatch));
+                    }
+                    if parts.len() == search_parts {
+                        break;
+                    }
+                    let text = match corpus::search_part_with_selection(
+                        call,
+                        &scope,
+                        metadata,
+                        chunk,
+                        selection.as_ref(),
+                    )
+                    .await
+                    {
+                        Ok(text) => text,
+                        Err(error) if corpus::hidden(&error) => continue,
+                        Err(error) => return Err(error),
+                    };
+                    parts.push(text);
                 }
-                if !recall && parts.len() == search_parts {
-                    break;
+                let mut item = json!({
+                    "noteId": reference.note_id,
+                    "spaceId": reference.space_id,
+                    "versionToken": metadata.revision(),
+                    "title": hit.card.title,
+                    "path": hit.card.path,
+                    "class": metadata.class(),
+                    "snippet": parts.first(),
+                });
+                if external {
+                    item["score"] = json!(hit.score);
                 }
-                let tokens = chunk.part().tokens();
-                let charge = tokens + framing_tokens(&reference.note_id, parts.is_empty());
-                if recall && (tokens > source_remaining || charge > remaining) {
-                    truncated = true;
-                    continue;
-                }
-                let text = match corpus::search_part_with_selection(
-                    call,
-                    &scope,
-                    metadata,
-                    chunk,
-                    selection.as_ref(),
-                )
-                .await
-                {
-                    Ok(text) => text,
-                    Err(error) if corpus::hidden(&error) => continue,
-                    Err(error) => return Err(error),
-                };
-                if recall {
-                    source_remaining -= tokens;
-                    remaining -= charge;
-                }
-                parts.push(text);
-            }
-            if recall {
-                if parts.is_empty() {
-                    call.rollback_provenance(provenance_checkpoint);
-                    continue 'candidates;
-                }
-                combined.push_str(&heading);
-                for part in &parts {
-                    combined.push_str(part);
-                    combined.push_str("\n\n");
-                }
-            }
-
-            let mut item = json!({
-                "noteId": reference.note_id,
-                "spaceId": reference.space_id,
-                "versionToken": metadata.revision(),
-                "title": hit.card.title,
-                "path": hit.card.path,
-                "class": metadata.class(),
-            });
-            if external {
-                item["score"] = json!(hit.score);
-            }
-            if !recall {
-                item["snippet"] = json!(parts.first());
                 if matches!(args.response_format, Some(Format::Detailed)) {
                     item["chunks"] = json!(parts);
                 }
+                best.get_or_insert(hit.score);
+                seen.insert(key);
+                hits.push(reference.clone());
+                output.push(item);
             }
-            best.get_or_insert(hit.score);
-            seen.insert(key);
-            hits.push(reference.clone());
-            output.push(item);
         }
 
         let mut degradation = own_degradation;

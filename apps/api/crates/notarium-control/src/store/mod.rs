@@ -9,7 +9,7 @@ pub(crate) mod target;
 pub(crate) mod values;
 #[cfg(test)]
 mod writer_tests;
-use crate::error::{database, invalid, unavailable};
+use crate::error::{database, database_not_committed, invalid, unavailable};
 pub use export::TargetExport;
 pub use import::TargetImport;
 use notarium_core::{
@@ -423,14 +423,14 @@ impl ControlStore {
             .run(
                 async {
                     let mut inner = match &self.backend {
-                        Backend::Sqlite { read_pool, .. } => {
-                            Transaction::Sqlite(read_pool.begin().await.map_err(database)?)
-                        }
+                        Backend::Sqlite { read_pool, .. } => Transaction::Sqlite(
+                            read_pool.begin().await.map_err(database_not_committed)?,
+                        ),
                         Backend::Postgres { read_pool, .. } => Transaction::Postgres(
                             read_pool
                                 .begin_with("BEGIN TRANSACTION READ ONLY")
                                 .await
-                                .map_err(database)?,
+                                .map_err(database_not_committed)?,
                         ),
                     };
                     budget.configure(&mut inner).await?;
@@ -504,7 +504,11 @@ impl ControlStore {
                 };
                 let inner = match &store.backend {
                     Backend::Sqlite { pool, .. } => {
-                        match pool.begin_with("BEGIN IMMEDIATE").await.map_err(database) {
+                        match pool
+                            .begin_with("BEGIN IMMEDIATE")
+                            .await
+                            .map_err(database_not_committed)
+                        {
                             Ok(tx) => Transaction::Sqlite(tx),
                             Err(err) => {
                                 if let Some(fence) = file_fence {
@@ -515,7 +519,7 @@ impl ControlStore {
                         }
                     }
                     Backend::Postgres { pool, .. } => {
-                        Transaction::Postgres(pool.begin().await.map_err(database)?)
+                        Transaction::Postgres(pool.begin().await.map_err(database_not_committed)?)
                     }
                 };
                 let mut tx = WriteTransaction {
@@ -534,7 +538,7 @@ impl ControlStore {
                         .bind(BACKUP_LOCK)
                         .execute(&mut **inner)
                         .await
-                        .map_err(database)?;
+                        .map_err(database_not_committed)?;
                 }
                 worker_budget.check(CommitEffect::NotCommitted)?;
                 Ok(tx)
@@ -564,13 +568,13 @@ impl ControlStore {
             )
             .fetch_optional(read_pool)
             .await
-            .map_err(database)?,
+            .map_err(database_not_committed)?,
             Backend::Postgres { read_pool, .. } => sqlx::query_scalar(
                 "SELECT installation_id FROM v1_control.v1_storage_epoch WHERE singleton=1 AND epoch_version=1 AND state='ready'",
             )
             .fetch_optional(read_pool)
             .await
-            .map_err(database)?,
+            .map_err(database_not_committed)?,
         };
         value
             .map(|value| InstallationId::parse(&value).map_err(Into::into))
@@ -614,7 +618,7 @@ where
     let envelope = encoded_size(&serde_json::json!({"table":table.name(),"row":null}))? - 4;
     let mut rows = Vec::new();
     let mut bytes = 0usize;
-    while let Some(row) = stream.try_next().await.map_err(database)? {
+    while let Some(row) = stream.try_next().await.map_err(database_not_committed)? {
         // Match TargetRecord's exact tagged envelope used by import admission.
         let size = encoded_size(&row)?.saturating_add(envelope);
         if size > EXPORT_PAGE_BYTES {
@@ -660,8 +664,8 @@ impl ReadTransaction {
         let ReadResources { inner, _admission } =
             self.resources.take().expect("live read transaction");
         let result = match inner {
-            Transaction::Sqlite(tx) => tx.rollback().await.map_err(database),
-            Transaction::Postgres(tx) => tx.rollback().await.map_err(database),
+            Transaction::Sqlite(tx) => tx.rollback().await.map_err(database_not_committed),
+            Transaction::Postgres(tx) => tx.rollback().await.map_err(database_not_committed),
         };
         drop(_admission);
         result
@@ -709,8 +713,8 @@ impl WriteResources {
             file_fence,
         } = self;
         let result = match inner {
-            Transaction::Sqlite(tx) => tx.rollback().await.map_err(database),
-            Transaction::Postgres(tx) => tx.rollback().await.map_err(database),
+            Transaction::Sqlite(tx) => tx.rollback().await.map_err(database_not_committed),
+            Transaction::Postgres(tx) => tx.rollback().await.map_err(database_not_committed),
         };
         let fence_result = if let Some(fence) = file_fence {
             fence.release()

@@ -6692,4 +6692,197 @@ async fn rollback_preserves_updated_at_sort_and_pre_run_manual_order(
         vec![newer.note, older.note],
         "rollback must restore pre-run note_heads.updated_at so updated_at DESC stays [Newer, Older]"
     );
+
+    // Case E: Partially ranked group `[X (manual rank), B (unranked), C (unranked)]`
+    // sorted by `title ASC`. Agent edits `B`'s title to `Z-B` and moves `D` before `C`
+    // (synthetically materializing ranks on `B` and `C`). Even though `X` keeps its
+    // lower pre-run manual rank, rollback must delete the run-materialized overlays on
+    // `B` and `C` (since no surviving non-materialized card has a rank > `B`/`C`) so
+    // `B` returns to unranked order `[X, B, C]`, not `[X, C, B]`.
+    let proj_e = folder(store, &owner, None, "rb-partial-rank-mat", true)
+        .await
+        .unwrap();
+    let (ve, ve_rev) = create_view(
+        store,
+        &owner,
+        &proj_e,
+        "rb-partial-board",
+        "board",
+        "{scope: project}",
+        "group_by: status\nfilter: {exists: status}\nsort: [{field: title, type: string, direction: asc}]\n",
+    )
+    .await;
+    let card_x = create_note(
+        store,
+        &owner,
+        Some(proj_e.clone()),
+        "p-x",
+        "---\nstatus: todo\ntitle: X-Manual\n---\n".into(),
+    )
+    .await;
+    let card_x2 = create_note(
+        store,
+        &owner,
+        Some(proj_e.clone()),
+        "p-x2",
+        "---\nstatus: todo\ntitle: Y-Manual\n---\n".into(),
+    )
+    .await;
+    // Human manually ranks `X` before `X2` in `todo`, then creates unranked `B` and `C`.
+    let card_x = store
+        .move_board_card(
+            owner.clone(),
+            mutation(
+                &owner,
+                MoveBoardCard {
+                    view: ve.clone(),
+                    note: card_x.note.clone(),
+                    group: group("todo"),
+                    before: Some(notarium_core::ports::RankNeighbor {
+                        note: card_x2.note.clone(),
+                        expected_rank: RankExpectation::Absent,
+                    }),
+                    after: None,
+                    fields: BTreeMap::new(),
+                    expected_note: card_x.revision.clone(),
+                    expected_view: ve_rev.revision.clone(),
+                    expected_rank: RankExpectation::Absent,
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .value
+        .revision;
+    let card_b = create_note(
+        store,
+        &owner,
+        Some(proj_e.clone()),
+        "p-b",
+        "---\nstatus: todo\ntitle: B-Card\n---\n".into(),
+    )
+    .await;
+    let card_c = create_note(
+        store,
+        &owner,
+        Some(proj_e.clone()),
+        "p-c",
+        "---\nstatus: todo\ntitle: C-Card\n---\n".into(),
+    )
+    .await;
+    let card_d = create_note(
+        store,
+        &owner,
+        Some(proj_e),
+        "p-d",
+        "---\nstatus: doing\ntitle: D-Card\n---\n".into(),
+    )
+    .await;
+    sync(store, runtime, &scope).await;
+    let ve_before: Vec<NoteId> = query(&engine, owner.clone(), ve.clone())
+        .await
+        .unwrap()
+        .rows
+        .items
+        .into_iter()
+        .filter(|row| row.card.document.provenance().reference().note_id != card_d.note)
+        .map(|row| row.card.document.provenance().reference().note_id.clone())
+        .collect();
+    assert_eq!(
+        ve_before,
+        vec![
+            card_x.note.clone(),
+            card_x2.note.clone(),
+            card_b.note.clone(),
+            card_c.note.clone()
+        ]
+    );
+
+    let run_e = AgentRunId::from_bytes(random_bytes());
+    let agent_e = super::agent(&owner, run_e.clone(), ChatAudience::Personal);
+    // Agent renames `B` to `Z-B` so `C` now sorts before `B` in default order,
+    // then moves `D` into `todo` before `B`, materializing synthetic ranks on `C` and `B`.
+    let old_b_carrier = "---\nstatus: todo\ntitle: B-Card\n---\n";
+    let new_b_carrier = "---\nstatus: todo\ntitle: Z-B-Card\n---\n";
+    let analyzed_b =
+        notarium_syntax::frontmatter::analyze(old_b_carrier, DocClass::UserDoc).unwrap();
+    let header_span_b = analyzed_b.carrier.header.unwrap();
+    let b_plan = notarium_syntax::patch::plan(
+        old_b_carrier,
+        analyzed_b.carrier.body,
+        vec![(
+            CarrierEditOrigin::Header,
+            header_span_b,
+            new_b_carrier.to_owned(),
+        )],
+    )
+    .unwrap();
+    let mut edit_b = mutation(
+        &agent_e,
+        EditNote {
+            note: card_b.note.clone(),
+            plan: b_plan,
+        },
+    );
+    edit_b.preconditions.revision = Some(card_b.revision.clone());
+    let card_b_edited = store
+        .edit_note(agent_e.clone(), edit_b)
+        .await
+        .unwrap()
+        .value;
+    sync(store, runtime, &scope).await;
+    store
+        .move_board_card(
+            agent_e.clone(),
+            mutation(
+                &agent_e,
+                MoveBoardCard {
+                    view: ve.clone(),
+                    note: card_d.note.clone(),
+                    group: group("todo"),
+                    before: Some(notarium_core::ports::RankNeighbor {
+                        note: card_b_edited.note.clone(),
+                        expected_rank: RankExpectation::Absent,
+                    }),
+                    after: Some(notarium_core::ports::RankNeighbor {
+                        note: card_c.note.clone(),
+                        expected_rank: RankExpectation::Absent,
+                    }),
+                    fields: BTreeMap::from([(
+                        "status".into(),
+                        Some(YamlValue::String("todo".into())),
+                    )]),
+                    expected_note: card_d.revision.clone(),
+                    expected_view: ve_rev.revision.clone(),
+                    expected_rank: RankExpectation::Absent,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    sync(store, runtime, &scope).await;
+
+    let prep_e = store
+        .prepare_agent_run_rollback(owner.clone(), run_e)
+        .await
+        .unwrap();
+    store
+        .rollback_agent_run(owner.clone(), mutation(&owner, prep_e))
+        .await
+        .unwrap();
+    sync(store, runtime, &scope).await;
+    let ve_after: Vec<NoteId> = query(&engine, owner.clone(), ve)
+        .await
+        .unwrap()
+        .rows
+        .items
+        .into_iter()
+        .filter(|row| row.card.document.provenance().reference().note_id != card_d.note)
+        .map(|row| row.card.document.provenance().reference().note_id.clone())
+        .collect();
+    assert_eq!(
+        ve_after,
+        vec![card_x.note, card_x2.note, card_b.note, card_c.note],
+        "rollback must delete synthetic run-materialized overlays on B and C when only lower-ranked manual cards X/X2 survive"
+    );
 }

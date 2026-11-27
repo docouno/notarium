@@ -2999,6 +2999,20 @@ fn build_rollback_execute_fn(
                                         mg == &grp
                                             && base_pos.get(mid).copied().unwrap_or(usize::MAX)
                                                 > cid_pos
+                                            && effective_overlays.get(mid).is_some_and(|mid_ov| {
+                                                effective_overlays.iter().any(
+                                                    |(other_id, other_ov)| {
+                                                        other_ov.group == grp
+                                                            && !retired_note_ids.contains(other_id)
+                                                            && !moved_targets_on_view
+                                                                .contains(other_id)
+                                                            && !same_group_run_materialized
+                                                                .contains_key(other_id)
+                                                            && other_ov.sort_rank_lexo
+                                                                > mid_ov.sort_rank_lexo
+                                                    },
+                                                )
+                                            })
                                     });
                                 if !needs_rank_in_working
                                     && !needs_rank_for_surviving_mat
@@ -3188,14 +3202,20 @@ fn build_rollback_execute_fn(
                         });
                     }
                     for (nid, grp) in &same_group_run_materialized {
-                        let group_has_surviving_ranked = touched_final_groups.contains(grp)
-                            || effective_overlays.iter().any(|(other_id, other_ov)| {
-                                &other_ov.group == grp
-                                    && !retired_note_ids.contains(other_id)
-                                    && !moved_targets_on_view.contains(other_id)
-                                    && !same_group_run_materialized.contains_key(other_id)
+                        let nid_rank = effective_overlays
+                            .get(nid)
+                            .map(|ov| ov.sort_rank_lexo.as_str());
+                        let group_has_surviving_ranked_below = touched_final_groups.contains(grp)
+                            || nid_rank.is_some_and(|rank| {
+                                effective_overlays.iter().any(|(other_id, other_ov)| {
+                                    &other_ov.group == grp
+                                        && !retired_note_ids.contains(other_id)
+                                        && !moved_targets_on_view.contains(other_id)
+                                        && !same_group_run_materialized.contains_key(other_id)
+                                        && other_ov.sort_rank_lexo.as_str() > rank
+                                })
                             });
-                        if !group_has_surviving_ranked {
+                        if !group_has_surviving_ranked_below {
                             pending_stale_deletes.push(nid.clone());
                         }
                     }
@@ -3295,6 +3315,7 @@ fn build_rollback_execute_fn(
                         }
                     }
                 }
+                preloaded_view_overlays.insert(view.clone(), overlays);
             }
 
             // 5. Count exact SpaceSeq allocations before executing SQL mutations.

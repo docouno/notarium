@@ -184,6 +184,9 @@ impl ControlService {
             let batch_len = batch.len();
             for row in batch {
                 scanned = scanned.saturating_add(1);
+                if scanned > MAX_SCAN {
+                    return Err(invalid(ValidationReason::BudgetExceeded));
+                }
                 let space = SpaceId::parse(&row.space_id)?;
                 let row_cursor = Cursor {
                     version: 1,

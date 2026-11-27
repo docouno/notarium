@@ -907,8 +907,12 @@ impl crate::CanonicalStore {
         published_out: &mut Vec<(SpaceId, ContentDigest)>,
     ) -> Result<PendingDirSyncs, PortError> {
         let mut extra_dirs = PendingDirSyncs::default();
-        let mut to_rename: Vec<(SpaceId, ContentDigest, local::DeferredLocalTempFile)> =
-            Vec::with_capacity(synced_entries.len());
+        let mut to_rename: Vec<(
+            SpaceId,
+            ContentDigest,
+            local::DeferredLocalTempFile,
+            Option<Arc<local::LocalSharedGuard>>,
+        )> = Vec::with_capacity(synced_entries.len());
         let mut to_unlink = Vec::new();
         let mut seen_renamed: HashSet<(String, ContentDigest)> =
             HashSet::with_capacity(synced_entries.len());
@@ -919,7 +923,7 @@ impl crate::CanonicalStore {
                 extra_dirs.merge(&entry.item_dirs);
                 if let Some(tf) = entry.temp_file {
                     if seen_renamed.insert(key) {
-                        to_rename.push((entry.space_id, entry.digest, tf));
+                        to_rename.push((entry.space_id, entry.digest, tf, entry._guard));
                     } else {
                         to_unlink.push(tf);
                     }
@@ -940,7 +944,7 @@ impl crate::CanonicalStore {
             if !to_rename.is_empty() {
                 let (published, err) = tokio::task::spawn_blocking(move || {
                     let mut done = Vec::with_capacity(to_rename.len());
-                    for (space_id, digest, tf) in to_rename {
+                    for (space_id, digest, tf, _guard) in to_rename {
                         if let Err(e) = tf.rename_into_place() {
                             return (done, Some(e));
                         }
@@ -968,7 +972,7 @@ impl crate::CanonicalStore {
                 }
                 ren_set.spawn_blocking(move || {
                     let mut done = Vec::with_capacity(chunk.len());
-                    for (space_id, digest, tf) in chunk {
+                    for (space_id, digest, tf, _guard) in chunk {
                         if let Err(e) = tf.rename_into_place() {
                             return (done, Some(e));
                         }

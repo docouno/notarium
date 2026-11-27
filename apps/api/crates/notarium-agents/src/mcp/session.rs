@@ -76,6 +76,8 @@ struct StartPlan {
     expected: ControlRevision,
     requested: EpisodeId,
     project: Option<FolderRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_ack: Option<delta::PendingDeliveryAck>,
 }
 
 pub(super) async fn handle(
@@ -523,9 +525,11 @@ async fn start(call: &mut ToolCallContext<'_>, args: StartArgs) -> Result<Value,
             // committing `delta::deliver` or writing the start-episode journal so
             // deterministic domain errors never advance the delta cursor or collapse
             // into a `CommitEffect::Unknown / RetrySameCommand` retry loop.
-            if let Some(receipt) = args.delivery_receipt.as_deref() {
-                delta::validate_delivery(call, receipt).await?;
-            }
+            let pending_ack = if let Some(receipt) = args.delivery_receipt.as_deref() {
+                delta::prepare_delivery(call, receipt, args.acknowledge).await?
+            } else {
+                None
+            };
             let project = match args.project.as_deref() {
                 Some(handle) => Some(resolve_project(call, handle).await?.folder),
                 None => None,
@@ -556,7 +560,9 @@ async fn start(call: &mut ToolCallContext<'_>, args: StartArgs) -> Result<Value,
                             }
                         }
                         NamedEpisodePreview::ProjectUnavailable => {
-                            return Err(DomainError::ResourceNotFound.into());
+                            if project.is_some() {
+                                return Err(invalid(ValidationReason::ScopeMismatch));
+                            }
                         }
                         NamedEpisodePreview::NoMatch | NamedEpisodePreview::Ambiguous => {}
                     }
@@ -642,23 +648,16 @@ async fn start(call: &mut ToolCallContext<'_>, args: StartArgs) -> Result<Value,
                 expected: ControlRevision::ZERO,
                 requested,
                 project,
+                pending_ack,
             });
         }
     } else if let Some(receipt) = args.delivery_receipt.as_deref() {
-        delta::validate_delivery(call, receipt).await?;
-    }
-    if existing_plan.is_none()
-        && let Some(receipt) = args.delivery_receipt.as_deref()
-    {
         let acknowledged = delta::deliver(call, receipt, args.acknowledge).await?;
-        committed_any |= acknowledged;
-        if !new_selection {
-            return Ok(json!({ "acknowledged": acknowledged }));
-        }
+        return Ok(json!({ "acknowledged": acknowledged }));
     }
     const SESSION_LABEL: &str = "notarium.mcp.start-session.v1";
-    let map_session_err = |error: PortError| {
-        if committed_any {
+    let map_session_err = |committed: bool, error: PortError| {
+        if committed {
             super::note_tools::post_commit_error(SESSION_LABEL, error)
         } else {
             super::note_tools::batch_operational_error(SESSION_LABEL, error, false)
@@ -671,9 +670,15 @@ async fn start(call: &mut ToolCallContext<'_>, args: StartArgs) -> Result<Value,
             let prepared = preflight_plan.expect("preflight_plan built when not yet journaled");
             call.journal("start-episode", || async move { Ok(prepared) })
                 .await
-                .map_err(map_session_err)?
+                .map_err(|error| map_session_err(committed_any, error))?
         }
     };
+    if let Some(pending) = &plan.pending_ack {
+        delta::acknowledge_prepared(call, pending)
+            .await
+            .map_err(|error| map_session_err(committed_any, error))?;
+        committed_any = true;
+    }
     let selector = match selector {
         EpisodeSelector::New { name, .. } => EpisodeSelector::New {
             name,
@@ -696,7 +701,7 @@ async fn start(call: &mut ToolCallContext<'_>, args: StartArgs) -> Result<Value,
             },
         )
         .await
-        .map_err(map_session_err)?;
+        .map_err(|error| map_session_err(committed_any, error))?;
     let (episode, state) = match opened.value {
         EpisodeStartResult::New(episode) => (episode, "new"),
         EpisodeStartResult::Resumed(episode) => (episode, "resumed"),

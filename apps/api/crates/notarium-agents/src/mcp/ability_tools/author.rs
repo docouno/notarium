@@ -446,9 +446,71 @@ pub(super) async fn create(
         .journal("create-ability-plan", || async {
             plan_replayed = false;
             let home = new_home(call, &args.placement).await?;
+            if let AbilityPlacement::OwnedProject(project) = &home.placement {
+                session::project_for_folder(call, project).await?;
+            }
             let skills = resolve_skills(call, attachments).await?;
             let availability =
                 select_projects(call, args.availability.as_ref(), &home.scope.space_id).await?;
+            // Pre-check active ability slug conflicts in the target placement
+            // BEFORE journaling the plan or creating `.abilities/` / the
+            // entrypoint note, so a deterministic `PathConflict` never persists
+            // a journal record that would skip the pre-check on retry.
+            let slot_project = match &home.placement {
+                AbilityPlacement::OwnedProject(project) => Some(project.clone()),
+                _ => None,
+            };
+            let space_account = notarium_core::ports::AccountContext::new(
+                call.auth.restrict_to_space(&home.scope.space_id)?,
+                call.budget(),
+            );
+            const MAX_SLUG_CHECK_PAGES: usize = 64;
+            let mut cursor: Option<String> = None;
+            for _ in 0..MAX_SLUG_CHECK_PAGES {
+                let existing_same_slug = call
+                    .registry
+                    .catalog
+                    .abilities(
+                        space_account.clone(),
+                        AbilityQuery {
+                            page: ControlPageRequest::new(200, cursor.clone())?,
+                            project: slot_project.clone(),
+                            kind: None,
+                            name: Some(slug.clone()),
+                            authoring: true,
+                        },
+                    )
+                    .await?;
+                if existing_same_slug
+                    .items
+                    .iter()
+                    .any(|item| item.reference.placement == home.placement)
+                {
+                    return Err(DomainError::PathConflict {
+                        target: notarium_core::model::PathTarget {
+                            space_id: home.scope.space_id.clone(),
+                            parent: home.parent.clone(),
+                            component: slug.clone(),
+                        },
+                    }
+                    .into());
+                }
+                match existing_same_slug.continuation {
+                    Some(next) => {
+                        if cursor.as_ref() == Some(&next) {
+                            return Err(invalid(ValidationReason::InvalidState));
+                        }
+                        cursor = Some(next);
+                    }
+                    None => {
+                        cursor = None;
+                        break;
+                    }
+                }
+            }
+            if cursor.is_some() {
+                return Err(invalid(ValidationReason::BudgetExceeded));
+            }
             Ok(CreatePlan {
                 home,
                 skills,
@@ -457,84 +519,36 @@ pub(super) async fn create(
             })
         })
         .await?;
-    if let AbilityPlacement::OwnedProject(project) = &plan.home.placement {
-        if !plan_replayed {
-            session::project_for_folder(call, project).await?;
+    if plan_replayed && let AbilityPlacement::OwnedProject(project) = &plan.home.placement {
+        let live_opt = match call
+            .registry
+            .catalog
+            .folder(call.account(), project.clone())
+            .await
+        {
+            Ok(folder) => Some(folder),
+            Err(PortError::Domain(DomainError::ResourceNotFound)) => None,
+            Err(error) => return Err(error),
+        };
+        if let Some(folder) = live_opt {
+            if folder.reference != *project
+                || folder.lifecycle == notarium_core::model::Lifecycle::Purged
+            {
+                return Err(DomainError::ResourceNotFound.into());
+            }
         } else {
-            let live_opt = match call
+            let trashed = call
                 .registry
                 .catalog
-                .folder(call.account(), project.clone())
-                .await
-            {
-                Ok(folder) => Some(folder),
-                Err(PortError::Domain(DomainError::ResourceNotFound)) => None,
-                Err(error) => return Err(error),
-            };
-            if let Some(folder) = live_opt {
-                if folder.reference != *project
-                    || folder.lifecycle == notarium_core::model::Lifecycle::Purged
-                {
-                    return Err(DomainError::ResourceNotFound.into());
-                }
-            } else {
-                let trashed = call
-                    .registry
-                    .catalog
-                    .trashed_folder_ancestry(call.account(), project.clone())
-                    .await?;
-                if trashed.reference != *project {
-                    return Err(DomainError::ResourceNotFound.into());
-                }
+                .trashed_folder_ancestry(call.account(), project.clone())
+                .await?;
+            if trashed.reference != *project {
+                return Err(DomainError::ResourceNotFound.into());
             }
         }
     }
     let carrier = created_carrier(&args, kind, &format_attachments(attachments, &plan.skills)?)?;
     const CREATE_LABEL: &str = "notarium.mcp.create-ability.v1";
-    if !plan_replayed {
-        // Pre-check active ability slug conflicts in the target placement BEFORE
-        // creating `.abilities/` or the entrypoint note so a conflicting active
-        // package outside `.abilities/` fails cleanly without leaving an orphan note.
-        let slot_project = match &plan.home.placement {
-            AbilityPlacement::OwnedProject(project) => Some(project.clone()),
-            _ => None,
-        };
-        let mut cursor = None;
-        loop {
-            let existing_same_slug = call
-                .registry
-                .catalog
-                .abilities(
-                    call.account(),
-                    AbilityQuery {
-                        page: ControlPageRequest::new(200, cursor)?,
-                        project: slot_project.clone(),
-                        kind: None,
-                        name: Some(slug.clone()),
-                        authoring: true,
-                    },
-                )
-                .await?;
-            if existing_same_slug
-                .items
-                .iter()
-                .any(|item| item.reference.placement == plan.home.placement)
-            {
-                return Err(DomainError::PathConflict {
-                    target: notarium_core::model::PathTarget {
-                        space_id: plan.home.scope.space_id.clone(),
-                        parent: plan.home.parent.clone(),
-                        component: slug.clone(),
-                    },
-                }
-                .into());
-            }
-            let Some(next) = existing_same_slug.continuation else {
-                break;
-            };
-            cursor = Some(next);
-        }
-    }
     let ensured_parent = ensure_ability_folder_journaled(
         call,
         &plan.home.scope,
@@ -973,6 +987,13 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
         } else {
             None
         };
+        if let Some(done) = &journaled_outcome {
+            // Package publication already committed before a prior failure;
+            // mark `published` before any follow-up read so a transient failure
+            // in `original_package` still escalates to `CommitEffect::Unknown`.
+            authored_changed = done.authored_changed;
+            published = authored_changed || plan.promote;
+        }
         let (orig_slug, orig_attached_skills, files, already_published) =
             match original_package(call, &plan, plan_replayed).await {
                 Ok(original) => {
@@ -1511,16 +1532,14 @@ async fn ensure_ability_folder_journaled(
             call.request_hash,
             || async {
                 existed_replayed = false;
-                Ok(call
-                    .registry
-                    .engine
-                    .resolve_folder_path(
-                        call.space(scope.clone())?,
-                        parent.clone(),
-                        ".abilities".to_owned(),
-                    )
-                    .await?
-                    .is_some())
+                let space = call.space(scope.clone())?;
+                super::super::note_tools::live_folder_exists_at(
+                    call,
+                    &space,
+                    parent.as_ref(),
+                    ".abilities",
+                )
+                .await
             },
         )
         .await

@@ -29,11 +29,13 @@ ancestry(ability_id, slug_fold, folder_id, parent_folder_id, is_project) AS (
       AND note.note_id = package.entrypoint_note_id
       AND folder.space_id = note.space_id
       AND folder.folder_id = note.parent_folder_id
-    UNION
+    UNION ALL
     SELECT ancestry.ability_id, ancestry.slug_fold, parent.folder_id, parent.parent_folder_id, parent.is_project
     FROM ancestry
     CROSS JOIN folder_heads AS parent
-    WHERE parent.space_id = $1 AND parent.folder_id = ancestry.parent_folder_id
+    WHERE ancestry.is_project = 0
+      AND parent.space_id = $1
+      AND parent.folder_id = ancestry.parent_folder_id
 ),
 destination_slots(slug_fold) AS (
     SELECT slug_fold FROM ancestry
