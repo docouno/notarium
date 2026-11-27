@@ -160,9 +160,14 @@ async fn select_projects(
             if projects.len() > 200 {
                 return Err(invalid(ValidationReason::InvalidLimit));
             }
+            let target_space = session::readable_space(call, space).await?;
             let mut resolved = Vec::with_capacity(projects.len());
             for handle in projects {
-                let project = session::resolve_project(call, handle).await?.folder;
+                let project =
+                    match session::resolve_project_in_space(call, &target_space, handle).await? {
+                        Some(project) => project.folder,
+                        None => session::resolve_project(call, handle).await?.folder,
+                    };
                 if &project.space_id != space || resolved.contains(&project) {
                     return Err(invalid(ValidationReason::ScopeMismatch));
                 }

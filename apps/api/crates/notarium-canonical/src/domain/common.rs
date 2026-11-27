@@ -1640,6 +1640,7 @@ pub(crate) fn combine_lifecycle(a: Lifecycle, b: Lifecycle) -> Lifecycle {
 #[derive(Clone, Debug)]
 pub(crate) struct FolderAncestryFacts {
     pub ancestors: Vec<FolderId>,
+    pub ancestor_revisions: Vec<RevisionId>,
     pub write_locked: bool,
     /// Whether a note placed directly in this folder is a logical root child.
     pub is_root_child: bool,
@@ -1695,6 +1696,8 @@ struct AncestryRow {
     write_locked: bool,
     lifecycle: Lifecycle,
     cover_note: Option<NoteId>,
+    head_rev_id: RevisionId,
+    updated_seq: Option<SpaceSeq>,
 }
 
 impl From<crate::runtime::FolderHeadRow> for AncestryRow {
@@ -1708,8 +1711,213 @@ impl From<crate::runtime::FolderHeadRow> for AncestryRow {
             write_locked: row.write_locked,
             lifecycle: row.lifecycle,
             cover_note: row.cover_note_id,
+            head_rev_id: row.head_rev_id,
+            updated_seq: row.updated_seq,
         }
     }
+}
+
+type HistoricalFolderInterval = (SpaceSeq, Option<SpaceSeq>, AncestryRow);
+
+/// Cross-cut memoization cache for historical folder ancestry queries.
+/// Reuses live `FolderAncestryCache` rows when `updated_seq <= cutoff` and caches
+/// historical revision validity intervals `[rev_vis_seq, next_change_seq)` so
+/// multi-item pages across distinct publication cuts avoid repeated ancestor walks.
+#[derive(Default)]
+pub(crate) struct HistoricalFolderCache {
+    intervals: HashMap<(SpaceId, FolderId), Vec<HistoricalFolderInterval>>,
+}
+
+impl HistoricalFolderCache {
+    async fn load_row_at_cut(
+        &mut self,
+        tx: &mut BackendConn<'_>,
+        scope: &HistoryScope,
+        cutoff: SpaceSeq,
+        live: &FolderAncestryCache,
+        folder: &FolderId,
+    ) -> Result<AncestryRow, PortError> {
+        let key = (scope.space_id.clone(), folder.clone());
+        if let Some(row) = live.rows.get(&key)
+            && row.updated_seq.is_some_and(|seq| seq <= cutoff)
+        {
+            return Ok(row.clone());
+        }
+        if let Some(entries) = self.intervals.get(&key)
+            && let Some((_, _, row)) = entries
+                .iter()
+                .find(|(lo, hi, _)| *lo <= cutoff && hi.is_none_or(|next| cutoff < next))
+        {
+            return Ok(row.clone());
+        }
+        let rev = crate::runtime::read_immutable_revision_tx(
+            tx,
+            scope,
+            "folder",
+            folder.as_str(),
+            cutoff,
+        )
+        .await?
+        .ok_or_else(|| DomainError::validation(ValidationReason::CursorStale))?;
+        let RevisionMetadataPayload::Folder(row) = rev.metadata.payload else {
+            return Err(internal_not_committed(
+                "corrupt_folder_revision",
+                "expected folder metadata",
+            ));
+        };
+        let next_seq = next_folder_revision_seq_tx(tx, scope, folder, cutoff).await?;
+        let anc_row = AncestryRow {
+            folder_id: row.folder_id,
+            parent_folder_id: row.parent_folder_id,
+            is_root: row.is_root,
+            is_project: row.is_project,
+            slug: row.slug,
+            write_locked: row.write_locked,
+            lifecycle: row.lifecycle,
+            cover_note: row.cover_note_id,
+            head_rev_id: rev.revision_id,
+            updated_seq: Some(rev.visibility_seq),
+        };
+        self.intervals.entry(key).or_default().push((
+            rev.visibility_seq,
+            next_seq,
+            anc_row.clone(),
+        ));
+        Ok(anc_row)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn build_resource_facts_at_cut_tx(
+        &mut self,
+        tx: &mut BackendConn<'_>,
+        scope: &HistoryScope,
+        space: &Space,
+        cutoff: SpaceSeq,
+        live: &FolderAncestryCache,
+        parent_folder_id: &FolderId,
+        class: DocClass,
+        ability_package: Option<AbilityId>,
+        require_active_folders: bool,
+    ) -> Result<(ResourceFacts, FolderAncestryFacts), PortError> {
+        if scope.space_id != space.id {
+            return Err(DomainError::validation(ValidationReason::ScopeMismatch).into());
+        }
+        let mut ancestors = Vec::new();
+        let mut ancestor_revisions = Vec::new();
+        let mut segments_rev = Vec::new();
+        let mut visited = BTreeSet::new();
+        let mut write_locked = false;
+        let mut current = parent_folder_id.clone();
+        let mut project = None;
+        let mut cover_note = None;
+        let mut folder_lifecycle = Lifecycle::Active;
+
+        for _depth in 0..=MAX_FOLDER_DEPTH {
+            if !visited.insert(current.clone()) {
+                return Err(internal_not_committed(
+                    "folder_cycle_detected",
+                    "corrupt cycle in folder_heads",
+                ));
+            }
+            let row = self
+                .load_row_at_cut(tx, scope, cutoff, live, &current)
+                .await?;
+            if require_active_folders && row.lifecycle != Lifecycle::Active {
+                return Err(DomainError::ResourceNotFound.into());
+            }
+            folder_lifecycle = combine_lifecycle(folder_lifecycle, row.lifecycle);
+            if row.write_locked {
+                write_locked = true;
+            }
+            if ancestors.is_empty() {
+                cover_note = row.cover_note;
+            }
+            if row.is_project && project.is_none() {
+                project = Some(row.folder_id.clone());
+            }
+            ancestors.push(row.folder_id.clone());
+            ancestor_revisions.push(row.head_rev_id.clone());
+            if row.is_root {
+                segments_rev.reverse();
+                let folder_path = if segments_rev.is_empty() {
+                    String::new()
+                } else {
+                    segments_rev.join("/")
+                };
+                let is_root_child = ancestors.len() == 1;
+                let anc = FolderAncestryFacts {
+                    ancestors,
+                    ancestor_revisions,
+                    write_locked,
+                    is_root_child,
+                    folder_path,
+                    project,
+                    cover_note,
+                    folder_lifecycle,
+                };
+                let facts = ResourceFacts {
+                    space: space.clone(),
+                    class,
+                    project: anc.project.clone(),
+                    ancestor_folders: anc.ancestors.clone(),
+                    folder_write_locked: anc.write_locked,
+                    ability_package,
+                };
+                return Ok((facts, anc));
+            }
+            segments_rev.push(row.slug);
+            current = row.parent_folder_id.ok_or_else(|| {
+                internal_not_committed(
+                    "non_root_missing_parent",
+                    "non-root folder missing parent_folder_id",
+                )
+            })?;
+        }
+        Err(internal_not_committed(
+            "folder_depth_exceeded",
+            "folder tree exceeded MAX_FOLDER_DEPTH",
+        ))
+    }
+}
+
+async fn next_folder_revision_seq_tx(
+    tx: &mut BackendConn<'_>,
+    scope: &HistoryScope,
+    folder: &FolderId,
+    cutoff: SpaceSeq,
+) -> Result<Option<SpaceSeq>, PortError> {
+    let cut_i64 = cutoff.get() as i64;
+    let raw: Option<i64> = match tx {
+        BackendConn::Sqlite(conn) => sqlx::query_scalar(
+            "SELECT MIN(visibility_seq) FROM revisions
+             WHERE space_id = ?1 AND history_incarnation = ?2
+               AND entity_type = 'folder' AND entity_key = ?3
+               AND visibility_seq > ?4",
+        )
+        .bind(scope.space_id.as_str())
+        .bind(scope.incarnation.as_bytes().as_slice())
+        .bind(folder.as_str())
+        .bind(cut_i64)
+        .fetch_one(&mut **conn)
+        .await
+        .map_err(|err| internal_not_committed("sqlite_next_folder_rev", err.to_string()))?,
+        BackendConn::Postgres(conn) => sqlx::query_scalar(
+            "SELECT MIN(visibility_seq) FROM revisions
+             WHERE space_id = $1 AND history_incarnation = $2
+               AND entity_type = 'folder' AND entity_key = $3
+               AND visibility_seq > $4",
+        )
+        .bind(scope.space_id.as_str())
+        .bind(scope.incarnation.as_bytes().as_slice())
+        .bind(folder.as_str())
+        .bind(cut_i64)
+        .fetch_one(&mut **conn)
+        .await
+        .map_err(|err| crate::runtime::pg_read_error("pg_next_folder_rev", err))?,
+    };
+    raw.map(crate::codec::i64_to_space_seq)
+        .transpose()
+        .map_err(Into::into)
 }
 
 impl FolderAncestryCache {
@@ -1775,6 +1983,8 @@ impl FolderAncestryCache {
             write_locked: row.write_locked,
             lifecycle: row.lifecycle,
             cover_note: row.cover_note_id,
+            head_rev_id: rev.revision_id,
+            updated_seq: Some(rev.visibility_seq),
         })
     }
 
@@ -1837,6 +2047,7 @@ impl FolderAncestryCache {
             if row.is_root {
                 let root_facts = FolderAncestryFacts {
                     ancestors: vec![row.folder_id.clone()],
+                    ancestor_revisions: vec![row.head_rev_id.clone()],
                     write_locked: row.write_locked,
                     is_root_child: true,
                     folder_path: String::new(),
@@ -1877,6 +2088,9 @@ impl FolderAncestryCache {
             let mut next_anc = Vec::with_capacity(acc.ancestors.len() + 1);
             next_anc.push(child_row.folder_id.clone());
             next_anc.extend_from_slice(&acc.ancestors);
+            let mut next_revs = Vec::with_capacity(acc.ancestor_revisions.len() + 1);
+            next_revs.push(child_row.head_rev_id.clone());
+            next_revs.extend_from_slice(&acc.ancestor_revisions);
             let next_locked = child_row.write_locked || acc.write_locked;
             let next_path = if acc.folder_path.is_empty() {
                 child_row.slug.clone()
@@ -1885,6 +2099,7 @@ impl FolderAncestryCache {
             };
             acc = FolderAncestryFacts {
                 ancestors: next_anc,
+                ancestor_revisions: next_revs,
                 write_locked: next_locked,
                 is_root_child: false,
                 folder_path: next_path,
@@ -2003,6 +2218,7 @@ pub(crate) async fn load_folder_ancestry_tx(
     require_all_active: bool,
 ) -> Result<FolderAncestryFacts, PortError> {
     let mut ancestors = Vec::new();
+    let mut ancestor_revisions = Vec::new();
     let mut segments_rev = Vec::new();
     let mut visited = BTreeSet::new();
     let mut write_locked = false;
@@ -2033,6 +2249,7 @@ pub(crate) async fn load_folder_ancestry_tx(
             project = Some(row.folder_id.clone());
         }
         ancestors.push(row.folder_id.clone());
+        ancestor_revisions.push(row.head_rev_id.clone());
         if row.is_root {
             segments_rev.reverse();
             let folder_path = if segments_rev.is_empty() {
@@ -2043,6 +2260,7 @@ pub(crate) async fn load_folder_ancestry_tx(
             let is_root_child = ancestors.len() == 1;
             return Ok(FolderAncestryFacts {
                 ancestors,
+                ancestor_revisions,
                 write_locked,
                 is_root_child,
                 folder_path,

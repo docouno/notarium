@@ -586,7 +586,7 @@ fn pack(
     recall: Recall,
     recipient: Option<&dyn notarium_core::ports::SearchRecipient>,
 ) -> bool {
-    let had_chunks: Vec<bool> = hits.iter().map(|hit| !hit.chunks.is_empty()).collect();
+    let mut keep_title_only = vec![false; hits.len()];
     let mut remaining = recall.tokens;
     let cap = recall.max_per_source.map_or(remaining, u32::from);
     let mut source_remaining = vec![cap; hits.len()];
@@ -600,7 +600,22 @@ fn pack(
         })
     };
     let mut truncated = false;
-    for ((hit, mask), source) in hits.iter().zip(&mut selected).zip(&mut source_remaining) {
+    for (((hit, mask), source), keep_title) in hits
+        .iter()
+        .zip(&mut selected)
+        .zip(&mut source_remaining)
+        .zip(&mut keep_title_only)
+    {
+        if hit.chunks.is_empty() {
+            let frame = framing(hit, true);
+            if frame <= remaining {
+                remaining -= frame;
+                *keep_title = true;
+            } else {
+                truncated = true;
+            }
+            continue;
+        }
         let mut admitted = false;
         for (idx, part) in hit.chunks.iter().enumerate() {
             if choose(
@@ -615,7 +630,7 @@ fn pack(
             }
             truncated = true;
         }
-        if !admitted && !hit.chunks.is_empty() {
+        if !admitted {
             truncated = true;
         }
     }
@@ -647,10 +662,10 @@ fn pack(
         let mut keep = mask.into_iter();
         hit.chunks.retain(|_| keep.next().unwrap_or(false));
     }
-    // Preserve title-only notes that started without chunks while dropping
-    // notes whose chunks were all excluded by the token budget.
-    let mut had = had_chunks.into_iter();
-    hits.retain(|hit| !had.next().unwrap_or(false) || !hit.chunks.is_empty());
+    // Preserve title-only notes admitted within the framing budget while
+    // dropping notes whose chunks or framing were excluded by the token budget.
+    let mut keep_title = keep_title_only.into_iter();
+    hits.retain(|hit| keep_title.next().unwrap_or(false) || !hit.chunks.is_empty());
     truncated
 }
 
@@ -810,5 +825,43 @@ mod pack_tests {
             "Pass 1 must admit second chunk when lead chunk exceeds remaining budget"
         );
         assert!(hits[2].chunks.is_empty());
+    }
+
+    #[test]
+    fn pack_pass_one_enforces_framing_budget_on_title_only_hits() {
+        struct FixedFraming(u32);
+        impl notarium_core::ports::SearchRecipient for FixedFraming {
+            fn admit<'a>(
+                &'a self,
+                _card: &'a notarium_core::classes::ClassifiedMetadata,
+            ) -> notarium_core::ports::PortFuture<'a, bool> {
+                Box::pin(async { Ok(true) })
+            }
+            fn framing_tokens(&self, _note: &NoteId, _first_chunk: bool) -> u32 {
+                self.0
+            }
+        }
+
+        let mut hits = vec![
+            make_hit(11, 10.0, &[]),
+            make_hit(12, 9.0, &[]),
+            make_hit(13, 8.0, &[]),
+        ];
+        let recipient = FixedFraming(10);
+        let truncated = pack(
+            &mut hits,
+            Recall {
+                graph_depth: 1,
+                tokens: 25,
+                max_per_source: None,
+            },
+            Some(&recipient),
+        );
+        assert!(truncated, "3rd title-only hit exceeds framing token budget");
+        assert_eq!(
+            hits.len(),
+            2,
+            "only title-only hits fitting framing token budget must survive"
+        );
     }
 }

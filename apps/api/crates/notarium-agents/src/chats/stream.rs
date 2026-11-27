@@ -152,7 +152,7 @@ struct State {
     transient: Option<TransientStep>,
     last_step: Option<u32>,
     terminal: Option<RunTerminal>,
-    redaction_pending: bool,
+    redaction_pending: usize,
     visibility_floor: u64,
 }
 
@@ -260,7 +260,7 @@ impl StepStreamBuffer {
                 transient: None,
                 last_step: None,
                 terminal: None,
-                redaction_pending: false,
+                redaction_pending: 0,
                 visibility_floor: 0,
             })),
             changed,
@@ -513,7 +513,8 @@ impl StepStreamBuffer {
     }
 
     pub(crate) fn pause_for_redaction(self: &Arc<Self>) -> StreamRedaction {
-        lock(&self.state).redaction_pending = true;
+        let mut state = lock(&self.state);
+        state.redaction_pending = state.redaction_pending.saturating_add(1);
         StreamRedaction {
             buffer: self.clone(),
             discard: true,
@@ -623,7 +624,7 @@ impl Drop for StreamRedaction {
             // Invalidate old tail cursors as well as cursors into erased frames.
             state.reset_visibility();
         }
-        state.redaction_pending = false;
+        state.redaction_pending = state.redaction_pending.saturating_sub(1);
         self.buffer.changed.send_replace(state.end);
     }
 }
@@ -641,7 +642,7 @@ impl StepSubscription {
         loop {
             {
                 let state = lock(&self.state);
-                if !state.redaction_pending {
+                if state.redaction_pending == 0 {
                     if self.next_offset < state.visibility_floor
                         || self
                             .checkpoint

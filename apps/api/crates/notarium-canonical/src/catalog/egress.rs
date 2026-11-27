@@ -92,6 +92,7 @@ async fn rollback_pg_clean(conn: StorePgConnection) {
 enum DisclosureConnection {
     Sqlite {
         snapshot: Option<sqlx::pool::PoolConnection<sqlx::Sqlite>>,
+        wal_guard: Option<crate::wal::ReaderGateGuard>,
         _pin: crate::runtime::disclosure::DisclosurePin,
     },
     Postgres(Option<StorePgConnection>),
@@ -106,10 +107,15 @@ pub(crate) struct CanonicalDisclosureGuard {
 impl Drop for CanonicalDisclosureGuard {
     fn drop(&mut self) {
         match &mut self.connection {
-            DisclosureConnection::Sqlite { snapshot, .. } => {
+            DisclosureConnection::Sqlite {
+                snapshot,
+                wal_guard,
+                ..
+            } => {
                 if let Some(mut conn) = snapshot.take() {
                     conn.close_on_drop();
                 }
+                let _ = wal_guard.take();
             }
             DisclosureConnection::Postgres(conn) => {
                 if let Some(mut conn) = conn.take() {
@@ -133,18 +139,33 @@ impl CanonicalDisclosureGuard {
     }
 
     pub(super) async fn finish_snapshot(&mut self) {
-        if let DisclosureConnection::Sqlite { snapshot, .. } = &mut self.connection
-            && let Some(conn) = snapshot.take()
+        if let DisclosureConnection::Sqlite {
+            snapshot,
+            wal_guard,
+            ..
+        } = &mut self.connection
         {
-            rollback_sqlite_clean(conn).await;
+            if let Some(conn) = snapshot.take() {
+                rollback_sqlite_clean(conn).await;
+            }
+            if let Some(guard) = wal_guard.take() {
+                guard.finish_cleanly();
+            }
         }
     }
 
     pub(super) async fn release_clean(mut self) {
         match &mut self.connection {
-            DisclosureConnection::Sqlite { snapshot, .. } => {
+            DisclosureConnection::Sqlite {
+                snapshot,
+                wal_guard,
+                ..
+            } => {
                 if let Some(conn) = snapshot.take() {
                     rollback_sqlite_clean(conn).await;
+                }
+                if let Some(guard) = wal_guard.take() {
+                    guard.finish_cleanly();
                 }
             }
             DisclosureConnection::Postgres(conn) => {
@@ -179,7 +200,9 @@ impl CanonicalStore {
         cancellation: &Cancellation,
     ) -> Result<CanonicalDisclosureGuard, PortError> {
         self.ensure_open()?;
-        let deadline = Instant::now() + budget.remaining;
+        let deadline = Instant::now()
+            .checked_add(budget.remaining)
+            .unwrap_or_else(|| Instant::now() + std::time::Duration::from_secs(365 * 24 * 3600));
         let acquire = async {
             let connection = match &self.inner.sql {
                 SqlDriverState::Sqlite {
@@ -189,6 +212,13 @@ impl CanonicalStore {
                 } => {
                     let pin = disclosures.pin(spaces).await;
                     self.ensure_open()?;
+                    let wal_guard = if let Some(wal) = self.inner.wal_coord.get() {
+                        let (guard, _read_deadline) =
+                            wal.acquire_reader_gate_slot(Some(budget)).await?;
+                        Some(guard)
+                    } else {
+                        None
+                    };
                     let conn = read_pool
                         .acquire()
                         .await
@@ -200,6 +230,7 @@ impl CanonicalStore {
                         .map_err(|e| internal_not_committed("egress_begin", e.to_string()))?;
                     DisclosureConnection::Sqlite {
                         snapshot: Some(guarded.disarm()),
+                        wal_guard,
                         _pin: pin,
                     }
                 }
@@ -557,8 +588,7 @@ async fn snapshot(
     }
 
     let mut live_ancestry = FolderAncestryCache::default();
-    let mut historical_ancestry: BTreeMap<(SpaceId, SpaceSeq), FolderAncestryCache> =
-        BTreeMap::new();
+    let mut historical_ancestry = crate::domain::common::HistoricalFolderCache::default();
     let mut proof_memo = ProofFoldCache::new();
 
     if !request.project_folders.is_empty() {
@@ -644,7 +674,7 @@ async fn note_current(
     reference: &NoteRef,
     revision: &RevisionId,
     live_ancestry: &mut FolderAncestryCache,
-    historical_ancestry: &mut BTreeMap<(SpaceId, SpaceSeq), FolderAncestryCache>,
+    historical_ancestry: &mut crate::domain::common::HistoricalFolderCache,
 ) -> Result<ProviderCurrentContent, PortError> {
     if !auth.spaces().contains_key(&reference.space_id) || reference.space_id != space.space.id {
         return Err(DomainError::ResourceNotFound.into());
@@ -692,13 +722,13 @@ async fn note_current(
         .content_digest
         .ok_or(DomainError::ResourceNotFound)?;
     let visibility = i64_to_space_seq(visible)?;
-    let cut_cache = historical_ancestry
-        .entry((space.space.id.clone(), visibility))
-        .or_insert_with(|| FolderAncestryCache::at_cut(&space.scope, visibility));
-    let (recorded, _) = cut_cache
-        .build_resource_facts_tx(
+    let (recorded, _) = historical_ancestry
+        .build_resource_facts_at_cut_tx(
             tx,
+            &space.scope,
             &space.space,
+            visibility,
+            live_ancestry,
             &snapshot.parent_folder_id,
             snapshot.doc_class,
             snapshot.ability_id,

@@ -704,6 +704,7 @@ impl SearchEngine {
             vector,
             embedder,
             pending,
+            clock: clock.clone(),
         };
         let mut result = self
             .search_prepared_vectors(&prepared, clock, snapshot, filter, excluded, limit)
@@ -721,8 +722,14 @@ impl SearchEngine {
         excluded: Arc<BTreeSet<NoteId>>,
         limit: usize,
     ) -> Result<VectorCandidates, PortError> {
-        let remaining = request_clock.remaining()?.remaining;
-        let clock = request_clock.limited(remaining.min(self.services.config.interactive_budget()));
+        // Share the initial vector interactive budget across initial and widened passes.
+        let clock = prepared.clock.clone();
+        if clock.remaining().is_err() {
+            request_clock.remaining()?;
+            return Ok(VectorCandidates::degraded(
+                SearchDegradation::BudgetExceeded,
+            ));
+        }
         let work =
             self.search_prepared_vectors(prepared, &clock, snapshot, filter, excluded, limit);
         match clock.within(work).await {
@@ -874,6 +881,7 @@ struct PreparedVector {
     vector: crate::vector::QuantizedVector,
     embedder: Arc<Embedder>,
     pending: Option<SearchDegradation>,
+    clock: Clock,
 }
 
 #[derive(Default)]

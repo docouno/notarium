@@ -167,7 +167,7 @@ async fn next_lease_tx(
         };
     }
     let row = match tx {
-        BackendConn::Sqlite(c) => outstanding!(c, "BINARY", "r.owner_id || ''"),
+        BackendConn::Sqlite(c) => outstanding!(c, "BINARY", "r.owner_id"),
         BackendConn::Postgres(c) => outstanding!(c, r#""C""#, "r.owner_id"),
     }
     .map_err(|err| internal_not_committed("recover_chat_stage", err.to_string()))?;
@@ -228,6 +228,10 @@ pub(super) struct UndeliveredLease {
     scope: HistoryScope,
     staged: Option<StagedChatBlob>,
     owner_lease: String,
+    // Keep `aux_workers` read guard alive until either `deliver()` takes the
+    // capability or `Drop` registers the cleanup task, so shutdown cannot close
+    // `backup_cleanups` while this lease is still undelivered.
+    _aux_permit: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
 }
 
 impl UndeliveredLease {
@@ -237,11 +241,15 @@ impl UndeliveredLease {
         staged: StagedChatBlob,
         owner_lease: String,
     ) -> Self {
+        let _aux_permit = std::sync::Arc::clone(&store.inner.aux_workers)
+            .try_read_owned()
+            .ok();
         Self {
             store,
             scope,
             staged: Some(staged),
             owner_lease,
+            _aux_permit,
         }
     }
     pub(super) fn deliver(mut self) -> StagedChatBlob {

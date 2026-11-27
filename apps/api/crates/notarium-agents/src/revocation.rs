@@ -28,6 +28,8 @@ use crate::chats::{
 
 type Selectors = BTreeSet<RevocationSelector>;
 type RegistrationId = u64;
+type ThreadRedactionHold = Arc<Mutex<Vec<StreamRedaction>>>;
+type ActiveRedactionsMap = BTreeMap<(HistoryScope, ChatThreadId), Vec<ThreadRedactionHold>>;
 const MAX_SELECTORS: usize = 512;
 const RECENT_EVENTS: usize = 4096;
 const MAX_PENDING_CREDENTIALS: usize = 4096;
@@ -54,6 +56,7 @@ struct State {
     fences: BTreeMap<RegistrationId, Selectors>,
     pending: BTreeMap<PendingCredentialKey, PendingCredential>,
     thread_streams: BTreeMap<(HistoryScope, ChatThreadId), Vec<Weak<StepStreamBuffer>>>,
+    active_redactions: ActiveRedactionsMap,
     events: BTreeMap<RequestId, EventDelivery>,
     event_order: VecDeque<RequestId>,
 }
@@ -634,7 +637,23 @@ impl RevocationHub {
         stream: Weak<StepStreamBuffer>,
     ) {
         let mut state = self.inner.lock();
-        let entry = state.thread_streams.entry((scope, thread)).or_default();
+        let prune_threshold = state.runs.len().saturating_mul(2).max(16);
+        if state.thread_streams.len() > prune_threshold {
+            state.thread_streams.retain(|_, entries| {
+                entries.retain(|existing| existing.strong_count() > 0);
+                !entries.is_empty()
+            });
+        }
+        let key = (scope, thread);
+        if let Some(active_list) = state.active_redactions.get(&key)
+            && let Some(strong) = stream.upgrade()
+        {
+            for active in active_list {
+                let mut holds = active.lock().unwrap_or_else(|error| error.into_inner());
+                holds.push(strong.pause_for_redaction());
+            }
+        }
+        let entry = state.thread_streams.entry(key).or_default();
         entry.retain(|existing| existing.strong_count() > 0);
         entry.push(stream);
     }
@@ -643,15 +662,15 @@ impl RevocationHub {
         &self,
         scope: &HistoryScope,
         thread: &ChatThreadId,
-    ) -> Vec<StreamRedaction> {
-        let streams = {
+    ) -> ThreadRedactionGuard {
+        let key = (scope.clone(), thread.clone());
+        let active = {
             let mut state = self.inner.lock();
-            let key = (scope.clone(), thread.clone());
-            let mut live = Vec::new();
+            let mut holds = Vec::new();
             if let Some(entries) = state.thread_streams.get_mut(&key) {
                 entries.retain(|weak| {
                     if let Some(stream) = weak.upgrade() {
-                        live.push(stream);
+                        holds.push(stream.pause_for_redaction());
                         true
                     } else {
                         false
@@ -661,12 +680,20 @@ impl RevocationHub {
                     state.thread_streams.remove(&key);
                 }
             }
-            live
+            let active = Arc::new(Mutex::new(holds));
+            state
+                .active_redactions
+                .entry(key.clone())
+                .or_default()
+                .push(Arc::clone(&active));
+            active
         };
-        streams
-            .into_iter()
-            .map(|stream| stream.pause_for_redaction())
-            .collect()
+        ThreadRedactionGuard {
+            hub: self.clone(),
+            key,
+            active,
+            discard: true,
+        }
     }
 
     pub(crate) fn cancel_thread_runs(&self, scope: &HistoryScope, thread: &ChatThreadId) {
@@ -815,6 +842,43 @@ impl RevocationHub {
     }
 }
 
+pub(crate) struct ThreadRedactionGuard {
+    hub: RevocationHub,
+    key: (HistoryScope, ChatThreadId),
+    active: Arc<Mutex<Vec<StreamRedaction>>>,
+    discard: bool,
+}
+
+impl ThreadRedactionGuard {
+    pub(crate) fn keep_history(&mut self) {
+        self.discard = false;
+    }
+}
+
+impl Drop for ThreadRedactionGuard {
+    fn drop(&mut self) {
+        {
+            let mut state = self.hub.inner.lock();
+            if let Some(entries) = state.active_redactions.get_mut(&self.key) {
+                entries.retain(|entry| !Arc::ptr_eq(entry, &self.active));
+                if entries.is_empty() {
+                    state.active_redactions.remove(&self.key);
+                }
+            }
+        }
+        let mut holds = self
+            .active
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !self.discard {
+            for hold in holds.iter_mut() {
+                hold.keep_history();
+            }
+        }
+        holds.clear();
+    }
+}
+
 pub(crate) struct RollbackRunGuard {
     hub: RevocationHub,
     fence_id: RegistrationId,
@@ -852,7 +916,18 @@ impl RevocationLease for RunRevocationLease {
 
 impl Drop for RunRevocationLease {
     fn drop(&mut self) {
-        self.hub.inner.lock().runs.remove(&self.run);
+        {
+            let mut state = self.hub.inner.lock();
+            if let Some(removed) = state.runs.remove(&self.run)
+                && let Some(key) = removed.thread
+                && let Some(entries) = state.thread_streams.get_mut(&key)
+            {
+                entries.retain(|weak| weak.strong_count() > 0);
+                if entries.is_empty() {
+                    state.thread_streams.remove(&key);
+                }
+            }
+        }
         self.cancellation.cancel();
         self.hub.inner.notify();
     }

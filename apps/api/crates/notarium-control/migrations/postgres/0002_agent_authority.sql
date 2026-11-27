@@ -23,12 +23,18 @@ BEGIN
     END IF;
 END $$;
 ALTER TABLE v1_control.agent_schedules
-    ADD CHECK ((deleted_at IS NULL AND octet_length(title) BETWEEN 1 AND 512) OR (deleted_at IS NOT NULL AND octet_length(title) <= 512));
+    ADD CHECK ((deleted_at IS NULL AND octet_length(title) BETWEEN 1 AND 512) OR (deleted_at IS NOT NULL AND octet_length(title) <= 512)),
+    ADD CHECK (deleted_at IS NOT NULL OR coalesce(octet_length(owner_id),0) + coalesce(octet_length(space_id),0) + coalesce(octet_length(project_folder_id),0) + coalesce(octet_length(schedule_id),0) <= 2048);
+UPDATE v1_control.agent_schedules
+    SET title = ''
+    WHERE deleted_at IS NOT NULL AND title <> '';
 ALTER TABLE v1_control.provider_call_log
     ADD CHECK (coalesce(octet_length(run_id),0) + coalesce(octet_length(call_id),0) <= 2048);
 ALTER TABLE v1_control.provider_attachments
-    ADD CHECK (coalesce(octet_length(target_space),0) + coalesce(octet_length(id),0) <= 2048),
-    ADD CHECK (coalesce(octet_length(target_space),0) + coalesce(octet_length(target_project),0) + coalesce(octet_length(id),0) <= 2048);
+    ADD CHECK (state <> 'approved' OR coalesce(octet_length(target_space),0) + coalesce(octet_length(id),0) <= 2048),
+    ADD CHECK (state <> 'approved' OR target_kind <> 'project' OR coalesce(octet_length(target_space),0) + coalesce(octet_length(target_project),0) + coalesce(octet_length(id),0) <= 2048);
+ALTER TABLE v1_control.ability_placement_trail
+    ADD CHECK (coalesce(octet_length(destination_placement),0) + coalesce(octet_length(destination_id),0) <= 2048);
 ALTER TABLE v1_control.agent_schedule_runs
     ALTER COLUMN reserved_next_slot DROP NOT NULL,
     ADD COLUMN approved_skills TEXT COLLATE "C" NOT NULL DEFAULT '[]'

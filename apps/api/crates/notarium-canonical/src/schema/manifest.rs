@@ -808,7 +808,7 @@ pub const CANONICAL_TABLES: &[TableSpec] = &[
             col("created_at_ms", Int, false),
             col("updated_at_ms", Int, false),
         ],
-        indexes: &["idx_pending_purges_phase"],
+        indexes: &["idx_pending_purges_phase", "idx_pending_purges_successor"],
     },
     TableSpec {
         name: "account_catalog_receipts",

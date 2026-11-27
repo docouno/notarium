@@ -791,6 +791,7 @@ impl Drop for SearchEngine {
     }
 }
 
+#[derive(Clone)]
 pub(super) struct Clock {
     budget: CallBudget,
     pub deadline: Instant,
@@ -798,9 +799,12 @@ pub(super) struct Clock {
 
 impl Clock {
     pub fn limited(&self, duration: Duration) -> Self {
+        let capped = Instant::now()
+            .checked_add(duration)
+            .map_or(self.deadline, |d| self.deadline.min(d));
         Self {
             budget: self.budget.clone(),
-            deadline: self.deadline.min(Instant::now() + duration),
+            deadline: capped,
         }
     }
 

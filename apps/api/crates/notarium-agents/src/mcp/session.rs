@@ -6,7 +6,7 @@ use super::{EgressTarget, ToolCallContext, ToolName, ability_tools, corpus, deco
 use address::visible_projects;
 pub(super) use address::{
     project_for_folder, readable_space, readable_spaces, resolve_project,
-    resolve_project_for_direct_write, resolve_space, space,
+    resolve_project_for_direct_write, resolve_project_in_space, resolve_space, space,
 };
 pub(super) use delta::BootstrapContinuations;
 
@@ -292,80 +292,150 @@ async fn whoami(call: &mut ToolCallContext<'_>) -> Result<Value, PortError> {
 }
 
 async fn projects(call: &mut ToolCallContext<'_>) -> Result<Value, PortError> {
+    const MAX_PROJECTS: usize = 4096;
+    const CONTROL_PAGE: u16 = 200;
     let spaces = readable_spaces(call).await?;
-    let external = matches!(call.target, EgressTarget::ExternalMcp);
     let mut items = Vec::new();
     let mut pending_taints = Vec::new();
-    let mut space_wide_consented: std::collections::BTreeMap<notarium_core::ids::SpaceId, bool> =
-        std::collections::BTreeMap::new();
     let collected: Result<(), PortError> = async {
-        for card in visible_projects(call).await? {
-            let Some(space) = spaces.get(&card.folder.space_id) else {
-                continue;
-            };
-            let (space_slug, slug, name) = if external {
-                (space.slug.clone(), card.project_slug, card.name)
-            } else {
-                let scope = call.space(space.history.clone())?;
-                let space_wide = match space_wide_consented.get(&card.folder.space_id) {
-                    Some(&flag) => flag,
-                    None => {
-                        let flag = match call.provider_selection(&scope, None).await {
-                            Ok(Some(sel)) if sel.project_only.is_none() => {
-                                match project_metadata(
-                                    call,
-                                    scope.clone(),
-                                    CatalogDisclosure::Space(space.history.clone()),
-                                    None,
-                                    true,
-                                )
-                                .await?
-                                {
-                                    Some((_, taint)) => {
-                                        if let Some(taint) = taint {
-                                            pending_taints.push(taint);
-                                        }
-                                        true
-                                    }
-                                    None => false,
-                                }
-                            }
-                            Ok(_) => false,
-                            Err(PortError::Domain(DomainError::Provider {
-                                error: ProviderErrorCode::Unavailable,
-                            })) => false,
-                            Err(error) if corpus::hidden(&error) => false,
-                            Err(error) => return Err(error),
-                        };
-                        space_wide_consented.insert(card.folder.space_id.clone(), flag);
-                        flag
-                    }
-                };
-                let source = CatalogDisclosure::Folder(card.folder.clone());
-                let Some((proof, taint)) =
-                    project_metadata(call, scope, source, Some(card.folder.clone()), !space_wide)
-                        .await?
-                else {
-                    continue;
-                };
-                if !space_wide && let Some(taint) = taint {
-                    pending_taints.push(taint);
+        match call.target.clone() {
+            EgressTarget::ExternalMcp => {
+                for card in visible_projects(call).await? {
+                    let Some(space) = spaces.get(&card.folder.space_id) else {
+                        continue;
+                    };
+                    let handle = format!("{}/{}", space.slug, card.project_slug);
+                    let item = json!({
+                        "projectId": card.folder.folder_id,
+                        "spaceId": card.folder.space_id,
+                        "handle": handle,
+                        "slug": card.project_slug,
+                        "name": card.name,
+                    });
+                    items.push((handle, item));
                 }
-                (
-                    required_text(&proof, "spaceSlug")?.to_owned(),
-                    required_text(&proof, "projectSlug")?.to_owned(),
-                    required_text(&proof, "name")?.to_owned(),
-                )
-            };
-            let handle = format!("{space_slug}/{slug}");
-            let item = json!({
-                "projectId": card.folder.folder_id,
-                "spaceId": card.folder.space_id,
-                "handle": handle,
-                "slug": slug,
-                "name": name,
-            });
-            items.push((handle, item));
+            }
+            EgressTarget::InAppProvider { provider, .. } => {
+                let mut total_consented = 0usize;
+                for space in spaces.values() {
+                    let scope = call.space(space.history.clone())?;
+                    let space_wide = match call.provider_selection(&scope, None).await {
+                        Ok(Some(sel)) if sel.project_only.is_none() => {
+                            match project_metadata(
+                                call,
+                                scope.clone(),
+                                CatalogDisclosure::Space(space.history.clone()),
+                                None,
+                                true,
+                            )
+                            .await?
+                            {
+                                Some((_, taint)) => {
+                                    if let Some(taint) = taint {
+                                        pending_taints.push(taint);
+                                    }
+                                    true
+                                }
+                                None => false,
+                            }
+                        }
+                        Ok(_) => false,
+                        Err(PortError::Domain(DomainError::Provider {
+                            error: ProviderErrorCode::Unavailable,
+                        })) => false,
+                        Err(error) if corpus::hidden(&error) => false,
+                        Err(error) => return Err(error),
+                    };
+                    let mut candidate_folders: Vec<FolderRef> = Vec::new();
+                    if space_wide {
+                        let mut next: Option<String> = None;
+                        for _ in 0..=MAX_PROJECTS {
+                            let page = call
+                                .registry
+                                .catalog
+                                .projects(
+                                    scope.with_preflight_taint(),
+                                    ControlPageRequest::new(CONTROL_PAGE, next.clone())?,
+                                )
+                                .await?;
+                            if page.items.len() > usize::from(CONTROL_PAGE) {
+                                return Err(invalid(ValidationReason::InvalidState));
+                            }
+                            total_consented = total_consented.saturating_add(page.items.len());
+                            if total_consented > MAX_PROJECTS {
+                                return Err(invalid(ValidationReason::BudgetExceeded));
+                            }
+                            for card in page.items {
+                                candidate_folders.push(card.folder);
+                            }
+                            let Some(cursor) = page.continuation else {
+                                break;
+                            };
+                            if next.as_ref() == Some(&cursor) {
+                                return Err(invalid(ValidationReason::InvalidState));
+                            }
+                            next = Some(cursor);
+                        }
+                    } else {
+                        let mut next: Option<String> = None;
+                        for _ in 0..=MAX_PROJECTS {
+                            let page = call
+                                .registry
+                                .control
+                                .list_provider_project_targets(
+                                    scope.with_preflight_taint(),
+                                    provider.clone(),
+                                    ControlPageRequest::new(CONTROL_PAGE, next.clone())?,
+                                )
+                                .await?;
+                            if page.items.len() > usize::from(CONTROL_PAGE) {
+                                return Err(invalid(ValidationReason::InvalidState));
+                            }
+                            total_consented = total_consented.saturating_add(page.items.len());
+                            if total_consented > MAX_PROJECTS {
+                                return Err(invalid(ValidationReason::BudgetExceeded));
+                            }
+                            candidate_folders.extend(page.items);
+                            let Some(cursor) = page.continuation else {
+                                break;
+                            };
+                            if next.as_ref() == Some(&cursor) {
+                                return Err(invalid(ValidationReason::InvalidState));
+                            }
+                            next = Some(cursor);
+                        }
+                    }
+                    for folder in candidate_folders {
+                        let source = CatalogDisclosure::Folder(folder.clone());
+                        let Some((proof, taint)) = project_metadata(
+                            call,
+                            scope.clone(),
+                            source,
+                            Some(folder.clone()),
+                            !space_wide,
+                        )
+                        .await?
+                        else {
+                            continue;
+                        };
+                        if !space_wide && let Some(taint) = taint {
+                            pending_taints.push(taint);
+                        }
+                        let space_slug = required_text(&proof, "spaceSlug")?.to_owned();
+                        let slug = required_text(&proof, "projectSlug")?.to_owned();
+                        let name = required_text(&proof, "name")?.to_owned();
+                        let handle = format!("{space_slug}/{slug}");
+                        let item = json!({
+                            "projectId": folder.folder_id,
+                            "spaceId": folder.space_id,
+                            "handle": handle,
+                            "slug": slug,
+                            "name": name,
+                        });
+                        items.push((handle, item));
+                    }
+                }
+            }
         }
         items.sort_by(|left, right| left.0.cmp(&right.0));
         if items.windows(2).any(|pair| pair[0].0 == pair[1].0) {
@@ -760,7 +830,9 @@ async fn start(call: &mut ToolCallContext<'_>, args: StartArgs) -> Result<Value,
                 delta::acknowledge_prepared(call, &child_pending).await?;
             }
         }
-        check_committed_project(plan.project.as_ref(), &episode)?;
+        if !plan_replayed {
+            check_committed_project(plan.project.as_ref(), &episode)?;
+        }
         if let Some(project) = &episode.project_hint {
             project_for_folder(call, project).await?;
         }
@@ -863,19 +935,23 @@ async fn start(call: &mut ToolCallContext<'_>, args: StartArgs) -> Result<Value,
                 allow_ack,
             )
         };
-        output["delta"] = delta::open(
-            call,
-            episode.id,
-            owner,
-            episode.project_hint,
-            acknowledgements,
-            allow_ack,
-        )
-        .await?;
+        output["delta"] = if episode.lifecycle == notarium_core::ports::EpisodeLifecycle::Closed {
+            json!({ "changes": [], "complete": true })
+        } else {
+            delta::open(
+                call,
+                episode.id,
+                owner,
+                episode.project_hint,
+                acknowledgements,
+                allow_ack,
+            )
+            .await?
+        };
         Ok(output)
     }
     .await
-    .map_err(|error| super::note_tools::post_commit_error(SESSION_LABEL, error))
+    .map_err(|error| super::note_tools::batch_operational_error(SESSION_LABEL, error, true))
 }
 
 fn selector(

@@ -775,7 +775,18 @@ impl ControlService {
             )
             .await?;
         let target = usize::from(page.limit());
-        let batch_limit = i64::from(page.limit()).saturating_add(1).max(16);
+        let mut batch_limit = i64::from(page.limit()).saturating_add(1).max(16);
+        let allowed_spaces: Vec<String> = current
+            .auth()
+            .spaces()
+            .keys()
+            .map(|id| id.as_str().to_owned())
+            .collect();
+        let allowed_spaces_pipe = if allowed_spaces.is_empty() {
+            String::new()
+        } else {
+            format!("|{}|", allowed_spaces.join("|"))
+        };
         let mut items = Vec::with_capacity(target);
         let mut last_visible: Option<EntryRow> = None;
         let mut has_more = false;
@@ -801,6 +812,7 @@ impl ControlService {
                                     .bind(&after.space)
                                     .bind(&after.entity)
                                     .bind(fetch_limit)
+                                    .bind(&allowed_spaces_pipe)
                                     .fetch_all(&mut **tx)
                                     .await
                                     .map_err(crate::error::database_not_committed)?
@@ -814,6 +826,7 @@ impl ControlService {
                                     .bind(&after.space)
                                     .bind(&after.entity)
                                     .bind(fetch_limit)
+                                    .bind(&allowed_spaces)
                                     .fetch_all(&mut **tx)
                                     .await
                                     .map_err(crate::error::database_not_committed)?
@@ -1003,6 +1016,7 @@ impl ControlService {
             if has_more || batch_len < usize::try_from(fetch_limit).unwrap_or(usize::MAX) {
                 break;
             }
+            batch_limit = batch_limit.saturating_mul(2).min(512);
         }
         let continuation = if has_more {
             let last = last_visible.expect("positive page limit");

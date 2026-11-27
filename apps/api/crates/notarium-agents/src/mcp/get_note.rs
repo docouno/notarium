@@ -146,6 +146,7 @@ async fn read(call: &mut ToolCallContext<'_>, args: Value) -> Result<NoteOutput,
             call,
             &ctx,
             (&note, snapshot.document.revision()),
+            snapshot.document.metadata().current_project().as_ref(),
             &view,
             index,
             head,
@@ -193,10 +194,12 @@ async fn read(call: &mut ToolCallContext<'_>, args: Value) -> Result<NoteOutput,
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn describe_view(
     call: &mut ToolCallContext<'_>,
     ctx: &SpaceContext,
     (note, note_revision): (&NoteId, &notarium_core::ids::RevisionId),
+    note_project: Option<&notarium_core::model::FolderRef>,
     view: &ViewBlock,
     index: usize,
     head: Option<SpaceSeq>,
@@ -257,7 +260,8 @@ async fn describe_view(
             .map(|folder_id| notarium_core::model::FolderRef {
                 space_id: ctx.scope().space_id.clone(),
                 folder_id: folder_id.clone(),
-            });
+            })
+            .or_else(|| note_project.cloned());
         match call.provider_selection(&query_scope, project_opt).await {
             Ok(Some(selection)) => {
                 query_scope =

@@ -442,42 +442,99 @@ struct PoolKey {
     origin: String,
     policy_epoch: u64,
 }
+struct IdlePool {
+    conns: Vec<PooledConn>,
+    reaper_running: bool,
+}
 struct Slot {
     endpoint: CheckedEndpoint,
     tls: OnceCell<Option<Arc<rustls::ClientConfig>>>,
-    idle: Mutex<Vec<PooledConn>>,
+    idle: Mutex<IdlePool>,
     cancelled: Cancellation,
 }
 impl Slot {
     fn cancel(&self) {
         self.cancelled.cancel();
         if let Ok(mut idle) = self.idle.lock() {
-            idle.clear();
+            idle.conns.clear();
         }
     }
     fn pop_idle(&self) -> Option<PooledConn> {
         let mut idle = self.idle.lock().ok()?;
-        while let Some(conn) = idle.pop() {
+        while let Some(conn) = idle.conns.pop() {
             if conn.last_used.elapsed() < POOL_IDLE_TIMEOUT && !conn.sender.is_closed() {
                 return Some(conn);
             }
         }
         None
     }
-    fn push_idle(&self, conn: PooledConn) -> Option<PooledConn> {
-        let Ok(mut idle) = self.idle.lock() else {
-            return Some(conn);
+    fn push_idle(self: &Arc<Self>, conn: PooledConn) -> Option<PooledConn> {
+        let spawn_reaper = {
+            let Ok(mut idle) = self.idle.lock() else {
+                return Some(conn);
+            };
+            if self.cancelled.is_cancelled() || conn.sender.is_closed() {
+                return Some(conn);
+            }
+            idle.conns
+                .retain(|c| c.last_used.elapsed() < POOL_IDLE_TIMEOUT && !c.sender.is_closed());
+            if idle.conns.len() < MAX_IDLE_PER_SLOT {
+                idle.conns.push(conn);
+                if !idle.reaper_running {
+                    idle.reaper_running = true;
+                    true
+                } else {
+                    false
+                }
+            } else {
+                return Some(conn);
+            }
         };
-        if self.cancelled.is_cancelled() || conn.sender.is_closed() {
-            return Some(conn);
+        if spawn_reaper {
+            let weak = Arc::downgrade(self);
+            let cancel = self.cancelled.clone();
+            tokio::spawn(async move {
+                loop {
+                    let next_deadline = {
+                        let Some(slot) = weak.upgrade() else {
+                            return;
+                        };
+                        let Ok(mut idle) = slot.idle.lock() else {
+                            return;
+                        };
+                        if slot.cancelled.is_cancelled() {
+                            idle.conns.clear();
+                            idle.reaper_running = false;
+                            return;
+                        }
+                        idle.conns.retain(|c| {
+                            c.last_used.elapsed() < POOL_IDLE_TIMEOUT && !c.sender.is_closed()
+                        });
+                        match idle.conns.iter().map(|c| c.last_used).min() {
+                            Some(oldest) => oldest + POOL_IDLE_TIMEOUT,
+                            None => {
+                                idle.reaper_running = false;
+                                return;
+                            }
+                        }
+                    };
+                    tokio::select! {
+                        biased;
+                        () = cancel.cancelled() => {
+                            if let Some(slot) = weak.upgrade()
+                                && let Ok(mut idle) = slot.idle.lock()
+                            {
+                                idle.conns.clear();
+                                idle.reaper_running = false;
+                            }
+                            return;
+                        }
+                        () = tokio::time::sleep_until(next_deadline) => {}
+                    }
+                }
+            });
         }
-        idle.retain(|c| c.last_used.elapsed() < POOL_IDLE_TIMEOUT && !c.sender.is_closed());
-        if idle.len() < MAX_IDLE_PER_SLOT {
-            idle.push(conn);
-            None
-        } else {
-            Some(conn)
-        }
+        None
     }
 }
 struct Entry {
@@ -683,7 +740,10 @@ impl OutboundTransport {
         let slot = Arc::new(Slot {
             endpoint: endpoint.clone(),
             tls: OnceCell::new(),
-            idle: Mutex::new(Vec::new()),
+            idle: Mutex::new(IdlePool {
+                conns: Vec::new(),
+                reaper_running: false,
+            }),
             cancelled: Cancellation::default(),
         });
         state.clients.insert(

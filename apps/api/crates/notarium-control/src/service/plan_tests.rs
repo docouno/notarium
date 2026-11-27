@@ -494,11 +494,19 @@ async fn sqlite_hot_control_queries_use_indexes_before_and_after_analyze() {
         .fetch_all(&mut conn)
         .await
         .unwrap();
-        check_plan(
-            phase,
-            "ability_trail_destination",
-            "USING INDEX ability_trail_destination",
-            &rows,
+        let trail_details: Vec<String> = rows.iter().map(|r| r.get::<String, _>(3)).collect();
+        let trail_joined = trail_details.join("\n");
+        assert!(
+            trail_joined.contains("SEARCH t USING INDEX ability_trail_destination"),
+            "{phase} ability_trail_destination must use ability_trail_destination, got:\n{trail_joined}"
+        );
+        assert!(
+            !trail_details.iter().any(|d| {
+                (d.starts_with("SCAN ") && d != "SCAN CONSTANT ROW" && d != "SCAN w")
+                    || d.contains("TEMP B-TREE")
+                    || d.contains("ANY(")
+            }),
+            "{phase} ability_trail_destination must avoid base-table scans, temp B-trees, and skip-scans, got:\n{trail_joined}"
         );
 
         let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
@@ -619,6 +627,7 @@ async fn sqlite_hot_control_queries_use_indexes_before_and_after_analyze() {
         .bind("")
         .bind("")
         .bind(32i64)
+        .bind(format!("|{first_space}|"))
         .fetch_all(&mut conn)
         .await
         .unwrap();
@@ -719,6 +728,8 @@ async fn sqlite_hot_control_queries_use_indexes_before_and_after_analyze() {
         .bind(&first_space)
         .bind("")
         .bind(0i64)
+        .bind(1i64)
+        .bind(Option::<i64>::None)
         .bind(32i64)
         .fetch_all(&mut conn)
         .await

@@ -82,6 +82,7 @@ pub struct FolderSnapshot {
     pub revision: RevisionId,
     pub path: String,
     pub ancestor_folders: Vec<FolderId>,
+    pub ancestor_revisions: Vec<RevisionId>,
     pub name: String,
     pub parent: Option<FolderId>,
     pub project: Option<FolderId>,

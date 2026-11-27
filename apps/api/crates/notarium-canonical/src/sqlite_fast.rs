@@ -4858,6 +4858,7 @@ fn load_folder_head_row_rusqlite(
         write_locked: write_lock_json.is_some(),
         lifecycle,
         head_rev_id,
+        updated_seq: None,
     })
 }
 
@@ -4868,6 +4869,7 @@ fn load_folder_ancestry_rusqlite(
     require_all_active: bool,
 ) -> Result<FolderAncestryFacts, PortError> {
     let mut ancestors = Vec::new();
+    let mut ancestor_revisions = Vec::new();
     let mut segments_rev = Vec::new();
     let mut visited = BTreeSet::new();
     let mut write_locked = false;
@@ -4899,6 +4901,7 @@ fn load_folder_ancestry_rusqlite(
             project = Some(row.folder_id.clone());
         }
         ancestors.push(row.folder_id.clone());
+        ancestor_revisions.push(row.head_rev_id.clone());
         if row.is_root {
             segments_rev.reverse();
             let folder_path = if segments_rev.is_empty() {
@@ -4909,6 +4912,7 @@ fn load_folder_ancestry_rusqlite(
             let is_root_child = ancestors.len() == 1;
             return Ok(FolderAncestryFacts {
                 ancestors,
+                ancestor_revisions,
                 write_locked,
                 is_root_child,
                 folder_path,

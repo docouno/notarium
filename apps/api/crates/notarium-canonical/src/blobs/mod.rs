@@ -737,13 +737,98 @@ impl crate::CanonicalStore {
                     .await
                     .unwrap_or_default();
             if !digests.is_empty() {
-                let candidates = digests
-                    .into_iter()
-                    .map(|digest| (space_id.clone(), digest))
-                    .collect();
-                self.cleanup_unretained_local_files_inner(candidates, wait_for_lock)
-                    .await;
+                let mut candidates = Vec::new();
+                for chunk in digests.chunks(512) {
+                    let uncataloged = self
+                        .filter_uncataloged_digests_async(&space_id, chunk)
+                        .await;
+                    for digest in uncataloged {
+                        candidates.push((space_id.clone(), digest));
+                    }
+                }
+                if !candidates.is_empty() {
+                    self.cleanup_unretained_local_files_inner(candidates, wait_for_lock)
+                        .await;
+                }
             }
+        }
+    }
+
+    async fn filter_uncataloged_digests_async(
+        &self,
+        space_id: &SpaceId,
+        chunk: &[ContentDigest],
+    ) -> Vec<ContentDigest> {
+        let space_chk = space_id.clone();
+        let raw_digests: Vec<Vec<u8>> = chunk.iter().map(|d| d.as_bytes().to_vec()).collect();
+        let cataloged_set: Result<HashSet<[u8; 32]>, PortError> = self
+            .with_read_tx_during_shutdown(|tx| {
+                Box::pin(async move {
+                    let mut present = HashSet::new();
+                    match tx {
+                        BackendConn::Sqlite(conn) => {
+                            let hex_list: Vec<String> =
+                                raw_digests.iter().map(hex::encode).collect();
+                            let encoded = serde_json::to_string(&hex_list).map_err(|err| {
+                                internal_not_committed(
+                                    "sqlite_encode_orphan_batch",
+                                    err.to_string(),
+                                )
+                            })?;
+                            let rows: Vec<Vec<u8>> = sqlx::query_scalar(
+                                "SELECT content_blake3 FROM blob_catalog
+                                 WHERE space_id = ?1
+                                   AND blob_state <> 'retired'
+                                   AND content_blake3 IN (SELECT unhex(value) FROM json_each(?2))",
+                            )
+                            .bind(space_chk.as_str())
+                            .bind(encoded)
+                            .fetch_all(&mut **conn)
+                            .await
+                            .map_err(|err| {
+                                internal_not_committed(
+                                    "sqlite_batch_orphan_catalog",
+                                    err.to_string(),
+                                )
+                            })?;
+                            for bytes in rows {
+                                if let Ok(arr) = <[u8; 32]>::try_from(bytes.as_slice()) {
+                                    present.insert(arr);
+                                }
+                            }
+                        }
+                        BackendConn::Postgres(conn) => {
+                            let rows: Vec<Vec<u8>> = sqlx::query_scalar(
+                                "SELECT content_blake3 FROM blob_catalog
+                                 WHERE space_id = $1
+                                   AND blob_state <> 'retired'
+                                   AND content_blake3 = ANY($2)",
+                            )
+                            .bind(space_chk.as_str())
+                            .bind(&raw_digests)
+                            .fetch_all(&mut **conn)
+                            .await
+                            .map_err(|err| {
+                                crate::runtime::pg_read_error("pg_batch_orphan_catalog", err)
+                            })?;
+                            for bytes in rows {
+                                if let Ok(arr) = <[u8; 32]>::try_from(bytes.as_slice()) {
+                                    present.insert(arr);
+                                }
+                            }
+                        }
+                    }
+                    Ok(present)
+                })
+            })
+            .await;
+        match cataloged_set {
+            Ok(present) => chunk
+                .iter()
+                .copied()
+                .filter(|d| !present.contains(d.as_bytes()))
+                .collect(),
+            Err(_) => Vec::new(),
         }
     }
 
@@ -767,8 +852,18 @@ impl crate::CanonicalStore {
                 local.acquire_exclusive_guard(&space_id, digest).await
             } else {
                 let Some(guard) = local.try_acquire_exclusive_guard(&space_id, digest) else {
-                    // An active writer/reader currently holds the shared guard on this digest;
-                    // if that writer aborts, its own cleanup path will reconcile the file.
+                    // Retain the candidate when a concurrent shared guard or shard lock is
+                    // momentarily held so a later sweep or shutdown can still reconcile it.
+                    let mut deferred = self
+                        .inner
+                        .deferred_local_orphan_cleanups
+                        .lock()
+                        .expect("deferred local orphan cleanups mutex");
+                    if deferred.items.len() < 4096 {
+                        deferred.items.insert((space_id.clone(), digest));
+                    } else {
+                        deferred.overflow_spaces.insert(space_id.clone());
+                    }
                     continue;
                 };
                 guard
@@ -779,7 +874,7 @@ impl crate::CanonicalStore {
                 HoldActive,
             }
             let mut guard_opt = Some(guard);
-            for _attempt in 0..4 {
+            for attempt in 0..4 {
                 let gen_before = self
                     .inner
                     .deferred_local_orphan_cleanups
@@ -844,7 +939,7 @@ impl crate::CanonicalStore {
                                 .deferred_local_orphan_cleanups
                                 .lock()
                                 .expect("deferred local orphan cleanups mutex");
-                            if deferred.release_gen != gen_before {
+                            if deferred.release_gen != gen_before && attempt < 3 {
                                 true
                             } else {
                                 if deferred.items.len() < 4096 {

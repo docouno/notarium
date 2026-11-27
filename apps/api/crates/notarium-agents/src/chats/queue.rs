@@ -41,7 +41,9 @@ impl AgentRunSupervisor {
             return Err(gate_deadline());
         }
         account.budget.remaining = remaining;
+        let caller_cancellation = account.budget.cancellation.clone();
         let ownership_lost = Cancellation::default();
+        let _cancel_bridge = CancelBridge::link(caller_cancellation, ownership_lost.clone());
         account.budget = bounded(&account.budget, MAINTENANCE_BUDGET, ownership_lost.clone());
         let mut route = self
             .admit_chat_route(&scope, &thread, &account.budget)
@@ -188,7 +190,20 @@ impl AgentRunSupervisor {
             drop(route);
             // A peer can resolve the same receipt through the shared hub. Keep
             // its sender revocable until the claim has a definitive outcome.
-            let _handoff = sender.handoff.lock().await;
+            let handoff_remaining = deadline.saturating_duration_since(Instant::now());
+            if handoff_remaining.is_zero() {
+                return Err(after_append(gate_deadline()));
+            }
+            let _handoff = tokio::select! {
+                biased;
+                () = account.budget.cancellation.cancelled() => {
+                    return Err(after_append(gate_cancelled()));
+                }
+                () = tokio::time::sleep(handoff_remaining) => {
+                    return Err(after_append(gate_deadline()));
+                }
+                guard = sender.handoff.lock() => guard,
+            };
             let sender_live = || {
                 self.inner
                     .revocations
@@ -208,7 +223,10 @@ impl AgentRunSupervisor {
                         None
                     };
                     if let Some(active) = active {
-                        active.stream.committed(&entry.value, None)?;
+                        active
+                            .stream
+                            .committed(&entry.value, None)
+                            .map_err(|_| after_append(owner_unavailable()))?;
                     } else if let Some(branch) = branch
                         && branch.thread.active_run.is_none()
                         && branch.thread.head == entry.value.seq
@@ -476,6 +494,7 @@ impl AgentRunSupervisor {
                                     }
                                     Err(error)
                                         if !self.inner.shutdown.is_cancelled()
+                                            && !sender.cancellation().is_cancelled()
                                             && retry_handoff(&error).is_some() =>
                                     {
                                         return Err(error);
@@ -485,6 +504,7 @@ impl AgentRunSupervisor {
                             }
                             Err(error)
                                 if !self.inner.shutdown.is_cancelled()
+                                    && !sender.cancellation().is_cancelled()
                                     && retry_handoff(&error).is_some() =>
                             {
                                 return Err(error);
@@ -590,7 +610,11 @@ fn retry_handoff(error: &PortError) -> Option<PortError> {
     if concurrency_retry_delay(error).is_some() {
         return Some(error.clone());
     }
-    let (PortError::Unavailable(failure) | PortError::DeadlineExceeded(failure)) = error else {
+    let (PortError::Unavailable(failure)
+    | PortError::DeadlineExceeded(failure)
+    | PortError::Cancelled(failure)
+    | PortError::Internal(failure)) = error
+    else {
         return None;
     };
     if failure.effect() != CommitEffect::NotCommitted {

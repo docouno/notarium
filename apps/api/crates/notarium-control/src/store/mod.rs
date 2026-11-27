@@ -731,6 +731,13 @@ impl WriteResources {
         fence_result
     }
     async fn commit(self) -> Result<(), PortError> {
+        let fences = self.commit_keeping_fences().await?;
+        drop(fences);
+        Ok(())
+    }
+    async fn commit_keeping_fences(
+        self,
+    ) -> Result<Vec<Box<dyn notarium_core::ports::RevocationLease>>, PortError> {
         let checked = self
             .revocation_fences
             .iter()
@@ -756,18 +763,20 @@ impl WriteResources {
         } else {
             Ok(())
         };
-        drop(revocation_fences);
         if let Some(mut pin) = schedule_pin {
             let _ = pin.close().await;
         }
         drop(_guard);
         drop(_admission);
-        result?;
+        if let Err(error) = result {
+            drop(revocation_fences);
+            return Err(error);
+        }
         // `tx.commit()` is already durable and `fence.release(self)` closed the
         // file descriptor on return, releasing the OS lock; do not misreport
         // `CommitEffect::NotCommitted` after a committed write.
         let _ = fence_result;
-        Ok(())
+        Ok(revocation_fences)
     }
 }
 pub(crate) struct WriteTransaction {
@@ -811,6 +820,14 @@ impl WriteTransaction {
     pub(crate) fn spawn_commit(mut self) -> tokio::task::JoinHandle<Result<(), PortError>> {
         let resources = self.resources.take().expect("live write transaction");
         tokio::spawn(resources.commit())
+    }
+    pub(crate) fn spawn_commit_keeping_fences(
+        mut self,
+    ) -> tokio::task::JoinHandle<
+        Result<Vec<Box<dyn notarium_core::ports::RevocationLease>>, PortError>,
+    > {
+        let resources = self.resources.take().expect("live write transaction");
+        tokio::spawn(resources.commit_keeping_fences())
     }
     pub(crate) async fn commit(self) -> Result<(), PortError> {
         self.spawn_commit()

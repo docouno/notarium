@@ -78,7 +78,8 @@ impl Calendar {
         let at = Timestamp::from_unix_parts(slot.div_euclid(1000), 0)?;
         if active {
             let mut previous = slot;
-            for following in self.after(at)?.take(2) {
+            let check_count = if allow_legacy_fold { 1 } else { 2 };
+            for following in self.after(at)?.take(check_count) {
                 if following.saturating_sub(previous) < MIN_INTERVAL_MS {
                     return Err(DomainError::validation(ValidationReason::InvalidQuery));
                 }

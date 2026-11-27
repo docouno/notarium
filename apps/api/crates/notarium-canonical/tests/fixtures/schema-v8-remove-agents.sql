@@ -1,3 +1,4 @@
+DROP INDEX IF EXISTS idx_pending_purges_successor;
 DROP INDEX IF EXISTS idx_ability_packages_space_kind;
 DROP INDEX IF EXISTS idx_revision_purge_fences_seq;
 DROP INDEX IF EXISTS idx_note_heads_space_title_fold;

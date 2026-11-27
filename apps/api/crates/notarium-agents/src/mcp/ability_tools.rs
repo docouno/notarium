@@ -526,6 +526,10 @@ async fn provider_authoring_skill_spaces(
 ) -> Result<BTreeSet<SpaceId>, PortError> {
     const MAX_PROJECT_CANDIDATES: usize = 4096;
     const PROJECT_PAGE_LIMIT: u16 = 100;
+    let provider = match &call.target {
+        EgressTarget::InAppProvider { provider, .. } => Some(provider.clone()),
+        EgressTarget::ExternalMcp => None,
+    };
     let mut allowed = BTreeSet::new();
     let mut scanned_projects = 0usize;
     for (space_id, grant) in call.auth.spaces() {
@@ -539,6 +543,9 @@ async fn provider_authoring_skill_spaces(
             allowed.insert(space_id.clone());
             continue;
         }
+        let Some(provider_id) = provider.as_ref() else {
+            continue;
+        };
         let scope = match session::space(call, space_id).await {
             Ok(scope) => scope,
             Err(error) if visible_error(&error) => continue,
@@ -548,9 +555,10 @@ async fn provider_authoring_skill_spaces(
         'projects: for _ in 0..=MAX_PROJECT_CANDIDATES {
             let page = call
                 .registry
-                .catalog
-                .projects(
+                .control
+                .list_provider_project_targets(
                     scope.with_preflight_taint(),
+                    provider_id.clone(),
                     ControlPageRequest::new(PROJECT_PAGE_LIMIT, continuation.clone())?,
                 )
                 .await?;
@@ -561,8 +569,8 @@ async fn provider_authoring_skill_spaces(
             if scanned_projects > MAX_PROJECT_CANDIDATES {
                 return Err(invalid(ValidationReason::BudgetExceeded));
             }
-            for item in page.items {
-                if corpus::skill_selection(call, space_id, Some(item.folder))
+            for project in page.items {
+                if corpus::skill_selection(call, space_id, Some(project))
                     .await?
                     .is_some()
                 {
@@ -2655,22 +2663,17 @@ async fn use_ability(
     {
         const ROLE_LABEL: &str = "notarium.mcp.activate-role.v1";
         replay_active_role_plan(call, &plan).await?;
-        let descriptor = call
-            .registry
-            .control
-            .get_ability(
-                call.account(),
-                plan.active_role.clone(),
-                plan.project_hint.clone(),
-            )
-            .await
-            .map_err(|error| {
-                super::note_tools::batch_operational_error(
-                    ROLE_LABEL,
-                    collapse_provider_error(call, error),
-                    true,
-                )
-            })?;
+        let descriptor =
+            resolve_replayed_role_descriptor(call, &plan.active_role, plan.project_hint.as_ref())
+                .await
+                .map_err(|error| {
+                    super::note_tools::batch_operational_error(
+                        ROLE_LABEL,
+                        collapse_provider_error(call, error),
+                        true,
+                    )
+                })?
+                .ok_or(DomainError::ResourceNotFound)?;
         let (rendered, deferred_taints) = activation(
             call,
             &descriptor,
@@ -2765,22 +2768,20 @@ async fn use_ability(
                 || replayed_plan.project_hint != project)
         {
             const ROLE_LABEL: &str = "notarium.mcp.activate-role.v1";
-            let replayed_desc = call
-                .registry
-                .control
-                .get_ability(
-                    call.account(),
-                    replayed_plan.active_role.clone(),
-                    replayed_plan.project_hint.clone(),
+            let replayed_desc = resolve_replayed_role_descriptor(
+                call,
+                &replayed_plan.active_role,
+                replayed_plan.project_hint.as_ref(),
+            )
+            .await
+            .map_err(|error| {
+                super::note_tools::batch_operational_error(
+                    ROLE_LABEL,
+                    collapse_provider_error(call, error),
+                    true,
                 )
-                .await
-                .map_err(|error| {
-                    super::note_tools::batch_operational_error(
-                        ROLE_LABEL,
-                        collapse_provider_error(call, error),
-                        true,
-                    )
-                })?;
+            })?
+            .ok_or(DomainError::ResourceNotFound)?;
             let (replayed_rendered, replayed_taints) = activation(
                 call,
                 &replayed_desc,
@@ -2828,6 +2829,45 @@ pub(super) async fn validate_session_role(
     Ok(())
 }
 
+async fn resolve_replayed_role_descriptor(
+    call: &ToolCallContext<'_>,
+    reference: &AbilityRef,
+    project: Option<&FolderRef>,
+) -> Result<Option<AbilityDescriptor>, PortError> {
+    match call
+        .registry
+        .control
+        .get_ability(call.account(), reference.clone(), project.cloned())
+        .await
+    {
+        Ok(desc) => Ok(Some(desc)),
+        Err(PortError::Domain(DomainError::ResourceNotFound)) => {
+            match call
+                .registry
+                .control
+                .inspect_ability(call.account(), reference.identity())
+                .await
+            {
+                Ok(insp) if insp.descriptor.reference != *reference => {
+                    match call
+                        .registry
+                        .control
+                        .get_ability(call.account(), insp.descriptor.reference, project.cloned())
+                        .await
+                    {
+                        Ok(desc) => Ok(Some(desc)),
+                        Err(PortError::Domain(DomainError::ResourceNotFound)) => Ok(None),
+                        Err(error) => Err(error),
+                    }
+                }
+                Ok(_) | Err(PortError::Domain(DomainError::ResourceNotFound)) => Ok(None),
+                Err(error) => Err(error),
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
 pub(super) async fn activate_session_role(
     call: &mut ToolCallContext<'_>,
     episode: &AgentEpisode,
@@ -2840,16 +2880,13 @@ pub(super) async fn activate_session_role(
             .await?
     {
         replay_active_role_plan(call, &plan).await?;
-        let descriptor = call
-            .registry
-            .control
-            .get_ability(
-                call.account(),
-                plan.active_role.clone(),
-                plan.project_hint.clone(),
-            )
-            .await
-            .map_err(|error| collapse_provider_error(call, error))?;
+        let Some(descriptor) =
+            resolve_replayed_role_descriptor(call, &plan.active_role, plan.project_hint.as_ref())
+                .await
+                .map_err(|error| collapse_provider_error(call, error))?
+        else {
+            return Ok(None);
+        };
         let body = read_body_inner(call, &descriptor, plan.project_hint.as_ref(), false)
             .await
             .map_err(|error| collapse_provider_error(call, error))?;
@@ -2919,16 +2956,16 @@ pub(super) async fn activate_session_role(
             && (replayed_plan.active_role != descriptor.reference
                 || replayed_plan.project_hint != project)
         {
-            let replayed_desc = call
-                .registry
-                .control
-                .get_ability(
-                    call.account(),
-                    replayed_plan.active_role.clone(),
-                    replayed_plan.project_hint.clone(),
-                )
-                .await
-                .map_err(|error| collapse_provider_error(call, error))?;
+            let Some(replayed_desc) = resolve_replayed_role_descriptor(
+                call,
+                &replayed_plan.active_role,
+                replayed_plan.project_hint.as_ref(),
+            )
+            .await
+            .map_err(|error| collapse_provider_error(call, error))?
+            else {
+                return Ok(None);
+            };
             let replayed_body = read_body_inner(
                 call,
                 &replayed_desc,

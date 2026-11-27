@@ -388,11 +388,8 @@ async fn authorize_resource(
                 false,
             )
             .await?;
-            for anc in &ancestry.ancestors {
-                let row = crate::runtime::load_folder_head_row(tx, &srec.space.id, anc).await?;
-                if row.lifecycle == notarium_core::model::Lifecycle::Purged {
-                    return Err(DomainError::ResourceNotFound.into());
-                }
+            if ancestry.folder_lifecycle == notarium_core::model::Lifecycle::Purged {
+                return Err(DomainError::ResourceNotFound.into());
             }
             auth.can_view_folder(&srec.space, folder, &ancestry.ancestors)?;
             return Ok(auth.authorize_direct_write(&facts, &facts)?);
@@ -407,11 +404,8 @@ async fn authorize_resource(
                 false,
             )
             .await?;
-            for anc in &ancestry.ancestors {
-                let row = crate::runtime::load_folder_head_row(tx, &srec.space.id, anc).await?;
-                if row.lifecycle == notarium_core::model::Lifecycle::Purged {
-                    return Err(DomainError::ResourceNotFound.into());
-                }
+            if ancestry.folder_lifecycle == notarium_core::model::Lifecycle::Purged {
+                return Err(DomainError::ResourceNotFound.into());
             }
             auth.can_view_folder(&srec.space, folder, &ancestry.ancestors)?;
             auth.authorize_direct_write(&facts, &facts)?;

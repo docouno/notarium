@@ -454,6 +454,21 @@ pub(super) async fn retrieve(
                     Err(error) => return Err(error),
                 };
                 if hit.chunks.is_empty() {
+                    match corpus::admit_metadata_with_selection(
+                        call,
+                        &scope,
+                        metadata,
+                        selection.as_ref(),
+                    )
+                    .await
+                    {
+                        Ok(()) => {}
+                        Err(error) if corpus::hidden(&error) => {
+                            call.rollback_provenance(provenance_checkpoint);
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    }
                     remaining -= header_charge;
                     best.get_or_insert(hit.score);
                     seen.insert(key);

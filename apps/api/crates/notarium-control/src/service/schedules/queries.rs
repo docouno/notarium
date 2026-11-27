@@ -271,6 +271,15 @@ impl ControlService {
             )
             .await
     }
+    pub async fn scheduler_clock(&self, ctx: MaintenanceContext) -> Result<Timestamp, PortError> {
+        ctx.authority.require(ServicePurpose::Scheduler)?;
+        let now_ms = self.clock.now_ms()?;
+        let secs = now_ms.div_euclid(1000);
+        let nanos = u32::try_from(now_ms.rem_euclid(1000))
+            .map_err(|_| invalid(ValidationReason::InvalidTimestamp))?
+            .saturating_mul(1_000_000);
+        Ok(Timestamp::from_unix_parts(secs, nanos)?)
+    }
     pub async fn list_due_schedules(
         &self,
         ctx: MaintenanceContext,
@@ -278,10 +287,7 @@ impl ControlService {
         page: ControlPageRequest,
     ) -> Result<ControlPage<AgentSchedule>, PortError> {
         ctx.authority.require(ServicePurpose::Scheduler)?;
-        let at = floor_ms(now)?;
-        if at > self.clock.now_ms()? {
-            return Err(invalid(ValidationReason::InvalidTimestamp));
-        }
+        let at = floor_ms(now)?.min(self.clock.now_ms()?);
         let scope = ContentDigest::from_bytes(
             *blake3::hash(json(&(1, "due", &self.installation, at))?.as_bytes()).as_bytes(),
         );
@@ -323,10 +329,7 @@ impl ControlService {
         page: ControlPageRequest,
     ) -> Result<ControlPage<ScheduleRunReceipt>, PortError> {
         ctx.authority.require(ServicePurpose::Scheduler)?;
-        let at = floor_ms(now)?;
-        if at > self.clock.now_ms()? {
-            return Err(invalid(ValidationReason::InvalidTimestamp));
-        }
+        let at = floor_ms(now)?.min(self.clock.now_ms()?);
         let scope = ContentDigest::from_bytes(
             *blake3::hash(json(&(1, "expired-schedule-runs", &self.installation, at))?.as_bytes())
                 .as_bytes(),

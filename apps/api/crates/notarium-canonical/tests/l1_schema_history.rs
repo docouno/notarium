@@ -1108,3 +1108,122 @@ async fn verify_postgres_mid_command_and_purge_fence(
         Err(PortError::Domain(DomainError::ResourceNotFound))
     ));
 }
+
+#[tokio::test]
+async fn l1_long_incompressible_title_fold_succeeds_in_sqlite_and_postgres_v9_index() {
+    use notarium_core::ids::{CommandKey, ContentDigest, GrantId, RequestId};
+    use notarium_core::ports::{CreateNote, Mutation, NoteWritePort, Preconditions, SpaceContext};
+    use notarium_core::receipt::CommandIdentity;
+
+    // 8192 incompressible hex characters (128 distinct blake3 chunks): exceeds PG16's 8 KiB
+    // B-tree item limit if indexed verbatim, but fits cleanly in the bounded 256-char prefix index.
+    let mut long_title = String::with_capacity(8192);
+    for i in 0u16..128 {
+        let digest = blake3::hash(&i.to_be_bytes());
+        long_title.push_str(&digest.to_hex());
+    }
+    assert_eq!(long_title.len(), 8192);
+    let body = format!("# {long_title}\n\nbody\n");
+
+    let run_case = |store: CanonicalStore| {
+        let body = body.clone();
+        async move {
+            let owner = sample_principal_id(41);
+            let space_id = sample_space_id(41);
+            let inc = sample_incarnation(41);
+            let root = sample_folder_id(41);
+            let scope = HistoryScope {
+                space_id: space_id.clone(),
+                incarnation: inc,
+            };
+            store
+                .create_space(CreateSpaceSpec {
+                    space_id: space_id.clone(),
+                    incarnation: inc,
+                    root_folder_id: root.clone(),
+                    slug: "long-title-space".to_owned(),
+                    kind: SpaceKind::Personal,
+                    owner: owner.clone(),
+                    active_epoch: LeaseEpoch::new(1).unwrap(),
+                    initial_last_seq: SpaceSeq::ZERO,
+                    created_at: None,
+                })
+                .await
+                .expect("create space");
+            let auth = notarium_core::auth::EngineAuthContext::for_human(
+                notarium_core::auth::VerifiedHuman::attest(
+                    owner.clone(),
+                    GrantId::from_bytes([41; 16]),
+                    std::collections::BTreeMap::from([(
+                        space_id.clone(),
+                        notarium_core::auth::SpaceGrant {
+                            role: notarium_core::auth::SpaceRole::Owner,
+                            read_classes: std::collections::BTreeSet::from([
+                                notarium_core::classes::DocClass::UserDoc,
+                            ]),
+                            write_classes: std::collections::BTreeSet::from([
+                                notarium_core::classes::DocClass::UserDoc,
+                            ]),
+                            project_root: None,
+                        },
+                    )]),
+                    false,
+                ),
+            );
+            let ctx = SpaceContext::new(
+                auth,
+                scope.clone(),
+                notarium_core::ports::CallBudget {
+                    request: RequestId::from_bytes([41; 16]),
+                    cancellation: notarium_core::ports::Cancellation::default(),
+                    remaining: std::time::Duration::from_secs(10),
+                },
+            )
+            .unwrap();
+            store
+                .create_note(
+                    ctx,
+                    Mutation {
+                        identity: CommandIdentity {
+                            scope,
+                            actor: owner,
+                            key: CommandKey::from_bytes([41; 16]),
+                            hash: ContentDigest::from_bytes(
+                                *blake3::hash(body.as_bytes()).as_bytes(),
+                            ),
+                        },
+                        preconditions: Preconditions::default(),
+                        input: CreateNote {
+                            note: sample_note_id(41),
+                            parent: None,
+                            slug: "long-h1".to_owned(),
+                            class: notarium_core::classes::DocClass::UserDoc,
+                            carrier: body,
+                            folder_page: false,
+                        },
+                    },
+                )
+                .await
+                .expect("active note with 8 KiB incompressible H1 must fit v9 title_fold index");
+        }
+    };
+
+    {
+        let temp = TempDataRoot::new("l1-long-title-sqlite");
+        let cfg = CanonicalConfig::local_default(sample_installation_id(41), temp.data_root());
+        let (store, runtime) = CanonicalRuntime::open(cfg).await.expect("open SQLite");
+        run_case(store).await;
+        runtime.shutdown().await.expect("shutdown SQLite");
+    }
+    {
+        let fixtures = StorageTestFixtures::load_required();
+        let schema = fixtures.fresh_pg_schema();
+        let blob_temp = TempDataRoot::new("l1-long-title-pg-blobs");
+        let cfg =
+            fixtures.pg_local_config(sample_installation_id(42), &schema, blob_temp.data_root());
+        let (store, runtime) = CanonicalRuntime::open(cfg).await.expect("open PG16");
+        run_case(store).await;
+        runtime.shutdown().await.expect("shutdown PG16");
+        fixtures.drop_pg_schema(&schema).await;
+    }
+}

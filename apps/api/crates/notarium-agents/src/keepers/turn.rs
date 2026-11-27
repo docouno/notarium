@@ -500,7 +500,11 @@ impl KeeperTurn<'_> {
             )),
             Ok(_) => Err(invalid(ValidationReason::InvalidAuthority)),
             Err(failure) => Ok((
-                json!({"error":failure.error.code()}).to_string(),
+                bounded_tool_text_within(
+                    &json!({"error":failure.error.code()}).to_string(),
+                    display_budget.0,
+                    display_budget.1,
+                ),
                 failure.provenance,
             )),
         }

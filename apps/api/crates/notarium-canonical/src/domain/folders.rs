@@ -1248,13 +1248,16 @@ pub(crate) async fn resolve_note_alias_impl(
                         BackendConn::Sqlite(conn) => {
                             let rows = sqlx::query(
                                 "SELECT note_id FROM note_heads
-                                 WHERE space_id = ? AND parent_folder_id = ? AND title_fold = ?
+                                 WHERE space_id = ? AND parent_folder_id = ?
+                                   AND substr(title_fold, 1, 256) = substr(?, 1, 256)
+                                   AND title_fold = ?
                                    AND lifecycle_state = 'active'
                                  ORDER BY updated_seq DESC, note_id ASC
                                  LIMIT 16",
                             )
                             .bind(scope.space_id.as_str())
                             .bind(parent_id.as_str())
+                            .bind(&title_norm)
                             .bind(&title_norm)
                             .fetch_all(&mut **conn)
                             .await
@@ -1266,7 +1269,9 @@ pub(crate) async fn resolve_note_alias_impl(
                         BackendConn::Postgres(conn) => {
                             let rows = sqlx::query(
                                 "SELECT note_id FROM note_heads
-                                 WHERE space_id = $1 AND parent_folder_id = $2 AND title_fold = $3
+                                 WHERE space_id = $1 AND parent_folder_id = $2
+                                   AND (substr(title_fold, 1, 256) COLLATE \"C\") = (substr($3, 1, 256) COLLATE \"C\")
+                                   AND title_fold = $3
                                    AND lifecycle_state = 'active'
                                  ORDER BY updated_seq DESC, note_id COLLATE \"C\" ASC
                                  LIMIT 16",

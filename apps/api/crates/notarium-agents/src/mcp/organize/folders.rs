@@ -154,10 +154,36 @@ fn visible_ancestors<'a>(
     out
 }
 
+fn visible_ancestor_pairs<'a>(
+    scope: &SpaceContext,
+    ancestors: &'a [FolderId],
+    revisions: &'a [RevisionId],
+    self_id: &FolderId,
+) -> Option<Vec<(&'a FolderId, &'a RevisionId)>> {
+    if ancestors.len() != revisions.len() {
+        return None;
+    }
+    let project_root = scope
+        .auth()
+        .spaces()
+        .get(&scope.scope().space_id)
+        .and_then(|grant| grant.project_root.as_ref());
+    let mut out = Vec::new();
+    for (ancestor, rev) in ancestors.iter().zip(revisions.iter()) {
+        if ancestor != self_id {
+            out.push((ancestor, rev));
+        }
+        if project_root == Some(ancestor) {
+            break;
+        }
+    }
+    Some(out)
+}
+
 async fn capture_ancestor_revisions(
     call: &ToolCallContext<'_>,
     scope: &SpaceContext,
-    ancestors: &[FolderId],
+    snapshot: &FolderSnapshot,
     self_id: &FolderId,
     extra_parent: Option<&FolderSnapshot>,
 ) -> Result<Vec<(FolderId, RevisionId)>, PortError> {
@@ -169,7 +195,20 @@ async fn capture_ancestor_revisions(
     {
         revs.push((parent.reference.folder_id.clone(), parent.revision.clone()));
     }
-    for ancestor in visible_ancestors(scope, ancestors, self_id) {
+    if let Some(pairs) = visible_ancestor_pairs(
+        scope,
+        &snapshot.ancestor_folders,
+        &snapshot.ancestor_revisions,
+        self_id,
+    ) {
+        for (ancestor, rev) in pairs {
+            if seen.insert(ancestor.clone()) {
+                revs.push((ancestor.clone(), rev.clone()));
+            }
+        }
+        return Ok(revs);
+    }
+    for ancestor in visible_ancestors(scope, &snapshot.ancestor_folders, self_id) {
         if !seen.insert(ancestor.clone()) {
             continue;
         }
@@ -185,6 +224,21 @@ async fn ancestors_unchanged(
     current: &FolderSnapshot,
     expected: &[(FolderId, RevisionId)],
 ) -> Result<bool, PortError> {
+    if let Some(pairs) = visible_ancestor_pairs(
+        scope,
+        &current.ancestor_folders,
+        &current.ancestor_revisions,
+        &current.reference.folder_id,
+    ) {
+        if pairs.len() != expected.len() {
+            return Ok(false);
+        }
+        let live_map: std::collections::BTreeMap<&FolderId, &RevisionId> =
+            pairs.into_iter().collect();
+        return Ok(expected
+            .iter()
+            .all(|(id, rev)| live_map.get(id) == Some(&rev)));
+    }
     let live_ancestors: std::collections::BTreeSet<&FolderId> = visible_ancestors(
         scope,
         &current.ancestor_folders,
@@ -371,7 +425,7 @@ async fn plan(
                 let revs = capture_ancestor_revisions(
                     call,
                     &address.scope,
-                    &source.ancestor_folders,
+                    &source,
                     &source.reference.folder_id,
                     None,
                 )
@@ -381,7 +435,7 @@ async fn plan(
                 let revs = capture_ancestor_revisions(
                     call,
                     &address.scope,
-                    &dest.ancestor_folders,
+                    &dest,
                     &source.reference.folder_id,
                     Some(&dest),
                 )
@@ -401,7 +455,7 @@ async fn plan(
             let ancestor_revisions = capture_ancestor_revisions(
                 call,
                 &address.scope,
-                &source.ancestor_folders,
+                &source,
                 &source.reference.folder_id,
                 None,
             )
@@ -432,7 +486,7 @@ async fn plan(
             let ancestor_revisions = capture_ancestor_revisions(
                 call,
                 &scope,
-                &source.ancestor_folders,
+                &source,
                 &source.reference.folder_id,
                 None,
             )

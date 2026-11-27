@@ -496,6 +496,7 @@ impl KeeperScheduler {
         let control = self.inner.registry.control();
         let mut result = control.claim_schedule(ctx.clone(), claim.clone()).await;
         let mut retry_stepper = NextSlotRetry::new(slot, now, fresh, claim.next_slot);
+        let mut probed_control_clock = false;
         const MAX_NEXT_SLOT_RETRIES: usize = 20;
         for step in 0..MAX_NEXT_SLOT_RETRIES {
             if !matches!(&result, Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
@@ -505,6 +506,22 @@ impl KeeperScheduler {
             }
             if cancellation.is_cancelled() || ownership_lost.is_cancelled() {
                 break;
+            }
+            if !probed_control_clock {
+                probed_control_clock = true;
+                if let Ok(control_now) = control.scheduler_clock(ctx.clone()).await
+                    && control_now >= slot
+                {
+                    let authoritative = next(control_now)?;
+                    if authoritative != claim.next_slot {
+                        owner.check()?;
+                        claim.next_slot = authoritative;
+                        retry_stepper =
+                            NextSlotRetry::new(slot, control_now, control_now, claim.next_slot);
+                        result = control.claim_schedule(ctx.clone(), claim.clone()).await;
+                        continue;
+                    }
+                }
             }
             let latest = if let Some(clock) = clock {
                 let current = clock_now(clock)?;

@@ -277,11 +277,41 @@ impl ProviderService {
             let _ = lease.close().await;
         }
         drop(progress.leases);
-        if let Some(handle) = progress.pending_commit.take() {
+        let mut deferred_late_reserve: Option<tokio::task::JoinHandle<Result<(), PortError>>> =
+            None;
+        if let Some(mut handle) = progress.pending_commit.take() {
             // Wait (bounded) for any spawned reserve/sending COMMIT task to
             // finish before `finalize` runs so PostgreSQL does not race ahead
             // of the in-flight COMMIT and miss the inserted row.
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+            tokio::select! {
+                _ = &mut handle => {}
+                _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                    deferred_late_reserve = Some(handle);
+                }
+            }
+        }
+        if let Some(handle) = deferred_late_reserve
+            && progress.reserved
+            && !progress.submitted
+        {
+            // A slow reserve COMMIT exceeded the inline wait before any remote
+            // call was sent: settle it asynchronously as NotSent once COMMIT
+            // resolves so quota is not stranded as Unknown.
+            let svc = self.clone();
+            let call_id = progress.call.clone();
+            tokio::spawn(async move {
+                let _ = handle.await;
+                let _ = svc
+                    .finalize(
+                        &call_id,
+                        Some(&svc.dispatcher),
+                        ProviderUsage::Unknown,
+                        ProviderOutcome::NotSent,
+                        None,
+                    )
+                    .await;
+            });
+            progress.reserved = false;
         }
         if progress.reserved {
             let outcome = match &result {

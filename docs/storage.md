@@ -606,7 +606,12 @@ same example against an isolated prefix.
   (`idx_folder_heads_space_updated`), active chat-run lookup
   (`idx_chat_threads_active_run`), tainted chat entry scans
   (`idx_chat_entries_tainted`), consumed pending chat inputs
-  (`idx_chat_pending_inputs_consumed`), and `COLLATE "C"`-aligned keyset paging
+  (`idx_chat_pending_inputs_consumed`), folder-alias parent scans
+  (`idx_folder_aliases_parent_seq`), bounded active-note title lookups
+  (`idx_note_heads_space_title_fold`), purge-fence sequence lookups
+  (`idx_revision_purge_fences_seq`), ability-kind filtering
+  (`idx_ability_packages_space_kind`), mint-and-purge successor scrubbing
+  (`idx_pending_purges_successor`), and `COLLATE "C"`-aligned keyset paging
   (`idx_note_heads_keyset`, `idx_ability_packages_keyset`, `idx_chat_threads_keyset`,
   plus `COLLATE "C"` on `idx_folder_heads_parent_lifecycle`).
   It returns typed rows in the original table and column order within the

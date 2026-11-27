@@ -1950,7 +1950,7 @@ async fn execute_sql_erasure_for_old_note_tx(
             sqlx::query(
                 "UPDATE pending_purges
                  SET new_note_rev_id = NULL, sanitized_response_msgpack = X''
-                 WHERE space_id = ? AND new_note_id = ?",
+                 WHERE space_id = ? AND new_note_id IS NOT NULL AND new_note_id = ?",
             )
             .bind(scope.space_id.as_str())
             .bind(old_id_str)
@@ -1964,7 +1964,7 @@ async fn execute_sql_erasure_for_old_note_tx(
             sqlx::query(
                 "UPDATE pending_purges
                  SET new_note_rev_id = NULL, sanitized_response_msgpack = ''::BYTEA
-                 WHERE space_id = $1 AND new_note_id = $2",
+                 WHERE space_id = $1 AND new_note_id IS NOT NULL AND new_note_id = $2",
             )
             .bind(scope.space_id.as_str())
             .bind(old_id_str)
@@ -2395,28 +2395,59 @@ async fn scrub_command_receipt_envelope_for_note_tx(
     Ok(())
 }
 
+async fn distinct_receipt_incarnations_tx(
+    tx: &mut BackendConn<'_>,
+    space_id: &SpaceId,
+) -> Result<Vec<Vec<u8>>, PortError> {
+    const SQL: &str = "WITH RECURSIVE histories(h) AS (
+            SELECT (SELECT history_incarnation FROM command_receipts WHERE space_id=$1 ORDER BY history_incarnation LIMIT 1)
+            UNION ALL
+            SELECT (SELECT r.history_incarnation FROM command_receipts r
+                    WHERE r.space_id=$1 AND r.history_incarnation > histories.h
+                    ORDER BY r.history_incarnation LIMIT 1)
+            FROM histories WHERE h IS NOT NULL
+        )
+        SELECT h FROM histories WHERE h IS NOT NULL";
+    match tx {
+        BackendConn::Sqlite(conn) => sqlx::query_scalar(SQL)
+            .bind(space_id.as_str())
+            .fetch_all(&mut **conn)
+            .await
+            .map_err(|err| internal_not_committed("sqlite_receipt_incarnations", err.to_string())),
+        BackendConn::Postgres(conn) => sqlx::query_scalar(SQL)
+            .bind(space_id.as_str())
+            .fetch_all(&mut **conn)
+            .await
+            .map_err(|err| internal_not_committed("pg_receipt_incarnations", err.to_string())),
+    }
+}
+
 async fn scrub_legacy_mint_and_purge_receipts_tx(
     tx: &mut BackendConn<'_>,
     scope: &HistoryScope,
     purged_note: &NoteId,
     erased_detail_ids: &[String],
 ) -> Result<(), PortError> {
-    for detail in erased_detail_ids {
-        let Some((actor, key)) = detail
-            .strip_prefix("rcpt_pay:")
-            .and_then(|s| s.split_once(':'))
-        else {
-            continue;
-        };
-        scrub_command_receipt_envelope_for_note_tx(
-            tx,
-            &scope.space_id,
-            None,
-            actor,
-            key,
-            purged_note,
-        )
-        .await?;
+    let pairs: Vec<(&str, &str)> = erased_detail_ids
+        .iter()
+        .filter_map(|detail| detail.strip_prefix("rcpt_pay:")?.split_once(':'))
+        .collect();
+    if pairs.is_empty() {
+        return Ok(());
+    }
+    let incarnations = distinct_receipt_incarnations_tx(tx, &scope.space_id).await?;
+    for (actor, key) in pairs {
+        for inc in &incarnations {
+            scrub_command_receipt_envelope_for_note_tx(
+                tx,
+                &scope.space_id,
+                Some(inc.as_slice()),
+                actor,
+                key,
+                purged_note,
+            )
+            .await?;
+        }
     }
     Ok(())
 }
@@ -2430,7 +2461,7 @@ async fn scrub_pending_purge_successor_receipts_tx(
         BackendConn::Sqlite(conn) => {
             let rows = sqlx::query(
                 "SELECT history_incarnation, actor_id, idempotency_key
-                 FROM pending_purges WHERE space_id = ? AND new_note_id = ?",
+                 FROM pending_purges WHERE space_id = ? AND new_note_id IS NOT NULL AND new_note_id = ?",
             )
             .bind(scope.space_id.as_str())
             .bind(purged_note.as_str())
@@ -2452,7 +2483,7 @@ async fn scrub_pending_purge_successor_receipts_tx(
         BackendConn::Postgres(conn) => {
             let rows = sqlx::query(
                 "SELECT history_incarnation, actor_id, idempotency_key
-                 FROM pending_purges WHERE space_id = $1 AND new_note_id = $2",
+                 FROM pending_purges WHERE space_id = $1 AND new_note_id IS NOT NULL AND new_note_id = $2",
             )
             .bind(scope.space_id.as_str())
             .bind(purged_note.as_str())

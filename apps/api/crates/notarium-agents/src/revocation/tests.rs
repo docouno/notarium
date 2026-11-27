@@ -596,3 +596,107 @@ async fn thread_stream_pause_discards_unread_frames_and_pending_submitters_refco
         "rolling back the final submitter must clear the pending credential"
     );
 }
+
+#[tokio::test]
+async fn concurrent_redactions_refcount_and_pause_streams_registered_mid_redaction() {
+    use crate::chats::stream::{StepStreamBuffer, StreamRead};
+    use notarium_core::ids::{ChatThreadId, HistoryIncarnation, ThreadEntrySeq};
+    use notarium_core::model::HistoryScope;
+
+    let hub = RevocationHub::new_local();
+    let space = SpaceId::from_bytes([0x61; 16]);
+    let scope = HistoryScope {
+        space_id: space.clone(),
+        incarnation: HistoryIncarnation::from_bytes([0x62; 16]),
+    };
+    let thread = ChatThreadId::from_bytes([0x63; 16]);
+
+    let buf1 = Arc::new(StepStreamBuffer::new(
+        AgentRunId::from_bytes([0x64; 16]),
+        thread.clone(),
+        ThreadEntrySeq::ZERO,
+    ));
+    hub.register_thread_stream(scope.clone(), thread.clone(), Arc::downgrade(&buf1));
+    let mut sub1 = buf1.subscribe(None);
+    buf1.begin_step(1).unwrap();
+    buf1.text_delta(1, "pre-redaction frame").unwrap();
+
+    // Two concurrent redactions on the same thread.
+    let guard1 = hub.pause_thread_streams(&scope, &thread);
+    let mut guard2 = hub.pause_thread_streams(&scope, &thread);
+
+    // A second supervisor starts a run and registers a new stream while guard1 is active.
+    let buf2 = Arc::new(StepStreamBuffer::new(
+        AgentRunId::from_bytes([0x65; 16]),
+        thread.clone(),
+        ThreadEntrySeq::ZERO,
+    ));
+    hub.register_thread_stream(scope.clone(), thread.clone(), Arc::downgrade(&buf2));
+    let mut sub2 = buf2.subscribe(None);
+    buf2.begin_step(1).unwrap();
+    buf2.text_delta(1, "mid-redaction frame").unwrap();
+
+    // Second redaction hits RevisionConflict and keeps history; streams MUST stay paused
+    // while guard1 is still held.
+    guard2.keep_history();
+    drop(guard2);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), sub1.next())
+            .await
+            .is_err(),
+        "first stream must remain paused while first redaction guard is still active"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), sub2.next())
+            .await
+            .is_err(),
+        "mid-redaction stream must be paused while first redaction guard is still active"
+    );
+
+    // First redaction commits and drops guard1 with discard = true.
+    drop(guard1);
+    assert!(matches!(sub1.next().await, StreamRead::CatchUpRequired(_)));
+    assert!(matches!(sub2.next().await, StreamRead::CatchUpRequired(_)));
+
+    // Dropping a run lease and its buffer cleans up the thread_streams entry.
+    let run3 = AgentRunId::from_bytes([0x66; 16]);
+    let human = caller(
+        0x67,
+        &space,
+        AuthenticatedCredential::Session(AuthSessionId::from_bytes([0x68; 16])),
+    );
+    let run_auth = human
+        .for_agent_run(
+            run3.clone(),
+            space.clone(),
+            notarium_core::auth::ChatAudience::Personal,
+            human.spaces().clone(),
+        )
+        .unwrap();
+    let thread2 = ChatThreadId::from_bytes([0x69; 16]);
+    let lease = hub
+        .register_run_with_sender(
+            context(9),
+            &run_auth,
+            None,
+            Cancellation::default(),
+            Some((scope.clone(), thread2.clone())),
+            None,
+        )
+        .unwrap();
+    let buf3 = Arc::new(StepStreamBuffer::new(
+        run3,
+        thread2.clone(),
+        ThreadEntrySeq::ZERO,
+    ));
+    hub.register_thread_stream(scope.clone(), thread2.clone(), Arc::downgrade(&buf3));
+    drop(buf3);
+    drop(lease);
+    assert!(
+        !hub.inner
+            .lock()
+            .thread_streams
+            .contains_key(&(scope, thread2)),
+        "RunRevocationLease::drop must prune dead thread_streams keys"
+    );
+}

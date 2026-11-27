@@ -163,7 +163,7 @@ CREATE INDEX IF NOT EXISTS idx_note_heads_keyset
     ON note_heads (space_id, note_id, created_seq);
 
 CREATE INDEX IF NOT EXISTS idx_note_heads_space_title_fold
-    ON note_heads (space_id, title_fold, note_id)
+    ON note_heads (space_id, parent_folder_id, substr(title_fold, 1, 256), note_id)
     WHERE lifecycle_state = 'active';
 
 CREATE TABLE IF NOT EXISTS note_aliases (
@@ -876,6 +876,10 @@ CREATE TABLE IF NOT EXISTS pending_purges (
 
 CREATE INDEX IF NOT EXISTS idx_pending_purges_phase
     ON pending_purges (space_id, phase);
+
+CREATE INDEX IF NOT EXISTS idx_pending_purges_successor
+    ON pending_purges (space_id, new_note_id)
+    WHERE new_note_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS account_catalog_receipts (
     owner_id TEXT NOT NULL,

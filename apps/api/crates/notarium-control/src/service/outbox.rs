@@ -96,6 +96,7 @@ impl ControlService {
     ) -> Result<(), PortError> {
         const MAX_FENCE_SELECTORS: usize = 512;
         let mut unique = std::collections::BTreeSet::new();
+        let mut to_revoke = Vec::new();
         for id in events {
             let event = budget
                 .run(
@@ -113,7 +114,12 @@ impl ControlService {
                 if envelope.version != 1 {
                     return Err(invalid(ValidationReason::InvalidState));
                 }
-                unique.insert(envelope.selector);
+                let reason: RevocationReason =
+                    serde_json::from_value(serde_json::Value::String(event.reason))
+                        .map_err(|_| invalid(ValidationReason::InvalidState))?;
+                let request = RequestId::parse(&event.event_id)?;
+                unique.insert(envelope.selector.clone());
+                to_revoke.push((event.event_id, request, envelope.selector, reason));
             }
         }
         let selectors: Vec<_> = unique.into_iter().collect();
@@ -133,7 +139,65 @@ impl ControlService {
             fence.check()?;
             tx.hold_revocation_fence(fence);
         }
-        budget.commit_tx(tx).await
+        let fences = budget.commit_tx_keeping_fences(tx).await?;
+        // Deliver revocation signals to the authority BEFORE dropping the fences
+        // (and after SQL write locks are released), so pending entries are wiped
+        // and no post-commit registration can race ahead of this revocation event.
+        let mut delivered_ids = Vec::with_capacity(to_revoke.len());
+        let revoke_result: Result<(), PortError> = async {
+            for (event_id, request, selector, reason) in to_revoke {
+                budget
+                    .run(
+                        self.revoker.revoke(
+                            MaintenanceContext {
+                                authority: ServiceAuthority::admit(ServicePurpose::Revocation),
+                                budget: budget.context(request),
+                            },
+                            selector,
+                            reason,
+                        ),
+                        CommitEffect::Unknown,
+                    )
+                    .await
+                    .map_err(|_| {
+                        unavailable("control revocation delivery", CommitEffect::Unknown)
+                    })?;
+                delivered_ids.push(event_id);
+            }
+            Ok(())
+        }
+        .await;
+        drop(fences);
+        revoke_result?;
+        if !delivered_ids.is_empty() {
+            let mark_delivered: Result<(), PortError> = async {
+                let mut mark_tx = self.store.write(budget.clone()).await?;
+                let now = self.clock.now_ms()?;
+                budget
+                    .run(
+                        async {
+                            for event_id in &delivered_ids {
+                                execute!(
+                                    mark_tx.inner_mut(),
+                                    "UPDATE revocation_events SET attempts=attempts+1, delivered_at=$1 WHERE event_id=$2 AND delivered_at IS NULL",
+                                    "UPDATE v1_control.revocation_events SET attempts=attempts+1, delivered_at=$1 WHERE event_id=$2 AND delivered_at IS NULL";
+                                    now,
+                                    event_id
+                                )?;
+                            }
+                            Ok(())
+                        },
+                        CommitEffect::Unknown,
+                    )
+                    .await?;
+                budget.commit_tx(mark_tx).await
+            }
+            .await;
+            // If recording `delivered_at` fails transiently, `flush_event` will
+            // retry idempotently while the authority has already applied the event.
+            let _ = mark_delivered;
+        }
+        Ok(())
     }
     pub(super) async fn flush_event(
         &self,

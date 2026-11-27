@@ -204,7 +204,6 @@ pub struct AgentRunSupervisor {
 }
 
 type ThreadKey = (SpaceId, ChatThreadId);
-type ScopedThreadKey = (HistoryScope, ChatThreadId);
 
 struct SupervisorState {
     registry: Arc<ToolRegistry>,
@@ -219,7 +218,6 @@ struct ThreadRuns {
     gates: BTreeMap<ThreadKey, Weak<AsyncMutex<()>>>,
     admitting: BTreeMap<AgentRunId, Cancellation>,
     active: BTreeMap<ThreadKey, Arc<ActiveRun>>,
-    streams: BTreeMap<ScopedThreadKey, Vec<Weak<StepStreamBuffer>>>,
 }
 
 /// Track the candidate while its predecessor remains active during admission.
@@ -264,9 +262,10 @@ enum LaunchOutcome {
 }
 
 enum ClaimSettlement {
-    Retired,
+    Cleared,
     Changed,
     Pending,
+    Abandoned,
 }
 
 enum RunTaskStart {
@@ -652,7 +651,9 @@ impl AgentRunSupervisor {
                 return Err(gate_deadline());
             }
             account.budget.remaining = remaining;
+            let caller_cancellation = account.budget.cancellation.clone();
             let ownership_lost = Cancellation::default();
+            let _cancel_bridge = CancelBridge::link(caller_cancellation, ownership_lost.clone());
             account.budget = bounded(&account.budget, MAINTENANCE_BUDGET, ownership_lost);
             let route = service
                 .admit_chat_route(&scope, &thread, &account.budget)
@@ -675,15 +676,12 @@ impl AgentRunSupervisor {
                 .thread_at(ctx.clone(), &thread, ThreadEntrySeq::ZERO)
                 .await?;
             let can_change = current.thread.revision == request.input.expected_thread_revision;
-            let mut holds = Vec::new();
-            if can_change {
-                holds.extend(
-                    service
-                        .inner
-                        .revocations
-                        .pause_thread_streams(&scope, &thread),
-                );
-            }
+            let mut hold = can_change.then(|| {
+                service
+                    .inner
+                    .revocations
+                    .pause_thread_streams(&scope, &thread)
+            });
             let result = match route.as_ref().map_or(Ok(()), |lease| lease.check()) {
                 Ok(()) => {
                     service
@@ -705,12 +703,10 @@ impl AgentRunSupervisor {
                 {
                     active.cancellation.cancel();
                 }
-            } else {
-                for hold in &mut holds {
-                    hold.keep_history();
-                }
+            } else if let Some(hold) = hold.as_mut() {
+                hold.keep_history();
             }
-            drop(holds);
+            drop(hold);
             result
         })
         .await
@@ -900,10 +896,6 @@ impl AgentRunSupervisor {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         state.gates.retain(|_, gate| gate.strong_count() != 0);
-        state.streams.retain(|_, streams| {
-            streams.retain(|stream| stream.strong_count() != 0);
-            !streams.is_empty()
-        });
         let key = (scope.space_id.clone(), thread.clone());
         if let Some(gate) = state.gates.get(&key).and_then(Weak::upgrade) {
             return gate;
@@ -1124,11 +1116,6 @@ impl AgentRunSupervisor {
                 request.thread.clone(),
                 Arc::downgrade(&state.stream),
             );
-            threads
-                .streams
-                .entry((request.scope.clone(), request.thread.clone()))
-                .or_default()
-                .push(Arc::downgrade(&state.stream));
             threads.active.insert(key.clone(), state.clone())
         };
         struct ActiveCandidateGuard<'a> {
@@ -1214,9 +1201,18 @@ impl AgentRunSupervisor {
                 self.restore_predecessor(key, candidate_guard.previous.take());
                 Ok(LaunchOutcome::Settled(error))
             }
-            ClaimSettlement::Retired => {
+            ClaimSettlement::Cleared => {
                 candidate_guard.disarmed = true;
                 self.remove_run(&state);
+                Ok(LaunchOutcome::Settled(error))
+            }
+            ClaimSettlement::Abandoned => {
+                candidate_guard.disarmed = true;
+                if let Some(previous) = candidate_guard.previous.take() {
+                    self.restore_predecessor(key, Some(previous));
+                } else {
+                    self.remove_run(&state);
+                }
                 Ok(LaunchOutcome::Settled(error))
             }
         }
@@ -1258,6 +1254,7 @@ impl AgentRunSupervisor {
             expected_run: run.id.clone(),
         };
         let mut delay = Duration::from_millis(25);
+        let mut shutdown_dismiss_rounds = 0u8;
         loop {
             let owner_live = run.owner.check().is_ok();
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -1265,7 +1262,7 @@ impl AgentRunSupervisor {
                 return if owner_live && !self.inner.shutdown.is_cancelled() {
                     ClaimSettlement::Pending
                 } else {
-                    ClaimSettlement::Retired
+                    ClaimSettlement::Abandoned
                 };
             }
             let result = match run.settlement_context_bounded(remaining) {
@@ -1275,19 +1272,69 @@ impl AgentRunSupervisor {
             match result {
                 // Queue is empty; do not wipe newer submissions registered on another
                 // supervisor after `active_run_id` cleared.
-                Ok(FinishChatRunOutcome::Cleared) => return ClaimSettlement::Retired,
+                Ok(FinishChatRunOutcome::Cleared) => return ClaimSettlement::Cleared,
                 Ok(FinishChatRunOutcome::Changed) => return ClaimSettlement::Changed,
                 Ok(FinishChatRunOutcome::Pending)
                     if owner_live && !self.inner.shutdown.is_cancelled() =>
                 {
                     return ClaimSettlement::Pending;
                 }
-                Ok(FinishChatRunOutcome::Pending) => return ClaimSettlement::Retired,
+                Ok(FinishChatRunOutcome::Pending) if owner_live && shutdown_dismiss_rounds < 8 => {
+                    // This supervisor is shutting down while the writer generation is still live.
+                    // Dismiss pending inputs bounded by caller deadline so `active_run_id` clears
+                    // instead of stranding the thread on a live generation.
+                    shutdown_dismiss_rounds += 1;
+                    let Ok(list_ctx) = run.settlement_context_bounded(
+                        deadline.saturating_duration_since(Instant::now()),
+                    ) else {
+                        return ClaimSettlement::Abandoned;
+                    };
+                    let Ok(items) = engine
+                        .list_pending_chat_inputs(list_ctx, run.thread.clone())
+                        .await
+                    else {
+                        return ClaimSettlement::Abandoned;
+                    };
+                    let mut dismissed_any = false;
+                    for item in items {
+                        let rem = deadline.saturating_duration_since(Instant::now());
+                        if rem.is_zero() || run.owner.check().is_err() {
+                            return ClaimSettlement::Abandoned;
+                        }
+                        let key = PendingCredentialKey {
+                            scope: run.scope.clone(),
+                            thread: run.thread.clone(),
+                            input: item.id,
+                        };
+                        let Ok(dismiss_ctx) = run.settlement_context_bounded(rem) else {
+                            return ClaimSettlement::Abandoned;
+                        };
+                        if engine
+                            .dismiss_chat_input(
+                                dismiss_ctx,
+                                DismissPending {
+                                    thread: run.thread.clone(),
+                                    input: key.input.clone(),
+                                },
+                            )
+                            .await
+                            .is_ok()
+                        {
+                            self.inner.revocations.finish_pending(&key);
+                            dismissed_any = true;
+                        }
+                    }
+                    if dismissed_any {
+                        continue;
+                    }
+                    return ClaimSettlement::Abandoned;
+                }
+                Ok(FinishChatRunOutcome::Pending) => return ClaimSettlement::Abandoned,
                 Err(error) if !queue::retry_cleanup(&error) => {
-                    return ClaimSettlement::Retired;
+                    return ClaimSettlement::Abandoned;
                 }
                 _ if !owner_live || self.inner.shutdown.is_cancelled() => {
-                    return ClaimSettlement::Retired;
+                    return ClaimSettlement::Abandoned;
                 }
                 _ => (),
             }
@@ -1296,12 +1343,12 @@ impl AgentRunSupervisor {
                 return if owner_live && !self.inner.shutdown.is_cancelled() {
                     ClaimSettlement::Pending
                 } else {
-                    ClaimSettlement::Retired
+                    ClaimSettlement::Abandoned
                 };
             }
             tokio::select! {
                 () = tokio::time::sleep(wait) => (),
-                () = self.inner.shutdown.cancelled() => return ClaimSettlement::Retired,
+                () = self.inner.shutdown.cancelled() => continue,
             }
             delay = (delay * 2).min(Duration::from_secs(2));
         }
@@ -1457,6 +1504,26 @@ async fn detached<T: Send + 'static>(
         let _ = reply.send(work.await);
     });
     receive.await.map_err(|_| owner_unavailable())?
+}
+
+pub(super) struct CancelBridge(tokio::task::JoinHandle<()>);
+
+impl CancelBridge {
+    pub(super) fn link(source: Cancellation, target: Cancellation) -> Self {
+        if source.is_cancelled() {
+            target.cancel();
+        }
+        Self(tokio::spawn(async move {
+            source.cancelled().await;
+            target.cancel();
+        }))
+    }
+}
+
+impl Drop for CancelBridge {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 fn bounded(budget: &CallBudget, limit: Duration, cancellation: Cancellation) -> CallBudget {

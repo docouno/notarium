@@ -10,7 +10,7 @@ before shutting down canonical storage.
 ## Queries and recall
 
 - Lexical ranking uses Tantivy with title, body (shared across searchable note
-  classes, including agent memory) and chat fields (`TOKENIZER_VERSION = 2`).
+  classes, including agent memory) and chat fields (`TOKENIZER_VERSION = 3`).
   Filter metadata is stored in fast fields without stored note or chat text.
   English and Russian prose use case folding and stemming. Exact fields retain
   code identifiers and path terms. Quoted clauses match phrase positions.

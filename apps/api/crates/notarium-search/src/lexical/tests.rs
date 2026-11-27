@@ -210,7 +210,7 @@ fn lexical_queries_use_morphology_code_and_exact_phrase_positions() {
     let scratch = TestDir::new();
     let snapshot = Snapshot::new([NoteId::from_bytes([1; 16]), NoteId::from_bytes([2; 16])]);
     let index = LexicalIndex::create(&scratch.0).unwrap();
-    assert_eq!(TOKENIZER_VERSION, 2);
+    assert_eq!(TOKENIZER_VERSION, 3);
     assert!(index.schema().get_field("memory_body_prose").is_err());
     assert!(index.schema().get_field("memory_body_exact").is_err());
     for name in ["doc_kind", "doc_class_ord", "parent_folder_ord"] {

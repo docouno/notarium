@@ -701,9 +701,54 @@ pub(super) async fn hydrate_payloads(
     started: tokio::time::Instant,
     deadline: CommandDeadline,
 ) -> Result<Vec<HydratedChatEntry>, PortError> {
-    let mut results = Vec::with_capacity(payloads.len());
+    let (results, _) = hydrate_payloads_bounded(
+        store, auth, space, thread, payloads, budget, started, deadline, None,
+    )
+    .await?;
+    Ok(results)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn hydrate_payloads_bounded(
+    store: &CanonicalStore,
+    auth: &EngineAuthContext,
+    space: &SpaceRecord,
+    thread: &ThreadHeadRow,
+    payloads: Vec<PayloadRow>,
+    budget: &CallBudget,
+    started: tokio::time::Instant,
+    deadline: CommandDeadline,
+    max_bytes: Option<usize>,
+) -> Result<(Vec<HydratedChatEntry>, Option<ThreadEntrySeq>), PortError> {
+    let mut results = Vec::with_capacity(payloads.len().min(64));
     let mut memo = ProofFoldCache::new();
+    let mut hydrated_bytes = 0usize;
+    let mut last_seq: Option<ThreadEntrySeq> = None;
+    let mut prev_group_non_cp = false;
+    let mut has_valid_cut = false;
+    let mut in_model_group = false;
+    let mut truncated_at: Option<ThreadEntrySeq> = None;
     for mut row in payloads {
+        if let Some(limit) = max_bytes
+            && hydrated_bytes >= limit
+            && results.len() >= 2
+        {
+            let next_starts_non_tool_group =
+                matches!(row.kind.as_str(), "human" | "model" | "compaction");
+            let hard_cap = limit.saturating_add(2 * 1024 * 1024);
+            let can_cut_here = (has_valid_cut && next_starts_non_tool_group)
+                || (hydrated_bytes >= hard_cap && (next_starts_non_tool_group || !in_model_group));
+            if can_cut_here {
+                truncated_at = last_seq;
+                break;
+            }
+        }
+        let seq = row.seq()?;
+        let kind_str = row.kind.clone();
+        if row.kind == "redacted" {
+            last_seq = Some(seq);
+            continue;
+        }
         let reader = PageReader::Snapshots(store, budget, deadline);
         fold_stored_proof(reader, &space.scope, thread, &mut row, Some(&mut memo)).await?;
         let body = hydrate_body(
@@ -715,6 +760,7 @@ pub(super) async fn hydrate_payloads(
             started,
         )
         .await?;
+        hydrated_bytes = hydrated_bytes.saturating_add(body.len());
         let ModelTurn {
             text,
             tool_calls,
@@ -722,14 +768,42 @@ pub(super) async fn hydrate_payloads(
         } = decode_turn(row.body_format, &row.kind, body)?;
         let content = transcript(auth, &space.space, thread, &row, text)?;
         results.push(HydratedChatEntry {
-            seq: row.seq()?,
+            seq,
             content,
             interruption,
             tool_calls,
         });
+        last_seq = Some(seq);
+        match kind_str.as_str() {
+            "human" => {
+                if prev_group_non_cp {
+                    has_valid_cut = true;
+                }
+                prev_group_non_cp = true;
+                in_model_group = false;
+            }
+            "model" => {
+                if prev_group_non_cp {
+                    has_valid_cut = true;
+                }
+                prev_group_non_cp = true;
+                in_model_group = true;
+            }
+            "compaction" => {
+                if prev_group_non_cp {
+                    has_valid_cut = true;
+                }
+                prev_group_non_cp = false;
+                in_model_group = false;
+            }
+            "tool" if !in_model_group => {
+                prev_group_non_cp = true;
+            }
+            _ => {}
+        }
     }
     deadline.remaining(budget)?;
-    Ok(results)
+    Ok((results, truncated_at))
 }
 
 /// Exact read for human approval. This method returns an attestation for the

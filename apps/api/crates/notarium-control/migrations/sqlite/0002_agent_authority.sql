@@ -33,7 +33,8 @@ CREATE TABLE agent_schedules (
     CHECK (instr(misfire_policy,char(0))=0),
     CHECK (coalesce(length(CAST(schedule_id AS BLOB)),0) <= 2048),
     CHECK (8 + coalesce(length(CAST(paused_reason AS BLOB)),0) + 8 + coalesce(length(CAST(schedule_id AS BLOB)),0) <= 2048),
-    CHECK (coalesce(length(CAST(owner_id AS BLOB)),0) + coalesce(length(CAST(space_id AS BLOB)),0) + coalesce(length(CAST(schedule_id AS BLOB)),0) <= 2048)
+    CHECK (coalesce(length(CAST(owner_id AS BLOB)),0) + coalesce(length(CAST(space_id AS BLOB)),0) + coalesce(length(CAST(schedule_id AS BLOB)),0) <= 2048),
+    CHECK (deleted_at IS NOT NULL OR coalesce(length(CAST(owner_id AS BLOB)),0) + coalesce(length(CAST(space_id AS BLOB)),0) + coalesce(length(CAST(project_folder_id AS BLOB)),0) + coalesce(length(CAST(schedule_id AS BLOB)),0) <= 2048)
 ) STRICT;
 
 CREATE TABLE agent_schedule_runs (
@@ -61,7 +62,7 @@ CREATE TABLE agent_schedule_runs (
 ) STRICT;
 
 INSERT INTO agent_schedules(schedule_id,owner_id,space_id,project_folder_id,title,init_prompt,cron_expr,timezone,approved_role,paused_reason,write_class_mask,budgets,misfire_policy,next_slot_utc_ms,deleted_at,config_revision,revision,created_at,updated_at)
-SELECT schedule_id,owner_id,space_id,project_folder_id,title,init_prompt,cron_expr,timezone,approved_role,paused_reason,write_class_mask,budgets,misfire_policy,next_slot_utc_ms,deleted_at,config_revision,revision,created_at,updated_at FROM agent_schedules_v1;
+SELECT schedule_id,owner_id,space_id,project_folder_id,CASE WHEN deleted_at IS NOT NULL THEN '' ELSE title END,init_prompt,cron_expr,timezone,approved_role,paused_reason,write_class_mask,budgets,misfire_policy,next_slot_utc_ms,deleted_at,config_revision,revision,created_at,updated_at FROM agent_schedules_v1;
 INSERT INTO agent_schedule_runs(run_id,schedule_id,slot_utc_ms,lease_epoch,claim_request_hash,claimed_schedule_revision,reserved_next_slot,status,started_at,finished_at,safe_result,owner_auth_version,config_revision,admission_epoch,history_scope,expires_at)
 SELECT run_id,schedule_id,slot_utc_ms,lease_epoch,claim_request_hash,claimed_schedule_revision,reserved_next_slot,status,started_at,finished_at,safe_result,owner_auth_version,config_revision,admission_epoch,history_scope,expires_at FROM agent_schedule_runs_v1;
 
@@ -108,8 +109,8 @@ CREATE TABLE provider_attachments (
     CHECK (coalesce(length(CAST(resource_id AS BLOB)),0) + coalesce(length(CAST(target_space AS BLOB)),0) <= 2048),
     CHECK (coalesce(length(CAST(resource_id AS BLOB)),0) + coalesce(length(CAST(target_space AS BLOB)),0) + coalesce(length(CAST(target_project AS BLOB)),0) <= 2048),
     CHECK (coalesce(length(CAST(target_space AS BLOB)),0) + coalesce(length(CAST(state AS BLOB)),0) + coalesce(length(CAST(resource_id AS BLOB)),0) <= 2048),
-    CHECK (coalesce(length(CAST(target_space AS BLOB)),0) + coalesce(length(CAST(id AS BLOB)),0) <= 2048),
-    CHECK (coalesce(length(CAST(target_space AS BLOB)),0) + coalesce(length(CAST(target_project AS BLOB)),0) + coalesce(length(CAST(id AS BLOB)),0) <= 2048)
+    CHECK (state <> 'approved' OR coalesce(length(CAST(target_space AS BLOB)),0) + coalesce(length(CAST(id AS BLOB)),0) <= 2048),
+    CHECK (state <> 'approved' OR target_kind <> 'project' OR coalesce(length(CAST(target_space AS BLOB)),0) + coalesce(length(CAST(target_project AS BLOB)),0) + coalesce(length(CAST(id AS BLOB)),0) <= 2048)
 ) STRICT;
 INSERT INTO provider_attachments(id,resource_id,target_kind,target_owner,target_space,target_project,resource_epoch,credential_epoch,state,disclosure,expires_at,revision)
 SELECT id,resource_id,target_kind,target_owner,target_space,target_project,resource_epoch,credential_epoch,state,disclosure,expires_at,revision FROM provider_attachments_v1;
@@ -166,6 +167,23 @@ CREATE INDEX call_owner ON provider_call_log(owner_id,created_at,call_id);
 CREATE INDEX call_pending ON provider_call_log(delivery_state,created_at,call_id);
 CREATE INDEX call_settled ON provider_call_log(delivery_state,settled_at,call_id);
 CREATE INDEX call_run ON provider_call_log(run_id,call_id);
+ALTER TABLE ability_placement_trail RENAME TO ability_placement_trail_v1;
+CREATE TABLE ability_placement_trail (
+    source_placement TEXT NOT NULL, ability_id TEXT NOT NULL, destination_placement TEXT NOT NULL,
+    destination_id TEXT NOT NULL, manifest_ref TEXT NOT NULL, created_at INTEGER NOT NULL,
+    PRIMARY KEY(source_placement,ability_id),
+    CHECK (source_placement<>destination_placement OR ability_id<>destination_id),
+    CHECK (instr(source_placement,char(0))=0),
+    CHECK (instr(ability_id,char(0))=0),
+    CHECK (instr(destination_placement,char(0))=0),
+    CHECK (instr(destination_id,char(0))=0),
+    CHECK (instr(manifest_ref,char(0))=0),
+    CHECK (coalesce(length(CAST(source_placement AS BLOB)),0) + coalesce(length(CAST(ability_id AS BLOB)),0) <= 2048),
+    CHECK (coalesce(length(CAST(destination_placement AS BLOB)),0) + coalesce(length(CAST(destination_id AS BLOB)),0) <= 2048)
+) STRICT;
+INSERT INTO ability_placement_trail(source_placement,ability_id,destination_placement,destination_id,manifest_ref,created_at)
+SELECT source_placement,ability_id,destination_placement,destination_id,manifest_ref,created_at FROM ability_placement_trail_v1;
+DROP TABLE ability_placement_trail_v1;
 CREATE INDEX ability_trail_destination ON ability_placement_trail(destination_placement,destination_id);
 CREATE INDEX ability_preference_placement ON ability_preferences(placement,ability_id,owner_id);
 CREATE INDEX favorite_note_order ON favorites(owner_id,rank,space_id,entity_id)

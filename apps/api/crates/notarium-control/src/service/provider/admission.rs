@@ -481,6 +481,7 @@ impl ProviderService {
                 );
             }
         }
+        let mut cached_query_disclosure: Option<RunQuerySourceDisclosure> = None;
         for input in embedding_inputs {
             let EmbeddingInput::Query(query) = input else {
                 continue;
@@ -501,7 +502,13 @@ impl ProviderService {
             {
                 return Err(DomainError::AccessDenied.into());
             }
-            let source_disclosure = required_query_source_disclosure(tx, &auth, grant).await?;
+            let source_disclosure = match &cached_query_disclosure {
+                Some(cached) => cached,
+                None => {
+                    let loaded = required_query_source_disclosure(tx, &auth, grant).await?;
+                    cached_query_disclosure.insert(loaded)
+                }
+            };
             if !query.classes.iter().all(|class| {
                 admitted.policy.allowed_classes.contains(class)
                     && grant.read_classes.contains(class)

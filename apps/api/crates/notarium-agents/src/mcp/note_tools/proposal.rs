@@ -196,44 +196,118 @@ pub(in crate::mcp) async fn preview_proposal(
 }
 
 fn unified_preview(before: &str, after: &str) -> Option<String> {
+    const PREVIEW_CAP_BYTES: usize = 64 * 1024;
     if before == after {
         return None;
     }
-    let old: Vec<_> = before.split_inclusive('\n').collect();
-    let new: Vec<_> = after.split_inclusive('\n').collect();
-    let first = old
-        .iter()
-        .zip(&new)
-        .take_while(|(left, right)| left == right)
-        .count();
-    let suffix = old[first..]
-        .iter()
+    let mut context_before: std::collections::VecDeque<&str> =
+        std::collections::VecDeque::with_capacity(3);
+    let mut first = 0usize;
+    let mut prefix_bytes = 0usize;
+    for (left, right) in before
+        .split_inclusive('\n')
+        .zip(after.split_inclusive('\n'))
+    {
+        if left != right {
+            break;
+        }
+        if context_before.len() == 3 {
+            context_before.pop_front();
+        }
+        context_before.push_back(left);
+        first += 1;
+        prefix_bytes += left.len();
+    }
+    let before_rem = &before[prefix_bytes..];
+    let after_rem = &after[prefix_bytes..];
+    let mut context_after_rev: std::collections::VecDeque<&str> =
+        std::collections::VecDeque::with_capacity(3);
+    let mut suffix = 0usize;
+    let mut suffix_bytes = 0usize;
+    for (left, right) in before_rem
+        .split_inclusive('\n')
         .rev()
-        .zip(new[first..].iter().rev())
-        .take_while(|(left, right)| left == right)
-        .count();
+        .zip(after_rem.split_inclusive('\n').rev())
+    {
+        if left != right {
+            break;
+        }
+        if context_after_rev.len() == 3 {
+            context_after_rev.pop_front();
+        }
+        context_after_rev.push_back(left);
+        suffix += 1;
+        suffix_bytes += left.len();
+    }
+    let old_mid = &before_rem[..before_rem.len() - suffix_bytes];
+    let new_mid = &after_rem[..after_rem.len() - suffix_bytes];
+    let old_mid_lines = if old_mid.is_empty() {
+        0
+    } else {
+        old_mid.split_inclusive('\n').count()
+    };
+    let new_mid_lines = if new_mid.is_empty() {
+        0
+    } else {
+        new_mid.split_inclusive('\n').count()
+    };
     let begin = first.saturating_sub(3);
-    let (old_end, new_end) = (old.len() - suffix, new.len() - suffix);
     let following = suffix.min(3);
-    let (old_count, new_count) = (old_end - begin + following, new_end - begin + following);
-    let (old_line, new_line) = (
-        begin + usize::from(old_count > 0),
-        begin + usize::from(new_count > 0),
-    );
+    let old_count = (first - begin) + old_mid_lines + following;
+    let new_count = (first - begin) + new_mid_lines + following;
+    let old_line = begin + usize::from(old_count > 0);
+    let new_line = begin + usize::from(new_count > 0);
     let mut output = format!(
         "--- current\n+++ proposed\n@@ -{old_line},{old_count} +{new_line},{new_count} @@\n"
     );
-    for (marker, lines) in [
-        (' ', &old[begin..first]),
-        ('-', &old[first..old_end]),
-        ('+', &new[first..new_end]),
-        (' ', &old[old_end..old_end + following]),
-    ] {
-        for line in lines {
-            output.push(marker);
+    let mut push_line = |marker: char, line: &str| -> bool {
+        if output.len() >= PREVIEW_CAP_BYTES {
+            return false;
+        }
+        output.push(marker);
+        let room = PREVIEW_CAP_BYTES.saturating_sub(output.len());
+        if line.len() <= room {
             output.push_str(line);
-            if !line.ends_with('\n') {
+            if !line.ends_with('\n') && output.len() < PREVIEW_CAP_BYTES {
                 output.push_str("\n\\ No newline at end of file\n");
+            }
+            true
+        } else {
+            let mut end = room;
+            while end > 0 && !line.is_char_boundary(end) {
+                end -= 1;
+            }
+            output.push_str(&line[..end]);
+            false
+        }
+    };
+    let mut ok = true;
+    for line in &context_before {
+        if !push_line(' ', line) {
+            ok = false;
+            break;
+        }
+    }
+    if ok && !old_mid.is_empty() {
+        for line in old_mid.split_inclusive('\n') {
+            if !push_line('-', line) {
+                ok = false;
+                break;
+            }
+        }
+    }
+    if ok && !new_mid.is_empty() {
+        for line in new_mid.split_inclusive('\n') {
+            if !push_line('+', line) {
+                ok = false;
+                break;
+            }
+        }
+    }
+    if ok {
+        for line in context_after_rev.iter().rev() {
+            if !push_line(' ', line) {
+                break;
             }
         }
     }
@@ -253,6 +327,18 @@ fn preview_keeps_changed_lines_and_final_newline_semantics() {
             " First.\n Second.\n Third.\n-Old.\n\\ No newline at end of file\n+New.\n",
         )
     );
+
+    let prefix = "\n".repeat(100_000);
+    let large_old = format!("{prefix}old\n");
+    let large_new = format!("{prefix}new\n");
+    let diff = unified_preview(&large_old, &large_new).unwrap();
+    assert!(diff.contains("@@ -99998,4 +99998,4 @@\n"));
+    assert!(diff.contains("-old\n+new\n"));
+
+    let huge_before = "a".repeat(100_000);
+    let huge_after = "b".repeat(100_000);
+    let capped = unified_preview(&huge_before, &huge_after).unwrap();
+    assert!(capped.len() <= 64 * 1024 + 64);
 }
 
 pub(super) async fn authorize_folder(

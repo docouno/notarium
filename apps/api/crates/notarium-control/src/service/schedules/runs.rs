@@ -151,6 +151,10 @@ impl ControlService {
                     grant("scheduled-run", run.as_str()), true,
                 ).await?;
                 let row = schedule(tx.inner_mut(), &request.schedule, true).await?;
+                let locked_now = self.clock.now_ms()?;
+                if slot > locked_now {
+                    return Err(invalid(ValidationReason::InvalidTimestamp));
+                }
                 let previous = slot_receipt(tx.inner_mut(), &request.schedule, slot).await?;
                 if let Some(previous) = &previous {
                     if previous.claim_request_hash == fingerprint {
@@ -184,7 +188,7 @@ impl ControlService {
                 } else if civil_slot != slot {
                     match slot_receipt(tx.inner_mut(), &request.schedule, civil_slot).await? {
                         Some(early) => Some(ScheduleClaim::SkippedDuplicate(receipt(&early)?)),
-                        None if observed_at.saturating_sub(civil_slot.max(row.created_at))
+                        None if locked_now.saturating_sub(civil_slot.max(row.created_at))
                             >= super::super::telemetry::MIN_COMPACT_MS &&
                             missing_cursor_history(tx.inner_mut(), &row, request.expected).await? =>
                             Some(ScheduleClaim::SkippedUnverifiedFold),
@@ -203,12 +207,12 @@ impl ControlService {
                 if row.next_slot_utc_ms != Some(slot) {
                     return Err(invalid(ValidationReason::ScopeMismatch));
                 }
-                let trusted_instant = Timestamp::from_unix_parts(observed_at.div_euclid(1000), 0)?;
+                let trusted_instant = Timestamp::from_unix_parts(locked_now.div_euclid(1000), 0)?;
                 if calendar.next_ms(request.slot.max(trusted_instant))? != next_slot {
                     return Err(invalid(ValidationReason::InvalidTimestamp));
                 }
                 if let Some(outcome) = skipped {
-                    advance(tx.inner_mut(), &request.schedule, next_slot, &row, self.clock.now_ms()?).await?;
+                    advance(tx.inner_mut(), &request.schedule, next_slot, &row, locked_now).await?;
                     return Ok((outcome, Vec::new(), None));
                 }
                 validate(&info.definition, request.next_slot, RunLimits::HARD_CEILING, false)?;
@@ -252,7 +256,7 @@ impl ControlService {
                     };
                     (Some(reason), None)
                 };
-                let now = self.clock.now_ms()?;
+                let now = locked_now;
                 let claimed_at = std::time::Instant::now();
                 if let Some(reason) = reason {
                     let label: String = parse(&json(&reason)?)?;

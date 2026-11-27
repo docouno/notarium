@@ -30,12 +30,19 @@ struct PendingWrite<T> {
     permission: Arc<AtomicBool>,
     task: JoinHandle<Result<T, PortError>>,
     abort_on_revoke: bool,
+    allow_abort_before_effect: bool,
+    effect_entered: Option<Arc<AtomicBool>>,
 }
 
 impl<T> PendingWrite<T> {
     fn revoke(&self) -> bool {
         let pending = self.permission.swap(false, Ordering::AcqRel);
-        if pending && self.abort_on_revoke {
+        let before_effect = self.allow_abort_before_effect
+            && self
+                .effect_entered
+                .as_ref()
+                .is_some_and(|entered| !entered.load(Ordering::Acquire));
+        if pending && (self.abort_on_revoke || before_effect) {
             self.task.abort();
         }
         pending
@@ -54,11 +61,13 @@ pub(crate) struct AuxiliaryEffect(Option<Arc<AuxiliaryRegistration>>);
 struct AuxiliaryRegistration {
     admission: CanonicalEffectAdmission,
     active: Mutex<Option<Box<dyn RevocationLease>>>,
+    entered: Arc<AtomicBool>,
 }
 
 impl AuxiliaryEffect {
     pub(crate) async fn begin(&self) -> Result<(), PortError> {
         if let Some(effect) = &self.0 {
+            effect.entered.store(true, Ordering::Release);
             let active = effect.admission.begin().await?;
             *effect.active.lock().expect("auxiliary effect lock") = Some(active);
         }
@@ -192,6 +201,7 @@ impl CanonicalStore {
             timing,
             registration,
             abort_on_revoke,
+            true,
             after_commit,
             || Box::pin(async {}),
             op,
@@ -229,6 +239,7 @@ impl CanonicalStore {
             timing,
             registration,
             false,
+            false,
             after_commit,
             on_pre_commit_abort,
             op,
@@ -244,6 +255,7 @@ impl CanonicalStore {
         timing: Option<(&CallBudget, CommandDeadline)>,
         registration: Option<CanonicalEffectAdmission>,
         abort_on_revoke: bool,
+        allow_abort_before_effect: bool,
         after_commit: impl FnOnce(T) -> Result<R, PortError> + Send + 'static,
         on_pre_commit_abort: C,
         op: F,
@@ -277,10 +289,18 @@ impl CanonicalStore {
         let store = self.clone();
         let permission = Arc::new(AtomicBool::new(true));
         let commit = Arc::clone(&permission);
+        let effect_entered = registration
+            .as_ref()
+            .map(|_| Arc::new(AtomicBool::new(false)));
         let active = AuxiliaryEffect(registration.map(|admission| {
             Arc::new(AuxiliaryRegistration {
                 admission,
                 active: Mutex::new(None),
+                entered: Arc::clone(
+                    effect_entered
+                        .as_ref()
+                        .expect("entered flag created for registration"),
+                ),
             })
         }));
         let task = self.inner.backup_executor.spawn(async move {
@@ -327,6 +347,8 @@ impl CanonicalStore {
             permission,
             task,
             abort_on_revoke,
+            allow_abort_before_effect,
+            effect_entered,
         };
         let joined = match timing {
             Some((budget, deadline)) => deadline.wait(budget, || &mut pending.task).await,

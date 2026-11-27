@@ -301,7 +301,7 @@ impl SearchDefaultWitness {
     }
 }
 
-pub(crate) const LIST_PROVIDER_PROJECT_TARGETS_SQLITE_SQL: &str = "SELECT target_project FROM provider_attachments INDEXED BY attachment_project WHERE resource_id=$1 AND target_space=$2 AND target_kind='project' AND target_project>$3 AND state='approved' AND (expires_at IS NULL OR expires_at>$4) ORDER BY target_project LIMIT $5";
+pub(crate) const LIST_PROVIDER_PROJECT_TARGETS_SQLITE_SQL: &str = "SELECT target_project FROM provider_attachments INDEXED BY attachment_project WHERE resource_id=$1 AND target_space=$2 AND target_kind='project' AND target_project>$3 AND state='approved' AND resource_epoch=$5 AND (($6 IS NULL AND credential_epoch IS NULL) OR credential_epoch=$6) AND (expires_at IS NULL OR expires_at>$4) ORDER BY target_project LIMIT $7";
 
 pub(super) async fn search_default(
     tx: &mut Transaction,
@@ -882,17 +882,82 @@ impl ProviderService {
                         return Err(invalid(ValidationReason::CursorStale));
                     }
                     let now = self.control.clock.now_ms()?;
+                    let Ok(resource_row) = resource_read(tx.inner_mut(), resource.as_str()).await else {
+                        return Ok(ControlPage {
+                            items: Vec::new(),
+                            continuation: None,
+                        });
+                    };
+                    let owner_active = rows!(
+                        tx.inner_mut(),
+                        (i64,),
+                        fetch_one,
+                        "SELECT count(*) FROM users WHERE user_id=$1 AND disabled_at IS NULL",
+                        "SELECT count(*) FROM v1_control.users WHERE user_id=$1 AND disabled_at IS NULL";
+                        &resource_row.owner_id
+                    )?
+                    .0;
+                    if owner_active != 1 {
+                        return Ok(ControlPage {
+                            items: Vec::new(),
+                            continuation: None,
+                        });
+                    }
+                    let Ok(credential) =
+                        credential_for_selection(tx.inner_mut(), &resource_row).await
+                    else {
+                        return Ok(ControlPage {
+                            items: Vec::new(),
+                            continuation: None,
+                        });
+                    };
+                    let credential_epoch = credential.as_ref().map(|row| row.consent_epoch);
+                    if let Some(root) = &grant.project_root {
+                        if root.as_str() <= after {
+                            return Ok(ControlPage {
+                                items: Vec::new(),
+                                continuation: None,
+                            });
+                        }
+                        let row = rows!(
+                            tx.inner_mut(),
+                            ProviderAttachmentsRow,
+                            fetch_optional,
+                            "SELECT * FROM provider_attachments WHERE resource_id=$1 AND target_kind='project' AND target_space=$2 AND target_project=$3",
+                            "SELECT * FROM v1_control.provider_attachments WHERE resource_id=$1 AND target_kind='project' AND target_space=$2 AND target_project=$3";
+                            resource.as_str(),
+                            ctx.scope().space_id.as_str(),
+                            root.as_str()
+                        )?;
+                        let items = if row
+                            .as_ref()
+                            .is_some_and(|r| active(r, &resource_row, credential_epoch, now))
+                        {
+                            vec![FolderRef {
+                                space_id: ctx.scope().space_id.clone(),
+                                folder_id: root.clone(),
+                            }]
+                        } else {
+                            Vec::new()
+                        };
+                        return Ok(ControlPage {
+                            items,
+                            continuation: None,
+                        });
+                    }
                     let limit = i64::from(page.limit());
                     let fetched = rows!(
                         tx.inner_mut(),
                         (String,),
                         fetch_all,
                         LIST_PROVIDER_PROJECT_TARGETS_SQLITE_SQL,
-                        "SELECT target_project FROM v1_control.provider_attachments WHERE resource_id=$1 AND target_space=$2 AND target_kind='project' AND target_project>$3 AND state='approved' AND (expires_at IS NULL OR expires_at>$4) ORDER BY target_project LIMIT $5";
+                        "SELECT target_project FROM v1_control.provider_attachments WHERE resource_id=$1 AND target_space=$2 AND target_kind='project' AND target_project>$3 AND state='approved' AND resource_epoch=$5 AND (($6::BIGINT IS NULL AND credential_epoch IS NULL) OR credential_epoch=$6) AND (expires_at IS NULL OR expires_at>$4) ORDER BY target_project LIMIT $7";
                         resource.as_str(),
                         ctx.scope().space_id.as_str(),
                         after,
                         now,
+                        resource_row.consent_epoch,
+                        credential_epoch,
                         limit + 1
                     )?;
                     let has_more = fetched.len() > usize::from(page.limit());
@@ -901,13 +966,6 @@ impl ProviderService {
                     for (proj,) in fetched.into_iter().take(usize::from(page.limit())) {
                         let folder_id = FolderId::parse(&proj)?;
                         last = Some(proj);
-                        if grant
-                            .project_root
-                            .as_ref()
-                            .is_some_and(|root| root != &folder_id)
-                        {
-                            continue;
-                        }
                         items.push(FolderRef {
                             space_id: ctx.scope().space_id.clone(),
                             folder_id,

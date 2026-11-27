@@ -225,6 +225,28 @@ pub(in super::super) async fn resolve_project_for_direct_write(
     Ok(project)
 }
 
+pub(in super::super) async fn resolve_project_in_space(
+    call: &ToolCallContext<'_>,
+    space: &CatalogSpace,
+    handle: &str,
+) -> Result<Option<ProjectInfo>, PortError> {
+    let (space_slug, slug) = project_handle(handle)?;
+    if lookup_key(space_slug) != lookup_key(&space.slug) {
+        return Ok(None);
+    }
+    let scope = call.space(space.history.clone())?;
+    let project = call
+        .registry
+        .catalog
+        .project_by_slug(scope.clone(), slug.to_owned())
+        .await?;
+    if project.folder.space_id != scope.scope().space_id {
+        return Err(invalid(ValidationReason::InvalidState));
+    }
+    admit_in_app_address(call, &scope, Some(&project.folder)).await?;
+    Ok(Some(project))
+}
+
 pub(in super::super) async fn resolve_project(
     call: &ToolCallContext<'_>,
     handle: &str,

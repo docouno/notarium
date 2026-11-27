@@ -370,7 +370,9 @@ impl ToolRegistry {
         };
         let tool =
             ToolName::parse(name).ok_or_else(|| pre(DomainError::ResourceNotFound.into()))?;
-        let deadline = Instant::now() + ctx.account.budget.remaining;
+        let deadline = Instant::now()
+            .checked_add(ctx.account.budget.remaining)
+            .unwrap_or_else(|| Instant::now() + Duration::from_secs(365 * 24 * 3600));
         let auth = self
             .control
             .revalidate_auth(ctx.account.clone())

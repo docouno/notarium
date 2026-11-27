@@ -330,6 +330,7 @@ pub(super) async fn list_children(
                         write_locked: write_lock_json.is_some(),
                         lifecycle,
                         head_rev_id,
+                        updated_seq: None,
                     };
                     folders.insert_preloaded_row(scope.space_id.clone(), row.clone());
                     rows.push(row);
@@ -374,6 +375,7 @@ pub(super) async fn list_children(
                         revision: row.head_rev_id,
                         path: child_ancestry.folder_path,
                         ancestor_folders: child_ancestry.ancestors,
+                        ancestor_revisions: child_ancestry.ancestor_revisions,
                         name: row.display_name,
                         parent: row.parent_folder_id,
                         project: child_ancestry.project,
@@ -510,6 +512,7 @@ async fn snapshot(
         revision: row.head_rev_id,
         path: ancestry.folder_path,
         ancestor_folders: ancestry.ancestors,
+        ancestor_revisions: ancestry.ancestor_revisions,
         name: row.display_name,
         parent: row.parent_folder_id,
         project: ancestry.project,

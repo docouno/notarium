@@ -275,11 +275,22 @@ pub(super) async fn open(
     let authority = authority(account.auth())?;
     let key = call.command_key("bootstrap-window", 0);
     if let Some(start) = call.registry.bootstrap.find_start(&key, authority) {
-        if start.batch.episode != episode || start.batch.project != project {
+        if start.batch.episode != episode {
             return Err(stale());
         }
-        revalidate(call, &start.batch, Some(0), None).await?;
-        return page(call, start.opened, start.batch, next_space(0), acknowledge).await;
+        if start.batch.project == project
+            && match revalidate(call, &start.batch, Some(0), None).await {
+                Ok(()) => true,
+                Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
+                    if diagnostic.reason == ValidationReason::CursorStale =>
+                {
+                    false
+                }
+                Err(error) => return Err(error),
+            }
+        {
+            return page(call, start.opened, start.batch, next_space(0), acknowledge).await;
+        }
     }
     let batch = Arc::new(Batch {
         principal: account.auth().principal().clone(),

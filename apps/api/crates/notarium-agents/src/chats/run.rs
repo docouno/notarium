@@ -560,7 +560,57 @@ impl AgentRunSupervisor {
                 Err(error) => return Err(error),
             }
         }
-        Err(invalid(ValidationReason::BudgetExceeded))
+        // All deterministic episode generations are closed; open a run-scoped
+        // fallback episode so this thread can keep receiving answers.
+        let fallback_bytes = derive_digest(
+            "notarium.chats.episode-fallback.v1",
+            &[
+                run.scope.space_id.as_str().as_bytes(),
+                run.thread.as_str().as_bytes(),
+                run.auth.principal().as_str().as_bytes(),
+                run.id.as_str().as_bytes(),
+            ],
+        );
+        let fallback_id = EpisodeId::from_bytes(
+            fallback_bytes.as_bytes()[..16]
+                .try_into()
+                .expect("sixteen bytes"),
+        );
+        let request_key = derive_key(
+            "notarium.chats.open-episode-fallback.v1",
+            &[run.id.as_str().as_bytes()],
+        );
+        let principal = run.auth.principal().clone();
+        let opened = control
+            .start_or_resume_episode(
+                account()?,
+                AccountMutation {
+                    identity: AccountCommandIdentity {
+                        owner: principal.clone(),
+                        actor: principal,
+                        expected: ControlRevision::ZERO,
+                        key: request_key,
+                        hash: fallback_bytes,
+                    },
+                    input: StartEpisode {
+                        selector: EpisodeSelector::New {
+                            requested: fallback_id.clone(),
+                            name: None,
+                        },
+                        project_hint: run.project.clone(),
+                        guard: EpisodeRevisionGuard::Target,
+                    },
+                },
+            )
+            .await?;
+        match opened.value {
+            EpisodeStartResult::New(episode) | EpisodeStartResult::Resumed(episode)
+                if episode.id == fallback_id && &episode.owner == run.auth.principal() =>
+            {
+                Ok(fallback_id)
+            }
+            _ => Err(invalid(ValidationReason::SourceMismatch)),
+        }
     }
 
     async fn append(
@@ -669,7 +719,11 @@ impl AgentRunSupervisor {
                 proof: result.provenance,
             }),
             Err(failure) => Ok(ToolReply {
-                display: json!({"error":failure.error.code()}).to_string(),
+                display: crate::completion::bounded_tool_text_within(
+                    &json!({"error":failure.error.code()}).to_string(),
+                    display_budget.0,
+                    display_budget.1,
+                ),
                 proof: failure.provenance,
                 proposal: None,
             }),

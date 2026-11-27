@@ -5,7 +5,15 @@ use notarium_core::auth::SpaceRole;
 use std::collections::BTreeSet;
 
 const ABILITY_TRAIL_LOCK: i64 = 0x4e54_5452_4149_4c31;
-pub(crate) const ABILITY_TRAIL_BY_DEST_SQLITE_SQL: &str = "SELECT source_placement, ability_id FROM ability_placement_trail WHERE destination_placement=$1 AND destination_id=$2";
+pub(crate) const ABILITY_TRAIL_BY_DEST_SQLITE_SQL: &str = "WITH RECURSIVE walk(pl, id, depth) AS (\
+    SELECT $1, $2, 0 \
+    UNION \
+    SELECT t.source_placement, t.ability_id, w.depth + 1 \
+    FROM walk w \
+    JOIN ability_placement_trail t INDEXED BY ability_trail_destination \
+      ON t.destination_placement = w.pl AND t.destination_id = w.id \
+    WHERE w.depth < 17\
+) SELECT COALESCE(MAX(depth), 0) FROM walk";
 pub(crate) const ABILITY_PREFS_MOVE_DELETE_SQLITE_SQL: &str = "DELETE FROM ability_preferences AS src WHERE src.placement=$1 AND src.ability_id=$2 AND EXISTS (SELECT 1 FROM ability_preferences AS dst WHERE dst.placement=$3 AND dst.owner_id=src.owner_id AND dst.ability_id=src.ability_id)";
 pub(crate) const ABILITY_PREFS_MOVE_UPDATE_SQLITE_SQL: &str =
     "UPDATE ability_preferences SET placement=$1 WHERE placement=$2 AND ability_id=$3";
@@ -870,35 +878,25 @@ async fn max_incoming_trail_depth_db(
     target_placement: &str,
     target_id: &str,
 ) -> Result<usize, PortError> {
-    let mut visited = BTreeSet::new();
-    visited.insert((target_placement.to_owned(), target_id.to_owned()));
-    let mut queue = std::collections::VecDeque::new();
-    queue.push_back((target_placement.to_owned(), target_id.to_owned(), 0usize));
-    let mut max_depth = 0usize;
-    while let Some((dst_pl, dst_id, depth)) = queue.pop_front() {
-        let parents = rows!(
-            tx,
-            (String, String),
-            fetch_all,
-            ABILITY_TRAIL_BY_DEST_SQLITE_SQL,
-            "SELECT source_placement, ability_id FROM v1_control.ability_placement_trail WHERE destination_placement=$1 AND destination_id=$2";
-            &dst_pl,
-            &dst_id
-        )?;
-        for (src_pl, src_id) in parents {
-            let next_depth = depth + 1;
-            if next_depth > 16 {
-                return Ok(next_depth);
-            }
-            if next_depth > max_depth {
-                max_depth = next_depth;
-            }
-            if visited.insert((src_pl.clone(), src_id.clone())) {
-                queue.push_back((src_pl, src_id, next_depth));
-            }
-        }
-    }
-    Ok(max_depth)
+    let depth = rows!(
+        tx,
+        (i64,),
+        fetch_one,
+        ABILITY_TRAIL_BY_DEST_SQLITE_SQL,
+        "WITH RECURSIVE walk(pl, id, depth) AS (\
+             SELECT $1::text COLLATE \"C\", $2::text COLLATE \"C\", 0 \
+             UNION \
+             SELECT t.source_placement, t.ability_id, w.depth + 1 \
+             FROM walk w \
+             JOIN v1_control.ability_placement_trail t \
+               ON t.destination_placement = w.pl AND t.destination_id = w.id \
+             WHERE w.depth < 17\
+         ) SELECT COALESCE(MAX(depth), 0)::bigint FROM walk";
+        target_placement,
+        target_id
+    )?
+    .0;
+    Ok(usize::try_from(depth).unwrap_or(17))
 }
 
 async fn read_overlay_state(

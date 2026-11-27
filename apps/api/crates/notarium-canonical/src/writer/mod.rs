@@ -2474,7 +2474,16 @@ async fn execute_batch_on_conn(
             }
             drop(batch_retained_tickets);
             drop(batch_retained_guards);
-            store.schedule_unretained_local_files_cleanup(newly_published);
+            // On PostgreSQL an uncertain COMMIT error may still complete on the
+            // server asynchronously; deleting a newly published local blob on
+            // another connection before the server settles would orphan a live
+            // committed revision. Only schedule immediate orphan cleanup on SQLite.
+            if !matches!(
+                store.inner.sql,
+                crate::runtime::SqlDriverState::Postgres { .. }
+            ) {
+                store.schedule_unretained_local_files_cleanup(newly_published);
+            }
             BatchExecOutcome::UnknownCommit {
                 slots,
                 diag_reason: format!("{commit_err:?}"),

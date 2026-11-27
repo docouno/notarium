@@ -739,20 +739,14 @@ impl CanonicalRuntime {
             coord.drain_and_shutdown().await;
         }
         // Reject new auxiliary writers and wait for every in-flight auxiliary worker
-        // (including post-rollback `on_pre_commit_abort` hooks) to finish before closing
-        // local CAS cleanup admission.
+        // (including post-rollback `on_pre_commit_abort` hooks and undelivered staging
+        // leases) to finish before closing local CAS cleanup admission.
         let _aux_drained = self.inner.aux_workers.write().await;
-        // Sweep any local CAS orphans whose deletion was deferred by an earlier
-        // backup hold that may have been released before shutdown.
-        CanonicalStore {
-            inner: self.inner.clone(),
-        }
-        .sweep_deferred_local_orphans_async(true)
-        .await;
         // Close cleanup admission under `backup_cleanups` lock and drain all pending
-        // local CAS orphan cleanup tasks BEFORE shutting down WAL / SQL pools and
-        // releasing `DataRootOwnerLock`, so every cleanup task sees an open read gate
-        // and no physical `delete_physical_file` thread can outlive ownership.
+        // local CAS orphan cleanup tasks BEFORE the final deferred orphan sweep and
+        // BEFORE shutting down WAL / SQL pools and releasing `DataRootOwnerLock`, so
+        // every cleanup task sees an open read gate and any item deferred by a drained
+        // task is swept before ownership ends.
         loop {
             let pending = {
                 let mut tasks = self
@@ -772,6 +766,11 @@ impl CanonicalRuntime {
                 let _ = task.await;
             }
         }
+        CanonicalStore {
+            inner: self.inner.clone(),
+        }
+        .sweep_deferred_local_orphans_async(true)
+        .await;
         if let Some(wal) = self.inner.wal_coord.get() {
             wal.shutdown().await;
         }
@@ -2351,6 +2350,7 @@ pub(crate) struct FolderHeadRow {
     pub write_locked: bool,
     pub lifecycle: Lifecycle,
     pub head_rev_id: RevisionId,
+    pub updated_seq: Option<SpaceSeq>,
 }
 
 async fn fetch_space_by_id_or_slug(
@@ -3018,6 +3018,7 @@ pub(crate) async fn load_folder_head_row(
         write_lock_json,
         lc_raw,
         head_rev_raw,
+        updated_seq_raw,
     ): (
         Option<String>,
         i32,
@@ -3032,12 +3033,13 @@ pub(crate) async fn load_folder_head_row(
         Option<String>,
         String,
         String,
+        i64,
     ) = match tx {
         BackendConn::Sqlite(conn) => {
             let row = sqlx::query(
                 "SELECT parent_folder_id, is_root, slug, slug_fold, display_name,
                         is_project, project_slug, project_slug_fold, description,
-                        cover_note_id, write_lock_json, lifecycle_state, head_rev_id
+                        cover_note_id, write_lock_json, lifecycle_state, head_rev_id, updated_seq
                  FROM folder_heads WHERE space_id = ? AND folder_id = ?",
             )
             .bind(space_id.as_str())
@@ -3060,13 +3062,14 @@ pub(crate) async fn load_folder_head_row(
                 row.get("write_lock_json"),
                 row.get("lifecycle_state"),
                 row.get("head_rev_id"),
+                row.get("updated_seq"),
             )
         }
         BackendConn::Postgres(conn) => {
             let row = sqlx::query(
                 "SELECT parent_folder_id, is_root, slug, slug_fold, display_name,
                         is_project, project_slug, project_slug_fold, description,
-                        cover_note_id, write_lock_json, lifecycle_state, head_rev_id
+                        cover_note_id, write_lock_json, lifecycle_state, head_rev_id, updated_seq
                  FROM folder_heads WHERE space_id = $1 AND folder_id = $2",
             )
             .bind(space_id.as_str())
@@ -3089,6 +3092,7 @@ pub(crate) async fn load_folder_head_row(
                 row.get("write_lock_json"),
                 row.get("lifecycle_state"),
                 row.get("head_rev_id"),
+                row.get("updated_seq"),
             )
         }
     };
@@ -3109,6 +3113,7 @@ pub(crate) async fn load_folder_head_row(
     let head_rev_id = RevisionId::parse(&head_rev_raw)
         .map_err(|_| internal_not_committed("corrupt_folder_rev", "invalid head_rev_id"))?;
     let lifecycle = lifecycle_from_db(&lc_raw)?;
+    let updated_seq = crate::codec::i64_to_space_seq(updated_seq_raw)?;
 
     Ok(FolderHeadRow {
         folder_id: folder_id.clone(),
@@ -3125,6 +3130,7 @@ pub(crate) async fn load_folder_head_row(
         write_locked: write_lock_json.is_some(),
         lifecycle,
         head_rev_id,
+        updated_seq: Some(updated_seq),
     })
 }
 

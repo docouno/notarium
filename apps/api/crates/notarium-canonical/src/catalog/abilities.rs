@@ -97,7 +97,7 @@ async fn resolve(
         id.as_str()
     )?
     .ok_or(DomainError::ResourceNotFound)?;
-    let mut historical_ancestry = std::collections::BTreeMap::new();
+    let mut historical_ancestry = crate::domain::common::HistoricalFolderCache::default();
     resolve_with_package(
         tx,
         auth,
@@ -120,10 +120,7 @@ async fn resolve_with_package(
     (entry, tip, state, current_name): (String, String, String, String),
     exact: Option<&RevisionId>,
     live_ancestry: &mut crate::domain::common::FolderAncestryCache,
-    historical_ancestry: &mut std::collections::BTreeMap<
-        SpaceSeq,
-        crate::domain::common::FolderAncestryCache,
-    >,
+    historical_ancestry: &mut crate::domain::common::HistoricalFolderCache,
 ) -> Result<ResolvedAbility, PortError> {
     if state != "active" {
         return Err(DomainError::ResourceNotFound.into());
@@ -186,13 +183,13 @@ async fn resolve_with_package(
         {
             return Err(DomainError::ResourceNotFound.into());
         }
-        let cut_cache = historical_ancestry.entry(cutoff).or_insert_with(|| {
-            crate::domain::common::FolderAncestryCache::at_cut(&space.scope, cutoff)
-        });
-        let (facts, ancestry) = cut_cache
-            .build_resource_facts_tx(
+        let (facts, ancestry) = historical_ancestry
+            .build_resource_facts_at_cut_tx(
                 tx,
+                &space.scope,
                 &space.space,
+                cutoff,
+                live_ancestry,
                 &snapshot.parent_folder_id,
                 snapshot.doc_class,
                 Some(id.clone()),
@@ -300,10 +297,7 @@ async fn descriptor_from_package_row(
     id: &AbilityId,
     package: (String, String, String, String),
     live_ancestry: &mut crate::domain::common::FolderAncestryCache,
-    historical_ancestry: &mut std::collections::BTreeMap<
-        SpaceSeq,
-        crate::domain::common::FolderAncestryCache,
-    >,
+    historical_ancestry: &mut crate::domain::common::HistoricalFolderCache,
 ) -> Result<AbilityDescriptor, PortError> {
     let resolved = resolve_with_package(
         tx,
@@ -769,66 +763,146 @@ async fn fetch_ability_package_batch(
     let map_err = |err| crate::runtime::pg_read_error("list_ability_packages", err);
     if let Some(target_project) = project_scope {
         let project_id = target_project.map(FolderId::as_str).unwrap_or("");
-        let kind_str = kind.map(crate::codec::ability_kind_to_db);
-        const LIST_PACKAGES_SCOPED_SQLITE: &str = "WITH RECURSIVE allowed_folders(folder_id) AS (
-            SELECT folder_id FROM folder_heads
-            WHERE space_id=$1 AND (is_root=1 OR ($2 <> '' AND folder_id=$2))
-            UNION ALL
-            SELECT fh.folder_id FROM allowed_folders af
-            CROSS JOIN folder_heads fh
-            WHERE fh.space_id=$1 AND fh.parent_folder_id=af.folder_id AND fh.is_project=0
-        )
-        SELECT ap.ability_id, ap.created_seq, ap.entrypoint_note_id, ap.manifest_rev_id, ap.lifecycle_state, ap.slug_fold
-        FROM ability_packages ap
-        CROSS JOIN note_heads nh
-        WHERE ap.space_id=$1 AND ap.lifecycle_state='active'
-          AND ($3 IS NULL OR ap.slug_fold=$3)
-          AND ($4 IS NULL OR ap.kind=$4)
-          AND ap.ability_id>$5
-          AND nh.space_id=ap.space_id AND nh.note_id=ap.entrypoint_note_id
-          AND nh.parent_folder_id IN (SELECT folder_id FROM allowed_folders)
-        ORDER BY ap.ability_id
-        LIMIT $6";
-        const LIST_PACKAGES_SCOPED_PG: &str = "WITH RECURSIVE allowed_folders(folder_id) AS (
-            SELECT folder_id FROM folder_heads
-            WHERE space_id=$1 AND (is_root=1 OR ($2 <> '' AND folder_id=$2))
-            UNION ALL
-            SELECT fh.folder_id FROM allowed_folders af
-            CROSS JOIN folder_heads fh
-            WHERE fh.space_id=$1 AND fh.parent_folder_id=af.folder_id AND fh.is_project=0
-        )
-        SELECT ap.ability_id, ap.created_seq, ap.entrypoint_note_id, ap.manifest_rev_id, ap.lifecycle_state, ap.slug_fold
-        FROM ability_packages ap
-        CROSS JOIN note_heads nh
-        WHERE ap.space_id=$1 AND ap.lifecycle_state='active'
-          AND ($3::TEXT IS NULL OR ap.slug_fold=$3)
-          AND ($4::TEXT IS NULL OR ap.kind=$4)
-          AND ap.ability_id COLLATE \"C\" > $5
-          AND nh.space_id=ap.space_id AND nh.note_id=ap.entrypoint_note_id
-          AND nh.parent_folder_id IN (SELECT folder_id FROM allowed_folders)
-        ORDER BY ap.ability_id COLLATE \"C\"
-        LIMIT $6";
-        return match tx {
-            BackendConn::Sqlite(conn) => sqlx::query_as(LIST_PACKAGES_SCOPED_SQLITE)
-                .bind(space_id.as_str())
-                .bind(project_id)
-                .bind(slug)
-                .bind(kind_str)
-                .bind(scan_after_id)
-                .bind(batch_size)
-                .fetch_all(&mut **conn)
-                .await
-                .map_err(map_err),
-            BackendConn::Postgres(conn) => sqlx::query_as(LIST_PACKAGES_SCOPED_PG)
-                .bind(space_id.as_str())
-                .bind(project_id)
-                .bind(slug)
-                .bind(kind_str)
-                .bind(scan_after_id)
-                .bind(batch_size)
-                .fetch_all(&mut **conn)
-                .await
-                .map_err(map_err),
+        macro_rules! scoped_ability_sql {
+            ($filter:literal, $gt_param:literal, $limit_param:literal, $collation:literal) => {
+                concat!(
+                    "SELECT ap.ability_id, ap.created_seq, ap.entrypoint_note_id, ap.manifest_rev_id, ap.lifecycle_state, ap.slug_fold
+                     FROM ability_packages ap
+                     CROSS JOIN note_heads nh
+                     WHERE ap.space_id=$1 AND ap.lifecycle_state='active'",
+                    $filter,
+                    " AND ap.ability_id",
+                    $collation,
+                    " > ",
+                    $gt_param,
+                    " AND nh.space_id=ap.space_id AND nh.note_id=ap.entrypoint_note_id
+                       AND (
+                           WITH RECURSIVE anc(folder_id, parent_folder_id, is_project) AS (
+                               SELECT f.folder_id, f.parent_folder_id, f.is_project
+                               FROM folder_heads AS f
+                               WHERE f.space_id=$1 AND f.folder_id=nh.parent_folder_id
+                               UNION ALL
+                               SELECT p.folder_id, p.parent_folder_id, p.is_project
+                               FROM anc
+                               CROSS JOIN folder_heads AS p
+                               WHERE anc.is_project=0
+                                 AND anc.parent_folder_id IS NOT NULL
+                                 AND p.space_id=$1
+                                 AND p.folder_id=anc.parent_folder_id
+                           )
+                           SELECT COALESCE(MAX(CASE WHEN is_project=1 THEN folder_id END), '') FROM anc
+                       ) IN ('', $2)
+                     ORDER BY ap.ability_id",
+                    $collation,
+                    " LIMIT ",
+                    $limit_param
+                )
+            };
+        }
+        const SCOPED_SLUG_KIND_SQLITE: &str =
+            scoped_ability_sql!(" AND ap.slug_fold=$3 AND ap.kind=$4", "$5", "$6", "");
+        const SCOPED_SLUG_KIND_PG: &str = scoped_ability_sql!(
+            " AND ap.slug_fold=$3 AND ap.kind=$4",
+            "$5",
+            "$6",
+            " COLLATE \"C\""
+        );
+        const SCOPED_SLUG_SQLITE: &str =
+            scoped_ability_sql!(" AND ap.slug_fold=$3", "$4", "$5", "");
+        const SCOPED_SLUG_PG: &str =
+            scoped_ability_sql!(" AND ap.slug_fold=$3", "$4", "$5", " COLLATE \"C\"");
+        const SCOPED_KIND_SQLITE: &str = scoped_ability_sql!(" AND ap.kind=$3", "$4", "$5", "");
+        const SCOPED_KIND_PG: &str =
+            scoped_ability_sql!(" AND ap.kind=$3", "$4", "$5", " COLLATE \"C\"");
+        const SCOPED_ALL_SQLITE: &str = scoped_ability_sql!("", "$3", "$4", "");
+        const SCOPED_ALL_PG: &str = scoped_ability_sql!("", "$3", "$4", " COLLATE \"C\"");
+        return match (slug, kind) {
+            (Some(slug), Some(kind)) => {
+                let kind_str = crate::codec::ability_kind_to_db(kind);
+                match tx {
+                    BackendConn::Sqlite(conn) => sqlx::query_as(SCOPED_SLUG_KIND_SQLITE)
+                        .bind(space_id.as_str())
+                        .bind(project_id)
+                        .bind(slug)
+                        .bind(kind_str)
+                        .bind(scan_after_id)
+                        .bind(batch_size)
+                        .fetch_all(&mut **conn)
+                        .await
+                        .map_err(map_err),
+                    BackendConn::Postgres(conn) => sqlx::query_as(SCOPED_SLUG_KIND_PG)
+                        .bind(space_id.as_str())
+                        .bind(project_id)
+                        .bind(slug)
+                        .bind(kind_str)
+                        .bind(scan_after_id)
+                        .bind(batch_size)
+                        .fetch_all(&mut **conn)
+                        .await
+                        .map_err(map_err),
+                }
+            }
+            (Some(slug), None) => match tx {
+                BackendConn::Sqlite(conn) => sqlx::query_as(SCOPED_SLUG_SQLITE)
+                    .bind(space_id.as_str())
+                    .bind(project_id)
+                    .bind(slug)
+                    .bind(scan_after_id)
+                    .bind(batch_size)
+                    .fetch_all(&mut **conn)
+                    .await
+                    .map_err(map_err),
+                BackendConn::Postgres(conn) => sqlx::query_as(SCOPED_SLUG_PG)
+                    .bind(space_id.as_str())
+                    .bind(project_id)
+                    .bind(slug)
+                    .bind(scan_after_id)
+                    .bind(batch_size)
+                    .fetch_all(&mut **conn)
+                    .await
+                    .map_err(map_err),
+            },
+            (None, Some(kind)) => {
+                let kind_str = crate::codec::ability_kind_to_db(kind);
+                match tx {
+                    BackendConn::Sqlite(conn) => sqlx::query_as(SCOPED_KIND_SQLITE)
+                        .bind(space_id.as_str())
+                        .bind(project_id)
+                        .bind(kind_str)
+                        .bind(scan_after_id)
+                        .bind(batch_size)
+                        .fetch_all(&mut **conn)
+                        .await
+                        .map_err(map_err),
+                    BackendConn::Postgres(conn) => sqlx::query_as(SCOPED_KIND_PG)
+                        .bind(space_id.as_str())
+                        .bind(project_id)
+                        .bind(kind_str)
+                        .bind(scan_after_id)
+                        .bind(batch_size)
+                        .fetch_all(&mut **conn)
+                        .await
+                        .map_err(map_err),
+                }
+            }
+            (None, None) => match tx {
+                BackendConn::Sqlite(conn) => sqlx::query_as(SCOPED_ALL_SQLITE)
+                    .bind(space_id.as_str())
+                    .bind(project_id)
+                    .bind(scan_after_id)
+                    .bind(batch_size)
+                    .fetch_all(&mut **conn)
+                    .await
+                    .map_err(map_err),
+                BackendConn::Postgres(conn) => sqlx::query_as(SCOPED_ALL_PG)
+                    .bind(space_id.as_str())
+                    .bind(project_id)
+                    .bind(scan_after_id)
+                    .bind(batch_size)
+                    .fetch_all(&mut **conn)
+                    .await
+                    .map_err(map_err),
+            },
         };
     }
     match (slug, kind) {
@@ -960,13 +1034,9 @@ pub(super) async fn page(
                 let cap = usize::from(query.page.limit());
                 let mut visible_items: Vec<(usize, i64, AbilityDescriptor)> = Vec::new();
                 let mut scanned = 0usize;
-                let mut historical_caches: Vec<
-                    std::collections::BTreeMap<
-                        SpaceSeq,
-                        crate::domain::common::FolderAncestryCache,
-                    >,
-                > = (0..live.len())
-                    .map(|_| std::collections::BTreeMap::new())
+                let mut historical_caches: Vec<crate::domain::common::HistoricalFolderCache> = (0
+                    ..live.len())
+                    .map(|_| crate::domain::common::HistoricalFolderCache::default())
                     .collect();
                 'spaces: for (index, rec) in live.iter().enumerate() {
                     let project_scope = if query.authoring && query.project.is_none() {

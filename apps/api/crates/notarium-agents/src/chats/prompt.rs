@@ -299,7 +299,10 @@ pub(crate) async fn load_history_after(
     if floor.is_some_and(|floor| floor > leaf) {
         return Err(invalid(ValidationReason::SourceMismatch));
     }
-    let deadline = Instant::now() + ctx.budget.remaining;
+    let now = Instant::now();
+    let deadline = now
+        .checked_add(ctx.budget.remaining)
+        .unwrap_or_else(|| now + std::time::Duration::from_secs(86_400));
     let read = ChatRead {
         thread: thread.clone(),
         leaf,
@@ -367,7 +370,12 @@ fn partition_entry_groups(
             ChatEntryKind::Model => {
                 let start = i;
                 i += 1;
-                while i < entries.len() && matches!(entries[i].kind, ChatEntryKind::Tool { .. }) {
+                while i < entries.len()
+                    && matches!(
+                        entries[i].kind,
+                        ChatEntryKind::Tool { .. } | ChatEntryKind::Redacted
+                    )
+                {
                     i += 1;
                 }
                 ranges.push(start..i);
@@ -651,6 +659,10 @@ fn assemble_group(
             let mut results = vec![None; calls.len()];
             let mut unpaired = Vec::new();
             for candidate in &group_entries[1..] {
+                if matches!(candidate.kind, ChatEntryKind::Redacted) {
+                    through = candidate.seq;
+                    continue;
+                }
                 let ChatEntryKind::Tool { call_id } = &candidate.kind else {
                     return Err(invalid(ValidationReason::SourceMismatch));
                 };
@@ -1101,6 +1113,45 @@ mod tests {
             planned.budget.max_output_tokens > 100,
             "has_tail compaction must retain a healthy summary budget (got {})",
             planned.budget.max_output_tokens
+        );
+    }
+
+    #[test]
+    fn partition_entry_groups_keeps_surviving_tool_paired_across_redacted_sibling() {
+        let thread = ChatThreadId::from_bytes([0x91; 16]);
+        let author = PrincipalId::from_bytes([0x92; 16]);
+        let run = notarium_core::ids::AgentRunId::from_bytes([0x93; 16]);
+        let entry = |seq: u64, kind: ChatEntryKind| notarium_core::ports::ChatEntry {
+            thread: thread.clone(),
+            seq: ThreadEntrySeq::new(seq).unwrap(),
+            parent: (seq > 1).then(|| ThreadEntrySeq::new(seq - 1).unwrap()),
+            is_chain_node: true,
+            depth: seq as u32,
+            ancestors: Vec::new(),
+            author: author.clone(),
+            run: Some(run.clone()),
+            kind,
+            body: notarium_core::ports::ChatBody::Inline(String::new()),
+            tainted: false,
+            referenced_notes: Vec::new(),
+        };
+        let entries = vec![
+            entry(1, ChatEntryKind::Human),
+            entry(2, ChatEntryKind::Model),
+            entry(3, ChatEntryKind::Redacted),
+            entry(
+                4,
+                ChatEntryKind::Tool {
+                    call_id: notarium_core::ids::CommandKey::from_bytes([0x94; 16]),
+                },
+            ),
+            entry(5, ChatEntryKind::Human),
+        ];
+        let ranges = partition_entry_groups(&entries);
+        assert_eq!(
+            ranges,
+            vec![0..1, 1..4, 4..5],
+            "redacted tool sibling must stay inside the Model->Tool group so surviving tool pairs stay attached"
         );
     }
 }

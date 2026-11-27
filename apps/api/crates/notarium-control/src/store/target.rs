@@ -866,8 +866,12 @@ target_tables! {
             validate_index(r.resource_id.len() + r.target_space.len())?;
             validate_index(r.resource_id.len() + r.target_space.len() + r.target_project.as_ref().map_or(0, String::len))?;
             validate_index(r.target_space.len() + r.state.len() + r.resource_id.len())?;
-            validate_index(r.target_space.len() + r.id.len())?;
-            validate_index(r.target_space.len() + r.target_project.as_ref().map_or(0, String::len) + r.id.len())?;
+            if r.state == "approved" {
+                validate_index(r.target_space.len() + r.id.len())?;
+                if r.target_kind == "project" {
+                    validate_index(r.target_space.len() + r.target_project.as_ref().map_or(0, String::len) + r.id.len())?;
+                }
+            }
         })
     },
     ProviderPreferences (ProviderPreferencesRow, "provider_preferences") {
@@ -1019,7 +1023,10 @@ target_tables! {
             source_placement: String,
             ability_id: String,
         ]
-        indexes(|r| { validate_index(r.source_placement.len() + r.ability_id.len())?; })
+        indexes(|r| {
+            validate_index(r.source_placement.len() + r.ability_id.len())?;
+            validate_index(r.destination_placement.len() + r.destination_id.len())?;
+        })
     },
     Favorites (FavoritesRow, "favorites") {
         cols("owner_id,space_id,entity_kind,entity_id,rank,created_at", "$1,$2,$3,$4,$5,$6"): [
@@ -1334,6 +1341,9 @@ target_tables! {
             validate_index(r.schedule_id.len())?;
             validate_index(8 + r.paused_reason.as_ref().map_or(0, String::len) + 8 + r.schedule_id.len())?;
             validate_index(r.owner_id.len() + r.space_id.len() + r.schedule_id.len())?;
+            if r.deleted_at.is_none() {
+                validate_index(r.owner_id.len() + r.space_id.len() + r.project_folder_id.as_ref().map_or(0, String::len) + r.schedule_id.len())?;
+            }
         })
     },
     AgentScheduleRuns (AgentScheduleRunsRow, "agent_schedule_runs") {

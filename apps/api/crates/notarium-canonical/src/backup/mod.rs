@@ -2118,6 +2118,7 @@ fn spool_tables(schema_version: u32) -> impl Iterator<Item = TableSpec> + Clone 
                         ];
                     }
                     "chat_pending_inputs" => table.indexes = &table.indexes[..2],
+                    "pending_purges" => table.indexes = &["idx_pending_purges_phase"],
                     _ => {}
                 }
             }

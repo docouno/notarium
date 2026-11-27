@@ -612,6 +612,7 @@ async fn execute_general_rollback(
             candidates,
             durable_active_rooms,
             run_board_moves,
+            extra_overlay_views,
             active_view_notes,
             package_cut,
             observed_max_bmh_seq,
@@ -651,10 +652,11 @@ async fn execute_general_rollback(
             Err(err) => return Err(err),
         };
 
-        // Load pre-run carriers from CAS ONLY when board views were moved by this run and require
-        // `planned_carrier` in `RollbackBoardFactsRequest`.
+        // Load pre-run carriers from CAS ONLY when board views were moved by this run or
+        // carry overlays for mutated restorable notes and require `planned_carrier` in
+        // `RollbackBoardFactsRequest`.
         let mut candidates_with_carriers: BTreeMap<NoteId, CandidateAction> = BTreeMap::new();
-        let need_board_carriers = !run_board_moves.is_empty();
+        let need_board_carriers = !run_board_moves.is_empty() || !extra_overlay_views.is_empty();
         for (nid, mut action) in candidates {
             if need_board_carriers
                 && let CandidateAction::RestorePreExisting {
@@ -781,6 +783,21 @@ async fn execute_general_rollback(
                 active_after_rollback_views.insert(bmh.view.clone());
                 if has_restorable_eligible || eligible_notes.contains_key(&bmh.target_note_id) {
                     affected_views_set.insert(bmh.view.clone());
+                }
+            }
+        }
+        for view in &extra_overlay_views {
+            let view_active_after_rollback = match eligible_notes.get(&view.note) {
+                Some(CandidateAction::TrashCreated { .. }) => false,
+                Some(CandidateAction::RestorePreExisting { pre_meta, .. }) => {
+                    pre_meta.lifecycle == Lifecycle::Active
+                }
+                None => active_view_notes.contains(&view.note),
+            };
+            if view_active_after_rollback {
+                active_after_rollback_views.insert(view.clone());
+                if has_restorable_eligible {
+                    affected_views_set.insert(view.clone());
                 }
             }
         }
@@ -933,6 +950,7 @@ async fn execute_general_rollback(
                 active_after_rollback_views,
                 rb_facts_opt,
                 run_board_moves.clone(),
+                extra_overlay_views,
                 observed_max_bmh_seq,
             ),
         };
@@ -1750,12 +1768,10 @@ fn materialize_working_group(
     moved_targets_on_view: &BTreeSet<&NoteId>,
     stale_prerun_restores: &BTreeMap<NoteId, (GroupKey, crate::codec::RankRevisionMetadata)>,
     same_group_run_materialized: &BTreeMap<NoteId, GroupKey>,
-    working_groups: &mut Vec<(GroupKey, Vec<ExistingRankedItem>)>,
+    working_groups: &mut Vec<(GroupKey, Vec<ExistingRankedItem>, bool)>,
     neighbor_dirty: &mut BTreeMap<NoteId, (GroupKey, String, bool)>,
+    materialize_unranked: bool,
 ) -> Result<usize, PortError> {
-    if let Some(idx) = working_groups.iter().position(|(gk, _)| gk == group) {
-        return Ok(idx);
-    }
     let kept_notes: &[NoteId] = kept_groups
         .iter()
         .find(|(gk, _)| gk == group)
@@ -1771,10 +1787,6 @@ fn materialize_working_group(
             .cmp(&b.1.sort_rank_lexo)
             .then_with(|| a.0.cmp(b.0))
     });
-    if kept_notes.is_empty() && stale_in_group.is_empty() {
-        working_groups.push((group.clone(), Vec::new()));
-        return Ok(working_groups.len() - 1);
-    }
     let must_keep_materialized = |nid: &NoteId| {
         same_group_run_materialized.contains_key(nid)
             && overlays.get(nid).is_some_and(|ov| {
@@ -1797,10 +1809,66 @@ fn materialize_working_group(
         overlays.get(nid).map(|o| &o.group) == Some(group)
             && (!same_group_run_materialized.contains_key(nid) || must_keep_materialized(nid))
     };
+    if let Some(idx) = working_groups.iter().position(|(gk, _, _)| gk == group) {
+        if materialize_unranked && !working_groups[idx].2 {
+            let items = &mut working_groups[idx].1;
+            if items.is_empty() {
+                let init = evenly_spaced_ranks(kept_notes.len())?;
+                for (nid, r) in kept_notes.iter().zip(init) {
+                    if !moved_targets_on_view.contains(nid)
+                        && !stale_prerun_restores.contains_key(nid)
+                    {
+                        neighbor_dirty.insert(nid.clone(), (group.clone(), r.clone(), false));
+                    }
+                    items.push(ExistingRankedItem {
+                        note_id: nid.clone(),
+                        rank: r,
+                    });
+                }
+            } else {
+                for nid in kept_notes {
+                    if items.iter().any(|it| &it.note_id == nid) {
+                        continue;
+                    }
+                    let tail = compute_rank_placement(items, nid, items.len())?;
+                    for (pn, pr) in tail.pma_neighbor_updates {
+                        if let Some(it) = items.iter_mut().find(|i| i.note_id == pn) {
+                            it.rank = pr.clone();
+                        }
+                        if !moved_targets_on_view.contains(&pn)
+                            && !stale_prerun_restores.contains_key(&pn)
+                        {
+                            let is_pma = overlays.get(&pn).is_some_and(|o| &o.group == group)
+                                && !same_group_run_materialized.contains_key(&pn);
+                            neighbor_dirty.insert(pn, (group.clone(), pr, is_pma));
+                        }
+                    }
+                    if !moved_targets_on_view.contains(nid)
+                        && !stale_prerun_restores.contains_key(nid)
+                    {
+                        neighbor_dirty.insert(
+                            nid.clone(),
+                            (group.clone(), tail.target_rank.clone(), false),
+                        );
+                    }
+                    items.push(ExistingRankedItem {
+                        note_id: nid.clone(),
+                        rank: tail.target_rank,
+                    });
+                }
+            }
+            working_groups[idx].2 = true;
+        }
+        return Ok(idx);
+    }
+    if kept_notes.is_empty() && stale_in_group.is_empty() {
+        working_groups.push((group.clone(), Vec::new(), materialize_unranked));
+        return Ok(working_groups.len() - 1);
+    }
     let all_unranked =
         stale_in_group.is_empty() && kept_notes.iter().all(|nid| !has_true_overlay(nid));
     let mut items = Vec::with_capacity(kept_notes.len() + stale_in_group.len());
-    if all_unranked {
+    if all_unranked && materialize_unranked {
         let init = evenly_spaced_ranks(kept_notes.len())?;
         for (nid, r) in kept_notes.iter().zip(init) {
             if !moved_targets_on_view.contains(nid) && !stale_prerun_restores.contains_key(nid) {
@@ -1811,7 +1879,7 @@ fn materialize_working_group(
                 rank: r,
             });
         }
-    } else {
+    } else if !all_unranked {
         let mut ranked_only: Vec<ExistingRankedItem> = kept_notes
             .iter()
             .filter_map(|nid| {
@@ -1868,37 +1936,40 @@ fn materialize_working_group(
                 );
             }
         }
-        for nid in kept_notes {
-            let in_grp = has_true_overlay(nid);
-            if !in_grp {
-                let tail = compute_rank_placement(&items, nid, items.len())?;
-                for (pn, pr) in tail.pma_neighbor_updates {
-                    if let Some(it) = items.iter_mut().find(|i| i.note_id == pn) {
-                        it.rank = pr.clone();
+        if materialize_unranked {
+            for nid in kept_notes {
+                let in_grp = has_true_overlay(nid);
+                if !in_grp {
+                    let tail = compute_rank_placement(&items, nid, items.len())?;
+                    for (pn, pr) in tail.pma_neighbor_updates {
+                        if let Some(it) = items.iter_mut().find(|i| i.note_id == pn) {
+                            it.rank = pr.clone();
+                        }
+                        if !moved_targets_on_view.contains(&pn)
+                            && !stale_prerun_restores.contains_key(&pn)
+                        {
+                            let is_pma = overlays.get(&pn).is_some_and(|o| &o.group == group)
+                                && !same_group_run_materialized.contains_key(&pn);
+                            neighbor_dirty.insert(pn, (group.clone(), pr, is_pma));
+                        }
                     }
-                    if !moved_targets_on_view.contains(&pn)
-                        && !stale_prerun_restores.contains_key(&pn)
+                    if !moved_targets_on_view.contains(nid)
+                        && !stale_prerun_restores.contains_key(nid)
                     {
-                        let is_pma = overlays.get(&pn).is_some_and(|o| &o.group == group)
-                            && !same_group_run_materialized.contains_key(&pn);
-                        neighbor_dirty.insert(pn, (group.clone(), pr, is_pma));
+                        neighbor_dirty.insert(
+                            nid.clone(),
+                            (group.clone(), tail.target_rank.clone(), false),
+                        );
                     }
+                    items.push(ExistingRankedItem {
+                        note_id: nid.clone(),
+                        rank: tail.target_rank,
+                    });
                 }
-                if !moved_targets_on_view.contains(nid) && !stale_prerun_restores.contains_key(nid)
-                {
-                    neighbor_dirty.insert(
-                        nid.clone(),
-                        (group.clone(), tail.target_rank.clone(), false),
-                    );
-                }
-                items.push(ExistingRankedItem {
-                    note_id: nid.clone(),
-                    rank: tail.target_rank,
-                });
             }
         }
     }
-    working_groups.push((group.clone(), items));
+    working_groups.push((group.clone(), items, materialize_unranked));
     Ok(working_groups.len() - 1)
 }
 
@@ -2015,6 +2086,7 @@ fn plan_inactive_view_rollbacks_tx<'a>(
     scope_cl: &'a HistoryScope,
     run: &'a AgentRunId,
     run_moves_cl: &'a [RunBoardMoveRow],
+    extra_overlay_views: &'a BTreeSet<ViewRef>,
     eligible_notes: &'a BTreeMap<NoteId, CandidateAction>,
     eligible_all_ids: &'a BTreeSet<NoteId>,
     retired_note_ids: &'a BTreeSet<NoteId>,
@@ -2034,6 +2106,7 @@ fn plan_inactive_view_rollbacks_tx<'a>(
         let inactive_or_retired_views: BTreeSet<ViewRef> = run_moves_cl
             .iter()
             .map(|bmh| &bmh.view)
+            .chain(extra_overlay_views.iter())
             .filter(|view| {
                 !retired_note_ids.contains(&view.note)
                     && (!active_after_rollback_views.contains(*view)
@@ -2058,20 +2131,19 @@ fn plan_inactive_view_rollbacks_tx<'a>(
             let view_has_rollback_effect =
                 eligible_all_ids.contains(&view.note) || !earliest_bmh_for_target.is_empty();
             let mut run_mat_seqs: BTreeMap<NoteId, SpaceSeq> = BTreeMap::new();
-            if view_has_rollback_effect {
-                for (nid, ov) in &overlays {
-                    if !retired_note_ids.contains(nid)
-                        && ov.placement_run_id.is_none()
-                        && let Some(seq) = run_materialized_overlay_seq_tx(
-                            tx,
-                            &scope_cl.space_id,
-                            &ov.placement_revision,
-                            run,
-                        )
-                        .await?
-                    {
-                        run_mat_seqs.insert(nid.clone(), seq);
-                    }
+            for (nid, ov) in &overlays {
+                if !retired_note_ids.contains(nid)
+                    && ov.placement_run_id.is_none()
+                    && (view_has_rollback_effect || eligible_all_ids.contains(nid))
+                    && let Some(seq) = run_materialized_overlay_seq_tx(
+                        tx,
+                        &scope_cl.space_id,
+                        &ov.placement_revision,
+                        run,
+                    )
+                    .await?
+                {
+                    run_mat_seqs.insert(nid.clone(), seq);
                 }
             }
             let mut overlay_ids: Vec<NoteId> = overlays.keys().cloned().collect();
@@ -2079,8 +2151,15 @@ fn plan_inactive_view_rollbacks_tx<'a>(
             let mut prerun_restores: Vec<(NoteId, crate::codec::RankRevisionMetadata)> = Vec::new();
             let mut pending_mat_deletes: Vec<(NoteId, GroupKey, String)> = Vec::new();
             let mut cleared_run_owned: BTreeSet<NoteId> = BTreeSet::new();
-            let mut cleared_to_unranked: Vec<(NoteId, GroupKey, Option<NoteId>, Option<NoteId>)> =
-                Vec::new();
+            type InactiveClearedTarget = (
+                SpaceSeq,
+                i32,
+                NoteId,
+                GroupKey,
+                Option<NoteId>,
+                Option<NoteId>,
+            );
+            let mut cleared_to_unranked: Vec<InactiveClearedTarget> = Vec::new();
             for nid in overlay_ids {
                 if retired_note_ids.contains(&nid) {
                     continue;
@@ -2091,47 +2170,85 @@ fn plan_inactive_view_rollbacks_tx<'a>(
                         continue;
                     };
                     let mut cutoff_seq = earliest_bmh.command_end_seq;
-                    if let Some(CandidateAction::RestorePreExisting { first_run_seq, .. }) =
-                        eligible_notes.get(&nid)
-                    {
-                        cutoff_seq = cutoff_seq.min(*first_run_seq);
-                    }
-                    match &earliest_bmh.before_placement {
-                        StoredSemanticPlacementV1::Ineligible => {
+                    let note_mutated_before_move = match eligible_notes.get(&nid) {
+                        Some(CandidateAction::RestorePreExisting {
+                            first_run_seq,
+                            needs_note_mutation,
+                            ..
+                        }) => {
+                            cutoff_seq = cutoff_seq.min(*first_run_seq);
+                            *needs_note_mutation && *first_run_seq < earliest_bmh.command_end_seq
+                        }
+                        _ => false,
+                    };
+                    if note_mutated_before_move {
+                        // The run edited this note before its first move on `view`, so
+                        // `earliest_bmh.before_placement` captures an intermediate state.
+                        // Restore the note's true pre-run manual rank if one existed;
+                        // otherwise clear the run-owned overlay without synthesizing a
+                        // placement in an intermediate group.
+                        let prerun = load_latest_prerun_rank_meta_tx(
+                            tx,
+                            scope_cl,
+                            view,
+                            &nid,
+                            run,
+                            run_vis_seqs,
+                            cutoff_seq,
+                        )
+                        .await?;
+                        if let Some(meta) = prerun
+                            && !meta.removed
+                        {
+                            prerun_restores.push((nid, meta));
+                        } else {
                             cleared_run_owned.insert(nid.clone());
                             planned_overlay_deletes.push(PlannedOverlayDelete {
                                 view: view.clone(),
                                 target_note: nid,
                             });
                         }
-                        StoredSemanticPlacementV1::InGroup {
-                            group: expected_before_grp,
-                            predecessor,
-                            successor,
-                        } => {
-                            let prerun = load_latest_prerun_rank_meta_tx(
-                                tx,
-                                scope_cl,
-                                view,
-                                &nid,
-                                run,
-                                run_vis_seqs,
-                                cutoff_seq,
-                            )
-                            .await?;
-                            if let Some(meta) = prerun
-                                && !meta.removed
-                                && &meta.group_key == expected_before_grp
-                            {
-                                prerun_restores.push((nid, meta));
-                            } else {
+                    } else {
+                        match &earliest_bmh.before_placement {
+                            StoredSemanticPlacementV1::Ineligible => {
                                 cleared_run_owned.insert(nid.clone());
-                                cleared_to_unranked.push((
-                                    nid,
-                                    expected_before_grp.clone(),
-                                    predecessor.clone(),
-                                    successor.clone(),
-                                ));
+                                planned_overlay_deletes.push(PlannedOverlayDelete {
+                                    view: view.clone(),
+                                    target_note: nid,
+                                });
+                            }
+                            StoredSemanticPlacementV1::InGroup {
+                                group: expected_before_grp,
+                                predecessor,
+                                successor,
+                            } => {
+                                let prerun = load_latest_prerun_rank_meta_tx(
+                                    tx,
+                                    scope_cl,
+                                    view,
+                                    &nid,
+                                    run,
+                                    run_vis_seqs,
+                                    cutoff_seq,
+                                )
+                                .await?;
+                                if let Some(meta) = prerun
+                                    && !meta.removed
+                                    && crate::codec::group_key_hex(&meta.group_key)?.1
+                                        == crate::codec::group_key_hex(expected_before_grp)?.1
+                                {
+                                    prerun_restores.push((nid, meta));
+                                } else {
+                                    cleared_run_owned.insert(nid.clone());
+                                    cleared_to_unranked.push((
+                                        earliest_bmh.command_end_seq,
+                                        earliest_bmh.ordinal,
+                                        nid,
+                                        expected_before_grp.clone(),
+                                        predecessor.clone(),
+                                        successor.clone(),
+                                    ));
+                                }
                             }
                         }
                     }
@@ -2157,7 +2274,8 @@ fn plan_inactive_view_rollbacks_tx<'a>(
                     .await?;
                     if let Some(meta) = prerun
                         && !meta.removed
-                        && (restored_fields.is_some() || meta.group_key == ov.group)
+                        && (restored_fields.is_some()
+                            || crate::codec::group_key_hex(&meta.group_key)?.1 == ov.group_key_hex)
                     {
                         prerun_restores.push((nid, meta));
                     } else if restored_fields.is_some() {
@@ -2173,13 +2291,38 @@ fn plan_inactive_view_rollbacks_tx<'a>(
                             ov.sort_rank_lexo.clone(),
                         ));
                     }
+                } else if ov.placement_run_id.is_none()
+                    && let Some(CandidateAction::RestorePreExisting {
+                        needs_note_mutation: true,
+                        first_run_seq,
+                        ..
+                    }) = eligible_notes.get(&nid)
+                    && ov.updated_seq > *first_run_seq
+                {
+                    let prerun = load_latest_prerun_rank_meta_tx(
+                        tx,
+                        scope_cl,
+                        view,
+                        &nid,
+                        run,
+                        run_vis_seqs,
+                        *first_run_seq,
+                    )
+                    .await?;
+                    if let Some(meta) = prerun
+                        && !meta.removed
+                        && crate::codec::group_key_hex(&meta.group_key)?.1 != ov.group_key_hex
+                    {
+                        prerun_restores.push((nid, meta));
+                    }
                 }
             }
             let mut deleted_mat_ids: BTreeSet<NoteId> = BTreeSet::new();
             for (nid, grp, rank) in pending_mat_deletes {
+                let grp_hex = crate::codec::group_key_hex(&grp)?.1;
                 let has_surviving_ranked_below = overlays.iter().any(|(other_id, other_ov)| {
                     other_id != &nid
-                        && other_ov.group == grp
+                        && other_ov.group_key_hex == grp_hex
                         && !retired_note_ids.contains(other_id)
                         && !run_mat_seqs.contains_key(other_id)
                         && !cleared_run_owned.contains(other_id)
@@ -2187,7 +2330,11 @@ fn plan_inactive_view_rollbacks_tx<'a>(
                         && (other_ov.sort_rank_lexo > rank
                             || other_ov.placement_run_id.as_ref() == Some(run))
                 }) || prerun_restores.iter().any(|(rid, meta)| {
-                    rid != &nid && meta.group_key == grp && meta.sort_rank_lexo > rank
+                    rid != &nid
+                        && crate::codec::group_key_hex(&meta.group_key)
+                            .map(|(_, h)| h == grp_hex)
+                            .unwrap_or(false)
+                        && meta.sort_rank_lexo > rank
                 });
                 if !has_surviving_ranked_below {
                     deleted_mat_ids.insert(nid.clone());
@@ -2197,8 +2344,7 @@ fn plan_inactive_view_rollbacks_tx<'a>(
                     });
                 }
             }
-            let mut surviving_by_group: BTreeMap<Vec<u8>, Vec<ExistingRankedItem>> =
-                BTreeMap::new();
+            let mut surviving_by_group: BTreeMap<String, Vec<ExistingRankedItem>> = BTreeMap::new();
             for (nid, ov) in &overlays {
                 if retired_note_ids.contains(nid)
                     || cleared_run_owned.contains(nid)
@@ -2207,9 +2353,8 @@ fn plan_inactive_view_rollbacks_tx<'a>(
                 {
                     continue;
                 }
-                let gkey = encode_msgpack(&ov.group)?;
                 surviving_by_group
-                    .entry(gkey)
+                    .entry(ov.group_key_hex.clone())
                     .or_default()
                     .push(ExistingRankedItem {
                         note_id: nid.clone(),
@@ -2228,8 +2373,8 @@ fn plan_inactive_view_rollbacks_tx<'a>(
                     .then_with(|| a.0.cmp(&b.0))
             });
             for (nid, meta) in prerun_restores {
-                let gkey = encode_msgpack(&meta.group_key)?;
-                let items = surviving_by_group.entry(gkey).or_default();
+                let gkey = crate::codec::group_key_hex(&meta.group_key)?.1;
+                let items = surviving_by_group.entry(gkey.clone()).or_default();
                 let collides = items.iter().any(|it| it.rank == meta.sort_rank_lexo);
                 let settled_rank = if !collides {
                     let pos = items
@@ -2257,9 +2402,8 @@ fn plan_inactive_view_rollbacks_tx<'a>(
                         if let Some(prev) = settled_prerun.get_mut(&pn) {
                             prev.rank = pr;
                         } else {
-                            let is_pma =
-                                overlays.get(&pn).is_some_and(|o| o.group == meta.group_key)
-                                    && !run_mat_seqs.contains_key(&pn);
+                            let is_pma = overlays.get(&pn).is_some_and(|o| o.group_key_hex == gkey)
+                                && !run_mat_seqs.contains_key(&pn);
                             inactive_neighbor_updates
                                 .insert(pn, (meta.group_key.clone(), pr, is_pma));
                         }
@@ -2286,8 +2430,13 @@ fn plan_inactive_view_rollbacks_tx<'a>(
                     },
                 );
             }
-            for (nid, grp, pred, succ) in cleared_to_unranked {
-                let gkey = encode_msgpack(&grp)?;
+            cleared_to_unranked.sort_by(|a, b| {
+                b.0.cmp(&a.0)
+                    .then_with(|| b.1.cmp(&a.1))
+                    .then_with(|| a.2.cmp(&b.2))
+            });
+            for (_, _, nid, grp, pred, succ) in cleared_to_unranked {
+                let gkey = crate::codec::group_key_hex(&grp)?.1;
                 let has_anchored_surviving = surviving_by_group.get(&gkey).is_some_and(|items| {
                     !items.is_empty()
                         && (pred
@@ -2304,7 +2453,7 @@ fn plan_inactive_view_rollbacks_tx<'a>(
                     });
                     continue;
                 }
-                let items = surviving_by_group.entry(gkey).or_default();
+                let items = surviving_by_group.entry(gkey.clone()).or_default();
                 let lo = pred
                     .as_ref()
                     .and_then(|p| items.iter().position(|it| &it.note_id == p).map(|i| i + 1))
@@ -2322,7 +2471,7 @@ fn plan_inactive_view_rollbacks_tx<'a>(
                     if let Some(prev) = settled_prerun.get_mut(&pn) {
                         prev.rank = pr;
                     } else {
-                        let is_pma = overlays.get(&pn).is_some_and(|o| o.group == grp)
+                        let is_pma = overlays.get(&pn).is_some_and(|o| o.group_key_hex == gkey)
                             && !run_mat_seqs.contains_key(&pn);
                         inactive_neighbor_updates.insert(pn, (grp.clone(), pr, is_pma));
                     }
@@ -2380,6 +2529,7 @@ fn build_rollback_execute_fn(
     active_after_rollback_views: BTreeSet<ViewRef>,
     rb_facts_opt: Option<notarium_core::ports::RollbackBoardFacts>,
     run_moves_cl: Vec<RunBoardMoveRow>,
+    extra_overlay_views: BTreeSet<ViewRef>,
     observed_max_bmh_seq: i64,
 ) -> crate::writer::ItemExecuteFn {
     Box::new(move |tx, item_ctx| {
@@ -2502,7 +2652,10 @@ fn build_rollback_execute_fn(
                 HashMap<NoteId, crate::domain::board::OverlayRow>,
             > = BTreeMap::new();
 
-            let run_vis_seqs = if rb_facts_opt.is_some() || !run_moves_cl.is_empty() {
+            let run_vis_seqs = if rb_facts_opt.is_some()
+                || !run_moves_cl.is_empty()
+                || !extra_overlay_views.is_empty()
+            {
                 load_run_visibility_seqs_tx(tx, &scope_cl, &input.run).await?
             } else {
                 std::collections::HashSet::new()
@@ -2822,7 +2975,8 @@ fn build_rollback_execute_fn(
                         }
                     }
 
-                    let mut working_groups: Vec<(GroupKey, Vec<ExistingRankedItem>)> = Vec::new();
+                    let mut working_groups: Vec<(GroupKey, Vec<ExistingRankedItem>, bool)> =
+                        Vec::new();
                     let mut neighbor_dirty: BTreeMap<NoteId, (GroupKey, String, bool)> =
                         BTreeMap::new();
                     let mut cleared_to_unranked_group: HashMap<NoteId, GroupKey> = HashMap::new();
@@ -2860,7 +3014,7 @@ fn build_rollback_execute_fn(
                         for (_, notes) in &mut kept_groups {
                             notes.retain(|nid| nid != target);
                         }
-                        for (_, g_items) in &mut working_groups {
+                        for (_, g_items, _) in &mut working_groups {
                             g_items.retain(|it| &it.note_id != target);
                         }
 
@@ -2937,16 +3091,48 @@ fn build_rollback_execute_fn(
                                                 &same_group_run_materialized,
                                                 &mut working_groups,
                                                 &mut neighbor_dirty,
+                                                false,
                                             )?;
                                             let g_items = &mut working_groups[g_idx].1;
+                                            let is_orig_ranked_in_post = |nid: &NoteId| -> bool {
+                                                if stale_prerun_restores
+                                                    .get(nid)
+                                                    .is_some_and(|(g, _)| g == &post_grp)
+                                                {
+                                                    return true;
+                                                }
+                                                if let Some(TargetSettlement::Replayed {
+                                                    group: rg,
+                                                    placement_revision: Some(_),
+                                                    ..
+                                                }) = target_final_state.get(nid)
+                                                {
+                                                    return rg == &post_grp;
+                                                }
+                                                !moved_targets_on_view.contains(nid)
+                                                    && !same_group_run_materialized
+                                                        .contains_key(nid)
+                                                    && effective_overlays
+                                                        .get(nid)
+                                                        .is_some_and(|o| o.group == post_grp)
+                                            };
+                                            let first_unranked = g_items
+                                                .iter()
+                                                .position(|it| !is_orig_ranked_in_post(&it.note_id))
+                                                .unwrap_or(g_items.len());
                                             let collides = g_items
                                                 .iter()
                                                 .any(|it| it.rank == meta.sort_rank_lexo);
-                                            let restored_rank = if !collides {
-                                                let pos = g_items
+                                            let fits_before_unranked = first_unranked
+                                                == g_items.len()
+                                                || meta.sort_rank_lexo
+                                                    < g_items[first_unranked].rank;
+                                            let restored_rank = if !collides && fits_before_unranked
+                                            {
+                                                let pos = g_items[..first_unranked]
                                                     .iter()
                                                     .position(|it| it.rank > meta.sort_rank_lexo)
-                                                    .unwrap_or(g_items.len());
+                                                    .unwrap_or(first_unranked);
                                                 g_items.insert(
                                                     pos,
                                                     ExistingRankedItem {
@@ -2956,10 +3142,10 @@ fn build_rollback_execute_fn(
                                                 );
                                                 meta.sort_rank_lexo
                                             } else {
-                                                let pos = g_items
+                                                let pos = g_items[..first_unranked]
                                                     .iter()
                                                     .position(|it| it.rank >= meta.sort_rank_lexo)
-                                                    .unwrap_or(g_items.len());
+                                                    .unwrap_or(first_unranked);
                                                 let computed =
                                                     compute_rank_placement(g_items, target, pos)?;
                                                 for (pn, pr) in computed.pma_neighbor_updates {
@@ -3106,6 +3292,7 @@ fn build_rollback_execute_fn(
                                     &same_group_run_materialized,
                                     &mut working_groups,
                                     &mut neighbor_dirty,
+                                    true,
                                 )?;
                                 let g_items = &mut working_groups[g_idx].1;
 
@@ -3430,8 +3617,8 @@ fn build_rollback_execute_fn(
                                 let cid_pos = base_pos.get(&cid).copied().unwrap_or(usize::MAX);
                                 let (min_idx, max_idx, working_len) = working_groups
                                     .iter()
-                                    .find(|(g, _)| g == &grp)
-                                    .map(|(_, items)| {
+                                    .find(|(g, _, _)| g == &grp)
+                                    .map(|(_, items, _)| {
                                         let mut lo = 0usize;
                                         let mut hi = items.len();
                                         for (idx, it) in items.iter().enumerate() {
@@ -3452,8 +3639,10 @@ fn build_rollback_execute_fn(
                                     .unwrap_or((0, 0, 0));
                                 let has_replayed_successor = max_idx < working_len;
                                 let needs_rank_in_working = has_surviving_non_mat_ranked
-                                    && working_groups.iter().find(|(g, _)| g == &grp).is_some_and(
-                                        |(_, items)| {
+                                    && working_groups
+                                        .iter()
+                                        .find(|(g, _, _)| g == &grp)
+                                        .is_some_and(|(_, items, _)| {
                                             let start = min_idx.min(items.len());
                                             items[start..].iter().any(|it| {
                                                 !is_originally_ranked(
@@ -3465,8 +3654,7 @@ fn build_rollback_execute_fn(
                                                     .unwrap_or(usize::MAX)
                                                     > cid_pos
                                             })
-                                        },
-                                    );
+                                        });
                                 let needs_rank_for_surviving_mat = has_surviving_non_mat_ranked
                                     && same_group_run_materialized.iter().any(|(mid, mg)| {
                                         mg == &grp
@@ -3502,6 +3690,7 @@ fn build_rollback_execute_fn(
                                     &same_group_run_materialized,
                                     &mut working_groups,
                                     &mut neighbor_dirty,
+                                    true,
                                 )?;
                                 let g_items = &mut working_groups[g_idx].1;
                                 let lo = min_idx.min(g_items.len());
@@ -3621,6 +3810,7 @@ fn build_rollback_execute_fn(
                             &same_group_run_materialized,
                             &mut working_groups,
                             &mut neighbor_dirty,
+                            false,
                         )?;
                         let settled_rank = working_groups[g_idx]
                             .1
@@ -3715,6 +3905,7 @@ fn build_rollback_execute_fn(
                 &scope_cl,
                 &input.run,
                 &run_moves_cl,
+                &extra_overlay_views,
                 &eligible_notes,
                 &eligible_all_ids,
                 &retired_note_ids,
@@ -4395,6 +4586,7 @@ async fn discover_rollback_state_tx(
         BTreeMap<NoteId, CandidateAction>,
         BTreeSet<NoteId>,
         Vec<RunBoardMoveRow>,
+        BTreeSet<ViewRef>,
         BTreeSet<NoteId>,
         Option<SpaceSeq>,
         i64,
@@ -4598,16 +4790,108 @@ async fn discover_rollback_state_tx(
         }
     }
 
+    let mutated_restorable_ids: Vec<NoteId> = candidates
+        .iter()
+        .filter_map(|(nid, action)| match action {
+            CandidateAction::RestorePreExisting {
+                needs_note_mutation: true,
+                ..
+            } => Some(nid.clone()),
+            _ => None,
+        })
+        .collect();
+    let mut extra_overlay_views = BTreeSet::new();
+    let mut active_views = active_views;
+    if !mutated_restorable_ids.is_empty() {
+        let overlay_views =
+            load_overlay_views_for_notes_tx(tx, &srec.scope.space_id, &mutated_restorable_ids)
+                .await?;
+        for view in overlay_views {
+            if run_moves.iter().any(|m| m.view == view) {
+                continue;
+            }
+            if let Ok(Some((_head, effective))) = super::board::authorized_rollback_view_head_opt(
+                tx,
+                &srec.space,
+                ctx.auth(),
+                &view.note,
+            )
+            .await
+            {
+                if effective == Lifecycle::Active {
+                    active_views.insert(view.note.clone());
+                }
+                extra_overlay_views.insert(view);
+            }
+        }
+    }
+
     Ok((
         srec,
         skipped_manual_edits,
         candidates,
         durable_active_rooms,
         run_moves,
+        extra_overlay_views,
         active_views,
         package_cut,
         observed_max_bmh_seq,
     ))
+}
+
+async fn load_overlay_views_for_notes_tx(
+    tx: &mut BackendConn<'_>,
+    space_id: &SpaceId,
+    note_ids: &[NoteId],
+) -> Result<Vec<ViewRef>, PortError> {
+    if note_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut views = BTreeSet::new();
+    for chunk in note_ids.chunks(256) {
+        let rows: Vec<(String, String)> = match tx {
+            BackendConn::Sqlite(conn) => {
+                let mut qb: sqlx::QueryBuilder<sqlx::Sqlite> = sqlx::QueryBuilder::new(
+                    "SELECT DISTINCT view_note_id, view_key FROM view_rank_overlays WHERE space_id = ",
+                );
+                qb.push_bind(space_id.as_str());
+                qb.push(" AND target_note_id IN (");
+                let mut sep = qb.separated(", ");
+                for nid in chunk {
+                    sep.push_bind(nid.as_str());
+                }
+                qb.push(")");
+                qb.build_query_as::<(String, String)>()
+                    .fetch_all(&mut **conn)
+                    .await
+                    .map_err(|err| {
+                        internal_not_committed("sqlite_load_overlay_views", err.to_string())
+                    })?
+            }
+            BackendConn::Postgres(conn) => {
+                let ids: Vec<&str> = chunk.iter().map(NoteId::as_str).collect();
+                sqlx::query_as(
+                    "SELECT DISTINCT view_note_id, view_key FROM view_rank_overlays
+                     WHERE space_id = $1 AND target_note_id = ANY($2)",
+                )
+                .bind(space_id.as_str())
+                .bind(&ids)
+                .fetch_all(&mut **conn)
+                .await
+                .map_err(|err| crate::runtime::pg_read_error("pg_load_overlay_views", err))?
+            }
+        };
+        for (vnote_raw, vkey_raw) in rows {
+            let note = NoteId::parse(&vnote_raw).map_err(|_| {
+                internal_not_committed("corrupt_overlay_view_note", "invalid NoteId")
+            })?;
+            let key = notarium_core::ids::ViewKey::parse(&vkey_raw).map_err(|_| {
+                internal_not_committed("corrupt_overlay_view_key", "invalid ViewKey")
+            })?;
+            views.insert(ViewRef { note, key });
+        }
+    }
+    Ok(views.into_iter().collect())
 }
 
 pub(crate) fn verify_authorized_rollback_revisions<'a>(
@@ -5316,34 +5600,56 @@ async fn has_later_foreign_non_pma_rank_revision_tx(
         let key = super::board::rank_entity_key(&view.note, &view.key, note_id);
         let rows: Vec<Vec<u8>> = match tx {
             BackendConn::Sqlite(conn) => sqlx::query_scalar(
-                "SELECT metadata_msgpack FROM revisions
-                 WHERE space_id = ?1 AND history_incarnation = ?2
-                   AND entity_type = 'rank' AND entity_key = ?3
-                   AND space_seq > ?4
-                   AND (agent_run_id IS NULL OR agent_run_id != ?5)
-                 ORDER BY visibility_seq DESC, space_seq DESC",
+                "SELECT r.metadata_msgpack FROM revisions r
+                 WHERE r.space_id = ?1 AND r.history_incarnation = ?2
+                   AND r.entity_type = 'rank' AND r.entity_key = ?3
+                   AND r.space_seq > ?4
+                   AND (r.agent_run_id IS NULL OR r.agent_run_id != ?5)
+                   AND NOT EXISTS (
+                       SELECT 1 FROM board_move_history b
+                       WHERE b.space_id = r.space_id
+                         AND b.command_end_seq = r.visibility_seq
+                         AND b.view_note_id = ?6
+                         AND b.view_key = ?7
+                         AND b.target_note_id != ?8
+                   )
+                 ORDER BY r.visibility_seq DESC, r.space_seq DESC",
             )
             .bind(scope.space_id.as_str())
             .bind(scope.incarnation.as_bytes().as_slice())
             .bind(&key)
             .bind(after_i64)
             .bind(run.as_str())
+            .bind(view.note.as_str())
+            .bind(view.key.as_str())
+            .bind(note_id.as_str())
             .fetch_all(&mut **conn)
             .await
             .map_err(|err| internal_not_committed("sqlite_later_rank_revs", err.to_string()))?,
             BackendConn::Postgres(conn) => sqlx::query_scalar(
-                "SELECT metadata_msgpack FROM revisions
-                 WHERE space_id = $1 AND history_incarnation = $2
-                   AND entity_type = 'rank' AND entity_key = $3
-                   AND space_seq > $4
-                   AND (agent_run_id IS NULL OR agent_run_id != $5)
-                 ORDER BY visibility_seq DESC, space_seq DESC",
+                "SELECT r.metadata_msgpack FROM revisions r
+                 WHERE r.space_id = $1 AND r.history_incarnation = $2
+                   AND r.entity_type = 'rank' AND r.entity_key = $3
+                   AND r.space_seq > $4
+                   AND (r.agent_run_id IS NULL OR r.agent_run_id != $5)
+                   AND NOT EXISTS (
+                       SELECT 1 FROM board_move_history b
+                       WHERE b.space_id = r.space_id
+                         AND b.command_end_seq = r.visibility_seq
+                         AND b.view_note_id = $6
+                         AND b.view_key = $7
+                         AND b.target_note_id != $8
+                   )
+                 ORDER BY r.visibility_seq DESC, r.space_seq DESC",
             )
             .bind(scope.space_id.as_str())
             .bind(scope.incarnation.as_bytes().as_slice())
             .bind(&key)
             .bind(after_i64)
             .bind(run.as_str())
+            .bind(view.note.as_str())
+            .bind(view.key.as_str())
+            .bind(note_id.as_str())
             .fetch_all(&mut **conn)
             .await
             .map_err(|err| crate::runtime::pg_read_error("pg_later_rank_revs", err))?,
@@ -7958,6 +8264,7 @@ async fn execute_pg_fast_rollback_inner(
                     write_locked: write_lock_json.is_some(),
                     lifecycle,
                     head_rev_id,
+                    updated_seq: None,
                 },
             );
         }
