@@ -53,8 +53,7 @@ use notarium_core::{
         DeleteDisposition, DeleteNote, EditNote, EmptyRootAuthorization, EvaluatedBoardGroup,
         EvaluatedBoardRow, GetNote, GroupKey, MaintenanceContext, MoveBoardCard, MoveFolder,
         Mutation, NoteRevision, NoteWritePort, PageLimit, PortFuture, Preconditions,
-        RankExpectation, RankNeighbor, RollbackAgentRun, RollbackBoardFacts,
-        RollbackBoardFactsRequest, SemanticPlacement, ServiceAuthority, ServicePurpose,
+        RankExpectation, RankNeighbor, SemanticPlacement, ServiceAuthority, ServicePurpose,
         SpaceContext, ViewRef,
     },
     receipt::{CausalBasis, CommandIdentity, ReceiptSet},
@@ -1467,16 +1466,7 @@ async fn measure_fresh_rollbacks(
             )
             .await
             .unwrap();
-        let request = next_mutation(
-            &fixture.scope,
-            &fixture.owner,
-            RollbackAgentRun {
-                run: fixture.run_id,
-                expected_run_revision: fixture.expected_run_rev,
-                expected_entities: fixture.expected_entities,
-                associated_board_expectations: Vec::new(),
-            },
-        );
+        let request = next_mutation(&fixture.scope, &fixture.owner, fixture.run_id);
         let before = store
             .read_space(&fixture.scope.space_id)
             .await
@@ -1485,7 +1475,7 @@ async fn measure_fresh_rollbacks(
         let rollback_ctx = ctx.clone();
         let start = Instant::now();
         let result = store
-            .rollback_agent_run(rollback_ctx, request)
+            .rollback_agent_run_by_id(rollback_ctx, request)
             .await
             .unwrap();
         let elapsed = start.elapsed();
@@ -2086,15 +2076,6 @@ impl BoardMutationFactsProvider for FastBenchBoardPlanner {
                 },
             ))
         })
-    }
-
-    fn evaluate_rollback<'a>(
-        &'a self,
-        _authority: &'a BoardPlannerAuthority,
-        _ctx: SpaceContext,
-        _request: RollbackBoardFactsRequest,
-    ) -> PortFuture<'a, RollbackBoardFacts> {
-        Box::pin(async move { unreachable!("unused in board first-slot benchmark") })
     }
 }
 

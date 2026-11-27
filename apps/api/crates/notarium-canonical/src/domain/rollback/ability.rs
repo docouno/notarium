@@ -1,4 +1,5 @@
 use super::*;
+use crate::domain::common::NoteHeadRow;
 
 pub(super) fn retain_binding(
     meta: &mut NoteRevisionMetadata,

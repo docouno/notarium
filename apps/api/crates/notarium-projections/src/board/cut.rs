@@ -20,7 +20,7 @@ use notarium_core::{
     error::{Diagnostic, PortError, ValidationReason},
     ids::{AbilityId, ContentDigest, FolderId, NoteId, RevisionId, SpaceSeq},
     model::{HistoryScope, Lifecycle},
-    ports::{Cancellation, PageLimit, PlannedNoteRestoration, SpaceContext, ViewRef},
+    ports::{Cancellation, PageLimit, SpaceContext, ViewRef},
     query::{FieldObservation, FieldSchema, FieldValue},
     value::{Timestamp, YamlValue},
 };
@@ -35,7 +35,7 @@ use crate::{
     runtime::{ProjectionEngine, PublishedCut, records::effective_tags},
 };
 
-use super::{RollbackBoardPlan, board_plan, board_plan_for_rollback};
+use super::board_plan;
 
 const MAX_REPLAY_EVENTS: u64 = 512;
 const BOARD_WAIT: Duration = Duration::from_millis(25);
@@ -97,15 +97,12 @@ struct ReplayedChanges {
 }
 
 impl BoardCut {
-    #[allow(clippy::too_many_arguments)]
     pub(super) async fn load<'a>(
         engine: &ProjectionEngine,
         ctx: &SpaceContext,
         requested: Option<SpaceSeq>,
         views: impl IntoIterator<Item = &'a ViewRef>,
         additional_notes: impl IntoIterator<Item = &'a NoteId>,
-        restorations: &[PlannedNoteRestoration],
-        for_rollback: bool,
         deadline: &PlannerDeadline,
     ) -> Result<Self, PortError> {
         let _ = engine.current_admission(engine.active_generation())?;
@@ -156,8 +153,6 @@ impl BoardCut {
                     &views,
                     &view_notes,
                     &additional,
-                    restorations,
-                    for_rollback,
                     deadline,
                 )
                 .await
@@ -197,8 +192,6 @@ impl BoardCut {
         views: &BTreeSet<ViewRef>,
         view_notes: &BTreeSet<&NoteId>,
         additional: &BTreeSet<NoteId>,
-        restorations: &[PlannedNoteRestoration],
-        for_rollback: bool,
         deadline: &PlannerDeadline,
     ) -> Result<(), PortError> {
         let projected = published.cut.projected_seq;
@@ -271,17 +264,8 @@ impl BoardCut {
         } else {
             ReplayedChanges::default()
         };
-        self.hydrate_candidates(
-            engine,
-            ctx,
-            published,
-            views,
-            &replayed,
-            restorations,
-            for_rollback,
-            deadline,
-        )
-        .await
+        self.hydrate_candidates(engine, ctx, published, views, &replayed, deadline)
+            .await
     }
 
     async fn load_from_canonical(
@@ -392,7 +376,6 @@ impl BoardCut {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn hydrate_candidates(
         &mut self,
         engine: &ProjectionEngine,
@@ -400,8 +383,6 @@ impl BoardCut {
         published: &PublishedCut,
         views: &BTreeSet<ViewRef>,
         replayed: &ReplayedChanges,
-        restorations: &[notarium_core::ports::PlannedNoteRestoration],
-        for_rollback: bool,
         deadline: &PlannerDeadline,
     ) -> Result<(), PortError> {
         let index = deadline.wait(engine.open_index_async(published)).await?;
@@ -421,27 +402,10 @@ impl BoardCut {
                 universe.remove(dense);
             }
         }
-        let restored_by_note: BTreeMap<&NoteId, &notarium_core::ports::PlannedNoteRestoration> =
-            restorations
-                .iter()
-                .map(|entry| (&entry.note, entry))
-                .collect();
         let mut candidates = croaring::Bitmap::new();
         for view in views {
             deadline.check()?;
-            let plan = if !for_rollback {
-                board_plan(self, ctx, view)?
-            } else {
-                match board_plan_for_rollback(
-                    self,
-                    ctx,
-                    view,
-                    restored_by_note.get(&view.note).copied(),
-                )? {
-                    RollbackBoardPlan::Board(plan) => *plan,
-                    RollbackBoardPlan::Retired => continue,
-                }
-            };
+            let plan = board_plan(self, ctx, view)?;
             let folder = plan
                 .source_folder
                 .as_ref()
@@ -793,90 +757,6 @@ impl BoardCut {
         Ok(())
     }
 
-    pub(super) fn authorize_folder_allowing_inactive(
-        &self,
-        ctx: &SpaceContext,
-        folder: &FolderId,
-        ancestry: &Ancestry,
-    ) -> Result<(), PortError> {
-        let grant = ctx
-            .auth()
-            .spaces()
-            .get(&self.scope.space_id)
-            .ok_or(DomainError::ResourceNotFound)?;
-        if let Some(project_root) = grant.project_root.as_ref()
-            && !ancestry.ids.contains(project_root)
-        {
-            return Err(DomainError::ResourceNotFound.into());
-        }
-        ctx.auth()
-            .authorize_folder_read(&self.space, folder, &ancestry.ids)
-            .map_err(|_| DomainError::ResourceNotFound.into())
-    }
-
-    pub(super) fn path_within_project_root(&self, project_root: &FolderId, raw_path: &str) -> bool {
-        let Ok(ancestry) = self.ancestry(project_root) else {
-            return false;
-        };
-        if !ancestry.active {
-            return false;
-        }
-        let mut root_segments = Vec::new();
-        for id in ancestry.ids.iter().rev() {
-            if id == &self.root {
-                continue;
-            }
-            let Some(folder) = self.folders.get(id) else {
-                return false;
-            };
-            root_segments.push(folder.slug_fold.as_str());
-        }
-        let trimmed = raw_path.trim().trim_matches('/');
-        if trimmed.is_empty() || root_segments.is_empty() {
-            return false;
-        }
-        let target_segments: Vec<String> = trimmed
-            .split('/')
-            .filter(|seg| !seg.is_empty())
-            .map(notarium_syntax::unicode::lookup_key)
-            .collect();
-        target_segments.len() >= root_segments.len()
-            && root_segments
-                .iter()
-                .zip(target_segments.iter())
-                .all(|(root_seg, target_seg)| *root_seg == target_seg.as_str())
-    }
-
-    pub(super) fn authorize_placement_allowing_inactive(
-        &self,
-        ctx: &SpaceContext,
-        parent: &FolderId,
-        class: DocClass,
-        ability: Option<AbilityId>,
-    ) -> Result<bool, PortError> {
-        let ancestry = self.ancestry(parent)?;
-        let active = ancestry.active;
-        ctx.auth()
-            .authorize_read(&ResourceFacts {
-                space: self.space.clone(),
-                class,
-                project: ancestry
-                    .ids
-                    .iter()
-                    .find(|id| {
-                        self.folders
-                            .get(*id)
-                            .is_some_and(|folder| folder.is_project)
-                    })
-                    .cloned(),
-                ancestor_folders: ancestry.ids,
-                folder_write_locked: ancestry.locked,
-                ability_package: ability,
-            })
-            .map_err(|_| DomainError::ResourceNotFound)?;
-        Ok(active)
-    }
-
     pub(super) fn authorize_board_source(
         &self,
         ctx: &SpaceContext,
@@ -932,19 +812,6 @@ impl BoardCut {
             .map_err(|_| DomainError::ResourceNotFound.into())
     }
 
-    pub(super) fn authorize_note_allowing_inactive(
-        &self,
-        ctx: &SpaceContext,
-        note: &BoardNote,
-    ) -> Result<bool, PortError> {
-        self.authorize_placement_allowing_inactive(
-            ctx,
-            &note.parent_folder,
-            note.class,
-            note.ability.clone(),
-        )
-    }
-
     pub(super) fn authorize_note(
         &self,
         ctx: &SpaceContext,
@@ -978,7 +845,6 @@ impl BoardCut {
         views: impl IntoIterator<Item = (&'a ViewRef, &'a [notarium_core::ports::EvaluatedBoardGroup])>,
         additional: impl IntoIterator<Item = &'a NoteId>,
         auth_folders: impl IntoIterator<Item = &'a FolderId>,
-        restorations: impl IntoIterator<Item = &'a notarium_core::ports::PlannedNoteRestoration>,
         deadline: &PlannerDeadline,
     ) -> Result<LiveReadPermit, PortError> {
         deadline.check()?;
@@ -1014,41 +880,17 @@ impl BoardCut {
                 .auth()
                 .authorize_folder_read(&facts.space, folder, &facts.ancestor_folders)?)
         };
-        let restorations: Vec<_> = restorations.into_iter().collect();
-        let restored_active_views: BTreeSet<&NoteId> = restorations
-            .iter()
-            .filter(|entry| entry.planned_lifecycle == Lifecycle::Active)
-            .map(|entry| &entry.note)
-            .collect();
         for folder in auth_folders {
             check_folder(folder)?;
         }
         for (view, groups) in views {
-            if !restored_active_views.contains(&view.note) {
-                check_note(&view.note)?;
-            }
+            check_note(&view.note)?;
             for row in groups.iter().flat_map(|group| &group.rows) {
                 check_note(&row.note)?;
             }
         }
         for id in additional {
             check_note(id)?;
-        }
-        for restoration in restorations {
-            deadline.check()?;
-            if restoration.planned_lifecycle == Lifecycle::Active {
-                check_folder(&restoration.planned_parent_folder)?;
-            }
-            match permit.classify(ctx, &restoration.note, false)? {
-                LiveNoteStatus::ActiveVisible(facts)
-                | LiveNoteStatus::TrashedVisible(facts)
-                | LiveNoteStatus::EncryptedVisible { facts, .. } => {
-                    ctx.auth().authorize_read(&facts)?;
-                }
-                LiveNoteStatus::HiddenByAuth { .. } | LiveNoteStatus::PurgedOrAbsent => {
-                    return Err(DomainError::ResourceNotFound.into());
-                }
-            }
         }
         Ok(permit)
     }
@@ -1237,13 +1079,13 @@ impl PlannerDeadline {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::board::{evaluate_move, evaluate_rollback};
+    use crate::board::evaluate_move;
     use notarium_core::{
         auth::{EngineAuthContext, SpaceGrant, SpaceKind, SpaceRole, VerifiedHuman},
         ids::{GrantId, HistoryIncarnation, PrincipalId, RequestId, SpaceId, ViewKey},
         ports::{
-            BoardGroupFieldKind, CallBudget, GroupKey, MoveBoardCard, PlannedNoteRestoration,
-            RankExpectation, RollbackBoardFactsRequest, SemanticPlacement,
+            BoardGroupFieldKind, CallBudget, GroupKey, MoveBoardCard, RankExpectation,
+            SemanticPlacement,
         },
         value::ScalarValue,
     };
@@ -1484,75 +1326,6 @@ mod tests {
     }
 
     #[test]
-    fn rollback_uses_the_restored_parent_and_respects_trashed_ancestors() {
-        let (mut cut, ctx, view) = fixture("source: {scope: folder, folder: recovered}\n");
-        let restored_parent = FolderId::from_bytes([9; 16]);
-        cut.folders.insert(
-            restored_parent.clone(),
-            BoardFolder {
-                parent: Some(cut.root.clone()),
-                slug_fold: "recovered".to_owned(),
-                lifecycle: Lifecycle::Active,
-                locked: false,
-                is_project: false,
-            },
-        );
-        let (target, note) = note(10, &cut.root, DocClass::UserDoc, Some("done"), "");
-        let request = RollbackBoardFactsRequest {
-            cutoff: None,
-            views: vec![view.clone()],
-            eligible_notes: vec![PlannedNoteRestoration {
-                note: target.clone(),
-                current_revision: note.revision.clone(),
-                restored_from_revision: Some(RevisionId::from_bytes([4; 16])),
-                planned_lifecycle: Lifecycle::Active,
-                planned_parent_folder: restored_parent.clone(),
-                planned_class: DocClass::UserDoc,
-                planned_ability: None,
-                planned_header_diagnostic: None,
-                planned_carrier: None,
-                planned_fields: BTreeMap::from([(
-                    "status".to_owned(),
-                    Some(YamlValue::String("todo".to_owned())),
-                )]),
-                planned_updated_at: None,
-            }],
-        };
-        cut.notes.insert(target.clone(), note);
-        let deadline = PlannerDeadline::start(&ctx);
-        let (facts, _) = evaluate_rollback(&cut, &ctx, &request, &deadline).unwrap();
-        assert_eq!(
-            facts[&view].post_restore_membership[&target],
-            Some(group("todo"))
-        );
-        assert!(
-            facts[&view]
-                .groups
-                .iter()
-                .all(|column| column.rows.is_empty())
-        );
-
-        // The board's folder itself must stay active. Trash a descendant that
-        // was the earlier placement of the restored card.
-        let child = FolderId::from_bytes([11; 16]);
-        cut.folders.insert(
-            child.clone(),
-            BoardFolder {
-                parent: Some(restored_parent.clone()),
-                slug_fold: "child".to_owned(),
-                lifecycle: Lifecycle::Trashed,
-                locked: false,
-                is_project: false,
-            },
-        );
-        let mut request = request;
-        request.eligible_notes[0].planned_parent_folder = child;
-        let (facts, auth_folders) = evaluate_rollback(&cut, &ctx, &request, &deadline).unwrap();
-        assert_eq!(facts[&view].post_restore_membership[&target], None);
-        assert!(auth_folders.contains(&restored_parent));
-    }
-
-    #[test]
     fn static_source_auth_rejects_oracle_even_when_filter_matches_no_notes() {
         // Class oracle: source includes profile, caller only has UserDoc, and
         // filter matches ZERO notes — must still reject statically before filter evaluation.
@@ -1767,7 +1540,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let moved_created = store
+        let _moved_created = store
             .create_note(
                 owner.clone(),
                 Mutation {
@@ -1842,41 +1615,25 @@ mod tests {
             Some(past_cutoff),
             [&view_ref],
             [&moved_id, &purged_id],
-            &[],
-            false,
             &deadline,
         )
         .await
         .unwrap();
-        let hidden_restoration = PlannedNoteRestoration {
-            note: moved_id,
-            current_revision: moved_created.value.revision,
-            restored_from_revision: None,
-            planned_lifecycle: Lifecycle::Active,
-            planned_parent_folder: project_a.clone(),
-            planned_class: DocClass::UserDoc,
-            planned_ability: None,
-            planned_fields: BTreeMap::new(),
-            planned_header_diagnostic: None,
-            planned_carrier: None,
-            planned_updated_at: None,
-        };
         assert!(matches!(
             cut.check_live(
                 &engine,
                 &scoped,
                 Some(past_cutoff),
                 std::iter::empty(),
+                std::iter::once(&moved_id),
                 std::iter::empty(),
-                std::iter::empty(),
-                std::iter::once(&hidden_restoration),
                 &deadline,
             ),
             Err(PortError::Domain(DomainError::ResourceNotFound))
         ));
 
         // 2. Now purge purged_id concurrently after BoardCut::load and prove check_live
-        //    rejects the PurgedOrAbsent restoration instead of silently skipping it.
+        //    rejects the PurgedOrAbsent note instead of silently skipping it.
         let purged_receipt = store
             .delete_note(
                 owner.clone(),
@@ -1895,28 +1652,14 @@ mod tests {
             .wait_for_projected(&scope, purged_receipt.receipt.seq(), &budget)
             .await
             .unwrap();
-        let purged_restoration = PlannedNoteRestoration {
-            note: purged_id,
-            current_revision: purged_created.value.revision,
-            restored_from_revision: None,
-            planned_lifecycle: Lifecycle::Active,
-            planned_parent_folder: project_a,
-            planned_class: DocClass::UserDoc,
-            planned_ability: None,
-            planned_fields: BTreeMap::new(),
-            planned_header_diagnostic: None,
-            planned_carrier: None,
-            planned_updated_at: None,
-        };
         assert!(matches!(
             cut.check_live(
                 &engine,
                 &scoped,
                 Some(past_cutoff),
                 std::iter::empty(),
+                std::iter::once(&purged_id),
                 std::iter::empty(),
-                std::iter::empty(),
-                std::iter::once(&purged_restoration),
                 &deadline,
             ),
             Err(PortError::Domain(DomainError::ResourceNotFound))
@@ -1933,7 +1676,6 @@ mod tests {
                 std::iter::empty(),
                 std::iter::empty(),
                 std::iter::empty(),
-                std::iter::empty(),
                 &deadline,
             ),
             Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
@@ -1946,8 +1688,6 @@ mod tests {
                 Some(past_cutoff),
                 [&view_ref],
                 std::iter::empty(),
-                &[],
-                false,
                 &deadline,
             )
             .await,

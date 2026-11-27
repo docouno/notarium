@@ -430,11 +430,9 @@ async fn wide_subtree_probes_children_by_parent_before_analyze() {
             query.get_status(rusqlite::StatementStatus::VmStep) < 100_000,
             "1,254 descendants must not trigger repeated Space scans"
         );
-        // Also verify rollback's pre-run rank revision query and compaction candidate query
+        // Also verify compaction candidate and project ability subtree queries
         // use their exact indexes without scans, skip-scans (ANY(...)), or temp B-trees
         // both pre- and post-ANALYZE with realistic cardinality statistics.
-        const PRERUN_RANK_SQL: &str =
-            include_str!("../../src/domain/rollback/prerun_rank.sqlite.sql");
         const COMPACTION_CANDIDATES_SQL: &str =
             include_str!("../../src/chats/latest_compaction_candidates.sqlite.sql");
         const PROJECT_ABILITY_SUBTREE_SQL: &str =
@@ -567,35 +565,6 @@ async fn wide_subtree_probes_children_by_parent_before_analyze() {
             if phase == "post-ANALYZE" {
                 conn.execute_batch("ANALYZE").unwrap();
             }
-            let mut rank_plan = conn
-                .prepare(&format!("EXPLAIN QUERY PLAN {PRERUN_RANK_SQL}"))
-                .unwrap();
-            let rank_details = rank_plan
-                .query_map(
-                    rusqlite::params![
-                        scope.space_id.as_str(),
-                        scope.incarnation.as_bytes().as_slice(),
-                        "rk_1",
-                        "run_1",
-                        900i64
-                    ],
-                    |r| r.get::<_, String>(3),
-                )
-                .unwrap()
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap()
-                .join("\n");
-            assert!(
-                rank_details.contains("idx_revisions_entity_vis_seq"),
-                "{phase} pre-run rank query must use idx_revisions_entity_vis_seq:\n{rank_details}"
-            );
-            assert!(
-                !rank_details.contains("SCAN ")
-                    && !rank_details.contains("TEMP B-TREE")
-                    && !rank_details.contains("ANY("),
-                "{phase} pre-run rank query must avoid scans, skip-scans, and temp B-trees:\n{rank_details}"
-            );
-
             let mut comp_plan = conn
                 .prepare(&format!("EXPLAIN QUERY PLAN {COMPACTION_CANDIDATES_SQL}"))
                 .unwrap();
@@ -786,55 +755,6 @@ async fn wide_subtree_probes_children_by_parent_before_analyze() {
                     && !slot_details.contains("SCAN ability_packages")
                     && !slot_details.contains("SCAN folder_heads"),
                 "{phase} ability_slot_check must seek idx_ability_packages_active_slug without scanning folder_heads:\n{slot_details}"
-            );
-
-            let mut prerun_plan = conn
-                .prepare(&format!("EXPLAIN QUERY PLAN {PRERUN_RANK_SQL}"))
-                .unwrap();
-            let prerun_details = prerun_plan
-                .query_map(
-                    rusqlite::params![
-                        scope.space_id.as_str(),
-                        scope.incarnation.as_bytes().as_slice(),
-                        "nt_v:default:nt_t",
-                        "run_0001",
-                        9999i64,
-                    ],
-                    |r| r.get::<_, String>(3),
-                )
-                .unwrap()
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap()
-                .join("\n");
-            assert!(
-                prerun_details.contains("idx_revisions_entity_vis_seq")
-                    && !prerun_details.contains("SCAN revisions")
-                    && !prerun_details.contains("TEMP B-TREE FOR ORDER BY"),
-                "{phase} prerun_rank must seek idx_revisions_entity_vis_seq without temp sort:\n{prerun_details}"
-            );
-
-            const RUN_VIS_SEQS_SQL: &str =
-                include_str!("../../src/domain/rollback/run_vis_seqs.sqlite.sql");
-            let mut run_vis_plan = conn
-                .prepare(&format!("EXPLAIN QUERY PLAN {RUN_VIS_SEQS_SQL}"))
-                .unwrap();
-            let run_vis_details = run_vis_plan
-                .query_map(
-                    rusqlite::params![
-                        scope.space_id.as_str(),
-                        scope.incarnation.as_bytes().as_slice(),
-                        "run_0001",
-                    ],
-                    |r| r.get::<_, String>(3),
-                )
-                .unwrap()
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap()
-                .join("\n");
-            assert!(
-                run_vis_details.contains("idx_revisions_agent_run")
-                    && !run_vis_details.contains("SCAN revisions"),
-                "{phase} run_vis_seqs must seek idx_revisions_agent_run:\n{run_vis_details}"
             );
         }
     }

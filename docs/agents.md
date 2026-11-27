@@ -181,7 +181,7 @@ The full parent chain remains available through `read_chat`.
 Run rollback uses canonical mutation provenance to undo eligible note effects
 while preserving later manual edits. Retrying the same run and command key
 returns the original rollback receipt under current authorization. The writer checks every
-note and board view named in the stored response against current access, including
+note named in the stored response against current access, including
 notes skipped because of manual edits or an active room. Purging a referenced
 note erases new receipt details. The remaining envelope contains the receipt
 token and empty result lists.

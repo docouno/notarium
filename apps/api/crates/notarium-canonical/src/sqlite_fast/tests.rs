@@ -8,41 +8,6 @@ use notarium_core::{
 use std::sync::mpsc;
 use tokio::sync::oneshot;
 
-#[test]
-fn rollback_board_history_includes_run_moves_and_both_ends_of_foreign_moves() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    conn.execute_batch(
-        "CREATE TABLE revisions(space_id TEXT, agent_run_id TEXT, entity_type TEXT, entity_key TEXT);
-         CREATE TABLE board_move_history(space_id TEXT, agent_run_id TEXT, target_note_id TEXT, view_note_id TEXT);",
-    ).unwrap();
-    let space = SpaceId::from_bytes([1; 16]);
-    let run = AgentRunId::from_bytes([2; 16]);
-    conn.execute(
-        "INSERT INTO revisions VALUES (?1, ?2, 'note', 'changed')",
-        params![space.as_str(), run.as_str()],
-    )
-    .unwrap();
-    assert!(!has_rollback_board_history_rusqlite(&conn, &space, &run).unwrap());
-    for (scope, author, target, view, relevant) in [
-        (space.as_str(), "run_peer", "nt_other", "nt_board", false),
-        ("sp_else", run.as_str(), "changed", "nt_board", false),
-        (space.as_str(), run.as_str(), "nt_other", "nt_board", true),
-        (space.as_str(), "run_peer", "changed", "nt_board", true),
-        (space.as_str(), "run_peer", "nt_other", "changed", true),
-    ] {
-        conn.execute("DELETE FROM board_move_history", []).unwrap();
-        conn.execute(
-            "INSERT INTO board_move_history VALUES (?1, ?2, ?3, ?4)",
-            params![scope, author, target, view],
-        )
-        .unwrap();
-        assert_eq!(
-            has_rollback_board_history_rusqlite(&conn, &space, &run).unwrap(),
-            relevant
-        );
-    }
-}
-
 #[tokio::test]
 async fn native_rollback_checks_the_lease_before_publishing_sql_and_room_state() {
     struct Lease(bool);

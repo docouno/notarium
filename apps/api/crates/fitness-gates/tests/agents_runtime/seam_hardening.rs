@@ -27444,50 +27444,6 @@ async fn verify_part_i_locks_and_rollback(
         json!(true),
         "rejected MCP link must leave published ability healthy: {ab_after}"
     );
-    let dup_note = NoteId::from_bytes([0xF0, 9, 11, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
-    let dup_rev = RevisionId::from_bytes([0xF0, 9, 11, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
-    let dup_rb_err = fixture
-        .canonical
-        .rollback_agent_run(
-            s2_sc.clone(),
-            Mutation {
-                identity: CommandIdentity {
-                    scope: s2.history.clone(),
-                    actor: actor.clone(),
-                    key: CommandKey::from_bytes([
-                        0xF0, 9, 11, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3,
-                    ]),
-                    hash: ContentDigest::from_bytes([0xF2; 32]),
-                },
-                preconditions: Preconditions::default(),
-                input: RollbackAgentRun {
-                    run: AgentRunId::from_bytes([
-                        0xF0, 9, 11, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4,
-                    ]),
-                    expected_run_revision: dup_rev.clone(),
-                    expected_entities: vec![
-                        NoteRevision {
-                            note: dup_note.clone(),
-                            revision: dup_rev.clone(),
-                        },
-                        NoteRevision {
-                            note: dup_note,
-                            revision: dup_rev,
-                        },
-                    ],
-                    associated_board_expectations: Vec::new(),
-                },
-            },
-        )
-        .await;
-    assert!(
-        matches!(
-            dup_rb_err,
-            Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
-                if diagnostic.reason == ValidationReason::InvalidState
-        ),
-        "duplicate expected_entities on nonexistent run must reject InvalidState before lookup, got {dup_rb_err:?}"
-    );
     // 7. Write-only caller without read permission on touched notes cannot roll back a note-only run.
     let rb_view_note = NoteId::from_bytes([0xF0, 9, 11, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
     fixture

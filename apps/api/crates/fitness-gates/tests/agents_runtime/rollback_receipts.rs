@@ -85,7 +85,6 @@ async fn check_receipt(
     let original = rollback().await.unwrap();
     assert!(original.value.restored.is_empty());
     assert!(original.value.trashed.is_empty());
-    assert!(original.value.restored_ranks.is_empty());
     assert_eq!(
         original.value.skipped_manual_edits,
         std::slice::from_ref(&manual)
@@ -172,7 +171,6 @@ async fn check_receipt(
             assert_eq!(replay.receipt, original.receipt);
             assert!(replay.value.restored.is_empty());
             assert!(replay.value.trashed.is_empty());
-            assert!(replay.value.restored_ranks.is_empty());
             assert!(replay.value.skipped_manual_edits.is_empty());
             assert!(replay.value.skipped_room_active.is_empty());
         }

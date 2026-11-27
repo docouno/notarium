@@ -14,8 +14,8 @@ use notarium_core::{
         Link, LinkBatch, LiveCollabInterceptor, MemoryAppendResult, MintAndPurge,
         MintAndPurgeResult, MoveBoardCard, MoveFolder, MoveNote, Mutation, NoteCard, NoteRevision,
         NoteSnapshot, NoteWritePort, PageLimit, PortFuture, PublishAbilityPackage,
-        ReadAbilityResource, RenameFolder, RenameNote, RenameProject, RollbackAgentRun,
-        RollbackResult, SpaceContext, TrashAbilityPackage,
+        ReadAbilityResource, RenameFolder, RenameNote, RenameProject, RollbackResult, SpaceContext,
+        TrashAbilityPackage,
     },
 };
 
@@ -184,15 +184,6 @@ impl NoteWritePort for CanonicalStore {
         Box::pin(async move { packages::publish_ability_package_impl(&store, ctx, request).await })
     }
 
-    fn rollback_agent_run(
-        &self,
-        ctx: SpaceContext,
-        request: Mutation<RollbackAgentRun>,
-    ) -> PortFuture<'_, Committed<RollbackResult>> {
-        let store = self.clone();
-        Box::pin(async move { rollback::rollback_agent_run_impl(&store, ctx, request).await })
-    }
-
     fn rollback_agent_run_by_id(
         &self,
         ctx: SpaceContext,
@@ -256,17 +247,6 @@ impl CanonicalStore {
         revision: Option<notarium_core::ids::RevisionId>,
     ) -> Result<notarium_core::ports::SpaceSchemaSnapshot, PortError> {
         folder_paths::space_schema_snapshot(self, ctx, revision).await
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    pub async fn prepare_agent_run_rollback(
-        &self,
-        ctx: SpaceContext,
-        run: AgentRunId,
-    ) -> Result<RollbackAgentRun, PortError> {
-        rollback::prepare_agent_run_rollback(self, ctx, run)
-            .await
-            .map(|(prepared, _)| prepared)
     }
 
     pub fn room_fences(&self) -> &Arc<RoomFenceTable> {

@@ -20,7 +20,7 @@ use notarium_core::{
     error::PortError,
     ids::*,
     patch::CarrierEditOrigin,
-    ports::{NoteRevision, NoteWritePort, RollbackAgentRun, ServicePurpose},
+    ports::{NoteWritePort, ServicePurpose},
 };
 use support::*;
 use yrs::{
@@ -262,7 +262,6 @@ async fn abrupt_restart(pg: Option<(&StorageTestFixtures, &str, &str)>) {
     let hub = CollabHub::new(store.clone(), Default::default()).unwrap();
     hub.register().unwrap();
     let owner = owner_context(&scope);
-    let mut rollback_heads = Vec::new();
     for seed in DIRTY_FIRST..=CLEAN {
         let note = NoteId::from_bytes([seed; 16]);
         let saved = store
@@ -272,32 +271,15 @@ async fn abrupt_restart(pg: Option<(&StorageTestFixtures, &str, &str)>) {
             .unwrap();
         assert_eq!(saved.session.room_state, CollabRoomState::Fenced);
         assert_eq!(saved.session.carrier_dirty, seed != CLEAN);
-        rollback_heads.push(NoteRevision {
-            note,
-            revision: saved.session.carrier_rev_id,
-        });
     }
     let run = agent_run();
-    let run_revision = store
-        .inspect_agent_run_revision_for_test(&scope.space_id, &run)
-        .await
-        .unwrap()
-        .unwrap();
-    let rollback = mutation(
-        &owner,
-        RollbackAgentRun {
-            run,
-            expected_run_revision: run_revision,
-            expected_entities: rollback_heads,
-            associated_board_expectations: Vec::new(),
-        },
-    );
+    let rollback = mutation(&owner, run);
     let committed = store
-        .rollback_agent_run(owner.clone(), rollback.clone())
+        .rollback_agent_run_by_id(owner.clone(), rollback.clone())
         .await
         .unwrap();
     let replay = store
-        .rollback_agent_run(owner.clone(), rollback)
+        .rollback_agent_run_by_id(owner.clone(), rollback)
         .await
         .unwrap();
     assert_eq!(committed.receipt, replay.receipt);

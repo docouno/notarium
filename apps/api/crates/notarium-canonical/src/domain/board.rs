@@ -4,19 +4,18 @@ use notarium_core::{
     DomainError,
     classes::{DocClass, authorize_field_key},
     error::{Diagnostic, PortError, ValidationReason},
-    ids::{AgentRunId, ContentDigest, NoteId, PrincipalId, RevisionId, SpaceId, SpaceSeq, ViewKey},
+    ids::{AgentRunId, NoteId, PrincipalId, RevisionId, SpaceId, SpaceSeq, ViewKey},
     model::{HistoryScope, Lifecycle},
     ports::{
         BoardMoveFacts, BoardMoveResult, ClosedRoomReservation, Committed, EvaluatedBoardRow,
         GroupKey, InterceptedMutation, InterceptedOutcome, InterceptedPayload, InterceptionResult,
-        MoveBoardCard, Mutation, NoteRevision, Preconditions, RankExpectation, SemanticPlacement,
-        SpaceContext, ViewRef,
+        MoveBoardCard, Mutation, NoteRevision, Preconditions, RankExpectation, SpaceContext,
+        ViewRef,
     },
     receipt::{CommandIdentity, MutationReceiptToken},
     value::Timestamp,
 };
 use notarium_syntax::frontmatter::FieldEdit;
-use serde::{Deserialize, Serialize};
 use sqlx::Row;
 
 use crate::{
@@ -258,53 +257,6 @@ pub fn compute_rank_placement(
     }
 }
 
-/// Adjacently-tagged MessagePack mirror of `notarium_core::ports::SemanticPlacement`
-/// (`notarium_core`'s `SemanticPlacement` is internally tagged for JSON/utoipa).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "placement", content = "data", rename_all = "snake_case")]
-pub(crate) enum StoredSemanticPlacementV1 {
-    Ineligible,
-    InGroup {
-        group: GroupKey,
-        predecessor: Option<NoteId>,
-        successor: Option<NoteId>,
-    },
-}
-
-impl From<&SemanticPlacement> for StoredSemanticPlacementV1 {
-    fn from(value: &SemanticPlacement) -> Self {
-        match value {
-            SemanticPlacement::OutsideView => Self::Ineligible,
-            SemanticPlacement::InGroup {
-                group,
-                predecessor,
-                successor,
-            } => Self::InGroup {
-                group: group.clone(),
-                predecessor: predecessor.clone(),
-                successor: successor.clone(),
-            },
-        }
-    }
-}
-
-impl From<StoredSemanticPlacementV1> for SemanticPlacement {
-    fn from(value: StoredSemanticPlacementV1) -> Self {
-        match value {
-            StoredSemanticPlacementV1::Ineligible => Self::OutsideView,
-            StoredSemanticPlacementV1::InGroup {
-                group,
-                predecessor,
-                successor,
-            } => Self::InGroup {
-                group,
-                predecessor,
-                successor,
-            },
-        }
-    }
-}
-
 #[doc(hidden)]
 #[derive(Clone, Debug)]
 pub struct OverlayRow {
@@ -381,17 +333,6 @@ impl CanonicalStore {
     }
 }
 
-type RawOverlayTuple = (
-    Vec<u8>,
-    String,
-    String,
-    String,
-    String,
-    String,
-    Option<String>,
-    i64,
-);
-
 type RawViewOverlayTuple = (
     String,
     Vec<u8>,
@@ -403,86 +344,6 @@ type RawViewOverlayTuple = (
     Option<String>,
     i64,
 );
-
-pub(crate) async fn load_overlay_row_opt_tx(
-    tx: &mut BackendConn<'_>,
-    space_id: &SpaceId,
-    view: &ViewRef,
-    target_note: &NoteId,
-) -> Result<Option<OverlayRow>, PortError> {
-    let raw: Option<RawOverlayTuple> = match tx {
-        BackendConn::Sqlite(conn) => {
-            let row = sqlx::query(
-                    "SELECT group_key_msgpack, group_key_hex, sort_rank_lexo, rank_rev_id,
-                            placement_revision, placement_actor_id, placement_run_id, updated_seq
-                     FROM view_rank_overlays
-                     WHERE space_id = ? AND view_note_id = ? AND view_key = ? AND target_note_id = ?",
-                )
-                .bind(space_id.as_str())
-                .bind(view.note.as_str())
-                .bind(view.key.as_str())
-                .bind(target_note.as_str())
-                .fetch_optional(&mut **conn)
-                .await
-                .map_err(|err| internal_not_committed("sqlite_load_overlay_row", err.to_string()))?;
-            row.map(|r| {
-                (
-                    r.get("group_key_msgpack"),
-                    r.get("group_key_hex"),
-                    r.get("sort_rank_lexo"),
-                    r.get("rank_rev_id"),
-                    r.get("placement_revision"),
-                    r.get("placement_actor_id"),
-                    r.get("placement_run_id"),
-                    r.get("updated_seq"),
-                )
-            })
-        }
-        BackendConn::Postgres(conn) => {
-            let row = sqlx::query(
-                    "SELECT group_key_msgpack, group_key_hex, sort_rank_lexo, rank_rev_id,
-                            placement_revision, placement_actor_id, placement_run_id, updated_seq
-                     FROM view_rank_overlays
-                     WHERE space_id = $1 AND view_note_id = $2 AND view_key = $3 AND target_note_id = $4",
-                )
-                .bind(space_id.as_str())
-                .bind(view.note.as_str())
-                .bind(view.key.as_str())
-                .bind(target_note.as_str())
-                .fetch_optional(&mut **conn)
-                .await
-                .map_err(|err| crate::runtime::pg_read_error("pg_load_overlay_row", err))?;
-            row.map(|r| {
-                (
-                    r.get("group_key_msgpack"),
-                    r.get("group_key_hex"),
-                    r.get("sort_rank_lexo"),
-                    r.get("rank_rev_id"),
-                    r.get("placement_revision"),
-                    r.get("placement_actor_id"),
-                    r.get("placement_run_id"),
-                    r.get("updated_seq"),
-                )
-            })
-        }
-    };
-
-    let Some((gk_bytes, gk_hex, rank_lexo, rrev, prev, pactor, prun, useq)) = raw else {
-        return Ok(None);
-    };
-    decode_overlay_tuple(
-        target_note.clone(),
-        gk_bytes,
-        gk_hex,
-        rank_lexo,
-        rrev,
-        prev,
-        pactor,
-        prun,
-        useq,
-    )
-    .map(Some)
-}
 
 pub(crate) async fn load_view_overlays_tx(
     tx: &mut BackendConn<'_>,
@@ -798,6 +659,13 @@ fn verify_board_move_request(
     ctx: &SpaceContext,
     request: &Mutation<MoveBoardCard>,
 ) -> Result<crate::writer::CommandIdentitySpec, PortError> {
+    if matches!(
+        ctx.auth().kind(),
+        notarium_core::auth::PrincipalKind::AgentRun(_)
+            | notarium_core::auth::PrincipalKind::Keeper(_)
+    ) {
+        return Err(DomainError::AccessDenied.into());
+    }
     validate_mutation_identity(ctx, &request.identity)?;
     for (field_key, opt_val) in &request.input.fields {
         authorize_field_key(field_key)?;
@@ -1170,7 +1038,6 @@ pub(crate) async fn move_board_card_impl(
                 intent,
                 None,
                 None,
-                None,
             )
             .await
         {
@@ -1254,14 +1121,7 @@ impl CanonicalStore {
             BoardRoomWrite::Accepted(work.transition),
         );
         let stored: StoredCommittedBoardMoveV1 = self
-            .submit_write_command_until(
-                &ctx.budget,
-                deadline.at,
-                intent,
-                None,
-                None,
-                Some(active_op),
-            )
+            .submit_write_command_until(&ctx.budget, deadline.at, intent, None, Some(active_op))
             .await?;
         Ok(stored.into_committed())
     }
@@ -1562,17 +1422,6 @@ impl CanonicalStore {
                         neighbor_final_ranks.insert(nid, (r, was_already_overlay));
                     }
 
-                    let predecessor = if insert_index == 0 {
-                        None
-                    } else {
-                        Some(existing_ranked[insert_index - 1].note_id.clone())
-                    };
-                    let successor = if insert_index >= existing_ranked.len() {
-                        None
-                    } else {
-                        Some(existing_ranked[insert_index].note_id.clone())
-                    };
-
                     let run_opt = extract_agent_run_from_auth(&auth);
 
                     // Count total SpaceSeq allocations for this atomic command:
@@ -1815,15 +1664,6 @@ impl CanonicalStore {
                     let target_rank_rev = new_revision_id()?;
                     let target_placement_rev = new_revision_id()?;
                     let prior_target_ov = overlays.remove(&input.note);
-                    let before_placement_rev = match facts_cl.before_placement() {
-                        notarium_core::ports::SemanticPlacement::InGroup { group, .. } => {
-                            prior_target_ov
-                                .as_ref()
-                                .filter(|o| &o.group == group)
-                                .map(|o| o.placement_revision.clone())
-                        }
-                        notarium_core::ports::SemanticPlacement::OutsideView => None,
-                    };
 
                     upsert_overlay_and_rank_revision_tx(
                         tx,
@@ -1869,57 +1709,7 @@ impl CanonicalStore {
                         .await?;
                     }
 
-                    // 5. Append semantic `board_move_history` + `payload_owners` for Purge erasure & Rollback replay.
-                    let before_stored =
-                        StoredSemanticPlacementV1::from(facts_cl.before_placement());
-                    let after_stored = StoredSemanticPlacementV1::InGroup {
-                        group: input.group.clone(),
-                        predecessor,
-                        successor,
-                    };
-                    let before_msgpack = encode_msgpack(&before_stored)?;
-                    let after_msgpack = encode_msgpack(&after_stored)?;
-                    let before_json = input
-                        .before
-                        .as_ref()
-                        .map(|n| (n.note.as_str(), &n.expected_rank));
-                    let after_json = input
-                        .after
-                        .as_ref()
-                        .map(|n| (n.note.as_str(), &n.expected_rank));
-                    let phys_prec_json = serde_json::json!({
-                        "expected_note": input.expected_note.as_str(),
-                        "expected_view": input.expected_view.as_str(),
-                        "expected_rank": &input.expected_rank,
-                        "before": before_json,
-                        "after": after_json,
-                    })
-                    .to_string();
-
-                    insert_board_move_history_tx(
-                        tx,
-                        &scope_cl,
-                        visibility_seq,
-                        0,
-                        facts_cl.cutoff(),
-                        auth.principal(),
-                        run_opt.as_ref(),
-                        &input.view,
-                        &input.expected_view,
-                        facts_cl.schema_revision(),
-                        &facts_cl.descriptor_fingerprint(),
-                        &input.note,
-                        before_placement_rev.as_ref(),
-                        &target_placement_rev,
-                        &target_rank_rev,
-                        &phys_prec_json,
-                        &before_msgpack,
-                        &after_msgpack,
-                        &facts_cl.base_order_binding(),
-                    )
-                    .await?;
-
-                    // 6. Build receipt & change effect payload.
+                    // 5. Build receipt & change effect payload.
                     let command_id = new_prefixed_hex_id("cmd_")?;
                     let extra_digest = format!(
                         "{}:{}:{}",
@@ -2060,44 +1850,6 @@ pub(crate) async fn authorized_view_head(
     Ok(head)
 }
 
-/// Authorize visibility of a view note referenced in `board_move_history`
-/// during agent-run rollback without requiring `Lifecycle::Active` or active
-/// ancestor folders.
-///
-/// Purged or purge-fenced views (including views inside purged folders) return
-/// `Ok(None)`; visible active or trashed views still enforce folder/class read
-/// authorization and return `Ok(Some((head, effective_lifecycle)))`.
-pub(crate) async fn authorized_rollback_view_head_opt(
-    tx: &mut BackendConn<'_>,
-    space: &notarium_core::auth::Space,
-    auth: &notarium_core::auth::EngineAuthContext,
-    view: &NoteId,
-) -> Result<Option<(super::common::NoteHeadRow, Lifecycle)>, PortError> {
-    if is_note_purge_fenced_tx(tx, &space.id, view.as_str()).await? {
-        return Ok(None);
-    }
-    let head = match load_note_head_row_tx(tx, &space.id, view).await {
-        Ok(head) => head,
-        Err(PortError::Domain(DomainError::ResourceNotFound)) => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    let (facts, anc) = build_resource_facts_tx(
-        tx,
-        space,
-        &head.parent_folder_id,
-        head.doc_class,
-        head.ability_id.clone(),
-        false,
-    )
-    .await?;
-    let effective = super::common::combine_lifecycle(head.lifecycle, anc.folder_lifecycle);
-    if effective == Lifecycle::Purged {
-        return Ok(None);
-    }
-    auth.authorize_read(&facts)?;
-    Ok(Some((head, effective)))
-}
-
 fn build_move_board_card_identity_spec(
     ctx: &SpaceContext,
     request: &Mutation<MoveBoardCard>,
@@ -2161,135 +1913,6 @@ fn move_identity_for_group(
     )
     .with_preconditions(&request.preconditions, "note", request.input.note.as_str())
     .with_known_base(&request.input.expected_note))
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn insert_board_move_history_tx(
-    tx: &mut BackendConn<'_>,
-    scope: &HistoryScope,
-    command_end_seq: SpaceSeq,
-    ordinal: i32,
-    facts_cutoff_seq: SpaceSeq,
-    actor_id: &PrincipalId,
-    agent_run_id: Option<&AgentRunId>,
-    view: &ViewRef,
-    view_rev_id: &RevisionId,
-    schema_rev_id: Option<&RevisionId>,
-    descriptor_fingerprint: &ContentDigest,
-    target_note_id: &NoteId,
-    before_placement_revision: Option<&RevisionId>,
-    after_placement_revision: &RevisionId,
-    after_rank_rev_id: &RevisionId,
-    physical_precondition_json: &str,
-    before_placement_msgpack: &[u8],
-    after_placement_msgpack: &[u8],
-    base_order_binding: &ContentDigest,
-) -> Result<(), PortError> {
-    let end_i64 = command_end_seq.get() as i64;
-    let cut_i64 = facts_cutoff_seq.get() as i64;
-    let run_str = agent_run_id.map(AgentRunId::as_str);
-    let schema_str = schema_rev_id.map(RevisionId::as_str);
-    let before_prev_str = before_placement_revision.map(RevisionId::as_str);
-    let payload_id = format!("{}:{ordinal}", command_end_seq.get());
-
-    match tx {
-        BackendConn::Sqlite(conn) => {
-            sqlx::query(
-                "INSERT INTO board_move_history (
-                    space_id, history_incarnation, command_end_seq, ordinal, facts_cutoff_seq,
-                    actor_id, agent_run_id, view_note_id, view_key, view_rev_id, schema_rev_id,
-                    descriptor_fingerprint, target_note_id, before_placement_revision,
-                    after_placement_revision, after_rank_rev_id, physical_precondition_json,
-                    before_placement_msgpack, after_placement_msgpack, base_order_binding
-                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            )
-            .bind(scope.space_id.as_str())
-            .bind(scope.incarnation.as_bytes().as_slice())
-            .bind(end_i64)
-            .bind(i64::from(ordinal))
-            .bind(cut_i64)
-            .bind(actor_id.as_str())
-            .bind(run_str)
-            .bind(view.note.as_str())
-            .bind(view.key.as_str())
-            .bind(view_rev_id.as_str())
-            .bind(schema_str)
-            .bind(descriptor_fingerprint.as_bytes().as_slice())
-            .bind(target_note_id.as_str())
-            .bind(before_prev_str)
-            .bind(after_placement_revision.as_str())
-            .bind(after_rank_rev_id.as_str())
-            .bind(physical_precondition_json)
-            .bind(before_placement_msgpack)
-            .bind(after_placement_msgpack)
-            .bind(base_order_binding.as_bytes().as_slice())
-            .execute(&mut **conn)
-            .await
-            .map_err(|err| internal_not_committed("sqlite_insert_bmh", err.to_string()))?;
-
-            for owner in [target_note_id, &view.note] {
-                sqlx::query(
-                    "INSERT OR IGNORE INTO payload_owners (space_id, payload_kind, payload_id, note_id)
-                     VALUES (?, 'board_move_history', ?, ?)",
-                )
-                .bind(scope.space_id.as_str())
-                .bind(&payload_id)
-                .bind(owner.as_str())
-                .execute(&mut **conn)
-                .await
-                .map_err(|err| internal_not_committed("sqlite_insert_bmh_owner", err.to_string()))?;
-            }
-        }
-        BackendConn::Postgres(conn) => {
-            sqlx::query(
-                "INSERT INTO board_move_history (
-                    space_id, history_incarnation, command_end_seq, ordinal, facts_cutoff_seq,
-                    actor_id, agent_run_id, view_note_id, view_key, view_rev_id, schema_rev_id,
-                    descriptor_fingerprint, target_note_id, before_placement_revision,
-                    after_placement_revision, after_rank_rev_id, physical_precondition_json,
-                    before_placement_msgpack, after_placement_msgpack, base_order_binding
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)",
-            )
-            .bind(scope.space_id.as_str())
-            .bind(scope.incarnation.as_bytes().as_slice())
-            .bind(end_i64)
-            .bind(ordinal)
-            .bind(cut_i64)
-            .bind(actor_id.as_str())
-            .bind(run_str)
-            .bind(view.note.as_str())
-            .bind(view.key.as_str())
-            .bind(view_rev_id.as_str())
-            .bind(schema_str)
-            .bind(descriptor_fingerprint.as_bytes().as_slice())
-            .bind(target_note_id.as_str())
-            .bind(before_prev_str)
-            .bind(after_placement_revision.as_str())
-            .bind(after_rank_rev_id.as_str())
-            .bind(physical_precondition_json)
-            .bind(before_placement_msgpack)
-            .bind(after_placement_msgpack)
-            .bind(base_order_binding.as_bytes().as_slice())
-            .execute(&mut **conn)
-            .await
-            .map_err(|err| internal_not_committed("pg_insert_bmh", err.to_string()))?;
-
-            for owner in [target_note_id, &view.note] {
-                sqlx::query(
-                    "INSERT INTO payload_owners (space_id, payload_kind, payload_id, note_id)
-                     VALUES ($1, 'board_move_history', $2, $3)
-                     ON CONFLICT DO NOTHING",
-                )
-                .bind(scope.space_id.as_str())
-                .bind(&payload_id)
-                .bind(owner.as_str())
-                .execute(&mut **conn)
-                .await
-                .map_err(|err| internal_not_committed("pg_insert_bmh_owner", err.to_string()))?;
-            }
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]

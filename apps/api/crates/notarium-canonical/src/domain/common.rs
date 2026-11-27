@@ -15,8 +15,8 @@ use notarium_core::{
     model::{FolderRef, HistoryScope, Lifecycle},
     ports::{
         AbilityPackageRevision, BoardMoveResult, ClosedRoomReservation, Committed, GroupKey, Link,
-        LinkTarget, MintAndPurgeResult, NoteRevision, Preconditions, RestoredBoardRank,
-        RollbackReservation, RollbackResult, RoomFenceState, SpaceContext,
+        LinkTarget, MintAndPurgeResult, NoteRevision, Preconditions, RollbackReservation,
+        RollbackResult, RoomFenceState, SpaceContext,
     },
     query::FieldSchema,
     receipt::{CommandIdentity, MutationReceiptToken},
@@ -119,7 +119,7 @@ impl CommandDeadline {
         intent: crate::writer::PreparedWriteIntent,
     ) -> Result<T, PortError> {
         store
-            .submit_write_command_until(budget, self.at, intent, None, None, None)
+            .submit_write_command_until(budget, self.at, intent, None, None)
             .await
     }
 
@@ -138,7 +138,6 @@ impl CommandDeadline {
                 self.at,
                 intent,
                 canonical_effect,
-                None,
                 None,
                 None,
             )
@@ -3147,7 +3146,6 @@ impl StoredCommittedBoardMoveV1 {
 pub(crate) struct StoredCommittedRollbackV1 {
     pub restored: Vec<NoteRevision>,
     pub trashed: Vec<NoteRevision>,
-    pub restored_ranks: Vec<RestoredBoardRank>,
     pub skipped_manual_edits: Vec<NoteId>,
     pub skipped_room_active: Vec<NoteId>,
     pub receipt: MutationReceiptToken,
@@ -3158,7 +3156,6 @@ impl StoredCommittedRollbackV1 {
         Self {
             restored: Vec::new(),
             trashed: Vec::new(),
-            restored_ranks: Vec::new(),
             skipped_manual_edits: Vec::new(),
             skipped_room_active: Vec::new(),
             receipt,
@@ -3172,26 +3169,18 @@ impl StoredCommittedRollbackV1 {
             .map(|head| &head.note)
             .chain(&self.skipped_manual_edits)
             .chain(&self.skipped_room_active)
-            .chain(self.restored_ranks.iter().map(|rank| &rank.note))
     }
 
     /// Effect pointers retain their original owners. A receipt can also disclose
-    /// notes whose history was skipped and both ends of a restored board rank.
+    /// notes whose history was skipped.
     pub(crate) fn receipt_owners(&self, mut changed: Vec<NoteId>) -> Vec<NoteId> {
-        if !(self.skipped_manual_edits.is_empty()
-            && self.skipped_room_active.is_empty()
-            && self.restored_ranks.is_empty())
-        {
+        if !(self.skipped_manual_edits.is_empty() && self.skipped_room_active.is_empty()) {
             changed.extend(
                 self.skipped_manual_edits
                     .iter()
                     .chain(&self.skipped_room_active)
                     .cloned(),
             );
-            for rank in &self.restored_ranks {
-                changed.push(rank.note.clone());
-                changed.push(rank.view.note.clone());
-            }
             changed.sort_unstable();
             changed.dedup();
         }
@@ -3203,7 +3192,6 @@ impl StoredCommittedRollbackV1 {
             value: RollbackResult {
                 restored: self.restored,
                 trashed: self.trashed,
-                restored_ranks: self.restored_ranks,
                 skipped_manual_edits: self.skipped_manual_edits,
                 skipped_room_active: self.skipped_room_active,
             },

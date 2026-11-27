@@ -14,7 +14,7 @@ use std::{
 use notarium_canonical::{
     BlobBackendConfig, CanonicalConfig, CanonicalRuntime, CanonicalStore, CreateSpaceSpec,
     PgConnectConfig, PgTransport, SqlBackendConfig, UpdateSpaceSchema, WriterConfig,
-    codec::RevisionMetadataPayload, config::default_postgres_backup_budget,
+    config::default_postgres_backup_budget,
 };
 use notarium_core::{
     DomainError,
@@ -25,12 +25,11 @@ use notarium_core::{
     ids::*,
     model::HistoryScope,
     ports::{
-        AssociatedBoardExpectation, CallBudget, Cancellation, CreateNote, EventBusPort,
-        FilenamePin, GetNote, GroupKey, InterceptedMutation, InterceptionResult,
-        LiveCollabInterceptor, MaintenanceContext, MoveBoardCard, Mutation, NoteRevision,
-        NoteWritePort, PortFuture, Preconditions, RankExpectation, RollbackAgentRun,
-        RollbackReservation, ServiceAuthority, ServicePurpose, SpaceContext, SpaceEventKind,
-        ViewRef,
+        CallBudget, Cancellation, CreateNote, EventBusPort, FilenamePin, GetNote, GroupKey,
+        InterceptedMutation, InterceptionResult, LiveCollabInterceptor, MaintenanceContext,
+        MoveBoardCard, Mutation, NoteRevision, NoteWritePort, PortFuture, Preconditions,
+        RankExpectation, RollbackReservation, ServiceAuthority, ServicePurpose, SpaceContext,
+        SpaceEventKind, ViewRef,
     },
     query::{FieldObservation, FieldSchema, FieldType, FieldValue, ScalarType},
     receipt::{CausalBasis, ChangeCursor, CommandIdentity, ReceiptSet},
@@ -371,10 +370,17 @@ async fn run_board_round_trip(
     let runner = agent(&owner, run.clone(), ChatAudience::Personal);
     let intent = move_card(&card, &view, key.clone());
     let view_ref = intent.view.clone();
+    // Agents cannot mutate shared board order directly; they edit note frontmatter instead.
+    assert!(matches!(
+        store
+            .move_board_card(runner.clone(), mutation(&runner, intent.clone()))
+            .await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
     let moved = store
-        .move_board_card(runner.clone(), mutation(&runner, intent))
+        .move_board_card(owner.clone(), mutation(&owner, intent))
         .await
-        .expect("move card with the projection planner");
+        .expect("human move card with the projection planner");
     assert_eq!(moved.value.group, group("doing"));
     sync(store, runtime, &scope).await;
     let delta = tokio::time::timeout(Duration::from_secs(5), async {
@@ -402,53 +408,68 @@ async fn run_board_round_trip(
     );
     assert_eq!(delta.ranks, [(card.note.clone(), moved.value.rank.clone())]);
 
-    let run_revision = store
-        .read_entity_revision_at_cutoff(&scope, "agent_run", run.as_str(), None)
-        .await
-        .unwrap()
-        .expect("agent run revision")
-        .revision_id;
-    let rank_key = format!("{}:{}:{}", view.note, key, card.note);
-    let rank = store
-        .read_entity_revision_at_cutoff(&scope, "rank", &rank_key, None)
-        .await
-        .unwrap()
-        .expect("board rank revision");
-    let RevisionMetadataPayload::Rank(rank_meta) = rank.metadata.payload else {
-        panic!("expected rank metadata");
-    };
-
-    let rollback = store
-        .rollback_agent_run(
+    // An agent changes the card's grouping field via ordinary note editing, moving it to `done`.
+    let before_agent = store
+        .get_note(
             owner.clone(),
-            mutation(
-                &owner,
-                RollbackAgentRun {
-                    run,
-                    expected_run_revision: run_revision,
-                    expected_entities: vec![moved.value.revision],
-                    associated_board_expectations: vec![AssociatedBoardExpectation {
-                        view: view_ref,
-                        note: card.note.clone(),
-                        expected_rank: RankExpectation::Existing(rank.revision_id),
-                        expected_placement_revision: rank_meta.placement_revision,
-                    }],
-                },
-            ),
+            GetNote {
+                note: card.note.clone(),
+                revision: None,
+                causal: CausalBasis::Exact(ReceiptSet::default()),
+            },
         )
         .await
-        .expect("rollback board placement and fields with the same planner");
+        .unwrap();
+    let carrier = before_agent
+        .document
+        .explicit_read(owner.auth())
+        .expect("read card carrier");
+    let pos = carrier.find("doing").expect("status: doing in carrier");
+    let header_end = carrier
+        .find("\n---\n")
+        .map(|i| i + "\n---\n".len())
+        .unwrap_or(0);
+    let plan = notarium_syntax::patch::plan(
+        carrier,
+        notarium_core::span::ByteSpan::new(header_end, carrier.len()).unwrap(),
+        vec![(
+            notarium_core::patch::CarrierEditOrigin::Header,
+            notarium_core::span::ByteSpan::new(pos, pos + "doing".len()).unwrap(),
+            "done".into(),
+        )],
+    )
+    .unwrap();
+    let mut agent_edit = mutation(
+        &runner,
+        notarium_core::ports::EditNote {
+            note: card.note.clone(),
+            plan,
+        },
+    );
+    agent_edit.preconditions.revision = Some(moved.value.revision.revision.clone());
+    store
+        .edit_note(runner.clone(), agent_edit)
+        .await
+        .expect("agent edits status frontmatter");
+    sync(store, runtime, &scope).await;
+
+    // Rolling back the agent run restores the card to `doing` while preserving the human rank.
+    let rollback = store
+        .rollback_agent_run_by_id(owner.clone(), mutation(&owner, run))
+        .await
+        .expect("rollback agent frontmatter edit by run id");
     let restored = rollback
         .value
         .restored
         .into_iter()
         .find(|row| row.note == card.note)
         .expect("restored card");
+    sync(store, runtime, &scope).await;
     let snapshot = store
         .get_note(
             owner.clone(),
             GetNote {
-                note: card.note,
+                note: card.note.clone(),
                 revision: None,
                 causal: CausalBasis::Exact(ReceiptSet::default()),
             },
@@ -458,8 +479,19 @@ async fn run_board_round_trip(
     assert_eq!(
         snapshot.fields.get("status"),
         Some(&FieldObservation::Ok(FieldValue::Scalar(
-            ScalarValue::String("todo".into())
+            ScalarValue::String("doing".into())
         ))),
+    );
+    let overlays = store
+        .inspect_view_overlays_for_test(&scope.space_id, &view_ref)
+        .await
+        .unwrap();
+    assert_eq!(
+        overlays
+            .get(&card.note)
+            .map(|ov| ov.sort_rank_lexo.as_str()),
+        Some(moved.value.rank.as_str()),
+        "human manual rank in `doing` survives agent frontmatter edit + rollback"
     );
     (owner, view, restored, key)
 }
@@ -560,10 +592,36 @@ async fn exercise(
         AgentRunId::from_bytes(random_bytes()),
         ChatAudience::Shared,
     );
-    let denied = store
+    let agent_denied = store
         .move_board_card(
             shared.clone(),
-            mutation(&shared, move_card(&card, &view, key)),
+            mutation(&shared, move_card(&card, &view, key.clone())),
+        )
+        .await;
+    assert!(matches!(
+        agent_denied,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+    assert_eq!(interceptor.0.load(Ordering::SeqCst), 0);
+
+    // A human caller without read access to `DocClass::Profile` must receive ResourceNotFound
+    // before live room interception when the board sources `profile`.
+    let mut restricted_grants = owner.auth().spaces().clone();
+    restricted_grants
+        .get_mut(&owner.scope().space_id)
+        .unwrap()
+        .read_classes
+        .remove(&DocClass::Profile);
+    let restricted = SpaceContext::new(
+        owner.auth().for_pat(restricted_grants).unwrap(),
+        owner.scope().clone(),
+        budget(),
+    )
+    .unwrap();
+    let denied = store
+        .move_board_card(
+            restricted.clone(),
+            mutation(&restricted, move_card(&card, &view, key)),
         )
         .await;
     assert!(matches!(

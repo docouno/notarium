@@ -65,7 +65,7 @@ The store implements
 (`get_note`, `get_note_metadata`, `hydrate_cards`, `read_ability_resource`, `read_changes`,
 `recent_activity`, `resolve_note_target`, `resolve_folder_path`,
 `list_child_folders`, `space_schema`), `move_board_card`,
-`rollback_agent_run`,
+`rollback_agent_run_by_id`,
 `accept_external_observation`, and peer session/job persistence. Full query
 planning (`NoteReadPort::list_notes`), `ViewGraphPort` and `SearchPort` remain
 owned by downstream projection and search crates.
@@ -488,29 +488,25 @@ same example against an isolated prefix.
   serialization. Authorization inspects the moved subtree for folder write
   locks and descendant document classes before validating depth. Same-depth and
   upward moves check the two ancestor paths; moving deeper also probes indexed
-  children until the first path that would exceed 256 levels. `move_board_card` maintains `<= 16`-byte `sort_rank_lexo` keys
-  via windowed Packed Memory Array (PMA) rebalancing that updates physical
+  children until the first path that would exceed 256 levels. `move_board_card`
+  is restricted to human callers and maintains `<= 16`-byte `sort_rank_lexo`
+  keys via windowed Packed Memory Array (PMA) rebalancing that updates physical
   `rank_rev_id` without overwriting semantic `placement_revision` provenance.
-  Rollback spends one caller budget across room reservations, Board planning,
-  retries and writer admission. The direct PostgreSQL path includes the writer
-  safe point, connection checkout and SQL in that budget. Planning reads also
-  respect the configured read timeout. Cancellation before writer admission
+  Agent runs move cards across columns by editing note frontmatter directly, so
+  shared manual board ordering stays human-owned.
+  `rollback_agent_run_by_id` spends one caller budget across optional room
+  reservations (when live collaboration rooms or fences are present in the
+  Space), retries and writer admission. Cancellation before writer admission
   leaves the command uncommitted. A queued command can finish after its caller
-  stops waiting. An ambiguous acknowledgement returns `Unknown`. Retrying with
-  the same command identity recovers the durable outcome. On the direct
-  PostgreSQL path the writer gate and room fences cover the outstanding COMMIT.
-  Pools with at least three connections can retain one idle rollback session
-  across Spaces to reuse database plans. A successful rollback returns that
-  session to the cache after COMMIT acknowledgement. Shutdown drains the cache.
-  `rollback_agent_run` freezes eligible targets and closed-room reservations
-  before planning, simulates inverse board moves in reverse command order over
-  recorded semantic before-anchors, and applies `Trash`-first slug deconfliction
-  atomically. Restoring a note to a different folder requires write access to
-  both its current and restored placement and document class. For user
-  documents directly under the root, PostgreSQL reads each current head
-  alongside its pre-run revision and candidate blob publication. The commit
-  locks the Space and rechecks the writer epoch, run revision, expected
-  heads, root permissions and live publications.
+  stops waiting. An ambiguous acknowledgement returns `Unknown`; retrying with
+  the same command identity recovers the durable outcome. Inside a single writer
+  transaction, `rollback_agent_run_by_id` verifies live authorization on touched
+  notes and their pre-run destinations, skips notes with later manual edits or
+  active rooms, locks closed-room fences, applies `Trash`-first slug
+  deconfliction atomically, removes rank overlays for retired notes/views,
+  synchronizes folder covers and ability entrypoints, and restores pre-run
+  content and timestamps. Restoring a note to a different folder requires write
+  access to both its current and restored placement and document class.
 - **Collaboration room ownership.** A PostgreSQL writer takeover fences active
   rooms in the same transaction that advances the Space writer epoch. The
   successor recovers the stored snapshot and durable updates under the room

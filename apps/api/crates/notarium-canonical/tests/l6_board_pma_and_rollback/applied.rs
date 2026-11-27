@@ -1136,26 +1136,7 @@ async fn check_room_command_commit(store: &CanonicalStore, ctx: &SpaceContext, r
         .unwrap();
     assert_eq!(closed.room_state, CollabRoomState::Closed);
     let rollback = store
-        .rollback_agent_run(
-            ctx.clone(),
-            next_mutation(
-                scope,
-                actor,
-                RollbackAgentRun {
-                    expected_run_revision: store
-                        .inspect_agent_run_revision_for_test(&scope.space_id, &run)
-                        .await
-                        .unwrap()
-                        .unwrap(),
-                    run,
-                    expected_entities: vec![NoteRevision {
-                        note: note.clone(),
-                        revision: settled.carrier_rev_id.clone(),
-                    }],
-                    associated_board_expectations: vec![],
-                },
-            ),
-        )
+        .rollback_agent_run_by_id(ctx.clone(), next_mutation(scope, actor, run))
         .await
         .unwrap();
     assert!(rollback.value.skipped_manual_edits.is_empty());

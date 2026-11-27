@@ -207,12 +207,8 @@ pub(super) async fn check(
     assert_eq!(cover_at(&left).await, None);
     assert_eq!(cover_at(&right).await.as_ref(), Some(&left_note));
 
-    let plan = store
-        .prepare_agent_run_rollback(ctx.clone(), run)
-        .await
-        .unwrap();
     let result = store
-        .rollback_agent_run(ctx.clone(), next_mutation(scope, owner, plan))
+        .rollback_agent_run_by_id(ctx.clone(), next_mutation(scope, owner, run))
         .await
         .unwrap();
     assert_eq!(result.value.restored[0].note, left_note);

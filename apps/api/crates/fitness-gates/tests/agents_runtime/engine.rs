@@ -361,7 +361,6 @@ canonical_port!(NoteWritePort;
     rename_project(Mutation<RenameProject>) -> Committed<FolderRef>,
     accept_batch(AcceptBatch) -> BatchResult<NoteRevision>,
     link(Mutation<Link>) -> Committed<Link>,
-    rollback_agent_run(Mutation<RollbackAgentRun>) -> Committed<RollbackResult>,
     accept_external_observation(Mutation<ExternalObservation>) -> ExternalObservationResult;
 
     fn link_many(

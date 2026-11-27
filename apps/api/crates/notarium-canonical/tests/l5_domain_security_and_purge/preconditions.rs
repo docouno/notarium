@@ -3,7 +3,7 @@ use notarium_core::{
     ids::{ChatThreadId, JobId, LineageEpoch, PendingInputId, ThreadEntrySeq},
     ports::{
         CancelJob, ChatPort, ChatThreadKind, ContentJobKind, ContentJobPort, CreateChat, ForkChat,
-        PendingChatInput, RollbackAgentRun,
+        PendingChatInput,
     },
 };
 
@@ -123,16 +123,7 @@ async fn mutation_envelopes_validate_before_replay_on_both_drivers() {
             },
             pre
         );
-        invalid!(
-            rollback_agent_run,
-            RollbackAgentRun {
-                run,
-                expected_run_revision: revision.clone(),
-                expected_entities: vec![],
-                associated_board_expectations: vec![]
-            },
-            pre
-        );
+        invalid!(rollback_agent_run_by_id, run, pre);
         invalid!(create_job, ContentJobKind::Backup, pre);
         invalid!(
             cancel_job,

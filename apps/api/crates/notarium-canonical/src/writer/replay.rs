@@ -25,7 +25,6 @@ pub(crate) enum ReplayResource {
     WriteUnpurged(NoteId),
     Read(NoteId),
     View(NoteId),
-    RollbackView(NoteId),
     Create(NoteId, Option<FolderId>, DocClass),
     Move(NoteId, Option<FolderId>),
     WriteFolder(Option<FolderId>),
@@ -37,7 +36,6 @@ pub(crate) enum ReplayResource {
 pub(crate) enum ReplayPolicy {
     Documents(Vec<ReplayResource>),
     RollbackRun(AgentRunId),
-    RollbackDocuments(Vec<ReplayResource>),
     Schema(Vec<ReplayResource>),
     Memory(ResolvedMemoryTarget),
     Chat(ChatThreadId, Option<ThreadEntrySeq>, Vec<NoteRef>, bool),
@@ -63,11 +61,6 @@ impl UnboundCommand {
         canonical_effect: Option<CanonicalEffectAdmission>,
     ) -> Self {
         Self(spec, canonical_effect)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn command_hash(&self) -> notarium_core::ids::ContentDigest {
-        self.0.command_hash
     }
 
     pub(crate) fn with_policy(
@@ -201,16 +194,14 @@ impl CommandIdentitySpec {
         &self,
         scope: &HistoryScope,
         receipt: &super::StoredReceiptRow,
-    ) -> Result<std::collections::BTreeMap<NoteId, bool>, PortError> {
-        let mut notes = std::collections::BTreeMap::new();
+    ) -> Result<std::collections::BTreeSet<NoteId>, PortError> {
+        let mut notes = std::collections::BTreeSet::new();
         if receipt.command_hash == self.command_hash
             && receipt.status == "completed"
-            && self.authority.as_deref().is_some_and(|a| {
-                matches!(
-                    a.policy,
-                    ReplayPolicy::RollbackRun(_) | ReplayPolicy::RollbackDocuments(_)
-                )
-            })
+            && self
+                .authority
+                .as_deref()
+                .is_some_and(|a| matches!(a.policy, ReplayPolicy::RollbackRun(_)))
         {
             let wire: crate::domain::common::StoredCommittedRollbackV1 =
                 rmp_serde::from_slice(&receipt.response_blob).map_err(|err| {
@@ -220,12 +211,7 @@ impl CommandIdentitySpec {
                     )
                 })?;
             scope.check(wire.receipt.scope())?;
-            notes.extend(wire.disclosed_notes().map(|note| (note.clone(), false)));
-            notes.extend(
-                wire.restored_ranks
-                    .into_iter()
-                    .map(|rank| (rank.view.note, true)),
-            );
+            notes.extend(wire.disclosed_notes().cloned());
         }
         Ok(notes)
     }
@@ -243,17 +229,12 @@ impl CommandIdentitySpec {
         let auth = &self.authority.as_ref().expect("rollback authority").auth;
         let space = load_space_record(tx, &scope.space_id).await?;
         space.scope.check(scope)?;
-        let ids = notes.keys().cloned().collect::<Vec<_>>();
+        let ids = notes.iter().cloned().collect::<Vec<_>>();
         if crate::runtime::are_any_notes_purge_fenced_tx(tx, &scope.space_id, &ids).await? {
             return Err(DomainError::ResourceNotFound.into());
         }
-        for (note, is_view) in notes {
-            let target = if is_view {
-                ReplayResource::RollbackView(note)
-            } else {
-                ReplayResource::Read(note)
-            };
-            authorize_resource(tx, &space, auth, &target).await?;
+        for note in notes {
+            authorize_resource(tx, &space, auth, &ReplayResource::Read(note)).await?;
         }
         Ok(())
     }
@@ -273,14 +254,8 @@ impl CommandIdentitySpec {
             ReplayPolicy::RollbackRun(run) => {
                 // `rollback_agent_run_by_id` replay intentionally enforces live active-folder
                 // visibility on the run's current sources (see `rollback_receipts`).
-                crate::domain::rollback::prepare_rollback_sources_tx(
-                    tx,
-                    &srec,
-                    auth,
-                    run.clone(),
-                    true,
-                )
-                .await?;
+                crate::domain::rollback::authorize_rollback_run_replay_tx(tx, &srec, auth, run)
+                    .await?;
             }
             ReplayPolicy::Memory(target) => {
                 let (_, head) =
@@ -343,9 +318,7 @@ impl CommandIdentitySpec {
                 crate::peers::authorize_job_replay_tx(tx, &srec.space, auth, job.as_ref(), notes)
                     .await?
             }
-            ReplayPolicy::Documents(targets)
-            | ReplayPolicy::RollbackDocuments(targets)
-            | ReplayPolicy::Schema(targets) => {
+            ReplayPolicy::Documents(targets) | ReplayPolicy::Schema(targets) => {
                 auth.authorize_space_write(&srec.space)?;
                 if matches!(policy, ReplayPolicy::Schema(_)) {
                     authorize_schema_space(auth, &srec.space)?;
@@ -433,16 +406,6 @@ async fn authorize_resource(
             return crate::domain::board::authorized_view_head(tx, &srec.space, auth, note)
                 .await
                 .map(|_| ());
-        }
-        ReplayResource::RollbackView(note) => {
-            return crate::domain::board::authorized_rollback_view_head_opt(
-                tx,
-                &srec.space,
-                auth,
-                note,
-            )
-            .await
-            .map(|_| ());
         }
         ReplayResource::Read(note)
         | ReplayResource::Write(note)

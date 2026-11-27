@@ -67,11 +67,10 @@ async fn rollback_deadline_spans_room_reservations_and_writer_ack_on_both_backen
         let ctx = owner_ctx(&scope, owner.clone());
         let run = sample_run_id(78);
         let agent = agent_run_ctx(&ctx, run.clone());
-        let mut entities = Vec::new();
         let mut fence_epochs = Vec::new();
         for id in [78, 79] {
             let note = sample_note_id(id);
-            let created = store
+            let _created = store
                 .create_note(
                     agent.clone(),
                     next_mutation(
@@ -89,26 +88,11 @@ async fn rollback_deadline_spans_room_reservations_and_writer_ack_on_both_backen
                 )
                 .await
                 .unwrap();
-            entities.push(created.value);
             let fence = store.room_fences().get_or_init(&scope, &note);
             let epoch = fence.lock().await.epoch();
             fence_epochs.push((fence, epoch));
         }
-        let expected_run_revision = store
-            .inspect_agent_run_revision_for_test(&scope.space_id, &run)
-            .await
-            .unwrap()
-            .unwrap();
-        let command = next_mutation(
-            &scope,
-            &owner,
-            RollbackAgentRun {
-                run,
-                expected_run_revision,
-                expected_entities: entities,
-                associated_board_expectations: Vec::new(),
-            },
-        );
+        let command = next_mutation(&scope, &owner, run);
         let rooms = Arc::new(DelayedReservations {
             fences: Arc::clone(store.room_fences()),
             delay: AtomicBool::new(true),
@@ -125,7 +109,7 @@ async fn rollback_deadline_spans_room_reservations_and_writer_ack_on_both_backen
         let mut short = ctx.clone();
         short.budget.remaining = Duration::from_millis(340);
         let failure = store
-            .rollback_agent_run(short.clone(), command.clone())
+            .rollback_agent_run_by_id(short.clone(), command.clone())
             .await
             .unwrap_err();
         assert!(
@@ -156,7 +140,7 @@ async fn rollback_deadline_spans_room_reservations_and_writer_ack_on_both_backen
         rooms.delay.store(false, Ordering::SeqCst);
         let pause = store.acquire_writer_safe_point().await.unwrap();
         let ambiguous = store
-            .rollback_agent_run(short, command.clone())
+            .rollback_agent_run_by_id(short, command.clone())
             .await
             .unwrap_err();
         assert!(
@@ -165,10 +149,10 @@ async fn rollback_deadline_spans_room_reservations_and_writer_ack_on_both_backen
         );
         drop(pause);
         let confirmed = store
-            .rollback_agent_run(ctx.clone(), command.clone())
+            .rollback_agent_run_by_id(ctx.clone(), command.clone())
             .await
             .unwrap();
-        let replayed = store.rollback_agent_run(ctx, command).await.unwrap();
+        let replayed = store.rollback_agent_run_by_id(ctx, command).await.unwrap();
         assert_eq!(confirmed.receipt, replayed.receipt);
         assert_eq!(confirmed.value.trashed.len(), 2);
         assert_eq!(

@@ -17,17 +17,15 @@ use notarium_core::{
     model::Lifecycle,
     ports::{
         BoardGroupFieldKind, BoardMoveFacts, BoardMoveFactsSpec, BoardMutationFactsProvider,
-        BoardPlannerAuthority, BoardViewRollbackFacts, EvaluatedBoardGroup, EvaluatedBoardRow,
-        GroupKey, MoveBoardCard, PlannedNoteRestoration, PortFuture, RankExpectation,
-        RollbackBoardFacts, RollbackBoardFactsRequest, SemanticPlacement, SpaceContext, ViewRef,
+        BoardPlannerAuthority, EvaluatedBoardGroup, EvaluatedBoardRow, GroupKey, MoveBoardCard,
+        PortFuture, RankExpectation, SemanticPlacement, SpaceContext, ViewRef,
     },
     query::{FieldObservation, FieldSchema, FieldValue},
     value::YamlValue,
 };
-use notarium_syntax::extract::{ExtractedDocDelta, extract};
 
 use crate::{
-    nota::{NotaDescriptor, ViewInput, ViewKind, compile_projected_views},
+    nota::{NotaDescriptor, ViewKind, compile_projected_views},
     query::{
         compare_board_rows, compare_group_keys, group_key, sort_tuple, source_matches,
         view_authorization_folder,
@@ -84,8 +82,6 @@ impl BoardMutationFactsProvider for ProjectionBoardPlanner {
                 cutoff,
                 [&intent.view],
                 [&intent.note],
-                &[],
-                false,
                 &deadline,
             )
             .await?;
@@ -99,49 +95,9 @@ impl BoardMutationFactsProvider for ProjectionBoardPlanner {
                 [(&spec.view, spec.groups.as_slice())],
                 std::iter::once(&intent.note),
                 auth_folder.iter(),
-                std::iter::empty(),
                 &deadline,
             )?;
             Ok(BoardMoveFacts::attest(authority, spec))
-        })
-    }
-
-    fn evaluate_rollback<'a>(
-        &'a self,
-        authority: &'a BoardPlannerAuthority,
-        ctx: SpaceContext,
-        request: RollbackBoardFactsRequest,
-    ) -> PortFuture<'a, RollbackBoardFacts> {
-        Box::pin(async move {
-            let engine = self.engine()?;
-            let deadline = PlannerDeadline::start(&ctx);
-            let cut = BoardCut::load(
-                &engine,
-                &ctx,
-                request.cutoff,
-                request.views.iter(),
-                request.eligible_notes.iter().map(|note| &note.note),
-                &request.eligible_notes,
-                true,
-                &deadline,
-            )
-            .await?;
-            let (views, auth_folders) = evaluate_rollback(&cut, &ctx, &request, &deadline)?;
-            let _permit = cut.check_live(
-                &engine,
-                &ctx,
-                request.cutoff,
-                views
-                    .iter()
-                    .map(|(view, facts)| (view, facts.groups.as_slice())),
-                std::iter::empty(),
-                auth_folders.iter(),
-                request.eligible_notes.iter(),
-                &deadline,
-            )?;
-            Ok(RollbackBoardFacts::attest(
-                authority, cut.scope, cut.cutoff, views,
-            ))
         })
     }
 }
@@ -229,75 +185,6 @@ fn evaluate_move(
     ))
 }
 
-fn evaluate_rollback(
-    cut: &BoardCut,
-    ctx: &SpaceContext,
-    request: &RollbackBoardFactsRequest,
-    deadline: &PlannerDeadline,
-) -> Result<
-    (
-        BTreeMap<ViewRef, BoardViewRollbackFacts>,
-        BTreeSet<FolderId>,
-    ),
-    PortError,
-> {
-    let mut views = BTreeMap::new();
-    let mut auth_folders = BTreeSet::new();
-    let restored_by_note: BTreeMap<&NoteId, &PlannedNoteRestoration> = request
-        .eligible_notes
-        .iter()
-        .map(|entry| (&entry.note, entry))
-        .collect();
-    for view in &request.views {
-        deadline.check()?;
-        let restored_view = restored_by_note.get(&view.note).copied();
-        let RollbackBoardPlan::Board(plan) =
-            board_plan_for_rollback(cut, ctx, view, restored_view)?
-        else {
-            continue;
-        };
-        if let Some(folder) =
-            view_authorization_folder(&plan.descriptor.source, plan.source_folder.as_ref())
-        {
-            auth_folders.insert(folder.clone());
-        }
-        let groups = plan.groups(cut, ctx, view, deadline)?;
-        let mut post_restore_membership = BTreeMap::new();
-        let mut post_restore_entries = Vec::new();
-        for restoration in &request.eligible_notes {
-            deadline.check()?;
-            let restored = restored_membership(cut, ctx, &plan, restoration)?;
-            let membership = restored.as_ref().map(|(grp, _)| grp.clone());
-            if let Some((grp, sort_key)) = restored {
-                post_restore_entries.push((grp, restoration.note.clone(), sort_key));
-            }
-            post_restore_membership.insert(restoration.note.clone(), membership);
-        }
-        let post_restore_group_order =
-            plan.post_restore_group_order(cut, view, &groups, &post_restore_entries, deadline)?;
-        views.insert(
-            view.clone(),
-            BoardViewRollbackFacts {
-                view: view.clone(),
-                view_revision: plan.view_revision,
-                schema_revision: cut.schema_revision(),
-                descriptor_fingerprint: cut.schema_fingerprint(),
-                group_field: plan.group_field,
-                group_field_kind: plan.group_field_kind,
-                groups,
-                post_restore_membership,
-                post_restore_group_order,
-            },
-        );
-    }
-    Ok((views, auth_folders))
-}
-
-enum RollbackBoardPlan<'a> {
-    Board(Box<BoardPlan<'a>>),
-    Retired,
-}
-
 struct BoardPlan<'a> {
     view_revision: RevisionId,
     descriptor: NotaDescriptor,
@@ -305,166 +192,6 @@ struct BoardPlan<'a> {
     group_field_kind: BoardGroupFieldKind,
     fields: &'a BTreeMap<String, FieldSchema>,
     source_folder: Option<FolderId>,
-}
-
-fn board_plan_for_rollback<'a>(
-    cut: &'a BoardCut,
-    ctx: &SpaceContext,
-    view: &ViewRef,
-    restored_view: Option<&PlannedNoteRestoration>,
-) -> Result<RollbackBoardPlan<'a>, PortError> {
-    let (view_revision, parent_folder, views_owned, views_slice): (
-        RevisionId,
-        &FolderId,
-        Vec<ViewInput>,
-        Option<&[ViewInput]>,
-    ) = match restored_view {
-        None => {
-            let note = cut
-                .notes
-                .get(&view.note)
-                .ok_or(DomainError::ResourceNotFound)?;
-            let active_ancestry = cut.authorize_note_allowing_inactive(ctx, note)?;
-            if note.lifecycle != Lifecycle::Active
-                || !active_ancestry
-                || note.class == DocClass::EncryptedNote
-            {
-                return Ok(RollbackBoardPlan::Retired);
-            }
-            (
-                note.revision.clone(),
-                &note.parent_folder,
-                Vec::new(),
-                Some(note.views.as_slice()),
-            )
-        }
-        Some(restoration) => {
-            let current = cut
-                .notes
-                .get(&view.note)
-                .ok_or(DomainError::ResourceNotFound)?;
-            let _ = cut.authorize_note_allowing_inactive(ctx, current)?;
-            if current.revision != restoration.current_revision {
-                return Err(DomainError::validation(ValidationReason::CursorStale).into());
-            }
-            if restoration.planned_lifecycle != Lifecycle::Active {
-                return Ok(RollbackBoardPlan::Retired);
-            }
-            cut.authorize_placement(
-                ctx,
-                &restoration.planned_parent_folder,
-                restoration.planned_class,
-                restoration.planned_ability.clone(),
-            )?;
-            if restoration.planned_class == DocClass::EncryptedNote {
-                return Ok(RollbackBoardPlan::Retired);
-            }
-            let Some(carrier) = restoration.planned_carrier.as_deref() else {
-                return Ok(RollbackBoardPlan::Retired);
-            };
-            let extracted: Vec<ViewInput> = match extract(
-                carrier,
-                restoration.planned_class,
-                &restoration.note,
-                "",
-                None,
-            )? {
-                ExtractedDocDelta::Plain(doc) => {
-                    doc.views.into_iter().map(ViewInput::from).collect()
-                }
-                ExtractedDocDelta::Encrypted(_) => return Ok(RollbackBoardPlan::Retired),
-            };
-            (
-                restoration.current_revision.clone(),
-                &restoration.planned_parent_folder,
-                extracted,
-                None,
-            )
-        }
-    };
-
-    let fields = cut.schema_fields();
-    let compiled = compile_projected_views(views_slice.unwrap_or(&views_owned), fields);
-    let descriptor = match compiled.get(&view.key) {
-        Ok(descriptor) => descriptor,
-        Err(DomainError::ResourceNotFound | DomainError::ValidationFailed { .. }) => {
-            return Ok(RollbackBoardPlan::Retired);
-        }
-        Err(error) => return Err(error.into()),
-    };
-    if descriptor.kind != ViewKind::Board {
-        return Ok(RollbackBoardPlan::Retired);
-    }
-    let Some(group_field) = descriptor.group_by.clone() else {
-        return Ok(RollbackBoardPlan::Retired);
-    };
-    let group_field_kind = match descriptor.board_group_kind(fields) {
-        Ok(kind) => kind,
-        Err(DomainError::ValidationFailed { .. }) => return Ok(RollbackBoardPlan::Retired),
-        Err(error) => return Err(error.into()),
-    };
-
-    // Statically authorize declared source classes and unqualified Space scope
-    // BEFORE resolving the source folder so missing/trashed targets can never
-    // bypass class/Keeper checks or leak cross-project folder existence.
-    cut.authorize_board_source_static(ctx, &descriptor.source)?;
-    let project_root = ctx
-        .auth()
-        .spaces()
-        .get(&cut.scope.space_id)
-        .and_then(|grant| grant.project_root.as_ref());
-
-    let source_folder = match cut.resolve_source(&descriptor.source, parent_folder) {
-        Ok(Some(folder)) => match cut.ancestry(&folder) {
-            Ok(ancestry) => {
-                cut.authorize_folder_allowing_inactive(ctx, &folder, &ancestry)?;
-                if !ancestry.active {
-                    return Ok(RollbackBoardPlan::Retired);
-                }
-                Some(folder)
-            }
-            Err(PortError::Domain(DomainError::ResourceNotFound)) => {
-                if project_root.is_some() {
-                    return Err(DomainError::ResourceNotFound.into());
-                }
-                return Ok(RollbackBoardPlan::Retired);
-            }
-            Err(error) => return Err(error),
-        },
-        Ok(None) => {
-            cut.authorize_entry(ctx, view_authorization_folder(&descriptor.source, None))?;
-            cut.authorize_board_source(ctx, &descriptor.source, None)?;
-            None
-        }
-        Err(PortError::Domain(DomainError::ResourceNotFound)) => {
-            if let Some(root) = project_root {
-                match &descriptor.source.folder {
-                    Some(crate::nota::SourceFolder::Path(raw_path))
-                        if cut.path_within_project_root(root, raw_path) =>
-                    {
-                        return Ok(RollbackBoardPlan::Retired);
-                    }
-                    None => {
-                        // `scope: project` outside any project; note placement was
-                        // already authorized under `root`.
-                        return Ok(RollbackBoardPlan::Retired);
-                    }
-                    _ => return Err(DomainError::ResourceNotFound.into()),
-                }
-            }
-            return Ok(RollbackBoardPlan::Retired);
-        }
-        Err(error) => return Err(error),
-    };
-
-    Ok(RollbackBoardPlan::Board(Box::new(BoardPlan {
-        view_revision,
-        descriptor: descriptor.clone(),
-        group_field,
-        group_field_kind,
-        fields,
-        source_folder,
-    })))
 }
 
 fn board_plan<'a>(
@@ -617,81 +344,6 @@ impl BoardPlan<'_> {
         });
         Ok(groups)
     }
-
-    fn post_restore_group_order(
-        &self,
-        cut: &BoardCut,
-        _view: &ViewRef,
-        groups: &[EvaluatedBoardGroup],
-        restored: &[(GroupKey, NoteId, notarium_core::query::SortTuple)],
-        deadline: &PlannerDeadline,
-    ) -> Result<Vec<(GroupKey, Vec<NoteId>)>, PortError> {
-        let restored_by_note: BTreeMap<&NoteId, (&GroupKey, &notarium_core::query::SortTuple)> =
-            restored
-                .iter()
-                .map(|(grp, note, order)| (note, (grp, order)))
-                .collect();
-        type GroupOrderEntry<'a> = (Option<&'a str>, notarium_core::query::SortTuple, NoteId);
-        let mut by_group: Vec<(GroupKey, Vec<GroupOrderEntry<'_>>)> = Vec::new();
-        for eg in groups {
-            deadline.check()?;
-            let entry = if let Some((_, existing)) =
-                by_group.iter_mut().find(|(grp, _)| grp == &eg.group)
-            {
-                existing
-            } else {
-                by_group.push((eg.group.clone(), Vec::new()));
-                &mut by_group.last_mut().expect("just pushed").1
-            };
-            for row in &eg.rows {
-                if let Some((restored_grp, _)) = restored_by_note.get(&row.note)
-                    && *restored_grp != &eg.group
-                {
-                    continue;
-                }
-                let Some(note) = cut.notes.get(&row.note) else {
-                    continue;
-                };
-                let order = restored_by_note
-                    .get(&row.note)
-                    .map(|(_, order)| (*order).clone())
-                    .unwrap_or_else(|| {
-                        sort_tuple(
-                            &self.descriptor.sort,
-                            &row.note,
-                            note.updated_at,
-                            &note.fields,
-                        )
-                    });
-                // Always emit pure base sort order (ignoring run-mutated pre-rollback
-                // overlays); canonical rollback re-applies surviving overlays by rank.
-                entry.push((None, order, row.note.clone()));
-            }
-        }
-        for (grp, note, order) in restored {
-            deadline.check()?;
-            let entry = if let Some((_, existing)) = by_group.iter_mut().find(|(g, _)| g == grp) {
-                existing
-            } else {
-                by_group.push((grp.clone(), Vec::new()));
-                &mut by_group.last_mut().expect("just pushed").1
-            };
-            if entry.iter().any(|(_, _, id)| id == note) {
-                continue;
-            }
-            entry.push((None, order.clone(), note.clone()));
-        }
-        let mut ordered = Vec::with_capacity(by_group.len());
-        for (grp, mut rows) in by_group {
-            deadline.check()?;
-            rows.sort_by(|left, right| {
-                compare_board_rows(&self.descriptor.sort, left.0, &left.1, right.0, &right.1)
-                    .expect("sort tuples are produced by the same validated descriptor")
-            });
-            ordered.push((grp, rows.into_iter().map(|(_, _, id)| id).collect()));
-        }
-        Ok(ordered)
-    }
 }
 
 fn proposed_raw_fields(
@@ -716,80 +368,6 @@ fn proposed_raw_fields(
         }
     }
     Ok(Some(raw))
-}
-
-fn restored_membership(
-    cut: &BoardCut,
-    ctx: &SpaceContext,
-    plan: &BoardPlan<'_>,
-    restoration: &PlannedNoteRestoration,
-) -> Result<Option<(GroupKey, notarium_core::query::SortTuple)>, PortError> {
-    if restoration.planned_lifecycle != Lifecycle::Active
-        || restoration.planned_class == DocClass::EncryptedNote
-        || !cut.ancestry(&restoration.planned_parent_folder)?.active
-    {
-        return Ok(None);
-    }
-    let current = cut
-        .notes
-        .get(&restoration.note)
-        .ok_or(DomainError::ResourceNotFound)?;
-    if current.revision != restoration.current_revision {
-        return Err(DomainError::validation(ValidationReason::CursorStale).into());
-    }
-    let inline_tags = if let Some(carrier) = restoration
-        .planned_carrier
-        .as_deref()
-        .filter(|_| !plan.descriptor.source.tags.is_empty())
-    {
-        match extract(
-            carrier,
-            restoration.planned_class,
-            &restoration.note,
-            "",
-            None,
-        )? {
-            ExtractedDocDelta::Plain(doc) => doc.tags.into_iter().map(|tag| tag.key).collect(),
-            ExtractedDocDelta::Encrypted(_) => Vec::new(),
-        }
-    } else {
-        Vec::new()
-    };
-    let raw: BTreeMap<_, _> = restoration
-        .planned_fields
-        .iter()
-        .filter_map(|(key, value)| value.as_ref().map(|value| (key.clone(), value.clone())))
-        .collect();
-    let raw = (!raw.is_empty() || restoration.planned_header_diagnostic.is_none()).then_some(&raw);
-    let tags = effective_tags(&inline_tags, raw).into_iter().collect();
-    let fields = evaluate_fields_with_schema(
-        raw,
-        restoration.planned_header_diagnostic.as_ref(),
-        Some(plan.fields),
-    );
-    let group = plan.group(
-        cut,
-        &restoration.planned_parent_folder,
-        restoration.planned_class,
-        &tags,
-        &fields,
-    )?;
-    if let Some(group) = group {
-        cut.authorize_placement(
-            ctx,
-            &restoration.planned_parent_folder,
-            restoration.planned_class,
-            restoration.planned_ability.clone(),
-        )?;
-        let order = sort_tuple(
-            &plan.descriptor.sort,
-            &restoration.note,
-            restoration.planned_updated_at.unwrap_or(current.updated_at),
-            &fields,
-        );
-        return Ok(Some((group, order)));
-    }
-    Ok(None)
 }
 
 fn semantic_placement(groups: &[EvaluatedBoardGroup], target: &NoteId) -> SemanticPlacement {

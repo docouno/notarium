@@ -2177,7 +2177,7 @@ async fn check_mutation_authority(
             ctx.auth().spaces().clone(),
         )
         .unwrap();
-    let moved = store
+    let _moved = store
         .move_note(
             SpaceContext::new(move_auth, scope.clone(), make_budget()).unwrap(),
             next_mutation(
@@ -2192,21 +2192,7 @@ async fn check_mutation_authority(
         )
         .await
         .unwrap();
-    let revision = store
-        .inspect_agent_run_revision_for_test(&scope.space_id, &mover)
-        .await
-        .unwrap()
-        .unwrap();
-    let rollback = next_mutation(
-        scope,
-        owner,
-        notarium_core::ports::RollbackAgentRun {
-            run: mover,
-            expected_run_revision: revision,
-            expected_entities: vec![moved.value],
-            associated_board_expectations: Vec::new(),
-        },
-    );
+    let rollback = next_mutation(scope, owner, mover);
     store
         .set_folder_write_lock(ctx.clone(), archive_root.clone(), true)
         .await
@@ -2214,7 +2200,7 @@ async fn check_mutation_authority(
     let before = store.read_space(&scope.space_id).await.unwrap().last_seq;
     assert!(matches!(
         store
-            .rollback_agent_run(ctx.clone(), rollback.clone())
+            .rollback_agent_run_by_id(ctx.clone(), rollback.clone())
             .await,
         Err(PortError::Domain(DomainError::SpaceReadOnly))
     ));
@@ -2228,7 +2214,7 @@ async fn check_mutation_authority(
         .unwrap();
     assert_eq!(
         store
-            .rollback_agent_run(ctx.clone(), rollback)
+            .rollback_agent_run_by_id(ctx.clone(), rollback)
             .await
             .unwrap()
             .value

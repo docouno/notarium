@@ -4,12 +4,10 @@ use notarium_core::{
     error::PortError,
     ids::{AgentRunId, NoteId, PrincipalId, RevisionId, SpaceId, SpaceSeq, ViewKey},
     model::{HistoryScope, Lifecycle},
-    ports::ViewRef,
     value::Timestamp,
 };
-use rusqlite::params;
 
-use super::{CandidateAction, PlannedOverlayDelete};
+use super::CandidateAction;
 use crate::{
     codec::{
         MAX_MSGPACK_DECODE_BYTES, RankRevisionMetadata, RevisionMetadataEnvelope,
@@ -37,10 +35,6 @@ const RANKS_BY_ENDPOINT: &str = concat!(
     "o.target_note_id = $2 UNION ALL ",
     rank_rows!(),
     "o.view_note_id = $2 AND o.target_note_id <> $2"
-);
-const RANK_BY_KEY: &str = concat!(
-    rank_rows!(),
-    "o.view_note_id = $2 AND o.view_key = $3 AND o.target_note_id = $4"
 );
 const DELETE_RANK: &str = "DELETE FROM view_rank_overlays
     WHERE space_id = $1 AND view_note_id = $2 AND view_key = $3
@@ -129,7 +123,6 @@ pub(super) async fn plan_tx(
     tx: &mut BackendConn<'_>,
     space: &SpaceId,
     eligible: &BTreeMap<NoteId, CandidateAction>,
-    explicit: &[PlannedOverlayDelete],
 ) -> Result<Vec<RankRemoval>, PortError> {
     let err = |e: sqlx::Error| internal_not_committed("rollback_rank_read", e.to_string());
     let mut removals = BTreeMap::new();
@@ -146,19 +139,6 @@ pub(super) async fn plan_tx(
                     add_removal(&mut removals, eligible, row)?;
                 }
             }
-            for deletion in explicit {
-                let row: Option<RawRank> = sqlx::query_as(RANK_BY_KEY)
-                    .bind(space.as_str())
-                    .bind(deletion.view.note.as_str())
-                    .bind(deletion.view.key.as_str())
-                    .bind(deletion.target_note.as_str())
-                    .fetch_optional(&mut **$conn)
-                    .await
-                    .map_err(err)?;
-                if let Some(row) = row {
-                    add_removal(&mut removals, eligible, row)?;
-                }
-            }
         };
     }
     match tx {
@@ -167,38 +147,6 @@ pub(super) async fn plan_tx(
         }
         BackendConn::Postgres(conn) => {
             load!(conn);
-        }
-    }
-    Ok(removals.into_values().collect())
-}
-
-pub(crate) fn plan_rusqlite(
-    conn: &rusqlite::Connection,
-    space: &SpaceId,
-    eligible: &BTreeMap<NoteId, CandidateAction>,
-) -> Result<Vec<RankRemoval>, PortError> {
-    let error = |e: rusqlite::Error| internal_not_committed("rollback_rank_read", e.to_string());
-    let mut stmt = conn.prepare_cached(RANKS_BY_ENDPOINT).map_err(error)?;
-    let mut removals = BTreeMap::new();
-    for note in select_endpoints(eligible) {
-        let rows = stmt
-            .query_map(params![space.as_str(), note.as_str()], |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                    row.get(7)?,
-                    row.get(8)?,
-                    row.get(9)?,
-                ))
-            })
-            .map_err(error)?;
-        for row in rows {
-            add_removal(&mut removals, eligible, row.map_err(error)?)?;
         }
     }
     Ok(removals.into_values().collect())
@@ -234,27 +182,6 @@ impl RankRemoval {
             "rollback_rank_delete",
             "planned rank row is missing or changed within the rollback",
         ))
-    }
-
-    pub(crate) fn delete_rusqlite(
-        &self,
-        conn: &rusqlite::Connection,
-        space: &SpaceId,
-    ) -> Result<(), PortError> {
-        let rank = &self.metadata;
-        let mut stmt = conn
-            .prepare_cached(DELETE_RANK)
-            .map_err(|e| internal_not_committed("rollback_rank_delete", e.to_string()))?;
-        let affected = stmt
-            .execute(params![
-                space.as_str(),
-                rank.view_note_id.as_str(),
-                rank.view_key.as_str(),
-                rank.target_note_id.as_str(),
-                self.previous.as_str(),
-            ])
-            .map_err(|e| internal_not_committed("rollback_rank_delete", e.to_string()))?;
-        Self::check_deleted(affected as u64)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -310,14 +237,6 @@ impl RankRemoval {
     pub(crate) fn owners(&self) -> [&NoteId; 2] {
         [&self.metadata.view_note_id, &self.metadata.target_note_id]
     }
-}
-
-pub(super) fn removes_view_or_target(
-    eligible: &BTreeMap<NoteId, CandidateAction>,
-    view: &ViewRef,
-    target: &NoteId,
-) -> bool {
-    removes_ranks(eligible.get(&view.note)) || removes_ranks(eligible.get(target))
 }
 
 #[cfg(test)]

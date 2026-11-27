@@ -352,33 +352,9 @@ pub enum RankExpectation {
     Existing(RevisionId),
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AssociatedBoardExpectation {
-    pub view: ViewRef,
-    pub note: NoteId,
-    pub expected_rank: RankExpectation,
-    pub expected_placement_revision: RevisionId,
-}
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct RestoredBoardRank {
-    pub view: ViewRef,
-    pub note: NoteId,
-    pub group: GroupKey,
-    pub rank: String,
-    pub rank_revision: RevisionId,
-    pub placement_revision: RevisionId,
-}
-#[derive(Clone, Debug)]
-pub struct RollbackAgentRun {
-    pub run: AgentRunId,
-    pub expected_run_revision: RevisionId,
-    pub expected_entities: Vec<NoteRevision>,
-    pub associated_board_expectations: Vec<AssociatedBoardExpectation>,
-}
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RollbackResult {
     pub restored: Vec<NoteRevision>,
     pub trashed: Vec<NoteRevision>,
-    pub restored_ranks: Vec<RestoredBoardRank>,
     pub skipped_manual_edits: Vec<NoteId>,
     pub skipped_room_active: Vec<NoteId>,
 }

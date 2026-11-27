@@ -1159,10 +1159,6 @@ pub(crate) struct LiveWriteSet {
 }
 
 impl LiveWriteSet {
-    pub(crate) fn has_live_state(&self) -> bool {
-        self.guards.iter().any(|guard| guard.state().is_some())
-    }
-
     fn guard_refresh_changes(
         state: &LiveState,
         windows: &[VisibilityWindow],

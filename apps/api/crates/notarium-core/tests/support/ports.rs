@@ -117,11 +117,6 @@ impl NoteWritePort for RejectingPorts {
             ctx: SpaceContext,
             request: Mutation<PublishAbilityPackage>,
         ) -> PortFuture<'_, Committed<AbilityPackageRevision>>;
-    fn rollback_agent_run(
-            &self,
-            ctx: SpaceContext,
-            request: Mutation<RollbackAgentRun>,
-        ) -> PortFuture<'_, Committed<RollbackResult>>;
     fn rollback_agent_run_by_id(
             &self,
             ctx: SpaceContext,
@@ -581,14 +576,6 @@ impl BoardMutationFactsProvider for RejectingPorts {
         _cutoff: Option<SpaceSeq>,
         _intent: MoveBoardCard,
     ) -> PortFuture<'a, BoardMoveFacts> {
-        Box::pin(async { Err(DomainError::ResourceNotFound.into()) })
-    }
-    fn evaluate_rollback<'a>(
-        &'a self,
-        _authority: &'a BoardPlannerAuthority,
-        _ctx: SpaceContext,
-        _request: RollbackBoardFactsRequest,
-    ) -> PortFuture<'a, RollbackBoardFacts> {
         Box::pin(async { Err(DomainError::ResourceNotFound.into()) })
     }
 }

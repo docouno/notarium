@@ -162,11 +162,6 @@ pub trait NoteWritePort: Send + Sync {
         ctx: SpaceContext,
         request: Mutation<TrashAbilityPackage>,
     ) -> PortFuture<'_, Committed<NoteRevision>>;
-    fn rollback_agent_run(
-        &self,
-        ctx: SpaceContext,
-        request: Mutation<RollbackAgentRun>,
-    ) -> PortFuture<'_, Committed<RollbackResult>>;
     /// Resolve the current rollback plan internally. The durable command is
     /// identified by the run, even after a successful rollback changes the plan.
     fn rollback_agent_run_by_id(

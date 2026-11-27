@@ -11,8 +11,7 @@ use notarium_core::{
     ports::{
         BoardGroupFieldKind, BoardMoveFacts, BoardMoveFactsSpec, BoardMutationFactsProvider,
         BoardPlannerAuthority, Cancellation, EvaluatedBoardGroup, EvaluatedBoardRow, GroupKey,
-        MoveBoardCard, PortFuture, RankExpectation, RollbackAgentRun, RollbackBoardFacts,
-        RollbackBoardFactsRequest, SemanticPlacement, SpaceContext, ViewRef,
+        MoveBoardCard, PortFuture, RankExpectation, SemanticPlacement, SpaceContext, ViewRef,
     },
     value::{ScalarValue, YamlValue},
 };
@@ -92,27 +91,6 @@ impl BoardMutationFactsProvider for OneCardPlanner {
                     base_order_binding: binding,
                     after_eligible_in_group,
                 },
-            ))
-        })
-    }
-
-    fn evaluate_rollback<'a>(
-        &'a self,
-        authority: &'a BoardPlannerAuthority,
-        ctx: SpaceContext,
-        request: RollbackBoardFactsRequest,
-    ) -> PortFuture<'a, RollbackBoardFacts> {
-        Box::pin(async move {
-            assert!(
-                request.views.is_empty(),
-                "provenance cases operate outside this board"
-            );
-            let current = self.store.read_space(&ctx.scope().space_id).await?.last_seq;
-            Ok(RollbackBoardFacts::attest(
-                authority,
-                ctx.scope().clone(),
-                request.cutoff.unwrap_or(current),
-                BTreeMap::new(),
             ))
         })
     }
@@ -253,7 +231,7 @@ pub async fn rollback(
         "peer update remains separate from the later agent revision"
     );
     let start = seed.find("todo").unwrap();
-    let agent_edit = store
+    let _agent_edit = store
         .edit_note(
             actor.clone(),
             edit(
@@ -290,24 +268,8 @@ pub async fn rollback(
         .await;
     }
 
-    let run_revision = store
-        .inspect_agent_run_revision_for_test(&owner.scope().space_id, &run)
-        .await
-        .unwrap()
-        .expect("run head");
     let rollback = store
-        .rollback_agent_run(
-            owner.clone(),
-            mutation(
-                owner,
-                RollbackAgentRun {
-                    run,
-                    expected_run_revision: run_revision,
-                    expected_entities: vec![agent_edit.value],
-                    associated_board_expectations: Vec::new(),
-                },
-            ),
-        )
+        .rollback_agent_run_by_id(owner.clone(), mutation(owner, run))
         .await
         .unwrap()
         .value;

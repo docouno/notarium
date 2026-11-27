@@ -264,18 +264,18 @@ An unsupported field produces `InvalidState` after checking command identity
 and before using a receipt. It needs no knowledge of resource existence.
 Supported conditions are checked under current resource authority. A schema
 update that supplies a note revision requires an existing note. The expected
-package revision, queue base leaf, rollback run/entity/rank expectations and
-job cancellation lease belong to their typed inputs.
+package revision, queue base leaf and job cancellation lease belong to their
+typed inputs.
 
-`rollback_agent_run_by_id` resolves those rollback expectations inside the
-canonical owner. Its command identity binds the run independently of the
-derived plan, so a retry can reach the original receipt after revisions advance.
-For supervised note-only rollbacks, PostgreSQL and local SQLite with local
-blob storage select the run's current notes in the writer transaction. This
-includes edits committed while the command was waiting for admission. Active
-rooms and board history can require a separate planning step. Before replay,
-Canonical checks current access to the run's sources and to the items in the
-stored result.
+`rollback_agent_run_by_id` is the sole canonical rollback command and resolves
+run provenance directly inside the canonical owner. Its command identity binds
+the run ID independently of note revisions, so a retry reaches the original
+receipt even after revisions advance. When a Space has no live collaboration
+rooms or fences, rollback executes directly in a single writer transaction on
+both SQLite and PostgreSQL; when live rooms or fences are present, it reserves
+closed rooms in deterministic `NoteId` order before submitting the same writer
+transaction. Before replay, Canonical checks current access to the run's
+sources and to every note named in the stored result.
 
 ## Complete mutation intent across live rooms
 

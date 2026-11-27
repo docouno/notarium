@@ -236,14 +236,7 @@ impl CanonicalStore {
             Some(CarrierRoomWrite::Accepted(work.transition)),
         );
         let stored: StoredCommittedNoteRevV1 = self
-            .submit_write_command_until(
-                &ctx.budget,
-                deadline.at,
-                intent,
-                None,
-                None,
-                Some(active_op),
-            )
+            .submit_write_command_until(&ctx.budget, deadline.at, intent, None, Some(active_op))
             .await?;
         Ok(stored.into_committed())
     }
@@ -786,7 +779,6 @@ pub(crate) async fn create_note_impl(
             deadline.at,
             intent,
             fast_plan,
-            None,
             Some(active_op_guard),
         )
         .await
@@ -1486,7 +1478,6 @@ pub(crate) async fn edit_note_impl(
                 deadline.at,
                 intent,
                 Some(fast_plan),
-                None,
                 Some(active_op_guard),
             )
             .await?;
@@ -1516,7 +1507,6 @@ pub(crate) async fn edit_note_impl(
             &ctx.budget,
             deadline.at,
             intent,
-            None,
             None,
             Some(active_op_guard),
         )
@@ -3419,7 +3409,7 @@ pub(crate) async fn rename_note_impl(
                 None,
             );
             let stored: StoredCommittedNoteRevV1 = store
-                .submit_write_command_until(&ctx.budget, deadline.at, intent, None, None, None)
+                .submit_write_command_until(&ctx.budget, deadline.at, intent, None, None)
                 .await?;
             return Ok(stored.into_committed());
         }
@@ -3437,7 +3427,7 @@ pub(crate) async fn rename_note_impl(
         Ok(move_pin),
     );
     let stored: StoredCommittedNoteRevV1 = store
-        .submit_write_command_until(&ctx.budget, deadline.at, intent, None, None, None)
+        .submit_write_command_until(&ctx.budget, deadline.at, intent, None, None)
         .await?;
     Ok(stored.into_committed())
 }
@@ -5613,7 +5603,6 @@ impl CanonicalStore {
                 &ctx.budget,
                 deadline.at,
                 intent,
-                None,
                 None,
                 Some(active_op),
             )

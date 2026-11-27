@@ -3,7 +3,7 @@ WITH touched AS (
     WHERE space_id = $1 AND agent_run_id = $2 AND entity_type = 'note'
     GROUP BY entity_key
 )
-SELECT t.entity_key, COALESCE(p.space_seq > t.first_seq, FALSE),
+SELECT t.entity_key, t.first_seq, COALESCE(p.space_seq > t.first_seq, FALSE),
        CASE WHEN p.space_seq < t.first_seq THEN p.rev_id END,
        CASE WHEN p.space_seq < t.first_seq THEN p.metadata_msgpack END,
        CASE WHEN p.space_seq < t.first_seq THEN p.created_at_sec END,

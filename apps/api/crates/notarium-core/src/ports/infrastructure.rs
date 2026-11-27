@@ -2,20 +2,15 @@ use super::{PortFuture, PortStream, context::*, provider::ProviderRuntimeEpochs,
 use crate::{
     DomainError, DomainResult,
     classes::{DocClass, ProviderPart},
-    error::{Diagnostic, ValidationReason},
+    error::ValidationReason,
     ids::*,
     model::*,
     patch::*,
     query::FieldFilterAstV1,
     receipt::*,
-    value::YamlValue,
 };
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 pub trait StructuralSnapshot: Send + Sync {
     fn cut(&self) -> &SnapshotCut;
@@ -492,86 +487,6 @@ impl BoardMoveFacts {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct PlannedNoteRestoration {
-    pub note: NoteId,
-    pub current_revision: RevisionId,
-    pub restored_from_revision: Option<RevisionId>,
-    pub planned_lifecycle: Lifecycle,
-    /// Exact placement prepared by the canonical rollback command.
-    pub planned_parent_folder: FolderId,
-    pub planned_class: DocClass,
-    pub planned_ability: Option<AbilityId>,
-    pub planned_header_diagnostic: Option<Diagnostic>,
-    pub planned_carrier: Option<String>,
-    pub planned_fields: BTreeMap<String, Option<YamlValue>>,
-    /// Pre-run revision timestamp used to preserve pure base-order sorting on default-sorted
-    /// (`updated_at DESC`) boards during rollback planning.
-    pub planned_updated_at: Option<crate::value::Timestamp>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BoardViewRollbackFacts {
-    pub view: ViewRef,
-    pub view_revision: RevisionId,
-    pub schema_revision: Option<RevisionId>,
-    pub descriptor_fingerprint: ContentDigest,
-    pub group_field: String,
-    pub group_field_kind: BoardGroupFieldKind,
-    pub groups: Vec<EvaluatedBoardGroup>,
-    /// Post-restoration group membership for each eligible target (`None` = outside view).
-    pub post_restore_membership: BTreeMap<NoteId, Option<GroupKey>>,
-    /// Post-restoration group ordering for active and returning eligible notes,
-    /// sorted by the board view's rank/sort descriptor.
-    pub post_restore_group_order: Vec<(GroupKey, Vec<NoteId>)>,
-}
-
-#[derive(Clone, Debug)]
-pub struct RollbackBoardFacts {
-    authority: BoardPlannerAuthority,
-    scope: HistoryScope,
-    cutoff: SpaceSeq,
-    views: BTreeMap<ViewRef, BoardViewRollbackFacts>,
-}
-impl RollbackBoardFacts {
-    pub fn attest(
-        authority: &BoardPlannerAuthority,
-        scope: HistoryScope,
-        cutoff: SpaceSeq,
-        views: BTreeMap<ViewRef, BoardViewRollbackFacts>,
-    ) -> Self {
-        Self {
-            authority: authority.clone(),
-            scope,
-            cutoff,
-            views,
-        }
-    }
-    pub fn verify_authority(&self, expected: &BoardPlannerAuthority) -> DomainResult<()> {
-        if self.authority.matches(expected) {
-            Ok(())
-        } else {
-            Err(DomainError::validation(ValidationReason::InvalidAuthority))
-        }
-    }
-    pub fn scope(&self) -> &HistoryScope {
-        &self.scope
-    }
-    pub fn cutoff(&self) -> SpaceSeq {
-        self.cutoff
-    }
-    pub fn views(&self) -> &BTreeMap<ViewRef, BoardViewRollbackFacts> {
-        &self.views
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct RollbackBoardFactsRequest {
-    pub cutoff: Option<SpaceSeq>,
-    pub views: Vec<ViewRef>,
-    pub eligible_notes: Vec<PlannedNoteRestoration>,
-}
-
 pub trait BoardMutationFactsProvider: Send + Sync {
     fn evaluate_move<'a>(
         &'a self,
@@ -580,13 +495,6 @@ pub trait BoardMutationFactsProvider: Send + Sync {
         cutoff: Option<SpaceSeq>,
         intent: MoveBoardCard,
     ) -> PortFuture<'a, BoardMoveFacts>;
-
-    fn evaluate_rollback<'a>(
-        &'a self,
-        authority: &'a BoardPlannerAuthority,
-        ctx: SpaceContext,
-        request: RollbackBoardFactsRequest,
-    ) -> PortFuture<'a, RollbackBoardFacts>;
 }
 
 #[derive(Clone, Debug)]

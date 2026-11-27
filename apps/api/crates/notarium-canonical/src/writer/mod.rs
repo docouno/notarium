@@ -294,21 +294,6 @@ pub type ItemExecuteFn = Box<
         + Send,
 >;
 
-pub(crate) enum PgSingleFastAttempt {
-    Handled(BatchExecOutcome),
-    FallbackToStandard,
-}
-
-pub(crate) type PgSingleItemFastFn = Box<
-    dyn for<'a> FnOnce(
-            &'a crate::CanonicalStore,
-            &'a mut sqlx::PgConnection,
-            WriterConfig,
-            &'a WriterFaultState,
-        ) -> BoxFuture<'a, PgSingleFastAttempt>
-        + Send,
->;
-
 pub struct PreparedWriteIntent {
     pub scope: HistoryScope,
     pub active_epoch: LeaseEpoch,
@@ -370,7 +355,6 @@ enum QueuedWriteEntry {
     Single {
         intent: BatchWriteIntent,
         sqlite_fast_plan: Option<Box<dyn crate::sqlite_fast::SqliteSyncItemPlan>>,
-        pg_fast_plan: Option<PgSingleItemFastFn>,
         reservation: QueueReservation,
         reply_tx: oneshot::Sender<Result<Vec<u8>, PortError>>,
     },
@@ -780,32 +764,10 @@ impl WriteCoordinator {
         &self.batch_telemetry
     }
 
-    pub(crate) fn config(&self) -> WriterConfig {
-        self.cfg
-    }
-
-    pub(crate) fn is_accepting(&self) -> bool {
-        self.accepting.load(Ordering::SeqCst)
-    }
-
-    pub(crate) fn is_batch_telemetry_enabled(&self) -> bool {
-        self.batch_telemetry.enabled.load(Ordering::Relaxed)
-    }
-
-    pub(crate) fn record_batch_telemetry(&self, duration_ns: u64, items: u32) {
-        self.batch_telemetry.record(duration_ns, items);
-    }
-
     /// Acquires an exclusive writer safe point between Phase-2 batch commits without dropping queued items.
     pub async fn acquire_safe_point(&self) -> WriterSafePointGuard {
         let guard = Arc::clone(&self.commit_gate).write_owned().await;
         WriterSafePointGuard { _guard: guard }
-    }
-
-    pub(crate) fn try_acquire_commit_read_guard(
-        &self,
-    ) -> Option<tokio::sync::OwnedRwLockReadGuard<()>> {
-        self.commit_gate.clone().try_read_owned().ok()
     }
 
     /// Acquires a shared commit-gate read guard for auxiliary SQL writes that must pause during safe points.
@@ -827,7 +789,6 @@ impl WriteCoordinator {
             intent.into(),
             None,
             None,
-            None,
         )
         .await
     }
@@ -838,7 +799,6 @@ impl WriteCoordinator {
         wait: WriterWait<'_>,
         mut intent: BatchWriteIntent,
         sqlite_fast_plan: Option<Box<dyn crate::sqlite_fast::SqliteSyncItemPlan>>,
-        pg_fast_plan: Option<PgSingleItemFastFn>,
         pretracked_guard: Option<ActiveWriteOpGuard>,
     ) -> Result<Vec<u8>, PortError> {
         let space = &intent.prepared.scope.space_id;
@@ -863,11 +823,6 @@ impl WriteCoordinator {
                 Some(plan)
             }
         });
-        let pg_fast_plan = if confirmed_step || guarded {
-            None
-        } else {
-            pg_fast_plan
-        };
         let _active_guard = match pretracked_guard {
             Some(g) => g,
             None => self.enter_write_op(space, 1),
@@ -900,7 +855,6 @@ impl WriteCoordinator {
         let (reply_tx, reply_rx) = oneshot::channel();
         // Once sent through `permit.send(...)`, the item is admitted: caller drop/cancel NEVER aborts commit!
         let entry = if intent.room_wal.is_some() {
-            debug_assert!(pg_fast_plan.is_none());
             QueuedWriteEntry::RoomWal {
                 intent,
                 sqlite_fast_plan,
@@ -911,7 +865,6 @@ impl WriteCoordinator {
             QueuedWriteEntry::Single {
                 intent,
                 sqlite_fast_plan,
-                pg_fast_plan,
                 reservation: reserved_bytes,
                 reply_tx,
             }
@@ -1177,7 +1130,7 @@ impl crate::CanonicalStore {
     {
         let deadline =
             crate::runtime::deadline_after(tokio::time::Instant::now(), budget.remaining);
-        self.submit_write_command_until(budget, deadline, intent, None, None, None)
+        self.submit_write_command_until(budget, deadline, intent, None, None)
             .await
     }
 
@@ -1199,7 +1152,6 @@ impl crate::CanonicalStore {
         deadline: tokio::time::Instant,
         intent: PreparedWriteIntent,
         sqlite_fast_plan: Option<Box<dyn crate::sqlite_fast::SqliteSyncItemPlan>>,
-        pg_fast_plan: Option<PgSingleItemFastFn>,
         pretracked_guard: Option<ActiveWriteOpGuard>,
     ) -> Result<R, PortError>
     where
@@ -1211,7 +1163,6 @@ impl crate::CanonicalStore {
             intent,
             None,
             sqlite_fast_plan,
-            pg_fast_plan,
             pretracked_guard,
         )
         .await
@@ -1225,7 +1176,6 @@ impl crate::CanonicalStore {
         intent: PreparedWriteIntent,
         canonical_effect: Option<notarium_core::ports::CanonicalEffectAdmission>,
         sqlite_fast_plan: Option<Box<dyn crate::sqlite_fast::SqliteSyncItemPlan>>,
-        pg_fast_plan: Option<PgSingleItemFastFn>,
         pretracked_guard: Option<ActiveWriteOpGuard>,
     ) -> Result<R, PortError>
     where
@@ -1245,7 +1195,6 @@ impl crate::CanonicalStore {
                 },
                 batch_intent,
                 sqlite_fast_plan,
-                pg_fast_plan,
                 pretracked_guard,
             )
             .await?;
@@ -1290,7 +1239,6 @@ impl crate::CanonicalStore {
                     canonical_effect: None,
                 },
                 sqlite_fast_plan,
-                None,
                 None,
             )
             .await?;
@@ -1623,7 +1571,6 @@ async fn flush_single_batch(
     type UnpackedBatchItem = (
         BatchWriteIntent,
         Option<Box<dyn crate::sqlite_fast::SqliteSyncItemPlan>>,
-        Option<PgSingleItemFastFn>,
     );
     let mut items: Vec<UnpackedBatchItem> = Vec::with_capacity(batch.len());
 
@@ -1634,7 +1581,6 @@ async fn flush_single_batch(
             QueuedWriteEntry::Single {
                 intent,
                 sqlite_fast_plan,
-                pg_fast_plan,
                 reservation,
                 reply_tx,
             } => {
@@ -1647,7 +1593,7 @@ async fn flush_single_batch(
                 }
                 reserved_list.push(reservation);
                 reply_targets.push(ReplyTarget::Single { reply_tx });
-                items.push((intent, sqlite_fast_plan, pg_fast_plan));
+                items.push((intent, sqlite_fast_plan));
             }
             QueuedWriteEntry::RoomWal {
                 intent,
@@ -1664,7 +1610,7 @@ async fn flush_single_batch(
                 }
                 reserved_list.push(reservation);
                 reply_targets.push(ReplyTarget::Single { reply_tx });
-                items.push((intent, sqlite_fast_plan, None));
+                items.push((intent, sqlite_fast_plan));
             }
             QueuedWriteEntry::Group {
                 space_id,
@@ -1688,7 +1634,7 @@ async fn flush_single_batch(
                     all_idempotent,
                     reply_tx,
                 });
-                items.extend(group_intents.into_iter().map(|it| (it.into(), None, None)));
+                items.extend(group_intents.into_iter().map(|it| (it.into(), None)));
             }
         }
     }
@@ -1709,11 +1655,11 @@ async fn flush_single_batch(
             let standalone_or_unguarded = items.len() == 1
                 || items
                     .iter()
-                    .all(|(intent, _, _)| intent.canonical_effect().is_none());
+                    .all(|(intent, _)| intent.canonical_effect().is_none());
             let can_fast = group_spaces.is_empty()
                 && standalone_or_unguarded
                 && !rollback_fault_armed
-                && items.iter().all(|(_, fp, _)| fp.is_some())
+                && items.iter().all(|(_, fp)| fp.is_some())
                 && faults.pre_commit_space_delays.lock().await.is_empty();
             let mut guard = writer.lock().await;
             match guard.as_mut() {
@@ -1727,7 +1673,7 @@ async fn flush_single_batch(
                     } else if can_fast {
                         let sq_items = items
                             .into_iter()
-                            .map(|(it, fp, _)| (it.prepared, fp))
+                            .map(|(it, fp)| (it.prepared, fp))
                             .collect();
                         crate::sqlite_fast::execute_sqlite_fast_batch(
                             &store, pair, sq_items, cfg, faults,
@@ -1736,7 +1682,7 @@ async fn flush_single_batch(
                     } else {
                         let intents = items
                             .into_iter()
-                            .map(|(mut intent, fp_opt, _)| {
+                            .map(|(mut intent, fp_opt)| {
                                 if let Some(fp) = fp_opt {
                                     intent.prepared.execute = fp.into_async_exec();
                                 }
@@ -1763,10 +1709,6 @@ async fn flush_single_batch(
             }
         }
         SqlDriverState::Postgres { pool, .. } => {
-            let can_pg_fast = group_spaces.is_empty()
-                && items.len() == 1
-                && items[0].2.is_some()
-                && faults.pre_commit_space_delays.lock().await.is_empty();
             let conn_res = match pool.take_idle_writer() {
                 Some(c) => Ok(c),
                 None => pool.acquire().await,
@@ -1775,48 +1717,25 @@ async fn flush_single_batch(
                 Ok(mut pooled) => {
                     let mut lease = PgTransactionLease::new(&mut pooled);
                     let conn = lease.conn();
-                    let out = if can_pg_fast {
-                        let (mut intent, fp_opt, pg_fast_opt) = items.pop().expect("len == 1");
-                        if let Some(fp) = fp_opt {
-                            intent.prepared.execute = fp.into_async_exec();
-                        }
-                        let pg_fast = pg_fast_opt.expect("is_some");
-                        match pg_fast(&store, conn, cfg, faults).await {
-                            PgSingleFastAttempt::Handled(out) => out,
-                            PgSingleFastAttempt::FallbackToStandard => {
-                                let mut backend = BackendConn::Postgres(conn);
-                                execute_batch_on_conn(
-                                    &store,
-                                    &mut backend,
-                                    vec![intent],
-                                    &group_spaces,
-                                    cfg,
-                                    faults,
-                                )
-                                .await
+                    let intents = items
+                        .into_iter()
+                        .map(|(mut intent, fp_opt)| {
+                            if let Some(fp) = fp_opt {
+                                intent.prepared.execute = fp.into_async_exec();
                             }
-                        }
-                    } else {
-                        let intents = items
-                            .into_iter()
-                            .map(|(mut intent, fp_opt, _)| {
-                                if let Some(fp) = fp_opt {
-                                    intent.prepared.execute = fp.into_async_exec();
-                                }
-                                intent
-                            })
-                            .collect();
-                        let mut backend = BackendConn::Postgres(conn);
-                        execute_batch_on_conn(
-                            &store,
-                            &mut backend,
-                            intents,
-                            &group_spaces,
-                            cfg,
-                            faults,
-                        )
-                        .await
-                    };
+                            intent
+                        })
+                        .collect();
+                    let mut backend = BackendConn::Postgres(conn);
+                    let out = execute_batch_on_conn(
+                        &store,
+                        &mut backend,
+                        intents,
+                        &group_spaces,
+                        cfg,
+                        faults,
+                    )
+                    .await;
                     if matches!(
                         out,
                         BatchExecOutcome::Committed {

@@ -2,19 +2,20 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use notarium_core::{
     DomainError,
+    auth::EngineAuthContext,
     classes::DocClass,
     error::{Diagnostic, PortError, ValidationReason},
     ids::{
         AbilityId, AgentRunId, ContentDigest, FolderId, HistoryIncarnation, LeaseEpoch, NoteId,
-        PrincipalId, RevisionId, SpaceId, SpaceSeq,
+        RevisionId, SpaceId, SpaceSeq,
     },
     model::{HistoryScope, Lifecycle, PathTarget},
     ports::{
-        AssociatedBoardExpectation, ClosedRoomReservation, Committed, GroupKey, Mutation,
-        NoteRevision, PlannedNoteRestoration, RankExpectation, RestoredBoardRank, RollbackAgentRun,
-        RollbackBoardFactsRequest, RollbackReservation, RollbackResult, SpaceContext, ViewRef,
+        ClosedRoomReservation, Committed, Mutation, NoteRevision, RollbackReservation,
+        RollbackResult, SpaceContext,
     },
-    receipt::MutationReceiptToken,
+    receipt::{CommandIdentity, MutationReceiptToken},
+    value::Timestamp,
 };
 use sqlx::Row;
 use tokio::time::Instant;
@@ -24,49 +25,27 @@ use crate::{
     blobs::{BlobOwnerKind, ExistingBlobRefItem, bind_existing_active_blob_refs_batch_tx},
     changes::{EffectBodyV1, StoredAwaitReasonV1, build_effect_payload_draft},
     codec::{
-        MAX_MSGPACK_DECODE_BYTES, NoteRevisionMetadata, RevisionMetadataEnvelope,
-        RevisionMetadataPayload, decode_msgpack_bounded, doc_class_to_db, encode_msgpack,
-        encode_timestamp_parts, evaluate_fields_with_schema, i64_to_space_seq,
-        internal_not_committed, lifecycle_from_db, lifecycle_to_db, new_prefixed_hex_id,
-        new_revision_id, normalize_title_key, now_unix_ms, now_utc_timestamp,
-        unavailable_retryable,
+        NoteRevisionMetadata, RevisionMetadataEnvelope, RevisionMetadataPayload, doc_class_to_db,
+        encode_msgpack, encode_timestamp_parts, evaluate_fields_with_schema, i64_to_space_seq,
+        internal_not_committed, lifecycle_to_db, new_prefixed_hex_id, new_revision_id,
+        normalize_title_key, now_utc_timestamp, unavailable_retryable,
     },
     domain::{
-        board::{
-            ExistingRankedItem, StoredSemanticPlacementV1, compute_rank_placement,
-            evenly_spaced_ranks, load_overlay_row_opt_tx, load_view_overlays_tx,
-            upsert_overlay_and_rank_revision_tx, verify_rank_expectation,
-        },
         common::{
-            FolderAncestryCache, NoteHeadRow, StoredCommittedRollbackV1,
-            load_current_space_schema_tx, load_note_head_row_tx, load_note_heads_batch_tx,
-            upsert_agent_run_head_tx, validate_mutation_identity,
+            FolderAncestryCache, StoredCommittedRollbackV1, load_current_space_schema_tx,
+            load_note_heads_batch_tx, validate_mutation_identity,
         },
         notes::try_replay_completed_receipt,
     },
-    runtime::{
-        FolderHeadRow, RevisionInsertItem, insert_revision_rows_batch_tx, load_space_record,
-    },
+    runtime::{RevisionInsertItem, SpaceRecord, insert_revision_rows_batch_tx, load_space_record},
     sql_exec::BackendConn,
-    writer::{BatchEventDraft, ItemCommitArtifacts, PreparedWriteIntent, SemanticCutMismatchKind},
+    writer::{BatchEventDraft, ItemCommitArtifacts, PreparedWriteIntent},
 };
 
 mod ability;
-mod fingerprint;
 pub(crate) mod rank_removal;
 
 const MAX_PLANNER_RETRIES: usize = 4;
-
-#[allow(dead_code)]
-#[derive(Clone, Debug)]
-struct RunBoardMoveRow {
-    command_end_seq: SpaceSeq,
-    ordinal: i32,
-    view: ViewRef,
-    target_note_id: NoteId,
-    before_placement_revision: Option<RevisionId>,
-    before_placement: StoredSemanticPlacementV1,
-}
 
 pub(crate) fn decode_rollback_note(
     bytes: &[u8],
@@ -85,7 +64,7 @@ pub(crate) enum RollbackRevision<'a> {
     Trash,
     Restore {
         schema: Option<&'a crate::domain::common::CurrentSpaceSchema>,
-        logical_updated_at: Option<notarium_core::value::Timestamp>,
+        logical_updated_at: Option<Timestamp>,
     },
 }
 
@@ -144,17 +123,6 @@ pub(crate) fn encode_rollback_note(
     RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Note(result.into_owned())).encode()
 }
 
-fn current_rollback_metadata(
-    history: &[NoteRevHistoryRow],
-    head: &RevisionId,
-    note: &NoteId,
-) -> Result<Box<NoteRevisionMetadata>, PortError> {
-    let row = history.iter().find(|r| &r.0 == head).ok_or_else(|| {
-        internal_not_committed("rollback_missing_head", "current note revision is missing")
-    })?;
-    decode_rollback_note(&row.2, note).map(Box::new)
-}
-
 #[derive(Clone, Debug)]
 pub(crate) enum CandidateAction {
     TrashCreated {
@@ -163,103 +131,34 @@ pub(crate) enum CandidateAction {
         current_lifecycle: Lifecycle,
         doc_class: DocClass,
         parent_folder_id: FolderId,
-        slug: String,
-        slug_fold: String,
-        title: String,
-        ability_id: Option<notarium_core::ids::AbilityId>,
-        visibility_mask: i32,
-        byte_size: u64,
         content_digest: Option<ContentDigest>,
     },
     RestorePreExisting {
         current_rev: RevisionId,
         pre_rev_id: RevisionId,
         pre_meta: Box<NoteRevisionMetadata>,
-        pre_carrier: Option<String>,
-        pre_updated_at: Option<notarium_core::value::Timestamp>,
+        pre_updated_at: Option<Timestamp>,
         needs_note_mutation: bool,
         head_unchanged_placement: bool,
         current_cover_parent: Option<FolderId>,
-        first_run_seq: SpaceSeq,
     },
 }
 
-#[derive(Clone, Debug)]
-struct PlannedOverlayDelete {
-    view: ViewRef,
-    target_note: NoteId,
-}
-
-#[derive(Clone, Debug)]
-struct PlannedNeighborRankUpdate {
-    view: ViewRef,
-    neighbor_note: NoteId,
-    group: GroupKey,
-    rank: String,
-    is_pma: bool,
-}
-
-#[derive(Clone, Debug)]
-struct PlannedTargetRankRestore {
-    view: ViewRef,
-    target_note: NoteId,
-    group: GroupKey,
-    rank: String,
-    restored_placement_revision: Option<RevisionId>,
-    restored_placement_actor: Option<PrincipalId>,
-    restored_placement_run: Option<AgentRunId>,
-}
-
-fn validate_rollback_expectations_unique(input: &RollbackAgentRun) -> Result<(), PortError> {
-    let mut seen_notes = BTreeSet::new();
-    for entry in &input.expected_entities {
-        if !seen_notes.insert(&entry.note) {
-            return Err(DomainError::validation(ValidationReason::InvalidState).into());
-        }
-    }
-    let mut seen_board_targets = BTreeSet::new();
-    for entry in &input.associated_board_expectations {
-        if !seen_board_targets.insert((&entry.view, &entry.note)) {
-            return Err(DomainError::validation(ValidationReason::InvalidState).into());
-        }
-    }
-    Ok(())
-}
-
-pub(crate) fn rollback_fallback_board_present_err() -> PortError {
-    internal_not_committed(
-        "rb_fallback_board_present",
-        "board_move_history present; delegate to 2-phase planner",
-    )
-}
-
-pub(crate) fn rollback_fallback_cover_change_err() -> PortError {
-    internal_not_committed(
-        "rb_fallback_cover_change",
-        "folder cover change requires the general rollback planner",
-    )
-}
-
-pub(crate) fn rollback_fallback_ability_slot_err() -> PortError {
-    internal_not_committed(
-        "rb_fallback_ability_slot",
-        "restoring an active ability requires its project package slot check",
-    )
-}
-
-fn requires_general_planner(err: &PortError) -> bool {
-    err == &rollback_fallback_board_present_err()
-        || err == &rollback_fallback_cover_change_err()
-        || err == &rollback_fallback_ability_slot_err()
+/// A run-created `AgentMemory` note that the same run also trashed still carries
+/// `agent_run_id = Some(run)` on its latest tombstone revision. Emitting a fresh
+/// rollback tombstone (`agent_run_id = None` at the rollback visibility cut) lets
+/// `MEMORY_UNDONE_SLOT_SQL` recognize the undone creation and reopen the slot.
+fn needs_trash_mutation(current_lifecycle: Lifecycle, doc_class: DocClass) -> bool {
+    current_lifecycle != Lifecycle::Trashed || doc_class == DocClass::AgentMemory
 }
 
 type RoomGuard = tokio::sync::OwnedMutexGuard<notarium_core::ports::RoomFenceState>;
 
 /// Validate every room transition before writing and keep each guard through settlement.
-pub(crate) fn stage_rollback_fences(
+fn stage_rollback_fences(
     ctx: &mut crate::writer::ItemExecCtx,
     guards: Vec<(RoomGuard, ClosedRoomReservation)>,
-    identity: &notarium_core::receipt::CommandIdentity,
+    identity: &CommandIdentity,
 ) -> Result<(), PortError> {
     if guards.is_empty() {
         return Ok(());
@@ -278,45 +177,42 @@ pub(crate) fn stage_rollback_fences(
     Ok(())
 }
 
-pub(crate) async fn rollback_agent_run_impl(
-    store: &CanonicalStore,
-    mut ctx: SpaceContext,
-    request: Mutation<RollbackAgentRun>,
-) -> Result<Committed<RollbackResult>, PortError> {
-    let deadline = super::common::CommandDeadline::start(&ctx.budget, "rollback").at;
-    validate_mutation_identity(&ctx, &request.identity)?;
-    crate::domain::common::require_empty_preconditions(&request.preconditions)?;
-    validate_rollback_expectations_unique(&request.input)?;
-    let idemp = fingerprint::current(&ctx, &request)?
-        .with_policy(ctx.auth(), rollback_policy(&request.input));
+struct RoomRollbackPlan {
+    expected_run_rev: RevisionId,
+    expected_heads: BTreeMap<NoteId, RevisionId>,
+    reservations: BTreeMap<NoteId, ClosedRoomReservation>,
+    skipped_room_active: BTreeSet<NoteId>,
+}
 
-    let result = execute_rollback(store, &mut ctx, &request, &idemp, None, deadline).await;
-    if !matches!(
-        result,
-        Err(PortError::Domain(DomainError::IdempotencyKeyReused))
-    ) {
-        return result;
+struct RoomPlanDiscovery {
+    space_epoch: LeaseEpoch,
+    actual_run_rev: RevisionId,
+    expected_heads: BTreeMap<NoteId, RevisionId>,
+    candidates: BTreeMap<NoteId, RevisionId>,
+    durable_active_rooms: BTreeSet<NoteId>,
+}
+
+fn rollback_needs_room_planning(store: &CanonicalStore, space: &SpaceId) -> bool {
+    store.inner.collab_interceptor.get().is_some_and(|rooms| {
+        rooms.space_has_live_rooms(space) || store.inner.room_fences.has_any_fenced_in_space(space)
+    })
+}
+
+async fn rollback_writer_epoch(
+    store: &CanonicalStore,
+    ctx: &SpaceContext,
+    deadline: Instant,
+) -> Result<LeaseEpoch, PortError> {
+    if store.is_postgres() {
+        return store.inner.writer_epoch(&ctx.scope().space_id);
     }
-    let Some(old_hash) = fingerprint::legacy(&request)? else {
-        return result;
-    };
-    let mut previous = idemp;
-    previous.command_hash = old_hash;
-    ctx.budget.remaining = rollback_time_left(&ctx.budget, deadline)?;
-    let saved = rollback_wait(
+    Ok(rollback_wait(
         &ctx.budget,
         deadline,
-        try_replay_completed_receipt::<StoredCommittedRollbackV1>(
-            store,
-            ctx.scope(),
-            &previous,
-            Some(&ctx.budget),
-        ),
+        store.read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget)),
     )
-    .await??;
-    saved
-        .map(StoredCommittedRollbackV1::into_committed)
-        .ok_or_else(|| DomainError::IdempotencyKeyReused.into())
+    .await??
+    .active_epoch)
 }
 
 pub(crate) async fn rollback_agent_run_by_id(
@@ -337,38 +233,37 @@ pub(crate) async fn rollback_agent_run_by_id(
         ctx.auth(),
         crate::writer::replay::ReplayPolicy::RollbackRun(request.input.clone()),
     );
-    let direct_by_id = ctx.canonical_effect().is_some()
-        && (store.is_postgres()
-            || (store.is_sqlite_local() && ctx.confirmed_chat_step().is_none()))
-        && !rollback_needs_room_planning(store, &ctx.scope().space_id);
-    if direct_by_id {
-        let scope = ctx.scope();
-        let guard = store.enter_write_op(&scope.space_id)?;
-        let epoch = rollback_writer_epoch(store, &ctx, None, deadline).await?;
-        let (intent, sqlite_plan) = direct_rollback_intent(
-            store,
-            &ctx,
+
+    if !rollback_needs_room_planning(store, &ctx.scope().space_id) {
+        let guard = store.enter_write_op(&ctx.scope().space_id)?;
+        let epoch = rollback_writer_epoch(store, &ctx, deadline).await?;
+        let intent = build_unified_rollback_intent(
+            ctx.scope().clone(),
             epoch,
-            idemp.clone(),
-            &request.identity,
-            DirectRollbackTarget::ById(request.input.clone()),
+            idemp,
+            ctx.auth().clone(),
+            request.identity,
+            request.input,
+            store.inner.room_fences.clone(),
+            None,
         );
-        let result = store
-            .submit_write_command_until::<StoredCommittedRollbackV1>(
-                &ctx.budget,
-                deadline,
-                intent,
-                sqlite_plan,
-                None,
-                Some(guard),
-            )
-            .await;
-        match result {
-            Ok(done) => return Ok(done.into_committed()),
-            Err(error) if requires_general_planner(&error) => {}
-            Err(error) => return Err(error),
-        }
+        ctx.budget.remaining = rollback_time_left(&ctx.budget, deadline)?;
+        let done: StoredCommittedRollbackV1 = store
+            .submit_write_command_until(&ctx.budget, deadline, intent, None, Some(guard))
+            .await?;
+        return Ok(done.into_committed());
     }
+
+    execute_room_planned_rollback(store, &mut ctx, request, idemp, deadline).await
+}
+
+async fn execute_room_planned_rollback(
+    store: &CanonicalStore,
+    ctx: &mut SpaceContext,
+    request: Mutation<AgentRunId>,
+    idemp: crate::writer::CommandIdentitySpec,
+    deadline: Instant,
+) -> Result<Committed<RollbackResult>, PortError> {
     let active_effect = match ctx.canonical_effect() {
         Some(effect) => Some(effect.begin().await?),
         None => None,
@@ -392,246 +287,27 @@ pub(crate) async fn rollback_agent_run_by_id(
         return Ok(replayed.into_committed());
     }
     drop(active_effect);
-    let mut read_ctx = ctx.clone();
-    read_ctx.budget.remaining = rollback_time_left(&ctx.budget, deadline)?;
-    let (input, prepared_epoch) =
-        prepare_agent_run_rollback(store, read_ctx, request.input.clone()).await?;
-    let prepared = Mutation {
-        identity: request.identity,
-        preconditions: request.preconditions,
-        input,
-    };
-    if direct_by_id {
-        // Only a confirmed request for the general planner reaches this point.
-        return execute_general_rollback(store, &mut ctx, &prepared, &idemp, deadline).await;
-    }
-    execute_rollback(
-        store,
-        &mut ctx,
-        &prepared,
-        &idemp,
-        Some(prepared_epoch),
-        deadline,
-    )
-    .await
-}
 
-async fn rollback_writer_epoch(
-    store: &CanonicalStore,
-    ctx: &SpaceContext,
-    prepared: Option<LeaseEpoch>,
-    deadline: Instant,
-) -> Result<LeaseEpoch, PortError> {
-    if store.is_postgres() {
-        return store.inner.writer_epoch(&ctx.scope().space_id);
-    }
-    if let Some(epoch) = prepared {
-        return Ok(epoch);
-    }
-    Ok(rollback_wait(
-        &ctx.budget,
-        deadline,
-        store.read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget)),
-    )
-    .await??
-    .active_epoch)
-}
-
-fn direct_rollback_intent(
-    store: &CanonicalStore,
-    ctx: &SpaceContext,
-    epoch: LeaseEpoch,
-    idemp: crate::writer::CommandIdentitySpec,
-    identity: &notarium_core::receipt::CommandIdentity,
-    target: DirectRollbackTarget,
-) -> (
-    PreparedWriteIntent,
-    Option<Box<dyn crate::sqlite_fast::SqliteSyncItemPlan>>,
-) {
-    let fences = store.inner.room_fences.clone();
-    if store.is_sqlite_local() && !idemp.has_confirmed_chat_step() {
-        let (intent, plan) = crate::sqlite_fast::build_rollback_direct_sqlite_fast_intent(
-            ctx.scope(),
-            epoch,
-            idemp,
-            ctx.auth().clone(),
-            identity.clone(),
-            target,
-            fences,
-        );
-        (intent, Some(plan))
-    } else {
-        let intent = build_rollback_direct_single_tx_intent(
-            ctx.scope().clone(),
-            epoch,
-            idemp,
-            ctx.auth().clone(),
-            identity.clone(),
-            target,
-            fences,
-        );
-        (intent, None)
-    }
-}
-
-fn rollback_policy(input: &RollbackAgentRun) -> crate::writer::replay::ReplayPolicy {
-    use crate::writer::replay::{ReplayPolicy, ReplayResource};
-
-    let views = input
-        .associated_board_expectations
-        .iter()
-        .map(|entry| &entry.view.note)
-        .collect::<BTreeSet<_>>();
-    ReplayPolicy::RollbackDocuments(
-        input
-            .expected_entities
-            .iter()
-            .map(|entry| ReplayResource::Write(entry.note.clone()))
-            .chain(views.into_iter().cloned().map(ReplayResource::RollbackView))
-            .collect(),
-    )
-}
-
-fn rollback_needs_room_planning(store: &CanonicalStore, space: &SpaceId) -> bool {
-    store.inner.collab_interceptor.get().is_some_and(|rooms| {
-        rooms.space_has_live_rooms(space) || store.inner.room_fences.has_any_fenced_in_space(space)
-    })
-}
-
-async fn execute_rollback(
-    store: &CanonicalStore,
-    ctx: &mut SpaceContext,
-    request: &Mutation<RollbackAgentRun>,
-    idemp: &crate::writer::CommandIdentitySpec,
-    prepared_epoch: Option<notarium_core::ids::LeaseEpoch>,
-    deadline: Instant,
-) -> Result<Committed<RollbackResult>, PortError> {
-    ctx.budget.remaining = rollback_time_left(&ctx.budget, deadline)?;
-    if request.input.associated_board_expectations.is_empty()
-        && !rollback_needs_room_planning(store, &ctx.scope().space_id)
-    {
-        let active_op_guard = store.enter_write_op(&ctx.scope().space_id)?;
-        let writer_epoch = rollback_writer_epoch(store, ctx, prepared_epoch, deadline).await?;
-        let mut try_pg_batch_plan = true;
-        let standard_writer = idemp.requires_standard_writer();
-        if !standard_writer
-            && matches!(
-                store.inner.sql,
-                crate::runtime::SqlDriverState::Postgres { .. }
-            )
-            && let Some(outcome) = try_execute_pg_root_rollback(
-                store,
-                ctx,
-                idemp,
-                request,
-                writer_epoch,
-                &mut try_pg_batch_plan,
-                deadline,
-            )
-            .await
-        {
-            return outcome;
-        }
-        ctx.budget.remaining = rollback_time_left(&ctx.budget, deadline)?;
-        let pg_fast = (store.is_postgres() && try_pg_batch_plan && !standard_writer).then(|| {
-            build_rollback_pg_single_item_fast(
-                ctx.scope().clone(),
-                idemp.clone(),
-                ctx.auth().clone(),
-                request.identity.clone(),
-                request.input.clone(),
-                store.inner.room_fences.clone(),
-                writer_epoch,
-            )
-        });
-        let (intent, sqlite_plan) = direct_rollback_intent(
-            store,
-            ctx,
-            writer_epoch,
-            idemp.clone(),
-            &request.identity,
-            DirectRollbackTarget::Prepared(request.input.clone()),
-        );
-        let single_res = store
-            .submit_write_command_until::<StoredCommittedRollbackV1>(
-                &ctx.budget,
-                deadline,
-                intent,
-                sqlite_plan,
-                pg_fast,
-                Some(active_op_guard),
-            )
-            .await;
-
-        match single_res {
-            Ok(decoded) => return Ok(decoded.into_committed()),
-            Err(err) if requires_general_planner(&err) => {
-                // The general planner handles board history, folder covers and restored ability slots.
-            }
-            Err(err) => return Err(err),
-        }
-    }
-
-    execute_general_rollback(store, ctx, request, idemp, deadline).await
-}
-
-async fn execute_general_rollback(
-    store: &CanonicalStore,
-    ctx: &mut SpaceContext,
-    request: &Mutation<RollbackAgentRun>,
-    idemp: &crate::writer::CommandIdentitySpec,
-    deadline: Instant,
-) -> Result<Committed<RollbackResult>, PortError> {
-    ctx.budget.remaining = rollback_time_left(&ctx.budget, deadline)?;
-    if let Some(replayed) = rollback_wait(
-        &ctx.budget,
-        deadline,
-        try_replay_completed_receipt::<StoredCommittedRollbackV1>(
-            store,
-            ctx.scope(),
-            idemp,
-            Some(&ctx.budget),
-        ),
-    )
-    .await??
-    {
-        return Ok(replayed.into_committed());
-    }
-
-    let mut effective_input = request.input.clone();
     let mut attempt = 0;
     let mut replanned_after_recovery = false;
     while attempt < MAX_PLANNER_RETRIES {
-        // Step 1 & 2: Read run head, touched set, caller expectations, and classify `skipped_manual_edits`.
         ctx.budget.remaining = rollback_time_left(&ctx.budget, deadline)?;
-        let ctx_read = ctx.clone();
-        let input_read = effective_input.clone();
-        let (
-            space_rec,
-            skipped_manual_edits,
-            candidates,
-            durable_active_rooms,
-            run_board_moves,
-            extra_overlay_views,
-            active_view_notes,
-            package_cut,
-            observed_max_bmh_seq,
-        ) = match rollback_wait(
+        let scope_read = ctx.scope().clone();
+        let auth_read = ctx.auth().clone();
+        let run_read = request.input.clone();
+        let discovery = match rollback_wait(
             &ctx.budget,
             deadline,
             store.with_read_tx_budget(Some(&ctx.budget), |tx| {
-                Box::pin(
-                    async move { discover_rollback_state_tx(tx, &ctx_read, &input_read).await },
-                )
+                Box::pin(async move {
+                    discover_room_plan_tx(tx, &scope_read, &auth_read, &run_read).await
+                })
             }),
         )
         .await?
         {
-            Ok(discovered) => discovered,
-            Err(
-                err @ (PortError::Domain(DomainError::RevisionConflict { .. })
-                | PortError::Domain(DomainError::ResourceNotFound)),
-            ) => {
+            Ok(found) => found,
+            Err(err @ PortError::Domain(DomainError::ResourceNotFound)) => {
                 ctx.budget.remaining = rollback_time_left(&ctx.budget, deadline)?;
                 if let Some(replayed) = rollback_wait(
                     &ctx.budget,
@@ -639,7 +315,7 @@ async fn execute_general_rollback(
                     try_replay_completed_receipt::<StoredCommittedRollbackV1>(
                         store,
                         ctx.scope(),
-                        idemp,
+                        &idemp,
                         Some(&ctx.budget),
                     ),
                 )
@@ -652,61 +328,24 @@ async fn execute_general_rollback(
             Err(err) => return Err(err),
         };
 
-        // Load pre-run carriers from CAS ONLY when board views were moved by this run or
-        // carry overlays for mutated restorable notes and require `planned_carrier` in
-        // `RollbackBoardFactsRequest`.
-        let mut candidates_with_carriers: BTreeMap<NoteId, CandidateAction> = BTreeMap::new();
-        let need_board_carriers = !run_board_moves.is_empty() || !extra_overlay_views.is_empty();
-        for (nid, mut action) in candidates {
-            if need_board_carriers
-                && let CandidateAction::RestorePreExisting {
-                    ref pre_meta,
-                    ref mut pre_carrier,
-                    ..
-                } = action
-                && pre_meta.doc_class != DocClass::EncryptedNote
-                && let Some(digest) = pre_meta.content_digest
-            {
-                let raw = rollback_wait(
-                    &ctx.budget,
-                    deadline,
-                    store.read_verified_blob(&space_rec.scope, digest),
-                )
-                .await??;
-                let carrier_str = String::from_utf8(raw).map_err(|_| {
-                    internal_not_committed(
-                        "rollback_corrupt_utf8",
-                        "restored carrier invalid UTF-8",
-                    )
-                })?;
-                *pre_carrier = Some(carrier_str);
-            }
-            candidates_with_carriers.insert(nid, action);
-        }
-
-        // Step 3: Deterministic room reservation in ascending `NoteId` order BEFORE `evaluate_rollback`.
-        let mut skipped_room_active = Vec::new();
-        let mut eligible_notes: BTreeMap<NoteId, CandidateAction> = BTreeMap::new();
-        let mut eligible_reservations: BTreeMap<NoteId, ClosedRoomReservation> = BTreeMap::new();
-        let mut recovered_revisions = BTreeMap::new();
+        // Reserve closed rooms in ascending NoteId order outside the writer transaction.
+        let mut skipped_room_active = BTreeSet::new();
+        let mut reservations = BTreeMap::new();
+        let mut recovered_any = false;
         let interceptor = store.inner.collab_interceptor.get();
         let fences = &store.inner.room_fences;
         let space_id = ctx.scope().space_id.clone();
 
-        for (nid, action) in candidates_with_carriers {
-            let current = match &action {
-                CandidateAction::TrashCreated { current_rev, .. }
-                | CandidateAction::RestorePreExisting { current_rev, .. } => current_rev,
-            };
-            let was_blocked = durable_active_rooms.contains(&nid);
+        for (nid, current_rev) in &discovery.candidates {
+            let was_blocked = discovery.durable_active_rooms.contains(nid);
             if was_blocked
                 && (interceptor.is_none()
-                    || (!fences.is_room_fenced(&space_id, &nid)
+                    || (!fences.is_room_fenced(&space_id, nid)
                         && fences
-                            .fenced_recovery_revision(&space_id, &nid, current)
+                            .fenced_recovery_revision(&space_id, nid, current_rev)
                             .is_none()))
             {
-                skipped_room_active.push(nid);
+                skipped_room_active.insert(nid.clone());
                 continue;
             }
             ctx.budget.remaining = rollback_time_left(&ctx.budget, deadline)?;
@@ -716,32 +355,31 @@ async fn execute_general_rollback(
                         .reserve_rollback(ctx.clone(), nid.clone(), request.identity.clone())
                         .await
                 } else {
-                    store
-                        .inner
-                        .room_fences
-                        .reserve_rollback(ctx.scope(), &nid, request.identity.clone())
+                    fences
+                        .reserve_rollback(ctx.scope(), nid, request.identity.clone())
                         .await
                 }
             })
             .await??;
             match reservation {
                 RollbackReservation::SkippedRoomActive => {
-                    skipped_room_active.push(nid);
+                    skipped_room_active.insert(nid.clone());
                 }
                 RollbackReservation::Closed(closed_res) => {
                     if was_blocked
-                        && let Some(recovered) =
-                            fences.fenced_recovery_revision(&space_id, &nid, current)
+                        && fences
+                            .fenced_recovery_revision(&space_id, nid, current_rev)
+                            .is_some()
                     {
-                        recovered_revisions.insert(nid, recovered);
+                        recovered_any = true;
                         continue;
                     }
-                    eligible_reservations.insert(nid.clone(), closed_res);
-                    eligible_notes.insert(nid, action);
+                    reservations.insert(nid.clone(), closed_res);
                 }
             }
         }
-        if !recovered_revisions.is_empty() {
+
+        if recovered_any {
             if replanned_after_recovery {
                 return Err(unavailable_retryable(
                     "rollback_room_revision_contention",
@@ -749,211 +387,27 @@ async fn execute_general_rollback(
                     std::time::Duration::from_millis(10),
                 ));
             }
-            // Only substitute a recovery of the exact, already-authorized revision.
-            // The next discovery detects concurrent changes and counts recovered
-            // human edits as foreign to the rolled-back agent run.
-            for expected in &mut effective_input.expected_entities {
-                if let Some(revision) = recovered_revisions.remove(&expected.note) {
-                    expected.revision = revision;
-                }
-            }
             replanned_after_recovery = true;
             continue;
         }
 
         attempt += 1;
-
-        // Step 4: If eligible notes have board moves in `input.run` or any pre-existing
-        // eligible note may carry a stale neighbor overlay from `input.run`'s board moves,
-        // evaluate rollback board facts for views that remain active after rollback.
-        let has_restorable_eligible = eligible_notes
-            .values()
-            .any(|action| matches!(action, CandidateAction::RestorePreExisting { .. }));
-        let mut affected_views_set: BTreeSet<ViewRef> = BTreeSet::new();
-        let mut active_after_rollback_views: BTreeSet<ViewRef> = BTreeSet::new();
-        for bmh in &run_board_moves {
-            let view_active_after_rollback = match eligible_notes.get(&bmh.view.note) {
-                Some(CandidateAction::TrashCreated { .. }) => false,
-                Some(CandidateAction::RestorePreExisting { pre_meta, .. }) => {
-                    pre_meta.lifecycle == Lifecycle::Active
-                }
-                None => active_view_notes.contains(&bmh.view.note),
-            };
-            if view_active_after_rollback {
-                active_after_rollback_views.insert(bmh.view.clone());
-                if has_restorable_eligible || eligible_notes.contains_key(&bmh.target_note_id) {
-                    affected_views_set.insert(bmh.view.clone());
-                }
-            }
-        }
-        for view in &extra_overlay_views {
-            let view_active_after_rollback = match eligible_notes.get(&view.note) {
-                Some(CandidateAction::TrashCreated { .. }) => false,
-                Some(CandidateAction::RestorePreExisting { pre_meta, .. }) => {
-                    pre_meta.lifecycle == Lifecycle::Active
-                }
-                None => active_view_notes.contains(&view.note),
-            };
-            if view_active_after_rollback {
-                active_after_rollback_views.insert(view.clone());
-                if has_restorable_eligible {
-                    affected_views_set.insert(view.clone());
-                }
-            }
-        }
-
-        let rb_facts_opt = if !affected_views_set.is_empty() {
-            let (board_authority, provider) = store.board_facts_provider()?;
-
-            let mut planned_list = Vec::with_capacity(eligible_notes.len());
-            for (nid, action) in &eligible_notes {
-                match action {
-                    CandidateAction::TrashCreated {
-                        current_rev,
-                        parent_folder_id,
-                        doc_class,
-                        ability_id,
-                        ..
-                    } => {
-                        planned_list.push(PlannedNoteRestoration {
-                            note: nid.clone(),
-                            current_revision: current_rev.clone(),
-                            restored_from_revision: None,
-                            planned_lifecycle: Lifecycle::Trashed,
-                            planned_parent_folder: parent_folder_id.clone(),
-                            planned_class: *doc_class,
-                            planned_ability: ability_id.clone(),
-                            planned_header_diagnostic: None,
-                            planned_carrier: None,
-                            planned_fields: BTreeMap::new(),
-                            planned_updated_at: None,
-                        });
-                    }
-                    CandidateAction::RestorePreExisting {
-                        current_rev,
-                        pre_rev_id,
-                        pre_meta,
-                        pre_carrier,
-                        pre_updated_at,
-                        ..
-                    } => {
-                        let mut pfields = BTreeMap::new();
-                        if let Some(ref raw_map) = pre_meta.raw_fields {
-                            for (k, v) in raw_map {
-                                pfields.insert(k.clone(), Some(v.clone()));
-                            }
-                        }
-                        planned_list.push(PlannedNoteRestoration {
-                            note: nid.clone(),
-                            current_revision: current_rev.clone(),
-                            restored_from_revision: Some(pre_rev_id.clone()),
-                            planned_lifecycle: pre_meta.lifecycle,
-                            planned_parent_folder: pre_meta.parent_folder_id.clone(),
-                            planned_class: pre_meta.doc_class,
-                            planned_ability: pre_meta.ability_id.clone(),
-                            planned_header_diagnostic: pre_meta.diagnostics.first().cloned(),
-                            planned_carrier: pre_carrier.clone(),
-                            planned_fields: pfields,
-                            planned_updated_at: *pre_updated_at,
-                        });
-                    }
-                }
-            }
-
-            let req = RollbackBoardFactsRequest {
-                cutoff: None,
-                views: affected_views_set.iter().cloned().collect(),
-                eligible_notes: planned_list,
-            };
-            ctx.budget.remaining = rollback_time_left(&ctx.budget, deadline)?;
-            let facts = match rollback_wait(
-                &ctx.budget,
-                deadline,
-                provider.evaluate_rollback(&board_authority, ctx.clone(), req),
-            )
-            .await?
-            {
-                Ok(facts) => facts,
-                Err(
-                    err @ PortError::Domain(DomainError::ValidationFailed {
-                        diagnostic:
-                            Diagnostic {
-                                reason: ValidationReason::CursorStale,
-                                ..
-                            },
-                    }),
-                ) => {
-                    ctx.budget.remaining = rollback_time_left(&ctx.budget, deadline)?;
-                    if let Some(replayed) = rollback_wait(
-                        &ctx.budget,
-                        deadline,
-                        try_replay_completed_receipt::<StoredCommittedRollbackV1>(
-                            store,
-                            ctx.scope(),
-                            idemp,
-                            Some(&ctx.budget),
-                        ),
-                    )
-                    .await??
-                    {
-                        return Ok(replayed.into_committed());
-                    }
-                    if attempt < MAX_PLANNER_RETRIES {
-                        continue;
-                    }
-                    return Err(err);
-                }
-                Err(err) => return Err(err),
-            };
-            facts.verify_authority(&board_authority)?;
-            ctx.scope().check(facts.scope())?;
-            Some(facts)
-        } else {
-            None
+        let plan = RoomRollbackPlan {
+            expected_run_rev: discovery.actual_run_rev,
+            expected_heads: discovery.expected_heads,
+            reservations,
+            skipped_room_active,
         };
-
-        // Step 5 & 6: Submit ONE atomic write intent executing room consumption, reverse board replay,
-        // created-note trashing FIRST, note restoration, overlay updates, and agent_run_heads bump.
-        let required_cut = rb_facts_opt
-            .as_ref()
-            .map(|f| f.cutoff())
-            .into_iter()
-            .chain(package_cut)
-            .min()
-            .map(|cut| (cut, SemanticCutMismatchKind::CursorStale));
-
-        let mut source_note_ids: Vec<NoteId> = eligible_notes.keys().cloned().collect();
-        for v in &affected_views_set {
-            if !source_note_ids.contains(&v.note) {
-                source_note_ids.push(v.note.clone());
-            }
-        }
-
-        let intent = PreparedWriteIntent {
-            scope: space_rec.scope.clone(),
-            active_epoch: space_rec.active_epoch,
-            idempotency: Some(idemp.clone()),
-            source_note_ids,
-            staged_bytes: 0,
-            required_semantic_cut: required_cut,
-            execute: build_rollback_execute_fn(
-                space_rec.scope.clone(),
-                ctx.auth().clone(),
-                request.identity.clone(),
-                effective_input.clone(),
-                store.inner.room_fences.clone(),
-                eligible_notes,
-                eligible_reservations,
-                skipped_manual_edits.clone(),
-                skipped_room_active.clone(),
-                affected_views_set,
-                active_after_rollback_views,
-                rb_facts_opt,
-                run_board_moves.clone(),
-                extra_overlay_views,
-                observed_max_bmh_seq,
-            ),
-        };
+        let intent = build_unified_rollback_intent(
+            ctx.scope().clone(),
+            discovery.space_epoch,
+            idemp.clone(),
+            ctx.auth().clone(),
+            request.identity.clone(),
+            request.input.clone(),
+            store.inner.room_fences.clone(),
+            Some(plan),
+        );
 
         ctx.budget.remaining = rollback_time_left(&ctx.budget, deadline)?;
         match store
@@ -963,3599 +417,1027 @@ async fn execute_general_rollback(
                 intent,
                 None,
                 None,
-                None,
             )
             .await
         {
-            Ok(decoded) => {
-                return Ok(decoded.into_committed());
-            }
+            Ok(decoded) => return Ok(decoded.into_committed()),
             Err(PortError::Domain(DomainError::ValidationFailed {
                 diagnostic:
                     Diagnostic {
                         reason: ValidationReason::CursorStale,
                         ..
                     },
-            })) if attempt < MAX_PLANNER_RETRIES => {
-                continue;
-            }
+            })) if attempt < MAX_PLANNER_RETRIES => continue,
             Err(err) => return Err(err),
         }
     }
 
     Err(unavailable_retryable(
         "rollback_planner_cut_contention",
-        "rollback board facts cutoff contended across bounded retries",
+        "rollback room planning contended across bounded retries",
         std::time::Duration::from_millis(10),
     ))
 }
 
-pub(crate) enum DirectRollbackTarget {
-    Prepared(RollbackAgentRun),
-    ById(AgentRunId),
-}
+async fn discover_room_plan_tx(
+    tx: &mut BackendConn<'_>,
+    scope: &HistoryScope,
+    auth: &EngineAuthContext,
+    run: &AgentRunId,
+) -> Result<RoomPlanDiscovery, PortError> {
+    let srec = load_space_record(tx, &scope.space_id).await?;
+    srec.scope.check(scope)?;
+    auth.authorize_space_write(&srec.space)?;
+    ensure_chat_run_not_active_tx(tx, &srec.space, auth, run).await?;
 
-impl DirectRollbackTarget {
-    pub(crate) fn parts(&self) -> (&AgentRunId, Option<&RollbackAgentRun>) {
-        match self {
-            Self::Prepared(input) => (&input.run, Some(input)),
-            Self::ById(run) => (run, None),
-        }
+    let actual_run_rev = load_run_revision_only_tx(tx, &srec.scope, run).await?;
+    let histories = load_direct_rollback_histories(tx, &scope.space_id, run).await?;
+    let touched: Vec<NoteId> = histories.keys().cloned().collect();
+    let states = load_rollback_note_states(
+        tx,
+        &scope.space_id,
+        touched.iter().map(NoteId::as_str).collect(),
+    )
+    .await?;
+    if !states.purged.is_empty() {
+        return Err(DomainError::ResourceNotFound.into());
     }
+    let heads_map = load_note_heads_batch_tx(tx, &scope.space_id, &touched).await?;
+    let mut folder_cache = FolderAncestryCache::default();
+    let mut expected_heads = BTreeMap::new();
+    let mut candidates = BTreeMap::new();
+    let mut durable_active_rooms = BTreeSet::new();
+
+    for (nid, history) in &histories {
+        let head = heads_map.get(nid).ok_or(DomainError::ResourceNotFound)?;
+        let (rfacts, anc) = folder_cache
+            .build_resource_facts_tx(
+                tx,
+                &srec.space,
+                &head.parent_folder_id,
+                head.doc_class,
+                head.ability_id.clone(),
+                false,
+            )
+            .await?;
+        if anc.folder_lifecycle == Lifecycle::Purged {
+            return Err(DomainError::ResourceNotFound.into());
+        }
+        auth.can_view_resource(&rfacts)?;
+        auth.authorize_direct_write(&rfacts, &rfacts)?;
+        expected_heads.insert(nid.clone(), head.head_rev_id.clone());
+
+        if history.foreign_edit {
+            continue;
+        }
+        if (head.doc_class == DocClass::Skill || head.ability_id.is_some())
+            && ability::has_later_foreign_publication(
+                tx,
+                &srec.scope,
+                head,
+                history.first_seq,
+                run,
+                history.prior.is_none(),
+            )
+            .await?
+        {
+            continue;
+        }
+        if states.rooms.get(nid) == Some(&true) {
+            durable_active_rooms.insert(nid.clone());
+        }
+        candidates.insert(nid.clone(), head.head_rev_id.clone());
+    }
+
+    Ok(RoomPlanDiscovery {
+        space_epoch: srec.active_epoch,
+        actual_run_rev,
+        expected_heads,
+        candidates,
+        durable_active_rooms,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_rollback_direct_single_tx_intent(
+fn build_unified_rollback_intent(
     scope: HistoryScope,
-    active_epoch: notarium_core::ids::LeaseEpoch,
+    active_epoch: LeaseEpoch,
     idemp: crate::writer::CommandIdentitySpec,
-    auth: notarium_core::auth::EngineAuthContext,
-    req_id: notarium_core::receipt::CommandIdentity,
-    target: DirectRollbackTarget,
+    auth: EngineAuthContext,
+    req_id: CommandIdentity,
+    run: AgentRunId,
     room_fences: std::sync::Arc<crate::domain::RoomFenceTable>,
+    room_plan: Option<RoomRollbackPlan>,
 ) -> PreparedWriteIntent {
+    let source_note_ids = room_plan
+        .as_ref()
+        .map(|plan| plan.expected_heads.keys().cloned().collect())
+        .unwrap_or_default();
     PreparedWriteIntent {
         scope: scope.clone(),
         active_epoch,
         idempotency: Some(idemp),
-        source_note_ids: Vec::new(),
+        source_note_ids,
         staged_bytes: 0,
         required_semantic_cut: None,
-        execute: build_rollback_direct_single_tx_exec(scope, auth, req_id, target, room_fences),
-    }
-}
-
-pub(crate) fn build_rollback_direct_single_tx_exec(
-    scope_cl: HistoryScope,
-    auth: notarium_core::auth::EngineAuthContext,
-    req_id: notarium_core::receipt::CommandIdentity,
-    target: DirectRollbackTarget,
-    room_fences: std::sync::Arc<crate::domain::RoomFenceTable>,
-) -> crate::writer::ItemExecuteFn {
-    Box::new(move |tx, item_ctx| {
-        Box::pin(async move {
-            let (run, expected) = target.parts();
-            if let Some(input) = expected {
-                validate_rollback_expectations_unique(input)?;
-            }
-            auth.authorize_space_write(&item_ctx.space)?;
-            ensure_chat_run_not_active_tx(tx, &item_ctx.space, &auth, run).await?;
-            let mut folder_cache = FolderAncestryCache::default();
-            type RollbackStateProbe = (bool, bool, Option<bool>, bool, Option<(Vec<u8>, String)>);
-            let (has_bmh, has_note_states, known_overlays, read_schema, run_head_opt): RollbackStateProbe =
-                match tx {
-                BackendConn::Postgres(conn) => {
-                    // Folder ancestry and the current schema use the same reads as ordinary note writes.
-                    let row = sqlx::query(
-                        "SELECT EXISTS(SELECT 1 FROM board_move_history WHERE space_id = $1) AS has_bmh,
-                                (EXISTS(SELECT 1 FROM revision_purge_fences WHERE space_id = $1) OR
-                                 EXISTS(SELECT 1 FROM collab_sessions WHERE space_id = $1)) AS has_note_states,
-                                history_incarnation, run_revision
-                         FROM agent_run_heads WHERE space_id = $1 AND run_id = $2",
-                    )
-                    .bind(scope_cl.space_id.as_str())
-                    .bind(run.as_str())
-                    .fetch_optional(&mut **conn)
-                    .await
-                    .map_err(|err| internal_not_committed("pg_rb_combined_probe", err.to_string()))?
-                    .ok_or(DomainError::ResourceNotFound)?;
-                    (
-                        row.get("has_bmh"), row.get("has_note_states"), None, true,
-                        Some((row.get("history_incarnation"), row.get("run_revision"))),
-                    )
-                }
-                BackendConn::Sqlite(conn) => {
-                    let row = sqlx::query(concat!(
-                        "SELECT (", include_str!("rollback/sqlite_board_history.sql"), ") AS has_bmh,
-                                (EXISTS(SELECT 1 FROM revision_purge_fences WHERE space_id = ?1) OR
-                                 EXISTS(SELECT 1 FROM collab_sessions WHERE space_id = ?1)) AS has_note_states,
-                                EXISTS(SELECT 1 FROM view_rank_overlays WHERE space_id = ?1) AS has_ov,
-                                EXISTS(SELECT 1 FROM space_field_schemas WHERE space_id = ?1 AND is_current = 1) AS has_schema,
-                                arh.history_incarnation, arh.run_revision
-                         FROM (SELECT 1)
-                         LEFT JOIN agent_run_heads arh ON arh.space_id = ?1 AND arh.run_id = ?2"
-                    ))
-                    .bind(scope_cl.space_id.as_str())
-                    .bind(run.as_str())
-                    .fetch_one(&mut **conn)
-                    .await
-                    .map_err(|e| internal_not_committed("sqlite_rb_combined_probe", e.to_string()))?;
-                    let incarnation: Option<Vec<u8>> = row.get("history_incarnation");
-                    (
-                        row.get("has_bmh"),
-                        row.get("has_note_states"),
-                        Some(row.get("has_ov")),
-                        row.get("has_schema"),
-                        incarnation.zip(row.get("run_revision")),
-                    )
-                }
-            };
-
-            if has_bmh && matches!(tx, BackendConn::Sqlite(_)) {
-                return Err(rollback_fallback_board_present_err());
-            }
-
-            let Some((inc_bytes, run_rev_raw)) = run_head_opt else {
-                return Err(DomainError::ResourceNotFound.into());
-            };
-            let actual_run_rev = scoped_run_revision(&scope_cl, &inc_bytes, &run_rev_raw)?;
-
-            let expected_notes = if let Some(input) = expected {
-                let mut notes = BTreeSet::new();
-                for note in &input.expected_entities {
-                    if !notes.insert(&note.note) {
-                        return Err(DomainError::validation(ValidationReason::InvalidState).into());
-                    }
-                }
-                Some(notes)
-            } else {
-                None
-            };
-
-            let histories = load_direct_rollback_histories(tx, &scope_cl.space_id, run).await?;
-            let touched: Vec<NoteId> = histories.keys().cloned().collect();
-            let states = if has_note_states {
-                let ids = touched.iter().map(NoteId::as_str).collect();
-                load_rollback_note_states(tx, &scope_cl.space_id, ids).await?
-            } else {
-                RollbackNoteStates::default()
-            };
-            if !states.purged.is_empty() {
-                return Err(DomainError::ResourceNotFound.into());
-            }
-            if has_bmh && let BackendConn::Postgres(conn) = &mut *tx {
-                let ids: Vec<_> = touched.iter().map(NoteId::as_str).collect();
-                let relevant: bool = sqlx::query_scalar(
-                    "SELECT EXISTS(SELECT 1 FROM board_move_history WHERE space_id = $1
-                      AND (agent_run_id = $2 OR target_note_id = ANY($3) OR view_note_id = ANY($3)))",
-                ).bind(scope_cl.space_id.as_str()).bind(run.as_str()).bind(ids)
-                 .fetch_one(&mut **conn).await
-                 .map_err(|err| crate::runtime::pg_read_error("pg_rollback_board_scope", err))?;
-                if relevant {
-                    return Err(rollback_fallback_board_present_err());
-                }
-            }
-
-            let mut heads_map = load_note_heads_batch_tx(tx, &scope_cl.space_id, &touched).await?;
-
-            for nid in &touched {
-                let head = heads_map.get(nid).ok_or(DomainError::ResourceNotFound)?;
-                if head.slug_fold == super::folder_cover::SLUG {
-                    return Err(rollback_fallback_cover_change_err());
-                }
-                let (rfacts, anc) = folder_cache
-                    .build_resource_facts_tx(
-                        tx,
-                        &item_ctx.space,
-                        &head.parent_folder_id,
-                        head.doc_class,
-                        head.ability_id.clone(),
-                        false,
-                    )
-                    .await?;
-                if anc.folder_lifecycle == Lifecycle::Purged {
-                    return Err(DomainError::ResourceNotFound.into());
-                }
-                auth.can_view_resource(&rfacts)?;
-                auth.authorize_direct_write(&rfacts, &rfacts)?;
-            }
-
-            if let Some(notes) = expected_notes
-                && notes.into_iter().ne(touched.iter())
-            {
-                return Err(DomainError::validation(ValidationReason::SourceMismatch).into());
-            }
-
-            if let Some(input) = expected {
-                verify_authorized_rollback_revisions(actual_run_rev, input, |nid| {
-                    heads_map.get(nid).map(|head| &head.head_rev_id)
-                })?;
-            }
-
-            let collab_states = states.rooms;
-
-            let mut skipped_manual_edits = Vec::new();
-            let mut skipped_room_active = Vec::new();
-            let mut eligible_notes: BTreeMap<NoteId, CandidateAction> = BTreeMap::new();
-
-            for (nid, history) in histories {
-                let head = heads_map
-                    .remove(&nid)
-                    .ok_or(DomainError::ResourceNotFound)?;
-                if history.foreign_edit {
-                    skipped_manual_edits.push(nid);
-                    continue;
-                }
-
-                if collab_states.get(&nid) == Some(&true) {
-                    skipped_room_active.push(nid);
-                    continue;
-                }
-
-                if head.doc_class == DocClass::Skill || head.ability_id.is_some() {
-                    return Err(rollback_fallback_ability_slot_err());
-                }
-
-                let action = match history.prior {
-                    None => CandidateAction::TrashCreated {
-                        metadata: Box::new(decode_rollback_note(
-                            history.current_metadata.as_deref().ok_or_else(|| {
-                                internal_not_committed(
-                                    "rollback_missing_head",
-                                    "current note revision is missing",
-                                )
-                            })?,
-                            &nid,
-                        )?),
-                        current_rev: head.head_rev_id,
-                        current_lifecycle: head.lifecycle,
-                        doc_class: head.doc_class,
-                        parent_folder_id: head.parent_folder_id,
-                        slug: head.slug,
-                        slug_fold: head.slug_fold,
-                        title: head.title,
-                        ability_id: head.ability_id,
-                        visibility_mask: head.visibility_mask,
-                        byte_size: head.byte_size,
-                        content_digest: head.content_digest,
-                    },
-                    Some((pre_rev_id, meta_bytes, pre_updated_at)) => {
-                        let pre_meta = decode_rollback_note(&meta_bytes, &nid)?;
-                        if pre_meta.slug_fold == super::folder_cover::SLUG {
-                            return Err(rollback_fallback_cover_change_err());
-                        }
-                        if pre_meta.ability_id.is_some() {
-                            return Err(rollback_fallback_ability_slot_err());
-                        }
-                        let head_unchanged_placement = head.lifecycle == pre_meta.lifecycle
-                            && head.parent_folder_id == pre_meta.parent_folder_id
-                            && head.slug == pre_meta.slug
-                            && head.slug_fold == pre_meta.slug_fold;
-                        let needs_note_mutation =
-                            head.head_rev_id != pre_rev_id || !head_unchanged_placement;
-                        let pre_updated_at = pre_meta.logical_updated_at.or(pre_updated_at);
-                        CandidateAction::RestorePreExisting {
-                            current_rev: head.head_rev_id,
-                            pre_rev_id,
-                            pre_meta: Box::new(pre_meta),
-                            pre_carrier: None,
-                            pre_updated_at,
-                            needs_note_mutation,
-                            head_unchanged_placement,
-                            current_cover_parent: None,
-                            first_run_seq: SpaceSeq::ZERO,
-                        }
-                    }
-                };
-
-                eligible_notes.insert(nid, action);
-            }
-
-            // Lock per-note fences in ascending NoteId order before collision checks so no room can open/close
-            // concurrently and any PathConflict drops the guards without bumping fence epochs.
-            let mut final_eligible: BTreeMap<NoteId, CandidateAction> = BTreeMap::new();
-            let mut locked_fences = Vec::with_capacity(eligible_notes.len());
-            for (nid, action) in eligible_notes {
-                match room_fences
-                    .try_lock_closed_for_rollback(&scope_cl, &nid, &req_id)
-                    .await?
-                {
-                    Some((guard, res)) => {
-                        locked_fences.push((guard, res));
-                        final_eligible.insert(nid, action);
-                    }
-                    None => {
-                        skipped_room_active.push(nid);
-                    }
-                }
-            }
-            skipped_room_active.sort();
-
-            let eligible_all_ids: BTreeSet<NoteId> = final_eligible.keys().cloned().collect();
-            let mut planned_active_slots: HashMap<(FolderId, String), NoteId> = HashMap::new();
-            let mut planned_collision_checks: Vec<(FolderId, String, String, bool)> = Vec::new();
-            let mut restored_ancestries: HashMap<NoteId, bool> = HashMap::new();
-
-            for (nid, action) in &final_eligible {
-                if let CandidateAction::RestorePreExisting {
-                    pre_meta,
-                    head_unchanged_placement,
-                    ..
-                } = action
-                {
-                    let anc = authorize_rollback_destination_tx(
-                        tx,
-                        &mut folder_cache,
-                        &item_ctx.space,
-                        &auth,
-                        pre_meta,
-                    )
-                    .await?;
-                    restored_ancestries.insert(nid.clone(), anc.is_root_child);
-
-                    if pre_meta.lifecycle == Lifecycle::Active {
-                        let slot_key = (
-                            pre_meta.parent_folder_id.clone(),
-                            pre_meta.slug_fold.clone(),
-                        );
-                        if planned_active_slots.insert(slot_key, nid.clone()).is_some() {
-                            return Err(DomainError::PathConflict {
-                                target: PathTarget {
-                                    space_id: scope_cl.space_id.clone(),
-                                    parent: if anc.is_root_child {
-                                        None
-                                    } else {
-                                        Some(pre_meta.parent_folder_id.clone())
-                                    },
-                                    component: pre_meta.slug.clone(),
-                                },
-                            }
-                            .into());
-                        }
-                        if !*head_unchanged_placement {
-                            planned_collision_checks.push((
-                                pre_meta.parent_folder_id.clone(),
-                                pre_meta.slug_fold.clone(),
-                                pre_meta.slug.clone(),
-                                anc.is_root_child,
-                            ));
-                        }
-                    }
-                }
-            }
-
-            verify_no_active_non_eligible_collisions_batch_tx(
-                tx,
-                &scope_cl.space_id,
-                &planned_collision_checks,
-                &eligible_all_ids,
-            )
-            .await?;
-
-            stage_rollback_fences(item_ctx, locked_fences, &req_id)?;
-
-            let current_schema = if read_schema {
-                load_current_space_schema_tx(tx, &scope_cl.space_id).await?
-            } else {
-                None
-            };
-
-            let trash_note_count = final_eligible
-                .values()
-                .filter(|act| {
-                    matches!(
-                        act,
-                        CandidateAction::TrashCreated {
-                            current_lifecycle,
-                            ..
-                        } if *current_lifecycle != Lifecycle::Trashed
-                    )
-                })
-                .count() as u64;
-            let restore_note_count = final_eligible
-                .values()
-                .filter(|act| {
-                    matches!(
-                        act,
-                        CandidateAction::RestorePreExisting {
-                            needs_note_mutation: true,
-                            ..
-                        }
-                    )
-                })
-                .count() as u64;
-            let has_ov = match known_overlays {
-                Some(present) => present,
-                None => {
-                    final_eligible
-                        .values()
-                        .any(|action| rank_removal::removes_ranks(Some(action)))
-                        && has_any_overlays_in_space_tx(tx, &scope_cl.space_id).await?
-                }
-            };
-            let rank_removals = if has_ov {
-                rank_removal::plan_tx(tx, &scope_cl.space_id, &final_eligible, &[]).await?
-            } else {
-                Vec::new()
-            };
-            let total_seqs =
-                (trash_note_count + restore_note_count + rank_removals.len() as u64).max(1);
-            let (first_seq, visibility_seq) = item_ctx.preview_seq_range(total_seqs)?;
-            let vis_i64 = visibility_seq.get() as i64;
-            let now_ts = now_utc_timestamp()?;
-            let (sec, nsec) = encode_timestamp_parts(now_ts);
-
-            let mut events = Vec::with_capacity(total_seqs as usize);
-            let mut trashed_out = Vec::with_capacity(trash_note_count as usize);
-            let mut restored_out = Vec::with_capacity(restore_note_count as usize);
-            let mut owner_notes_for_receipt: BTreeSet<NoteId> = BTreeSet::new();
-            struct PendingSingleRev {
-                rev_id: RevisionId,
-                entity_type: &'static str,
-                entity_key: String,
-                space_seq: SpaceSeq,
-                parent_rev_id: Option<RevisionId>,
-                restored_from_rev_id: Option<RevisionId>,
-                content_blake3: Option<ContentDigest>,
-                metadata_msgpack: Vec<u8>,
-                agent_run_id: Option<AgentRunId>,
-            }
-            let mut pending_rev_rows: Vec<PendingSingleRev> =
-                Vec::with_capacity(final_eligible.len() + 1);
-            let mut pending_trash_heads: Vec<(NoteId, RevisionId)> =
-                Vec::with_capacity(trash_note_count as usize);
-
-            // Trash created notes FIRST.
-            for (nid, action) in &final_eligible {
-                let CandidateAction::TrashCreated {
-                    metadata,
-                    current_rev,
-                    current_lifecycle,
-                    doc_class,
-                    parent_folder_id,
-                    content_digest,
-                    ..
-                } = action
-                else {
-                    continue;
-                };
-
-                owner_notes_for_receipt.insert(nid.clone());
-
-                if *current_lifecycle == Lifecycle::Trashed {
-                    trashed_out.push(NoteRevision {
-                        note: nid.clone(),
-                        revision: current_rev.clone(),
-                    });
-                    continue;
-                }
-
-                let tseq = item_ctx.alloc_next_seq()?;
-                let trev = new_revision_id()?;
-                let anc = folder_cache
-                    .load_ancestry_tx(tx, &scope_cl.space_id, parent_folder_id, false)
-                    .await?;
-
-                pending_trash_heads.push((nid.clone(), trev.clone()));
-                if collab_states.contains_key(nid) {
-                    bump_closed_collab_session_lineage_tx(
-                        tx,
-                        &scope_cl.space_id,
-                        nid,
-                        &trev,
-                        vis_i64,
-                    )
-                    .await?;
-                }
-
-                let meta = encode_rollback_note(
-                    metadata,
-                    None,
-                    anc.is_root_child,
-                    RollbackRevision::Trash,
-                )?;
-
-                pending_rev_rows.push(PendingSingleRev {
-                    rev_id: trev.clone(),
-                    entity_type: "note",
-                    entity_key: nid.as_str().to_owned(),
-                    space_seq: tseq,
-                    parent_rev_id: Some(current_rev.clone()),
-                    restored_from_rev_id: None,
-                    content_blake3: *content_digest,
-                    metadata_msgpack: meta,
-                    agent_run_id: None,
-                });
-
-                events.push(BatchEventDraft {
-                    space_seq: tseq,
-                    entity_type: "note".to_owned(),
-                    entity_id: nid.as_str().to_owned(),
-                    op_kind: "trash".to_owned(),
-                    rev_id: trev.clone(),
-                    lifecycle: Lifecycle::Trashed,
-                    doc_class: Some(*doc_class),
-                });
-                trashed_out.push(NoteRevision {
-                    note: nid.clone(),
-                    revision: trev,
-                });
-            }
-
-            update_note_heads_trashed_batch_tx(
-                tx,
-                &scope_cl.space_id,
-                &pending_trash_heads,
-                vis_i64,
-                sec,
-                nsec,
-                auth.principal().as_str(),
-            )
-            .await?;
-
-            let mut pending_restore_heads: Vec<RestoredHeadUpdateItem<'_>> =
-                Vec::with_capacity(restore_note_count as usize);
-
-            for (nid, action) in &final_eligible {
-                let CandidateAction::RestorePreExisting {
-                    current_rev,
-                    pre_rev_id,
-                    pre_meta,
-                    pre_updated_at,
-                    needs_note_mutation,
-                    ..
-                } = action
-                else {
-                    continue;
-                };
-                owner_notes_for_receipt.insert(nid.clone());
-
-                if !*needs_note_mutation {
-                    continue;
-                }
-
-                let rseq = item_ctx.alloc_next_seq()?;
-                let rrev = new_revision_id()?;
-                let is_root_child = restored_ancestries.get(nid).copied().unwrap_or(false);
-
-                let title_fold = if pre_meta.doc_class == DocClass::EncryptedNote {
-                    normalize_title_key(&pre_meta.slug)
-                } else {
-                    normalize_title_key(&pre_meta.title)
-                };
-                let (head_updated_sec, head_updated_nsec) = pre_updated_at
-                    .map(encode_timestamp_parts)
-                    .unwrap_or((sec, nsec));
-
-                pending_restore_heads.push(RestoredHeadUpdateItem {
-                    note_id: nid,
-                    parent_folder_id: &pre_meta.parent_folder_id,
-                    slug: &pre_meta.slug,
-                    slug_fold: &pre_meta.slug_fold,
-                    title: &pre_meta.title,
-                    title_fold,
-                    doc_class_str: doc_class_to_db(pre_meta.doc_class),
-                    ability_id_str: pre_meta.ability_id.as_ref().map(|a| a.as_str()),
-                    rev_id: rrev.clone(),
-                    content_digest: pre_meta.content_digest,
-                    byte_size: pre_meta.byte_size,
-                    lifecycle_str: lifecycle_to_db(pre_meta.lifecycle),
-                    visibility_mask: pre_meta.visibility_mask,
-                    updated_at_sec: head_updated_sec,
-                    updated_at_nsec: head_updated_nsec,
-                });
-
-                if collab_states.contains_key(nid) {
-                    bump_closed_collab_session_lineage_tx(
-                        tx,
-                        &scope_cl.space_id,
-                        nid,
-                        &rrev,
-                        vis_i64,
-                    )
-                    .await?;
-                }
-
-                let meta = encode_rollback_note(
-                    pre_meta,
-                    None,
-                    is_root_child,
-                    RollbackRevision::Restore {
-                        schema: current_schema.as_ref(),
-                        logical_updated_at: *pre_updated_at,
-                    },
-                )?;
-
-                pending_rev_rows.push(PendingSingleRev {
-                    rev_id: rrev.clone(),
-                    entity_type: "note",
-                    entity_key: nid.as_str().to_owned(),
-                    space_seq: rseq,
-                    parent_rev_id: Some(current_rev.clone()),
-                    restored_from_rev_id: Some(pre_rev_id.clone()),
-                    content_blake3: pre_meta.content_digest,
-                    metadata_msgpack: meta,
-                    agent_run_id: None,
-                });
-
-                events.push(BatchEventDraft {
-                    space_seq: rseq,
-                    entity_type: "note".to_owned(),
-                    entity_id: nid.as_str().to_owned(),
-                    op_kind: "restore".to_owned(),
-                    rev_id: rrev.clone(),
-                    lifecycle: pre_meta.lifecycle,
-                    doc_class: Some(pre_meta.doc_class),
-                });
-                restored_out.push(NoteRevision {
-                    note: nid.clone(),
-                    revision: rrev,
-                });
-            }
-
-            // Coalesce the `agent_run` revision row into the exact same `revisions` batch insert!
-            let new_run_rev = new_revision_id()?;
-            let run_meta = RevisionMetadataEnvelope::v1(RevisionMetadataPayload::AgentRun(
-                crate::codec::AgentRunRevisionMetadata {
-                    run_id: run.clone(),
-                    last_seq: visibility_seq,
-                },
-            ))
-            .encode()?;
-            pending_rev_rows.push(PendingSingleRev {
-                rev_id: new_run_rev.clone(),
-                entity_type: "agent_run",
-                entity_key: run.as_str().to_owned(),
-                space_seq: visibility_seq,
-                parent_rev_id: None,
-                restored_from_rev_id: None,
-                content_blake3: None,
-                metadata_msgpack: run_meta,
-                agent_run_id: Some(run.clone()),
-            });
-
-            let rev_items: Vec<RevisionInsertItem<'_>> = pending_rev_rows
-                .iter()
-                .map(|r| RevisionInsertItem {
-                    rev_id: &r.rev_id,
-                    entity_type: r.entity_type,
-                    entity_key: &r.entity_key,
-                    space_seq: r.space_seq,
-                    visibility_seq,
-                    parent_rev_id: r.parent_rev_id.as_ref(),
-                    restored_from_rev_id: r.restored_from_rev_id.as_ref(),
-                    content_blake3: r.content_blake3,
-                    metadata_msgpack: &r.metadata_msgpack,
-                    actor_id: auth.principal(),
-                    agent_run_id: r.agent_run_id.as_ref(),
-                    created_at: now_ts,
-                })
-                .collect();
-
-            if let BackendConn::Postgres(conn) = &mut *tx {
-                execute_pg_rollback_domain_writes_cte(
-                    conn,
-                    &scope_cl,
+        execute: Box::new(move |tx, item_ctx| {
+            Box::pin(async move {
+                execute_unified_rollback_tx(
+                    tx,
+                    item_ctx,
+                    scope,
+                    auth,
+                    req_id,
                     run,
-                    &new_run_rev,
-                    vis_i64,
-                    sec,
-                    nsec,
-                    auth.principal().as_str(),
-                    &pending_restore_heads,
-                    &rev_items,
+                    room_fences,
+                    room_plan,
                 )
-                .await?;
-            } else {
-                update_note_heads_restored_batch_tx(
-                    tx,
-                    &scope_cl.space_id,
-                    &pending_restore_heads,
-                    vis_i64,
-                    auth.principal().as_str(),
-                )
-                .await?;
-
-                let pending_blob_rebinds: Vec<_> = rev_items
-                    .iter()
-                    .filter(|revision| revision.entity_type == "note")
-                    .filter_map(|revision| {
-                        Some(ExistingBlobRefItem {
-                            owner_kind: BlobOwnerKind::NoteRevision,
-                            owner_id: revision.entity_key.to_owned(),
-                            owner_rev_id: revision.rev_id.as_str().to_owned(),
-                            resource_key: "carrier",
-                            digest: revision.content_blake3?,
-                            created_seq: revision.space_seq,
-                        })
-                    })
-                    .collect();
-                bind_existing_active_blob_refs_batch_tx(
-                    tx,
-                    &scope_cl.space_id,
-                    &pending_blob_rebinds,
-                )
-                .await?;
-
-                insert_revision_rows_batch_tx(tx, &scope_cl, &rev_items).await?;
-
-                upsert_agent_run_head_row_only_tx(
-                    tx,
-                    &scope_cl,
-                    run,
-                    &new_run_rev,
-                    vis_i64,
-                    sec,
-                    nsec,
-                )
-                .await?;
-            }
-
-            for removal in rank_removals {
-                let seq = item_ctx.alloc_next_seq()?;
-                let revision = new_revision_id()?;
-                removal
-                    .write_tx(
-                        tx,
-                        &scope_cl,
-                        seq,
-                        visibility_seq,
-                        &revision,
-                        auth.principal(),
-                        now_ts,
-                    )
-                    .await?;
-                owner_notes_for_receipt.extend(removal.owners().into_iter().cloned());
-                events.push(removal.event(seq, revision));
-            }
-
-            if events.is_empty() {
-                let noop_seq = item_ctx.alloc_next_seq()?;
-                events.push(BatchEventDraft {
-                    space_seq: noop_seq,
-                    entity_type: "folder".to_owned(),
-                    entity_id: item_ctx.root_folder_id.as_str().to_owned(),
-                    op_kind: "edit".to_owned(),
-                    rev_id: new_run_rev,
-                    lifecycle: Lifecycle::Active,
-                    doc_class: None,
-                });
-            }
-
-            let owner_vec: Vec<NoteId> = owner_notes_for_receipt.into_iter().collect();
-            let cmd_range = notarium_core::ports::CommandSeqRange::new(first_seq, visibility_seq)?;
-            let effect_draft = build_effect_payload_draft(
-                new_prefixed_hex_id("pay_")?,
-                scope_cl.clone(),
-                cmd_range,
-                "rollback_agent_run",
-                EffectBodyV1::AwaitProjection {
-                    reason: StoredAwaitReasonV1::Bulk,
-                },
-                owner_vec.clone(),
-            )?;
-            let receipt_token = MutationReceiptToken::new(scope_cl.clone(), visibility_seq)?;
-            let wire = StoredCommittedRollbackV1 {
-                restored: restored_out,
-                trashed: trashed_out,
-                restored_ranks: Vec::new(),
-                skipped_manual_edits,
-                skipped_room_active: skipped_room_active.clone(),
-                receipt: receipt_token.clone(),
-            };
-            let resp_bytes = encode_msgpack(&wire)?;
-            let sanitized = encode_msgpack(&StoredCommittedRollbackV1::sanitized(receipt_token))?;
-
-            Ok(ItemCommitArtifacts {
-                command_id: new_prefixed_hex_id("cmd_")?,
-                command_kind: "rollback_agent_run".to_owned(),
-                events,
-                change_payload: Some(effect_draft),
-                receipt_detail_blob: Some(resp_bytes.clone()),
-                receipt_sanitized_blob: sanitized,
-                receipt_owner_note_ids: wire.receipt_owners(owner_vec),
-                response_bytes: resp_bytes,
+                .await
             })
-        })
-    })
+        }),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn materialize_working_group(
-    group: &GroupKey,
-    kept_groups: &[(GroupKey, Vec<NoteId>)],
-    overlays: &HashMap<NoteId, crate::domain::board::OverlayRow>,
-    moved_targets_on_view: &BTreeSet<&NoteId>,
-    stale_prerun_restores: &BTreeMap<NoteId, (GroupKey, crate::codec::RankRevisionMetadata)>,
-    same_group_run_materialized: &BTreeMap<NoteId, GroupKey>,
-    working_groups: &mut Vec<(GroupKey, Vec<ExistingRankedItem>, bool)>,
-    neighbor_dirty: &mut BTreeMap<NoteId, (GroupKey, String, bool)>,
-    materialize_unranked: bool,
-) -> Result<usize, PortError> {
-    let kept_notes: &[NoteId] = kept_groups
-        .iter()
-        .find(|(gk, _)| gk == group)
-        .map(|(_, notes)| notes.as_slice())
-        .unwrap_or(&[]);
-    let mut stale_in_group: Vec<(&NoteId, &crate::codec::RankRevisionMetadata)> =
-        stale_prerun_restores
-            .iter()
-            .filter_map(|(nid, (grp, meta))| (grp == group).then_some((nid, meta)))
-            .collect();
-    stale_in_group.sort_by(|a, b| {
-        a.1.sort_rank_lexo
-            .cmp(&b.1.sort_rank_lexo)
-            .then_with(|| a.0.cmp(b.0))
-    });
-    let must_keep_materialized = |nid: &NoteId| {
-        same_group_run_materialized.contains_key(nid)
-            && overlays.get(nid).is_some_and(|ov| {
-                &ov.group == group
-                    && (kept_notes.iter().any(|other_id| {
-                        other_id != nid
-                            && !same_group_run_materialized.contains_key(other_id)
-                            && overlays.get(other_id).is_some_and(|other_ov| {
-                                &other_ov.group == group
-                                    && (other_ov.sort_rank_lexo > ov.sort_rank_lexo
-                                        || (other_ov.placement_run_id.is_some()
-                                            && !moved_targets_on_view.contains(other_id)))
-                            })
-                    }) || stale_in_group
-                        .iter()
-                        .any(|(_, meta)| meta.sort_rank_lexo > ov.sort_rank_lexo))
-            })
-    };
-    let has_true_overlay = |nid: &NoteId| {
-        overlays.get(nid).map(|o| &o.group) == Some(group)
-            && (!same_group_run_materialized.contains_key(nid) || must_keep_materialized(nid))
-    };
-    if let Some(idx) = working_groups.iter().position(|(gk, _, _)| gk == group) {
-        if materialize_unranked && !working_groups[idx].2 {
-            let items = &mut working_groups[idx].1;
-            if items.is_empty() {
-                let init = evenly_spaced_ranks(kept_notes.len())?;
-                for (nid, r) in kept_notes.iter().zip(init) {
-                    if !moved_targets_on_view.contains(nid)
-                        && !stale_prerun_restores.contains_key(nid)
-                    {
-                        neighbor_dirty.insert(nid.clone(), (group.clone(), r.clone(), false));
-                    }
-                    items.push(ExistingRankedItem {
-                        note_id: nid.clone(),
-                        rank: r,
-                    });
-                }
-            } else {
-                for nid in kept_notes {
-                    if items.iter().any(|it| &it.note_id == nid) {
-                        continue;
-                    }
-                    let tail = compute_rank_placement(items, nid, items.len())?;
-                    for (pn, pr) in tail.pma_neighbor_updates {
-                        if let Some(it) = items.iter_mut().find(|i| i.note_id == pn) {
-                            it.rank = pr.clone();
-                        }
-                        if !moved_targets_on_view.contains(&pn)
-                            && !stale_prerun_restores.contains_key(&pn)
-                        {
-                            let is_pma = overlays.get(&pn).is_some_and(|o| &o.group == group)
-                                && !same_group_run_materialized.contains_key(&pn);
-                            neighbor_dirty.insert(pn, (group.clone(), pr, is_pma));
-                        }
-                    }
-                    if !moved_targets_on_view.contains(nid)
-                        && !stale_prerun_restores.contains_key(nid)
-                    {
-                        neighbor_dirty.insert(
-                            nid.clone(),
-                            (group.clone(), tail.target_rank.clone(), false),
-                        );
-                    }
-                    items.push(ExistingRankedItem {
-                        note_id: nid.clone(),
-                        rank: tail.target_rank,
-                    });
-                }
-            }
-            working_groups[idx].2 = true;
-        }
-        return Ok(idx);
-    }
-    if kept_notes.is_empty() && stale_in_group.is_empty() {
-        working_groups.push((group.clone(), Vec::new(), materialize_unranked));
-        return Ok(working_groups.len() - 1);
-    }
-    let all_unranked =
-        stale_in_group.is_empty() && kept_notes.iter().all(|nid| !has_true_overlay(nid));
-    let mut items = Vec::with_capacity(kept_notes.len() + stale_in_group.len());
-    if all_unranked && materialize_unranked {
-        let init = evenly_spaced_ranks(kept_notes.len())?;
-        for (nid, r) in kept_notes.iter().zip(init) {
-            if !moved_targets_on_view.contains(nid) && !stale_prerun_restores.contains_key(nid) {
-                neighbor_dirty.insert(nid.clone(), (group.clone(), r.clone(), false));
-            }
-            items.push(ExistingRankedItem {
-                note_id: nid.clone(),
-                rank: r,
-            });
-        }
-    } else if !all_unranked {
-        let mut ranked_only: Vec<ExistingRankedItem> = kept_notes
-            .iter()
-            .filter_map(|nid| {
-                if !has_true_overlay(nid) {
-                    return None;
-                }
-                let o = overlays.get(nid)?;
-                Some(ExistingRankedItem {
-                    note_id: nid.clone(),
-                    rank: o.sort_rank_lexo.clone(),
-                })
-            })
-            .collect();
-        ranked_only.sort_by(|a, b| a.rank.cmp(&b.rank).then_with(|| a.note_id.cmp(&b.note_id)));
-        items.extend(ranked_only);
-        for &(nid, meta) in &stale_in_group {
-            let collides = items.iter().any(|it| it.rank == meta.sort_rank_lexo);
-            if !collides {
-                let pos = items
-                    .iter()
-                    .position(|it| it.rank > meta.sort_rank_lexo)
-                    .unwrap_or(items.len());
-                items.insert(
-                    pos,
-                    ExistingRankedItem {
-                        note_id: nid.clone(),
-                        rank: meta.sort_rank_lexo.clone(),
-                    },
-                );
-            } else {
-                let pos = items
-                    .iter()
-                    .position(|it| it.rank >= meta.sort_rank_lexo)
-                    .unwrap_or(items.len());
-                let computed = compute_rank_placement(&items, nid, pos)?;
-                for (pn, pr) in computed.pma_neighbor_updates {
-                    if let Some(it) = items.iter_mut().find(|i| i.note_id == pn) {
-                        it.rank = pr.clone();
-                    }
-                    if !moved_targets_on_view.contains(&pn)
-                        && !stale_prerun_restores.contains_key(&pn)
-                    {
-                        let is_pma = overlays.get(&pn).is_some_and(|o| &o.group == group)
-                            && !same_group_run_materialized.contains_key(&pn);
-                        neighbor_dirty.insert(pn, (group.clone(), pr, is_pma));
-                    }
-                }
-                items.insert(
-                    pos,
-                    ExistingRankedItem {
-                        note_id: nid.clone(),
-                        rank: computed.target_rank,
-                    },
-                );
-            }
-        }
-        if materialize_unranked {
-            for nid in kept_notes {
-                let in_grp = has_true_overlay(nid);
-                if !in_grp {
-                    let tail = compute_rank_placement(&items, nid, items.len())?;
-                    for (pn, pr) in tail.pma_neighbor_updates {
-                        if let Some(it) = items.iter_mut().find(|i| i.note_id == pn) {
-                            it.rank = pr.clone();
-                        }
-                        if !moved_targets_on_view.contains(&pn)
-                            && !stale_prerun_restores.contains_key(&pn)
-                        {
-                            let is_pma = overlays.get(&pn).is_some_and(|o| &o.group == group)
-                                && !same_group_run_materialized.contains_key(&pn);
-                            neighbor_dirty.insert(pn, (group.clone(), pr, is_pma));
-                        }
-                    }
-                    if !moved_targets_on_view.contains(nid)
-                        && !stale_prerun_restores.contains_key(nid)
-                    {
-                        neighbor_dirty.insert(
-                            nid.clone(),
-                            (group.clone(), tail.target_rank.clone(), false),
-                        );
-                    }
-                    items.push(ExistingRankedItem {
-                        note_id: nid.clone(),
-                        rank: tail.target_rank,
-                    });
-                }
-            }
-        }
-    }
-    working_groups.push((group.clone(), items, materialize_unranked));
-    Ok(working_groups.len() - 1)
-}
-
-async fn load_run_visibility_seqs_tx(
+async fn execute_unified_rollback_tx(
     tx: &mut BackendConn<'_>,
-    scope: &HistoryScope,
-    run: &AgentRunId,
-) -> Result<std::collections::HashSet<i64>, PortError> {
-    const RUN_VIS_SEQS_SQLITE_SQL: &str = include_str!("rollback/run_vis_seqs.sqlite.sql");
-    let rows: Vec<i64> = match tx {
-        BackendConn::Sqlite(conn) => sqlx::query_scalar(RUN_VIS_SEQS_SQLITE_SQL)
-            .bind(scope.space_id.as_str())
-            .bind(scope.incarnation.as_bytes().as_slice())
-            .bind(run.as_str())
-            .fetch_all(&mut **conn)
-            .await
-            .map_err(|err| internal_not_committed("sqlite_run_vis_seqs", err.to_string()))?,
-        BackendConn::Postgres(conn) => sqlx::query_scalar(
-            "SELECT DISTINCT visibility_seq FROM revisions
-             WHERE space_id = $1
-               AND history_incarnation = $2
-               AND agent_run_id IS NOT NULL
-               AND agent_run_id = $3",
-        )
-        .bind(scope.space_id.as_str())
-        .bind(scope.incarnation.as_bytes().as_slice())
-        .bind(run.as_str())
-        .fetch_all(&mut **conn)
-        .await
-        .map_err(|err| crate::runtime::pg_read_error("pg_run_vis_seqs", err))?,
-    };
-    Ok(rows.into_iter().collect())
-}
+    item_ctx: &mut crate::writer::ItemExecCtx,
+    scope_cl: HistoryScope,
+    auth: EngineAuthContext,
+    req_id: CommandIdentity,
+    run: AgentRunId,
+    room_fences: std::sync::Arc<crate::domain::RoomFenceTable>,
+    mut room_plan: Option<RoomRollbackPlan>,
+) -> Result<ItemCommitArtifacts, PortError> {
+    auth.authorize_space_write(&item_ctx.space)?;
+    ensure_chat_run_not_active_tx(tx, &item_ctx.space, &auth, &run).await?;
 
-async fn load_latest_prerun_rank_meta_tx(
-    tx: &mut BackendConn<'_>,
-    scope: &HistoryScope,
-    view: &ViewRef,
-    target: &NoteId,
-    run: &AgentRunId,
-    run_vis_seqs: &std::collections::HashSet<i64>,
-    before_seq: SpaceSeq,
-) -> Result<Option<crate::codec::RankRevisionMetadata>, PortError> {
-    use futures_util::TryStreamExt;
-    const PRERUN_RANK_SQLITE_SQL: &str = include_str!("rollback/prerun_rank.sqlite.sql");
-    let key = super::board::rank_entity_key(&view.note, &view.key, target);
-    let before_i64 = before_seq.get() as i64;
-    let bytes_opt: Option<Vec<u8>> =
-        match tx {
-            BackendConn::Sqlite(conn) => {
-                let mut found = None;
-                let mut stream = sqlx::query_as::<_, (i64, Vec<u8>)>(PRERUN_RANK_SQLITE_SQL)
-                    .bind(scope.space_id.as_str())
-                    .bind(scope.incarnation.as_bytes().as_slice())
-                    .bind(&key)
-                    .bind(run.as_str())
-                    .bind(before_i64)
-                    .fetch(&mut **conn);
-                while let Some((vis_seq, bytes)) = stream.try_next().await.map_err(|err| {
-                    internal_not_committed("sqlite_prerun_rank_meta", err.to_string())
-                })? {
-                    if !run_vis_seqs.contains(&vis_seq) {
-                        found = Some(bytes);
-                        break;
-                    }
-                }
-                found
-            }
-            BackendConn::Postgres(conn) => {
-                let mut found = None;
-                let mut stream = sqlx::query_as::<_, (i64, Vec<u8>)>(
-                    "SELECT visibility_seq, metadata_msgpack FROM revisions
-                 WHERE space_id = $1 AND history_incarnation = $2
-                   AND entity_type = 'rank' AND entity_key = $3
-                   AND (agent_run_id IS NULL OR agent_run_id != $4)
-                   AND space_seq < $5
-                 ORDER BY visibility_seq DESC, space_seq DESC",
+    let mut folder_cache = FolderAncestryCache::default();
+    type RollbackStateProbe = (bool, Option<bool>, bool, Option<(Vec<u8>, String)>);
+    let (has_note_states, known_overlays, read_schema, run_head_opt): RollbackStateProbe = match tx
+    {
+        BackendConn::Postgres(conn) => {
+            let row = sqlx::query(
+                    "SELECT (EXISTS(SELECT 1 FROM revision_purge_fences WHERE space_id = $1) OR
+                             EXISTS(SELECT 1 FROM collab_sessions WHERE space_id = $1)) AS has_note_states,
+                            history_incarnation, run_revision
+                     FROM agent_run_heads WHERE space_id = $1 AND run_id = $2",
                 )
-                .bind(scope.space_id.as_str())
-                .bind(scope.incarnation.as_bytes().as_slice())
-                .bind(&key)
+                .bind(scope_cl.space_id.as_str())
                 .bind(run.as_str())
-                .bind(before_i64)
-                .fetch(&mut **conn);
-                while let Some((vis_seq, bytes)) = stream
-                    .try_next()
-                    .await
-                    .map_err(|err| crate::runtime::pg_read_error("pg_prerun_rank_meta", err))?
-                {
-                    if !run_vis_seqs.contains(&vis_seq) {
-                        found = Some(bytes);
-                        break;
-                    }
+                .fetch_optional(&mut **conn)
+                .await
+                .map_err(|err| internal_not_committed("pg_rb_combined_probe", err.to_string()))?
+                .ok_or(DomainError::ResourceNotFound)?;
+            (
+                row.get("has_note_states"),
+                None,
+                true,
+                Some((row.get("history_incarnation"), row.get("run_revision"))),
+            )
+        }
+        BackendConn::Sqlite(conn) => {
+            let row = sqlx::query(
+                    "SELECT (EXISTS(SELECT 1 FROM revision_purge_fences WHERE space_id = ?1) OR
+                             EXISTS(SELECT 1 FROM collab_sessions WHERE space_id = ?1)) AS has_note_states,
+                            EXISTS(SELECT 1 FROM view_rank_overlays WHERE space_id = ?1) AS has_ov,
+                            EXISTS(SELECT 1 FROM space_field_schemas WHERE space_id = ?1 AND is_current = 1) AS has_schema,
+                            arh.history_incarnation, arh.run_revision
+                     FROM (SELECT 1)
+                     LEFT JOIN agent_run_heads arh ON arh.space_id = ?1 AND arh.run_id = ?2",
+                )
+                .bind(scope_cl.space_id.as_str())
+                .bind(run.as_str())
+                .fetch_one(&mut **conn)
+                .await
+                .map_err(|e| internal_not_committed("sqlite_rb_combined_probe", e.to_string()))?;
+            let incarnation: Option<Vec<u8>> = row.get("history_incarnation");
+            (
+                row.get("has_note_states"),
+                Some(row.get("has_ov")),
+                row.get("has_schema"),
+                incarnation.zip(row.get("run_revision")),
+            )
+        }
+    };
+
+    let Some((inc_bytes, run_rev_raw)) = run_head_opt else {
+        return Err(DomainError::ResourceNotFound.into());
+    };
+    let actual_run_rev = scoped_run_revision(&scope_cl, &inc_bytes, &run_rev_raw)?;
+
+    let histories = load_direct_rollback_histories(tx, &scope_cl.space_id, &run).await?;
+    let touched: Vec<NoteId> = histories.keys().cloned().collect();
+    let states = if has_note_states {
+        let ids = touched.iter().map(NoteId::as_str).collect();
+        load_rollback_note_states(tx, &scope_cl.space_id, ids).await?
+    } else {
+        RollbackNoteStates::default()
+    };
+    if !states.purged.is_empty() {
+        return Err(DomainError::ResourceNotFound.into());
+    }
+
+    let mut heads_map = load_note_heads_batch_tx(tx, &scope_cl.space_id, &touched).await?;
+
+    for nid in &touched {
+        let head = heads_map.get(nid).ok_or(DomainError::ResourceNotFound)?;
+        let (rfacts, anc) = folder_cache
+            .build_resource_facts_tx(
+                tx,
+                &item_ctx.space,
+                &head.parent_folder_id,
+                head.doc_class,
+                head.ability_id.clone(),
+                false,
+            )
+            .await?;
+        if anc.folder_lifecycle == Lifecycle::Purged {
+            return Err(DomainError::ResourceNotFound.into());
+        }
+        auth.can_view_resource(&rfacts)?;
+        auth.authorize_direct_write(&rfacts, &rfacts)?;
+    }
+
+    if let Some(plan) = &room_plan {
+        let heads_match = actual_run_rev == plan.expected_run_rev
+            && heads_map.len() == plan.expected_heads.len()
+            && plan
+                .expected_heads
+                .iter()
+                .all(|(nid, rev)| heads_map.get(nid).is_some_and(|h| &h.head_rev_id == rev));
+        if !heads_match {
+            return Err(DomainError::validation(ValidationReason::CursorStale).into());
+        }
+    }
+
+    let collab_states = states.rooms;
+    let mut skipped_manual_edits = Vec::new();
+    let mut skipped_room_active = Vec::new();
+    let mut eligible_notes: BTreeMap<NoteId, CandidateAction> = BTreeMap::new();
+
+    for (nid, history) in histories {
+        let head = heads_map
+            .remove(&nid)
+            .ok_or(DomainError::ResourceNotFound)?;
+        if history.foreign_edit {
+            skipped_manual_edits.push(nid);
+            continue;
+        }
+        if (head.doc_class == DocClass::Skill || head.ability_id.is_some())
+            && ability::has_later_foreign_publication(
+                tx,
+                &scope_cl,
+                &head,
+                history.first_seq,
+                &run,
+                history.prior.is_none(),
+            )
+            .await?
+        {
+            skipped_manual_edits.push(nid);
+            continue;
+        }
+        if let Some(plan) = &room_plan {
+            if plan.skipped_room_active.contains(&nid) {
+                skipped_room_active.push(nid);
+                continue;
+            }
+        } else if collab_states.get(&nid) == Some(&true) {
+            skipped_room_active.push(nid);
+            continue;
+        }
+
+        let current_cover_parent = if head.slug_fold == super::folder_cover::SLUG
+            && crate::runtime::load_folder_head_row(tx, &scope_cl.space_id, &head.parent_folder_id)
+                .await?
+                .cover_note_id
+                .as_ref()
+                == Some(&nid)
+        {
+            Some(head.parent_folder_id.clone())
+        } else {
+            None
+        };
+
+        let action = match history.prior {
+            None => {
+                let mut metadata = decode_rollback_note(
+                    history.current_metadata.as_deref().ok_or_else(|| {
+                        internal_not_committed(
+                            "rollback_missing_head",
+                            "current note revision is missing",
+                        )
+                    })?,
+                    &nid,
+                )?;
+                metadata.folder_page |= current_cover_parent.is_some();
+                ability::retain_binding(&mut metadata, &head)?;
+                CandidateAction::TrashCreated {
+                    metadata: Box::new(metadata),
+                    current_rev: head.head_rev_id,
+                    current_lifecycle: head.lifecycle,
+                    doc_class: head.doc_class,
+                    parent_folder_id: head.parent_folder_id,
+                    content_digest: head.content_digest,
                 }
-                found
+            }
+            Some((pre_rev_id, meta_bytes, pre_updated_at)) => {
+                let mut pre_meta = decode_rollback_note(&meta_bytes, &nid)?;
+                ability::retain_binding(&mut pre_meta, &head)?;
+                let head_unchanged_placement = head.lifecycle == pre_meta.lifecycle
+                    && head.parent_folder_id == pre_meta.parent_folder_id
+                    && head.slug == pre_meta.slug
+                    && head.slug_fold == pre_meta.slug_fold;
+                let needs_note_mutation =
+                    head.head_rev_id != pre_rev_id || !head_unchanged_placement;
+                let pre_updated_at = pre_meta.logical_updated_at.or(pre_updated_at);
+                CandidateAction::RestorePreExisting {
+                    current_rev: head.head_rev_id,
+                    pre_rev_id,
+                    pre_meta: Box::new(pre_meta),
+                    pre_updated_at,
+                    needs_note_mutation,
+                    head_unchanged_placement,
+                    current_cover_parent,
+                }
             }
         };
-    let Some(bytes) = bytes_opt else {
-        return Ok(None);
-    };
-    match RevisionMetadataEnvelope::decode(&bytes)?.payload {
-        RevisionMetadataPayload::Rank(meta) => Ok(Some(meta)),
-        _ => Err(internal_not_committed(
-            "rollback_prerun_rank_meta_kind",
-            "rank revision metadata has unexpected payload variant",
-        )),
+
+        eligible_notes.insert(nid, action);
     }
-}
 
-#[inline(never)]
-#[allow(clippy::too_many_arguments)]
-fn plan_inactive_view_rollbacks_tx<'a>(
-    tx: &'a mut BackendConn<'_>,
-    scope_cl: &'a HistoryScope,
-    run: &'a AgentRunId,
-    run_moves_cl: &'a [RunBoardMoveRow],
-    extra_overlay_views: &'a BTreeSet<ViewRef>,
-    eligible_notes: &'a BTreeMap<NoteId, CandidateAction>,
-    eligible_all_ids: &'a BTreeSet<NoteId>,
-    retired_note_ids: &'a BTreeSet<NoteId>,
-    active_after_rollback_views: &'a BTreeSet<ViewRef>,
-    affected_views_set: &'a BTreeSet<ViewRef>,
-    rb_facts_opt: &'a Option<notarium_core::ports::RollbackBoardFacts>,
-    run_vis_seqs: &'a std::collections::HashSet<i64>,
-    planned_overlay_deletes: &'a mut Vec<PlannedOverlayDelete>,
-    planned_target_restores: &'a mut Vec<PlannedTargetRankRestore>,
-    planned_neighbor_updates: &'a mut Vec<PlannedNeighborRankUpdate>,
-    preloaded_view_overlays: &'a mut BTreeMap<
-        ViewRef,
-        HashMap<NoteId, crate::domain::board::OverlayRow>,
-    >,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), PortError>> + Send + 'a>> {
-    Box::pin(async move {
-        let inactive_or_retired_views: BTreeSet<ViewRef> = run_moves_cl
-            .iter()
-            .map(|bmh| &bmh.view)
-            .chain(extra_overlay_views.iter())
-            .filter(|view| {
-                !retired_note_ids.contains(&view.note)
-                    && (!active_after_rollback_views.contains(*view)
-                        || (affected_views_set.contains(*view)
-                            && rb_facts_opt
-                                .as_ref()
-                                .is_none_or(|facts| !facts.views().contains_key(*view))))
-            })
-            .cloned()
-            .collect();
-        for view in &inactive_or_retired_views {
-            let overlays = load_view_overlays_tx(tx, &scope_cl.space_id, view).await?;
-            let mut earliest_bmh_for_target: HashMap<NoteId, &RunBoardMoveRow> = HashMap::new();
-            for bmh in run_moves_cl {
-                if &bmh.view == view
-                    && eligible_all_ids.contains(&bmh.target_note_id)
-                    && !retired_note_ids.contains(&bmh.target_note_id)
-                {
-                    earliest_bmh_for_target.insert(bmh.target_note_id.clone(), bmh);
-                }
+    // Lock per-note fences in ascending NoteId order before collision checks so no room can open/close
+    // concurrently and any PathConflict drops the guards without bumping fence epochs.
+    let mut final_eligible: BTreeMap<NoteId, CandidateAction> = BTreeMap::new();
+    let mut locked_fences = Vec::with_capacity(eligible_notes.len());
+    if let Some(plan) = room_plan.as_mut() {
+        for (nid, action) in eligible_notes {
+            let Some(mut res) = plan.reservations.remove(&nid) else {
+                return Err(DomainError::validation(ValidationReason::CursorStale).into());
+            };
+            let guard = room_fences.lock_for_consume(&scope_cl, &nid, &mut res)?;
+            if collab_states.get(&nid) == Some(&true) {
+                return Err(DomainError::validation(ValidationReason::InvalidState).into());
             }
-            let view_has_rollback_effect =
-                eligible_all_ids.contains(&view.note) || !earliest_bmh_for_target.is_empty();
-            let mut run_mat_seqs: BTreeMap<NoteId, SpaceSeq> = BTreeMap::new();
-            for (nid, ov) in &overlays {
-                if !retired_note_ids.contains(nid)
-                    && ov.placement_run_id.is_none()
-                    && (view_has_rollback_effect || eligible_all_ids.contains(nid))
-                    && let Some(seq) = run_materialized_overlay_seq_tx(
-                        tx,
-                        &scope_cl.space_id,
-                        &ov.placement_revision,
-                        run,
-                    )
-                    .await?
-                {
-                    run_mat_seqs.insert(nid.clone(), seq);
-                }
-            }
-            let mut overlay_ids: Vec<NoteId> = overlays.keys().cloned().collect();
-            overlay_ids.sort();
-            let mut prerun_restores: Vec<(NoteId, crate::codec::RankRevisionMetadata)> = Vec::new();
-            let mut pending_mat_deletes: Vec<(NoteId, GroupKey, String)> = Vec::new();
-            let mut cleared_run_owned: BTreeSet<NoteId> = BTreeSet::new();
-            type InactiveClearedTarget = (
-                SpaceSeq,
-                i32,
-                NoteId,
-                GroupKey,
-                Option<NoteId>,
-                Option<NoteId>,
-            );
-            let mut cleared_to_unranked: Vec<InactiveClearedTarget> = Vec::new();
-            for nid in overlay_ids {
-                if retired_note_ids.contains(&nid) {
-                    continue;
-                }
-                let ov = &overlays[&nid];
-                if ov.placement_run_id.as_ref() == Some(run) {
-                    let Some(earliest_bmh) = earliest_bmh_for_target.get(&nid) else {
-                        continue;
-                    };
-                    let mut cutoff_seq = earliest_bmh.command_end_seq;
-                    let note_mutated_before_move = match eligible_notes.get(&nid) {
-                        Some(CandidateAction::RestorePreExisting {
-                            first_run_seq,
-                            needs_note_mutation,
-                            ..
-                        }) => {
-                            cutoff_seq = cutoff_seq.min(*first_run_seq);
-                            *needs_note_mutation && *first_run_seq < earliest_bmh.command_end_seq
-                        }
-                        _ => false,
-                    };
-                    if note_mutated_before_move {
-                        // The run edited this note before its first move on `view`, so
-                        // `earliest_bmh.before_placement` captures an intermediate state.
-                        // Restore the note's true pre-run manual rank if one existed;
-                        // otherwise clear the run-owned overlay without synthesizing a
-                        // placement in an intermediate group.
-                        let prerun = load_latest_prerun_rank_meta_tx(
-                            tx,
-                            scope_cl,
-                            view,
-                            &nid,
-                            run,
-                            run_vis_seqs,
-                            cutoff_seq,
-                        )
-                        .await?;
-                        if let Some(meta) = prerun
-                            && !meta.removed
-                        {
-                            prerun_restores.push((nid, meta));
-                        } else {
-                            cleared_run_owned.insert(nid.clone());
-                            planned_overlay_deletes.push(PlannedOverlayDelete {
-                                view: view.clone(),
-                                target_note: nid,
-                            });
-                        }
-                    } else {
-                        match &earliest_bmh.before_placement {
-                            StoredSemanticPlacementV1::Ineligible => {
-                                cleared_run_owned.insert(nid.clone());
-                                planned_overlay_deletes.push(PlannedOverlayDelete {
-                                    view: view.clone(),
-                                    target_note: nid,
-                                });
-                            }
-                            StoredSemanticPlacementV1::InGroup {
-                                group: expected_before_grp,
-                                predecessor,
-                                successor,
-                            } => {
-                                let prerun = load_latest_prerun_rank_meta_tx(
-                                    tx,
-                                    scope_cl,
-                                    view,
-                                    &nid,
-                                    run,
-                                    run_vis_seqs,
-                                    cutoff_seq,
-                                )
-                                .await?;
-                                if let Some(meta) = prerun
-                                    && !meta.removed
-                                    && crate::codec::group_key_hex(&meta.group_key)?.1
-                                        == crate::codec::group_key_hex(expected_before_grp)?.1
-                                {
-                                    prerun_restores.push((nid, meta));
-                                } else {
-                                    cleared_run_owned.insert(nid.clone());
-                                    cleared_to_unranked.push((
-                                        earliest_bmh.command_end_seq,
-                                        earliest_bmh.ordinal,
-                                        nid,
-                                        expected_before_grp.clone(),
-                                        predecessor.clone(),
-                                        successor.clone(),
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                } else if let Some(&mat_seq) = run_mat_seqs.get(&nid) {
-                    let restored_fields = match eligible_notes.get(&nid) {
-                        Some(CandidateAction::RestorePreExisting {
-                            needs_note_mutation,
-                            first_run_seq,
-                            ..
-                        }) if *needs_note_mutation => Some(*first_run_seq),
-                        _ => None,
-                    };
-                    let cutoff_seq = restored_fields.map_or(mat_seq, |first| first.min(mat_seq));
-                    let prerun = load_latest_prerun_rank_meta_tx(
-                        tx,
-                        scope_cl,
-                        view,
-                        &nid,
-                        run,
-                        run_vis_seqs,
-                        cutoff_seq,
-                    )
-                    .await?;
-                    if let Some(meta) = prerun
-                        && !meta.removed
-                        && (restored_fields.is_some()
-                            || crate::codec::group_key_hex(&meta.group_key)?.1 == ov.group_key_hex)
-                    {
-                        prerun_restores.push((nid, meta));
-                    } else if restored_fields.is_some() {
-                        cleared_run_owned.insert(nid.clone());
-                        planned_overlay_deletes.push(PlannedOverlayDelete {
-                            view: view.clone(),
-                            target_note: nid,
-                        });
-                    } else {
-                        pending_mat_deletes.push((
-                            nid,
-                            ov.group.clone(),
-                            ov.sort_rank_lexo.clone(),
-                        ));
-                    }
-                } else if ov.placement_run_id.is_none()
-                    && let Some(CandidateAction::RestorePreExisting {
-                        needs_note_mutation: true,
-                        first_run_seq,
-                        ..
-                    }) = eligible_notes.get(&nid)
-                    && ov.updated_seq > *first_run_seq
-                {
-                    let prerun = load_latest_prerun_rank_meta_tx(
-                        tx,
-                        scope_cl,
-                        view,
-                        &nid,
-                        run,
-                        run_vis_seqs,
-                        *first_run_seq,
-                    )
-                    .await?;
-                    if let Some(meta) = prerun
-                        && !meta.removed
-                        && crate::codec::group_key_hex(&meta.group_key)?.1 != ov.group_key_hex
-                    {
-                        prerun_restores.push((nid, meta));
-                    }
-                }
-            }
-            let mut deleted_mat_ids: BTreeSet<NoteId> = BTreeSet::new();
-            for (nid, grp, rank) in pending_mat_deletes {
-                let grp_hex = crate::codec::group_key_hex(&grp)?.1;
-                let has_surviving_ranked_below = overlays.iter().any(|(other_id, other_ov)| {
-                    other_id != &nid
-                        && other_ov.group_key_hex == grp_hex
-                        && !retired_note_ids.contains(other_id)
-                        && !run_mat_seqs.contains_key(other_id)
-                        && !cleared_run_owned.contains(other_id)
-                        && !prerun_restores.iter().any(|(rid, _)| rid == other_id)
-                        && (other_ov.sort_rank_lexo > rank
-                            || other_ov.placement_run_id.as_ref() == Some(run))
-                }) || prerun_restores.iter().any(|(rid, meta)| {
-                    rid != &nid
-                        && crate::codec::group_key_hex(&meta.group_key)
-                            .map(|(_, h)| h == grp_hex)
-                            .unwrap_or(false)
-                        && meta.sort_rank_lexo > rank
-                });
-                if !has_surviving_ranked_below {
-                    deleted_mat_ids.insert(nid.clone());
-                    planned_overlay_deletes.push(PlannedOverlayDelete {
-                        view: view.clone(),
-                        target_note: nid,
-                    });
-                }
-            }
-            let mut surviving_by_group: BTreeMap<String, Vec<ExistingRankedItem>> = BTreeMap::new();
-            for (nid, ov) in &overlays {
-                if retired_note_ids.contains(nid)
-                    || cleared_run_owned.contains(nid)
-                    || deleted_mat_ids.contains(nid)
-                    || prerun_restores.iter().any(|(rid, _)| rid == nid)
-                {
-                    continue;
-                }
-                surviving_by_group
-                    .entry(ov.group_key_hex.clone())
-                    .or_default()
-                    .push(ExistingRankedItem {
-                        note_id: nid.clone(),
-                        rank: ov.sort_rank_lexo.clone(),
-                    });
-            }
-            for items in surviving_by_group.values_mut() {
-                items.sort_by(|a, b| a.rank.cmp(&b.rank).then_with(|| a.note_id.cmp(&b.note_id)));
-            }
-            let mut inactive_neighbor_updates: BTreeMap<NoteId, (GroupKey, String, bool)> =
-                BTreeMap::new();
-            let mut settled_prerun: BTreeMap<NoteId, PlannedTargetRankRestore> = BTreeMap::new();
-            prerun_restores.sort_by(|a, b| {
-                a.1.sort_rank_lexo
-                    .cmp(&b.1.sort_rank_lexo)
-                    .then_with(|| a.0.cmp(&b.0))
-            });
-            for (nid, meta) in prerun_restores {
-                let gkey = crate::codec::group_key_hex(&meta.group_key)?.1;
-                let items = surviving_by_group.entry(gkey.clone()).or_default();
-                let collides = items.iter().any(|it| it.rank == meta.sort_rank_lexo);
-                let settled_rank = if !collides {
-                    let pos = items
-                        .iter()
-                        .position(|it| it.rank > meta.sort_rank_lexo)
-                        .unwrap_or(items.len());
-                    items.insert(
-                        pos,
-                        ExistingRankedItem {
-                            note_id: nid.clone(),
-                            rank: meta.sort_rank_lexo.clone(),
-                        },
-                    );
-                    meta.sort_rank_lexo
-                } else {
-                    let pos = items
-                        .iter()
-                        .position(|it| it.rank >= meta.sort_rank_lexo)
-                        .unwrap_or(items.len());
-                    let computed = compute_rank_placement(items, &nid, pos)?;
-                    for (pn, pr) in computed.pma_neighbor_updates {
-                        if let Some(it) = items.iter_mut().find(|i| i.note_id == pn) {
-                            it.rank = pr.clone();
-                        }
-                        if let Some(prev) = settled_prerun.get_mut(&pn) {
-                            prev.rank = pr;
-                        } else {
-                            let is_pma = overlays.get(&pn).is_some_and(|o| o.group_key_hex == gkey)
-                                && !run_mat_seqs.contains_key(&pn);
-                            inactive_neighbor_updates
-                                .insert(pn, (meta.group_key.clone(), pr, is_pma));
-                        }
-                    }
-                    items.insert(
-                        pos,
-                        ExistingRankedItem {
-                            note_id: nid.clone(),
-                            rank: computed.target_rank.clone(),
-                        },
-                    );
-                    computed.target_rank
-                };
-                settled_prerun.insert(
-                    nid.clone(),
-                    PlannedTargetRankRestore {
-                        view: view.clone(),
-                        target_note: nid,
-                        group: meta.group_key,
-                        rank: settled_rank,
-                        restored_placement_revision: Some(meta.placement_revision),
-                        restored_placement_actor: Some(meta.placement_actor_id),
-                        restored_placement_run: meta.placement_run_id,
-                    },
-                );
-            }
-            cleared_to_unranked.sort_by(|a, b| {
-                b.0.cmp(&a.0)
-                    .then_with(|| b.1.cmp(&a.1))
-                    .then_with(|| a.2.cmp(&b.2))
-            });
-            for (_, _, nid, grp, pred, succ) in cleared_to_unranked {
-                let gkey = crate::codec::group_key_hex(&grp)?.1;
-                let has_anchored_surviving = surviving_by_group.get(&gkey).is_some_and(|items| {
-                    !items.is_empty()
-                        && (pred
-                            .as_ref()
-                            .is_some_and(|p| items.iter().any(|it| &it.note_id == p))
-                            || succ
-                                .as_ref()
-                                .is_some_and(|s| items.iter().any(|it| &it.note_id == s)))
-                });
-                if !has_anchored_surviving {
-                    planned_overlay_deletes.push(PlannedOverlayDelete {
-                        view: view.clone(),
-                        target_note: nid,
-                    });
-                    continue;
-                }
-                let items = surviving_by_group.entry(gkey.clone()).or_default();
-                let lo = pred
-                    .as_ref()
-                    .and_then(|p| items.iter().position(|it| &it.note_id == p).map(|i| i + 1))
-                    .unwrap_or(0);
-                let hi = succ
-                    .as_ref()
-                    .and_then(|s| items.iter().position(|it| &it.note_id == s))
-                    .unwrap_or(items.len());
-                let ins_idx = if hi >= lo { hi } else { lo.min(items.len()) };
-                let computed = compute_rank_placement(items, &nid, ins_idx)?;
-                for (pn, pr) in computed.pma_neighbor_updates {
-                    if let Some(it) = items.iter_mut().find(|i| i.note_id == pn) {
-                        it.rank = pr.clone();
-                    }
-                    if let Some(prev) = settled_prerun.get_mut(&pn) {
-                        prev.rank = pr;
-                    } else {
-                        let is_pma = overlays.get(&pn).is_some_and(|o| o.group_key_hex == gkey)
-                            && !run_mat_seqs.contains_key(&pn);
-                        inactive_neighbor_updates.insert(pn, (grp.clone(), pr, is_pma));
-                    }
-                }
-                items.insert(
-                    ins_idx,
-                    ExistingRankedItem {
-                        note_id: nid.clone(),
-                        rank: computed.target_rank.clone(),
-                    },
-                );
-                settled_prerun.insert(
-                    nid.clone(),
-                    PlannedTargetRankRestore {
-                        view: view.clone(),
-                        target_note: nid,
-                        group: grp,
-                        rank: computed.target_rank,
-                        restored_placement_revision: None,
-                        restored_placement_actor: None,
-                        restored_placement_run: None,
-                    },
-                );
-            }
-            for restore in settled_prerun.into_values() {
-                planned_target_restores.push(restore);
-            }
-            for (nbr_id, (grp, rnk, is_pma)) in inactive_neighbor_updates {
-                planned_neighbor_updates.push(PlannedNeighborRankUpdate {
-                    view: view.clone(),
-                    neighbor_note: nbr_id,
-                    group: grp,
-                    rank: rnk,
-                    is_pma,
-                });
-            }
-            preloaded_view_overlays.insert(view.clone(), overlays);
+            locked_fences.push((guard, res));
+            final_eligible.insert(nid, action);
         }
-        Ok(())
-    })
-}
+    } else {
+        for (nid, action) in eligible_notes {
+            match room_fences
+                .try_lock_closed_for_rollback(&scope_cl, &nid, &req_id)
+                .await?
+            {
+                Some((guard, res)) => {
+                    locked_fences.push((guard, res));
+                    final_eligible.insert(nid, action);
+                }
+                None => {
+                    skipped_room_active.push(nid);
+                }
+            }
+        }
+    }
+    skipped_room_active.sort();
 
-#[allow(clippy::too_many_arguments)]
-fn build_rollback_execute_fn(
-    scope_cl: HistoryScope,
-    auth: notarium_core::auth::EngineAuthContext,
-    req_id: notarium_core::receipt::CommandIdentity,
-    input: RollbackAgentRun,
-    room_fences: std::sync::Arc<crate::domain::RoomFenceTable>,
-    eligible_notes: BTreeMap<NoteId, CandidateAction>,
-    eligible_reservations: BTreeMap<NoteId, ClosedRoomReservation>,
-    skipped_manual_cl: Vec<NoteId>,
-    skipped_room_cl: Vec<NoteId>,
-    affected_views_set: BTreeSet<ViewRef>,
-    active_after_rollback_views: BTreeSet<ViewRef>,
-    rb_facts_opt: Option<notarium_core::ports::RollbackBoardFacts>,
-    run_moves_cl: Vec<RunBoardMoveRow>,
-    extra_overlay_views: BTreeSet<ViewRef>,
-    observed_max_bmh_seq: i64,
-) -> crate::writer::ItemExecuteFn {
-    Box::new(move |tx, item_ctx| {
-        Box::pin(async move {
-            // 1. Re-verify `expected_run_revision`, `expected_entities`, and `associated_board_expectations`.
-            let mut folder_cache = FolderAncestryCache::default();
-            let VerifiedRollbackSources {
-                rooms: collab_states,
-                ..
-            } = verify_run_and_entity_preconditions_tx(
+    let eligible_all_ids: BTreeSet<NoteId> = final_eligible.keys().cloned().collect();
+    let mut planned_active_slots: HashMap<(FolderId, String), NoteId> = HashMap::new();
+    let mut planned_collision_checks: Vec<(FolderId, String, String, bool)> = Vec::new();
+    let mut restored_ancestries: HashMap<NoteId, bool> = HashMap::new();
+    let mut restored_ability_slots = Vec::new();
+
+    for (nid, action) in &final_eligible {
+        if let CandidateAction::RestorePreExisting {
+            pre_meta,
+            needs_note_mutation,
+            head_unchanged_placement,
+            ..
+        } = action
+        {
+            let anc = authorize_rollback_destination_tx(
                 tx,
-                &scope_cl,
+                &mut folder_cache,
                 &item_ctx.space,
                 &auth,
-                &input,
-                &mut folder_cache,
+                pre_meta,
             )
             .await?;
-            // Intra-column board moves advance `board_move_history` without changing `note_heads.head_rev_id`.
-            // Replan if any board move committed between discovery and write execution so confirmed
-            // manual card reorderings are classified into `skipped_manual_edits`.
-            if !eligible_notes.is_empty()
-                && load_max_board_move_seq_tx(tx, &scope_cl.space_id).await? != observed_max_bmh_seq
-            {
-                return Err(DomainError::validation(ValidationReason::CursorStale).into());
-            }
+            restored_ancestries.insert(nid.clone(), anc.is_root_child);
 
-            // 2. Lock all closed-room reservations in ascending NoteId order.
-            let mut locked_fences = Vec::with_capacity(eligible_reservations.len());
-            for (nid, mut res) in eligible_reservations {
-                let guard = room_fences.lock_for_consume(&scope_cl, &nid, &mut res)?;
-                // Double-check durable `collab_sessions` did not become `'active'` or `'fenced'` concurrently.
-                if collab_states.get(&nid) == Some(&true) {
-                    return Err(DomainError::validation(ValidationReason::InvalidState).into());
+            if pre_meta.lifecycle == Lifecycle::Active {
+                if *needs_note_mutation && let Some(ability) = &pre_meta.ability_id {
+                    restored_ability_slots.push((ability, &pre_meta.slug_fold, anc.project));
                 }
-                locked_fences.push((guard, res));
-            }
-            stage_rollback_fences(item_ctx, locked_fences, &req_id)?;
-
-            // 3. Validate folder existence and post-trash slug uniqueness for all eligible restored notes.
-            let eligible_all_ids: BTreeSet<NoteId> = eligible_notes.keys().cloned().collect();
-            let retired_note_ids: BTreeSet<NoteId> = eligible_notes
-                .iter()
-                .filter(|(_, act)| rank_removal::removes_ranks(Some(act)))
-                .map(|(nid, _)| nid.clone())
-                .collect();
-
-            let mut planned_active_slots: HashMap<(FolderId, String), NoteId> = HashMap::new();
-            let mut planned_collision_checks: Vec<(FolderId, String, String, bool)> = Vec::new();
-            let mut restored_ancestries: HashMap<NoteId, bool> = HashMap::new();
-
-            let mut changed_packages = Vec::new();
-            let mut restored_ability_slots = Vec::new();
-            for (nid, action) in &eligible_notes {
-                if let CandidateAction::RestorePreExisting {
-                    pre_meta,
-                    needs_note_mutation,
-                    ..
-                } = action
-                {
-                    let anc = authorize_rollback_destination_tx(
-                        tx,
-                        &mut folder_cache,
-                        &item_ctx.space,
-                        &auth,
-                        pre_meta,
-                    )
-                    .await?;
-                    restored_ancestries.insert(nid.clone(), anc.is_root_child);
-
-                    if pre_meta.lifecycle == Lifecycle::Active {
-                        if *needs_note_mutation && let Some(ability) = &pre_meta.ability_id {
-                            restored_ability_slots.push((
-                                ability,
-                                &pre_meta.slug_fold,
-                                anc.project,
-                            ));
-                        }
-                        let slot_key = (
-                            pre_meta.parent_folder_id.clone(),
-                            pre_meta.slug_fold.clone(),
-                        );
-                        if planned_active_slots.insert(slot_key, nid.clone()).is_some() {
-                            return Err(DomainError::PathConflict {
-                                target: PathTarget {
-                                    space_id: scope_cl.space_id.clone(),
-                                    parent: if anc.is_root_child {
-                                        None
-                                    } else {
-                                        Some(pre_meta.parent_folder_id.clone())
-                                    },
-                                    component: pre_meta.slug.clone(),
-                                },
-                            }
-                            .into());
-                        }
-                        planned_collision_checks.push((
-                            pre_meta.parent_folder_id.clone(),
-                            pre_meta.slug_fold.clone(),
-                            pre_meta.slug.clone(),
-                            anc.is_root_child,
-                        ));
-                    }
-                }
-            }
-
-            verify_no_active_non_eligible_collisions_batch_tx(
-                tx,
-                &scope_cl.space_id,
-                &planned_collision_checks,
-                &eligible_all_ids,
-            )
-            .await?;
-            // 4. Plan reverse board rank replays `(command_end_seq DESC, ordinal DESC)` before mutating SQL.
-            let mut planned_overlay_deletes: Vec<PlannedOverlayDelete> = Vec::new();
-            let mut planned_neighbor_updates: Vec<PlannedNeighborRankUpdate> = Vec::new();
-            let mut planned_target_restores: Vec<PlannedTargetRankRestore> = Vec::new();
-            let mut preloaded_view_overlays: BTreeMap<
-                ViewRef,
-                HashMap<NoteId, crate::domain::board::OverlayRow>,
-            > = BTreeMap::new();
-
-            let run_vis_seqs = if rb_facts_opt.is_some()
-                || !run_moves_cl.is_empty()
-                || !extra_overlay_views.is_empty()
-            {
-                load_run_visibility_seqs_tx(tx, &scope_cl, &input.run).await?
-            } else {
-                std::collections::HashSet::new()
-            };
-            if let Some(ref rb_facts) = rb_facts_opt {
-                let current_schema = load_current_space_schema_tx(tx, &scope_cl.space_id).await?;
-                let cur_schema_rev = current_schema.as_ref().map(|s| &s.schema_revision);
-
-                for view in &affected_views_set {
-                    if retired_note_ids.contains(&view.note) {
-                        continue;
-                    }
-                    let Some(view_facts) = rb_facts.views().get(view) else {
-                        continue;
-                    };
-                    let view_restored = matches!(
-                        eligible_notes.get(&view.note),
-                        Some(CandidateAction::RestorePreExisting { .. })
-                    );
-                    let view_head =
-                        load_note_head_row_tx(tx, &scope_cl.space_id, &view.note).await?;
-                    let view_restored_to_active = matches!(
-                        eligible_notes.get(&view.note),
-                        Some(CandidateAction::RestorePreExisting { pre_meta, .. })
-                            if pre_meta.lifecycle == Lifecycle::Active
-                    );
-                    if view_head.lifecycle != Lifecycle::Active && !view_restored_to_active {
-                        return Err(DomainError::ResourceNotFound.into());
-                    }
-                    if view_head.head_rev_id != view_facts.view_revision {
-                        return Err(DomainError::RevisionConflict {
-                            current: view_head.head_rev_id,
-                            lineage: None,
-                        }
-                        .into());
-                    }
-                    if cur_schema_rev != view_facts.schema_revision.as_ref() {
-                        return Err(DomainError::validation(ValidationReason::CursorStale).into());
-                    }
-                    if let Some(ref cs) = current_schema
-                        && cs.descriptor_fingerprint != view_facts.descriptor_fingerprint
-                    {
-                        return Err(DomainError::validation(ValidationReason::CursorStale).into());
-                    }
-
-                    let overlays = load_view_overlays_tx(tx, &scope_cl.space_id, view).await?;
-
-                    // Verify planner rows match current note & overlay state.
-                    for eg in &view_facts.groups {
-                        for row in &eg.rows {
-                            let rhead = super::board::verified_board_row_tx(
-                                tx,
-                                &item_ctx.space,
-                                &auth,
-                                &mut folder_cache,
-                                row,
-                            )
-                            .await?;
-                            verify_rank_expectation(
-                                &row.expected_rank,
-                                overlays.get(&row.note),
-                                &rhead.head_rev_id,
-                            )?;
-                        }
-                    }
-
-                    // Build mutable working group lists excluding notes retired by this rollback
-                    // and reconciling non-moved eligible notes against `post_restore_membership`.
-                    // Groups are materialized lazily only when a card is actually inserted into
-                    // them so untouched columns never acquire spurious overlays or rank revisions.
-                    let moved_targets_on_view: BTreeSet<&NoteId> = run_moves_cl
-                        .iter()
-                        .filter(|bmh| {
-                            &bmh.view == view
-                                && eligible_all_ids.contains(&bmh.target_note_id)
-                                && !retired_note_ids.contains(&bmh.target_note_id)
-                        })
-                        .map(|bmh| &bmh.target_note_id)
-                        .collect();
-                    let mut earliest_bmh_for_target: HashMap<NoteId, (SpaceSeq, i32)> =
-                        HashMap::new();
-                    for bmh in &run_moves_cl {
-                        if &bmh.view == view
-                            && eligible_all_ids.contains(&bmh.target_note_id)
-                            && !retired_note_ids.contains(&bmh.target_note_id)
-                        {
-                            // `run_moves_cl` is ordered `(command_end_seq DESC, ordinal DESC)`,
-                            // so overwriting keeps the chronologically earliest move on `view`.
-                            earliest_bmh_for_target.insert(
-                                bmh.target_note_id.clone(),
-                                (bmh.command_end_seq, bmh.ordinal),
-                            );
-                        }
-                    }
-                    let mut kept_groups: Vec<(GroupKey, Vec<NoteId>)> =
-                        Vec::with_capacity(view_facts.groups.len());
-                    for eg in &view_facts.groups {
-                        let kept: Vec<NoteId> = eg
-                            .rows
-                            .iter()
-                            .filter(|r| {
-                                if retired_note_ids.contains(&r.note) {
-                                    return false;
-                                }
-                                if moved_targets_on_view.contains(&r.note)
-                                    || !eligible_all_ids.contains(&r.note)
-                                {
-                                    return true;
-                                }
-                                view_facts
-                                    .post_restore_membership
-                                    .get(&r.note)
-                                    .and_then(|opt| opt.as_ref())
-                                    == Some(&eg.group)
-                            })
-                            .map(|r| r.note.clone())
-                            .collect();
-                        kept_groups.push((eg.group.clone(), kept));
-                    }
-                    for (nid, post_opt) in &view_facts.post_restore_membership {
-                        if retired_note_ids.contains(nid) || moved_targets_on_view.contains(nid) {
-                            continue;
-                        }
-                        if let Some(post_grp) = post_opt {
-                            if let Some((_, entry)) =
-                                kept_groups.iter_mut().find(|(gk, _)| gk == post_grp)
-                            {
-                                if !entry.contains(nid) {
-                                    entry.push(nid.clone());
-                                }
+                let slot_key = (
+                    pre_meta.parent_folder_id.clone(),
+                    pre_meta.slug_fold.clone(),
+                );
+                if planned_active_slots.insert(slot_key, nid.clone()).is_some() {
+                    return Err(DomainError::PathConflict {
+                        target: PathTarget {
+                            space_id: scope_cl.space_id.clone(),
+                            parent: if anc.is_root_child {
+                                None
                             } else {
-                                kept_groups.push((post_grp.clone(), vec![nid.clone()]));
-                            }
-                        }
-                    }
-                    for (grp, entry) in &mut kept_groups {
-                        if let Some((_, order)) = view_facts
-                            .post_restore_group_order
-                            .iter()
-                            .find(|(g, _)| g == grp)
-                        {
-                            let rank_pos: HashMap<&NoteId, usize> = order
-                                .iter()
-                                .enumerate()
-                                .map(|(idx, id)| (id, idx))
-                                .collect();
-                            entry.sort_by_key(|id| rank_pos.get(id).copied().unwrap_or(usize::MAX));
-                        }
-                    }
-
-                    let note_first_run_seq = |nid: &NoteId| -> Option<SpaceSeq> {
-                        match eligible_notes.get(nid) {
-                            Some(CandidateAction::RestorePreExisting { first_run_seq, .. }) => {
-                                Some(*first_run_seq)
-                            }
-                            _ => None,
-                        }
-                    };
-
-                    // Classify non-moved eligible notes whose persisted overlay on `view`
-                    // mismatches their restored membership BEFORE `run_moves_cl` replays
-                    // any moved cards, so pre-run-restorable stale neighbors enter
-                    // `working_groups` at their true pre-run ranks instead of receiving
-                    // synthetic tail ranks that corrupt neighbor-relative placement.
-                    let mut effective_overlays = overlays.clone();
-                    let mut stale_non_moved: Vec<NoteId> = overlays
-                        .keys()
-                        .filter(|nid| {
-                            eligible_all_ids.contains(*nid)
-                                && !retired_note_ids.contains(*nid)
-                                && !moved_targets_on_view.contains(*nid)
-                        })
-                        .cloned()
-                        .collect();
-                    stale_non_moved.sort();
-                    let mut pending_stale_deletes: Vec<NoteId> = Vec::new();
-                    let mut same_group_run_materialized: BTreeMap<NoteId, GroupKey> =
-                        BTreeMap::new();
-                    let mut stale_prerun_restores: BTreeMap<
-                        NoteId,
-                        (GroupKey, crate::codec::RankRevisionMetadata),
-                    > = BTreeMap::new();
-                    for nid in stale_non_moved {
-                        let Some(ov) = overlays.get(&nid) else {
-                            continue;
-                        };
-                        let expected_post = view_facts
-                            .post_restore_membership
-                            .get(&nid)
-                            .cloned()
-                            .unwrap_or(None);
-                        let same_group = expected_post.as_ref() == Some(&ov.group);
-                        if same_group && ov.placement_run_id.is_some() {
-                            continue;
-                        }
-                        match expected_post {
-                            None => {
-                                effective_overlays.remove(&nid);
-                                pending_stale_deletes.push(nid);
-                            }
-                            Some(post_grp) => {
-                                let mat_seq = if ov.placement_run_id.is_none() {
-                                    run_materialized_overlay_seq_tx(
-                                        tx,
-                                        &scope_cl.space_id,
-                                        &ov.placement_revision,
-                                        &input.run,
-                                    )
-                                    .await?
-                                } else {
-                                    None
-                                };
-                                if same_group && mat_seq.is_none() {
-                                    continue;
-                                }
-                                let stale_before = match (note_first_run_seq(&nid), mat_seq) {
-                                    (Some(a), Some(b)) => Some(a.min(b)),
-                                    (a, b) => a.or(b),
-                                };
-                                let prerun = if let Some(stale_before) = stale_before {
-                                    load_latest_prerun_rank_meta_tx(
-                                        tx,
-                                        &scope_cl,
-                                        view,
-                                        &nid,
-                                        &input.run,
-                                        &run_vis_seqs,
-                                        stale_before,
-                                    )
-                                    .await?
-                                } else {
-                                    None
-                                };
-                                if let Some(meta) = prerun
-                                    && !meta.removed
-                                    && meta.group_key == post_grp
-                                {
-                                    for (_, notes) in &mut kept_groups {
-                                        notes.retain(|id| id != &nid);
-                                    }
-                                    effective_overlays.remove(&nid);
-                                    stale_prerun_restores.insert(nid, (post_grp, meta));
-                                } else if same_group {
-                                    same_group_run_materialized.insert(nid, post_grp);
-                                } else {
-                                    effective_overlays.remove(&nid);
-                                    pending_stale_deletes.push(nid);
-                                }
-                            }
-                        }
-                    }
-
-                    // Also classify untouched notes whose current overlay on `view` was
-                    // materialized solely by `input.run` (`placement_run_id IS NULL`):
-                    // restore any matching pre-run human overlay, defer same-group
-                    // run-materialized neighbors until surviving column ranks are known,
-                    // and delete orphaned overlays in groups the note no longer occupies.
-                    let mut stale_untouched: Vec<NoteId> = overlays
-                        .iter()
-                        .filter_map(|(nid, ov)| {
-                            (!retired_note_ids.contains(nid)
-                                && !eligible_all_ids.contains(nid)
-                                && ov.placement_run_id.is_none())
-                            .then_some(nid.clone())
-                        })
-                        .collect();
-                    stale_untouched.sort();
-                    for nid in stale_untouched {
-                        let Some(ov) = overlays.get(&nid) else {
-                            continue;
-                        };
-                        let current_group = view_facts
-                            .groups
-                            .iter()
-                            .find(|g| g.rows.iter().any(|r| r.note == nid))
-                            .map(|g| g.group.clone());
-                        let Some(mat_seq) = run_materialized_overlay_seq_tx(
-                            tx,
-                            &scope_cl.space_id,
-                            &ov.placement_revision,
-                            &input.run,
-                        )
-                        .await?
-                        else {
-                            continue;
-                        };
-                        let same_group = current_group.as_ref() == Some(&ov.group);
-                        if let Some(post_grp) = current_group {
-                            let prerun = load_latest_prerun_rank_meta_tx(
-                                tx,
-                                &scope_cl,
-                                view,
-                                &nid,
-                                &input.run,
-                                &run_vis_seqs,
-                                mat_seq,
-                            )
-                            .await?;
-                            if let Some(meta) = prerun
-                                && !meta.removed
-                                && meta.group_key == post_grp
-                            {
-                                for (_, notes) in &mut kept_groups {
-                                    notes.retain(|id| id != &nid);
-                                }
-                                effective_overlays.remove(&nid);
-                                stale_prerun_restores.insert(nid, (post_grp, meta));
-                            } else if same_group {
-                                same_group_run_materialized.insert(nid, post_grp);
-                            } else {
-                                effective_overlays.remove(&nid);
-                                pending_stale_deletes.push(nid);
-                            }
-                        } else {
-                            effective_overlays.remove(&nid);
-                            pending_stale_deletes.push(nid);
-                        }
-                    }
-
-                    let mut working_groups: Vec<(GroupKey, Vec<ExistingRankedItem>, bool)> =
-                        Vec::new();
-                    let mut neighbor_dirty: BTreeMap<NoteId, (GroupKey, String, bool)> =
-                        BTreeMap::new();
-                    let mut cleared_to_unranked_group: HashMap<NoteId, GroupKey> = HashMap::new();
-                    let mut replayed_anchors: HashMap<
-                        NoteId,
-                        (GroupKey, Option<NoteId>, Option<NoteId>),
-                    > = HashMap::new();
-
-                    enum TargetSettlement {
-                        Ineligible,
-                        ClearOverlay,
-                        Replayed {
-                            group: GroupKey,
-                            rank: String,
-                            placement_revision: Option<RevisionId>,
-                            placement_actor: Option<PrincipalId>,
-                            placement_run: Option<AgentRunId>,
+                                Some(pre_meta.parent_folder_id.clone())
+                            },
+                            component: pre_meta.slug.clone(),
                         },
                     }
-
-                    // Replay run's board moves on `view` for non-retired eligible notes in DESC order!
-                    let mut target_final_state: BTreeMap<NoteId, TargetSettlement> =
-                        BTreeMap::new();
-
-                    for bmh in &run_moves_cl {
-                        if &bmh.view != view
-                            || !eligible_all_ids.contains(&bmh.target_note_id)
-                            || retired_note_ids.contains(&bmh.target_note_id)
-                        {
-                            continue;
-                        }
-                        let target = &bmh.target_note_id;
-
-                        // Remove `target` from whichever group it currently occupies.
-                        for (_, notes) in &mut kept_groups {
-                            notes.retain(|nid| nid != target);
-                        }
-                        for (_, g_items, _) in &mut working_groups {
-                            g_items.retain(|it| &it.note_id != target);
-                        }
-
-                        let expected_post = view_facts
-                            .post_restore_membership
-                            .get(target)
-                            .cloned()
-                            .unwrap_or(None);
-                        let is_earliest = earliest_bmh_for_target.get(target)
-                            == Some(&(bmh.command_end_seq, bmh.ordinal));
-                        let before_group = match &bmh.before_placement {
-                            StoredSemanticPlacementV1::Ineligible => None,
-                            StoredSemanticPlacementV1::InGroup { group, .. } => Some(group.clone()),
-                        };
-                        let mut before_mat_seq_for_bmh: Option<SpaceSeq> = None;
-                        if is_earliest {
-                            let before_mat_seq =
-                                if let Some(ref pl_rev) = bmh.before_placement_revision {
-                                    run_materialized_overlay_seq_tx(
-                                        tx,
-                                        &scope_cl.space_id,
-                                        pl_rev,
-                                        &input.run,
-                                    )
-                                    .await?
-                                } else {
-                                    None
-                                };
-                            before_mat_seq_for_bmh = before_mat_seq;
-                            let mut prerun_before = bmh.command_end_seq;
-                            if let Some(first) = note_first_run_seq(target) {
-                                prerun_before = prerun_before.min(first);
-                            }
-                            if let Some(mat_seq) = before_mat_seq {
-                                prerun_before = prerun_before.min(mat_seq);
-                            }
-                            let group_changed = before_group != expected_post;
-                            let may_have_clobbered_prerun = !group_changed
-                                && expected_post.is_some()
-                                && (bmh.before_placement_revision.is_none()
-                                    || before_mat_seq.is_some());
-                            if group_changed || may_have_clobbered_prerun {
-                                // Reconcile `target` directly against its pre-run rank history when
-                                // an earlier in-run edit/view-change either moved `target` across
-                                // groups or clobbered its pre-run overlay during an in-run round-trip.
-                                match expected_post {
-                                    None => {
-                                        replayed_anchors.remove(target);
-                                        target_final_state
-                                            .insert(target.clone(), TargetSettlement::Ineligible);
-                                        continue;
-                                    }
-                                    Some(post_grp) => {
-                                        let prerun = load_latest_prerun_rank_meta_tx(
-                                            tx,
-                                            &scope_cl,
-                                            view,
-                                            target,
-                                            &input.run,
-                                            &run_vis_seqs,
-                                            prerun_before,
-                                        )
-                                        .await?;
-                                        if let Some(meta) = prerun
-                                            && !meta.removed
-                                            && meta.group_key == post_grp
-                                        {
-                                            let g_idx = materialize_working_group(
-                                                &post_grp,
-                                                &kept_groups,
-                                                &effective_overlays,
-                                                &moved_targets_on_view,
-                                                &stale_prerun_restores,
-                                                &same_group_run_materialized,
-                                                &mut working_groups,
-                                                &mut neighbor_dirty,
-                                                false,
-                                            )?;
-                                            let g_items = &mut working_groups[g_idx].1;
-                                            let is_orig_ranked_in_post = |nid: &NoteId| -> bool {
-                                                if stale_prerun_restores
-                                                    .get(nid)
-                                                    .is_some_and(|(g, _)| g == &post_grp)
-                                                {
-                                                    return true;
-                                                }
-                                                if let Some(TargetSettlement::Replayed {
-                                                    group: rg,
-                                                    placement_revision: Some(_),
-                                                    ..
-                                                }) = target_final_state.get(nid)
-                                                {
-                                                    return rg == &post_grp;
-                                                }
-                                                !moved_targets_on_view.contains(nid)
-                                                    && !same_group_run_materialized
-                                                        .contains_key(nid)
-                                                    && effective_overlays
-                                                        .get(nid)
-                                                        .is_some_and(|o| o.group == post_grp)
-                                            };
-                                            let first_unranked = g_items
-                                                .iter()
-                                                .position(|it| !is_orig_ranked_in_post(&it.note_id))
-                                                .unwrap_or(g_items.len());
-                                            let collides = g_items
-                                                .iter()
-                                                .any(|it| it.rank == meta.sort_rank_lexo);
-                                            let fits_before_unranked = first_unranked
-                                                == g_items.len()
-                                                || meta.sort_rank_lexo
-                                                    < g_items[first_unranked].rank;
-                                            let restored_rank = if !collides && fits_before_unranked
-                                            {
-                                                let pos = g_items[..first_unranked]
-                                                    .iter()
-                                                    .position(|it| it.rank > meta.sort_rank_lexo)
-                                                    .unwrap_or(first_unranked);
-                                                g_items.insert(
-                                                    pos,
-                                                    ExistingRankedItem {
-                                                        note_id: target.clone(),
-                                                        rank: meta.sort_rank_lexo.clone(),
-                                                    },
-                                                );
-                                                meta.sort_rank_lexo
-                                            } else {
-                                                let pos = g_items[..first_unranked]
-                                                    .iter()
-                                                    .position(|it| it.rank >= meta.sort_rank_lexo)
-                                                    .unwrap_or(first_unranked);
-                                                let computed =
-                                                    compute_rank_placement(g_items, target, pos)?;
-                                                for (pn, pr) in computed.pma_neighbor_updates {
-                                                    if let Some(it) =
-                                                        g_items.iter_mut().find(|i| i.note_id == pn)
-                                                    {
-                                                        it.rank = pr.clone();
-                                                    }
-                                                    if let Some(TargetSettlement::Replayed {
-                                                        rank,
-                                                        ..
-                                                    }) = target_final_state.get_mut(&pn)
-                                                    {
-                                                        *rank = pr;
-                                                    } else if !moved_targets_on_view.contains(&pn)
-                                                        && !stale_prerun_restores.contains_key(&pn)
-                                                    {
-                                                        let is_pma = effective_overlays
-                                                            .get(&pn)
-                                                            .is_some_and(|o| o.group == post_grp)
-                                                            && !same_group_run_materialized
-                                                                .contains_key(&pn);
-                                                        neighbor_dirty.insert(
-                                                            pn,
-                                                            (post_grp.clone(), pr, is_pma),
-                                                        );
-                                                    }
-                                                }
-                                                g_items.insert(
-                                                    pos,
-                                                    ExistingRankedItem {
-                                                        note_id: target.clone(),
-                                                        rank: computed.target_rank.clone(),
-                                                    },
-                                                );
-                                                computed.target_rank
-                                            };
-                                            replayed_anchors.remove(target);
-                                            target_final_state.insert(
-                                                target.clone(),
-                                                TargetSettlement::Replayed {
-                                                    group: post_grp,
-                                                    rank: restored_rank,
-                                                    placement_revision: Some(
-                                                        meta.placement_revision,
-                                                    ),
-                                                    placement_actor: Some(meta.placement_actor_id),
-                                                    placement_run: meta.placement_run_id,
-                                                },
-                                            );
-                                            continue;
-                                        } else if group_changed {
-                                            replayed_anchors.remove(target);
-                                            cleared_to_unranked_group
-                                                .insert(target.clone(), post_grp);
-                                            target_final_state.insert(
-                                                target.clone(),
-                                                TargetSettlement::ClearOverlay,
-                                            );
-                                            continue;
-                                        } else if before_mat_seq.is_some() {
-                                            let has_ranked_successor = match &bmh.before_placement {
-                                                StoredSemanticPlacementV1::InGroup {
-                                                    successor: Some(succ),
-                                                    ..
-                                                } => {
-                                                    (!moved_targets_on_view.contains(succ)
-                                                        && !same_group_run_materialized
-                                                            .contains_key(succ)
-                                                        && effective_overlays
-                                                            .get(succ)
-                                                            .is_some_and(|o| o.group == post_grp))
-                                                        || stale_prerun_restores
-                                                            .get(succ)
-                                                            .is_some_and(|(g, _)| g == &post_grp)
-                                                        || matches!(
-                                                            target_final_state.get(succ),
-                                                            Some(TargetSettlement::Replayed {
-                                                                group,
-                                                                ..
-                                                            }) if group == &post_grp
-                                                        )
-                                                }
-                                                _ => false,
-                                            };
-                                            if !has_ranked_successor {
-                                                replayed_anchors.remove(target);
-                                                cleared_to_unranked_group
-                                                    .insert(target.clone(), post_grp);
-                                                target_final_state.insert(
-                                                    target.clone(),
-                                                    TargetSettlement::ClearOverlay,
-                                                );
-                                                continue;
-                                            }
-                                        } else if let StoredSemanticPlacementV1::InGroup {
-                                            group,
-                                            predecessor,
-                                            successor,
-                                        } = &bmh.before_placement
-                                            && (predecessor.is_some() || successor.is_some())
-                                            && predecessor.as_ref().is_none_or(|p| {
-                                                cleared_to_unranked_group.get(p) == Some(group)
-                                                    || same_group_run_materialized.get(p)
-                                                        == Some(group)
-                                            })
-                                            && successor.as_ref().is_none_or(|s| {
-                                                cleared_to_unranked_group.get(s) == Some(group)
-                                                    || same_group_run_materialized.get(s)
-                                                        == Some(group)
-                                            })
-                                        {
-                                            replayed_anchors.remove(target);
-                                            cleared_to_unranked_group
-                                                .insert(target.clone(), post_grp);
-                                            target_final_state.insert(
-                                                target.clone(),
-                                                TargetSettlement::ClearOverlay,
-                                            );
-                                            continue;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        match &bmh.before_placement {
-                            StoredSemanticPlacementV1::Ineligible => {
-                                replayed_anchors.remove(target);
-                                target_final_state
-                                    .insert(target.clone(), TargetSettlement::Ineligible);
-                            }
-                            StoredSemanticPlacementV1::InGroup {
-                                group,
-                                predecessor,
-                                successor,
-                            } => {
-                                let g_idx = materialize_working_group(
-                                    group,
-                                    &kept_groups,
-                                    &effective_overlays,
-                                    &moved_targets_on_view,
-                                    &stale_prerun_restores,
-                                    &same_group_run_materialized,
-                                    &mut working_groups,
-                                    &mut neighbor_dirty,
-                                    true,
-                                )?;
-                                let g_items = &mut working_groups[g_idx].1;
-
-                                let pred_pos = match predecessor {
-                                    Some(pred_id) => {
-                                        match g_items.iter().position(|it| &it.note_id == pred_id) {
-                                            Some(pos) => Some(pos),
-                                            None if eligible_all_ids.contains(pred_id)
-                                                || view_restored
-                                                || !is_earliest =>
-                                            {
-                                                None
-                                            }
-                                            None => {
-                                                return Err(DomainError::validation(
-                                                    ValidationReason::InvalidState,
-                                                )
-                                                .into());
-                                            }
-                                        }
-                                    }
-                                    None => None,
-                                };
-                                let succ_pos = match successor {
-                                    Some(succ_id) => {
-                                        match g_items.iter().position(|it| &it.note_id == succ_id) {
-                                            Some(pos) => Some(pos),
-                                            None if eligible_all_ids.contains(succ_id)
-                                                || view_restored
-                                                || !is_earliest =>
-                                            {
-                                                None
-                                            }
-                                            None => {
-                                                return Err(DomainError::validation(
-                                                    ValidationReason::InvalidState,
-                                                )
-                                                .into());
-                                            }
-                                        }
-                                    }
-                                    None => None,
-                                };
-
-                                let mut ins_idx = match (pred_pos, succ_pos) {
-                                    (None, None) => {
-                                        if predecessor.is_some() && successor.is_none() {
-                                            g_items.len()
-                                        } else {
-                                            0
-                                        }
-                                    }
-                                    (None, Some(s)) => s,
-                                    (Some(p), None) => p + 1,
-                                    (Some(p), Some(s)) => {
-                                        if p >= s {
-                                            let pred_eligible = predecessor
-                                                .as_ref()
-                                                .is_some_and(|id| eligible_all_ids.contains(id));
-                                            let succ_eligible = successor
-                                                .as_ref()
-                                                .is_some_and(|id| eligible_all_ids.contains(id));
-                                            if !pred_eligible
-                                                && !succ_eligible
-                                                && !view_restored
-                                                && is_earliest
-                                            {
-                                                return Err(DomainError::validation(
-                                                    ValidationReason::InvalidState,
-                                                )
-                                                .into());
-                                            }
-                                            let is_ranked = |id: &NoteId| {
-                                                (!same_group_run_materialized.contains_key(id)
-                                                    && effective_overlays
-                                                        .get(id)
-                                                        .is_some_and(|o| &o.group == group))
-                                                    || stale_prerun_restores
-                                                        .get(id)
-                                                        .is_some_and(|(g, _)| g == group)
-                                            };
-                                            let pred_ranked =
-                                                predecessor.as_ref().is_some_and(is_ranked);
-                                            let succ_ranked =
-                                                successor.as_ref().is_some_and(is_ranked);
-                                            if pred_ranked && !succ_ranked {
-                                                p + 1
-                                            } else {
-                                                s
-                                            }
-                                        } else {
-                                            p + 1
-                                        }
-                                    }
-                                };
-                                if is_earliest
-                                    && (bmh.before_placement_revision.is_none()
-                                        || before_mat_seq_for_bmh.is_some())
-                                    && let Some((_, base_order)) = view_facts
-                                        .post_restore_group_order
-                                        .iter()
-                                        .find(|(g, _)| g == group)
-                                    && let Some(target_base_pos) =
-                                        base_order.iter().position(|id| id == target)
-                                {
-                                    let is_orig_ranked_in_grp = |nid: &NoteId| -> bool {
-                                        if stale_prerun_restores
-                                            .get(nid)
-                                            .is_some_and(|(g, _)| g == group)
-                                        {
-                                            return true;
-                                        }
-                                        if let Some(TargetSettlement::Replayed {
-                                            group: rg,
-                                            placement_revision: Some(_),
-                                            ..
-                                        }) = target_final_state.get(nid)
-                                        {
-                                            return rg == group;
-                                        }
-                                        !moved_targets_on_view.contains(nid)
-                                            && !same_group_run_materialized.contains_key(nid)
-                                            && effective_overlays
-                                                .get(nid)
-                                                .is_some_and(|o| &o.group == group)
-                                    };
-                                    let upper =
-                                        succ_pos.unwrap_or(g_items.len()).min(g_items.len());
-                                    let lower = pred_pos.map_or(0, |p| p + 1).min(upper);
-                                    while ins_idx < upper {
-                                        let next_id = &g_items[ins_idx].note_id;
-                                        if is_orig_ranked_in_grp(next_id) {
-                                            break;
-                                        }
-                                        let Some(next_base_pos) =
-                                            base_order.iter().position(|id| id == next_id)
-                                        else {
-                                            break;
-                                        };
-                                        if next_base_pos < target_base_pos {
-                                            ins_idx += 1;
-                                        } else {
-                                            break;
-                                        }
-                                    }
-                                    while ins_idx > lower {
-                                        let prev_id = &g_items[ins_idx - 1].note_id;
-                                        if is_orig_ranked_in_grp(prev_id) {
-                                            break;
-                                        }
-                                        let Some(prev_base_pos) =
-                                            base_order.iter().position(|id| id == prev_id)
-                                        else {
-                                            break;
-                                        };
-                                        if prev_base_pos > target_base_pos {
-                                            ins_idx -= 1;
-                                        } else {
-                                            break;
-                                        }
-                                    }
-                                }
-
-                                let computed = compute_rank_placement(g_items, target, ins_idx)?;
-                                for (pn, pr) in computed.pma_neighbor_updates {
-                                    if let Some(it) = g_items.iter_mut().find(|i| i.note_id == pn) {
-                                        it.rank = pr.clone();
-                                    }
-                                    if let Some(TargetSettlement::Replayed { rank, .. }) =
-                                        target_final_state.get_mut(&pn)
-                                    {
-                                        *rank = pr;
-                                    } else if !moved_targets_on_view.contains(&pn)
-                                        && !stale_prerun_restores.contains_key(&pn)
-                                    {
-                                        let is_pma = effective_overlays
-                                            .get(&pn)
-                                            .is_some_and(|o| &o.group == group)
-                                            && !same_group_run_materialized.contains_key(&pn);
-                                        neighbor_dirty.insert(pn, (group.clone(), pr, is_pma));
-                                    }
-                                }
-                                g_items.insert(
-                                    ins_idx,
-                                    ExistingRankedItem {
-                                        note_id: target.clone(),
-                                        rank: computed.target_rank.clone(),
-                                    },
-                                );
-                                let restored_pl_rev = if before_mat_seq_for_bmh.is_some() {
-                                    None
-                                } else {
-                                    bmh.before_placement_revision.clone()
-                                };
-                                let (placement_actor, placement_run) = if let Some(ref pl_rev) =
-                                    restored_pl_rev
-                                {
-                                    load_latest_prerun_rank_meta_tx(
-                                        tx,
-                                        &scope_cl,
-                                        view,
-                                        target,
-                                        &input.run,
-                                        &run_vis_seqs,
-                                        bmh.command_end_seq,
-                                    )
-                                    .await?
-                                    .filter(|meta| {
-                                        !meta.removed && &meta.placement_revision == pl_rev
-                                    })
-                                    .map_or(
-                                        (None, None),
-                                        |meta| {
-                                            (Some(meta.placement_actor_id), meta.placement_run_id)
-                                        },
-                                    )
-                                } else {
-                                    (None, None)
-                                };
-                                replayed_anchors.insert(
-                                    target.clone(),
-                                    (group.clone(), predecessor.clone(), successor.clone()),
-                                );
-                                target_final_state.insert(
-                                    target.clone(),
-                                    TargetSettlement::Replayed {
-                                        group: group.clone(),
-                                        rank: computed.target_rank,
-                                        placement_revision: restored_pl_rev,
-                                        placement_actor,
-                                        placement_run,
-                                    },
-                                );
-                            }
-                        }
-                    }
-
-                    // Reconcile `ClearOverlay` targets against columns that retain any
-                    // non-originally-ranked card (materialized/replayed or surviving
-                    // `same_group_run_materialized` neighbor) after them in base order.
-                    // Ranked cards always sort strictly ahead of unranked cards on a board,
-                    // so leaving a cleared card unranked ahead of a ranked card would reverse them.
-                    if !cleared_to_unranked_group.is_empty() {
-                        let mut cleared_by_group: Vec<(GroupKey, Vec<NoteId>)> = Vec::new();
-                        for (cid, grp) in &cleared_to_unranked_group {
-                            if !matches!(
-                                target_final_state.get(cid),
-                                Some(TargetSettlement::ClearOverlay)
-                            ) {
-                                continue;
-                            }
-                            if let Some((_, list)) =
-                                cleared_by_group.iter_mut().find(|(g, _)| g == grp)
-                            {
-                                list.push(cid.clone());
-                            } else {
-                                cleared_by_group.push((grp.clone(), vec![cid.clone()]));
-                            }
-                        }
-                        for (grp, mut cleared_ids) in cleared_by_group {
-                            let base_pos: HashMap<&NoteId, usize> = view_facts
-                                .post_restore_group_order
-                                .iter()
-                                .find(|(g, _)| g == &grp)
-                                .map(|(_, order)| {
-                                    order
-                                        .iter()
-                                        .enumerate()
-                                        .map(|(idx, id)| (id, idx))
-                                        .collect()
-                                })
-                                .unwrap_or_default();
-                            cleared_ids.sort_by(|a, b| {
-                                base_pos
-                                    .get(a)
-                                    .copied()
-                                    .unwrap_or(usize::MAX)
-                                    .cmp(&base_pos.get(b).copied().unwrap_or(usize::MAX))
-                                    .then_with(|| a.cmp(b))
-                            });
-
-                            let is_originally_ranked =
-                                |nid: &NoteId, tfs: &BTreeMap<NoteId, TargetSettlement>| -> bool {
-                                    if stale_prerun_restores
-                                        .get(nid)
-                                        .is_some_and(|(g, _)| g == &grp)
-                                    {
-                                        return true;
-                                    }
-                                    if let Some(TargetSettlement::Replayed {
-                                        group,
-                                        placement_revision: Some(_),
-                                        ..
-                                    }) = tfs.get(nid)
-                                    {
-                                        return group == &grp;
-                                    }
-                                    !moved_targets_on_view.contains(nid)
-                                        && !same_group_run_materialized.contains_key(nid)
-                                        && effective_overlays
-                                            .get(nid)
-                                            .is_some_and(|o| o.group == grp)
-                                };
-
-                            let has_surviving_non_mat_ranked = stale_prerun_restores
-                                .values()
-                                .any(|(g, _)| g == &grp)
-                                || target_final_state.values().any(|s| {
-                                    matches!(
-                                        s,
-                                        TargetSettlement::Replayed { group, .. } if group == &grp
-                                    )
-                                })
-                                || effective_overlays.iter().any(|(other_id, other_ov)| {
-                                    other_ov.group == grp
-                                        && !retired_note_ids.contains(other_id)
-                                        && !moved_targets_on_view.contains(other_id)
-                                        && !same_group_run_materialized.contains_key(other_id)
-                                });
-
-                            for cid in cleared_ids {
-                                let cid_pos = base_pos.get(&cid).copied().unwrap_or(usize::MAX);
-                                let (min_idx, max_idx, working_len) = working_groups
-                                    .iter()
-                                    .find(|(g, _, _)| g == &grp)
-                                    .map(|(_, items, _)| {
-                                        let mut lo = 0usize;
-                                        let mut hi = items.len();
-                                        for (idx, it) in items.iter().enumerate() {
-                                            if let Some((ag, pred, succ)) =
-                                                replayed_anchors.get(&it.note_id)
-                                                && ag == &grp
-                                            {
-                                                if succ.as_ref() == Some(&cid) {
-                                                    lo = lo.max(idx + 1);
-                                                }
-                                                if pred.as_ref() == Some(&cid) {
-                                                    hi = hi.min(idx);
-                                                }
-                                            }
-                                        }
-                                        (lo, hi, items.len())
-                                    })
-                                    .unwrap_or((0, 0, 0));
-                                let has_replayed_successor = max_idx < working_len;
-                                let needs_rank_in_working = has_surviving_non_mat_ranked
-                                    && working_groups
-                                        .iter()
-                                        .find(|(g, _, _)| g == &grp)
-                                        .is_some_and(|(_, items, _)| {
-                                            let start = min_idx.min(items.len());
-                                            items[start..].iter().any(|it| {
-                                                !is_originally_ranked(
-                                                    &it.note_id,
-                                                    &target_final_state,
-                                                ) && base_pos
-                                                    .get(&it.note_id)
-                                                    .copied()
-                                                    .unwrap_or(usize::MAX)
-                                                    > cid_pos
-                                            })
-                                        });
-                                let needs_rank_for_surviving_mat = has_surviving_non_mat_ranked
-                                    && same_group_run_materialized.iter().any(|(mid, mg)| {
-                                        mg == &grp
-                                            && base_pos.get(mid).copied().unwrap_or(usize::MAX)
-                                                > cid_pos
-                                            && effective_overlays.get(mid).is_some_and(|mid_ov| {
-                                                effective_overlays.iter().any(
-                                                    |(other_id, other_ov)| {
-                                                        other_ov.group == grp
-                                                            && !retired_note_ids.contains(other_id)
-                                                            && !moved_targets_on_view
-                                                                .contains(other_id)
-                                                            && !same_group_run_materialized
-                                                                .contains_key(other_id)
-                                                            && other_ov.sort_rank_lexo
-                                                                > mid_ov.sort_rank_lexo
-                                                    },
-                                                )
-                                            })
-                                    });
-                                if !needs_rank_in_working
-                                    && !needs_rank_for_surviving_mat
-                                    && !has_replayed_successor
-                                {
-                                    continue;
-                                }
-                                let g_idx = materialize_working_group(
-                                    &grp,
-                                    &kept_groups,
-                                    &effective_overlays,
-                                    &moved_targets_on_view,
-                                    &stale_prerun_restores,
-                                    &same_group_run_materialized,
-                                    &mut working_groups,
-                                    &mut neighbor_dirty,
-                                    true,
-                                )?;
-                                let g_items = &mut working_groups[g_idx].1;
-                                let lo = min_idx.min(g_items.len());
-                                let hi = if has_replayed_successor {
-                                    max_idx.min(g_items.len())
-                                } else {
-                                    g_items.len()
-                                };
-                                let search_lo = lo.min(hi);
-                                let ins_idx = g_items[search_lo..hi]
-                                    .iter()
-                                    .position(|it| {
-                                        !is_originally_ranked(&it.note_id, &target_final_state)
-                                            && base_pos
-                                                .get(&it.note_id)
-                                                .copied()
-                                                .unwrap_or(usize::MAX)
-                                                > cid_pos
-                                    })
-                                    .map(|offset| search_lo + offset)
-                                    .unwrap_or(hi);
-                                let computed = compute_rank_placement(g_items, &cid, ins_idx)?;
-                                for (pn, pr) in computed.pma_neighbor_updates {
-                                    if let Some(it) = g_items.iter_mut().find(|i| i.note_id == pn) {
-                                        it.rank = pr.clone();
-                                    }
-                                    if let Some(TargetSettlement::Replayed { rank, .. }) =
-                                        target_final_state.get_mut(&pn)
-                                    {
-                                        *rank = pr;
-                                    } else if !moved_targets_on_view.contains(&pn)
-                                        && !stale_prerun_restores.contains_key(&pn)
-                                    {
-                                        let is_pma = effective_overlays
-                                            .get(&pn)
-                                            .is_some_and(|o| o.group == grp)
-                                            && !same_group_run_materialized.contains_key(&pn);
-                                        neighbor_dirty.insert(pn, (grp.clone(), pr, is_pma));
-                                    }
-                                }
-                                g_items.insert(
-                                    ins_idx,
-                                    ExistingRankedItem {
-                                        note_id: cid.clone(),
-                                        rank: computed.target_rank.clone(),
-                                    },
-                                );
-                                target_final_state.insert(
-                                    cid,
-                                    TargetSettlement::Replayed {
-                                        group: grp.clone(),
-                                        rank: computed.target_rank,
-                                        placement_revision: None,
-                                        placement_actor: None,
-                                        placement_run: None,
-                                    },
-                                );
-                            }
-                        }
-                    }
-
-                    // Emit settled moved-target restores/deletes and stale non-moved pre-run
-                    // restores using their final settled ranks in `working_groups`.
-                    let mut view_target_restores: Vec<PlannedTargetRankRestore> = Vec::new();
-                    for (target, settlement) in target_final_state {
-                        let expected_post = view_facts
-                            .post_restore_membership
-                            .get(&target)
-                            .cloned()
-                            .unwrap_or(None);
-                        match (settlement, expected_post) {
-                            (TargetSettlement::Ineligible, None)
-                            | (TargetSettlement::ClearOverlay, _) => {
-                                if overlays.contains_key(&target) {
-                                    planned_overlay_deletes.push(PlannedOverlayDelete {
-                                        view: view.clone(),
-                                        target_note: target,
-                                    });
-                                }
-                            }
-                            (
-                                TargetSettlement::Replayed {
-                                    group: grp,
-                                    rank: rnk,
-                                    placement_revision: prev_pl_rev,
-                                    placement_actor: prev_pl_actor,
-                                    placement_run: prev_pl_run,
-                                },
-                                Some(post_grp),
-                            ) if grp == post_grp => {
-                                view_target_restores.push(PlannedTargetRankRestore {
-                                    view: view.clone(),
-                                    target_note: target,
-                                    group: grp,
-                                    rank: rnk,
-                                    restored_placement_revision: prev_pl_rev,
-                                    restored_placement_actor: prev_pl_actor,
-                                    restored_placement_run: prev_pl_run,
-                                });
-                            }
-                            _ => {
-                                return Err(DomainError::validation(
-                                    ValidationReason::InvalidState,
-                                )
-                                .into());
-                            }
-                        }
-                    }
-
-                    for (nid, (post_grp, meta)) in &stale_prerun_restores {
-                        let g_idx = materialize_working_group(
-                            post_grp,
-                            &kept_groups,
-                            &effective_overlays,
-                            &moved_targets_on_view,
-                            &stale_prerun_restores,
-                            &same_group_run_materialized,
-                            &mut working_groups,
-                            &mut neighbor_dirty,
-                            false,
-                        )?;
-                        let settled_rank = working_groups[g_idx]
-                            .1
-                            .iter()
-                            .find(|it| &it.note_id == nid)
-                            .map(|it| it.rank.clone())
-                            .ok_or_else(|| {
-                                DomainError::validation(ValidationReason::InvalidState)
-                            })?;
-                        view_target_restores.push(PlannedTargetRankRestore {
-                            view: view.clone(),
-                            target_note: nid.clone(),
-                            group: post_grp.clone(),
-                            rank: settled_rank,
-                            restored_placement_revision: Some(meta.placement_revision.clone()),
-                            restored_placement_actor: Some(meta.placement_actor_id.clone()),
-                            restored_placement_run: meta.placement_run_id.clone(),
-                        });
-                    }
-
-                    let mut touched_final_groups: Vec<GroupKey> = Vec::new();
-                    for tr in &view_target_restores {
-                        if !touched_final_groups.contains(&tr.group) {
-                            touched_final_groups.push(tr.group.clone());
-                        }
-                    }
-                    planned_target_restores.extend(view_target_restores);
-
-                    let mut materialized_neighbors: BTreeSet<NoteId> = BTreeSet::new();
-                    for (nbr_id, (grp, rnk, is_pma)) in neighbor_dirty {
-                        if !touched_final_groups.contains(&grp) {
-                            continue;
-                        }
-                        if eligible_all_ids.contains(&nbr_id)
-                            && view_facts
-                                .post_restore_membership
-                                .get(&nbr_id)
-                                .and_then(|opt| opt.as_ref())
-                                != Some(&grp)
-                        {
-                            return Err(
-                                DomainError::validation(ValidationReason::InvalidState).into()
-                            );
-                        }
-                        materialized_neighbors.insert(nbr_id.clone());
-                        planned_neighbor_updates.push(PlannedNeighborRankUpdate {
-                            view: view.clone(),
-                            neighbor_note: nbr_id,
-                            group: grp,
-                            rank: rnk,
-                            is_pma,
-                        });
-                    }
-                    for (nid, grp) in &same_group_run_materialized {
-                        let nid_rank = effective_overlays
-                            .get(nid)
-                            .map(|ov| ov.sort_rank_lexo.as_str());
-                        let group_has_surviving_ranked_below = touched_final_groups.contains(grp)
-                            || nid_rank.is_some_and(|rank| {
-                                effective_overlays.iter().any(|(other_id, other_ov)| {
-                                    &other_ov.group == grp
-                                        && !retired_note_ids.contains(other_id)
-                                        && !moved_targets_on_view.contains(other_id)
-                                        && !same_group_run_materialized.contains_key(other_id)
-                                        && (other_ov.sort_rank_lexo.as_str() > rank
-                                            || other_ov.placement_run_id.as_ref()
-                                                == Some(&input.run))
-                                })
-                            });
-                        if !group_has_surviving_ranked_below {
-                            pending_stale_deletes.push(nid.clone());
-                        }
-                    }
-                    for nid in pending_stale_deletes {
-                        if !materialized_neighbors.contains(&nid) {
-                            planned_overlay_deletes.push(PlannedOverlayDelete {
-                                view: view.clone(),
-                                target_note: nid,
-                            });
-                        }
-                    }
-
-                    preloaded_view_overlays.insert(view.clone(), overlays);
+                    .into());
+                }
+                if !*head_unchanged_placement {
+                    planned_collision_checks.push((
+                        pre_meta.parent_folder_id.clone(),
+                        pre_meta.slug_fold.clone(),
+                        pre_meta.slug.clone(),
+                        anc.is_root_child,
+                    ));
                 }
             }
+        }
+    }
 
-            // Delete run-owned overlays on views that are inactive, human-trashed, or
-            // no longer valid board views after rollback so rolled-back agent ordering
-            // cannot survive or resurrect if a trashed view or ancestor folder is restored.
-            plan_inactive_view_rollbacks_tx(
-                tx,
-                &scope_cl,
-                &input.run,
-                &run_moves_cl,
-                &extra_overlay_views,
-                &eligible_notes,
-                &eligible_all_ids,
-                &retired_note_ids,
-                &active_after_rollback_views,
-                &affected_views_set,
-                &rb_facts_opt,
-                &run_vis_seqs,
-                &mut planned_overlay_deletes,
-                &mut planned_target_restores,
-                &mut planned_neighbor_updates,
-                &mut preloaded_view_overlays,
-            )
-            .await?;
+    verify_no_active_non_eligible_collisions_batch_tx(
+        tx,
+        &scope_cl.space_id,
+        &planned_collision_checks,
+        &eligible_all_ids,
+    )
+    .await?;
 
-            // 5. Count exact SpaceSeq allocations before executing SQL mutations.
-            let trash_note_count = eligible_notes
-                .values()
-                .filter(|act| {
-                    matches!(
-                        act,
-                        CandidateAction::TrashCreated {
-                            current_lifecycle,
-                            ..
-                        } if *current_lifecycle != Lifecycle::Trashed
-                    )
-                })
-                .count() as u64;
-            let restore_note_count = eligible_notes
-                .values()
-                .filter(|act| {
-                    matches!(
-                        act,
-                        CandidateAction::RestorePreExisting {
-                            needs_note_mutation: true,
-                            ..
-                        }
-                    )
-                })
-                .count() as u64;
-            // A normalization must not recreate a rank whose view or card is being retired.
-            planned_neighbor_updates.retain(|update| {
-                !rank_removal::removes_view_or_target(
-                    &eligible_notes,
-                    &update.view,
-                    &update.neighbor_note,
-                )
-            });
-            planned_target_restores.retain(|restore| {
-                !rank_removal::removes_view_or_target(
-                    &eligible_notes,
-                    &restore.view,
-                    &restore.target_note,
-                )
-            });
-            let rank_removals = if has_any_overlays_in_space_tx(tx, &scope_cl.space_id).await? {
-                rank_removal::plan_tx(
-                    tx,
-                    &scope_cl.space_id,
-                    &eligible_notes,
-                    &planned_overlay_deletes,
-                )
-                .await?
-            } else {
-                Vec::new()
-            };
-            let mut planned_covers = BTreeMap::new();
-            let mut restored_covers = Vec::new();
-            for (note, action) in &eligible_notes {
-                match action {
-                    CandidateAction::TrashCreated {
-                        current_lifecycle: Lifecycle::Active,
-                        metadata,
-                        parent_folder_id,
-                        ..
-                    } if metadata.folder_page => {
-                        planned_covers.insert(parent_folder_id, None);
-                    }
-                    CandidateAction::RestorePreExisting {
-                        pre_meta,
-                        current_cover_parent,
-                        needs_note_mutation: true,
-                        ..
-                    } => {
-                        if let Some(folder) = current_cover_parent {
-                            planned_covers.insert(folder, None);
-                        }
-                        if pre_meta.folder_page && pre_meta.lifecycle == Lifecycle::Active {
-                            restored_covers.push((&pre_meta.parent_folder_id, Some(note)));
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            planned_covers.extend(restored_covers);
-            let mut cover_changes = Vec::with_capacity(planned_covers.len());
-            for (folder, cover) in planned_covers {
-                let row =
-                    crate::runtime::load_folder_head_row(tx, &scope_cl.space_id, folder).await?;
-                if row.cover_note_id.as_ref() != cover {
-                    cover_changes.push((folder, cover));
-                }
-            }
-            let entity_event_seqs = trash_note_count
-                + restore_note_count
-                + (cover_changes.len() as u64)
-                + (rank_removals.len() as u64)
-                + (planned_neighbor_updates.len() as u64)
-                + (planned_target_restores.len() as u64);
-            let total_seqs = entity_event_seqs.max(1);
-            let (first_seq, visibility_seq) = item_ctx.preview_seq_range(total_seqs)?;
-            let vis_i64 = visibility_seq.get() as i64;
-            let now_ts = now_utc_timestamp()?;
-            let (sec, nsec) = encode_timestamp_parts(now_ts);
-            let current_schema = load_current_space_schema_tx(tx, &scope_cl.space_id).await?;
+    stage_rollback_fences(item_ctx, locked_fences, &req_id)?;
 
-            let mut events = Vec::with_capacity(total_seqs as usize);
-            let mut trashed_out = Vec::new();
-            let mut restored_out = Vec::new();
-            let mut restored_ranks_out = Vec::new();
-            let mut owner_notes_for_receipt: BTreeSet<NoteId> = BTreeSet::new();
-            let mut pending_blob_rebinds: Vec<ExistingBlobRefItem> =
-                Vec::with_capacity(eligible_notes.len());
-            struct PendingRevRow {
-                rev_id: RevisionId,
-                entity_key: String,
-                space_seq: SpaceSeq,
-                parent_rev_id: RevisionId,
-                restored_from_rev_id: Option<RevisionId>,
-                content_blake3: Option<ContentDigest>,
-                metadata_msgpack: Vec<u8>,
-            }
-            let mut pending_rev_rows: Vec<PendingRevRow> = Vec::with_capacity(eligible_notes.len());
-            let mut pending_trash_heads: Vec<(NoteId, RevisionId)> =
-                Vec::with_capacity(trash_note_count as usize);
+    let current_schema = if read_schema {
+        load_current_space_schema_tx(tx, &scope_cl.space_id).await?
+    } else {
+        None
+    };
 
-            // 6a. Trash run-created eligible notes first.
-            for (nid, action) in &eligible_notes {
-                let CandidateAction::TrashCreated {
-                    metadata,
-                    current_rev,
+    let trash_note_count = final_eligible
+        .values()
+        .filter(|act| {
+            matches!(
+                act,
+                CandidateAction::TrashCreated {
                     current_lifecycle,
                     doc_class,
-                    parent_folder_id,
-                    content_digest,
                     ..
-                } = action
-                else {
-                    continue;
-                };
-
-                owner_notes_for_receipt.insert(nid.clone());
-
-                if *current_lifecycle == Lifecycle::Trashed {
-                    trashed_out.push(NoteRevision {
-                        note: nid.clone(),
-                        revision: current_rev.clone(),
-                    });
-                    continue;
-                }
-
-                let tseq = item_ctx.alloc_next_seq()?;
-                let trev = new_revision_id()?;
-                let anc = folder_cache
-                    .load_ancestry_tx(tx, &scope_cl.space_id, parent_folder_id, false)
-                    .await?;
-
-                pending_trash_heads.push((nid.clone(), trev.clone()));
-                if let Some(ability) = &metadata.ability_id {
-                    changed_packages.push((nid, ability));
-                }
-                if collab_states.contains_key(nid) {
-                    bump_closed_collab_session_lineage_tx(
-                        tx,
-                        &scope_cl.space_id,
-                        nid,
-                        &trev,
-                        vis_i64,
-                    )
-                    .await?;
-                }
-
-                if let Some(digest) = *content_digest {
-                    pending_blob_rebinds.push(ExistingBlobRefItem {
-                        owner_kind: BlobOwnerKind::NoteRevision,
-                        owner_id: nid.as_str().to_owned(),
-                        owner_rev_id: trev.as_str().to_owned(),
-                        resource_key: "carrier",
-                        digest,
-                        created_seq: tseq,
-                    });
-                }
-
-                let meta = encode_rollback_note(
-                    metadata,
-                    None,
-                    anc.is_root_child,
-                    RollbackRevision::Trash,
-                )?;
-
-                pending_rev_rows.push(PendingRevRow {
-                    rev_id: trev.clone(),
-                    entity_key: nid.as_str().to_owned(),
-                    space_seq: tseq,
-                    parent_rev_id: current_rev.clone(),
-                    restored_from_rev_id: None,
-                    content_blake3: *content_digest,
-                    metadata_msgpack: meta,
-                });
-
-                events.push(BatchEventDraft {
-                    space_seq: tseq,
-                    entity_type: "note".to_owned(),
-                    entity_id: nid.as_str().to_owned(),
-                    op_kind: "trash".to_owned(),
-                    rev_id: trev.clone(),
-                    lifecycle: Lifecycle::Trashed,
-                    doc_class: Some(*doc_class),
-                });
-                trashed_out.push(NoteRevision {
-                    note: nid.clone(),
-                    revision: trev,
-                });
-            }
-
-            update_note_heads_trashed_batch_tx(
-                tx,
-                &scope_cl.space_id,
-                &pending_trash_heads,
-                vis_i64,
-                sec,
-                nsec,
-                auth.principal().as_str(),
+                } if needs_trash_mutation(*current_lifecycle, *doc_class)
             )
+        })
+        .count() as u64;
+    let restore_note_count = final_eligible
+        .values()
+        .filter(|act| {
+            matches!(
+                act,
+                CandidateAction::RestorePreExisting {
+                    needs_note_mutation: true,
+                    ..
+                }
+            )
+        })
+        .count() as u64;
+    let has_ov = match known_overlays {
+        Some(present) => present,
+        None => {
+            final_eligible
+                .values()
+                .any(|action| rank_removal::removes_ranks(Some(action)))
+                && has_any_overlays_in_space_tx(tx, &scope_cl.space_id).await?
+        }
+    };
+    let rank_removals = if has_ov {
+        rank_removal::plan_tx(tx, &scope_cl.space_id, &final_eligible).await?
+    } else {
+        Vec::new()
+    };
+
+    let mut planned_covers = BTreeMap::new();
+    let mut restored_covers = Vec::new();
+    for (note, action) in &final_eligible {
+        match action {
+            CandidateAction::TrashCreated {
+                current_lifecycle: Lifecycle::Active,
+                metadata,
+                parent_folder_id,
+                ..
+            } if metadata.folder_page => {
+                planned_covers.insert(parent_folder_id, None);
+            }
+            CandidateAction::RestorePreExisting {
+                pre_meta,
+                current_cover_parent,
+                needs_note_mutation: true,
+                ..
+            } => {
+                if let Some(folder) = current_cover_parent {
+                    planned_covers.insert(folder, None);
+                }
+                if pre_meta.folder_page && pre_meta.lifecycle == Lifecycle::Active {
+                    restored_covers.push((&pre_meta.parent_folder_id, Some(note)));
+                }
+            }
+            _ => {}
+        }
+    }
+    planned_covers.extend(restored_covers);
+    let mut cover_changes = Vec::with_capacity(planned_covers.len());
+    for (folder, cover) in planned_covers {
+        let row = crate::runtime::load_folder_head_row(tx, &scope_cl.space_id, folder).await?;
+        if row.cover_note_id.as_ref() != cover {
+            cover_changes.push((folder, cover));
+        }
+    }
+
+    let total_seqs = (trash_note_count
+        + restore_note_count
+        + cover_changes.len() as u64
+        + rank_removals.len() as u64)
+        .max(1);
+    let (first_seq, visibility_seq) = item_ctx.preview_seq_range(total_seqs)?;
+    let vis_i64 = visibility_seq.get() as i64;
+    let now_ts = now_utc_timestamp()?;
+    let (sec, nsec) = encode_timestamp_parts(now_ts);
+
+    let mut events = Vec::with_capacity(total_seqs as usize);
+    let mut trashed_out = Vec::with_capacity(trash_note_count as usize);
+    let mut restored_out = Vec::with_capacity(restore_note_count as usize);
+    let mut owner_notes_for_receipt: BTreeSet<NoteId> = BTreeSet::new();
+    let mut changed_packages = Vec::new();
+
+    struct PendingSingleRev {
+        rev_id: RevisionId,
+        entity_type: &'static str,
+        entity_key: String,
+        space_seq: SpaceSeq,
+        parent_rev_id: Option<RevisionId>,
+        restored_from_rev_id: Option<RevisionId>,
+        content_blake3: Option<ContentDigest>,
+        metadata_msgpack: Vec<u8>,
+        agent_run_id: Option<AgentRunId>,
+    }
+    let mut pending_rev_rows: Vec<PendingSingleRev> = Vec::with_capacity(final_eligible.len() + 1);
+    let mut pending_trash_heads: Vec<(NoteId, RevisionId)> =
+        Vec::with_capacity(trash_note_count as usize);
+
+    // Trash run-created notes FIRST to vacate active slugs before restoring pre-existing notes.
+    for (nid, action) in &final_eligible {
+        let CandidateAction::TrashCreated {
+            metadata,
+            current_rev,
+            current_lifecycle,
+            doc_class,
+            parent_folder_id,
+            content_digest,
+            ..
+        } = action
+        else {
+            continue;
+        };
+
+        owner_notes_for_receipt.insert(nid.clone());
+
+        if !needs_trash_mutation(*current_lifecycle, *doc_class) {
+            trashed_out.push(NoteRevision {
+                note: nid.clone(),
+                revision: current_rev.clone(),
+            });
+            continue;
+        }
+
+        let tseq = item_ctx.alloc_next_seq()?;
+        let trev = new_revision_id()?;
+        let anc = folder_cache
+            .load_ancestry_tx(tx, &scope_cl.space_id, parent_folder_id, false)
             .await?;
 
-            // 6b. Restore pre-existing eligible notes (`restored_from_rev_id = Some(pre_rev_id)`).
-            let mut pending_restore_heads: Vec<RestoredHeadUpdateItem<'_>> =
-                Vec::with_capacity(restore_note_count as usize);
+        pending_trash_heads.push((nid.clone(), trev.clone()));
+        if let Some(ability) = &metadata.ability_id {
+            changed_packages.push((nid, ability));
+        }
+        if collab_states.contains_key(nid) {
+            bump_closed_collab_session_lineage_tx(tx, &scope_cl.space_id, nid, &trev, vis_i64)
+                .await?;
+        }
 
-            for (nid, action) in &eligible_notes {
-                let CandidateAction::RestorePreExisting {
-                    current_rev,
-                    pre_rev_id,
-                    pre_meta,
-                    pre_updated_at,
-                    needs_note_mutation,
-                    ..
-                } = action
-                else {
-                    continue;
-                };
-                owner_notes_for_receipt.insert(nid.clone());
+        let meta =
+            encode_rollback_note(metadata, None, anc.is_root_child, RollbackRevision::Trash)?;
 
-                if !*needs_note_mutation {
-                    continue;
-                }
+        pending_rev_rows.push(PendingSingleRev {
+            rev_id: trev.clone(),
+            entity_type: "note",
+            entity_key: nid.as_str().to_owned(),
+            space_seq: tseq,
+            parent_rev_id: Some(current_rev.clone()),
+            restored_from_rev_id: None,
+            content_blake3: *content_digest,
+            metadata_msgpack: meta,
+            agent_run_id: None,
+        });
 
-                let rseq = item_ctx.alloc_next_seq()?;
-                let rrev = new_revision_id()?;
-                let is_root_child = restored_ancestries.get(nid).copied().unwrap_or(false);
+        events.push(BatchEventDraft {
+            space_seq: tseq,
+            entity_type: "note".to_owned(),
+            entity_id: nid.as_str().to_owned(),
+            op_kind: "trash".to_owned(),
+            rev_id: trev.clone(),
+            lifecycle: Lifecycle::Trashed,
+            doc_class: Some(*doc_class),
+        });
+        trashed_out.push(NoteRevision {
+            note: nid.clone(),
+            revision: trev,
+        });
+    }
 
-                if let Some(digest) = pre_meta.content_digest {
-                    pending_blob_rebinds.push(ExistingBlobRefItem {
-                        owner_kind: BlobOwnerKind::NoteRevision,
-                        owner_id: nid.as_str().to_owned(),
-                        owner_rev_id: rrev.as_str().to_owned(),
-                        resource_key: "carrier",
-                        digest,
-                        created_seq: rseq,
-                    });
-                }
+    update_note_heads_trashed_batch_tx(
+        tx,
+        &scope_cl.space_id,
+        &pending_trash_heads,
+        vis_i64,
+        sec,
+        nsec,
+        auth.principal().as_str(),
+    )
+    .await?;
 
-                let title_fold = if pre_meta.doc_class == DocClass::EncryptedNote {
-                    normalize_title_key(&pre_meta.slug)
-                } else {
-                    normalize_title_key(&pre_meta.title)
-                };
+    let mut pending_restore_heads: Vec<RestoredHeadUpdateItem<'_>> =
+        Vec::with_capacity(restore_note_count as usize);
 
-                if let Some(ability) = &pre_meta.ability_id {
-                    changed_packages.push((nid, ability));
-                }
-                let (head_updated_sec, head_updated_nsec) = pre_updated_at
-                    .map(encode_timestamp_parts)
-                    .unwrap_or((sec, nsec));
-                pending_restore_heads.push(RestoredHeadUpdateItem {
-                    note_id: nid,
-                    parent_folder_id: &pre_meta.parent_folder_id,
-                    slug: &pre_meta.slug,
-                    slug_fold: &pre_meta.slug_fold,
-                    title: &pre_meta.title,
-                    title_fold,
-                    doc_class_str: doc_class_to_db(pre_meta.doc_class),
-                    ability_id_str: pre_meta.ability_id.as_ref().map(|a| a.as_str()),
-                    rev_id: rrev.clone(),
-                    content_digest: pre_meta.content_digest,
-                    byte_size: pre_meta.byte_size,
-                    lifecycle_str: lifecycle_to_db(pre_meta.lifecycle),
-                    visibility_mask: pre_meta.visibility_mask,
-                    updated_at_sec: head_updated_sec,
-                    updated_at_nsec: head_updated_nsec,
-                });
+    for (nid, action) in &final_eligible {
+        let CandidateAction::RestorePreExisting {
+            current_rev,
+            pre_rev_id,
+            pre_meta,
+            pre_updated_at,
+            needs_note_mutation,
+            ..
+        } = action
+        else {
+            continue;
+        };
+        owner_notes_for_receipt.insert(nid.clone());
 
-                if collab_states.contains_key(nid) {
-                    bump_closed_collab_session_lineage_tx(
-                        tx,
-                        &scope_cl.space_id,
-                        nid,
-                        &rrev,
-                        vis_i64,
-                    )
-                    .await?;
-                }
+        if !*needs_note_mutation {
+            continue;
+        }
 
-                let meta = encode_rollback_note(
-                    pre_meta,
-                    None,
-                    is_root_child,
-                    RollbackRevision::Restore {
-                        schema: current_schema.as_ref(),
-                        logical_updated_at: *pre_updated_at,
-                    },
-                )?;
+        let rseq = item_ctx.alloc_next_seq()?;
+        let rrev = new_revision_id()?;
+        let is_root_child = restored_ancestries.get(nid).copied().unwrap_or(false);
 
-                pending_rev_rows.push(PendingRevRow {
-                    rev_id: rrev.clone(),
-                    entity_key: nid.as_str().to_owned(),
-                    space_seq: rseq,
-                    parent_rev_id: current_rev.clone(),
-                    restored_from_rev_id: Some(pre_rev_id.clone()),
-                    content_blake3: pre_meta.content_digest,
-                    metadata_msgpack: meta,
-                });
+        let title_fold = if pre_meta.doc_class == DocClass::EncryptedNote {
+            normalize_title_key(&pre_meta.slug)
+        } else {
+            normalize_title_key(&pre_meta.title)
+        };
+        if let Some(ability) = &pre_meta.ability_id {
+            changed_packages.push((nid, ability));
+        }
+        let (head_updated_sec, head_updated_nsec) = pre_updated_at
+            .map(encode_timestamp_parts)
+            .unwrap_or((sec, nsec));
 
-                events.push(BatchEventDraft {
-                    space_seq: rseq,
-                    entity_type: "note".to_owned(),
-                    entity_id: nid.as_str().to_owned(),
-                    op_kind: "restore".to_owned(),
-                    rev_id: rrev.clone(),
-                    lifecycle: pre_meta.lifecycle,
-                    doc_class: Some(pre_meta.doc_class),
-                });
-                restored_out.push(NoteRevision {
-                    note: nid.clone(),
-                    revision: rrev,
-                });
-            }
+        pending_restore_heads.push(RestoredHeadUpdateItem {
+            note_id: nid,
+            parent_folder_id: &pre_meta.parent_folder_id,
+            slug: &pre_meta.slug,
+            slug_fold: &pre_meta.slug_fold,
+            title: &pre_meta.title,
+            title_fold,
+            doc_class_str: doc_class_to_db(pre_meta.doc_class),
+            ability_id_str: pre_meta.ability_id.as_ref().map(|a| a.as_str()),
+            rev_id: rrev.clone(),
+            content_digest: pre_meta.content_digest,
+            byte_size: pre_meta.byte_size,
+            lifecycle_str: lifecycle_to_db(pre_meta.lifecycle),
+            visibility_mask: pre_meta.visibility_mask,
+            updated_at_sec: head_updated_sec,
+            updated_at_nsec: head_updated_nsec,
+        });
 
-            update_note_heads_restored_batch_tx(
-                tx,
-                &scope_cl.space_id,
-                &pending_restore_heads,
-                vis_i64,
-                auth.principal().as_str(),
-            )
+        if collab_states.contains_key(nid) {
+            bump_closed_collab_session_lineage_tx(tx, &scope_cl.space_id, nid, &rrev, vis_i64)
+                .await?;
+        }
+
+        let meta = encode_rollback_note(
+            pre_meta,
+            None,
+            is_root_child,
+            RollbackRevision::Restore {
+                schema: current_schema.as_ref(),
+                logical_updated_at: *pre_updated_at,
+            },
+        )?;
+
+        pending_rev_rows.push(PendingSingleRev {
+            rev_id: rrev.clone(),
+            entity_type: "note",
+            entity_key: nid.as_str().to_owned(),
+            space_seq: rseq,
+            parent_rev_id: Some(current_rev.clone()),
+            restored_from_rev_id: Some(pre_rev_id.clone()),
+            content_blake3: pre_meta.content_digest,
+            metadata_msgpack: meta,
+            agent_run_id: None,
+        });
+
+        events.push(BatchEventDraft {
+            space_seq: rseq,
+            entity_type: "note".to_owned(),
+            entity_id: nid.as_str().to_owned(),
+            op_kind: "restore".to_owned(),
+            rev_id: rrev.clone(),
+            lifecycle: pre_meta.lifecycle,
+            doc_class: Some(pre_meta.doc_class),
+        });
+        restored_out.push(NoteRevision {
+            note: nid.clone(),
+            revision: rrev,
+        });
+    }
+
+    let new_run_rev = new_revision_id()?;
+    let run_meta = RevisionMetadataEnvelope::v1(RevisionMetadataPayload::AgentRun(
+        crate::codec::AgentRunRevisionMetadata {
+            run_id: run.clone(),
+            last_seq: visibility_seq,
+        },
+    ))
+    .encode()?;
+    pending_rev_rows.push(PendingSingleRev {
+        rev_id: new_run_rev.clone(),
+        entity_type: "agent_run",
+        entity_key: run.as_str().to_owned(),
+        space_seq: visibility_seq,
+        parent_rev_id: None,
+        restored_from_rev_id: None,
+        content_blake3: None,
+        metadata_msgpack: run_meta,
+        agent_run_id: Some(run.clone()),
+    });
+
+    let rev_items: Vec<RevisionInsertItem<'_>> = pending_rev_rows
+        .iter()
+        .map(|r| RevisionInsertItem {
+            rev_id: &r.rev_id,
+            entity_type: r.entity_type,
+            entity_key: &r.entity_key,
+            space_seq: r.space_seq,
+            visibility_seq,
+            parent_rev_id: r.parent_rev_id.as_ref(),
+            restored_from_rev_id: r.restored_from_rev_id.as_ref(),
+            content_blake3: r.content_blake3,
+            metadata_msgpack: &r.metadata_msgpack,
+            actor_id: auth.principal(),
+            agent_run_id: r.agent_run_id.as_ref(),
+            created_at: now_ts,
+        })
+        .collect();
+
+    if let BackendConn::Postgres(conn) = &mut *tx {
+        execute_pg_rollback_domain_writes_cte(
+            conn,
+            &scope_cl,
+            &run,
+            &new_run_rev,
+            vis_i64,
+            sec,
+            nsec,
+            auth.principal().as_str(),
+            &pending_restore_heads,
+            &rev_items,
+        )
+        .await?;
+    } else {
+        update_note_heads_restored_batch_tx(
+            tx,
+            &scope_cl.space_id,
+            &pending_restore_heads,
+            vis_i64,
+            auth.principal().as_str(),
+        )
+        .await?;
+
+        let pending_blob_rebinds: Vec<_> = rev_items
+            .iter()
+            .filter(|revision| revision.entity_type == "note")
+            .filter_map(|revision| {
+                Some(ExistingBlobRefItem {
+                    owner_kind: BlobOwnerKind::NoteRevision,
+                    owner_id: revision.entity_key.to_owned(),
+                    owner_rev_id: revision.rev_id.as_str().to_owned(),
+                    resource_key: "carrier",
+                    digest: revision.content_blake3?,
+                    created_seq: revision.space_seq,
+                })
+            })
+            .collect();
+        bind_existing_active_blob_refs_batch_tx(tx, &scope_cl.space_id, &pending_blob_rebinds)
             .await?;
-            for (note, ability) in changed_packages {
-                ability::sync_entrypoint(tx, &scope_cl.space_id, note, ability).await?;
-            }
-            // Final heads include every package arriving in or leaving the same project.
-            for (ability, slug, project) in restored_ability_slots {
-                super::packages::check_restored_ability_slot_tx(
-                    tx,
-                    &scope_cl.space_id,
-                    ability,
-                    slug,
-                    project.as_ref(),
-                )
-                .await?;
-            }
-            bind_existing_active_blob_refs_batch_tx(tx, &scope_cl.space_id, &pending_blob_rebinds)
-                .await?;
 
-            if !pending_rev_rows.is_empty() {
-                let rev_items: Vec<RevisionInsertItem<'_>> = pending_rev_rows
-                    .iter()
-                    .map(|r| RevisionInsertItem {
-                        rev_id: &r.rev_id,
-                        entity_type: "note",
-                        entity_key: &r.entity_key,
-                        space_seq: r.space_seq,
-                        visibility_seq,
-                        parent_rev_id: Some(&r.parent_rev_id),
-                        restored_from_rev_id: r.restored_from_rev_id.as_ref(),
-                        content_blake3: r.content_blake3,
-                        metadata_msgpack: &r.metadata_msgpack,
-                        actor_id: auth.principal(),
-                        agent_run_id: None,
-                        created_at: now_ts,
-                    })
-                    .collect();
-                insert_revision_rows_batch_tx(tx, &scope_cl, &rev_items).await?;
-            }
+        insert_revision_rows_batch_tx(tx, &scope_cl, &rev_items).await?;
 
-            for (folder, cover) in cover_changes {
-                let cseq = item_ctx.alloc_next_seq()?;
-                if let Some(event) = super::folder_cover::assign(
-                    tx,
-                    &scope_cl,
-                    folder,
-                    cover,
-                    cseq,
-                    visibility_seq,
-                    auth.principal(),
-                    None,
-                    now_ts,
-                )
-                .await?
-                {
-                    events.push(event);
-                }
-            }
+        upsert_agent_run_head_row_only_tx(tx, &scope_cl, &run, &new_run_rev, vis_i64, sec, nsec)
+            .await?;
+    }
 
-            // 6c. Apply planned board overlay deletes, neighbor normalizations, and target restores.
-            for removal in rank_removals {
-                let seq = item_ctx.alloc_next_seq()?;
-                let revision = new_revision_id()?;
-                removal
-                    .write_tx(
-                        tx,
-                        &scope_cl,
-                        seq,
-                        visibility_seq,
-                        &revision,
-                        auth.principal(),
-                        now_ts,
-                    )
-                    .await?;
-                owner_notes_for_receipt.extend(removal.owners().into_iter().cloned());
-                events.push(removal.event(seq, revision));
-            }
+    for (note, ability) in changed_packages {
+        ability::sync_entrypoint(tx, &scope_cl.space_id, note, ability).await?;
+    }
+    // Final heads include every package arriving in or leaving the same project.
+    for (ability, slug, project) in restored_ability_slots {
+        super::packages::check_restored_ability_slot_tx(
+            tx,
+            &scope_cl.space_id,
+            ability,
+            slug,
+            project.as_ref(),
+        )
+        .await?;
+    }
 
-            for nbr in &planned_neighbor_updates {
-                let nseq = item_ctx.alloc_next_seq()?;
-                let nrev = new_revision_id()?;
-                let existing_ov = preloaded_view_overlays
-                    .get(&nbr.view)
-                    .and_then(|m| m.get(&nbr.neighbor_note));
-                let (pl_rev, pl_actor, pl_run) = match existing_ov {
-                    Some(ov) if nbr.is_pma && ov.group == nbr.group => (
-                        ov.placement_revision.clone(),
-                        ov.placement_actor_id.clone(),
-                        ov.placement_run_id.clone(),
-                    ),
-                    _ => (nrev.clone(), auth.principal().clone(), None),
-                };
-                upsert_overlay_and_rank_revision_tx(
-                    tx,
-                    &scope_cl,
-                    &nbr.view,
-                    &nbr.neighbor_note,
-                    &nbr.group,
-                    &nbr.rank,
-                    &nrev,
-                    existing_ov.map(|o| &o.rank_rev_id),
-                    &pl_rev,
-                    &pl_actor,
-                    pl_run.as_ref(),
-                    auth.principal(),
-                    None,
-                    nbr.is_pma,
-                    nseq,
-                    visibility_seq,
-                    now_ts,
-                )
-                .await?;
-                events.push(BatchEventDraft {
-                    space_seq: nseq,
-                    entity_type: "note".to_owned(),
-                    entity_id: nbr.neighbor_note.as_str().to_owned(),
-                    op_kind: "move".to_owned(),
-                    rev_id: nrev,
-                    lifecycle: Lifecycle::Active,
-                    doc_class: None,
-                });
-            }
+    for (folder, cover) in cover_changes {
+        let cseq = item_ctx.alloc_next_seq()?;
+        if let Some(event) = super::folder_cover::assign(
+            tx,
+            &scope_cl,
+            folder,
+            cover,
+            cseq,
+            visibility_seq,
+            auth.principal(),
+            None,
+            now_ts,
+        )
+        .await?
+        {
+            events.push(event);
+        }
+    }
 
-            for tr in planned_target_restores {
-                let tseq = item_ctx.alloc_next_seq()?;
-                let trev = new_revision_id()?;
-                let pl_rev = tr
-                    .restored_placement_revision
-                    .unwrap_or_else(|| trev.clone());
-                let existing_ov = preloaded_view_overlays
-                    .get(&tr.view)
-                    .and_then(|m| m.get(&tr.target_note));
-                owner_notes_for_receipt.insert(tr.view.note.clone());
-
-                let pl_actor = tr
-                    .restored_placement_actor
-                    .as_ref()
-                    .unwrap_or_else(|| auth.principal());
-                upsert_overlay_and_rank_revision_tx(
-                    tx,
-                    &scope_cl,
-                    &tr.view,
-                    &tr.target_note,
-                    &tr.group,
-                    &tr.rank,
-                    &trev,
-                    existing_ov.map(|o| &o.rank_rev_id),
-                    &pl_rev,
-                    pl_actor,
-                    tr.restored_placement_run.as_ref(),
-                    auth.principal(),
-                    None,
-                    false,
-                    tseq,
-                    visibility_seq,
-                    now_ts,
-                )
-                .await?;
-                events.push(BatchEventDraft {
-                    space_seq: tseq,
-                    entity_type: "note".to_owned(),
-                    entity_id: tr.target_note.as_str().to_owned(),
-                    op_kind: "restore".to_owned(),
-                    rev_id: trev.clone(),
-                    lifecycle: Lifecycle::Active,
-                    doc_class: None,
-                });
-                restored_ranks_out.push(RestoredBoardRank {
-                    view: tr.view,
-                    note: tr.target_note,
-                    group: tr.group,
-                    rank: tr.rank,
-                    rank_revision: trev,
-                    placement_revision: pl_rev,
-                });
-            }
-
-            // 6d. Bump `agent_run_heads` so re-running the same rollback without fresh preconditions conflicts.
-            let new_run_rev = upsert_agent_run_head_tx(
+    for removal in rank_removals {
+        let seq = item_ctx.alloc_next_seq()?;
+        let revision = new_revision_id()?;
+        removal
+            .write_tx(
                 tx,
                 &scope_cl,
-                &input.run,
+                seq,
+                visibility_seq,
+                &revision,
                 auth.principal(),
-                visibility_seq,
-                visibility_seq,
                 now_ts,
             )
             .await?;
-            if events.is_empty() {
-                let noop_seq = item_ctx.alloc_next_seq()?;
-                events.push(BatchEventDraft {
-                    space_seq: noop_seq,
-                    entity_type: "folder".to_owned(),
-                    entity_id: item_ctx.root_folder_id.as_str().to_owned(),
-                    op_kind: "edit".to_owned(),
-                    rev_id: new_run_rev,
-                    lifecycle: Lifecycle::Active,
-                    doc_class: None,
-                });
-            }
+        owner_notes_for_receipt.extend(removal.owners().into_iter().cloned());
+        events.push(removal.event(seq, revision));
+    }
 
-            // 6e. Build `AwaitProjection { Bulk }` effect + receipt.
-            let owner_vec: Vec<NoteId> = owner_notes_for_receipt.into_iter().collect();
-            let cmd_range = notarium_core::ports::CommandSeqRange::new(first_seq, visibility_seq)?;
-            let effect_draft = build_effect_payload_draft(
-                new_prefixed_hex_id("pay_")?,
-                scope_cl.clone(),
-                cmd_range,
-                "rollback_agent_run",
-                EffectBodyV1::AwaitProjection {
-                    reason: StoredAwaitReasonV1::Bulk,
-                },
-                owner_vec.clone(),
-            )?;
-            let receipt_token = MutationReceiptToken::new(scope_cl.clone(), visibility_seq)?;
-            let wire = StoredCommittedRollbackV1 {
-                restored: restored_out,
-                trashed: trashed_out,
-                restored_ranks: restored_ranks_out,
-                skipped_manual_edits: skipped_manual_cl.clone(),
-                skipped_room_active: skipped_room_cl.clone(),
-                receipt: receipt_token,
-            };
-            let resp_bytes = encode_msgpack(&wire)?;
-            let sanitized = encode_msgpack(&StoredCommittedRollbackV1::sanitized(
-                MutationReceiptToken::new(scope_cl, visibility_seq)?,
-            ))?;
+    if events.is_empty() {
+        let noop_seq = item_ctx.alloc_next_seq()?;
+        events.push(BatchEventDraft {
+            space_seq: noop_seq,
+            entity_type: "folder".to_owned(),
+            entity_id: item_ctx.root_folder_id.as_str().to_owned(),
+            op_kind: "edit".to_owned(),
+            rev_id: new_run_rev,
+            lifecycle: Lifecycle::Active,
+            doc_class: None,
+        });
+    }
 
-            Ok(ItemCommitArtifacts {
-                command_id: new_prefixed_hex_id("cmd_")?,
-                command_kind: "rollback_agent_run".to_owned(),
-                events,
-                change_payload: Some(effect_draft),
-                receipt_detail_blob: Some(resp_bytes.clone()),
-                receipt_sanitized_blob: sanitized,
-                receipt_owner_note_ids: wire.receipt_owners(owner_vec),
-                response_bytes: resp_bytes,
-            })
-        })
+    let owner_vec: Vec<NoteId> = owner_notes_for_receipt.into_iter().collect();
+    let cmd_range = notarium_core::ports::CommandSeqRange::new(first_seq, visibility_seq)?;
+    let effect_draft = build_effect_payload_draft(
+        new_prefixed_hex_id("pay_")?,
+        scope_cl.clone(),
+        cmd_range,
+        "rollback_agent_run",
+        EffectBodyV1::AwaitProjection {
+            reason: StoredAwaitReasonV1::Bulk,
+        },
+        owner_vec.clone(),
+    )?;
+    let receipt_token = MutationReceiptToken::new(scope_cl.clone(), visibility_seq)?;
+    let wire = StoredCommittedRollbackV1 {
+        restored: restored_out,
+        trashed: trashed_out,
+        skipped_manual_edits,
+        skipped_room_active,
+        receipt: receipt_token.clone(),
+    };
+    let resp_bytes = encode_msgpack(&wire)?;
+    let sanitized = encode_msgpack(&StoredCommittedRollbackV1::sanitized(receipt_token))?;
+
+    Ok(ItemCommitArtifacts {
+        command_id: new_prefixed_hex_id("cmd_")?,
+        command_kind: "rollback_agent_run".to_owned(),
+        events,
+        change_payload: Some(effect_draft),
+        receipt_detail_blob: Some(resp_bytes.clone()),
+        receipt_sanitized_blob: sanitized,
+        receipt_owner_note_ids: wire.receipt_owners(owner_vec),
+        response_bytes: resp_bytes,
     })
 }
 
-#[allow(clippy::type_complexity)]
-// The current head is authorized when verifying the run's expected entities. The
-// restored revision can name a different folder, document class, or ability.
-async fn run_materialized_overlay_seq_tx(
+#[derive(sqlx::FromRow)]
+struct RollbackReplayHeadRow {
+    incarnation: Vec<u8>,
+    run_revision: String,
+    note_id: Option<String>,
+    parent_folder_id: Option<String>,
+    doc_class: Option<String>,
+    ability_id: Option<String>,
+    purged: bool,
+}
+
+pub(crate) async fn authorize_rollback_run_replay_tx(
     tx: &mut BackendConn<'_>,
-    space_id: &SpaceId,
-    placement_revision: &RevisionId,
+    record: &SpaceRecord,
+    auth: &EngineAuthContext,
     run: &AgentRunId,
-) -> Result<Option<SpaceSeq>, PortError> {
-    let seq_opt: Option<i64> = match tx {
-        BackendConn::Sqlite(conn) => sqlx::query_scalar::<_, i64>(
-            "SELECT space_seq FROM revisions
-             WHERE space_id = ? AND rev_id = ?
-               AND entity_type = 'rank' AND agent_run_id = ?
-             LIMIT 1",
-        )
-        .bind(space_id.as_str())
-        .bind(placement_revision.as_str())
-        .bind(run.as_str())
-        .fetch_optional(&mut **conn)
-        .await
-        .map_err(|err| {
-            internal_not_committed("sqlite_check_materialized_overlay", err.to_string())
-        })?,
-        BackendConn::Postgres(conn) => sqlx::query_scalar::<_, i64>(
-            "SELECT space_seq FROM revisions
-             WHERE space_id = $1 AND rev_id = $2
-               AND entity_type = 'rank' AND agent_run_id = $3
-             LIMIT 1",
-        )
-        .bind(space_id.as_str())
-        .bind(placement_revision.as_str())
-        .bind(run.as_str())
-        .fetch_optional(&mut **conn)
-        .await
-        .map_err(|err| crate::runtime::pg_read_error("pg_check_materialized_overlay", err))?,
+) -> Result<(), PortError> {
+    const SQL: &str = "WITH notes AS (
+        SELECT DISTINCT entity_key AS note_id FROM revisions
+        WHERE space_id = $1 AND agent_run_id = $2 AND entity_type = 'note'
+    )
+    SELECT r.history_incarnation AS incarnation, r.run_revision, n.note_id,
+           h.parent_folder_id, h.doc_class, h.ability_id,
+           EXISTS (SELECT 1 FROM revision_purge_fences p
+                   WHERE p.space_id = $1 AND p.note_id = n.note_id) AS purged
+    FROM agent_run_heads r LEFT JOIN notes n ON TRUE
+    LEFT JOIN note_heads h ON h.space_id = $1 AND h.note_id = n.note_id
+    WHERE r.space_id = $1 AND r.run_id = $2
+    ORDER BY n.note_id";
+
+    let scope = &record.scope;
+    auth.authorize_space_write(&record.space)?;
+    let rows: Vec<RollbackReplayHeadRow> = match tx {
+        BackendConn::Sqlite(conn) => sqlx::query_as(SQL)
+            .bind(scope.space_id.as_str())
+            .bind(run.as_str())
+            .fetch_all(&mut **conn)
+            .await
+            .map_err(|error| internal_not_committed("sqlite_rollback_heads", error.to_string()))?,
+        BackendConn::Postgres(conn) => sqlx::query_as(SQL)
+            .bind(scope.space_id.as_str())
+            .bind(run.as_str())
+            .fetch_all(&mut **conn)
+            .await
+            .map_err(|error| crate::runtime::pg_read_error("pg_rollback_heads", error))?,
     };
-    seq_opt
-        .map(|seq| {
-            u64::try_from(seq)
-                .ok()
-                .and_then(|v| SpaceSeq::new(v).ok())
-                .ok_or_else(|| {
-                    internal_not_committed("corrupt_materialized_overlay_seq", "invalid space_seq")
-                })
-        })
-        .transpose()
+    let run_head = rows.first().ok_or(DomainError::ResourceNotFound)?;
+    let _ = scoped_run_revision(scope, &run_head.incarnation, &run_head.run_revision)?;
+    if rows.iter().any(|row| row.purged) {
+        return Err(DomainError::ResourceNotFound.into());
+    }
+    let mut folders = FolderAncestryCache::default();
+    for row in rows {
+        let Some(_) = row.note_id else {
+            continue;
+        };
+        let (Some(parent), Some(class)) = (row.parent_folder_id, row.doc_class) else {
+            return Err(DomainError::ResourceNotFound.into());
+        };
+        let parent = FolderId::parse(&parent).map_err(|_| {
+            internal_not_committed("corrupt_note_parent", "invalid parent_folder_id")
+        })?;
+        let ability = row
+            .ability_id
+            .as_deref()
+            .map(AbilityId::parse)
+            .transpose()
+            .map_err(|_| internal_not_committed("corrupt_ability_id", "invalid ability_id"))?;
+        let (facts, anc) = folders
+            .build_resource_facts_tx(
+                tx,
+                &record.space,
+                &parent,
+                crate::codec::doc_class_from_db(&class)?,
+                ability,
+                true,
+            )
+            .await?;
+        if anc.folder_lifecycle == Lifecycle::Purged {
+            return Err(DomainError::ResourceNotFound.into());
+        }
+        auth.can_view_resource(&facts)?;
+        auth.authorize_direct_write(&facts, &facts)?;
+    }
+    Ok(())
 }
 
 async fn authorize_rollback_destination_tx(
     tx: &mut BackendConn<'_>,
     cache: &mut FolderAncestryCache,
     space: &notarium_core::auth::Space,
-    auth: &notarium_core::auth::EngineAuthContext,
+    auth: &EngineAuthContext,
     meta: &NoteRevisionMetadata,
 ) -> Result<crate::domain::common::FolderAncestryFacts, PortError> {
     let (after, anc) = cache
@@ -4575,354 +1457,10 @@ async fn authorize_rollback_destination_tx(
     Ok(anc)
 }
 
-async fn discover_rollback_state_tx(
-    tx: &mut BackendConn<'_>,
-    ctx: &SpaceContext,
-    input: &RollbackAgentRun,
-) -> Result<
-    (
-        crate::runtime::SpaceRecord,
-        Vec<NoteId>,
-        BTreeMap<NoteId, CandidateAction>,
-        BTreeSet<NoteId>,
-        Vec<RunBoardMoveRow>,
-        BTreeSet<ViewRef>,
-        BTreeSet<NoteId>,
-        Option<SpaceSeq>,
-        i64,
-    ),
-    PortError,
-> {
-    let srec = load_space_record(tx, &ctx.scope().space_id).await?;
-    srec.scope.check(ctx.scope())?;
-
-    let mut folder_cache = FolderAncestryCache::default();
-    let VerifiedRollbackSources {
-        heads: mut heads_map,
-        moves: run_moves,
-        active_views,
-        rooms: collab_states,
-    } = verify_run_and_entity_preconditions_tx(
-        tx,
-        &srec.scope,
-        &srec.space,
-        ctx.auth(),
-        input,
-        &mut folder_cache,
-    )
-    .await?;
-
-    let touched_notes: Vec<NoteId> = input
-        .expected_entities
-        .iter()
-        .map(|e| e.note.clone())
-        .collect();
-    let mut touched_sorted = touched_notes;
-    touched_sorted.sort();
-    touched_sorted.dedup();
-
-    let mut rev_histories =
-        load_notes_revision_histories_batch_tx(tx, &srec.scope.space_id, &touched_sorted).await?;
-    let observed_max_bmh_seq = load_max_board_move_seq_tx(tx, &srec.scope.space_id).await?;
-    let space_has_bmh = !run_moves.is_empty() || observed_max_bmh_seq > 0;
-
-    let mut skipped_manual_edits = Vec::new();
-    let mut candidates = BTreeMap::new();
-    let mut durable_active_rooms = BTreeSet::new();
-    let mut package_cut = None;
-
-    for nid in touched_sorted {
-        let head = heads_map
-            .remove(&nid)
-            .ok_or(DomainError::ResourceNotFound)?;
-        let note_revs = rev_histories.remove(&nid).unwrap_or_default();
-        let target_bmh = if space_has_bmh {
-            load_target_board_move_runs_tx(tx, &srec.scope.space_id, &nid).await?
-        } else {
-            Vec::new()
-        };
-
-        let earliest_note_touch = note_revs
-            .iter()
-            .filter(|r| r.3.as_ref() == Some(&input.run))
-            .map(|r| r.1)
-            .min();
-        let earliest_bmh_touch = target_bmh
-            .iter()
-            .filter(|m| m.1.as_ref() == Some(&input.run))
-            .map(|m| m.0)
-            .min();
-
-        let first_run_seq = match (earliest_note_touch, earliest_bmh_touch) {
-            (Some(a), Some(b)) => a.min(b),
-            (Some(a), None) => a,
-            (None, Some(b)) => b,
-            (None, None) => {
-                return Err(DomainError::validation(ValidationReason::SourceMismatch).into());
-            }
-        };
-
-        let has_foreign_note_edit = note_revs
-            .iter()
-            .any(|r| r.1 > first_run_seq && r.3.as_ref() != Some(&input.run));
-        let has_foreign_board_move = target_bmh
-            .iter()
-            .any(|m| m.0 > first_run_seq && m.1.as_ref() != Some(&input.run));
-        let has_foreign_rank_restore =
-            if !has_foreign_note_edit && !has_foreign_board_move && earliest_bmh_touch.is_some() {
-                has_later_foreign_non_pma_rank_revision_tx(
-                    tx,
-                    &srec.scope,
-                    &run_moves,
-                    &nid,
-                    first_run_seq,
-                    &input.run,
-                )
-                .await?
-            } else {
-                false
-            };
-
-        if has_foreign_note_edit || has_foreign_board_move || has_foreign_rank_restore {
-            skipped_manual_edits.push(nid);
-            continue;
-        }
-
-        if collab_states.get(&nid) == Some(&true) {
-            durable_active_rooms.insert(nid.clone());
-        }
-
-        let pre_rev_opt = note_revs
-            .iter()
-            .filter(|r| r.1 < first_run_seq)
-            .max_by_key(|r| r.1);
-
-        if head.doc_class == DocClass::Skill || head.ability_id.is_some() {
-            // Publication attaches a binding without advancing the note revision.
-            // Retry this rare plan if publication changes before the writer commits it.
-            package_cut = Some(srec.last_seq);
-            if ability::has_later_foreign_publication(
-                tx,
-                &srec.scope,
-                &head,
-                first_run_seq,
-                &input.run,
-                pre_rev_opt.is_none(),
-            )
-            .await?
-            {
-                skipped_manual_edits.push(nid);
-                continue;
-            }
-        }
-        let current_cover_parent = if head.slug_fold == super::folder_cover::SLUG
-            && crate::runtime::load_folder_head_row(
-                tx,
-                &srec.scope.space_id,
-                &head.parent_folder_id,
-            )
-            .await?
-            .cover_note_id
-            .as_ref()
-                == Some(&nid)
-        {
-            Some(head.parent_folder_id.clone())
-        } else {
-            None
-        };
-        match pre_rev_opt {
-            None => {
-                let mut metadata = current_rollback_metadata(&note_revs, &head.head_rev_id, &nid)?;
-                metadata.folder_page |= current_cover_parent.is_some();
-                ability::retain_binding(&mut metadata, &head)?;
-                candidates.insert(
-                    nid.clone(),
-                    CandidateAction::TrashCreated {
-                        metadata,
-                        current_rev: head.head_rev_id,
-                        current_lifecycle: head.lifecycle,
-                        doc_class: head.doc_class,
-                        parent_folder_id: head.parent_folder_id,
-                        slug: head.slug,
-                        slug_fold: head.slug_fold,
-                        title: head.title,
-                        ability_id: head.ability_id,
-                        visibility_mask: head.visibility_mask,
-                        byte_size: head.byte_size,
-                        content_digest: head.content_digest,
-                    },
-                );
-            }
-            Some((pre_rev_id, _, meta_bytes, _, pre_updated_at)) => {
-                let mut pre_meta = decode_rollback_note(meta_bytes, &nid)?;
-                ability::retain_binding(&mut pre_meta, &head)?;
-                authorize_rollback_destination_tx(
-                    tx,
-                    &mut folder_cache,
-                    &srec.space,
-                    ctx.auth(),
-                    &pre_meta,
-                )
-                .await?;
-                let head_unchanged_placement = head.lifecycle == pre_meta.lifecycle
-                    && head.parent_folder_id == pre_meta.parent_folder_id
-                    && head.slug == pre_meta.slug
-                    && head.slug_fold == pre_meta.slug_fold;
-                let needs_note_mutation =
-                    head.head_rev_id != *pre_rev_id || !head_unchanged_placement;
-                let effective_pre_updated_at =
-                    pre_meta.logical_updated_at.or(Some(*pre_updated_at));
-                candidates.insert(
-                    nid,
-                    CandidateAction::RestorePreExisting {
-                        current_rev: head.head_rev_id,
-                        pre_rev_id: pre_rev_id.clone(),
-                        pre_meta: Box::new(pre_meta),
-                        pre_carrier: None,
-                        pre_updated_at: effective_pre_updated_at,
-                        needs_note_mutation,
-                        head_unchanged_placement,
-                        current_cover_parent,
-                        first_run_seq,
-                    },
-                );
-            }
-        }
-    }
-
-    let mutated_restorable_ids: Vec<NoteId> = candidates
-        .iter()
-        .filter_map(|(nid, action)| match action {
-            CandidateAction::RestorePreExisting {
-                needs_note_mutation: true,
-                ..
-            } => Some(nid.clone()),
-            _ => None,
-        })
-        .collect();
-    let mut extra_overlay_views = BTreeSet::new();
-    let mut active_views = active_views;
-    if !mutated_restorable_ids.is_empty() {
-        let overlay_views =
-            load_overlay_views_for_notes_tx(tx, &srec.scope.space_id, &mutated_restorable_ids)
-                .await?;
-        for view in overlay_views {
-            if run_moves.iter().any(|m| m.view == view) {
-                continue;
-            }
-            if let Ok(Some((_head, effective))) = super::board::authorized_rollback_view_head_opt(
-                tx,
-                &srec.space,
-                ctx.auth(),
-                &view.note,
-            )
-            .await
-            {
-                if effective == Lifecycle::Active {
-                    active_views.insert(view.note.clone());
-                }
-                extra_overlay_views.insert(view);
-            }
-        }
-    }
-
-    Ok((
-        srec,
-        skipped_manual_edits,
-        candidates,
-        durable_active_rooms,
-        run_moves,
-        extra_overlay_views,
-        active_views,
-        package_cut,
-        observed_max_bmh_seq,
-    ))
-}
-
-async fn load_overlay_views_for_notes_tx(
-    tx: &mut BackendConn<'_>,
-    space_id: &SpaceId,
-    note_ids: &[NoteId],
-) -> Result<Vec<ViewRef>, PortError> {
-    if note_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut views = BTreeSet::new();
-    for chunk in note_ids.chunks(256) {
-        let rows: Vec<(String, String)> = match tx {
-            BackendConn::Sqlite(conn) => {
-                let mut qb: sqlx::QueryBuilder<sqlx::Sqlite> = sqlx::QueryBuilder::new(
-                    "SELECT DISTINCT view_note_id, view_key FROM view_rank_overlays WHERE space_id = ",
-                );
-                qb.push_bind(space_id.as_str());
-                qb.push(" AND target_note_id IN (");
-                let mut sep = qb.separated(", ");
-                for nid in chunk {
-                    sep.push_bind(nid.as_str());
-                }
-                qb.push(")");
-                qb.build_query_as::<(String, String)>()
-                    .fetch_all(&mut **conn)
-                    .await
-                    .map_err(|err| {
-                        internal_not_committed("sqlite_load_overlay_views", err.to_string())
-                    })?
-            }
-            BackendConn::Postgres(conn) => {
-                let ids: Vec<&str> = chunk.iter().map(NoteId::as_str).collect();
-                sqlx::query_as(
-                    "SELECT DISTINCT view_note_id, view_key FROM view_rank_overlays
-                     WHERE space_id = $1 AND target_note_id = ANY($2)",
-                )
-                .bind(space_id.as_str())
-                .bind(&ids)
-                .fetch_all(&mut **conn)
-                .await
-                .map_err(|err| crate::runtime::pg_read_error("pg_load_overlay_views", err))?
-            }
-        };
-        for (vnote_raw, vkey_raw) in rows {
-            let note = NoteId::parse(&vnote_raw).map_err(|_| {
-                internal_not_committed("corrupt_overlay_view_note", "invalid NoteId")
-            })?;
-            let key = notarium_core::ids::ViewKey::parse(&vkey_raw).map_err(|_| {
-                internal_not_committed("corrupt_overlay_view_key", "invalid ViewKey")
-            })?;
-            views.insert(ViewRef { note, key });
-        }
-    }
-    Ok(views.into_iter().collect())
-}
-
-pub(crate) fn verify_authorized_rollback_revisions<'a>(
-    actual_run: RevisionId,
-    input: &RollbackAgentRun,
-    current_head: impl Fn(&NoteId) -> Option<&'a RevisionId>,
-) -> Result<(), PortError> {
-    if actual_run != input.expected_run_revision {
-        return Err(DomainError::RevisionConflict {
-            current: actual_run,
-            lineage: None,
-        }
-        .into());
-    }
-    for expected in &input.expected_entities {
-        let current = current_head(&expected.note).ok_or(DomainError::ResourceNotFound)?;
-        if current != &expected.revision {
-            return Err(DomainError::RevisionConflict {
-                current: current.clone(),
-                lineage: None,
-            }
-            .into());
-        }
-    }
-    Ok(())
-}
-
 async fn ensure_chat_run_not_active_tx(
     tx: &mut BackendConn<'_>,
     space: &notarium_core::auth::Space,
-    auth: &notarium_core::auth::EngineAuthContext,
+    auth: &EngineAuthContext,
     run: &AgentRunId,
 ) -> Result<(), PortError> {
     let rows: Vec<(String, String, String, Option<String>)> = match tx {
@@ -5008,8 +1546,7 @@ async fn ensure_chat_run_not_active_tx(
     };
     if has_run_head {
         let touched = load_run_touched_notes_tx(tx, &space.id, run).await?;
-        let run_moves = load_run_board_moves_tx(tx, &space.id, run).await?;
-        if !touched.is_empty() || !run_moves.is_empty() {
+        if !touched.is_empty() {
             let states = load_rollback_note_states(
                 tx,
                 &space.id,
@@ -5044,18 +1581,6 @@ async fn ensure_chat_run_not_active_tx(
                     }
                 }
                 if authorized {
-                    let views: BTreeSet<&NoteId> = run_moves.iter().map(|m| &m.view.note).collect();
-                    for view in views {
-                        if super::board::authorized_rollback_view_head_opt(tx, space, auth, view)
-                            .await
-                            .is_err()
-                        {
-                            authorized = false;
-                            break;
-                        }
-                    }
-                }
-                if authorized {
                     return Err(DomainError::validation(ValidationReason::InvalidState).into());
                 }
             }
@@ -5064,14 +1589,11 @@ async fn ensure_chat_run_not_active_tx(
     Err(DomainError::ResourceNotFound.into())
 }
 
-async fn load_run_revision(
+async fn load_run_revision_only_tx(
     tx: &mut BackendConn<'_>,
     scope: &HistoryScope,
-    space: &notarium_core::auth::Space,
-    auth: &notarium_core::auth::EngineAuthContext,
     run: &AgentRunId,
 ) -> Result<RevisionId, PortError> {
-    ensure_chat_run_not_active_tx(tx, space, auth, run).await?;
     let run_row: Option<(Vec<u8>, String)> = match tx {
         BackendConn::Sqlite(conn) => {
             let row = sqlx::query(
@@ -5098,7 +1620,6 @@ async fn load_run_revision(
             row.map(|r| (r.get("history_incarnation"), r.get("run_revision")))
         }
     };
-
     let Some((inc_bytes, run_rev_raw)) = run_row else {
         return Err(DomainError::ResourceNotFound.into());
     };
@@ -5123,724 +1644,46 @@ fn scoped_run_revision(
         .map_err(|_| internal_not_committed("corrupt_run_rev", "invalid run_revision"))
 }
 
-// A run can touch a note through revisions, board moves, or both. LEFT JOIN
-// preserves missing and purge-fenced heads for the same authorization checks.
-#[derive(sqlx::FromRow)]
-struct RollbackHeadFacts {
-    incarnation: Vec<u8>,
-    run_revision: String,
-    note_id: Option<String>,
-    parent_folder_id: Option<String>,
-    doc_class: Option<String>,
-    ability_id: Option<String>,
-    head_rev_id: Option<String>,
-    purged: bool,
-    has_board_move: bool,
-}
-
-async fn load_rollback_head_facts(
-    tx: &mut BackendConn<'_>,
-    space: &SpaceId,
-    run: &AgentRunId,
-) -> Result<Vec<RollbackHeadFacts>, PortError> {
-    const SQL: &str = "WITH touched(note_id, board_move) AS (
-        SELECT entity_key, 0 FROM revisions
-        WHERE space_id = $1 AND agent_run_id = $2 AND entity_type = 'note'
-        UNION ALL
-        SELECT target_note_id, 1 FROM board_move_history
-        WHERE space_id = $1 AND agent_run_id = $2
-    ), notes AS (
-        SELECT note_id, MAX(board_move) <> 0 AS has_board_move FROM touched GROUP BY note_id
-    )
-    SELECT r.history_incarnation AS incarnation, r.run_revision, n.note_id, h.parent_folder_id,
-           h.doc_class, h.ability_id, h.head_rev_id,
-           EXISTS (SELECT 1 FROM revision_purge_fences p
-                   WHERE p.space_id = $1 AND p.note_id = n.note_id) AS purged,
-           COALESCE(n.has_board_move, FALSE) AS has_board_move
-    FROM agent_run_heads r LEFT JOIN notes n ON TRUE
-    LEFT JOIN note_heads h ON h.space_id = $1 AND h.note_id = n.note_id
-    WHERE r.space_id = $1 AND r.run_id = $2
-    ORDER BY n.note_id";
-    match tx {
-        BackendConn::Sqlite(conn) => sqlx::query_as(SQL)
-            .bind(space.as_str())
-            .bind(run.as_str())
-            .fetch_all(&mut **conn)
-            .await
-            .map_err(|error| internal_not_committed("sqlite_rollback_heads", error.to_string())),
-        BackendConn::Postgres(conn) => sqlx::query_as(SQL)
-            .bind(space.as_str())
-            .bind(run.as_str())
-            .fetch_all(&mut **conn)
-            .await
-            .map_err(|error| crate::runtime::pg_read_error("pg_rollback_heads", error)),
-    }
-}
-
-pub(super) async fn prepare_agent_run_rollback(
-    store: &CanonicalStore,
-    ctx: SpaceContext,
-    run: AgentRunId,
-) -> Result<(RollbackAgentRun, notarium_core::ids::LeaseEpoch), PortError> {
-    let scope = ctx.scope().clone();
-    let auth = ctx.auth().clone();
-    store
-        .with_read_tx_budget(Some(&ctx.budget), |tx| {
-            Box::pin(async move {
-                let record = load_space_record(tx, &scope.space_id).await?;
-                record.scope.check(&scope)?;
-                auth.authorize_space_write(&record.space)?;
-                ensure_chat_run_not_active_tx(tx, &record.space, &auth, &run).await?;
-                let input = prepare_rollback_sources_tx(tx, &record, &auth, run, false).await?;
-                Ok((input, record.active_epoch))
-            })
-        })
-        .await
-}
-
-pub(crate) async fn prepare_rollback_sources_tx(
-    tx: &mut BackendConn<'_>,
-    record: &crate::runtime::SpaceRecord,
-    auth: &notarium_core::auth::EngineAuthContext,
-    run: AgentRunId,
-    require_active_folders: bool,
-) -> Result<RollbackAgentRun, PortError> {
-    let scope = &record.scope;
-    auth.authorize_space_write(&record.space)?;
-    let rows = load_rollback_head_facts(tx, &scope.space_id, &run).await?;
-    let run_head = rows.first().ok_or(DomainError::ResourceNotFound)?;
-    let expected_run_revision =
-        scoped_run_revision(scope, &run_head.incarnation, &run_head.run_revision)?;
-    if rows.iter().any(|row| row.purged) {
-        return Err(DomainError::ResourceNotFound.into());
-    }
-    let mut folders = FolderAncestryCache::default();
-    let mut expected_entities = Vec::with_capacity(rows.len());
-    let mut has_board_moves = false;
-    for row in rows {
-        // A run with no touched notes still has one row with its revision.
-        let Some(id) = row.note_id else {
-            continue;
-        };
-        let (Some(parent), Some(class), Some(revision)) =
-            (row.parent_folder_id, row.doc_class, row.head_rev_id)
-        else {
-            return Err(DomainError::ResourceNotFound.into());
-        };
-        let parent = FolderId::parse(&parent).map_err(|_| {
-            internal_not_committed("corrupt_note_parent", "invalid parent_folder_id")
-        })?;
-        let ability = row
-            .ability_id
-            .as_deref()
-            .map(AbilityId::parse)
-            .transpose()
-            .map_err(|_| internal_not_committed("corrupt_ability_id", "invalid ability_id"))?;
-        let (facts, anc) = folders
-            .build_resource_facts_tx(
-                tx,
-                &record.space,
-                &parent,
-                crate::codec::doc_class_from_db(&class)?,
-                ability,
-                require_active_folders,
-            )
-            .await?;
-        if anc.folder_lifecycle == Lifecycle::Purged {
-            return Err(DomainError::ResourceNotFound.into());
-        }
-        auth.can_view_resource(&facts)?;
-        auth.authorize_direct_write(&facts, &facts)?;
-        expected_entities.push(NoteRevision {
-            note: NoteId::parse(&id)
-                .map_err(|_| internal_not_committed("corrupt_touched_note_id", "invalid NoteId"))?,
-            revision: RevisionId::parse(&revision)
-                .map_err(|_| internal_not_committed("corrupt_note_rev", "invalid head_rev_id"))?,
-        });
-        has_board_moves |= row.has_board_move;
-    }
-    let mut associated_board_expectations = Vec::new();
-    let moves = if has_board_moves {
-        load_run_board_moves_tx(tx, &scope.space_id, &run).await?
-    } else {
-        Vec::new()
-    };
-    let pairs: BTreeSet<_> = moves
-        .into_iter()
-        .map(|m| (m.view, m.target_note_id))
-        .collect();
-    for (view, note) in pairs {
-        let _ =
-            super::board::authorized_rollback_view_head_opt(tx, &record.space, auth, &view.note)
-                .await?;
-        let overlay = load_overlay_row_opt_tx(tx, &scope.space_id, &view, &note).await?;
-        let (expected_rank, expected_placement_revision) = match overlay {
-            Some(overlay) => (
-                RankExpectation::Existing(overlay.rank_rev_id),
-                overlay.placement_revision,
-            ),
-            None => (RankExpectation::Absent, expected_run_revision.clone()),
-        };
-        associated_board_expectations.push(AssociatedBoardExpectation {
-            view,
-            note,
-            expected_rank,
-            expected_placement_revision,
-        });
-    }
-    Ok(RollbackAgentRun {
-        run,
-        expected_run_revision,
-        expected_entities,
-        associated_board_expectations,
-    })
-}
-
-struct VerifiedRollbackSources {
-    heads: BTreeMap<NoteId, NoteHeadRow>,
-    moves: Vec<RunBoardMoveRow>,
-    active_views: BTreeSet<NoteId>,
-    rooms: HashMap<NoteId, bool>,
-}
-
-async fn verify_run_and_entity_preconditions_tx(
-    tx: &mut BackendConn<'_>,
-    scope: &HistoryScope,
-    space: &notarium_core::auth::Space,
-    auth: &notarium_core::auth::EngineAuthContext,
-    input: &RollbackAgentRun,
-    folder_cache: &mut FolderAncestryCache,
-) -> Result<VerifiedRollbackSources, PortError> {
-    // Pure input duplicate validation first (no DB lookups on caller-supplied IDs).
-    let mut caller_notes: BTreeMap<NoteId, RevisionId> = BTreeMap::new();
-    for exp in &input.expected_entities {
-        if caller_notes
-            .insert(exp.note.clone(), exp.revision.clone())
-            .is_some()
-        {
-            return Err(DomainError::validation(ValidationReason::InvalidState).into());
-        }
-    }
-    let mut caller_pairs: BTreeMap<(ViewRef, NoteId), &AssociatedBoardExpectation> =
-        BTreeMap::new();
-    for assoc in &input.associated_board_expectations {
-        if caller_pairs
-            .insert((assoc.view.clone(), assoc.note.clone()), assoc)
-            .is_some()
-        {
-            return Err(DomainError::validation(ValidationReason::InvalidState).into());
-        }
-    }
-
-    auth.authorize_space_write(space)?;
-    let actual_run_rev = load_run_revision(tx, scope, space, auth, &input.run).await?;
-
-    // Discover and authorize the run's actual touched notes and board views BEFORE
-    // checking caller-supplied expectations so unauthorized callers cannot probe
-    // arbitrary note/view existence, purge fences, or the run's touched set.
-    let mut touched_set: BTreeSet<NoteId> = BTreeSet::new();
-    for nid in load_run_touched_notes_tx(tx, &scope.space_id, &input.run).await? {
-        touched_set.insert(nid);
-    }
-    let run_moves = load_run_board_moves_tx(tx, &scope.space_id, &input.run).await?;
-
-    let touched_vec: Vec<NoteId> = touched_set.iter().cloned().collect();
-    let states = load_rollback_note_states(
-        tx,
-        &scope.space_id,
-        touched_vec.iter().map(NoteId::as_str).collect(),
-    )
-    .await?;
-    if !states.purged.is_empty() {
-        return Err(DomainError::ResourceNotFound.into());
-    }
-
-    let heads_map = load_note_heads_batch_tx(tx, &scope.space_id, &touched_vec).await?;
-    for nid in &touched_set {
-        let head = heads_map.get(nid).ok_or(DomainError::ResourceNotFound)?;
-        let (rfacts, anc) = folder_cache
-            .build_resource_facts_tx(
-                tx,
-                space,
-                &head.parent_folder_id,
-                head.doc_class,
-                head.ability_id.clone(),
-                false,
-            )
-            .await?;
-        if anc.folder_lifecycle == Lifecycle::Purged {
-            return Err(DomainError::ResourceNotFound.into());
-        }
-        auth.can_view_resource(&rfacts)?;
-        auth.authorize_direct_write(&rfacts, &rfacts)?;
-    }
-
-    let mut active_views = BTreeSet::new();
-    for view in run_moves
-        .iter()
-        .map(|m| &m.view.note)
-        .collect::<BTreeSet<_>>()
-    {
-        if let Some((_head, effective)) =
-            super::board::authorized_rollback_view_head_opt(tx, space, auth, view).await?
-            && effective == Lifecycle::Active
-        {
-            active_views.insert(view.clone());
-        }
-    }
-
-    let caller_set: BTreeSet<NoteId> = caller_notes.keys().cloned().collect();
-    if caller_set != touched_set {
-        return Err(DomainError::validation(ValidationReason::SourceMismatch).into());
-    }
-
-    let mut required_pairs: BTreeSet<(ViewRef, NoteId)> = BTreeSet::new();
-    for m in &run_moves {
-        required_pairs.insert((m.view.clone(), m.target_note_id.clone()));
-    }
-    let caller_pair_keys: BTreeSet<(ViewRef, NoteId)> = caller_pairs.keys().cloned().collect();
-    if caller_pair_keys != required_pairs {
-        return Err(DomainError::validation(ValidationReason::SourceMismatch).into());
-    }
-
-    verify_authorized_rollback_revisions(actual_run_rev, input, |nid| {
-        heads_map.get(nid).map(|head| &head.head_rev_id)
-    })?;
-
-    for ((view, nid), assoc) in caller_pairs {
-        let fallback_rev = caller_notes
-            .get(&nid)
-            .cloned()
-            .unwrap_or(input.expected_run_revision.clone());
-        let ov_opt = load_overlay_row_opt_tx(tx, &scope.space_id, &view, &nid).await?;
-        verify_rank_expectation(&assoc.expected_rank, ov_opt.as_ref(), &fallback_rev)?;
-        if let Some(ov) = ov_opt
-            && ov.placement_revision != assoc.expected_placement_revision
-        {
-            return Err(DomainError::RevisionConflict {
-                current: ov.placement_revision,
-                lineage: None,
-            }
-            .into());
-        }
-    }
-
-    Ok(VerifiedRollbackSources {
-        heads: heads_map,
-        moves: run_moves,
-        active_views,
-        rooms: states.rooms,
-    })
-}
-
 async fn load_run_touched_notes_tx(
     tx: &mut BackendConn<'_>,
     space_id: &SpaceId,
     run_id: &AgentRunId,
 ) -> Result<Vec<NoteId>, PortError> {
     let raw_ids: Vec<String> = match tx {
-        BackendConn::Sqlite(conn) => {
-            let rows = sqlx::query(
-                "SELECT DISTINCT entity_key AS nid FROM revisions
-                 WHERE space_id = ? AND agent_run_id = ? AND entity_type = 'note'
-                 UNION
-                 SELECT DISTINCT target_note_id AS nid FROM board_move_history
-                 WHERE space_id = ? AND agent_run_id = ?",
-            )
-            .bind(space_id.as_str())
-            .bind(run_id.as_str())
-            .bind(space_id.as_str())
-            .bind(run_id.as_str())
-            .fetch_all(&mut **conn)
-            .await
-            .map_err(|err| internal_not_committed("sqlite_run_touched_notes", err.to_string()))?;
-            rows.into_iter().map(|r| r.get("nid")).collect()
-        }
-        BackendConn::Postgres(conn) => {
-            let rows = sqlx::query(
-                "SELECT DISTINCT entity_key AS nid FROM revisions
-                 WHERE space_id = $1 AND agent_run_id = $2 AND entity_type = 'note'
-                 UNION
-                 SELECT DISTINCT target_note_id AS nid FROM board_move_history
-                 WHERE space_id = $1 AND agent_run_id = $2",
-            )
-            .bind(space_id.as_str())
-            .bind(run_id.as_str())
-            .fetch_all(&mut **conn)
-            .await
-            .map_err(|err| crate::runtime::pg_read_error("pg_run_touched_notes", err))?;
-            rows.into_iter().map(|r| r.get("nid")).collect()
-        }
+        BackendConn::Sqlite(conn) => sqlx::query_scalar(
+            "SELECT DISTINCT entity_key FROM revisions
+             WHERE space_id = ? AND agent_run_id = ? AND entity_type = 'note'
+             ORDER BY entity_key",
+        )
+        .bind(space_id.as_str())
+        .bind(run_id.as_str())
+        .fetch_all(&mut **conn)
+        .await
+        .map_err(|err| internal_not_committed("sqlite_touched_notes", err.to_string()))?,
+        BackendConn::Postgres(conn) => sqlx::query_scalar(
+            "SELECT DISTINCT entity_key FROM revisions
+             WHERE space_id = $1 AND agent_run_id = $2 AND entity_type = 'note'
+             ORDER BY entity_key",
+        )
+        .bind(space_id.as_str())
+        .bind(run_id.as_str())
+        .fetch_all(&mut **conn)
+        .await
+        .map_err(|err| crate::runtime::pg_read_error("pg_touched_notes", err))?,
     };
-
-    let mut out = Vec::with_capacity(raw_ids.len());
-    for raw in raw_ids {
-        let nid = NoteId::parse(&raw)
-            .map_err(|_| internal_not_committed("corrupt_touched_note_id", "invalid NoteId"))?;
-        out.push(nid);
-    }
-    Ok(out)
-}
-
-type RawRunBoardMoveTuple = (i64, i32, String, String, String, Option<String>, Vec<u8>);
-
-async fn load_run_board_moves_tx(
-    tx: &mut BackendConn<'_>,
-    space_id: &SpaceId,
-    run_id: &AgentRunId,
-) -> Result<Vec<RunBoardMoveRow>, PortError> {
-    let rows: Vec<RawRunBoardMoveTuple> = match tx {
-        BackendConn::Sqlite(conn) => {
-            let fetched = sqlx::query(
-                "SELECT command_end_seq, ordinal, view_note_id, view_key, target_note_id,
-                        before_placement_revision, before_placement_msgpack
-                 FROM board_move_history
-                 WHERE space_id = ? AND agent_run_id = ?
-                 ORDER BY command_end_seq DESC, ordinal DESC",
-            )
-            .bind(space_id.as_str())
-            .bind(run_id.as_str())
-            .fetch_all(&mut **conn)
-            .await
-            .map_err(|err| internal_not_committed("sqlite_load_run_bmh", err.to_string()))?;
-            fetched
-                .into_iter()
-                .map(|r| {
-                    (
-                        r.get("command_end_seq"),
-                        r.get::<i64, _>("ordinal") as i32,
-                        r.get("view_note_id"),
-                        r.get("view_key"),
-                        r.get("target_note_id"),
-                        r.get("before_placement_revision"),
-                        r.get("before_placement_msgpack"),
-                    )
-                })
-                .collect()
-        }
-        BackendConn::Postgres(conn) => {
-            let fetched = sqlx::query(
-                "SELECT command_end_seq, ordinal, view_note_id, view_key, target_note_id,
-                        before_placement_revision, before_placement_msgpack
-                 FROM board_move_history
-                 WHERE space_id = $1 AND agent_run_id = $2
-                 ORDER BY command_end_seq DESC, ordinal DESC",
-            )
-            .bind(space_id.as_str())
-            .bind(run_id.as_str())
-            .fetch_all(&mut **conn)
-            .await
-            .map_err(|err| crate::runtime::pg_read_error("pg_load_run_bmh", err))?;
-            fetched
-                .into_iter()
-                .map(|r| {
-                    (
-                        r.get("command_end_seq"),
-                        r.get("ordinal"),
-                        r.get("view_note_id"),
-                        r.get("view_key"),
-                        r.get("target_note_id"),
-                        r.get("before_placement_revision"),
-                        r.get("before_placement_msgpack"),
-                    )
-                })
-                .collect()
-        }
-    };
-
-    let mut out = Vec::with_capacity(rows.len());
-    for (end_seq_raw, ord, vnote_raw, vkey_raw, tnote_raw, bprev_raw, bp_bytes) in rows {
-        let command_end_seq = i64_to_space_seq(end_seq_raw)?;
-        let vnote = NoteId::parse(&vnote_raw)
-            .map_err(|_| internal_not_committed("corrupt_bmh_view_note", "invalid NoteId"))?;
-        let vkey = notarium_core::ids::ViewKey::parse(&vkey_raw)
-            .map_err(|_| internal_not_committed("corrupt_bmh_view_key", "invalid ViewKey"))?;
-        let target_note_id = NoteId::parse(&tnote_raw)
-            .map_err(|_| internal_not_committed("corrupt_bmh_target", "invalid NoteId"))?;
-        let before_placement_revision =
-            match bprev_raw {
-                Some(s) => Some(RevisionId::parse(&s).map_err(|_| {
-                    internal_not_committed("corrupt_bmh_bprev", "invalid RevisionId")
-                })?),
-                None => None,
-            };
-        let before_placement: StoredSemanticPlacementV1 =
-            decode_msgpack_bounded(&bp_bytes, MAX_MSGPACK_DECODE_BYTES)?;
-        out.push(RunBoardMoveRow {
-            command_end_seq,
-            ordinal: ord,
-            view: ViewRef {
-                note: vnote,
-                key: vkey,
-            },
-            target_note_id,
-            before_placement_revision,
-            before_placement,
-        });
-    }
-    Ok(out)
-}
-
-async fn has_later_foreign_non_pma_rank_revision_tx(
-    tx: &mut BackendConn<'_>,
-    scope: &HistoryScope,
-    run_moves: &[RunBoardMoveRow],
-    note_id: &NoteId,
-    first_run_seq: SpaceSeq,
-    run: &AgentRunId,
-) -> Result<bool, PortError> {
-    let mut views = BTreeSet::new();
-    for bmh in run_moves {
-        if &bmh.target_note_id == note_id {
-            views.insert(&bmh.view);
-        }
-    }
-    let after_i64 = first_run_seq.get() as i64;
-    for view in views {
-        let key = super::board::rank_entity_key(&view.note, &view.key, note_id);
-        let rows: Vec<Vec<u8>> = match tx {
-            BackendConn::Sqlite(conn) => sqlx::query_scalar(
-                "SELECT r.metadata_msgpack FROM revisions r
-                 WHERE r.space_id = ?1 AND r.history_incarnation = ?2
-                   AND r.entity_type = 'rank' AND r.entity_key = ?3
-                   AND r.space_seq > ?4
-                   AND (r.agent_run_id IS NULL OR r.agent_run_id != ?5)
-                   AND NOT EXISTS (
-                       SELECT 1 FROM board_move_history b
-                       WHERE b.space_id = r.space_id
-                         AND b.command_end_seq = r.visibility_seq
-                         AND b.view_note_id = ?6
-                         AND b.view_key = ?7
-                         AND b.target_note_id != ?8
-                   )
-                 ORDER BY r.visibility_seq DESC, r.space_seq DESC",
-            )
-            .bind(scope.space_id.as_str())
-            .bind(scope.incarnation.as_bytes().as_slice())
-            .bind(&key)
-            .bind(after_i64)
-            .bind(run.as_str())
-            .bind(view.note.as_str())
-            .bind(view.key.as_str())
-            .bind(note_id.as_str())
-            .fetch_all(&mut **conn)
-            .await
-            .map_err(|err| internal_not_committed("sqlite_later_rank_revs", err.to_string()))?,
-            BackendConn::Postgres(conn) => sqlx::query_scalar(
-                "SELECT r.metadata_msgpack FROM revisions r
-                 WHERE r.space_id = $1 AND r.history_incarnation = $2
-                   AND r.entity_type = 'rank' AND r.entity_key = $3
-                   AND r.space_seq > $4
-                   AND (r.agent_run_id IS NULL OR r.agent_run_id != $5)
-                   AND NOT EXISTS (
-                       SELECT 1 FROM board_move_history b
-                       WHERE b.space_id = r.space_id
-                         AND b.command_end_seq = r.visibility_seq
-                         AND b.view_note_id = $6
-                         AND b.view_key = $7
-                         AND b.target_note_id != $8
-                   )
-                 ORDER BY r.visibility_seq DESC, r.space_seq DESC",
-            )
-            .bind(scope.space_id.as_str())
-            .bind(scope.incarnation.as_bytes().as_slice())
-            .bind(&key)
-            .bind(after_i64)
-            .bind(run.as_str())
-            .bind(view.note.as_str())
-            .bind(view.key.as_str())
-            .bind(note_id.as_str())
-            .fetch_all(&mut **conn)
-            .await
-            .map_err(|err| crate::runtime::pg_read_error("pg_later_rank_revs", err))?,
-        };
-        for bytes in rows {
-            match RevisionMetadataEnvelope::decode(&bytes)?.payload {
-                RevisionMetadataPayload::Rank(meta) if !meta.is_pma_normalization => {
-                    return Ok(true);
-                }
-                RevisionMetadataPayload::Rank(_) => {}
-                _ => {
-                    return Err(internal_not_committed(
-                        "rollback_later_rank_meta_kind",
-                        "rank revision metadata has unexpected payload variant",
-                    ));
-                }
-            }
-        }
-    }
-    Ok(false)
-}
-
-async fn load_target_board_move_runs_tx(
-    tx: &mut BackendConn<'_>,
-    space_id: &SpaceId,
-    note_id: &NoteId,
-) -> Result<Vec<(SpaceSeq, Option<AgentRunId>)>, PortError> {
-    let rows: Vec<(i64, Option<String>)> = match tx {
-        BackendConn::Sqlite(conn) => {
-            let fetched = sqlx::query(
-                "SELECT command_end_seq, agent_run_id FROM board_move_history
-                 WHERE space_id = ? AND target_note_id = ?
-                 ORDER BY command_end_seq ASC, ordinal ASC",
-            )
-            .bind(space_id.as_str())
-            .bind(note_id.as_str())
-            .fetch_all(&mut **conn)
-            .await
-            .map_err(|err| internal_not_committed("sqlite_load_target_bmh", err.to_string()))?;
-            fetched
-                .into_iter()
-                .map(|r| (r.get("command_end_seq"), r.get("agent_run_id")))
-                .collect()
-        }
-        BackendConn::Postgres(conn) => {
-            let fetched = sqlx::query(
-                "SELECT command_end_seq, agent_run_id FROM board_move_history
-                 WHERE space_id = $1 AND target_note_id = $2
-                 ORDER BY command_end_seq ASC, ordinal ASC",
-            )
-            .bind(space_id.as_str())
-            .bind(note_id.as_str())
-            .fetch_all(&mut **conn)
-            .await
-            .map_err(|err| crate::runtime::pg_read_error("pg_load_target_bmh", err))?;
-            fetched
-                .into_iter()
-                .map(|r| (r.get("command_end_seq"), r.get("agent_run_id")))
-                .collect()
-        }
-    };
-
-    let mut out = Vec::with_capacity(rows.len());
-    for (seq_raw, run_raw) in rows {
-        let seq = i64_to_space_seq(seq_raw)?;
-        let run = match run_raw {
-            Some(s) => Some(
-                AgentRunId::parse(&s)
-                    .map_err(|_| internal_not_committed("corrupt_bmh_run", "invalid run_id"))?,
-            ),
-            None => None,
-        };
-        out.push((seq, run));
-    }
-    Ok(out)
-}
-
-#[allow(clippy::type_complexity)]
-type NoteRevHistoryRow = (
-    RevisionId,
-    SpaceSeq,
-    Vec<u8>,
-    Option<AgentRunId>,
-    notarium_core::value::Timestamp,
-);
-
-async fn load_notes_revision_histories_batch_tx(
-    tx: &mut BackendConn<'_>,
-    space_id: &SpaceId,
-    note_ids: &[NoteId],
-) -> Result<BTreeMap<NoteId, Vec<NoteRevHistoryRow>>, PortError> {
-    let mut out: BTreeMap<NoteId, Vec<NoteRevHistoryRow>> = BTreeMap::new();
-    if note_ids.is_empty() {
-        return Ok(out);
-    }
-    type RawNoteRevRow = (String, String, i64, Vec<u8>, Option<String>, i64, i32);
-    for chunk in note_ids.chunks(200) {
-        let rows: Vec<RawNoteRevRow> = match tx {
-            BackendConn::Sqlite(conn) => {
-                let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
-                    "SELECT entity_key, rev_id, space_seq, metadata_msgpack, agent_run_id, created_at_sec, created_at_nsec
-                     FROM revisions
-                     WHERE space_id = ",
-                );
-                qb.push_bind(space_id.as_str())
-                    .push(" AND entity_type = 'note' AND entity_key IN (");
-                let mut sep = qb.separated(", ");
-                for nid in chunk {
-                    sep.push_bind(nid.as_str());
-                }
-                sep.push_unseparated(") ORDER BY entity_key ASC, space_seq ASC");
-                let fetched = qb.build().fetch_all(&mut **conn).await.map_err(|err| {
-                    internal_not_committed("sqlite_load_note_revs_batch", err.to_string())
-                })?;
-                fetched
-                    .into_iter()
-                    .map(|r| {
-                        (
-                            r.get("entity_key"),
-                            r.get("rev_id"),
-                            r.get("space_seq"),
-                            r.get("metadata_msgpack"),
-                            r.get("agent_run_id"),
-                            r.get("created_at_sec"),
-                            r.get("created_at_nsec"),
-                        )
-                    })
-                    .collect()
-            }
-            BackendConn::Postgres(conn) => {
-                let mut qb = sqlx::QueryBuilder::<sqlx::Postgres>::new(
-                    "SELECT entity_key, rev_id, space_seq, metadata_msgpack, agent_run_id, created_at_sec, created_at_nsec
-                     FROM revisions
-                     WHERE space_id = ",
-                );
-                qb.push_bind(space_id.as_str())
-                    .push(" AND entity_type = 'note' AND entity_key IN (");
-                let mut sep = qb.separated(", ");
-                for nid in chunk {
-                    sep.push_bind(nid.as_str());
-                }
-                sep.push_unseparated(") ORDER BY entity_key ASC, space_seq ASC");
-                let fetched =
-                    qb.build().fetch_all(&mut **conn).await.map_err(|err| {
-                        crate::runtime::pg_read_error("pg_load_note_revs_batch", err)
-                    })?;
-                fetched
-                    .into_iter()
-                    .map(|r| {
-                        (
-                            r.get("entity_key"),
-                            r.get("rev_id"),
-                            r.get("space_seq"),
-                            r.get("metadata_msgpack"),
-                            r.get("agent_run_id"),
-                            r.get("created_at_sec"),
-                            r.get("created_at_nsec"),
-                        )
-                    })
-                    .collect()
-            }
-        };
-
-        for (nid_raw, rev_raw, seq_raw, meta, run_raw, sec, nsec) in rows {
-            let nid = NoteId::parse(&nid_raw)
-                .map_err(|_| internal_not_committed("corrupt_rev_nid", "invalid note_id"))?;
-            let rev = RevisionId::parse(&rev_raw)
-                .map_err(|_| internal_not_committed("corrupt_rev_id", "invalid rev_id"))?;
-            let seq = i64_to_space_seq(seq_raw)?;
-            let run = match run_raw {
-                Some(s) => Some(
-                    AgentRunId::parse(&s)
-                        .map_err(|_| internal_not_committed("corrupt_rev_run", "invalid run_id"))?,
-                ),
-                None => None,
-            };
-            let ts = notarium_core::value::Timestamp::from_unix_parts(
-                sec,
-                u32::try_from(nsec)
-                    .map_err(|_| internal_not_committed("corrupt_rev_ts", "invalid nsec"))?,
-            )
-            .map_err(|_| internal_not_committed("corrupt_rev_ts", "invalid timestamp"))?;
-            out.entry(nid).or_default().push((rev, seq, meta, run, ts));
-        }
-    }
-    Ok(out)
+    raw_ids
+        .into_iter()
+        .map(|s| {
+            NoteId::parse(&s)
+                .map_err(|_| internal_not_committed("corrupt_touched_note", "invalid NoteId"))
+        })
+        .collect()
 }
 
 struct DirectRollbackHistory {
+    first_seq: SpaceSeq,
     foreign_edit: bool,
-    prior: Option<(RevisionId, Vec<u8>, Option<notarium_core::value::Timestamp>)>,
+    prior: Option<(RevisionId, Vec<u8>, Option<Timestamp>)>,
     current_metadata: Option<Vec<u8>>,
 }
 
@@ -5872,6 +1715,7 @@ async fn load_direct_rollback_histories(
     );
     type Row = (
         String,
+        i64,
         bool,
         Option<String>,
         Option<Vec<u8>>,
@@ -5895,9 +1739,19 @@ async fn load_direct_rollback_histories(
     };
     rows.into_iter()
         .map(
-            |(id, foreign_edit, rev, metadata, pre_sec, pre_nsec, current_metadata)| {
+            |(
+                id,
+                first_seq_raw,
+                foreign_edit,
+                rev,
+                metadata,
+                pre_sec,
+                pre_nsec,
+                current_metadata,
+            )| {
                 let note = NoteId::parse(&id)
                     .map_err(|_| internal_not_committed("corrupt_rev_nid", "invalid note_id"))?;
+                let first_seq = i64_to_space_seq(first_seq_raw)?;
                 let prior = rev
                     .zip(metadata)
                     .map(|(rev, meta)| {
@@ -5906,9 +1760,7 @@ async fn load_direct_rollback_histories(
                         })?;
                         let pre_ts = pre_sec
                             .zip(pre_nsec)
-                            .map(|(s, ns)| {
-                                notarium_core::value::Timestamp::from_unix_parts(s, ns as u32)
-                            })
+                            .map(|(s, ns)| Timestamp::from_unix_parts(s, ns as u32))
                             .transpose()
                             .map_err(|_| {
                                 internal_not_committed("corrupt_rev_ts", "invalid pre timestamp")
@@ -5919,6 +1771,7 @@ async fn load_direct_rollback_histories(
                 Ok((
                     note,
                     DirectRollbackHistory {
+                        first_seq,
                         foreign_edit,
                         prior,
                         current_metadata,
@@ -6042,40 +1895,6 @@ async fn load_rollback_note_states(
         }
     }
     Ok(states)
-}
-
-async fn load_max_board_move_seq_tx(
-    tx: &mut BackendConn<'_>,
-    space_id: &SpaceId,
-) -> Result<i64, PortError> {
-    match tx {
-        BackendConn::Sqlite(conn) => {
-            let max_seq: Option<i64> = sqlx::query_scalar(
-                "SELECT command_end_seq FROM board_move_history
-                 WHERE space_id = ?
-                 ORDER BY command_end_seq DESC
-                 LIMIT 1",
-            )
-            .bind(space_id.as_str())
-            .fetch_optional(&mut **conn)
-            .await
-            .map_err(|err| internal_not_committed("sqlite_max_bmh_seq", err.to_string()))?;
-            Ok(max_seq.unwrap_or(0))
-        }
-        BackendConn::Postgres(conn) => {
-            let max_seq: Option<i64> = sqlx::query_scalar(
-                "SELECT command_end_seq FROM board_move_history
-                 WHERE space_id = $1
-                 ORDER BY command_end_seq DESC
-                 LIMIT 1",
-            )
-            .bind(space_id.as_str())
-            .fetch_optional(&mut **conn)
-            .await
-            .map_err(|err| crate::runtime::pg_read_error("pg_max_bmh_seq", err))?;
-            Ok(max_seq.unwrap_or(0))
-        }
-    }
 }
 
 async fn has_any_overlays_in_space_tx(
@@ -6450,7 +2269,7 @@ async fn bump_closed_collab_session_lineage_tx(
     new_carrier_rev: &RevisionId,
     vis_seq: i64,
 ) -> Result<(), PortError> {
-    let seq = crate::codec::i64_to_space_seq(vis_seq)?;
+    let seq = i64_to_space_seq(vis_seq)?;
     crate::domain::common::sync_closed_collab_session_on_direct_write_tx(
         tx,
         space_id,
@@ -6633,15 +2452,15 @@ async fn execute_pg_rollback_domain_writes_cte(
             RETURNING 1
         ),
         upsert_run AS (
-        INSERT INTO agent_run_heads (
-            space_id, history_incarnation, run_id, run_revision, last_seq, updated_at_sec, updated_at_nsec
-        ) VALUES ($1, $2, $7, $8, $3, $4, $5)
-        ON CONFLICT (space_id, run_id) DO UPDATE SET
-            history_incarnation = EXCLUDED.history_incarnation,
-            run_revision = EXCLUDED.run_revision,
-            last_seq = EXCLUDED.last_seq,
-            updated_at_sec = EXCLUDED.updated_at_sec,
-            updated_at_nsec = EXCLUDED.updated_at_nsec
+            INSERT INTO agent_run_heads (
+                space_id, history_incarnation, run_id, run_revision, last_seq, updated_at_sec, updated_at_nsec
+            ) VALUES ($1, $2, $7, $8, $3, $4, $5)
+            ON CONFLICT (space_id, run_id) DO UPDATE SET
+                history_incarnation = EXCLUDED.history_incarnation,
+                run_revision = EXCLUDED.run_revision,
+                last_seq = EXCLUDED.last_seq,
+                updated_at_sec = EXCLUDED.updated_at_sec,
+                updated_at_nsec = EXCLUDED.updated_at_nsec
         ) SELECT COUNT(*) FROM ins_refs",
     )
     .bind(scope.space_id.as_str())
@@ -6713,185 +2532,6 @@ async fn execute_pg_rollback_domain_writes_cte(
     Ok(())
 }
 
-fn build_rollback_pg_single_item_fast(
-    scope_cl: HistoryScope,
-    idemp: crate::writer::CommandIdentitySpec,
-    auth: notarium_core::auth::EngineAuthContext,
-    req_id: notarium_core::receipt::CommandIdentity,
-    input: RollbackAgentRun,
-    room_fences: std::sync::Arc<crate::domain::RoomFenceTable>,
-    writer_epoch: notarium_core::ids::LeaseEpoch,
-) -> crate::writer::PgSingleItemFastFn {
-    Box::new(move |store, conn, cfg, faults| {
-        Box::pin(async move {
-            execute_pg_fast_rollback_on_conn(
-                store,
-                conn,
-                cfg,
-                faults,
-                &scope_cl,
-                &idemp,
-                &auth,
-                &req_id,
-                &input,
-                &room_fences,
-                writer_epoch,
-            )
-            .await
-        })
-    })
-}
-
-enum PgFastInnerResult {
-    FallbackToStandard,
-    Failed {
-        err: PortError,
-        effective_cut: Option<SpaceSeq>,
-    },
-    Committed {
-        response_bytes: Vec<u8>,
-        initial_cut: SpaceSeq,
-        new_effective_cut: SpaceSeq,
-    },
-    UnknownCommit {
-        response_bytes: Vec<u8>,
-        diag_reason: String,
-    },
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn execute_pg_fast_rollback_on_conn(
-    store: &CanonicalStore,
-    conn: &mut sqlx::PgConnection,
-    cfg: crate::config::WriterConfig,
-    faults: &crate::writer::WriterFaultState,
-    scope_cl: &HistoryScope,
-    idemp: &crate::writer::CommandIdentitySpec,
-    auth: &notarium_core::auth::EngineAuthContext,
-    req_id: &notarium_core::receipt::CommandIdentity,
-    input: &RollbackAgentRun,
-    room_fences: &std::sync::Arc<crate::domain::RoomFenceTable>,
-    writer_epoch: notarium_core::ids::LeaseEpoch,
-) -> crate::writer::PgSingleFastAttempt {
-    use crate::writer::{BatchExecOutcome, ItemOutcomeSlot, PgSingleFastAttempt};
-
-    let inner_res = execute_pg_fast_rollback_inner(
-        conn,
-        cfg,
-        scope_cl,
-        idemp,
-        auth,
-        req_id,
-        input,
-        room_fences,
-        writer_epoch,
-    )
-    .await;
-
-    match inner_res {
-        PgFastInnerResult::FallbackToStandard => PgSingleFastAttempt::FallbackToStandard,
-        PgFastInnerResult::Failed { err, effective_cut } => {
-            let mut cuts = BTreeMap::new();
-            let mut windows = Vec::new();
-            if let Some(c) = effective_cut {
-                cuts.insert(scope_cl.space_id.clone(), c);
-                windows.push(crate::projection_fence::VisibilityWindow {
-                    scope: scope_cl.clone(),
-                    after: c,
-                    through: c,
-                    changes: crate::projection_fence::VisibilityChanges::default(),
-                });
-            }
-            let conn_clean = matches!(&err, PortError::Domain(_));
-            PgSingleFastAttempt::Handled(BatchExecOutcome::Committed {
-                slots: vec![ItemOutcomeSlot::Failed(err)],
-                space_effective_cuts: cuts,
-                conn_clean,
-                visibility_windows: windows,
-            })
-        }
-        PgFastInnerResult::Committed {
-            response_bytes,
-            initial_cut,
-            new_effective_cut,
-        } => {
-            store
-                .inner
-                .broadcast_hub
-                .publish(crate::changes::BroadcastSignal::Committed {
-                    scope: scope_cl.clone(),
-                    new_last_seq: new_effective_cut,
-                    targets: crate::changes::CommittedTargets::All,
-                });
-            if faults
-                .drop_commit_response_once
-                .swap(false, std::sync::atomic::Ordering::SeqCst)
-            {
-                return PgSingleFastAttempt::Handled(BatchExecOutcome::UnknownCommit {
-                    slots: vec![ItemOutcomeSlot::Succeeded {
-                        response_bytes,
-                        has_idempotency: true,
-                    }],
-                    diag_reason: "fault_injected_commit_response_loss".to_owned(),
-                });
-            }
-            let mut cuts = BTreeMap::new();
-            cuts.insert(scope_cl.space_id.clone(), new_effective_cut);
-            PgSingleFastAttempt::Handled(BatchExecOutcome::Committed {
-                slots: vec![ItemOutcomeSlot::Succeeded {
-                    response_bytes,
-                    has_idempotency: true,
-                }],
-                space_effective_cuts: cuts,
-                conn_clean: true,
-                visibility_windows: vec![crate::projection_fence::VisibilityWindow {
-                    scope: scope_cl.clone(),
-                    after: initial_cut,
-                    through: new_effective_cut,
-                    changes: crate::projection_fence::VisibilityChanges {
-                        notes: true,
-                        folders: true,
-                        erasures: false,
-                    },
-                }],
-            })
-        }
-        PgFastInnerResult::UnknownCommit {
-            response_bytes,
-            diag_reason,
-        } => PgSingleFastAttempt::Handled(BatchExecOutcome::UnknownCommit {
-            slots: vec![ItemOutcomeSlot::Succeeded {
-                response_bytes,
-                has_idempotency: true,
-            }],
-            diag_reason,
-        }),
-    }
-}
-
-struct PendingRollbackFencesGuard {
-    slots: Vec<
-        Option<(
-            tokio::sync::OwnedMutexGuard<notarium_core::ports::RoomFenceState>,
-            ClosedRoomReservation,
-        )>,
-    >,
-    req_id: notarium_core::receipt::CommandIdentity,
-    armed_for_drop_consume: bool,
-}
-
-impl Drop for PendingRollbackFencesGuard {
-    fn drop(&mut self) {
-        if self.armed_for_drop_consume {
-            for slot_opt in &mut self.slots {
-                if let Some((mut guard, res)) = slot_opt.take() {
-                    let _ = guard.consume(res, &self.req_id);
-                }
-            }
-        }
-    }
-}
-
 fn rollback_time_left(
     budget: &notarium_core::ports::CallBudget,
     deadline: Instant,
@@ -6907,2355 +2547,4 @@ async fn rollback_wait<T>(
     super::common::CommandDeadline::at(deadline, "rollback")
         .wait(budget, || operation)
         .await
-}
-
-// Reuse one session's prepared history and commit plans across clean rollbacks.
-fn park_pg_rollback_connection(
-    store: &CanonicalStore,
-    connection: crate::dialect::postgres::StorePgConnection,
-) {
-    if let crate::runtime::SqlDriverState::Postgres { pool, .. } = &store.inner.sql {
-        pool.park_writer(connection);
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn try_execute_pg_root_rollback(
-    store: &CanonicalStore,
-    ctx: &SpaceContext,
-    idemp: &crate::writer::CommandIdentitySpec,
-    request: &Mutation<RollbackAgentRun>,
-    writer_epoch: notarium_core::ids::LeaseEpoch,
-    try_pg_batch_plan: &mut bool,
-    deadline: Instant,
-) -> Option<Result<Committed<RollbackResult>, PortError>> {
-    use crate::{
-        codec::{
-            cancelled_not_committed, deadline_not_committed, ordered_ids_batch,
-            unknown_commit_outcome,
-        },
-        runtime::SqlDriverState,
-    };
-    use notarium_core::auth::{Space, SpaceKind, SpaceLifecycle};
-    use std::sync::atomic::Ordering;
-
-    if ctx.budget.cancellation.is_cancelled() {
-        return Some(Err(cancelled_not_committed(
-            "writer_cancelled_pre_enqueue",
-            "write cancelled prior to mailbox admission",
-        )));
-    }
-    if ctx.budget.remaining.is_zero() {
-        return Some(Err(deadline_not_committed(
-            "writer_deadline_zero_pre_enqueue",
-            "write call budget expired prior to mailbox admission",
-        )));
-    }
-    if !request.input.associated_board_expectations.is_empty() {
-        return None;
-    }
-
-    let writer = match store.inner.writer() {
-        Ok(w) => w,
-        Err(err) => return Some(Err(err)),
-    };
-    match writer.faults().pre_commit_space_delays.try_lock() {
-        Ok(delays) if delays.is_empty() => {}
-        _ => return None,
-    }
-
-    let SqlDriverState::Postgres {
-        pool,
-        statement_timeout,
-        ..
-    } = &store.inner.sql
-    else {
-        return None;
-    };
-
-    let expected = &request.input.expected_entities;
-    let n = expected.len();
-    if n == 0 {
-        return None;
-    }
-
-    let mut indices: Vec<usize> = (0..n).collect();
-    indices.sort_unstable_by(|&a, &b| expected[a].note.cmp(&expected[b].note));
-    for pair in indices.windows(2) {
-        if expected[pair[0]].note == expected[pair[1]].note {
-            return None;
-        }
-    }
-
-    let scope = ctx.scope();
-    let sorted_note_refs: Vec<&NoteId> = indices.iter().map(|&idx| &expected[idx].note).collect();
-    let sorted_note_strs: Vec<&str> = sorted_note_refs.iter().map(|nid| nid.as_str()).collect();
-    let sorted_exp_rev_strs: Vec<&str> = indices
-        .iter()
-        .map(|&idx| expected[idx].revision.as_str())
-        .collect();
-
-    let _commit_gate = match writer.try_acquire_commit_read_guard() {
-        Some(g) => g,
-        None => {
-            let _waiting = pool.yield_writer();
-            match rollback_wait(&ctx.budget, deadline, writer.acquire_commit_read_guard()).await {
-                Ok(guard) => guard,
-                Err(err) => return Some(Err(err)),
-            }
-        }
-    };
-    let visibility = match rollback_wait(&ctx.budget, deadline, async {
-        let mut admission = std::pin::pin!(
-            store
-                .inner
-                .live_visibility
-                .for_write(vec![scope.space_id.clone()])
-        );
-        if let std::task::Poll::Ready(visibility) = futures_util::poll!(admission.as_mut()) {
-            return visibility;
-        }
-        let _waiting = pool.yield_writer();
-        admission.await
-    })
-    .await
-    {
-        Ok(visibility) => visibility,
-        Err(err) => return Some(Err(err)),
-    };
-    if let Err(error) = store
-        .inner
-        .check_writer_epoch(&scope.space_id, writer_epoch)
-    {
-        return Some(Err(error));
-    }
-    if visibility.has_live_state() {
-        // The shared actor updates visibility for the standard and optimized
-        // batch paths. Keep this direct fast path for unprojected Spaces.
-        return None;
-    }
-
-    if !writer.is_accepting() || store.inner.shutting_down.load(Ordering::SeqCst) {
-        return Some(Err(unavailable_retryable(
-            "writer_shutting_down",
-            "canonical WriteBatchActor is draining for shutdown",
-            std::time::Duration::from_millis(100),
-        )));
-    }
-    if ctx.budget.cancellation.is_cancelled() {
-        return Some(Err(cancelled_not_committed(
-            "writer_cancelled_before_commit_handoff",
-            "write cancelled prior to commit handoff",
-        )));
-    }
-
-    let cached_conn = pool.take_idle_writer();
-    let read_deadline = deadline.min(crate::runtime::deadline_after(
-        Instant::now(),
-        *statement_timeout,
-    ));
-    let mut pooled = match cached_conn {
-        Some(c) => c,
-        None => match rollback_wait(&ctx.budget, read_deadline, pool.acquire()).await {
-            Ok(Ok(c)) => c,
-            Err(err) => return Some(Err(err)),
-            Ok(Err(err)) => {
-                return Some(Err(unavailable_retryable(
-                    "pg_pool_acquire_failed",
-                    err.to_string(),
-                    std::time::Duration::from_millis(25),
-                )));
-            }
-        },
-    };
-
-    // Read each run entity and the publication of the content it could restore together.
-    // The commit rechecks the grant, heads and live publication before applying any writes.
-    struct RollbackHead {
-        slug: String,
-        folded_slug: String,
-        head_rev: String,
-        lifecycle: Lifecycle,
-        digest: Option<ContentDigest>,
-    }
-    struct RestoredMetadata {
-        pre_meta: NoteRevisionMetadata,
-        normalized_title_fold: String,
-        canonical_root_meta_msgpack: Vec<u8>,
-    }
-    struct RunHistory {
-        first_run_seq: i64,
-        max_other_seq: Option<i64>,
-        pre_rev_id: Option<String>,
-        metadata: Option<RestoredMetadata>,
-    }
-    let mut read_lease = crate::sql_exec::PgTransactionLease::new(&mut pooled);
-    let query = sqlx::query(crate::schema::PG_LEAN_ROLLBACK_READ_SQL)
-        .bind(scope.space_id.as_str())
-        .bind(request.input.run.as_str())
-        .bind(&sorted_note_strs)
-        .bind(scope.incarnation.as_bytes().as_slice())
-        .bind(writer_epoch.get() as i64)
-        .bind(request.input.expected_run_revision.as_str())
-        .fetch_all(read_lease.conn());
-    let rows = match rollback_wait(&ctx.budget, read_deadline, query).await {
-        Ok(Ok(rows)) => rows,
-        Ok(Err(err)) => {
-            return Some(Err(internal_not_committed(
-                "pg_rollback_read",
-                err.to_string(),
-            )));
-        }
-        Err(err) => return Some(Err(err)),
-    };
-    read_lease.complete();
-    // The batch optimization also requires an empty room table. A known unsupported
-    // room should enter the ordinary planner directly, without a second history read.
-    if rows.iter().any(|row| !row.get::<bool, _>("room_writable")) {
-        *try_pg_batch_plan = false;
-        park_pg_rollback_connection(store, pooled);
-        return None;
-    }
-    let hydrated = (|| {
-        if rows.len() != n {
-            return None;
-        }
-        let first = rows.first()?;
-        let folder = FolderId::parse(first.get("root_folder_id")).ok()?;
-        let kind = match first.get::<&str, _>("space_kind") {
-            "personal" => SpaceKind::Personal,
-            "shared" => SpaceKind::Shared,
-            _ => return None,
-        };
-        let mut heads = Vec::with_capacity(n);
-        let mut history = Vec::with_capacity(n);
-        let mut pubs = std::collections::BTreeMap::new();
-        for (idx, row) in rows.iter().enumerate() {
-            if row.get::<&str, _>("note_id") != sorted_note_strs[idx]
-                || row.get::<&str, _>("head_rev_id") != sorted_exp_rev_strs[idx]
-            {
-                return None;
-            }
-            let dig = |col: &str| -> Option<Option<ContentDigest>> {
-                row.get::<Option<&[u8]>, _>(col)
-                    .map(|bytes| <[u8; 32]>::try_from(bytes).map(ContentDigest::from_bytes))
-                    .transpose()
-                    .ok()
-            };
-            let head = RollbackHead {
-                slug: row.get("slug"),
-                folded_slug: row.get("slug_fold"),
-                head_rev: row.get("head_rev_id"),
-                lifecycle: lifecycle_from_db(row.get("lifecycle_state")).ok()?,
-                digest: dig("content_blake3")?,
-            };
-            if let Some(pub_id) = row.get::<Option<&str>, _>("current_publication_id") {
-                pubs.insert(*dig("publication_digest")??.as_bytes(), pub_id.to_owned());
-            }
-            let metadata = match row.get::<Option<&[u8]>, _>("prior_metadata") {
-                Some(bytes) => {
-                    let pm = decode_rollback_note(bytes, sorted_note_refs[idx]).ok()?;
-                    if pm.doc_class != DocClass::UserDoc
-                        || pm.ability_id.is_some()
-                        || pm.visibility_mask < 0
-                        || pm.parent_folder_id != folder
-                        || pm.logical_updated_at.is_some()
-                    {
-                        return None;
-                    }
-                    let prior_ts = match row
-                        .get::<Option<i64>, _>("prior_created_sec")
-                        .zip(row.get::<Option<i32>, _>("prior_created_nsec"))
-                    {
-                        Some((s, ns)) => Some(crate::codec::decode_timestamp_parts(s, ns).ok()?),
-                        None => None,
-                    };
-                    let normalized_title_fold = normalize_title_key(&pm.title);
-                    let encoded = encode_rollback_note(
-                        &pm,
-                        Some(bytes.into()),
-                        true,
-                        RollbackRevision::Restore {
-                            schema: None,
-                            logical_updated_at: prior_ts,
-                        },
-                    )
-                    .ok()?;
-                    Some(RestoredMetadata {
-                        pre_meta: pm,
-                        normalized_title_fold,
-                        canonical_root_meta_msgpack: encoded,
-                    })
-                }
-                None => None,
-            };
-            heads.push(head);
-            history.push(RunHistory {
-                first_run_seq: row.get("first_seq"),
-                max_other_seq: row.get("space_seq"),
-                pre_rev_id: row.get("rev_id"),
-                metadata,
-            });
-        }
-        Some((folder, kind, heads, history, pubs))
-    })();
-    let Some((root_folder_id, space_kind, heads, mut revs, active_pubs)) = hydrated else {
-        park_pg_rollback_connection(store, pooled);
-        return None;
-    };
-
-    if heads
-        .iter()
-        .any(|head| head.folded_slug == super::folder_cover::SLUG)
-        || revs.iter().any(|history| {
-            history
-                .metadata
-                .as_ref()
-                .is_some_and(|metadata| metadata.pre_meta.slug_fold == super::folder_cover::SLUG)
-        })
-    {
-        *try_pg_batch_plan = false;
-        park_pg_rollback_connection(store, pooled);
-        return None;
-    }
-
-    let root_facts = notarium_core::auth::ResourceFacts {
-        space: Space {
-            id: scope.space_id.clone(),
-            lifecycle: SpaceLifecycle::Active,
-            kind: space_kind,
-        },
-        class: DocClass::UserDoc,
-        project: None,
-        ancestor_folders: vec![root_folder_id.clone()],
-        folder_write_locked: false,
-        ability_package: None,
-    };
-    if ctx.auth().can_view_resource(&root_facts).is_err()
-        || ctx
-            .auth()
-            .authorize_direct_write(&root_facts, &root_facts)
-            .is_err()
-    {
-        *try_pg_batch_plan = false;
-        park_pg_rollback_connection(store, pooled);
-        return None;
-    }
-
-    let root_folder_str = root_folder_id.as_str();
-
-    // Step 2: Acquire room fences only for non-manual-skip notes (matching `execute_pg_fast_rollback_inner`),
-    // classify actions in memory, and encode metadata + receipt MsgPack payloads in compiled Rust.
-    if let Err(err) = rollback_time_left(&ctx.budget, deadline) {
-        return Some(Err(err));
-    }
-    let fence_slots = match store.inner.room_fences.try_lock_batch_for_rollback_sync(
-        scope,
-        &sorted_note_refs,
-        &request.identity,
-    ) {
-        Ok(Some(slots)) => slots,
-        Ok(None) => {
-            let mut slots = Vec::with_capacity(n);
-            for &nid in &sorted_note_refs {
-                if let Err(err) = rollback_time_left(&ctx.budget, deadline) {
-                    return Some(Err(err));
-                }
-                match store
-                    .inner
-                    .room_fences
-                    .try_lock_closed_for_rollback(scope, nid, &request.identity)
-                    .await
-                {
-                    Ok(opt) => slots.push(opt),
-                    Err(err) => {
-                        park_pg_rollback_connection(store, pooled);
-                        return Some(Err(err));
-                    }
-                }
-            }
-            slots
-        }
-        Err(err) => {
-            park_pg_rollback_connection(store, pooled);
-            return Some(Err(err));
-        }
-    };
-
-    let mut fences_guard = PendingRollbackFencesGuard {
-        slots: fence_slots,
-        req_id: request.identity.clone(),
-        armed_for_drop_consume: false,
-    };
-
-    struct DecodedRestore {
-        pre_rev_id: String,
-        metadata: RestoredMetadata,
-        is_full: bool,
-    }
-
-    let mut acts: Vec<i16> = vec![0; n];
-    let mut decoded_restores: Vec<Option<DecodedRestore>> = (0..n).map(|_| None).collect();
-    let mut planned_active_slots: std::collections::BTreeSet<&str> =
-        std::collections::BTreeSet::new();
-    let mut trash_mut_cnt: usize = 0;
-    let mut restore_mut_cnt: usize = 0;
-    {
-        for i in 0..n {
-            let head = &heads[i];
-            let r_acc = &mut revs[i];
-            let first_run_seq = r_acc.first_run_seq;
-            if r_acc.max_other_seq.is_some_and(|mo| mo >= first_run_seq) {
-                // Release unused fence immediately for manual-edit skipped notes.
-                let _ = fences_guard.slots[i].take();
-                acts[i] = 0;
-                continue;
-            }
-            if fences_guard.slots[i].is_none() {
-                acts[i] = 1;
-                continue;
-            }
-            if r_acc.max_other_seq.is_none() {
-                if head.lifecycle == Lifecycle::Trashed {
-                    acts[i] = 2;
-                } else {
-                    acts[i] = 3;
-                    trash_mut_cnt += 1;
-                }
-            } else {
-                let Some(pre_rev_id) = r_acc.pre_rev_id.take() else {
-                    park_pg_rollback_connection(store, pooled);
-                    return None;
-                };
-                let Some(cached) = r_acc.metadata.take() else {
-                    park_pg_rollback_connection(store, pooled);
-                    return None;
-                };
-                let pre_meta = &cached.pre_meta;
-                let unchanged_placement = head.lifecycle == pre_meta.lifecycle
-                    && head.slug == pre_meta.slug
-                    && head.folded_slug == pre_meta.slug_fold;
-                let needs_mut = head.head_rev != pre_rev_id || !unchanged_placement;
-                if !needs_mut {
-                    acts[i] = 4;
-                } else {
-                    acts[i] = 5;
-                    restore_mut_cnt += 1;
-                }
-                decoded_restores[i] = Some(DecodedRestore {
-                    pre_rev_id,
-                    metadata: cached,
-                    is_full: !unchanged_placement,
-                });
-            }
-        }
-    }
-
-    // Intra-batch active sibling slug collision & swap guard (all notes live in `root_folder_id`).
-    let mut current_full_active_slugs: std::collections::BTreeSet<&str> =
-        std::collections::BTreeSet::new();
-    for i in 0..n {
-        if let Some(ref dr) = decoded_restores[i] {
-            let pm = &dr.metadata.pre_meta;
-            if pm.lifecycle == Lifecycle::Active
-                && !planned_active_slots.insert(pm.slug_fold.as_str())
-            {
-                park_pg_rollback_connection(store, pooled);
-                return None;
-            }
-            if acts[i] == 5 && dr.is_full {
-                let h = &heads[i];
-                if h.lifecycle == Lifecycle::Active {
-                    current_full_active_slugs.insert(h.folded_slug.as_str());
-                }
-            }
-        }
-    }
-    for i in 0..n {
-        if acts[i] == 5
-            && let Some(ref dr) = decoded_restores[i]
-            && dr.is_full
-            && dr.metadata.pre_meta.lifecycle == Lifecycle::Active
-            && current_full_active_slugs.contains(dr.metadata.pre_meta.slug_fold.as_str())
-        {
-            // Guard against intra-statement active slug swaps between two `is_full` restores.
-            park_pg_rollback_connection(store, pooled);
-            return None;
-        }
-    }
-
-    let Ok(total_seqs) = i64::try_from((trash_mut_cnt + restore_mut_cnt).max(1)) else {
-        park_pg_rollback_connection(store, pooled);
-        return None;
-    };
-
-    let (Ok(committed_at_ms), Ok(now_ts), Ok(raw_ids)) = (
-        now_unix_ms(),
-        now_utc_timestamp(),
-        ordered_ids_batch(trash_mut_cnt + restore_mut_cnt + 3),
-    ) else {
-        park_pg_rollback_connection(store, pooled);
-        return None;
-    };
-    let cfg = writer.config();
-    let receipt_ttl_ms = i64::try_from(cfg.receipt_ttl.as_millis()).unwrap_or(86_400_000);
-    let expires_at_ms = committed_at_ms.saturating_add(receipt_ttl_ms);
-    let (sec, nsec) = encode_timestamp_parts(now_ts);
-
-    let mut raw_it = raw_ids.into_iter();
-    let mut next_rev = || RevisionId::from_bytes(raw_it.next().expect("pre-sized"));
-
-    let mut rel_seq: i64 = 0;
-    let mut_cap = trash_mut_cnt + restore_mut_cnt;
-    let mut m_nids: Vec<&str> = Vec::with_capacity(mut_cap);
-    let mut m_prev_revs: Vec<&str> = Vec::with_capacity(mut_cap);
-    let mut m_rest_revs: Vec<Option<&str>> = Vec::with_capacity(mut_cap);
-    let mut m_digs_owned: Vec<Option<ContentDigest>> = Vec::with_capacity(mut_cap);
-    let mut m_lc: Vec<&'static str> = Vec::with_capacity(mut_cap);
-    let mut m_rel_seqs: Vec<i64> = Vec::with_capacity(mut_cap);
-    let mut m_ops: Vec<&'static str> = Vec::with_capacity(mut_cap);
-    let mut m_rev_ids: Vec<RevisionId> = Vec::with_capacity(mut_cap);
-
-    let mut tr_nids: Vec<&str> = Vec::with_capacity(trash_mut_cnt);
-    let mut tr_rev_idxs: Vec<usize> = Vec::with_capacity(trash_mut_cnt);
-
-    let mut hot_nids: Vec<&str> = Vec::with_capacity(restore_mut_cnt);
-    let mut hot_t: Vec<&str> = Vec::with_capacity(restore_mut_cnt);
-    let mut hot_tf: Vec<&str> = Vec::with_capacity(restore_mut_cnt);
-    let mut hot_rev_idxs: Vec<usize> = Vec::with_capacity(restore_mut_cnt);
-    let mut hot_digs_owned: Vec<Option<ContentDigest>> = Vec::with_capacity(restore_mut_cnt);
-    let mut hot_bs: Vec<i64> = Vec::with_capacity(restore_mut_cnt);
-    let mut hot_vm: Vec<i32> = Vec::with_capacity(restore_mut_cnt);
-
-    let mut fl_nids: Vec<&str> = Vec::new();
-    let mut fl_pf: Vec<&str> = Vec::new();
-    let mut fl_s: Vec<&str> = Vec::new();
-    let mut fl_sf: Vec<&str> = Vec::new();
-    let mut fl_t: Vec<&str> = Vec::new();
-    let mut fl_tf: Vec<&str> = Vec::new();
-    let mut fl_rev_idxs: Vec<usize> = Vec::new();
-    let mut fl_digs_owned: Vec<Option<ContentDigest>> = Vec::new();
-    let mut fl_bs: Vec<i64> = Vec::new();
-    let mut fl_lc: Vec<&'static str> = Vec::new();
-    let mut fl_vm: Vec<i32> = Vec::new();
-
-    let mut trash_metas_owned: Vec<Vec<u8>> = Vec::with_capacity(trash_mut_cnt);
-    let mut m_metas: Vec<&[u8]> = Vec::with_capacity(mut_cap);
-
-    struct PendingBr<'a> {
-        nid: &'a str,
-        rev_idx: usize,
-        dig: [u8; 32],
-        pub_id: &'a str,
-        rel_seq: i64,
-    }
-    let mut pending_brs: Vec<PendingBr<'_>> = Vec::with_capacity(mut_cap);
-
-    let mut trashed_out: Vec<NoteRevision> = Vec::with_capacity(trash_mut_cnt + 2);
-    let mut restored_out: Vec<NoteRevision> = Vec::with_capacity(restore_mut_cnt);
-    let mut skipped_manual_edits: Vec<NoteId> = Vec::new();
-    let mut skipped_room_active: Vec<NoteId> = Vec::new();
-    let mut owner_vec: Vec<NoteId> = Vec::with_capacity(n);
-    let mut elig_nids: Vec<&str> = Vec::with_capacity(n);
-    let mut delta_by_digest: BTreeMap<[u8; 32], (i64, &str)> = BTreeMap::new();
-
-    // Pass 1: Trash created notes first (`act_code in {2, 3}` in ascending `NoteId` order),
-    // plus collect `skipped_manual_edits`, `skipped_room_active`, and `owner_vec` / `elig_nids`.
-    for i in 0..n {
-        let nid_ref = sorted_note_refs[i];
-        match acts[i] {
-            0 => skipped_manual_edits.push(nid_ref.clone()),
-            1 => skipped_room_active.push(nid_ref.clone()),
-            2 => {
-                owner_vec.push(nid_ref.clone());
-                elig_nids.push(nid_ref.as_str());
-                trashed_out.push(NoteRevision {
-                    note: nid_ref.clone(),
-                    revision: expected[indices[i]].revision.clone(),
-                });
-            }
-            3 => {
-                owner_vec.push(nid_ref.clone());
-                elig_nids.push(nid_ref.as_str());
-                let head = &heads[i];
-                rel_seq += 1;
-                let trel = rel_seq;
-                let trev = next_rev();
-                let rev_idx = m_rev_ids.len();
-                if let Some(d) = head.digest {
-                    let Some(pub_arc) = active_pubs.get(d.as_bytes()) else {
-                        park_pg_rollback_connection(store, pooled);
-                        return None;
-                    };
-                    let pub_s = pub_arc.as_str();
-                    delta_by_digest.entry(*d.as_bytes()).or_insert((0, pub_s)).0 += 1;
-                    pending_brs.push(PendingBr {
-                        nid: nid_ref.as_str(),
-                        rev_idx,
-                        dig: *d.as_bytes(),
-                        pub_id: pub_s,
-                        rel_seq: trel,
-                    });
-                }
-                let metadata = rows[i]
-                    .get::<Option<&[u8]>, _>("created_metadata")
-                    .and_then(|bytes| decode_rollback_note(bytes, nid_ref).ok());
-                let Some(meta) = metadata.and_then(|source| {
-                    encode_rollback_note(&source, None, true, RollbackRevision::Trash).ok()
-                }) else {
-                    park_pg_rollback_connection(store, pooled);
-                    return None;
-                };
-                m_nids.push(nid_ref.as_str());
-                m_prev_revs.push(head.head_rev.as_str());
-                m_rest_revs.push(None);
-                m_digs_owned.push(head.digest);
-                m_lc.push("trashed");
-                m_rel_seqs.push(trel);
-                trash_metas_owned.push(meta);
-                m_ops.push("trash");
-                tr_nids.push(nid_ref.as_str());
-                tr_rev_idxs.push(rev_idx);
-                trashed_out.push(NoteRevision {
-                    note: nid_ref.clone(),
-                    revision: trev.clone(),
-                });
-                m_rev_ids.push(trev);
-            }
-            4 | 5 => {
-                owner_vec.push(nid_ref.clone());
-                elig_nids.push(nid_ref.as_str());
-            }
-            _ => {}
-        }
-    }
-    for tm in &trash_metas_owned {
-        m_metas.push(tm.as_slice());
-    }
-
-    // Pass 2: Restore pre-existing notes (`act_code == 5` in ascending `NoteId` order),
-    // borrowing pre-encoded `canonical_root_meta_msgpack` and `normalized_title_fold` with zero allocations.
-    for i in 0..n {
-        if acts[i] != 5 {
-            continue;
-        }
-        let nid_ref = sorted_note_refs[i];
-        let head = &heads[i];
-        let dr = decoded_restores[i]
-            .as_ref()
-            .expect("verified decoded_restore");
-        let pm = &dr.metadata.pre_meta;
-        rel_seq += 1;
-        let rrel = rel_seq;
-        let rrev = next_rev();
-        let rev_idx = m_rev_ids.len();
-        if let Some(d) = pm.content_digest {
-            let Some(pub_arc) = active_pubs.get(d.as_bytes()) else {
-                park_pg_rollback_connection(store, pooled);
-                return None;
-            };
-            let pub_s = pub_arc.as_str();
-            delta_by_digest.entry(*d.as_bytes()).or_insert((0, pub_s)).0 += 1;
-            pending_brs.push(PendingBr {
-                nid: nid_ref.as_str(),
-                rev_idx,
-                dig: *d.as_bytes(),
-                pub_id: pub_s,
-                rel_seq: rrel,
-            });
-        }
-        let lc_str = lifecycle_to_db(pm.lifecycle);
-        m_nids.push(nid_ref.as_str());
-        m_prev_revs.push(head.head_rev.as_str());
-        m_rest_revs.push(Some(dr.pre_rev_id.as_str()));
-        m_digs_owned.push(pm.content_digest);
-        m_lc.push(lc_str);
-        m_rel_seqs.push(rrel);
-        m_metas.push(dr.metadata.canonical_root_meta_msgpack.as_slice());
-        m_ops.push("restore");
-        if dr.is_full {
-            fl_nids.push(nid_ref.as_str());
-            fl_pf.push(pm.parent_folder_id.as_str());
-            fl_s.push(pm.slug.as_str());
-            fl_sf.push(pm.slug_fold.as_str());
-            fl_t.push(pm.title.as_str());
-            fl_tf.push(dr.metadata.normalized_title_fold.as_str());
-            fl_rev_idxs.push(rev_idx);
-            fl_digs_owned.push(pm.content_digest);
-            fl_bs.push(pm.byte_size as i64);
-            fl_lc.push(lc_str);
-            fl_vm.push(pm.visibility_mask);
-        } else {
-            hot_nids.push(nid_ref.as_str());
-            hot_t.push(pm.title.as_str());
-            hot_tf.push(dr.metadata.normalized_title_fold.as_str());
-            hot_rev_idxs.push(rev_idx);
-            hot_digs_owned.push(pm.content_digest);
-            hot_bs.push(pm.byte_size as i64);
-            hot_vm.push(pm.visibility_mask);
-        }
-        restored_out.push(NoteRevision {
-            note: nid_ref.clone(),
-            revision: rrev.clone(),
-        });
-        m_rev_ids.push(rrev);
-    }
-
-    let m_revs: Vec<&str> = m_rev_ids.iter().map(RevisionId::as_str).collect();
-    let m_digs: Vec<Option<&[u8]>> = m_digs_owned
-        .iter()
-        .map(|d| d.as_ref().map(|x| x.as_bytes().as_slice()))
-        .collect();
-
-    // Sort `blob_references` in ascending `(owner_rev_id, owner_id)` PK order.
-    pending_brs.sort_unstable_by(|a, b| {
-        m_revs[a.rev_idx]
-            .cmp(m_revs[b.rev_idx])
-            .then_with(|| a.nid.cmp(b.nid))
-    });
-    let mut br_nids: Vec<&str> = Vec::with_capacity(pending_brs.len());
-    let mut br_revs: Vec<&str> = Vec::with_capacity(pending_brs.len());
-    let mut br_digs: Vec<&[u8]> = Vec::with_capacity(pending_brs.len());
-    let mut br_pubs: Vec<&str> = Vec::with_capacity(pending_brs.len());
-    let mut br_rel_seqs: Vec<i64> = Vec::with_capacity(pending_brs.len());
-    for br in &pending_brs {
-        br_nids.push(br.nid);
-        br_revs.push(m_revs[br.rev_idx]);
-        br_digs.push(br.dig.as_slice());
-        br_pubs.push(br.pub_id);
-        br_rel_seqs.push(br.rel_seq);
-    }
-
-    let tr_revs: Vec<&str> = tr_rev_idxs.iter().map(|&idx| m_revs[idx]).collect();
-    let hot_revs: Vec<&str> = hot_rev_idxs.iter().map(|&idx| m_revs[idx]).collect();
-    let hot_digs: Vec<Option<&[u8]>> = hot_digs_owned
-        .iter()
-        .map(|d| d.as_ref().map(|x| x.as_bytes().as_slice()))
-        .collect();
-    let fl_revs: Vec<&str> = fl_rev_idxs.iter().map(|&idx| m_revs[idx]).collect();
-    let fl_digs: Vec<Option<&[u8]>> = fl_digs_owned
-        .iter()
-        .map(|d| d.as_ref().map(|x| x.as_bytes().as_slice()))
-        .collect();
-
-    let new_run_rev = next_rev();
-    let pay_id = format!(
-        "pay_{:032x}",
-        u128::from_be_bytes(raw_it.next().expect("pre-sized"))
-    );
-    let cmd_id = format!(
-        "cmd_{:032x}",
-        u128::from_be_bytes(raw_it.next().expect("pre-sized"))
-    );
-    let owner_key = format!("{}:{}", idemp.actor.as_str(), idemp.command_key.as_str());
-    let resp_pid = format!("rcpt_pay:{owner_key}");
-
-    // Pre-encode MsgPack payloads with distinct 64-bit big-endian sentinels (`> u32::MAX`) so PostgreSQL
-    // patches live `v_first_seq` / `v_vis_seq` via `overlay(... placing int8send(...) from off for 8)`
-    // in a single UDS round-trip without a preliminary read of `spaces.last_seq`.
-    const SEQ_SENTINEL_FIRST_U64: u64 = 0x5f4e_4f54_4653_5131;
-    const SEQ_SENTINEL_VIS_U64: u64 = 0x5f4e_4f54_5653_5132;
-    fn find_unique_u64_be_payload_offset_1based(buf: &[u8], val: u64) -> Option<i32> {
-        let mut pattern = [0u8; 9];
-        pattern[0] = 0xcf;
-        pattern[1..9].copy_from_slice(&val.to_be_bytes());
-        let first_pos = buf.windows(9).position(|w| w == pattern)?;
-        if buf[first_pos + 1..].windows(9).any(|w| w == pattern) {
-            return None;
-        }
-        i32::try_from(first_pos.checked_add(2)?).ok()
-    }
-
-    let sentinel_first = SpaceSeq::new(SEQ_SENTINEL_FIRST_U64).expect("valid first sentinel");
-    let sentinel_vis = SpaceSeq::new(SEQ_SENTINEL_VIS_U64).expect("valid vis sentinel");
-
-    let (Ok(run_meta), Ok(cmd_range), Ok(sentinel_receipt)) = (
-        RevisionMetadataEnvelope::v1(RevisionMetadataPayload::AgentRun(
-            crate::codec::AgentRunRevisionMetadata {
-                run_id: request.input.run.clone(),
-                last_seq: sentinel_vis,
-            },
-        ))
-        .encode(),
-        notarium_core::ports::CommandSeqRange::new(sentinel_first, sentinel_vis),
-        MutationReceiptToken::new(scope.clone(), sentinel_vis),
-    ) else {
-        park_pg_rollback_connection(store, pooled);
-        return None;
-    };
-    let Ok(effect_draft) = build_effect_payload_draft(
-        pay_id,
-        scope.clone(),
-        cmd_range,
-        "rollback_agent_run",
-        EffectBodyV1::AwaitProjection {
-            reason: StoredAwaitReasonV1::Bulk,
-        },
-        owner_vec,
-    ) else {
-        park_pg_rollback_connection(store, pooled);
-        return None;
-    };
-
-    let eff_pid_str = effect_draft.payload_id.as_str();
-    let owner_key_str = owner_key.as_str();
-
-    if !skipped_manual_edits.is_empty() || !skipped_room_active.is_empty() {
-        // The native SQL functions share their eligible set with the receipt owner set.
-        // The standard writer stores skipped receipt owners separately from changed notes.
-        *try_pg_batch_plan = false;
-        park_pg_rollback_connection(store, pooled);
-        return None;
-    }
-    let result_value = RollbackResult {
-        restored: restored_out,
-        trashed: trashed_out,
-        restored_ranks: Vec::new(),
-        skipped_manual_edits,
-        skipped_room_active,
-    };
-    let wire = StoredCommittedRollbackV1 {
-        restored: result_value.restored.clone(),
-        trashed: result_value.trashed.clone(),
-        restored_ranks: Vec::new(),
-        skipped_manual_edits: result_value.skipped_manual_edits.clone(),
-        skipped_room_active: result_value.skipped_room_active.clone(),
-        receipt: sentinel_receipt.clone(),
-    };
-    let (Ok(resp_bytes), Ok(sanitized)) = (
-        encode_msgpack(&wire),
-        encode_msgpack(&StoredCommittedRollbackV1::sanitized(sentinel_receipt)),
-    ) else {
-        park_pg_rollback_connection(store, pooled);
-        return None;
-    };
-
-    let (
-        Some(off_run_vis),
-        Some(off_eff_first),
-        Some(off_eff_vis),
-        Some(off_resp_vis),
-        Some(off_san_vis),
-    ) = (
-        find_unique_u64_be_payload_offset_1based(&run_meta, SEQ_SENTINEL_VIS_U64),
-        find_unique_u64_be_payload_offset_1based(
-            &effect_draft.effect_msgpack,
-            SEQ_SENTINEL_FIRST_U64,
-        ),
-        find_unique_u64_be_payload_offset_1based(
-            &effect_draft.effect_msgpack,
-            SEQ_SENTINEL_VIS_U64,
-        ),
-        find_unique_u64_be_payload_offset_1based(&resp_bytes, SEQ_SENTINEL_VIS_U64),
-        find_unique_u64_be_payload_offset_1based(&sanitized, SEQ_SENTINEL_VIS_U64),
-    )
-    else {
-        park_pg_rollback_connection(store, pooled);
-        return None;
-    };
-    if (off_eff_first - off_eff_vis).abs() < 9 {
-        park_pg_rollback_connection(store, pooled);
-        return None;
-    }
-
-    let noop_folder_id: Option<&str> = if m_nids.is_empty() {
-        Some(root_folder_id.as_str())
-    } else {
-        None
-    };
-    let cat_digs_owned: Vec<[u8; 32]> = delta_by_digest.keys().copied().collect();
-    let cat_deltas: Vec<i64> = delta_by_digest.values().map(|(d, _)| *d).collect();
-    let cat_pubs: Vec<&str> = delta_by_digest.values().map(|(_, p)| *p).collect();
-    let cat_digs: Vec<&[u8]> = cat_digs_owned.iter().map(|a| a.as_slice()).collect();
-
-    let all_exp_lcs: Vec<&'static str> =
-        heads.iter().map(|h| lifecycle_to_db(h.lifecycle)).collect();
-
-    // Step 3: Commit in 1 lean PL/pgSQL transaction (all INSERTs in PK order before pre-sliced UPDATEs).
-    let phase2_start = writer
-        .is_batch_telemetry_enabled()
-        .then(std::time::Instant::now);
-
-    if let Err(err) = ctx
-        .auth()
-        .can_view_resource(&root_facts)
-        .and_then(|()| ctx.auth().authorize_direct_write(&root_facts, &root_facts))
-    {
-        park_pg_rollback_connection(store, pooled);
-        return Some(Err(err.into()));
-    }
-    let (room_leases, room_lineages): (Vec<Option<i64>>, Vec<Option<i64>>) = rows
-        .iter()
-        .map(|row| {
-            (
-                row.get::<Option<i64>, _>("room_lease"),
-                row.get::<Option<i64>, _>("room_lineage"),
-            )
-        })
-        .unzip();
-    let apply = sqlx::query(crate::schema::PG_LEAN_ROLLBACK_COMMIT_CALL_SQL)
-        .bind(scope.space_id.as_str())
-        .bind(scope.incarnation.as_bytes().as_slice())
-        .bind(total_seqs)
-        .bind(off_run_vis)
-        .bind(off_eff_first)
-        .bind(off_eff_vis)
-        .bind(off_resp_vis)
-        .bind(off_san_vis)
-        .bind(sec)
-        .bind(nsec)
-        .bind(committed_at_ms)
-        .bind(expires_at_ms)
-        .bind(idemp.actor.as_str())
-        .bind(idemp.command_key.as_str())
-        .bind(idemp.command_hash.as_bytes().as_slice())
-        .bind(cmd_id.as_str())
-        .bind(request.input.run.as_str())
-        .bind(request.input.expected_run_revision.as_str())
-        .bind(new_run_rev.as_str())
-        .bind(run_meta.as_slice())
-        .bind(eff_pid_str)
-        .bind(effect_draft.effect_msgpack.as_slice())
-        .bind(resp_pid.as_str())
-        .bind(resp_bytes.as_slice())
-        .bind(sanitized.as_slice())
-        .bind(noop_folder_id)
-        .bind(&elig_nids)
-        .bind(&br_nids)
-        .bind(&br_revs)
-        .bind(&br_digs)
-        .bind(&br_pubs)
-        .bind(&br_rel_seqs)
-        .bind(&m_nids)
-        .bind(&m_revs)
-        .bind(&m_prev_revs)
-        .bind(&m_rest_revs)
-        .bind(&m_digs)
-        .bind(&m_rel_seqs)
-        .bind(&m_metas)
-        .bind(&m_lc)
-        .bind(&m_ops)
-        .bind(owner_key_str)
-        .bind(&cat_digs)
-        .bind(&cat_deltas)
-        .bind(&tr_nids)
-        .bind(&tr_revs)
-        .bind(&hot_nids)
-        .bind(&hot_t)
-        .bind(&hot_tf)
-        .bind(&hot_revs)
-        .bind(&hot_digs)
-        .bind(&hot_bs)
-        .bind(&hot_vm)
-        .bind(&fl_nids)
-        .bind(&fl_pf)
-        .bind(&fl_s)
-        .bind(&fl_sf)
-        .bind(&fl_t)
-        .bind(&fl_tf)
-        .bind(&fl_revs)
-        .bind(&fl_digs)
-        .bind(&fl_bs)
-        .bind(&fl_lc)
-        .bind(&fl_vm)
-        .bind(&cat_pubs)
-        .bind(&sorted_note_strs)
-        .bind(&sorted_exp_rev_strs)
-        .bind(&all_exp_lcs)
-        .bind(root_folder_str)
-        .bind(writer_epoch.get() as i64)
-        .bind(&room_leases)
-        .bind(&room_lineages);
-    let remaining = match rollback_time_left(&ctx.budget, deadline) {
-        Ok(remaining) => remaining,
-        Err(err) => return Some(Err(err)),
-    };
-    // The owned transaction rolls back on any return before COMMIT. The SQL
-    // timeout also bounds server work if the client disconnects.
-    let sql = format!(
-        "BEGIN; SET LOCAL statement_timeout = '{}ms'",
-        remaining.as_millis().clamp(1, i32::MAX as u128)
-    );
-    let mut transaction = crate::sql_exec::PgTransactionLease::new(pooled);
-    let begin = sqlx::raw_sql(sqlx::AssertSqlSafe(sql)).execute(transaction.conn());
-    match rollback_wait(&ctx.budget, deadline, begin).await {
-        Ok(Ok(_)) => {}
-        Ok(Err(err)) => {
-            return Some(Err(internal_not_committed(
-                "pg_rollback_begin",
-                err.to_string(),
-            )));
-        }
-        Err(err) => return Some(Err(err)),
-    };
-    let row = match rollback_wait(&ctx.budget, deadline, apply.fetch_one(transaction.conn())).await
-    {
-        Ok(Ok(row)) => row,
-        Ok(Err(sqlx::Error::Database(err))) if err.message().contains("NOTARIUM_RB_FALLBACK_0") => {
-            *try_pg_batch_plan = false;
-            return None;
-        }
-        Ok(Err(sqlx::Error::Database(err))) if err.code().as_deref() == Some("57014") => {
-            return Some(Err(deadline_not_committed(
-                "pg_rollback_statement_timeout",
-                "rollback statement exceeded its SQL time budget",
-            )));
-        }
-        Ok(Err(err)) => {
-            return Some(Err(internal_not_committed(
-                "pg_lean_rb_apply",
-                err.to_string(),
-            )));
-        }
-        Err(err) => return Some(Err(err)),
-    };
-    if row.get::<i64, usize>(0) <= 0 {
-        *try_pg_batch_plan = false;
-        return None;
-    }
-
-    let executor = store.inner.backup_executor.clone();
-    let store = store.clone();
-    let scope = scope.clone();
-    let writer = writer.clone();
-    let commit = async move {
-        // Retain the backup safe point, live visibility write lock, and room fences
-        // until the database answers, including when the caller stops waiting for the ACK.
-        let _gate = _commit_gate;
-        let _visibility = visibility;
-        fences_guard.armed_for_drop_consume = true;
-        let connection = match sqlx::raw_sql("COMMIT").execute(transaction.conn()).await {
-            Ok(_) => {
-                fences_guard.armed_for_drop_consume = false;
-                transaction.into_completed_connection()
-            }
-            Err(sqlx::Error::Database(err)) => {
-                fences_guard.armed_for_drop_consume = false;
-                drop(fences_guard);
-                return Err(internal_not_committed("pg_lean_rb_commit", err.to_string()));
-            }
-            Err(_) => {
-                return Err(unknown_commit_outcome(
-                    "pg_lean_rb_lost_ack",
-                    "rollback COMMIT reply was lost",
-                ));
-            }
-        };
-
-        if let Some(t0) = phase2_start {
-            let dur_ns = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
-            writer.record_batch_telemetry(dur_ns, 1);
-        }
-
-        let vis_seq_i64 = row.get::<i64, usize>(0);
-        let (Ok(visibility_seq), Some(receipt)) = (
-            i64_to_space_seq(vis_seq_i64),
-            i64_to_space_seq(vis_seq_i64)
-                .ok()
-                .and_then(|vs| MutationReceiptToken::new(scope.clone(), vs).ok()),
-        ) else {
-            drop(fences_guard);
-            return Err(unknown_commit_outcome(
-                "corrupt_lean_rb_vis_seq",
-                format!("invalid committed visibility_seq {vis_seq_i64}"),
-            ));
-        };
-
-        for (i, slot_opt) in fences_guard.slots.iter_mut().enumerate() {
-            if acts[i] >= 2
-                && let Some((mut guard, res)) = slot_opt.take()
-                && let Err(err) = guard.consume(res, &fences_guard.req_id)
-            {
-                return Err(unknown_commit_outcome(
-                    "fence_consume_lean_rb",
-                    format!("fence consume failed after lean rollback commit: {err:?}"),
-                ));
-            }
-        }
-        drop(fences_guard);
-
-        store
-            .inner
-            .broadcast_hub
-            .publish(crate::changes::BroadcastSignal::Committed {
-                scope: scope.clone(),
-                new_last_seq: visibility_seq,
-                targets: crate::changes::CommittedTargets::All,
-            });
-
-        if writer
-            .faults()
-            .drop_commit_response_once
-            .swap(false, Ordering::SeqCst)
-        {
-            return Err(unknown_commit_outcome(
-                "fault_injected_commit_response_loss",
-                "fault-injected commit response loss after lean rollback commit",
-            ));
-        }
-
-        park_pg_rollback_connection(&store, connection);
-        Ok(Committed {
-            value: result_value,
-            receipt,
-        })
-    };
-    let mut completion = Box::pin(commit);
-    // First poll is the COMMIT handoff. Prior cancellation can still discard
-    // the transaction. After that poll the same future must drain the ACK.
-    if let Err(err) = rollback_time_left(&ctx.budget, deadline) {
-        return Some(Err(err));
-    }
-    let first =
-        std::future::poll_fn(|cx| std::task::Poll::Ready(completion.as_mut().poll(cx))).await;
-    if let std::task::Poll::Ready(result) = first {
-        return Some(result);
-    }
-    let acknowledgement = executor.spawn(completion);
-    Some(
-        match rollback_wait(&ctx.budget, deadline, acknowledgement).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) | Err(_) => Err(unknown_commit_outcome(
-                "pg_lean_rb_ambiguous_commit",
-                "rollback COMMIT was sent without a definitive reply",
-            )),
-        },
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn execute_pg_fast_rollback_inner(
-    conn: &mut sqlx::PgConnection,
-    cfg: crate::config::WriterConfig,
-    scope_cl: &HistoryScope,
-    idemp: &crate::writer::CommandIdentitySpec,
-    auth: &notarium_core::auth::EngineAuthContext,
-    req_id: &notarium_core::receipt::CommandIdentity,
-    input: &RollbackAgentRun,
-    room_fences: &std::sync::Arc<crate::domain::RoomFenceTable>,
-    writer_epoch: notarium_core::ids::LeaseEpoch,
-) -> PgFastInnerResult {
-    use crate::codec::{doc_class_from_db, ordered_ids_batch};
-    use notarium_core::{
-        auth::{Space, SpaceKind, SpaceLifecycle},
-        ids::LeaseEpoch,
-    };
-
-    let committed_at_ms = match now_unix_ms() {
-        Ok(ms) => ms,
-        Err(err) => {
-            return PgFastInnerResult::Failed {
-                err,
-                effective_cut: None,
-            };
-        }
-    };
-    let receipt_ttl_ms = i64::try_from(cfg.receipt_ttl.as_millis()).unwrap_or(86_400_000);
-    let expires_at_ms = committed_at_ms.saturating_add(receipt_ttl_ms);
-
-    let mut caller_notes: BTreeMap<NoteId, RevisionId> = BTreeMap::new();
-    let mut has_duplicate_expected = false;
-    for exp in &input.expected_entities {
-        if caller_notes
-            .insert(exp.note.clone(), exp.revision.clone())
-            .is_some()
-        {
-            has_duplicate_expected = true;
-        }
-    }
-    let caller_note_vec: Vec<NoteId> = caller_notes.keys().cloned().collect();
-    let caller_note_strs: Vec<&str> = caller_note_vec.iter().map(NoteId::as_str).collect();
-
-    // Round-Trip 1: Single autocommit PL/pgSQL table call with cached SPI plan & single-pass window scan!
-    let r_rows = match sqlx::query(
-        "SELECT * FROM notarium_pg_fast_rollback_prep_v1($1, $2, $3, $4, $5, $6::TEXT[])",
-    )
-    .bind(scope_cl.space_id.as_str())
-    .bind(scope_cl.incarnation.as_bytes().as_slice())
-    .bind(idemp.actor.as_str())
-    .bind(idemp.command_key.as_str())
-    .bind(input.run.as_str())
-    .bind(&caller_note_strs)
-    .fetch_all(&mut *conn)
-    .await
-    {
-        Ok(rows) => rows,
-        Err(err) => {
-            return PgFastInnerResult::Failed {
-                err: internal_not_committed("pg_fast_rb_combined_read", err.to_string()),
-                effective_cut: None,
-            };
-        }
-    };
-
-    let Some(r0_idx) = r_rows.iter().position(|r| r.get::<i32, usize>(0) == 0) else {
-        return PgFastInnerResult::Failed {
-            err: DomainError::ResourceNotFound.into(),
-            effective_cut: None,
-        };
-    };
-    let r1 = &r_rows[r0_idx];
-
-    let s_inc_bytes: Vec<u8> = r1.get::<Vec<u8>, usize>(22);
-    let Ok(s_inc_arr) = <[u8; 16]>::try_from(s_inc_bytes) else {
-        return PgFastInnerResult::Failed {
-            err: internal_not_committed("corrupt_incarnation", "incarnation != 16B"),
-            effective_cut: None,
-        };
-    };
-    let s_last_seq_raw: i64 = r1.get::<i64, usize>(20);
-    let current_effective_cut = match i64_to_space_seq(s_last_seq_raw) {
-        Ok(seq) => seq,
-        Err(err) => {
-            return PgFastInnerResult::Failed {
-                err: err.into(),
-                effective_cut: None,
-            };
-        }
-    };
-    let db_scope = HistoryScope {
-        space_id: scope_cl.space_id.clone(),
-        incarnation: HistoryIncarnation::from_bytes(s_inc_arr),
-    };
-    if let Err(err) = db_scope.check(scope_cl) {
-        return PgFastInnerResult::Failed {
-            err: err.into(),
-            effective_cut: Some(current_effective_cut),
-        };
-    }
-
-    if r1.get::<i64, usize>(19) != writer_epoch.get() as i64 {
-        return PgFastInnerResult::Failed {
-            err: DomainError::validation(ValidationReason::InvalidAuthority).into(),
-            effective_cut: Some(current_effective_cut),
-        };
-    }
-
-    // Deliver receipts from the standard writer transaction, which checks live resource authority.
-    if r1.get::<Option<Vec<u8>>, usize>(23).is_some() {
-        return PgFastInnerResult::FallbackToStandard;
-    }
-
-    let flags: i32 = r1.get::<i32, usize>(21);
-    if (flags & 1) != 0 {
-        return PgFastInnerResult::Failed {
-            err: rollback_fallback_board_present_err(),
-            effective_cut: Some(current_effective_cut),
-        };
-    }
-    if (flags & (2 | 4 | 8 | 16)) != 0 {
-        return PgFastInnerResult::FallbackToStandard;
-    }
-
-    if has_duplicate_expected {
-        return PgFastInnerResult::Failed {
-            err: DomainError::validation(ValidationReason::InvalidState).into(),
-            effective_cut: Some(current_effective_cut),
-        };
-    }
-
-    let s_root_raw: String = r1.get::<String, usize>(1);
-    let Ok(root_folder_id) = FolderId::parse(&s_root_raw) else {
-        return PgFastInnerResult::Failed {
-            err: internal_not_committed("corrupt_root_folder", "invalid root_folder_id"),
-            effective_cut: Some(current_effective_cut),
-        };
-    };
-    let s_kind_raw: String = r1.get::<String, usize>(2);
-    let s_lc_raw: String = r1.get::<String, usize>(3);
-    let s_epoch_raw: i64 = r1.get::<i64, usize>(19);
-    let Ok(ep_u64) = u64::try_from(s_epoch_raw) else {
-        return PgFastInnerResult::Failed {
-            err: internal_not_committed("corrupt_epoch", "negative active_epoch"),
-            effective_cut: Some(current_effective_cut),
-        };
-    };
-    let Ok(active_epoch) = LeaseEpoch::new(ep_u64) else {
-        return PgFastInnerResult::Failed {
-            err: internal_not_committed("corrupt_epoch", "invalid active_epoch"),
-            effective_cut: Some(current_effective_cut),
-        };
-    };
-    let space_kind = match s_kind_raw.as_str() {
-        "personal" => SpaceKind::Personal,
-        "shared" => SpaceKind::Shared,
-        _ => return PgFastInnerResult::FallbackToStandard,
-    };
-    let space_lc = match s_lc_raw.as_str() {
-        "active" => SpaceLifecycle::Active,
-        "closing" => SpaceLifecycle::Closing,
-        "archived" => SpaceLifecycle::Archived,
-        _ => return PgFastInnerResult::FallbackToStandard,
-    };
-    let space_obj = Space {
-        id: scope_cl.space_id.clone(),
-        lifecycle: space_lc,
-        kind: space_kind,
-    };
-
-    if let Err(err) = auth.authorize_space_write(&space_obj) {
-        return PgFastInnerResult::Failed {
-            err: err.into(),
-            effective_cut: Some(current_effective_cut),
-        };
-    }
-    let run_inc_opt: Option<Vec<u8>> = r1.get::<Option<Vec<u8>>, usize>(24);
-    let run_rev_opt: Option<String> = r1.get::<Option<String>, usize>(6);
-    let Some((run_inc_bytes, run_rev_raw)) = run_inc_opt.zip(run_rev_opt) else {
-        return PgFastInnerResult::Failed {
-            err: DomainError::ResourceNotFound.into(),
-            effective_cut: Some(current_effective_cut),
-        };
-    };
-    let Ok(run_inc_arr) = <[u8; 16]>::try_from(run_inc_bytes) else {
-        return PgFastInnerResult::Failed {
-            err: internal_not_committed("corrupt_run_inc", "incarnation != 16B"),
-            effective_cut: Some(current_effective_cut),
-        };
-    };
-    if let Err(err) = scope_cl.check(&HistoryScope {
-        space_id: scope_cl.space_id.clone(),
-        incarnation: HistoryIncarnation::from_bytes(run_inc_arr),
-    }) {
-        return PgFastInnerResult::Failed {
-            err: err.into(),
-            effective_cut: Some(current_effective_cut),
-        };
-    }
-    let Ok(actual_run_rev) = RevisionId::parse(&run_rev_raw) else {
-        return PgFastInnerResult::Failed {
-            err: internal_not_committed("corrupt_run_rev", "invalid run_revision"),
-            effective_cut: Some(current_effective_cut),
-        };
-    };
-
-    if (flags & 512) != 0 {
-        return PgFastInnerResult::FallbackToStandard;
-    }
-
-    let mut folder_cache = FolderAncestryCache::default();
-    let rf_id_opt: Option<String> = r1.get::<Option<String>, usize>(7);
-    if rf_id_opt.is_some() {
-        let parent_raw: Option<String> = r1.get::<Option<String>, usize>(8);
-        let cover_raw: Option<String> = r1.get::<Option<String>, usize>(15);
-        let write_lock_json: Option<String> = r1.get::<Option<String>, usize>(16);
-        let lc_raw: Option<String> = r1.get::<Option<String>, usize>(17);
-        let head_rev_raw: Option<String> = r1.get::<Option<String>, usize>(18);
-        if let (Some(lc_s), Some(hrev_s)) = (lc_raw, head_rev_raw)
-            && let (Ok(head_rev_id), Ok(lifecycle)) =
-                (RevisionId::parse(&hrev_s), lifecycle_from_db(&lc_s))
-        {
-            let parent_folder_id = parent_raw.and_then(|s| FolderId::parse(&s).ok());
-            let cover_note_id = cover_raw.and_then(|s| NoteId::parse(&s).ok());
-            folder_cache.insert_preloaded_row(
-                scope_cl.space_id.clone(),
-                FolderHeadRow {
-                    folder_id: root_folder_id.clone(),
-                    parent_folder_id,
-                    is_root: (flags & 64) != 0,
-                    slug: r1.get::<Option<String>, usize>(9).unwrap_or_default(),
-                    slug_fold: r1.get::<Option<String>, usize>(10).unwrap_or_default(),
-                    display_name: r1.get::<Option<String>, usize>(11).unwrap_or_default(),
-                    is_project: (flags & 128) != 0,
-                    project_slug: r1.get::<Option<String>, usize>(12),
-                    project_slug_fold: r1.get::<Option<String>, usize>(13),
-                    description: r1.get::<Option<String>, usize>(14),
-                    cover_note_id,
-                    write_locked: write_lock_json.is_some(),
-                    lifecycle,
-                    head_rev_id,
-                    updated_seq: None,
-                },
-            );
-        }
-    }
-
-    struct MiniNoteSummary {
-        created_source: Option<(String, Vec<u8>)>,
-        has_foreign: bool,
-        pre_rev: Option<(RevisionId, Vec<u8>, Option<notarium_core::value::Timestamp>)>,
-    }
-
-    struct MiniHead {
-        parent_folder_id: FolderId,
-        slug: String,
-        slug_fold: String,
-        title: String,
-        doc_class: DocClass,
-        ability_id: Option<notarium_core::ids::AbilityId>,
-        head_rev_id: RevisionId,
-        content_digest: Option<ContentDigest>,
-        byte_size: u64,
-        lifecycle: Lifecycle,
-        visibility_mask: i32,
-    }
-
-    let mut rev_summaries: HashMap<NoteId, MiniNoteSummary> =
-        HashMap::with_capacity(caller_notes.len());
-    let mut heads_map: HashMap<NoteId, MiniHead> = HashMap::with_capacity(caller_notes.len());
-    let mut cat_map: HashMap<ContentDigest, (String, String, Option<String>)> = HashMap::new();
-
-    for row in &r_rows {
-        let kind: i32 = row.get::<i32, usize>(0);
-        if kind == 0 {
-            continue;
-        } else if kind == 1 {
-            let nid_raw: String = row.get::<String, usize>(1);
-            let first_run_seq_raw: i64 = row.get::<i64, usize>(19);
-            if first_run_seq_raw < 0 {
-                return PgFastInnerResult::FallbackToStandard;
-            }
-            let Ok(nid) = NoteId::parse(&nid_raw) else {
-                return PgFastInnerResult::Failed {
-                    err: internal_not_committed("corrupt_rev_nid", "invalid note_id"),
-                    effective_cut: Some(current_effective_cut),
-                };
-            };
-            let has_foreign = row.get::<i32, usize>(21) != 0;
-            let pre_rev_raw: Option<String> = row.get::<Option<String>, usize>(2);
-            let pre_meta_opt: Option<Vec<u8>> = row.get::<Option<Vec<u8>>, usize>(23);
-            let pre_nsec_opt: Option<String> = row.get::<Option<String>, usize>(4);
-            let pre_sec_raw: i64 = row.get::<i64, usize>(20);
-            let pre_rev = match (pre_rev_raw, pre_meta_opt) {
-                (Some(r_str), Some(meta_bytes)) => {
-                    let Ok(rev) = RevisionId::parse(&r_str) else {
-                        return PgFastInnerResult::Failed {
-                            err: internal_not_committed("corrupt_rev_id", "invalid rev_id"),
-                            effective_cut: Some(current_effective_cut),
-                        };
-                    };
-                    let pre_ts = match pre_nsec_opt {
-                        Some(ns_str) => {
-                            let Ok(ns) = ns_str.parse::<i32>() else {
-                                return PgFastInnerResult::Failed {
-                                    err: internal_not_committed("corrupt_rev_ts", "invalid nsec"),
-                                    effective_cut: Some(current_effective_cut),
-                                };
-                            };
-                            match crate::codec::decode_timestamp_parts(pre_sec_raw, ns) {
-                                Ok(ts) => Some(ts),
-                                Err(_) => {
-                                    return PgFastInnerResult::Failed {
-                                        err: internal_not_committed(
-                                            "corrupt_rev_ts",
-                                            "invalid timestamp",
-                                        ),
-                                        effective_cut: Some(current_effective_cut),
-                                    };
-                                }
-                            }
-                        }
-                        None => None,
-                    };
-                    Some((rev, meta_bytes, pre_ts))
-                }
-                _ => None,
-            };
-            rev_summaries.insert(
-                nid,
-                MiniNoteSummary {
-                    created_source: row
-                        .get::<Option<String>, usize>(3)
-                        .zip(row.get::<Option<Vec<u8>>, usize>(24)),
-                    has_foreign,
-                    pre_rev,
-                },
-            );
-        } else if kind == 2 {
-            let nid_raw: String = row.get::<String, usize>(1);
-            let parent_raw: String = row.get::<String, usize>(2);
-            let slug: String = row.get::<String, usize>(3);
-            let slug_fold: String = row.get::<String, usize>(4);
-            if slug_fold == super::folder_cover::SLUG {
-                return PgFastInnerResult::Failed {
-                    err: rollback_fallback_cover_change_err(),
-                    effective_cut: Some(current_effective_cut),
-                };
-            }
-            let title: String = row.get::<String, usize>(5);
-            let dc_raw: String = row.get::<String, usize>(6);
-            let ab_raw: Option<String> = row.get::<Option<String>, usize>(7);
-            let hrev_raw: String = row.get::<String, usize>(8);
-            let lc_raw: String = row.get::<String, usize>(9);
-            let bsize_raw: i64 = row.get::<i64, usize>(19);
-            let vmask: i32 = row.get::<i32, usize>(21);
-            let cbytes_opt: Option<Vec<u8>> = row.get::<Option<Vec<u8>>, usize>(22);
-
-            let (Ok(nid), Ok(parent_folder_id), Ok(doc_class), Ok(head_rev_id), Ok(lifecycle)) = (
-                NoteId::parse(&nid_raw),
-                FolderId::parse(&parent_raw),
-                doc_class_from_db(&dc_raw),
-                RevisionId::parse(&hrev_raw),
-                lifecycle_from_db(&lc_raw),
-            ) else {
-                return PgFastInnerResult::Failed {
-                    err: internal_not_committed("corrupt_head_row", "invalid note_heads column"),
-                    effective_cut: Some(current_effective_cut),
-                };
-            };
-            let ability_id = match ab_raw {
-                Some(s) => match notarium_core::ids::AbilityId::parse(&s) {
-                    Ok(id) => Some(id),
-                    Err(_) => {
-                        return PgFastInnerResult::Failed {
-                            err: internal_not_committed("corrupt_ability_id", "invalid AbilityId"),
-                            effective_cut: Some(current_effective_cut),
-                        };
-                    }
-                },
-                None => None,
-            };
-            let Ok(byte_size) = u64::try_from(bsize_raw) else {
-                return PgFastInnerResult::Failed {
-                    err: internal_not_committed("corrupt_byte_size", "negative size"),
-                    effective_cut: Some(current_effective_cut),
-                };
-            };
-            let content_digest = match cbytes_opt {
-                Some(b) => match <[u8; 32]>::try_from(b) {
-                    Ok(arr) => Some(ContentDigest::from_bytes(arr)),
-                    Err(_) => {
-                        return PgFastInnerResult::Failed {
-                            err: internal_not_committed("corrupt_digest", "digest != 32B"),
-                            effective_cut: Some(current_effective_cut),
-                        };
-                    }
-                },
-                None => None,
-            };
-            heads_map.insert(
-                nid,
-                MiniHead {
-                    parent_folder_id,
-                    slug,
-                    slug_fold,
-                    title,
-                    doc_class,
-                    ability_id,
-                    head_rev_id,
-                    content_digest,
-                    byte_size,
-                    lifecycle,
-                    visibility_mask: vmask,
-                },
-            );
-        } else {
-            let adm: String = row.get::<String, usize>(1);
-            let bstate: String = row.get::<String, usize>(2);
-            let pub_opt: Option<String> = row.get::<Option<String>, usize>(3);
-            let d_bytes: Vec<u8> = row.get::<Vec<u8>, usize>(22);
-            let Ok(arr) = <[u8; 32]>::try_from(d_bytes) else {
-                return PgFastInnerResult::Failed {
-                    err: internal_not_committed("corrupt_cat_digest", "digest != 32B"),
-                    effective_cut: Some(current_effective_cut),
-                };
-            };
-            cat_map.insert(ContentDigest::from_bytes(arr), (adm, bstate, pub_opt));
-        }
-    }
-    drop(r_rows);
-
-    if rev_summaries.len() != caller_notes.len() {
-        return PgFastInnerResult::FallbackToStandard;
-    }
-
-    {
-        let mut bconn = BackendConn::Postgres(conn);
-        for nid in caller_notes.keys() {
-            let Some(head) = heads_map.get(nid) else {
-                return PgFastInnerResult::Failed {
-                    err: DomainError::ResourceNotFound.into(),
-                    effective_cut: Some(current_effective_cut),
-                };
-            };
-            let rfacts = match folder_cache
-                .build_resource_facts_tx(
-                    &mut bconn,
-                    &space_obj,
-                    &head.parent_folder_id,
-                    head.doc_class,
-                    head.ability_id.clone(),
-                    false,
-                )
-                .await
-            {
-                Ok((_, anc)) if anc.folder_lifecycle == Lifecycle::Purged => {
-                    return PgFastInnerResult::Failed {
-                        err: DomainError::ResourceNotFound.into(),
-                        effective_cut: Some(current_effective_cut),
-                    };
-                }
-                Ok((rf, _)) => rf,
-                Err(err) => {
-                    return PgFastInnerResult::Failed {
-                        err,
-                        effective_cut: Some(current_effective_cut),
-                    };
-                }
-            };
-            if let Err(err) = auth
-                .can_view_resource(&rfacts)
-                .and_then(|()| auth.authorize_direct_write(&rfacts, &rfacts))
-            {
-                return PgFastInnerResult::Failed {
-                    err: err.into(),
-                    effective_cut: Some(current_effective_cut),
-                };
-            }
-        }
-    }
-
-    if let Err(err) = verify_authorized_rollback_revisions(actual_run_rev, input, |nid| {
-        heads_map.get(nid).map(|head| &head.head_rev_id)
-    }) {
-        return PgFastInnerResult::Failed {
-            err,
-            effective_cut: Some(current_effective_cut),
-        };
-    }
-
-    let mut skipped_manual_edits = Vec::new();
-    let mut skipped_room_active = Vec::new();
-    let mut eligible_notes: BTreeMap<NoteId, CandidateAction> = BTreeMap::new();
-
-    for nid in caller_note_vec {
-        let Some(head) = heads_map.remove(&nid) else {
-            return PgFastInnerResult::Failed {
-                err: DomainError::ResourceNotFound.into(),
-                effective_cut: Some(current_effective_cut),
-            };
-        };
-        let Some(summary) = rev_summaries.remove(&nid) else {
-            return PgFastInnerResult::Failed {
-                err: DomainError::validation(ValidationReason::SourceMismatch).into(),
-                effective_cut: Some(current_effective_cut),
-            };
-        };
-        if summary.has_foreign {
-            skipped_manual_edits.push(nid);
-            continue;
-        }
-        if head.doc_class == DocClass::Skill || head.ability_id.is_some() {
-            return PgFastInnerResult::Failed {
-                err: rollback_fallback_ability_slot_err(),
-                effective_cut: Some(current_effective_cut),
-            };
-        }
-        if head.slug_fold == super::folder_cover::SLUG {
-            return PgFastInnerResult::Failed {
-                err: rollback_fallback_cover_change_err(),
-                effective_cut: Some(current_effective_cut),
-            };
-        }
-        let action = match summary.pre_rev {
-            None => CandidateAction::TrashCreated {
-                metadata: match summary.created_source {
-                    Some((rev, bytes)) if rev == head.head_rev_id.as_str() => {
-                        match decode_rollback_note(&bytes, &nid) {
-                            Ok(meta) => Box::new(meta),
-                            Err(err) => {
-                                return PgFastInnerResult::Failed {
-                                    err,
-                                    effective_cut: Some(current_effective_cut),
-                                };
-                            }
-                        }
-                    }
-                    _ => return PgFastInnerResult::FallbackToStandard,
-                },
-                current_rev: head.head_rev_id,
-                current_lifecycle: head.lifecycle,
-                doc_class: head.doc_class,
-                parent_folder_id: head.parent_folder_id,
-                slug: head.slug,
-                slug_fold: head.slug_fold,
-                title: head.title,
-                ability_id: head.ability_id,
-                visibility_mask: head.visibility_mask,
-                byte_size: head.byte_size,
-                content_digest: head.content_digest,
-            },
-            Some((pre_rev_id, meta_bytes, pre_updated_at)) => {
-                let pre_meta = match decode_rollback_note(&meta_bytes, &nid) {
-                    Ok(meta) => meta,
-                    Err(err) => {
-                        return PgFastInnerResult::Failed {
-                            err,
-                            effective_cut: Some(current_effective_cut),
-                        };
-                    }
-                };
-                if pre_meta.logical_updated_at.is_some() {
-                    return PgFastInnerResult::FallbackToStandard;
-                }
-                if pre_meta.slug_fold == super::folder_cover::SLUG {
-                    return PgFastInnerResult::Failed {
-                        err: rollback_fallback_cover_change_err(),
-                        effective_cut: Some(current_effective_cut),
-                    };
-                }
-                if pre_meta.ability_id.is_some() {
-                    return PgFastInnerResult::Failed {
-                        err: rollback_fallback_ability_slot_err(),
-                        effective_cut: Some(current_effective_cut),
-                    };
-                }
-                let head_unchanged_placement = head.lifecycle == pre_meta.lifecycle
-                    && head.parent_folder_id == pre_meta.parent_folder_id
-                    && head.slug == pre_meta.slug
-                    && head.slug_fold == pre_meta.slug_fold;
-                let needs_note_mutation =
-                    head.head_rev_id != pre_rev_id || !head_unchanged_placement;
-                CandidateAction::RestorePreExisting {
-                    current_rev: head.head_rev_id,
-                    pre_rev_id,
-                    pre_meta: Box::new(pre_meta),
-                    pre_carrier: None,
-                    pre_updated_at,
-                    needs_note_mutation,
-                    head_unchanged_placement,
-                    current_cover_parent: None,
-                    first_run_seq: SpaceSeq::ZERO,
-                }
-            }
-        };
-        eligible_notes.insert(nid, action);
-    }
-
-    let mut final_eligible: BTreeMap<NoteId, CandidateAction> = BTreeMap::new();
-    let mut locked_fences = Vec::with_capacity(eligible_notes.len());
-    for (nid, action) in eligible_notes {
-        match room_fences
-            .try_lock_closed_for_rollback(scope_cl, &nid, req_id)
-            .await
-        {
-            Ok(Some((guard, res))) => {
-                locked_fences.push((guard, res));
-                final_eligible.insert(nid, action);
-            }
-            Ok(None) => {
-                skipped_room_active.push(nid);
-            }
-            Err(err) => {
-                return PgFastInnerResult::Failed {
-                    err,
-                    effective_cut: Some(current_effective_cut),
-                };
-            }
-        }
-    }
-    skipped_room_active.sort();
-
-    if !skipped_manual_edits.is_empty() || !skipped_room_active.is_empty() {
-        return PgFastInnerResult::FallbackToStandard;
-    }
-
-    let mut planned_active_slots: HashMap<(FolderId, String), NoteId> = HashMap::new();
-    let mut planned_collision_checks: Vec<(FolderId, String, String, bool)> = Vec::new();
-    let mut restored_ancestries: HashMap<NoteId, bool> = HashMap::new();
-    let mut trash_ancestries: HashMap<NoteId, bool> = HashMap::new();
-
-    {
-        let mut bconn = BackendConn::Postgres(conn);
-        for (nid, action) in &final_eligible {
-            match action {
-                CandidateAction::TrashCreated {
-                    current_lifecycle,
-                    parent_folder_id,
-                    ..
-                } if *current_lifecycle != Lifecycle::Trashed => {
-                    let anc = match folder_cache
-                        .load_ancestry_tx(&mut bconn, &scope_cl.space_id, parent_folder_id, false)
-                        .await
-                    {
-                        Ok(a) => a,
-                        Err(err) => {
-                            return PgFastInnerResult::Failed {
-                                err,
-                                effective_cut: Some(current_effective_cut),
-                            };
-                        }
-                    };
-                    trash_ancestries.insert(nid.clone(), anc.is_root_child);
-                }
-                CandidateAction::RestorePreExisting {
-                    pre_meta,
-                    head_unchanged_placement,
-                    ..
-                } => {
-                    let anc = match authorize_rollback_destination_tx(
-                        &mut bconn,
-                        &mut folder_cache,
-                        &space_obj,
-                        auth,
-                        pre_meta,
-                    )
-                    .await
-                    {
-                        Ok(a) => a,
-                        Err(err) => {
-                            return PgFastInnerResult::Failed {
-                                err,
-                                effective_cut: Some(current_effective_cut),
-                            };
-                        }
-                    };
-                    restored_ancestries.insert(nid.clone(), anc.is_root_child);
-                    if pre_meta.lifecycle == Lifecycle::Active {
-                        let slot_key = (
-                            pre_meta.parent_folder_id.clone(),
-                            pre_meta.slug_fold.clone(),
-                        );
-                        if planned_active_slots.insert(slot_key, nid.clone()).is_some() {
-                            return PgFastInnerResult::Failed {
-                                err: DomainError::PathConflict {
-                                    target: PathTarget {
-                                        space_id: scope_cl.space_id.clone(),
-                                        parent: if anc.is_root_child {
-                                            None
-                                        } else {
-                                            Some(pre_meta.parent_folder_id.clone())
-                                        },
-                                        component: pre_meta.slug.clone(),
-                                    },
-                                }
-                                .into(),
-                                effective_cut: Some(current_effective_cut),
-                            };
-                        }
-                        if !*head_unchanged_placement {
-                            planned_collision_checks.push((
-                                pre_meta.parent_folder_id.clone(),
-                                pre_meta.slug_fold.clone(),
-                                pre_meta.slug.clone(),
-                                anc.is_root_child,
-                            ));
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    let mut pub_by_digest: HashMap<ContentDigest, String> = HashMap::new();
-    for action in final_eligible.values() {
-        let d_opt = match action {
-            CandidateAction::TrashCreated {
-                current_lifecycle,
-                content_digest,
-                ..
-            } if *current_lifecycle != Lifecycle::Trashed => *content_digest,
-            CandidateAction::RestorePreExisting {
-                needs_note_mutation: true,
-                pre_meta,
-                ..
-            } => pre_meta.content_digest,
-            _ => None,
-        };
-        if let Some(d) = d_opt
-            && !pub_by_digest.contains_key(&d)
-        {
-            let Some((adm, bstate, pub_opt)) = cat_map.get(&d) else {
-                return PgFastInnerResult::Failed {
-                    err: unavailable_retryable(
-                        "blob_missing_for_rebind",
-                        "existing blob publication missing during metadata revision bind",
-                        std::time::Duration::from_millis(25),
-                    ),
-                    effective_cut: Some(current_effective_cut),
-                };
-            };
-            let Some(pub_id) = pub_opt else {
-                return PgFastInnerResult::Failed {
-                    err: unavailable_retryable(
-                        "blob_missing_for_rebind",
-                        "existing blob publication missing during metadata revision bind",
-                        std::time::Duration::from_millis(25),
-                    ),
-                    effective_cut: Some(current_effective_cut),
-                };
-            };
-            if adm != "open" || bstate != "active" {
-                return PgFastInnerResult::Failed {
-                    err: unavailable_retryable(
-                        "blob_retiring_on_rebind",
-                        "existing blob entered retirement before metadata revision commit",
-                        std::time::Duration::from_millis(25),
-                    ),
-                    effective_cut: Some(current_effective_cut),
-                };
-            }
-            pub_by_digest.insert(d, pub_id.clone());
-        }
-    }
-
-    let trash_note_count = final_eligible
-        .values()
-        .filter(|act| {
-            matches!(
-                act,
-                CandidateAction::TrashCreated {
-                    current_lifecycle,
-                    ..
-                } if *current_lifecycle != Lifecycle::Trashed
-            )
-        })
-        .count() as u64;
-    let restore_note_count = final_eligible
-        .values()
-        .filter(|act| {
-            matches!(
-                act,
-                CandidateAction::RestorePreExisting {
-                    needs_note_mutation: true,
-                    ..
-                }
-            )
-        })
-        .count() as u64;
-    let total_seqs = (trash_note_count + restore_note_count).max(1);
-
-    let prep_res: Result<(Vec<u8>, SpaceSeq, i64), PortError> = async {
-        let first_seq = current_effective_cut.checked_next()?;
-        let next_u64 = current_effective_cut
-            .get()
-            .checked_add(total_seqs)
-            .ok_or_else(|| DomainError::validation(ValidationReason::SequenceOverflow))?;
-        let visibility_seq = SpaceSeq::new(next_u64)?;
-        let mut cursor_seq = current_effective_cut;
-
-        let vis_i64 = visibility_seq.get() as i64;
-        let now_ts = now_utc_timestamp()?;
-        let (sec, nsec) = encode_timestamp_parts(now_ts);
-        let actor_str = idemp.actor.as_str();
-
-        let id_count = (trash_note_count + restore_note_count) as usize + 3;
-        let mut raw_ids = ordered_ids_batch(id_count)?.into_iter();
-        let mut next_rev = || RevisionId::from_bytes(raw_ids.next().expect("pre-allocated ID"));
-
-        struct UnifiedMutRow<'a> {
-            is_full: bool,
-            note_id: &'a str,
-            parent_folder_id: &'a str,
-            slug: &'a str,
-            slug_fold: &'a str,
-            title: &'a str,
-            title_fold: String,
-            doc_class_str: &'static str,
-            ability_id_str: Option<&'a str>,
-            rev_id: RevisionId,
-            parent_rev_str: &'a str,
-            restored_rev_str: Option<&'a str>,
-            content_digest: Option<ContentDigest>,
-            pub_id_str: Option<&'a str>,
-            byte_size: i64,
-            lifecycle_str: &'static str,
-            visibility_mask: i32,
-            space_seq: i64,
-            metadata_msgpack: Vec<u8>,
-            op_kind: &'static str,
-        }
-
-        let mut_cap = (trash_note_count + restore_note_count) as usize;
-        let mut mut_rows: Vec<UnifiedMutRow<'_>> = Vec::with_capacity(mut_cap);
-        let mut trashed_out = Vec::with_capacity(trash_note_count as usize);
-        let mut restored_out = Vec::with_capacity(restore_note_count as usize);
-        let mut owner_vec: Vec<NoteId> = Vec::with_capacity(final_eligible.len());
-        let mut delta_by_digest: BTreeMap<[u8; 32], i64> = BTreeMap::new();
-        let mut has_full = false;
-
-        for (nid, action) in &final_eligible {
-            let CandidateAction::TrashCreated {
-                metadata,
-                current_rev,
-                current_lifecycle,
-                doc_class,
-                parent_folder_id,
-                slug,
-                slug_fold,
-                title,
-                ability_id,
-                visibility_mask,
-                byte_size,
-                content_digest,
-            } = action
-            else {
-                continue;
-            };
-            if *current_lifecycle == Lifecycle::Trashed {
-                trashed_out.push(NoteRevision {
-                    note: nid.clone(),
-                    revision: current_rev.clone(),
-                });
-                continue;
-            }
-            cursor_seq = cursor_seq.checked_next()?;
-            let tseq = cursor_seq;
-            let trev = next_rev();
-            let is_root_child = trash_ancestries.get(nid).copied().unwrap_or(false);
-            let title_fold = if *doc_class == DocClass::EncryptedNote {
-                normalize_title_key(slug)
-            } else {
-                normalize_title_key(title)
-            };
-            let pub_id_str = if let Some(d) = *content_digest {
-                *delta_by_digest.entry(*d.as_bytes()).or_insert(0) += 1;
-                Some(pub_by_digest.get(&d).expect("verified digest").as_str())
-            } else {
-                None
-            };
-            let meta = encode_rollback_note(metadata, None, is_root_child, RollbackRevision::Trash)?;
-            mut_rows.push(UnifiedMutRow {
-                is_full: false,
-                note_id: nid.as_str(),
-                parent_folder_id: parent_folder_id.as_str(),
-                slug: slug.as_str(),
-                slug_fold: slug_fold.as_str(),
-                title: title.as_str(),
-                title_fold,
-                doc_class_str: doc_class_to_db(*doc_class),
-                ability_id_str: ability_id.as_ref().map(|a| a.as_str()),
-                rev_id: trev.clone(),
-                parent_rev_str: current_rev.as_str(),
-                restored_rev_str: None,
-                content_digest: *content_digest,
-                pub_id_str,
-                byte_size: *byte_size as i64,
-                lifecycle_str: "trashed",
-                visibility_mask: *visibility_mask,
-                space_seq: tseq.get() as i64,
-                metadata_msgpack: meta,
-                op_kind: "trash",
-            });
-            trashed_out.push(NoteRevision {
-                note: nid.clone(),
-                revision: trev,
-            });
-        }
-
-        for (nid, action) in &final_eligible {
-            owner_vec.push(nid.clone());
-            let CandidateAction::RestorePreExisting {
-                current_rev,
-                pre_rev_id,
-                pre_meta,
-                pre_updated_at,
-                needs_note_mutation,
-                head_unchanged_placement,
-                ..
-            } = action
-            else {
-                continue;
-            };
-            if !*needs_note_mutation {
-                continue;
-            }
-            cursor_seq = cursor_seq.checked_next()?;
-            let rseq = cursor_seq;
-            let rrev = next_rev();
-            let is_root_child = restored_ancestries.get(nid).copied().unwrap_or(false);
-            let pub_id_str = if let Some(d) = pre_meta.content_digest {
-                *delta_by_digest.entry(*d.as_bytes()).or_insert(0) += 1;
-                Some(pub_by_digest.get(&d).expect("verified digest").as_str())
-            } else {
-                None
-            };
-            let title_fold = if pre_meta.doc_class == DocClass::EncryptedNote {
-                normalize_title_key(&pre_meta.slug)
-            } else {
-                normalize_title_key(&pre_meta.title)
-            };
-            let is_full = !*head_unchanged_placement;
-            if is_full {
-                has_full = true;
-            }
-            let meta = encode_rollback_note(
-                pre_meta,
-                None,
-                is_root_child,
-                RollbackRevision::Restore {
-                    schema: None,
-                    logical_updated_at: *pre_updated_at,
-                },
-            )?;
-            mut_rows.push(UnifiedMutRow {
-                is_full,
-                note_id: nid.as_str(),
-                parent_folder_id: pre_meta.parent_folder_id.as_str(),
-                slug: pre_meta.slug.as_str(),
-                slug_fold: pre_meta.slug_fold.as_str(),
-                title: pre_meta.title.as_str(),
-                title_fold,
-                doc_class_str: doc_class_to_db(pre_meta.doc_class),
-                ability_id_str: pre_meta.ability_id.as_ref().map(|a| a.as_str()),
-                rev_id: rrev.clone(),
-                parent_rev_str: current_rev.as_str(),
-                restored_rev_str: Some(pre_rev_id.as_str()),
-                content_digest: pre_meta.content_digest,
-                pub_id_str,
-                byte_size: pre_meta.byte_size as i64,
-                lifecycle_str: lifecycle_to_db(pre_meta.lifecycle),
-                visibility_mask: pre_meta.visibility_mask,
-                space_seq: rseq.get() as i64,
-                metadata_msgpack: meta,
-                op_kind: "restore",
-            });
-            restored_out.push(NoteRevision {
-                note: nid.clone(),
-                revision: rrev,
-            });
-        }
-
-        let new_run_rev = next_rev();
-        let pay_raw = raw_ids.next().expect("pre-allocated pay ID");
-        let cmd_raw = raw_ids.next().expect("pre-allocated cmd ID");
-        let pay_id = format!("pay_{:032x}", u128::from_be_bytes(pay_raw));
-        let cmd_id = format!("cmd_{:032x}", u128::from_be_bytes(cmd_raw));
-
-        let run_meta = RevisionMetadataEnvelope::v1(RevisionMetadataPayload::AgentRun(
-            crate::codec::AgentRunRevisionMetadata {
-                run_id: input.run.clone(),
-                last_seq: visibility_seq,
-            },
-        ))
-        .encode()?;
-
-        let noop_folder_id: Option<&str> = if mut_rows.is_empty() {
-            Some(root_folder_id.as_str())
-        } else {
-            None
-        };
-        let has_trash = trash_note_count > 0;
-
-        let cmd_range = notarium_core::ports::CommandSeqRange::new(first_seq, visibility_seq)?;
-        let effect_draft = build_effect_payload_draft(
-            pay_id,
-            scope_cl.clone(),
-            cmd_range,
-            "rollback_agent_run",
-            EffectBodyV1::AwaitProjection {
-                reason: StoredAwaitReasonV1::Bulk,
-            },
-            owner_vec.clone(),
-        )?;
-        let receipt_token = MutationReceiptToken::new(scope_cl.clone(), visibility_seq)?;
-        let wire = StoredCommittedRollbackV1 {
-            restored: restored_out,
-            trashed: trashed_out,
-            restored_ranks: Vec::new(),
-            skipped_manual_edits,
-            skipped_room_active: skipped_room_active.clone(),
-            receipt: receipt_token.clone(),
-        };
-        let resp_bytes = encode_msgpack(&wire)?;
-        let sanitized = encode_msgpack(&StoredCommittedRollbackV1::sanitized(receipt_token))?;
-        let owner_key = format!("{}:{}", idemp.actor.as_str(), idemp.command_key.as_str());
-        let resp_pid = format!("rcpt_pay:{owner_key}");
-
-        let owner_nid_strs: Vec<&str> = owner_vec.iter().map(NoteId::as_str).collect();
-        let chk_folders: Vec<&str> = planned_collision_checks
-            .iter()
-            .map(|(f, _, _, _)| f.as_str())
-            .collect();
-        let chk_slug_folds: Vec<&str> = planned_collision_checks
-            .iter()
-            .map(|(_, sf, _, _)| sf.as_str())
-            .collect();
-
-        let cat_digests_owned: Vec<[u8; 32]> = delta_by_digest.keys().copied().collect();
-        let cat_deltas: Vec<i64> = delta_by_digest.values().copied().collect();
-        let cat_digests: Vec<&[u8]> = cat_digests_owned.iter().map(|a| a.as_slice()).collect();
-
-        let mut m_is_full: Vec<bool> = Vec::with_capacity(mut_rows.len());
-        let mut m_nids: Vec<&str> = Vec::with_capacity(mut_rows.len());
-        let mut m_parents: Vec<&str> = Vec::with_capacity(mut_rows.len());
-        let mut m_slugs: Vec<&str> = Vec::with_capacity(mut_rows.len());
-        let mut m_slug_folds: Vec<&str> = Vec::with_capacity(mut_rows.len());
-        let mut m_titles: Vec<&str> = Vec::with_capacity(mut_rows.len());
-        let mut m_title_folds: Vec<&str> = Vec::with_capacity(mut_rows.len());
-        let mut m_doc_classes: Vec<&str> = Vec::with_capacity(mut_rows.len());
-        let mut m_abilities: Vec<Option<&str>> = Vec::with_capacity(mut_rows.len());
-        let mut m_revs: Vec<&str> = Vec::with_capacity(mut_rows.len());
-        let mut m_parent_revs: Vec<&str> = Vec::with_capacity(mut_rows.len());
-        let mut m_restored_revs: Vec<Option<&str>> = Vec::with_capacity(mut_rows.len());
-        let mut m_digests: Vec<Option<&[u8]>> = Vec::with_capacity(mut_rows.len());
-        let mut m_pub_ids: Vec<Option<&str>> = Vec::with_capacity(mut_rows.len());
-        let mut m_byte_sizes: Vec<i64> = Vec::with_capacity(mut_rows.len());
-        let mut m_lifecycles: Vec<&str> = Vec::with_capacity(mut_rows.len());
-        let mut m_vis_masks: Vec<i32> = Vec::with_capacity(mut_rows.len());
-        let mut m_sseqs: Vec<i64> = Vec::with_capacity(mut_rows.len());
-        let mut m_metas: Vec<&[u8]> = Vec::with_capacity(mut_rows.len());
-        let mut m_op_kinds: Vec<&str> = Vec::with_capacity(mut_rows.len());
-        for m in &mut_rows {
-            m_is_full.push(m.is_full);
-            m_nids.push(m.note_id);
-            m_parents.push(m.parent_folder_id);
-            m_slugs.push(m.slug);
-            m_slug_folds.push(m.slug_fold);
-            m_titles.push(m.title);
-            m_title_folds.push(m.title_fold.as_str());
-            m_doc_classes.push(m.doc_class_str);
-            m_abilities.push(m.ability_id_str);
-            m_revs.push(m.rev_id.as_str());
-            m_parent_revs.push(m.parent_rev_str);
-            m_restored_revs.push(m.restored_rev_str);
-            m_digests.push(m.content_digest.as_ref().map(|d| d.as_bytes().as_slice()));
-            m_pub_ids.push(m.pub_id_str);
-            m_byte_sizes.push(m.byte_size);
-            m_lifecycles.push(m.lifecycle_str);
-            m_vis_masks.push(m.visibility_mask);
-            m_sseqs.push(m.space_seq);
-            m_metas.push(m.metadata_msgpack.as_slice());
-            m_op_kinds.push(m.op_kind);
-        }
-
-        let delta_i64 = total_seqs as i64;
-        let epoch_i64 = active_epoch.get() as i64;
-        let before_i64 = current_effective_cut.get() as i64;
-        let max_allowed_before = (SpaceSeq::MAX.get() - total_seqs) as i64;
-        let first_i64 = first_seq.get() as i64;
-
-        // Round-Trip 2: Single autocommit PL/pgSQL call executing unified single-CTE writes + synchronous WAL flush!
-        auth.authorize_space_write(&space_obj)?;
-        let apply_res = sqlx::query_scalar::<_, i64>(
-            "SELECT notarium_pg_fast_rollback_apply_v1(
-                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
-                $21, $22, $23, $24, $25, $26, $27, $28, $29, $30::TEXT[],
-                $31::TEXT[], $32::TEXT[], $33::BYTEA[], $34::BIGINT[], $35::BOOL[], $36::TEXT[], $37::TEXT[], $38::TEXT[],
-                $39::TEXT[], $40::TEXT[], $41::TEXT[], $42::TEXT[], $43::TEXT[], $44::TEXT[], $45::TEXT[], $46::TEXT[],
-                $47::BYTEA[], $48::TEXT[], $49::BIGINT[], $50::TEXT[], $51::INT4[], $52::BIGINT[], $53::BYTEA[], $54::TEXT[]
-            )",
-        )
-        .bind(scope_cl.space_id.as_str())
-        .bind(scope_cl.incarnation.as_bytes().as_slice())
-        .bind(epoch_i64)
-        .bind(before_i64)
-        .bind(max_allowed_before)
-        .bind(delta_i64)
-        .bind(first_i64)
-        .bind(vis_i64)
-        .bind(sec)
-        .bind(nsec)
-        .bind(committed_at_ms)
-        .bind(expires_at_ms)
-        .bind(actor_str)
-        .bind(idemp.command_key.as_str())
-        .bind(idemp.command_hash.as_bytes().as_slice())
-        .bind(cmd_id.as_str())
-        .bind(input.run.as_str())
-        .bind(new_run_rev.as_str())
-        .bind(run_meta.as_slice())
-        .bind(owner_key.as_str())
-        .bind(effect_draft.payload_id.as_str())
-        .bind(effect_draft.codec.as_str())
-        .bind(effect_draft.effect_msgpack.as_slice())
-        .bind(resp_pid.as_str())
-        .bind(resp_bytes.as_slice())
-        .bind(sanitized.as_slice())
-        .bind(noop_folder_id)
-        .bind(has_full)
-        .bind(has_trash)
-        .bind(owner_nid_strs)
-        .bind(chk_folders)
-        .bind(chk_slug_folds)
-        .bind(cat_digests)
-        .bind(cat_deltas)
-        .bind(m_is_full)
-        .bind(m_nids)
-        .bind(m_parents)
-        .bind(m_slugs)
-        .bind(m_slug_folds)
-        .bind(m_titles)
-        .bind(m_title_folds)
-        .bind(m_doc_classes)
-        .bind(m_abilities)
-        .bind(m_revs)
-        .bind(m_parent_revs)
-        .bind(m_restored_revs)
-        .bind(m_digests)
-        .bind(m_pub_ids)
-        .bind(m_byte_sizes)
-        .bind(m_lifecycles)
-        .bind(m_vis_masks)
-        .bind(m_sseqs)
-        .bind(m_metas)
-        .bind(m_op_kinds)
-        .fetch_one(&mut *conn)
-        .await;
-
-        match apply_res {
-            Ok(code) => Ok((resp_bytes, visibility_seq, code)),
-            Err(sqlx::Error::Database(db_err))
-                if db_err.message().contains("NOTARIUM_RB_FALLBACK_0") =>
-            {
-                Ok((resp_bytes, visibility_seq, 0))
-            }
-            Err(sqlx::Error::Database(db_err)) => Err(internal_not_committed(
-                "pg_fast_rb_apply_db_err",
-                db_err.to_string(),
-            )),
-            Err(_transport_err) => {
-                // Ambiguous autocommit outcome on transport/IO failure: consume held fences conservatively.
-                for (mut guard, res) in locked_fences.drain(..) {
-                    let _ = guard.consume(res, req_id);
-                }
-                Ok((resp_bytes, visibility_seq, i64::MIN))
-            }
-        }
-    }
-    .await;
-
-    match prep_res {
-        Ok((response_bytes, new_effective_cut, 1)) => {
-            for (mut guard, res) in locked_fences {
-                if let Err(err) = guard.consume(res, req_id) {
-                    return PgFastInnerResult::UnknownCommit {
-                        response_bytes,
-                        diag_reason: format!("fence_consume_post_commit:{err:?}"),
-                    };
-                }
-            }
-            PgFastInnerResult::Committed {
-                response_bytes,
-                initial_cut: current_effective_cut,
-                new_effective_cut,
-            }
-        }
-        Ok((_, _, 0)) => {
-            drop(locked_fences);
-            PgFastInnerResult::FallbackToStandard
-        }
-        Ok((_, _, neg_idx)) if neg_idx < 0 && neg_idx > i64::MIN => {
-            drop(locked_fences);
-            let idx = ((-neg_idx) as usize).saturating_sub(1);
-            let (folder_id, _, slug, is_root_child) = planned_collision_checks
-                .get(idx)
-                .cloned()
-                .unwrap_or_else(|| (root_folder_id.clone(), String::new(), String::new(), true));
-            PgFastInnerResult::Failed {
-                err: DomainError::PathConflict {
-                    target: PathTarget {
-                        space_id: scope_cl.space_id.clone(),
-                        parent: if is_root_child { None } else { Some(folder_id) },
-                        component: slug,
-                    },
-                }
-                .into(),
-                effective_cut: Some(current_effective_cut),
-            }
-        }
-        Ok((response_bytes, _, _)) => PgFastInnerResult::UnknownCommit {
-            response_bytes,
-            diag_reason: "pg_fast_rb_apply_ambiguous_io".to_owned(),
-        },
-        Err(err) => {
-            drop(locked_fences);
-            PgFastInnerResult::Failed {
-                err,
-                effective_cut: Some(current_effective_cut),
-            }
-        }
-    }
 }
