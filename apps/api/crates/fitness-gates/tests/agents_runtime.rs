@@ -52,8 +52,9 @@ use notarium_agents::{
     revocation::RevocationHub,
 };
 use notarium_canonical::{
-    CanonicalConfig, CanonicalRuntime, CanonicalStore, PgConnectConfig, PgTransport,
-    SqlBackendConfig,
+    BlobBackendConfig, CanonicalConfig, CanonicalRuntime, CanonicalStore, PgConnectConfig,
+    PgTransport, S3AddressingStyle, S3BucketModePolicy, S3Config, S3Credentials, SqlBackendConfig,
+    blobs::s3::admin_ensure_bucket,
 };
 use notarium_collab::CollabHub;
 use notarium_control::{
@@ -79,6 +80,54 @@ use support::{Fixture, budget};
 
 #[global_allocator]
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+async fn shared_test_s3_config(prefix: &str) -> S3Config {
+    let container_manifest =
+        std::path::Path::new("/workspace/.artifacts/storage-tests/current.json");
+    let manifest_path = if container_manifest.exists() {
+        container_manifest.to_path_buf()
+    } else {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../../.artifacts/storage-tests/current.json")
+    };
+    let raw: Value = serde_json::from_slice(
+        &std::fs::read(&manifest_path).expect("read storage-tests manifest"),
+    )
+    .expect("parse storage-tests manifest");
+    let container_sock = PathBuf::from(raw["s3_socket_container"].as_str().unwrap());
+    let host_sock = PathBuf::from(raw["s3_socket_host"].as_str().unwrap());
+    let s3_socket = if container_sock.exists() {
+        container_sock
+    } else {
+        host_sock
+    };
+    let mut cfg = S3Config {
+        endpoint: raw["s3_endpoint"].as_str().unwrap().to_owned(),
+        region: raw["s3_region"].as_str().unwrap().to_owned(),
+        bucket: "notarium-test-shared".to_owned(),
+        application_prefix: String::new(),
+        addressing: S3AddressingStyle::PathStyle,
+        credentials: S3Credentials {
+            access_key_id: raw["s3_access_key"].as_str().unwrap().to_owned(),
+            secret_access_key: raw["s3_secret_key"].as_str().unwrap().to_owned(),
+            session_token: None,
+        },
+        custom_ca_pem: None,
+        unix_socket: Some(s3_socket),
+        bucket_mode_policy: S3BucketModePolicy::DetectFromBucket,
+        request_timeout: std::time::Duration::from_secs(10),
+    };
+    static BUCKET_READY: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+    BUCKET_READY
+        .get_or_init(|| async {
+            admin_ensure_bucket(&cfg, Some("Enabled"))
+                .await
+                .expect("ensure shared test S3 bucket");
+        })
+        .await;
+    cfg.application_prefix = format!("{prefix}/");
+    cfg
+}
 
 struct RuntimeFixture {
     storage: Fixture,
@@ -146,6 +195,14 @@ impl RuntimeFixture {
                 *pool_size = size;
             }
             config.sql = sql;
+            let mut s3_nonce = [0_u8; 6];
+            getrandom::fill(&mut s3_nonce).unwrap();
+            let s3_cfg = shared_test_s3_config(&format!(
+                "agents-runtime-{fixture_name}-{}",
+                hex::encode(s3_nonce)
+            ))
+            .await;
+            config.blobs = BlobBackendConfig::S3(Box::new(s3_cfg));
             config.default_backup_budget =
                 notarium_canonical::config::default_postgres_backup_budget();
         }
@@ -414,7 +471,9 @@ impl RuntimeFixture {
         drop(canonical);
         runtime.shutdown().await.unwrap();
         storage.close().await;
-        if let Some(root) = temporary_blob_root {
+        if let Some(root) = temporary_blob_root
+            && root.exists()
+        {
             std::fs::remove_dir_all(root).unwrap();
         }
     }

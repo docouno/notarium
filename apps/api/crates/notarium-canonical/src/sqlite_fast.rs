@@ -1799,7 +1799,11 @@ pub(crate) async fn execute_sqlite_fast_batch(
         FastSqlStageResult::UnknownDirectCommit { slots, diag_reason } => {
             restore_writer_rconn(pair, rconn);
             store.schedule_unretained_local_files_cleanup(cleanup_all_published(local_cas_res));
-            BatchExecOutcome::UnknownCommit { slots, diag_reason }
+            BatchExecOutcome::UnknownCommit {
+                slots,
+                diag_reason,
+                pg_barrier: None,
+            }
         }
         FastSqlStageResult::CommittedDirectly {
             space_states,
@@ -1976,6 +1980,7 @@ pub(crate) async fn execute_sqlite_fast_batch(
                             BatchExecOutcome::UnknownCommit {
                                 slots: pending.slots,
                                 diag_reason,
+                                pg_barrier: None,
                             }
                         }
                     }
@@ -2044,6 +2049,7 @@ fn finalize_committed_batch(
         return BatchExecOutcome::UnknownCommit {
             slots,
             diag_reason: "fault_injected_commit_response_loss".to_owned(),
+            pg_barrier: None,
         };
     }
 

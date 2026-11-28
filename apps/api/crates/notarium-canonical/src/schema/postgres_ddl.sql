@@ -694,13 +694,13 @@ CREATE TABLE IF NOT EXISTS chat_entries (
     body_format INTEGER NOT NULL DEFAULT 0 CHECK (body_format IN (0, 1, 2)),
     provenance_json TEXT,
     PRIMARY KEY (space_id, thread_id, entry_seq),
-    CHECK (
+    CONSTRAINT chat_entries_body_check CHECK (
         (kind = 'redacted' AND inline_text IS NULL AND payload_blake3 IS NULL AND redacted_at_seq IS NOT NULL)
         OR (
             kind <> 'redacted'
             AND redacted_at_seq IS NULL
             AND (
-                (inline_text IS NOT NULL AND octet_length(inline_text) <= 512 AND payload_blake3 IS NULL)
+                (inline_text IS NOT NULL AND octet_length(inline_text) <= 32768 AND payload_blake3 IS NULL)
                 OR (inline_text IS NULL AND payload_blake3 IS NOT NULL)
             )
         )
@@ -769,8 +769,8 @@ CREATE TABLE IF NOT EXISTS chat_pending_inputs (
     consumed_entry_seq BIGINT,
     ext_space_tainted INTEGER NOT NULL DEFAULT 0 CHECK (ext_space_tainted IN (0, 1)),
     PRIMARY KEY (space_id, thread_id, input_id),
-    CHECK (
-        (inline_text IS NOT NULL AND octet_length(inline_text) <= 512 AND payload_blake3 IS NULL)
+    CONSTRAINT chat_pending_inputs_body_check CHECK (
+        (inline_text IS NOT NULL AND octet_length(inline_text) <= 32768 AND payload_blake3 IS NULL)
         OR (inline_text IS NULL AND payload_blake3 IS NOT NULL)
     ),
     FOREIGN KEY (space_id, thread_id) REFERENCES chat_threads (space_id, thread_id)

@@ -547,8 +547,6 @@ canonical_port!(ChatPort;
     read_chat(ChatRead) -> ChatBranch,
     read_chat_compaction_prefix(ChatRead) -> ChatCompactionPrefix,
     read_chat_proposal(ChatProposalRead) -> CanonicalChatProposal,
-    stage_chat_blob(String) -> StagedChatBlob,
-    discard_staged_chat_blob(StagedChatBlob) -> (),
     create_chat(Mutation<CreateChat>) -> Committed<ChatThread>,
     fork_chat(Mutation<ForkChat>) -> Committed<ChatThread>,
     queue_chat_input(Mutation<PendingChatInput>) -> QueueInputOutcome,

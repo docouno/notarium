@@ -495,6 +495,7 @@ impl CanonicalRuntime {
         config: CanonicalConfig,
         custom_s3_transport: Option<Arc<dyn S3Transport>>,
     ) -> Result<(CanonicalStore, Self), PortError> {
+        config.validate_storage_profile()?;
         config.validate_timer_intervals()?;
         let mut locks = Vec::new();
         match (&config.sql, &config.blobs) {
@@ -509,13 +510,10 @@ impl CanonicalRuntime {
                     locks.push(DataRootOwnerLock::acquire(blob_root)?);
                 }
             }
-            (SqlBackendConfig::Sqlite { data_root, .. }, BlobBackendConfig::S3(_)) => {
-                locks.push(DataRootOwnerLock::acquire(data_root)?);
-            }
-            (SqlBackendConfig::Postgres { .. }, BlobBackendConfig::Local { data_root }) => {
-                locks.push(DataRootOwnerLock::acquire(data_root)?);
-            }
             (SqlBackendConfig::Postgres { .. }, BlobBackendConfig::S3(_)) => {}
+            _ => {
+                unreachable!("validated storage profile allows only LocalSqlite or CloudPostgresS3")
+            }
         }
 
         let blobs = BlobBackendDriver::open(&config.blobs, custom_s3_transport).await?;
@@ -766,10 +764,11 @@ impl CanonicalRuntime {
                 let _ = task.await;
             }
         }
+        // Non-blocking final sweep so external retained tickets never deadlock shutdown.
         CanonicalStore {
             inner: self.inner.clone(),
         }
-        .sweep_deferred_local_orphans_async(true)
+        .sweep_deferred_local_orphans_async(false)
         .await;
         if let Some(wal) = self.inner.wal_coord.get() {
             wal.shutdown().await;
@@ -837,6 +836,75 @@ impl CanonicalStore {
     /// backend rather than a multi-writer PostgreSQL database.
     pub fn is_local_sqlite(&self) -> bool {
         matches!(self.inner.sql, SqlDriverState::Sqlite { .. })
+    }
+
+    /// Waits on PostgreSQL until any in-flight transaction that locked the
+    /// touched `spaces` rows `FOR UPDATE` has either committed or aborted.
+    ///
+    /// Called only after an ambiguous `COMMIT` outcome while `RevocationLease`
+    /// guards are still held, and strictly AFTER the ambiguous writer socket
+    /// has been closed and returned to the pool so `pool_size = 1` cannot
+    /// deadlock.
+    pub(crate) async fn await_pg_unknown_commit_barrier(&self, spaces: &[SpaceId]) {
+        let SqlDriverState::Postgres { pool, .. } = &self.inner.sql else {
+            return;
+        };
+        if spaces.is_empty() {
+            return;
+        }
+        let mut space_ids: Vec<&str> = spaces.iter().map(SpaceId::as_str).collect();
+        space_ids.sort_unstable();
+        space_ids.dedup();
+        let shutdown = self.inner.backup_shutdown.clone();
+        let mut backoff = Duration::from_millis(25);
+        let max_backoff = Duration::from_secs(1);
+
+        loop {
+            if shutdown.is_cancelled() || self.inner.shutting_down.load(Ordering::Acquire) {
+                return;
+            }
+            let attempt = async {
+                let mut pooled = pool.acquire().await.map_err(|_| ())?;
+                let mut lease = PgTransactionLease::new(&mut pooled);
+                sqlx::raw_sql("BEGIN")
+                    .execute(lease.conn())
+                    .await
+                    .map_err(|_| ())?;
+                sqlx::query(
+                    "SELECT 1 FROM spaces WHERE space_id = ANY($1) ORDER BY space_id FOR SHARE",
+                )
+                .bind(&space_ids)
+                .fetch_all(lease.conn())
+                .await
+                .map_err(|_| ())?;
+                sqlx::raw_sql("ROLLBACK")
+                    .execute(lease.conn())
+                    .await
+                    .map_err(|_| ())?;
+                lease.complete();
+                Ok::<(), ()>(())
+            };
+            tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => return,
+                res = attempt => {
+                    if res.is_ok() {
+                        return;
+                    }
+                }
+            }
+            tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => return,
+                _ = tokio::time::sleep(backoff) => {}
+            }
+            backoff = (backoff * 2).min(max_backoff);
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    pub async fn await_pg_unknown_commit_barrier_for_test(&self, spaces: &[SpaceId]) {
+        self.await_pg_unknown_commit_barrier(spaces).await;
     }
 
     /// Monotonic SQLite writer commit generation, or `None` on multi-writer

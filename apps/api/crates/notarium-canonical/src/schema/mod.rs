@@ -77,27 +77,89 @@ pub async fn bootstrap_sqlite_schema(
 ) -> Result<DatabaseWitness, PortError> {
     let expected_checksum = manifest_checksum();
 
-    sqlx::query("BEGIN IMMEDIATE")
-        .execute(&mut *conn)
+    let needs_fk_rebuild = sqlx::query_scalar::<_, i64>(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_meta'",
+    )
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|err| internal_not_committed("sqlite_bootstrap_probe_meta", err.to_string()))?
+    .is_some()
+        && sqlx::query_scalar::<_, i64>(
+            "SELECT CAST(schema_version AS INTEGER) FROM schema_meta WHERE singleton_id = 1",
+        )
+        .fetch_optional(&mut *conn)
         .await
-        .map_err(|err| internal_not_committed("sqlite_bootstrap_begin", err.to_string()))?;
+        .map_err(|err| internal_not_committed("sqlite_bootstrap_probe_version", err.to_string()))?
+        .is_some_and(|version| version < i64::from(CANONICAL_SCHEMA_VERSION));
 
-    let outcome = bootstrap_sqlite_inner(conn, expected_installation, expected_checksum).await;
-    match outcome {
-        Ok(witness) => {
-            sqlx::query("COMMIT")
-                .execute(&mut *conn)
-                .await
-                .map_err(|err| {
-                    internal_not_committed("sqlite_bootstrap_commit", err.to_string())
-                })?;
+    if needs_fk_rebuild {
+        sqlx::query("PRAGMA foreign_keys = OFF")
+            .execute(&mut *conn)
+            .await
+            .map_err(|err| internal_not_committed("sqlite_bootstrap_fk_off", err.to_string()))?;
+        sqlx::query("PRAGMA legacy_alter_table = ON")
+            .execute(&mut *conn)
+            .await
+            .map_err(|err| {
+                internal_not_committed("sqlite_bootstrap_legacy_alter_on", err.to_string())
+            })?;
+    }
+
+    let result = async {
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *conn)
+            .await
+            .map_err(|err| internal_not_committed("sqlite_bootstrap_begin", err.to_string()))?;
+
+        let outcome = async {
+            let witness =
+                bootstrap_sqlite_inner(conn, expected_installation, expected_checksum).await?;
+            if needs_fk_rebuild {
+                let fk_violation = sqlx::query("PRAGMA foreign_key_check")
+                    .fetch_optional(&mut *conn)
+                    .await
+                    .map_err(|err| {
+                        internal_not_committed("sqlite_bootstrap_fk_check", err.to_string())
+                    })?;
+                if fk_violation.is_some() {
+                    return Err(internal_not_committed(
+                        "sqlite_bootstrap_fk_violation",
+                        "foreign key check failed after schema upgrade",
+                    ));
+                }
+            }
             Ok(witness)
         }
-        Err(err) => {
-            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
-            Err(err)
+        .await;
+
+        match outcome {
+            Ok(witness) => {
+                sqlx::query("COMMIT")
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(|err| {
+                        internal_not_committed("sqlite_bootstrap_commit", err.to_string())
+                    })?;
+                Ok(witness)
+            }
+            Err(err) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                Err(err)
+            }
         }
     }
+    .await;
+
+    if needs_fk_rebuild {
+        let _ = sqlx::query("PRAGMA legacy_alter_table = OFF")
+            .execute(&mut *conn)
+            .await;
+        let _ = sqlx::query("PRAGMA foreign_keys = ON")
+            .execute(&mut *conn)
+            .await;
+    }
+
+    result
 }
 
 async fn bootstrap_sqlite_inner(

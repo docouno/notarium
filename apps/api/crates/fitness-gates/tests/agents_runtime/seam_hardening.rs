@@ -4216,7 +4216,6 @@ async fn rollback_run_stops_active_keeper_and_rejects_unsettled_runs(
     // 2. Remote/unsettled active Keeper: a second claimed slot with NO local RevocationHub
     //    entry must be rejected by `rollback_run` with ValidationReason::InvalidState.
     let next_due = Timestamp::parse("2025-02-09T03:00:00Z").unwrap();
-    let after_next = Timestamp::parse("2025-02-16T03:00:00Z").unwrap();
     fixture
         .storage
         .clock
@@ -4241,7 +4240,6 @@ async fn rollback_run_stops_active_keeper_and_rejects_unsettled_runs(
                 slot: next_due,
                 expected: live_sched.revision,
                 current_role: live_sched.definition.approved_role.clone(),
-                next_slot: Some(after_next),
             },
         )
         .await
@@ -14244,7 +14242,6 @@ async fn authority_narrowing_chat_and_replay_seams(
         let sched_b_id =
             ScheduleId::from_bytes([0xD2, 45, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
         let due_slot = Timestamp::parse("2029-01-07T03:00:00Z").unwrap();
-        let next_slot = Timestamp::parse("2029-01-14T03:00:00Z").unwrap();
         let mk_sched_def = |title: &str| ScheduleDefinition {
             space: sa.history.space_id.clone(),
             project: Some(sa_p1.clone()),
@@ -14300,7 +14297,6 @@ async fn authority_narrowing_chat_and_replay_seams(
                 ClaimSchedule {
                     schedule: sched_a_id.clone(),
                     slot: due_slot,
-                    next_slot: Some(next_slot),
                     current_role: sched_role.clone(),
                     expected: sched_a_rev,
                 },

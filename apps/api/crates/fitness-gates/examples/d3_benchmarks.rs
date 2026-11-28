@@ -1595,17 +1595,13 @@ async fn run_pg_rollback_benchmark(
     let _ = fs::remove_dir_all(&local_dir);
     fs::create_dir_all(&local_dir).unwrap();
 
-    let blobs_cfg = if use_s3 {
+    let blobs_cfg = {
         let bucket = fixtures.fresh_s3_bucket(tag);
         let s3_cfg = fixtures.s3_config(bucket);
         admin_ensure_bucket(&s3_cfg, Some("Enabled"))
             .await
             .expect("ensure benchmark S3 bucket");
         BlobBackendConfig::S3(Box::new(s3_cfg))
-    } else {
-        BlobBackendConfig::Local {
-            data_root: DataRoot::new(&local_dir),
-        }
     };
 
     let cfg = CanonicalConfig {
@@ -2768,6 +2764,12 @@ async fn paired_profiles(
     let schema = fixtures.fresh_pg_schema("paired");
     let (control_db, keyring) = if postgres {
         cfg.sql = SqlBackendConfig::postgres_default(fixtures.pg_connect(), &schema);
+        let bucket = fixtures.fresh_s3_bucket("paired");
+        let s3_cfg = fixtures.s3_config(bucket);
+        admin_ensure_bucket(&s3_cfg, Some("Enabled"))
+            .await
+            .expect("ensure paired benchmark S3 bucket");
+        cfg.blobs = BlobBackendConfig::S3(Box::new(s3_cfg));
         cfg.default_backup_budget = notarium_canonical::config::default_postgres_backup_budget();
         let db = ControlStore::postgres(PostgresConfig::unix_socket(
             fixtures.pg_socket_dir.clone(),
@@ -3179,14 +3181,14 @@ async fn d3(budgets: D3Budgets) {
     }
     {
         let pg_schema = fixtures.fresh_pg_schema("chat");
-        let chat_pg_dir = work_root.join("chat-pg-cas");
-        fs::create_dir_all(&chat_pg_dir).unwrap();
+        let s3_cfg = fixtures.s3_config(fixtures.fresh_s3_bucket("chat"));
+        admin_ensure_bucket(&s3_cfg, Some("Enabled"))
+            .await
+            .expect("ensure chat benchmark S3 bucket");
         let (st, rt) = CanonicalRuntime::open(CanonicalConfig {
             installation_id: InstallationId::from_bytes([0x59; 16]),
             sql: SqlBackendConfig::postgres_default(fixtures.pg_connect(), &pg_schema),
-            blobs: BlobBackendConfig::Local {
-                data_root: DataRoot::new(&chat_pg_dir),
-            },
+            blobs: BlobBackendConfig::S3(Box::new(s3_cfg)),
             writer: WriterConfig::default(),
             snapshot_retention: Duration::from_secs(300),
             default_backup_budget: notarium_canonical::config::default_postgres_backup_budget(),
@@ -3243,14 +3245,14 @@ async fn d3(budgets: D3Budgets) {
     }
     {
         let pg_schema = fixtures.fresh_pg_schema("board");
-        let b_dir = work_root.join("board-pg-cas");
-        fs::create_dir_all(&b_dir).unwrap();
+        let s3_cfg = fixtures.s3_config(fixtures.fresh_s3_bucket("board"));
+        admin_ensure_bucket(&s3_cfg, Some("Enabled"))
+            .await
+            .expect("ensure board benchmark S3 bucket");
         let (st, rt) = CanonicalRuntime::open(CanonicalConfig {
             installation_id: InstallationId::from_bytes([0x69; 16]),
             sql: SqlBackendConfig::postgres_default(fixtures.pg_connect(), &pg_schema),
-            blobs: BlobBackendConfig::Local {
-                data_root: DataRoot::new(&b_dir),
-            },
+            blobs: BlobBackendConfig::S3(Box::new(s3_cfg)),
             writer: WriterConfig::default(),
             snapshot_retention: Duration::from_secs(300),
             default_backup_budget: notarium_canonical::config::default_postgres_backup_budget(),
@@ -3312,14 +3314,14 @@ async fn d3(budgets: D3Budgets) {
     }
     {
         let pg_schema = fixtures.fresh_pg_schema("folder");
-        let f_dir = work_root.join("folder-pg-cas");
-        fs::create_dir_all(&f_dir).unwrap();
+        let s3_cfg = fixtures.s3_config(fixtures.fresh_s3_bucket("folder"));
+        admin_ensure_bucket(&s3_cfg, Some("Enabled"))
+            .await
+            .expect("ensure folder benchmark S3 bucket");
         let (st, rt) = CanonicalRuntime::open(CanonicalConfig {
             installation_id: InstallationId::from_bytes([0x7B; 16]),
             sql: SqlBackendConfig::postgres_default(fixtures.pg_connect(), &pg_schema),
-            blobs: BlobBackendConfig::Local {
-                data_root: DataRoot::new(&f_dir),
-            },
+            blobs: BlobBackendConfig::S3(Box::new(s3_cfg)),
             writer: WriterConfig::default(),
             snapshot_retention: Duration::from_secs(300),
             default_backup_budget: notarium_canonical::config::default_postgres_backup_budget(),

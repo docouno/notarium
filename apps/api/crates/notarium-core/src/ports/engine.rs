@@ -199,12 +199,6 @@ pub trait ChatPort: Send + Sync {
         ctx: SpaceContext,
         request: ChatProposalRead,
     ) -> PortFuture<'_, CanonicalChatProposal>;
-    fn stage_chat_blob(&self, ctx: SpaceContext, text: String) -> PortFuture<'_, StagedChatBlob>;
-    fn discard_staged_chat_blob(
-        &self,
-        ctx: SpaceContext,
-        staged: StagedChatBlob,
-    ) -> PortFuture<'_, ()>;
     fn create_chat(
         &self,
         ctx: SpaceContext,

@@ -15,7 +15,7 @@ async fn mutation_envelopes_validate_before_replay_on_both_drivers() {
         let root = TempDataRoot::new("mutation-predicates");
         let installation = sample_installation_id(92);
         let cfg = if postgres {
-            fixtures.pg_local_config(installation, &schema, root.data_root())
+            fixtures.open_pg_s3_config(installation, &schema).await
         } else {
             CanonicalConfig::local_default(installation, root.data_root())
         };

@@ -7,10 +7,11 @@ and `notarium-syntax` within the workspace.
 
 ## Runtime profiles and ownership boundary
 
-Two runtime storage profiles execute the same typed domain logic and pass the
-same behavioral parity suites:
+Two closed runtime storage profiles execute the same typed domain logic and pass
+the same behavioral parity suites (`CanonicalRuntime::open` rejects hybrid
+combinations such as PostgreSQL with local CAS or SQLite with S3):
 
-- **Local profile:** `SQLite` (`journal_mode = WAL`, `synchronous = FULL`,
+- **Local profile (`LocalSqlite`):** `SQLite` (`journal_mode = WAL`, `synchronous = FULL`,
   `secure_delete = ON`, `wal_autocheckpoint = 0`, `foreign_keys = ON`,
   `journal_size_limit = 64 MiB` at idle, zero `ATTACH DATABASE` statements and
   zero FTS/virtual shadow tables) paired with `LocalZstdV1` content-addressed
@@ -19,7 +20,7 @@ same behavioral parity suites:
   `fullfsync=ON`. On macOS this requests `F_FULLFSYNC` from the filesystem
   for both WAL commits and checkpoints. SQLite falls back to `fsync` if the
   filesystem does not support that request.
-- **Cloud profile:** `PostgreSQL 16` (`synchronous_commit = on`, `fsync = on`,
+- **Cloud profile (`CloudPostgresS3`):** `PostgreSQL 16` (`synchronous_commit = on`, `fsync = on`,
   `LC_COLLATE = C` / UTF-8 bytewise collation parity, `fillfactor = 70` on
   `spaces` and `fillfactor = 80` on `note_heads` to preserve PostgreSQL HOT
   updates without indexing `last_seq` or `updated_seq`) paired with
@@ -31,15 +32,21 @@ same behavioral parity suites:
   roots and match its identity to the configured host, including loopback.
   Set the TCP transport's `root_cert` field to a PEM CA file to trust a private
   issuer. Local PostgreSQL fixtures connect through a Unix socket.
+  When a PostgreSQL writer batch or guarded auxiliary commit returns an
+  ambiguous outcome while revocation leases are held, the store closes the
+  ambiguous connection and waits for a short `FOR SHARE` barrier on the touched
+  `spaces` rows before releasing those revocation leases so concurrent
+  revocation cannot settle ahead of a late server-side commit.
 
 `CanonicalRuntime::open` acquires lifetime `DataRootOwnerLock` guards where
 local storage is used, verifies or bootstraps the schema transactionally and
 reconciles interrupted collaboration room fences. SQLite resumes pending blob
-retirements on open. If the installation has used projections, a purge that
-still requires derived cleanup stays pending until its handler is available.
-While the exclusive SQLite opener waits for that handler, it can still reclaim
-unbound S3 uploads left by the previous process, including uploads from the
-current lease epoch. Online recovery protects uploads owned by a live writer.
+retirements on open. Shutdown performs a non-blocking local orphan sweep so
+external retained staging tickets cannot deadlock shutdown. If the installation
+has used projections, a purge that still requires derived cleanup stays pending
+until its handler is available. In the Cloud profile, lease takeover reclaims
+unbound S3 uploads left by a previous process. Online recovery protects uploads
+owned by a live writer.
 If recovery fails, opening cancels its workers and releases local ownership
 before returning the error. Dropping an opening future schedules the same
 shutdown on its Tokio runtime. The DataRoot stays locked until the workers and
@@ -529,17 +536,13 @@ same example against an isolated prefix.
 - **Job pagination.** `list_jobs` binds each cursor to the original Space cut.
   Continuation returns `CursorStale` if the cut advances or a heartbeat changes
   progress visible to the query. Consumers can open a new read at the current cut.
-- **Chat DAG and pending queue:** `chat_entries` stores `<= 512`-byte UTF-8
-  messages inline and `> 512`-byte payloads in verified CAS. Each
-  `stage_chat_blob` call records a per-author lease with its provenance, including
-  when several calls stage the same digest. Append consumes the specific lease.
-  When a caller leaves during COMMIT, storage releases its undelivered lease and
-  retires the content if the last owner has gone. Shutdown or a process crash can interrupt
-  this handoff. The original grant can call `next_staged_chat_blob` with its
-  request ID, content digest and matching provenance to recover each outstanding
-  lease, then append it or release it with `discard_staged_chat_blob`. A repeated
-  release is safe. Existing leases remain consumable with their original tokens.
-  Legacy leases with unknown provenance count as externally tainted. A leaf window follows at most one parent per returned entry and issues
+- **Chat DAG and pending queue:** `chat_entries` enforces a `256 KiB` UTF-8
+  per-entry payload cap, stores `<= 32 KiB` messages inline, and transparently
+  stages `> 32 KiB` payloads into verified CAS inside `append_chat` and
+  `queue_chat_input` without a separate client staging protocol. Verified CAS
+  decoding enforces a `64 MiB` hard raw-size ceiling before Zstd decompression,
+  and chat hydration checks per-read byte budgets before decompressing each blob.
+  A leaf window follows at most one parent per returned entry and issues
   zero writes. For a distant `before` cursor, ancestry validation first walks
   fixed jumps of 256 levels, then 16 levels, then individual parents. For a
   depth difference `d`, this takes up to `d / 256` full jumps plus at most 30

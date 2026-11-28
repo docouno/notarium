@@ -195,82 +195,7 @@ impl CanonicalStore {
         R: Send + 'static,
     {
         let abort_on_revoke = registration.is_none();
-        self.with_guarded_auxiliary_command_inner(
-            space,
-            visible_space,
-            timing,
-            registration,
-            abort_on_revoke,
-            true,
-            after_commit,
-            || Box::pin(async {}),
-            op,
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn with_guarded_auxiliary_command_with_abort_cleanup<T, R, F, C>(
-        &self,
-        space: SpaceId,
-        visible_space: Option<SpaceId>,
-        timing: Option<(&CallBudget, CommandDeadline)>,
-        registration: Option<CanonicalEffectAdmission>,
-        after_commit: impl FnOnce(T) -> Result<R, PortError> + Send + 'static,
-        on_pre_commit_abort: C,
-        op: F,
-    ) -> Result<R, PortError>
-    where
-        F: for<'c> FnOnce(
-                &'c mut BackendConn<'_>,
-                AuxiliaryEffect,
-            ) -> crate::BoxFuture<'c, Result<T, PortError>>
-            + Send
-            + 'static,
-        C: FnOnce() -> crate::BoxFuture<'static, ()> + Send + 'static,
-        T: Send + 'static,
-        R: Send + 'static,
-    {
-        // Never abort the worker task mid-flight when an abort cleanup hook owns
-        // local CAS rollback; let it observe revocation, roll back SQL, and run cleanup.
-        self.with_guarded_auxiliary_command_inner(
-            space,
-            visible_space,
-            timing,
-            registration,
-            false,
-            false,
-            after_commit,
-            on_pre_commit_abort,
-            op,
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn with_guarded_auxiliary_command_inner<T, R, F, C>(
-        &self,
-        space: SpaceId,
-        visible_space: Option<SpaceId>,
-        timing: Option<(&CallBudget, CommandDeadline)>,
-        registration: Option<CanonicalEffectAdmission>,
-        abort_on_revoke: bool,
-        allow_abort_before_effect: bool,
-        after_commit: impl FnOnce(T) -> Result<R, PortError> + Send + 'static,
-        on_pre_commit_abort: C,
-        op: F,
-    ) -> Result<R, PortError>
-    where
-        F: for<'c> FnOnce(
-                &'c mut BackendConn<'_>,
-                AuxiliaryEffect,
-            ) -> crate::BoxFuture<'c, Result<T, PortError>>
-            + Send
-            + 'static,
-        C: FnOnce() -> crate::BoxFuture<'static, ()> + Send + 'static,
-        T: Send + 'static,
-        R: Send + 'static,
-    {
+        let allow_abort_before_effect = true;
         let worker_timing = timing.map(|(budget, deadline)| (budget.clone(), deadline));
         let check = move || -> Result<(), PortError> {
             if let Some((budget, deadline)) = &worker_timing {
@@ -303,11 +228,14 @@ impl CanonicalStore {
                 ),
             })
         }));
+        let barrier_entered = effect_entered.clone();
         let task = self.inner.backup_executor.spawn(async move {
             let _aux_permit = aux_permit;
             check()?;
             // The owner keeps the active lease past a canceled waiter and
             // while the connection acknowledges COMMIT or ROLLBACK.
+            let barrier_space = space.clone();
+            let barrier_commit = Arc::clone(&commit);
             let operation_effect = active.clone();
             let result = store
                 .with_visibility_write_tx(
@@ -337,10 +265,18 @@ impl CanonicalStore {
                     after_commit,
                 )
                 .await;
-            drop(active);
-            if result.is_err() {
-                on_pre_commit_abort().await;
+            if store.is_postgres()
+                && result.is_err()
+                && !barrier_commit.load(Ordering::Acquire)
+                && barrier_entered
+                    .as_ref()
+                    .is_some_and(|flag| flag.load(Ordering::Acquire))
+            {
+                store
+                    .await_pg_unknown_commit_barrier(std::slice::from_ref(&barrier_space))
+                    .await;
             }
+            drop(active);
             result
         });
         let mut pending = PendingWrite {

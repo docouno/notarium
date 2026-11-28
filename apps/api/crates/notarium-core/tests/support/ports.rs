@@ -136,8 +136,6 @@ impl ChatPort for RejectingPorts {
     fn read_chat_context(&self, ctx: SpaceContext, request: ChatRead) -> PortFuture<'_, ChatBranch>;
     fn read_chat_contents(&self, ctx: SpaceContext, request: ChatContentRead) -> PortFuture<'_, Vec<HydratedChatEntry>>;
     fn read_chat_proposal(&self, ctx: SpaceContext, request: ChatProposalRead) -> PortFuture<'_, CanonicalChatProposal>;
-    fn stage_chat_blob(&self, ctx: SpaceContext, text: String) -> PortFuture<'_, StagedChatBlob>;
-    fn discard_staged_chat_blob(&self, ctx: SpaceContext, staged: StagedChatBlob) -> PortFuture<'_, ()>;
     fn list_pending_chat_inputs(&self, ctx: SpaceContext, thread: ChatThreadId) -> PortFuture<'_, Vec<QueuedChatInput>>;
     fn dismiss_chat_input(&self, ctx: SpaceContext, request: DismissPending) -> PortFuture<'_, bool>;
     fn claim_active_run(&self, ctx: SpaceContext, request: ClaimChatRun) -> PortFuture<'_, ClaimChatRunOutcome>;
@@ -401,7 +399,6 @@ impl ControlPort for RejectingPorts {
         now: Timestamp,
         page: ControlPageRequest,
     ) -> PortFuture<'_, ControlPage<ScheduleRunReceipt>>;
-    fn scheduler_clock(&self, ctx: MaintenanceContext) -> PortFuture<'_, Timestamp>;
     fn get_schedule_run(
         &self,
         ctx: ScheduleRunContext,

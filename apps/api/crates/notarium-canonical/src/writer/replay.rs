@@ -38,7 +38,7 @@ pub(crate) enum ReplayPolicy {
     RollbackRun(AgentRunId),
     Schema(Vec<ReplayResource>),
     Memory(ResolvedMemoryTarget),
-    Chat(ChatThreadId, Option<ThreadEntrySeq>, Vec<NoteRef>, bool),
+    Chat(ChatThreadId, Option<ThreadEntrySeq>, Vec<NoteRef>),
     Job(Option<JobId>, Vec<NoteId>),
 }
 
@@ -127,7 +127,7 @@ impl UnboundCommand {
         thread: &ChatThreadId,
         reads: Vec<NoteRef>,
     ) -> CommandIdentitySpec {
-        self.with_policy(auth, ReplayPolicy::Chat(thread.clone(), None, reads, false))
+        self.with_policy(auth, ReplayPolicy::Chat(thread.clone(), None, reads))
     }
 
     pub(crate) fn for_chat_leaf(
@@ -138,7 +138,7 @@ impl UnboundCommand {
     ) -> CommandIdentitySpec {
         self.with_policy(
             auth,
-            ReplayPolicy::Chat(thread.clone(), Some(leaf), Vec::new(), false),
+            ReplayPolicy::Chat(thread.clone(), Some(leaf), Vec::new()),
         )
     }
 
@@ -265,16 +265,9 @@ impl CommandIdentitySpec {
                     return Err(DomainError::ResourceNotFound.into());
                 }
             }
-            ReplayPolicy::Chat(thread, leaf, reads, legacy_staged) => {
-                crate::chats::authorize_chat_replay_tx(
-                    tx,
-                    &srec.space,
-                    auth,
-                    thread,
-                    *leaf,
-                    *legacy_staged,
-                )
-                .await?;
+            ReplayPolicy::Chat(thread, leaf, reads) => {
+                crate::chats::authorize_chat_replay_tx(tx, &srec.space, auth, thread, *leaf)
+                    .await?;
                 for note in reads {
                     if note.space_id == srec.space.id {
                         authorize_resource(

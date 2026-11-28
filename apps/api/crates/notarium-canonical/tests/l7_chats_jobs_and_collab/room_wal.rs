@@ -47,10 +47,10 @@ async fn room_takeover_releases_single_checkout_before_waiting_for_room_fence() 
     use sqlx::Row;
 
     let fixtures = StorageTestFixtures::load_required();
-    let temp = TempDataRoot::new("room-lease-single-pg");
     let schema = fixtures.fresh_pg_schema();
-    let mut config =
-        fixtures.pg_local_config(sample_installation_id(0x94), &schema, temp.data_root());
+    let mut config = fixtures
+        .open_pg_s3_config(sample_installation_id(0x94), &schema)
+        .await;
     let SqlBackendConfig::Postgres { pool_size, .. } = &mut config.sql else {
         unreachable!();
     };

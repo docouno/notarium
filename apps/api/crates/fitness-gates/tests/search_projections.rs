@@ -1170,7 +1170,6 @@ async fn claim_search_keeper(
                 slot,
                 current_role: approval.approved_role,
                 expected: scheduled.value.revision,
-                next_slot: None,
             },
         )
         .await

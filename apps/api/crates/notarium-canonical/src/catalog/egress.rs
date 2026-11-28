@@ -101,6 +101,7 @@ enum DisclosureConnection {
 pub(crate) struct CanonicalDisclosureGuard {
     connection: DisclosureConnection,
     deadline: Instant,
+    snapshot_deadline: Instant,
     cancellation: Cancellation,
 }
 
@@ -139,17 +140,25 @@ impl CanonicalDisclosureGuard {
     }
 
     pub(super) async fn finish_snapshot(&mut self) {
-        if let DisclosureConnection::Sqlite {
-            snapshot,
-            wal_guard,
-            ..
-        } = &mut self.connection
-        {
-            if let Some(conn) = snapshot.take() {
-                rollback_sqlite_clean(conn).await;
+        match &mut self.connection {
+            DisclosureConnection::Sqlite {
+                snapshot,
+                wal_guard,
+                ..
+            } => {
+                if let Some(conn) = snapshot.take() {
+                    rollback_sqlite_clean(conn).await;
+                }
+                if let Some(guard) = wal_guard.take() {
+                    guard.finish_cleanly();
+                }
             }
-            if let Some(guard) = wal_guard.take() {
-                guard.finish_cleanly();
+            DisclosureConnection::Postgres(conn) => {
+                // Return the PostgreSQL connection to the pool immediately after snapshot
+                // verification; never hold a PG transaction across Control TXs or LLM I/O.
+                if let Some(conn) = conn.take() {
+                    rollback_pg_clean(conn).await;
+                }
             }
         }
     }
@@ -182,13 +191,17 @@ impl CanonicalDisclosureGuard {
         }
         Ok(())
     }
+
+    pub(super) fn snapshot_deadline(&self) -> Instant {
+        self.snapshot_deadline
+    }
 }
 
-fn expired() -> PortError {
+pub(super) fn expired() -> PortError {
     deadline_not_committed("canonical_disclosure", "canonical disclosure deadline")
 }
 
-fn cancelled() -> PortError {
+pub(super) fn cancelled() -> PortError {
     cancelled_not_committed("canonical_disclosure", "canonical disclosure cancelled")
 }
 
@@ -204,7 +217,7 @@ impl CanonicalStore {
             .checked_add(budget.remaining)
             .unwrap_or_else(|| Instant::now() + std::time::Duration::from_secs(365 * 24 * 3600));
         let acquire = async {
-            let connection = match &self.inner.sql {
+            let (connection, snapshot_deadline) = match &self.inner.sql {
                 SqlDriverState::Sqlite {
                     read_pool,
                     disclosures,
@@ -212,13 +225,14 @@ impl CanonicalStore {
                 } => {
                     let pin = disclosures.pin(spaces).await;
                     self.ensure_open()?;
-                    let wal_guard = if let Some(wal) = self.inner.wal_coord.get() {
-                        let (guard, _read_deadline) =
-                            wal.acquire_reader_gate_slot(Some(budget)).await?;
-                        Some(guard)
-                    } else {
-                        None
-                    };
+                    let (wal_guard, snapshot_deadline) =
+                        if let Some(wal) = self.inner.wal_coord.get() {
+                            let (guard, read_deadline) =
+                                wal.acquire_reader_gate_slot(Some(budget)).await?;
+                            (Some(guard), deadline.min(read_deadline))
+                        } else {
+                            (None, deadline)
+                        };
                     let conn = read_pool
                         .acquire()
                         .await
@@ -228,39 +242,50 @@ impl CanonicalStore {
                         .execute(&mut **guarded.as_mut())
                         .await
                         .map_err(|e| internal_not_committed("egress_begin", e.to_string()))?;
-                    DisclosureConnection::Sqlite {
-                        snapshot: Some(guarded.disarm()),
-                        wal_guard,
-                        _pin: pin,
-                    }
+                    (
+                        DisclosureConnection::Sqlite {
+                            snapshot: Some(guarded.disarm()),
+                            wal_guard,
+                            _pin: pin,
+                        },
+                        snapshot_deadline,
+                    )
                 }
                 SqlDriverState::Postgres { pool, .. } => {
                     let conn = pool
                         .acquire()
                         .await
                         .map_err(|e| pg_read_error("egress_acquire", e))?;
-                    // Discard only if cancelled/failed mid-setup; clean release runs ROLLBACK and reuses the connection.
+                    // Short read-only repeatable-read snapshot (no FOR SHARE / advisory locks);
+                    // released back to the pool in `finish_snapshot` before Control TXs or LLM I/O.
                     let mut guarded = CloseOnAbort::new(conn);
-                    sqlx::raw_sql("BEGIN; SELECT pg_advisory_xact_lock_shared(hashtextextended(current_schema(), 7311229))")
+                    sqlx::raw_sql("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
                         .execute(&mut **guarded.as_mut())
                         .await
                         .map_err(|e| pg_read_error("egress_begin", e))?;
-                    for space in spaces {
-                        sqlx::query_scalar::<_, String>(
-                            "SELECT space_id FROM spaces WHERE space_id=$1 FOR SHARE",
+                    if !spaces.is_empty() {
+                        let space_ids: Vec<&str> = spaces.iter().map(SpaceId::as_str).collect();
+                        let found: i64 = sqlx::query_scalar(
+                            "SELECT COUNT(*) FROM spaces WHERE space_id = ANY($1)",
                         )
-                        .bind(space.as_str())
-                        .fetch_optional(&mut **guarded.as_mut())
+                        .bind(&space_ids)
+                        .fetch_one(&mut **guarded.as_mut())
                         .await
-                        .map_err(|e| pg_read_error("egress_lock_space", e))?
-                        .ok_or(DomainError::ResourceNotFound)?;
+                        .map_err(|e| pg_read_error("egress_check_spaces", e))?;
+                        if found as usize != space_ids.len() {
+                            return Err(DomainError::ResourceNotFound.into());
+                        }
                     }
-                    DisclosureConnection::Postgres(Some(guarded.disarm()))
+                    (
+                        DisclosureConnection::Postgres(Some(guarded.disarm())),
+                        deadline,
+                    )
                 }
             };
             Ok(CanonicalDisclosureGuard {
                 connection,
                 deadline,
+                snapshot_deadline,
                 cancellation: cancellation.clone(),
             })
         };
@@ -392,7 +417,7 @@ impl ProviderEgressCatalogPort for CanonicalStore {
             let mut guard = self
                 .pin_disclosure(&ctx.budget, &spaces, &cancellation)
                 .await?;
-            let deadline = guard.deadline;
+            let deadline = guard.snapshot_deadline;
             let current = {
                 let mut connection = guard.connection();
                 tokio::select! {

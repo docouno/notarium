@@ -13,7 +13,8 @@ use std::{
 
 use notarium_canonical::{
     BlobBackendConfig, CanonicalConfig, CanonicalRuntime, CanonicalStore, CreateSpaceSpec,
-    PgConnectConfig, PgTransport, SqlBackendConfig, UpdateSpaceSchema, WriterConfig,
+    PgConnectConfig, PgTransport, S3AddressingStyle, S3BucketModePolicy, S3Config, S3Credentials,
+    SqlBackendConfig, UpdateSpaceSchema, WriterConfig, blobs::s3::admin_ensure_bucket,
     config::default_postgres_backup_budget,
 };
 use notarium_core::{
@@ -87,6 +88,12 @@ struct PgFixture {
     pg_user: String,
     pg_password: String,
     pg_database: String,
+    s3_socket_container: PathBuf,
+    s3_socket_host: PathBuf,
+    s3_endpoint: String,
+    s3_region: String,
+    s3_access_key: String,
+    s3_secret_key: String,
 }
 
 impl PgFixture {
@@ -125,6 +132,40 @@ impl PgFixture {
             password: self.pg_password.clone(),
             database: self.pg_database.clone(),
         }
+    }
+
+    async fn s3_blobs(&self, prefix: &str) -> BlobBackendConfig {
+        let socket = [&self.s3_socket_container, &self.s3_socket_host]
+            .into_iter()
+            .find(|path| path.exists())
+            .expect("MinIO S3 fixture socket")
+            .clone();
+        let mut cfg = S3Config {
+            endpoint: self.s3_endpoint.clone(),
+            region: self.s3_region.clone(),
+            bucket: "notarium-test-shared".to_owned(),
+            application_prefix: String::new(),
+            addressing: S3AddressingStyle::PathStyle,
+            credentials: S3Credentials {
+                access_key_id: self.s3_access_key.clone(),
+                secret_access_key: self.s3_secret_key.clone(),
+                session_token: None,
+            },
+            custom_ca_pem: None,
+            unix_socket: Some(socket),
+            bucket_mode_policy: S3BucketModePolicy::DetectFromBucket,
+            request_timeout: Duration::from_secs(10),
+        };
+        static BUCKET_READY: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+        BUCKET_READY
+            .get_or_init(|| async {
+                admin_ensure_bucket(&cfg, Some("Enabled"))
+                    .await
+                    .expect("ensure shared MinIO test bucket");
+            })
+            .await;
+        cfg.application_prefix = format!("{prefix}/");
+        BlobBackendConfig::S3(Box::new(cfg))
     }
 
     fn pool_options(&self) -> PgConnectOptions {
@@ -825,9 +866,7 @@ async fn board_move_and_rollback_postgres() {
     let (store, canonical) = CanonicalRuntime::open(CanonicalConfig {
         installation_id: InstallationId::from_bytes(random_bytes()),
         sql: SqlBackendConfig::postgres_default(fixture.canonical(), &canonical_schema),
-        blobs: BlobBackendConfig::Local {
-            data_root: root.clone(),
-        },
+        blobs: fixture.s3_blobs(&canonical_schema).await,
         writer: WriterConfig::default(),
         snapshot_retention: Duration::from_secs(60),
         default_backup_budget: default_postgres_backup_budget(),

@@ -260,6 +260,9 @@ pub fn encode_zstd_level3(raw: &[u8]) -> Result<Vec<u8>, PortError> {
     })
 }
 
+/// Hard upper bound on any single decompressed canonical blob payload (64 MiB).
+pub const MAX_BLOB_DECODE_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Bounded Zstd decompression + exact raw length + full BLAKE3 integrity check.
 pub fn decode_zstd_verified(
     compressed: &[u8],
@@ -267,6 +270,12 @@ pub fn decode_zstd_verified(
     expected_raw_size: u64,
     expected_blake3: ContentDigest,
 ) -> Result<Vec<u8>, PortError> {
+    if expected_raw_size > MAX_BLOB_DECODE_BYTES {
+        return Err(internal_not_committed(
+            "blob_decode_limit_exceeded",
+            format!("raw_size {expected_raw_size} exceeds decode cap {MAX_BLOB_DECODE_BYTES}"),
+        ));
+    }
     if let Some(exp_comp) = expected_compressed_size
         && compressed.len() as u64 != exp_comp
     {
@@ -898,16 +907,12 @@ impl crate::CanonicalStore {
                                 .map_err(|err| {
                                     internal_not_committed("sqlite_check_orphan_catalog", err.to_string())
                                 })?,
-                                BackendConn::Postgres(conn) => sqlx::query_scalar(
-                                    "SELECT 1::BIGINT FROM blob_catalog WHERE space_id = $1 AND content_blake3 = $2 AND blob_state <> 'retired' LIMIT 1",
-                                )
-                                .bind(space_chk.as_str())
-                                .bind(digest.as_bytes().as_slice())
-                                .fetch_optional(&mut **conn)
-                                .await
-                                .map_err(|err| {
-                                    crate::runtime::pg_read_error("pg_check_orphan_catalog", err)
-                                })?,
+                                BackendConn::Postgres(_) => {
+                                    return Err(internal_not_committed(
+                                        "local_cas_on_postgres",
+                                        "local CAS cleanup is unsupported on PostgreSQL",
+                                    ));
+                                }
                             };
                             Ok(if cataloged.is_some() {
                                 OrphanOutcome::Keep
@@ -1937,6 +1942,18 @@ impl crate::CanonicalStore {
         digest: ContentDigest,
         budget: Option<&CallBudget>,
     ) -> Result<Vec<u8>, PortError> {
+        self.read_verified_blob_bounded(scope, digest, budget, MAX_BLOB_DECODE_BYTES)
+            .await
+    }
+
+    pub(crate) async fn read_verified_blob_bounded(
+        &self,
+        scope: &HistoryScope,
+        digest: ContentDigest,
+        budget: Option<&CallBudget>,
+        max_raw_bytes: u64,
+    ) -> Result<Vec<u8>, PortError> {
+        let cap = max_raw_bytes.min(MAX_BLOB_DECODE_BYTES);
         match &self.inner.blobs {
             BlobBackendDriver::Local(local) => {
                 let started = tokio::time::Instant::now();
@@ -1955,6 +1972,9 @@ impl crate::CanonicalStore {
                         })
                     })
                     .await?;
+                if meta.raw_size > cap {
+                    return Err(DomainError::validation(ValidationReason::BudgetExceeded).into());
+                }
                 FastLocalBlobReadPlan::new(
                     Arc::clone(local),
                     scope.space_id.clone(),
@@ -1974,6 +1994,12 @@ impl crate::CanonicalStore {
                             space_rec.scope.check(&scope_cl)?;
                             let meta =
                                 load_active_blob_meta_tx(tx, &scope_cl.space_id, digest).await?;
+                            if meta.raw_size > cap {
+                                return Err(DomainError::validation(
+                                    ValidationReason::BudgetExceeded,
+                                )
+                                .into());
+                            }
                             let pub_id = meta.publication_id.clone().ok_or_else(|| {
                                 internal_not_committed(
                                     "missing_s3_publication_id",

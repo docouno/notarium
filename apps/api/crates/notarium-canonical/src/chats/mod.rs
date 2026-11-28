@@ -2,7 +2,6 @@ mod compaction;
 mod content;
 mod queue;
 pub mod search;
-mod staging;
 mod submission;
 
 #[cfg(feature = "test-support")]
@@ -57,7 +56,7 @@ use notarium_core::{
         ConsumedPending, CreateChat, DismissPending, FinishChatRunOutcome, ForkChat,
         HydratedChatEntry, Mutation, PendingChatInput, PortFuture, Preconditions,
         QueueInputOutcome, QueuedChatInput, QueuedInput, RedactChatEntry, RedactedChat,
-        SpaceContext, StagedChatBlob, SubmitUserChatInput, SubmitUserChatOutcome,
+        SpaceContext, SubmitUserChatInput, SubmitUserChatOutcome,
     },
     receipt::MutationReceiptToken,
 };
@@ -69,14 +68,13 @@ use crate::{
     blobs::{
         BlobOwnerKind, BlobReferenceClaim, PreparedBlobSource, PublicationDiscard,
         RetirementReason, StagedBlobTicket, activate_and_bind_blob_ref_tx,
-        bind_existing_active_blob_ref_tx, count_reachable_refs_tx, release_owner_blob_refs_tx,
+        bind_existing_active_blob_ref_tx, release_owner_blob_refs_tx,
     },
     changes::{EffectBodyV1, StoredAwaitReasonV1, build_effect_payload_draft},
     codec::{
         RevisionMetadataEnvelope, RevisionMetadataPayload, ThreadRevisionMetadata,
         chat_thread_kind_from_db, chat_thread_kind_to_db, encode_timestamp_parts,
-        internal_not_committed, new_prefixed_hex_id, new_revision_id, now_unix_ms,
-        now_utc_timestamp,
+        internal_not_committed, new_prefixed_hex_id, new_revision_id, now_utc_timestamp,
     },
     domain::{
         common::{
@@ -482,18 +480,6 @@ impl ChatPort for CanonicalStore {
         Box::pin(content::read_chat_proposal(self, ctx, request))
     }
 
-    fn stage_chat_blob(&self, ctx: SpaceContext, text: String) -> PortFuture<'_, StagedChatBlob> {
-        Box::pin(async move { CanonicalStore::stage_chat_blob(self, ctx, &text).await })
-    }
-
-    fn discard_staged_chat_blob(
-        &self,
-        ctx: SpaceContext,
-        staged: StagedChatBlob,
-    ) -> PortFuture<'_, ()> {
-        Box::pin(CanonicalStore::discard_staged_chat_blob(self, ctx, staged))
-    }
-
     fn create_chat(
         &self,
         ctx: SpaceContext,
@@ -603,159 +589,6 @@ impl ChatPort for CanonicalStore {
     ) -> PortFuture<'_, Committed<RedactedChat>> {
         let store = self.clone();
         Box::pin(async move { redact_chat_entry_impl(&store, ctx, request).await })
-    }
-}
-
-impl CanonicalStore {
-    /// Stages a chat message body exceeding `StagedChatBlob::INLINE_MAX_BYTES` (`512` UTF-8 bytes)
-    /// in this Space's CAS and records a durable per-author staging reference so arbitrary unowned
-    /// digests cannot be attached via `ChatInputBody::Staged`.
-    pub async fn stage_chat_blob(
-        &self,
-        ctx: SpaceContext,
-        raw: &str,
-    ) -> Result<StagedChatBlob, PortError> {
-        if ctx.confirmed_chat_step().is_some() {
-            return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
-        }
-        let deadline =
-            crate::domain::common::CommandDeadline::start(&ctx.budget, "stage_chat_blob");
-        let byte_len = raw.len() as u64;
-        let attested = StagedChatBlob::attest_canonical(
-            ctx.scope().space_id.clone(),
-            ctx.auth().principal().clone(),
-            ContentDigest::from_bytes(*blake3::hash(raw.as_bytes()).as_bytes()),
-            byte_len,
-        )?;
-
-        let space_rec = deadline
-            .prepare(&ctx.budget, || {
-                self.read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
-            })
-            .await?;
-        space_rec.scope.check(ctx.scope())?;
-        authorize_chat_write_on_space(ctx.auth(), &space_rec.space)?;
-        if let Some(effect) = ctx.canonical_effect() {
-            effect.check()?;
-        }
-
-        let prepared = PreparedBlobSource::prepare(raw.as_bytes(), self.blob_codec())?;
-        let ticket = deadline
-            .prepare(&ctx.budget, || {
-                self.stage_blob_for_batch(&space_rec.scope, space_rec.active_epoch, &prepared)
-            })
-            .await?;
-
-        let scope = space_rec.scope.clone();
-        let staged_epoch = space_rec.active_epoch;
-        let auth_cl = ctx.auth().clone();
-        let owner_id = ctx.auth().principal().as_str().to_owned();
-        let mut lease = [0u8; 16];
-        getrandom::fill(&mut lease)
-            .map_err(|err| internal_not_committed("chat_staging_lease", err.to_string()))?;
-        let resource_key = staging::request_key(ctx.auth(), &ctx.budget.request);
-        let publish_ticket = ticket.clone();
-        let publisher = self.clone();
-        let abort_publisher = self.clone();
-        type PublishedBlobGuard = std::sync::Arc<
-            std::sync::Mutex<
-                Option<(
-                    crate::blobs::StagedBlobTicket,
-                    Vec<(SpaceId, ContentDigest)>,
-                )>,
-            >,
-        >;
-        let published_guard: PublishedBlobGuard = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let published_guard_op = std::sync::Arc::clone(&published_guard);
-        let published_guard_abort = std::sync::Arc::clone(&published_guard);
-        let effect = ctx.canonical_effect().cloned();
-        let value = self
-            .with_guarded_auxiliary_command_with_abort_cleanup(
-                ctx.scope().space_id.clone(),
-                None,
-                Some((&ctx.budget, deadline)),
-                effect,
-                Ok,
-                move || {
-                    Box::pin(async move {
-                        let pending = published_guard_abort
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .take();
-                        if let Some((held_ticket, newly_published)) = pending {
-                            // Release our LocalSharedGuard BEFORE scheduling synchronized
-                            // orphan cleanup off the writer/effect path so we never deadlock.
-                            drop(held_ticket);
-                            abort_publisher
-                                .schedule_unretained_local_files_cleanup(newly_published);
-                        }
-                    })
-                },
-                move |tx, effect| {
-                    Box::pin(async move {
-                        let live_space =
-                            crate::runtime::load_space_record_for_update_opt(tx, &scope.space_id)
-                                .await?
-                                .ok_or(DomainError::ResourceNotFound)?;
-                        effect.begin().await?;
-                        live_space.scope.check(&scope)?;
-                        publisher.inner.check_writer_epoch(
-                            &live_space.scope.space_id,
-                            live_space.active_epoch,
-                        )?;
-                        authorize_chat_write_on_space(&auth_cl, &live_space.space)?;
-                        if live_space.active_epoch != staged_epoch {
-                            return Err(crate::codec::unavailable_retryable(
-                                "stage_chat_blob_epoch_changed",
-                                "Space active_epoch changed while staging chat blob",
-                                std::time::Duration::from_millis(25),
-                            ));
-                        }
-                        let owner_lease =
-                            staged_chat_lease_key(lease, auth_cl.taint().is_tainted());
-                        activate_and_bind_blob_ref_tx(
-                            tx,
-                            &live_space.scope,
-                            live_space.active_epoch,
-                            &BlobReferenceClaim {
-                                ticket,
-                                owner_kind: BlobOwnerKind::StagedChat,
-                                owner_id,
-                                owner_rev_id: owner_lease.clone(),
-                                resource_key,
-                            },
-                            live_space.last_seq,
-                        )
-                        .await?;
-                        effect.check()?;
-                        let mut newly_published = Vec::new();
-                        let pub_res = publisher
-                            .publish_deferred_local_tickets_async(
-                                std::slice::from_ref(&publish_ticket),
-                                &mut newly_published,
-                            )
-                            .await;
-                        *published_guard_op.lock().unwrap_or_else(|e| e.into_inner()) =
-                            Some((publish_ticket, newly_published));
-                        let dirs = pub_res?;
-                        publisher.flush_pending_local_dirs_async(&dirs).await?;
-                        Ok(staging::UndeliveredLease::new(
-                            publisher,
-                            scope,
-                            attested.with_lease(lease),
-                            owner_lease,
-                        ))
-                    })
-                },
-            )
-            .await?;
-        drop(
-            published_guard
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .take(),
-        );
-        Ok(value.deliver())
     }
 }
 
@@ -1133,7 +966,6 @@ pub(crate) async fn authorize_chat_replay_tx(
     auth: &EngineAuthContext,
     thread: &ChatThreadId,
     leaf: Option<ThreadEntrySeq>,
-    legacy_staged: bool,
 ) -> Result<(), PortError> {
     authorize_chat_write_on_space(auth, space)?;
     let th = load_thread_head_opt_tx(tx, &space.id, thread)
@@ -1143,7 +975,7 @@ pub(crate) async fn authorize_chat_replay_tx(
         Some(leaf) => read_leaf_taint(tx, &space.id, thread, leaf).await?,
         None => th.tainted_mask != 0,
     };
-    authorize_thread_mutation(auth, space, &th, tainted || legacy_staged)
+    authorize_thread_mutation(auth, space, &th, tainted)
 }
 
 fn authorize_thread_mutation(
@@ -1802,192 +1634,6 @@ fn build_ancestors_vec(
         v.push(a256);
     }
     v
-}
-
-fn staged_chat_lease_key(lease: [u8; 16], tainted: bool) -> String {
-    let prefix = if tainted { "st2t_" } else { "st2c_" };
-    format!("{prefix}{:032x}", u128::from_be_bytes(lease))
-}
-
-async fn lookup_staged_chat_lease_tx(
-    tx: &mut BackendConn<'_>,
-    space_id: &SpaceId,
-    staged: &StagedChatBlob,
-) -> Result<String, PortError> {
-    let legacy = i32::from(staged.lease().is_none());
-    let clean_key = staged
-        .lease()
-        .map(|lease| staged_chat_lease_key(lease, false))
-        .unwrap_or_default();
-    let tainted_key = staged
-        .lease()
-        .map(|lease| staged_chat_lease_key(lease, true))
-        .unwrap_or_default();
-    let digest = staged.digest();
-    let lease_opt: Option<(String, i64)> = match tx {
-        BackendConn::Sqlite(conn) => {
-            let r = sqlx::query(
-                "SELECT r.owner_rev_id, c.raw_size
-                 FROM blob_references r
-                 JOIN blob_catalog c
-                   ON c.space_id = r.space_id AND c.content_blake3 = r.content_blake3
-                 WHERE r.space_id = ? AND r.owner_kind = 'staged_chat'
-                   AND r.owner_id = ?2 AND r.content_blake3 = ?3
-                   AND ((?4 = 1 AND substr(r.owner_rev_id,1,4) = 'stg_')
-                   OR (?4 = 0 AND r.owner_rev_id IN (?5,?6)))
-                   AND c.blob_state = 'active' AND c.admission_state = 'open'
-                 ORDER BY r.created_seq, r.owner_rev_id
-                 LIMIT 1",
-            )
-            .bind(space_id.as_str())
-            .bind(staged.owner().as_str())
-            .bind(digest.as_bytes().as_slice())
-            .bind(legacy)
-            .bind(&clean_key)
-            .bind(&tainted_key)
-            .fetch_optional(&mut **conn)
-            .await
-            .map_err(|err| internal_not_committed("sqlite_check_staged_chat", err.to_string()))?;
-            r.map(|row| (row.get("owner_rev_id"), row.get("raw_size")))
-        }
-        BackendConn::Postgres(conn) => {
-            let r = sqlx::query(
-                "SELECT r.owner_rev_id, c.raw_size
-                 FROM blob_references r
-                 JOIN blob_catalog c
-                   ON c.space_id = r.space_id AND c.content_blake3 = r.content_blake3
-                 WHERE r.space_id = $1 AND r.owner_kind = 'staged_chat'
-                   AND r.owner_id = $2 AND r.content_blake3 = $3
-                   AND (($4::int = 1 AND substr(r.owner_rev_id,1,4) = 'stg_')
-                   OR ($4::int = 0 AND r.owner_rev_id IN ($5,$6)))
-                   AND c.blob_state = 'active' AND c.admission_state = 'open'
-                 ORDER BY r.created_seq, r.owner_rev_id COLLATE \"C\"
-                 LIMIT 1",
-            )
-            .bind(space_id.as_str())
-            .bind(staged.owner().as_str())
-            .bind(digest.as_bytes().as_slice())
-            .bind(legacy)
-            .bind(&clean_key)
-            .bind(&tainted_key)
-            .fetch_optional(&mut **conn)
-            .await
-            .map_err(|err| internal_not_committed("pg_check_staged_chat", err.to_string()))?;
-            r.map(|row| (row.get("owner_rev_id"), row.get("raw_size")))
-        }
-    };
-
-    let Some((staging_lease, raw_size)) = lease_opt else {
-        return Err(DomainError::ResourceNotFound.into());
-    };
-    if u64::try_from(raw_size).ok() != Some(staged.byte_len()) {
-        return Err(DomainError::validation(ValidationReason::InvalidRange).into());
-    }
-
-    Ok(staging_lease)
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn consume_one_staged_chat_ref_and_bind_entry_tx(
-    tx: &mut BackendConn<'_>,
-    space_id: &SpaceId,
-    staged: &StagedChatBlob,
-    staging_lease: &str,
-    thread_id: &ChatThreadId,
-    entry_seq: ThreadEntrySeq,
-    entry_rev_id: &RevisionId,
-    seq: SpaceSeq,
-) -> Result<(), PortError> {
-    let digest = staged.digest();
-    let entry_owner_id = format!("{}:{}", thread_id.as_str(), entry_seq.get());
-    bind_existing_active_blob_ref_tx(
-        tx,
-        space_id,
-        BlobOwnerKind::ChatEntry,
-        &entry_owner_id,
-        entry_rev_id.as_str(),
-        "body",
-        digest,
-        seq,
-    )
-    .await?;
-
-    remove_staging_lease_tx(tx, space_id, staged, staging_lease).await?;
-    Ok(())
-}
-
-async fn remove_staging_lease_tx(
-    tx: &mut BackendConn<'_>,
-    space_id: &SpaceId,
-    staged: &StagedChatBlob,
-    staging_lease: &str,
-) -> Result<Option<i64>, PortError> {
-    let digest = staged.digest();
-    // Release the single consumed staging lease and recompute exact `ref_count`.
-    let now_ms = now_unix_ms()?;
-    let affected = match tx {
-        BackendConn::Sqlite(conn) => sqlx::query(
-            "DELETE FROM blob_references
-                 WHERE space_id = ? AND owner_kind = 'staged_chat'
-                   AND owner_id = ? AND owner_rev_id = ? AND content_blake3 = ?",
-        )
-        .bind(space_id.as_str())
-        .bind(staged.owner().as_str())
-        .bind(staging_lease)
-        .bind(digest.as_bytes().as_slice())
-        .execute(&mut **conn)
-        .await
-        .map_err(|err| internal_not_committed("sqlite_del_staged_chat", err.to_string()))?
-        .rows_affected(),
-        BackendConn::Postgres(conn) => sqlx::query(
-            "DELETE FROM blob_references
-                 WHERE space_id = $1 AND owner_kind = 'staged_chat'
-                   AND owner_id = $2 AND owner_rev_id = $3 AND content_blake3 = $4",
-        )
-        .bind(space_id.as_str())
-        .bind(staged.owner().as_str())
-        .bind(staging_lease)
-        .bind(digest.as_bytes().as_slice())
-        .execute(&mut **conn)
-        .await
-        .map_err(|err| internal_not_committed("pg_del_staged_chat", err.to_string()))?
-        .rows_affected(),
-    };
-    if affected == 0 {
-        return Ok(None);
-    }
-
-    let exact_count = count_reachable_refs_tx(tx, space_id, digest).await?;
-    match tx {
-        BackendConn::Sqlite(conn) => {
-            sqlx::query(
-                "UPDATE blob_catalog SET ref_count = ?, touched_at_ms = ?
-                 WHERE space_id = ? AND content_blake3 = ?",
-            )
-            .bind(exact_count)
-            .bind(now_ms)
-            .bind(space_id.as_str())
-            .bind(digest.as_bytes().as_slice())
-            .execute(&mut **conn)
-            .await
-            .map_err(|err| internal_not_committed("sqlite_sync_staged_cnt", err.to_string()))?;
-        }
-        BackendConn::Postgres(conn) => {
-            sqlx::query(
-                "UPDATE blob_catalog SET ref_count = $1, touched_at_ms = $2
-                 WHERE space_id = $3 AND content_blake3 = $4",
-            )
-            .bind(exact_count)
-            .bind(now_ms)
-            .bind(space_id.as_str())
-            .bind(digest.as_bytes().as_slice())
-            .execute(&mut **conn)
-            .await
-            .map_err(|err| internal_not_committed("pg_sync_staged_cnt", err.to_string()))?;
-        }
-    }
-
-    Ok(Some(exact_count))
 }
 
 async fn read_chat_impl(
@@ -3661,27 +3307,9 @@ async fn append_chat_impl(
     }
     let format = content::prepare(&mut request.input)?;
     let provenance_json = content::proof_json(request.input.provenance.as_ref())?;
-    match &request.input.body {
-        ChatInputBody::Text(s) => {
-            if (s.len() as u64) > StagedChatBlob::INLINE_MAX_BYTES
-                && (!is_run
-                    || request.input.kind == ChatEntryKind::Human
-                    || s.len() > content::MAX_TURN_BYTES)
-            {
-                return Err(DomainError::validation(ValidationReason::InvalidRange).into());
-            }
-        }
-        ChatInputBody::Staged(staged) => {
-            if staged.space() != &ctx.scope().space_id {
-                return Err(DomainError::validation(ValidationReason::ScopeMismatch).into());
-            }
-            if staged.owner() != ctx.auth().principal() {
-                return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
-            }
-            if staged.byte_len() <= StagedChatBlob::INLINE_MAX_BYTES {
-                return Err(DomainError::validation(ValidationReason::InvalidRange).into());
-            }
-        }
+    let ChatInputBody::Text(body_text) = &request.input.body;
+    if body_text.len() > ChatInputBody::MAX_ENTRY_BYTES {
+        return Err(DomainError::validation(ValidationReason::InvalidRange).into());
     }
 
     let mut fp = blake3::Hasher::new();
@@ -3695,19 +3323,8 @@ async fn append_chat_impl(
         fp.update(tc.as_bytes());
     }
     fp.update(&[0]);
-    match &request.input.body {
-        ChatInputBody::Text(s) => {
-            fp.update(&[1]);
-            fp.update(s.as_bytes());
-        }
-        ChatInputBody::Staged(st) => {
-            fp.update(&[2]);
-            fp.update(st.digest().as_bytes());
-            if let Some(lease) = st.lease() {
-                fp.update(&lease);
-            }
-        }
-    }
+    fp.update(&[1]);
+    fp.update(body_text.as_bytes());
     for r in &request.input.referenced_notes {
         fp.update(r.space_id.as_str().as_bytes());
         fp.update(r.note_id.as_str().as_bytes());
@@ -3720,8 +3337,6 @@ async fn append_chat_impl(
             fp.update(proof.as_bytes());
         }
     }
-    let legacy_staged =
-        matches!(&request.input.body,ChatInputBody::Staged(st) if st.lease().is_none());
     let idemp = derive_command_identity_spec(
         &ctx,
         &request.identity,
@@ -3740,7 +3355,6 @@ async fn append_chat_impl(
             request.input.thread.clone(),
             Some(request.input.parent),
             request.input.referenced_notes.clone(),
-            legacy_staged,
         ),
     );
 
@@ -3778,16 +3392,14 @@ async fn append_chat_impl(
                 replayed = replayed.sanitized_for_redaction();
             }
         }
-        replayed.value.tainted |= legacy_staged;
         if replayed.value.tainted {
             ctx.auth().taint().mark_external_read();
         }
         return Ok(replayed.into_committed());
     }
 
-    if request.input.kind == ChatEntryKind::Human
-        && let ChatInputBody::Text(text) = &request.input.body
-    {
+    if request.input.kind == ChatEntryKind::Human {
+        let ChatInputBody::Text(text) = &request.input.body;
         content::require_human_text(text)?;
     }
 
@@ -3814,18 +3426,18 @@ async fn append_chat_impl(
         })
         .await?;
 
-    let large_text = match &request.input.body {
-        ChatInputBody::Text(text) if text.len() as u64 > StagedChatBlob::INLINE_MAX_BYTES => {
-            authorize_chat_write_on_space(ctx.auth(), &space_rec.space)?;
-            let prepared = PreparedBlobSource::prepare(text.as_bytes(), store.blob_codec())?;
-            let ticket = deadline
-                .prepare(&ctx.budget, || {
-                    store.stage_blob_for_batch(&space_rec.scope, space_rec.active_epoch, &prepared)
-                })
-                .await?;
-            Some(ticket)
-        }
-        _ => None,
+    let ChatInputBody::Text(text) = &request.input.body;
+    let large_text = if text.len() as u64 > ChatInputBody::INLINE_MAX_BYTES {
+        authorize_chat_write_on_space(ctx.auth(), &space_rec.space)?;
+        let prepared = PreparedBlobSource::prepare(text.as_bytes(), store.blob_codec())?;
+        let ticket = deadline
+            .prepare(&ctx.budget, || {
+                store.stage_blob_for_batch(&space_rec.scope, space_rec.active_epoch, &prepared)
+            })
+            .await?;
+        Some(ticket)
+    } else {
+        None
     };
     let discard = large_text.as_ref().and_then(StagedBlobTicket::discard);
     let scope = space_rec.scope.clone();
@@ -3868,8 +3480,7 @@ async fn append_chat_impl(
     let result: Result<StoredCommittedChatEntryV1, PortError> =
         deadline.submit(store, &ctx.budget, intent).await;
     settle_queue_upload(deadline, &ctx.budget, discard, &result).await?;
-    let mut stored = result?;
-    stored.value.tainted |= legacy_staged;
+    let stored = result?;
     Ok(stored.into_committed())
 }
 
@@ -4002,17 +3613,6 @@ async fn append_chat_tx(
         effective_tainted = true;
     }
 
-    let staging_lease = if let ChatInputBody::Staged(staged) = &input.body {
-        let lease = lookup_staged_chat_lease_tx(tx, &scope.space_id, staged).await?;
-        // Legacy references carried no provenance. Only a verified v2 clean lease is clean.
-        if !lease.starts_with("st2c_") {
-            effective_tainted = true;
-        }
-        Some(lease)
-    } else {
-        None
-    };
-
     if effective_tainted
         && (th.kind == ChatThreadKind::SpaceGroup || live_space.space.kind == SpaceKind::Shared)
     {
@@ -4041,8 +3641,9 @@ async fn append_chat_tx(
     let (sec, nsec) = encode_timestamp_parts(now_ts);
     let seq_i64 = seq.get() as i64;
 
-    let (inline_text, payload_digest, body_out) = match (&input.body, staged) {
-        (ChatInputBody::Text(_), Some(ticket)) => {
+    let ChatInputBody::Text(s) = &input.body;
+    let (inline_text, payload_digest, body_out) = match staged {
+        Some(ticket) => {
             let digest = ticket.digest;
             item_ctx.record_staged_ticket(ticket.clone());
             activate_and_bind_blob_ref_tx(
@@ -4061,23 +3662,7 @@ async fn append_chat_tx(
             .await?;
             (None, Some(digest), ChatBody::Blob(digest))
         }
-        (ChatInputBody::Text(s), None) => (Some(s.clone()), None, ChatBody::Inline(s.clone())),
-        (ChatInputBody::Staged(staged), _) => {
-            consume_one_staged_chat_ref_and_bind_entry_tx(
-                tx,
-                &scope.space_id,
-                staged,
-                staging_lease
-                    .as_deref()
-                    .ok_or(DomainError::ResourceNotFound)?,
-                &input.thread,
-                entry_seq,
-                &entry_rev,
-                seq,
-            )
-            .await?;
-            (None, Some(staged.digest()), ChatBody::Blob(staged.digest()))
-        }
+        None => (Some(s.clone()), None, ChatBody::Inline(s.clone())),
     };
 
     let (kind_str, tool_call_opt) = entry_kind_to_db(&input.kind);
@@ -4409,7 +3994,7 @@ async fn check_queue_admission_tx(
     let live_space = load_space_record(tx, &scope.space_id).await?;
     live_space.scope.check(scope)?;
     forbid_project_agent_run(auth, &live_space.space)?;
-    authorize_chat_replay_tx(tx, &live_space.space, auth, thread, Some(base), false).await?;
+    authorize_chat_replay_tx(tx, &live_space.space, auth, thread, Some(base)).await?;
     let head = load_thread_head_tx(tx, &scope.space_id, thread).await?;
     if head.kind == ChatThreadKind::KeeperLog {
         return Err(DomainError::SpaceReadOnly.into());
@@ -4569,7 +4154,7 @@ async fn queue_chat_input_impl(
         });
     }
 
-    let staged_opt = if (request.input.body.len() as u64) > StagedChatBlob::INLINE_MAX_BYTES {
+    let staged_opt = if (request.input.body.len() as u64) > ChatInputBody::INLINE_MAX_BYTES {
         let prepared =
             PreparedBlobSource::prepare(request.input.body.as_bytes(), store.blob_codec())?;
         let ticket = tokio::select! {

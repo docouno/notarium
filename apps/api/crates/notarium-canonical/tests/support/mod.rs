@@ -193,22 +193,23 @@ impl StorageTestFixtures {
         let _ = conn.close().await;
     }
 
-    pub fn pg_local_config(
+    pub async fn open_pg_s3_config(
         &self,
         installation_id: InstallationId,
         schema: &str,
-        blob_root: DataRoot,
     ) -> CanonicalConfig {
-        CanonicalConfig {
-            installation_id,
-            sql: SqlBackendConfig::postgres_default(self.pg_connect_config(), schema),
-            blobs: BlobBackendConfig::Local {
-                data_root: blob_root,
-            },
-            writer: WriterConfig::default(),
-            snapshot_retention: Duration::from_secs(300),
-            default_backup_budget: notarium_canonical::config::default_postgres_backup_budget(),
-        }
+        let mut s3_cfg =
+            self.s3_config("notarium-test-shared", S3BucketModePolicy::DetectFromBucket);
+        static SHARED_BUCKET_READY: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+        SHARED_BUCKET_READY
+            .get_or_init(|| async {
+                notarium_canonical::blobs::s3::admin_ensure_bucket(&s3_cfg, Some("Enabled"))
+                    .await
+                    .expect("ensure shared MinIO test bucket");
+            })
+            .await;
+        s3_cfg.application_prefix = format!("{schema}/");
+        self.pg_s3_config(installation_id, schema, s3_cfg)
     }
 
     pub fn fresh_s3_bucket(&self, prefix: &str) -> String {

@@ -654,7 +654,6 @@ pub trait ControlPort: Send + Sync {
         now: Timestamp,
         page: ControlPageRequest,
     ) -> PortFuture<'_, ControlPage<ScheduleRunReceipt>>;
-    fn scheduler_clock(&self, ctx: MaintenanceContext) -> PortFuture<'_, Timestamp>;
     fn get_schedule_run(
         &self,
         ctx: ScheduleRunContext,

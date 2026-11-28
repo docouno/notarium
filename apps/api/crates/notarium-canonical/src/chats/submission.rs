@@ -116,7 +116,7 @@ pub(super) async fn submit(
     }
     content::require_human_text(&request.body)?;
     authorize_chat_write_on_space(ctx.auth(), &space.space)?;
-    let staged = if request.body.len() as u64 > StagedChatBlob::INLINE_MAX_BYTES {
+    let staged = if request.body.len() as u64 > ChatInputBody::INLINE_MAX_BYTES {
         // An unauthorized, stale, or full-queue request must not publish even a
         // provisional CAS blob; `submit_tx` re-verifies atomically under writer locks.
         let reader = ctx.auth().clone();

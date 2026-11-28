@@ -143,36 +143,21 @@ pub(super) async fn revoke_before_effect<T, R>(
 
 async fn revoke_while_writer_pinned<T, R>(
     fixture: &RuntimeFixture,
-    space: &SpaceId,
+    _space: &SpaceId,
     gate: (oneshot::Receiver<Cancellation>, oneshot::Sender<()>),
     mutation: impl Future<Output = Result<T, PortError>>,
     revocation: impl Future<Output = Result<R, PortError>>,
 ) -> PortError {
-    let pin_auth = fixture
-        .control
-        .trusted_none(
-            PerimeterAttestation::attest_checked().with_human_management(),
-            budget(),
-        )
-        .await
-        .unwrap();
-    let pinned = fixture
-        .canonical
-        .pin_schedule_abilities(
-            AccountContext::new(pin_auth.restrict_to_space(space).unwrap(), budget()),
-            Vec::new(),
-        )
-        .await
-        .unwrap();
+    let pinned = fixture.canonical.acquire_writer_safe_point().await.unwrap();
     let (entered, release) = gate;
     let revoke = async {
         let _ = entered
             .await
             .expect("the queued operation reached its Canonical admission gate");
         release.send(()).unwrap();
-        // Give the admitted operation time to queue behind the pinned SQL writer.
+        // Give the admitted operation time to queue behind the paused SQL writer.
         tokio::time::sleep(Duration::from_millis(40)).await;
-        // The SQL actor cannot obtain the pinned writer. A synchronous revoke
+        // The SQL actor cannot obtain the paused writer. A synchronous revoke
         // must still settle while that Canonical lock is held.
         revocation.await.unwrap();
         drop(pinned);

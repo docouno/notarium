@@ -205,6 +205,114 @@ async fn upgrade_owners_v5(conn: &mut crate::sql_exec::BackendConn<'_>) -> Resul
     Ok(())
 }
 
+const PG_UPGRADE_CHAT_INLINE_LIMIT_V9: &str = "DO $migration$
+    DECLARE
+        cname TEXT;
+    BEGIN
+        FOR cname IN
+            SELECT conname FROM pg_constraint
+            WHERE conrelid = 'chat_entries'::regclass AND contype = 'c'
+              AND (conname = 'chat_entries_body_check' OR pg_get_constraintdef(oid) LIKE '%inline_text IS NOT NULL%')
+        LOOP
+            EXECUTE format('ALTER TABLE chat_entries DROP CONSTRAINT %I', cname);
+        END LOOP;
+        ALTER TABLE chat_entries ADD CONSTRAINT chat_entries_body_check CHECK (
+            (kind = 'redacted' AND inline_text IS NULL AND payload_blake3 IS NULL AND redacted_at_seq IS NOT NULL)
+            OR (
+                kind <> 'redacted'
+                AND redacted_at_seq IS NULL
+                AND (
+                    (inline_text IS NOT NULL AND octet_length(inline_text) <= 32768 AND payload_blake3 IS NULL)
+                    OR (inline_text IS NULL AND payload_blake3 IS NOT NULL)
+                )
+            )
+        );
+        FOR cname IN
+            SELECT conname FROM pg_constraint
+            WHERE conrelid = 'chat_pending_inputs'::regclass AND contype = 'c'
+              AND (conname = 'chat_pending_inputs_body_check' OR pg_get_constraintdef(oid) LIKE '%inline_text IS NOT NULL%')
+        LOOP
+            EXECUTE format('ALTER TABLE chat_pending_inputs DROP CONSTRAINT %I', cname);
+        END LOOP;
+        ALTER TABLE chat_pending_inputs ADD CONSTRAINT chat_pending_inputs_body_check CHECK (
+            (inline_text IS NOT NULL AND octet_length(inline_text) <= 32768 AND payload_blake3 IS NULL)
+            OR (inline_text IS NULL AND payload_blake3 IS NOT NULL)
+        );
+    END $migration$";
+
+async fn upgrade_chat_inline_limit_v9(
+    conn: &mut crate::sql_exec::BackendConn<'_>,
+) -> Result<(), PortError> {
+    use crate::sql_exec::BackendConn;
+    let fail =
+        |e: sqlx::Error| internal_not_committed("migration_v9_chat_inline_limit", e.to_string());
+    match conn {
+        BackendConn::Sqlite(c) => {
+            let create_entries = create_new_table(SQLITE_BASELINE_DDL, "chat_entries")?;
+            let create_pending = create_new_table(SQLITE_BASELINE_DDL, "chat_pending_inputs")?;
+            for statement in [
+                "ALTER TABLE chat_entries RENAME TO chat_entries_v8",
+                &create_entries,
+                "INSERT INTO chat_entries(
+                    space_id, thread_id, entry_seq, parent_seq, revision_id, kind, tool_call_id,
+                    author_id, agent_run_id, inline_text, payload_blake3, referenced_notes_json,
+                    ext_space_tainted, is_chain_node, branch_depth, anc_16_seq, anc_256_seq,
+                    created_space_seq, redacted_at_seq, checkpoint_stale, human_origin,
+                    body_format, provenance_json
+                 )
+                 SELECT space_id, thread_id, entry_seq, parent_seq, revision_id, kind, tool_call_id,
+                    author_id, agent_run_id, inline_text, payload_blake3, referenced_notes_json,
+                    ext_space_tainted, is_chain_node, branch_depth, anc_16_seq, anc_256_seq,
+                    created_space_seq, redacted_at_seq, checkpoint_stale, human_origin,
+                    body_format, provenance_json
+                 FROM chat_entries_v8",
+                "DROP TABLE chat_entries_v8",
+                "ALTER TABLE chat_pending_inputs RENAME TO chat_pending_inputs_v8",
+                &create_pending,
+                "INSERT INTO chat_pending_inputs(
+                    space_id, thread_id, input_id, ordinal, author_id, inline_text, payload_blake3,
+                    queued_base_leaf_seq, in_flight_run_id, mentions_agent, status, enqueued_seq,
+                    consumed_entry_seq, ext_space_tainted
+                 )
+                 SELECT space_id, thread_id, input_id, ordinal, author_id, inline_text, payload_blake3,
+                    queued_base_leaf_seq, in_flight_run_id, mentions_agent, status, enqueued_seq,
+                    consumed_entry_seq, ext_space_tainted
+                 FROM chat_pending_inputs_v8",
+                "DROP TABLE chat_pending_inputs_v8",
+            ] {
+                sqlx::query(sqlx::AssertSqlSafe(statement))
+                    .execute(&mut **c)
+                    .await
+                    .map_err(fail)?;
+            }
+            for prefix in [
+                "CREATE INDEX IF NOT EXISTS idx_chat_entries_parent",
+                "CREATE INDEX IF NOT EXISTS idx_chat_entries_compaction",
+                "CREATE INDEX IF NOT EXISTS idx_chat_entries_tainted",
+                "CREATE INDEX IF NOT EXISTS idx_chat_entries_projection",
+                "CREATE INDEX IF NOT EXISTS idx_chat_entries_created_change",
+                "CREATE INDEX IF NOT EXISTS idx_chat_entries_redacted_change",
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_chat_pending_inputs_ordinal",
+                "CREATE INDEX IF NOT EXISTS idx_chat_pending_inputs_active",
+                "CREATE INDEX IF NOT EXISTS idx_chat_pending_inputs_consumed",
+            ] {
+                let sql = baseline_statement(SQLITE_BASELINE_DDL, prefix)?;
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .execute(&mut **c)
+                    .await
+                    .map_err(fail)?;
+            }
+        }
+        BackendConn::Postgres(c) => {
+            sqlx::raw_sql(PG_UPGRADE_CHAT_INLINE_LIMIT_V9)
+                .execute(&mut **c)
+                .await
+                .map_err(fail)?;
+        }
+    }
+    Ok(())
+}
+
 macro_rules! upgrade {
     ($name:ident, $connection:ty, $variant:ident, $ddl:ident, $pg_v2:expr $(, $catalog:ident)?) => {
         pub(super) async fn $name(
@@ -328,6 +436,8 @@ macro_rules! upgrade {
                         internal_not_committed("migration_v9_chat_history", e.to_string())
                     })?;
                 }
+                upgrade_chat_inline_limit_v9(&mut crate::sql_exec::BackendConn::$variant(conn))
+                    .await?;
                 sqlx::query("DROP INDEX IF EXISTS uq_ability_packages_active_slug")
                     .execute(&mut *conn)
                     .await
@@ -504,6 +614,34 @@ mod tests {
                 ("model".into(), Some(0), 0, None),
                 ("redacted".into(), None, 0, None),
             ]
+        );
+        // Verify upgraded v9 table enforces the 32 KiB inline threshold (not the old 512B cap).
+        let ten_kib = "x".repeat(10 * 1024);
+        sqlx::query(
+            "INSERT INTO chat_entries(
+                space_id, thread_id, entry_seq, parent_seq, revision_id, kind, author_id,
+                inline_text, referenced_notes_json, ext_space_tainted, is_chain_node,
+                branch_depth, created_space_seq, human_origin, body_format
+             ) VALUES ('space','thread',4,2,'d','model','owner',$1,'[]',0,1,2,5,0,0)",
+        )
+        .bind(&ten_kib)
+        .execute(&mut db)
+        .await
+        .expect("upgraded v9 chat_entries must accept 10 KiB inline body");
+        let over_32k = "y".repeat(32 * 1024 + 1);
+        assert!(
+            sqlx::query(
+                "INSERT INTO chat_entries(
+                    space_id, thread_id, entry_seq, parent_seq, revision_id, kind, author_id,
+                    inline_text, referenced_notes_json, ext_space_tainted, is_chain_node,
+                    branch_depth, created_space_seq, human_origin, body_format
+                 ) VALUES ('space','thread',5,4,'e','model','owner',$1,'[]',0,1,3,6,0,0)",
+            )
+            .bind(&over_32k)
+            .execute(&mut db)
+            .await
+            .is_err(),
+            "upgraded v9 chat_entries must reject > 32 KiB inline body"
         );
     }
 

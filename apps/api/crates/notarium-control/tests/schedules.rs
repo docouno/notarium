@@ -196,7 +196,6 @@ async fn exercise(pg: bool) {
         slot: tick(now),
         current_role: role.clone(),
         expected: created.revision,
-        next_slot: Some(tick(now + 60_000)),
     };
     let mut workers = Vec::new();
     for _ in 0..3 {
@@ -267,14 +266,7 @@ async fn exercise(pg: bool) {
             .status,
         ScheduleRunStatus::Claimed
     );
-    let mut different = claim.clone();
-    different.next_slot = Some(tick(now + 120_000));
-    assert!(
-        restarted
-            .claim_schedule(scheduler(), different)
-            .await
-            .is_err()
-    );
+    assert_eq!(advanced.next_slot, Some(tick(now + 60_000)));
     fixture.clock.0.store(now + 60_000, Ordering::SeqCst);
     let (run2, lease2, keeper2) = match service
         .claim_schedule(
@@ -284,7 +276,6 @@ async fn exercise(pg: bool) {
                 slot: tick(now + 60_000),
                 current_role: role.clone(),
                 expected: advanced.revision,
-                next_slot: Some(tick(now + 120_000)),
             },
         )
         .await
@@ -447,7 +438,6 @@ async fn exercise(pg: bool) {
                 slot: tick(now + 120_000),
                 current_role: role.clone(),
                 expected: resumed.revision,
-                next_slot: Some(tick(now + 180_000)),
             },
         )
         .await
@@ -499,7 +489,6 @@ async fn exercise(pg: bool) {
                 slot: tick(now + 120_000),
                 current_role: role.clone(),
                 expected: active.revision,
-                next_slot: Some(tick(now + 180_000)),
             },
         )
         .await
@@ -735,7 +724,6 @@ async fn authority_changes(
             ClaimSchedule {
                 schedule: created.id.clone(),
                 slot: tick(now),
-                next_slot: Some(tick(now + 60_000)),
                 current_role: role.clone(),
                 expected: created.revision,
             },
@@ -804,7 +792,6 @@ async fn authority_changes(
                 ClaimSchedule {
                     schedule: created.id.clone(),
                     slot: tick(now + 60_000),
-                    next_slot: Some(tick(now + 120_000)),
                     current_role: role.clone(),
                     expected: advanced.revision
                 }
@@ -864,7 +851,6 @@ async fn authority_changes(
             ClaimSchedule {
                 schedule: created.id,
                 slot: tick(now + 60_000),
-                next_slot: Some(tick(now + 120_000)),
                 current_role: role,
                 expected: created.revision,
             },
@@ -1214,7 +1200,6 @@ async fn role_placement_scope_and_run_inspection_access(pg: bool) {
             ClaimSchedule {
                 schedule: good_sched_id.clone(),
                 slot: Timestamp::parse("2023-11-14T22:15:00Z").unwrap(),
-                next_slot: Some(Timestamp::parse("2023-11-14T22:20:00Z").unwrap()),
                 current_role: role_pa1,
                 expected: ControlRevision::ZERO,
             },
@@ -1378,14 +1363,12 @@ async fn role_placement_scope_and_run_inspection_access(pg: bool) {
         .unwrap()
         .value;
     let next_slot = Timestamp::parse("2023-11-14T22:20:00Z").unwrap();
-    let third_slot = Timestamp::parse("2023-11-14T22:25:00Z").unwrap();
     let first = control
         .claim_schedule(
             scheduler(),
             ClaimSchedule {
                 schedule: id.clone(),
                 slot: now_ts,
-                next_slot: Some(next_slot),
                 current_role: role_space_a.clone(),
                 expected: created.revision,
             },
@@ -1438,7 +1421,6 @@ async fn role_placement_scope_and_run_inspection_access(pg: bool) {
                 ClaimSchedule {
                     schedule: id.clone(),
                     slot: next_slot,
-                    next_slot: Some(third_slot),
                     current_role: role_space_a.clone(),
                     expected: advanced.revision,
                 }
@@ -1506,7 +1488,6 @@ async fn role_placement_scope_and_run_inspection_access(pg: bool) {
             ClaimSchedule {
                 schedule: id.clone(),
                 slot: next_slot,
-                next_slot: Some(third_slot),
                 current_role: role_space_a,
                 expected: reapproved.revision,
             },
@@ -1756,7 +1737,6 @@ async fn role_placement_scope_and_run_inspection_access(pg: bool) {
         .unwrap()
         .revision;
     let sys_slot = Timestamp::parse("2023-11-14T22:40:00Z").unwrap();
-    let sys_next = Timestamp::parse("2023-11-14T22:45:00Z").unwrap();
     let sys_sched_id = ScheduleId::from_bytes([80; 16]);
     let sys_sched = control
         .create_schedule(
@@ -1801,7 +1781,6 @@ async fn role_placement_scope_and_run_inspection_access(pg: bool) {
             ClaimSchedule {
                 schedule: sys_sched_id,
                 slot: sys_slot,
-                next_slot: Some(sys_next),
                 current_role: sys_role.clone(),
                 expected: sys_sched.revision,
             },
@@ -1971,13 +1950,13 @@ async fn terminal_slots_and_migrated_folds(pg: bool) {
         .clock
         .0
         .store(late_time - 20 * 60_000, Ordering::SeqCst);
-    let make_claim = |schedule: &AgentSchedule, slot, next_slot| ClaimSchedule {
-        schedule: schedule.id.clone(),
-        expected: schedule.revision,
-        slot,
-        next_slot,
-        current_role: role.clone(),
-    };
+    let make_claim =
+        |schedule: &AgentSchedule, slot, _next_slot: Option<Timestamp>| ClaimSchedule {
+            schedule: schedule.id.clone(),
+            expected: schedule.revision,
+            slot,
+            current_role: role.clone(),
+        };
     let first_claim = service
         .claim_schedule(scheduler(), make_claim(&schedules[0], first, Some(next)))
         .await
@@ -2258,4 +2237,184 @@ async fn sqlite_terminal_slots_and_migrated_folds() {
 #[tokio::test]
 async fn postgres_terminal_slots_and_migrated_folds() {
     terminal_slots_and_migrated_folds(true).await;
+}
+
+async fn pinned_schedule_cursors_and_control_next_slot(pg: bool) {
+    let _serial = AUTH_TEST_LOCK.lock().await;
+    let fixture = Fixture::new(pg, "schedules_pinned_cursors").await;
+    let t0 = 1_767_225_600_000_i64; // 2026-01-01T00:00:00Z
+    fixture.clock.0.store(t0, Ordering::SeqCst);
+    let service = fixture.service(AuthenticationMode::Password).await.unwrap();
+    let bootstrap = service
+        .bootstrap(
+            empty(),
+            budget(),
+            BootstrapAccount {
+                username: "cursor-owner".into(),
+                email: None,
+                display_name: "Cursor Owner".into(),
+                password: Some(SecretString::new("cursor password fixture".into())),
+            },
+        )
+        .await
+        .unwrap();
+    let token = bootstrap.session.unwrap().token;
+    let auth = service
+        .resolve(evidence(AuthEvidenceKind::Session, token.expose()))
+        .await
+        .unwrap();
+    let ctx = AccountContext::new(auth, budget());
+    let personal = service
+        .list_spaces(ctx.clone(), ControlPageRequest::new(200, None).unwrap())
+        .await
+        .unwrap()
+        .items
+        .pop()
+        .unwrap();
+    let role = AbilityRef {
+        id: AbilityId::from_bytes([0x51; 16]),
+        placement: AbilityPlacement::System,
+        revision: RevisionId::from_bytes([0x52; 16]),
+    };
+    fixture
+        .catalog
+        .ability_entries
+        .lock()
+        .unwrap()
+        .push(AbilityDescriptor {
+            attached_skills: vec![],
+            promoted_from: None,
+            requires_explicit_binding: false,
+            reference: role.clone(),
+            kind: AbilityKind::Role,
+            name: "pinned-role".into(),
+            description: None,
+            enabled: true,
+            healthy: true,
+            lifecycle: Lifecycle::Active,
+            entrypoint: None,
+            auxiliary_files: vec![],
+        });
+
+    let mut created = Vec::new();
+    for idx in 1u8..=3 {
+        let sched = service
+            .create_schedule(
+                ctx.clone(),
+                AccountMutation {
+                    identity: identity(&service, &ctx, 200 + idx).await,
+                    input: CreateSchedule {
+                        id: ScheduleId::from_bytes([0x40 + idx; 16]),
+                        definition: ScheduleDefinition {
+                            space: personal.space.id.clone(),
+                            project: None,
+                            title: format!("Pinned {idx}"),
+                            init_prompt: "Run checks".into(),
+                            cron: "0 */5 * * * * *".into(),
+                            timezone: "UTC".into(),
+                            approved_role: role.clone(),
+                            limits: RunLimits::default(),
+                        },
+                        approved_skills: vec![],
+                        next_slot: tick(t0),
+                        paused: false,
+                    },
+                },
+            )
+            .await
+            .unwrap()
+            .value;
+        created.push(sched);
+    }
+
+    // 1. Paginate `list_due_schedules` with `requested > control_now` and advance Control's
+    //    clock between page 1 and page 2: cursor pins page-1 cutoff and must NOT return CursorStale.
+    let requested = tick(t0 + 120_000);
+    let mut seen_due = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = service
+            .list_due_schedules(
+                scheduler(),
+                requested,
+                ControlPageRequest::new(1, cursor).unwrap(),
+            )
+            .await
+            .expect("due schedule page must stay valid as Control clock advances");
+        seen_due.extend(page.items.into_iter().map(|s| s.id));
+        if page.continuation.is_none() {
+            break;
+        }
+        cursor = page.continuation;
+        // Advance Control clock between pages!
+        fixture.clock.0.fetch_add(15_000, Ordering::SeqCst);
+    }
+    assert_eq!(seen_due.len(), 3);
+
+    // 2. Claim all 3 schedules when Control clock is 7 minutes ahead of `slot` (t0):
+    //    Control must authoritatively compute `next_slot` strictly after Control's clock (t0 + 10m).
+    let ahead = t0 + 7 * 60_000;
+    fixture.clock.0.store(ahead, Ordering::SeqCst);
+    let mut claimed_runs = Vec::new();
+    for sched in &created {
+        let ScheduleClaim::Claimed { run, schedule, .. } = service
+            .claim_schedule(
+                scheduler(),
+                ClaimSchedule {
+                    schedule: sched.id.clone(),
+                    slot: tick(t0),
+                    current_role: role.clone(),
+                    expected: sched.revision,
+                },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected Claimed");
+        };
+        assert_eq!(
+            schedule.next_slot,
+            Some(tick(t0 + 10 * 60_000)),
+            "Control must compute next_slot from max(slot, control_now)"
+        );
+        claimed_runs.push(run);
+    }
+
+    // 3. Advance past run expiry and paginate `list_expired_schedule_runs` while clock keeps
+    //    advancing between pages (with `requested > control_now`): must not fail CursorStale.
+    let after_expiry = ahead + 400_000;
+    fixture.clock.0.store(after_expiry, Ordering::SeqCst);
+    let expired_cutoff = tick(after_expiry + 120_000);
+    let mut seen_expired = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = service
+            .list_expired_schedule_runs(
+                scheduler(),
+                expired_cutoff,
+                ControlPageRequest::new(1, cursor).unwrap(),
+            )
+            .await
+            .expect("expired run page must stay valid as Control clock advances");
+        seen_expired.extend(page.items.into_iter().map(|r| r.run));
+        if page.continuation.is_none() {
+            break;
+        }
+        cursor = page.continuation;
+        fixture.clock.0.fetch_add(10_000, Ordering::SeqCst);
+    }
+    assert_eq!(seen_expired.len(), claimed_runs.len());
+
+    drop(service);
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn sqlite_pinned_schedule_cursors_and_control_next_slot() {
+    pinned_schedule_cursors_and_control_next_slot(false).await;
+}
+
+#[tokio::test]
+async fn postgres_pinned_schedule_cursors_and_control_next_slot() {
+    pinned_schedule_cursors_and_control_next_slot(true).await;
 }

@@ -4,8 +4,9 @@
 mod support;
 use notarium_agents::abilities::{SystemAbilityCatalog, read_system_ability};
 use notarium_canonical::{
-    CanonicalConfig, CanonicalRuntime, CanonicalStore, CreateFolderSpec, PgConnectConfig,
-    PgTransport, SqlBackendConfig,
+    BlobBackendConfig, CanonicalConfig, CanonicalRuntime, CanonicalStore, CreateFolderSpec,
+    PgConnectConfig, PgTransport, S3AddressingStyle, S3BucketModePolicy, S3Config, S3Credentials,
+    SqlBackendConfig, blobs::s3::admin_ensure_bucket,
 };
 use notarium_control::service::{AuthenticationMode, ControlConfig, ControlService};
 use notarium_core::{
@@ -67,6 +68,54 @@ fn mutation<T>(ctx: &SpaceContext, k: u8, input: T) -> Mutation<T> {
     }
 }
 
+async fn shared_test_s3_config(prefix: &str) -> S3Config {
+    let container_manifest =
+        std::path::Path::new("/workspace/.artifacts/storage-tests/current.json");
+    let manifest_path = if container_manifest.exists() {
+        container_manifest.to_path_buf()
+    } else {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../../.artifacts/storage-tests/current.json")
+    };
+    let raw: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&manifest_path).expect("read storage-tests manifest"),
+    )
+    .expect("parse storage-tests manifest");
+    let container_sock = PathBuf::from(raw["s3_socket_container"].as_str().unwrap());
+    let host_sock = PathBuf::from(raw["s3_socket_host"].as_str().unwrap());
+    let s3_socket = if container_sock.exists() {
+        container_sock
+    } else {
+        host_sock
+    };
+    let mut cfg = S3Config {
+        endpoint: raw["s3_endpoint"].as_str().unwrap().to_owned(),
+        region: raw["s3_region"].as_str().unwrap().to_owned(),
+        bucket: "notarium-test-shared".to_owned(),
+        application_prefix: String::new(),
+        addressing: S3AddressingStyle::PathStyle,
+        credentials: S3Credentials {
+            access_key_id: raw["s3_access_key"].as_str().unwrap().to_owned(),
+            secret_access_key: raw["s3_secret_key"].as_str().unwrap().to_owned(),
+            session_token: None,
+        },
+        custom_ca_pem: None,
+        unix_socket: Some(s3_socket),
+        bucket_mode_policy: S3BucketModePolicy::DetectFromBucket,
+        request_timeout: std::time::Duration::from_secs(10),
+    };
+    static BUCKET_READY: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+    BUCKET_READY
+        .get_or_init(|| async {
+            admin_ensure_bucket(&cfg, Some("Enabled"))
+                .await
+                .expect("ensure shared test S3 bucket");
+        })
+        .await;
+    cfg.application_prefix = format!("{prefix}/");
+    cfg
+}
+
 async fn exercise(pg: bool) {
     let mut fixture = Fixture::new(pg, "canonical_catalog").await;
     let path = fixture.root.clone().unwrap_or_else(|| {
@@ -92,6 +141,11 @@ async fn exercise(pg: bool) {
             },
             "v1_canonical",
         );
+        let mut nonce = [0u8; 6];
+        getrandom::fill(&mut nonce).unwrap();
+        let s3_cfg =
+            shared_test_s3_config(&format!("control-catalog-{}", hex::encode(nonce))).await;
+        cfg.blobs = BlobBackendConfig::S3(Box::new(s3_cfg));
         cfg.default_backup_budget = notarium_canonical::config::default_postgres_backup_budget();
     }
     let (canonical, runtime) = CanonicalRuntime::open(cfg).await.unwrap();
@@ -766,7 +820,7 @@ async fn exercise(pg: bool) {
     drop(canonical);
     runtime.shutdown().await.unwrap();
     fixture.close().await;
-    if pg {
+    if pg && path.exists() {
         std::fs::remove_dir_all(path).unwrap();
     }
 }
@@ -825,49 +879,101 @@ async fn empty_folder_disclosure(
     .await
     .expect("two disclosures can share the same Space")
     .unwrap();
-    let mut rename = Box::pin(canonical.rename_folder(
-        scoped.clone(),
-        mutation(
-            scoped,
-            96,
-            RenameFolder {
-                folder: folder.folder_id,
-                name: "renamed".into(),
-            },
-        ),
-    ));
-    assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(20), &mut rename)
-            .await
-            .is_err()
-    );
-    let owner = account.auth().principal().clone();
-    tokio::time::timeout(
-        std::time::Duration::from_secs(1),
-        canonical.ensure_space(
-            budget(),
-            EnsureCatalogSpace {
-                identity: support::command(&owner, &owner, 98, ControlRevision::ZERO),
-                owner,
-                space: CreateSpace {
-                    id: SpaceId::from_bytes([98; 16]),
-                    kind: SpaceKind::Shared,
-                    name: "Concurrent workspace".into(),
+    if canonical.is_local_sqlite() {
+        let mut rename = Box::pin(canonical.rename_folder(
+            scoped.clone(),
+            mutation(
+                scoped,
+                96,
+                RenameFolder {
+                    folder: folder.folder_id,
+                    name: "renamed".into(),
                 },
-            },
-        ),
-    )
-    .await
-    .expect("independent Space can commit during disclosure")
-    .unwrap();
-    lease.mark_dispatched().await.unwrap();
-    assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(20), &mut rename)
+            ),
+        ));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut rename)
+                .await
+                .is_err()
+        );
+        let owner = account.auth().principal().clone();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            canonical.ensure_space(
+                budget(),
+                EnsureCatalogSpace {
+                    identity: support::command(&owner, &owner, 98, ControlRevision::ZERO),
+                    owner,
+                    space: CreateSpace {
+                        id: SpaceId::from_bytes([98; 16]),
+                        kind: SpaceKind::Shared,
+                        name: "Concurrent workspace".into(),
+                    },
+                },
+            ),
+        )
+        .await
+        .expect("independent Space can commit during disclosure")
+        .unwrap();
+        lease.mark_dispatched().await.unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut rename)
+                .await
+                .is_err()
+        );
+        second.mark_dispatched().await.unwrap();
+        rename.await.unwrap();
+    } else {
+        // PostgreSQL disclosure snapshots release their read-only connection immediately
+        // after snapshot verification so concurrent egress leases never exhaust the pool
+        // or block canonical mutations with long-lived FOR SHARE locks.
+        let mut extra_leases = Vec::new();
+        for _ in 0..10 {
+            let extra = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                canonical.acquire_egress(account.clone(), request.clone(), Cancellation::default()),
+            )
             .await
-            .is_err()
-    );
-    second.mark_dispatched().await.unwrap();
-    rename.await.unwrap();
+            .expect("concurrent PG egress leases must not exhaust the connection pool")
+            .unwrap();
+            extra_leases.push(extra);
+        }
+        canonical
+            .rename_folder(
+                scoped.clone(),
+                mutation(
+                    scoped,
+                    96,
+                    RenameFolder {
+                        folder: folder.folder_id,
+                        name: "renamed".into(),
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        let owner = account.auth().principal().clone();
+        canonical
+            .ensure_space(
+                budget(),
+                EnsureCatalogSpace {
+                    identity: support::command(&owner, &owner, 98, ControlRevision::ZERO),
+                    owner,
+                    space: CreateSpace {
+                        id: SpaceId::from_bytes([98; 16]),
+                        kind: SpaceKind::Shared,
+                        name: "Concurrent workspace".into(),
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        for mut extra in extra_leases {
+            extra.close().await.unwrap();
+        }
+        lease.mark_dispatched().await.unwrap();
+        second.mark_dispatched().await.unwrap();
+    }
     assert!(matches!(
         canonical
             .acquire_egress(account.clone(), request, Cancellation::default())

@@ -309,7 +309,7 @@ async fn model_payloads(store: &CanonicalStore) {
     let mut parent = ThreadEntrySeq::ZERO;
     for (seed, text, expected_blob, include_call) in [
         (0xb1, "Here is a result".to_owned(), false, true),
-        (0xb2, "Large response. ".repeat(100), true, true),
+        (0xb2, "Large response. ".repeat(2200), true, true),
         (
             0xb3,
             "\u{FDD0}notarium_model_turn_v1\n{\"text\":\"raw\"}".to_owned(),
@@ -411,7 +411,7 @@ async fn handoff_and_archive_fence(store: &CanonicalStore) {
         id: PendingInputId::from_bytes([seed; 16]),
         thread: thread.clone(),
         sender: sender.clone(),
-        body: "A queued message with a staged body. ".repeat(18),
+        body: "A queued message with a staged body. ".repeat(1000),
         queued_base_leaf: base,
         in_flight_run: run.clone(),
         mentions_agent: true,
@@ -684,7 +684,7 @@ async fn submitted_input_replays_across_route_changes(store: &CanonicalStore) {
         id: PendingInputId::from_bytes([seed; 16]),
         thread: thread.clone(),
         expected_leaf,
-        body: "A human input with a staged body. ".repeat(25),
+        body: "A human input with a staged body. ".repeat(1000),
         mentions_agent: true,
     };
     let lose_ack = || {
@@ -1111,12 +1111,11 @@ async fn supervised_queue_and_hydration_match_across_dialects() {
 
     let fixtures = StorageTestFixtures::load_required();
     let schema = fixtures.fresh_pg_schema();
-    let pg_blobs = TempDataRoot::new("chat-agent-pg");
-    let (store, runtime) = CanonicalRuntime::open(fixtures.pg_local_config(
-        sample_installation_id(0xa3),
-        &schema,
-        pg_blobs.data_root(),
-    ))
+    let (store, runtime) = CanonicalRuntime::open(
+        fixtures
+            .open_pg_s3_config(sample_installation_id(0xa3), &schema)
+            .await,
+    )
     .await
     .unwrap();
     original_human_classifier(&store).await;

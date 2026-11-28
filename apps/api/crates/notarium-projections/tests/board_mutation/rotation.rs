@@ -235,13 +235,12 @@ async fn postgres_single_owner_rotation() {
     use std::time::Duration;
 
     use super::{
-        BlobBackendConfig, CanonicalConfig, CanonicalRuntime, InstallationId, PgFixture,
-        PgPoolOptions, ProjectionConfig, Scratch, SqlBackendConfig, WriterConfig,
-        default_postgres_backup_budget, projection_context, random_bytes,
+        CanonicalConfig, CanonicalRuntime, InstallationId, PgFixture, PgPoolOptions,
+        ProjectionConfig, Scratch, SqlBackendConfig, WriterConfig, default_postgres_backup_budget,
+        projection_context, random_bytes,
     };
 
     let fixture = PgFixture::required();
-    let blobs = Scratch::new();
     let cache = Scratch::new();
     let id = hex::encode(&random_bytes()[..6]);
     let canonical_schema = format!("test_pg_rot_{id}");
@@ -249,9 +248,7 @@ async fn postgres_single_owner_rotation() {
     let cfg = CanonicalConfig {
         installation_id: InstallationId::from_bytes(random_bytes()),
         sql: SqlBackendConfig::postgres_default(fixture.canonical(), &canonical_schema),
-        blobs: BlobBackendConfig::Local {
-            data_root: blobs.root(),
-        },
+        blobs: fixture.s3_blobs(&canonical_schema).await,
         writer: WriterConfig::default(),
         snapshot_retention: Duration::from_secs(60),
         default_backup_budget: default_postgres_backup_budget(),
@@ -320,14 +317,12 @@ async fn postgres_split_owners_backlinks_and_detached_erasure() {
     use std::time::Duration;
 
     use super::{
-        BlobBackendConfig, CanonicalConfig, CanonicalRuntime, InstallationId, PgFixture,
-        PgPoolOptions, ProjectionConfig, Scratch, SqlBackendConfig, WriterConfig,
-        default_postgres_backup_budget, projection_context, random_bytes,
+        CanonicalConfig, CanonicalRuntime, InstallationId, PgFixture, PgPoolOptions,
+        ProjectionConfig, Scratch, SqlBackendConfig, WriterConfig, default_postgres_backup_budget,
+        projection_context, random_bytes,
     };
 
     let fixture = PgFixture::required();
-    let blobs_a = Scratch::new();
-    let blobs_b = Scratch::new();
     let cache_a = Scratch::new();
     let cache_b = Scratch::new();
     let open_cache_lock = |cache: &Scratch| {
@@ -343,22 +338,13 @@ async fn postgres_split_owners_backlinks_and_detached_erasure() {
     let cfg = CanonicalConfig {
         installation_id: InstallationId::from_bytes(random_bytes()),
         sql: SqlBackendConfig::postgres_default(fixture.canonical(), &canonical_schema),
-        blobs: BlobBackendConfig::Local {
-            data_root: blobs_a.root(),
-        },
+        blobs: fixture.s3_blobs(&canonical_schema).await,
         writer: WriterConfig::default(),
         snapshot_retention: Duration::from_secs(60),
         default_backup_budget: default_postgres_backup_budget(),
     };
     let (a, canonical_a) = CanonicalRuntime::open(cfg.clone()).await.unwrap();
-    let (b, canonical_b) = CanonicalRuntime::open(CanonicalConfig {
-        blobs: BlobBackendConfig::Local {
-            data_root: blobs_b.root(),
-        },
-        ..cfg
-    })
-    .await
-    .unwrap();
+    let (b, canonical_b) = CanonicalRuntime::open(cfg).await.unwrap();
     let (scope_a, owner_a) = open_space(&a).await;
     let (scope_b, owner_b) = open_space(&b).await;
     let ca = note(

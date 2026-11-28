@@ -124,9 +124,10 @@ async fn postgres_open_rejects_fsync_off_before_creating_the_schema() {
             .unwrap();
     assert_eq!((sync.as_str(), fsync.as_str()), ("on", "off"));
 
-    let temp = TempDataRoot::new("pg-durability");
     let schema = fixtures.fresh_pg_schema();
-    let cfg = fixtures.pg_local_config(sample_installation_id(53), &schema, temp.data_root());
+    let cfg = fixtures
+        .open_pg_s3_config(sample_installation_id(53), &schema)
+        .await;
     let Err(failure) = CanonicalRuntime::open(cfg).await else {
         panic!("fsync-off startup must fail");
     };
@@ -316,10 +317,9 @@ async fn l1_sqlite_bootstrap_witness_owner_lock_and_fail_closed_guards() {
 async fn l1_postgres_bootstrap_idempotence_and_fail_closed_guards() {
     let fixtures = StorageTestFixtures::load_required();
     let schema = fixtures.fresh_pg_schema();
-    let blob_temp = TempDataRoot::new("l1-pg-blobs");
     let install = sample_installation_id(3);
 
-    let cfg = fixtures.pg_local_config(install.clone(), &schema, blob_temp.data_root());
+    let cfg = fixtures.open_pg_s3_config(install.clone(), &schema).await;
     let (_store, runtime) = CanonicalRuntime::open(cfg.clone())
         .await
         .expect("initial PostgreSQL 16 canonical open");
@@ -371,8 +371,7 @@ async fn l1_postgres_bootstrap_idempotence_and_fail_closed_guards() {
     }
 
     // Reopen same schema idempotently.
-    let blob_temp2 = TempDataRoot::new("l1-pg-blobs-2");
-    let cfg2 = fixtures.pg_local_config(install.clone(), &schema, blob_temp2.data_root());
+    let cfg2 = fixtures.open_pg_s3_config(install.clone(), &schema).await;
     let (_store2, runtime2) = CanonicalRuntime::open(cfg2.clone())
         .await
         .expect("idempotent PG reopen");
@@ -466,9 +465,9 @@ async fn l1_postgres_bootstrap_idempotence_and_fail_closed_guards() {
     raw.close().await.unwrap();
 
     // Wrong installation fails closed.
-    let blob_temp3 = TempDataRoot::new("l1-pg-blobs-3");
-    let wrong_cfg =
-        fixtures.pg_local_config(sample_installation_id(4), &schema, blob_temp3.data_root());
+    let wrong_cfg = fixtures
+        .open_pg_s3_config(sample_installation_id(4), &schema)
+        .await;
     assert!(CanonicalRuntime::open(wrong_cfg).await.is_err());
 
     // Newer schema_version fails closed on PG.
@@ -483,15 +482,10 @@ async fn l1_postgres_bootstrap_idempotence_and_fail_closed_guards() {
             .expect("bump PG schema_version");
         let _ = raw.close().await;
     }
-    let blob_temp4 = TempDataRoot::new("l1-pg-blobs-4");
     assert!(
-        CanonicalRuntime::open(fixtures.pg_local_config(
-            install.clone(),
-            &schema,
-            blob_temp4.data_root()
-        ))
-        .await
-        .is_err()
+        CanonicalRuntime::open(fixtures.open_pg_s3_config(install.clone(), &schema).await)
+            .await
+            .is_err()
     );
 
     // Restore schema_version, test migration_state = 'migrating' fails closed on PG.
@@ -507,9 +501,8 @@ async fn l1_postgres_bootstrap_idempotence_and_fail_closed_guards() {
             .expect("set PG migrating");
         let _ = raw.close().await;
     }
-    let blob_temp5 = TempDataRoot::new("l1-pg-blobs-5");
     assert!(
-        CanonicalRuntime::open(fixtures.pg_local_config(install, &schema, blob_temp5.data_root()))
+        CanonicalRuntime::open(fixtures.open_pg_s3_config(install, &schema).await)
             .await
             .is_err()
     );
@@ -535,9 +528,9 @@ async fn l1_semantic_parity_sqlite_and_postgres() {
     {
         let fixtures = StorageTestFixtures::load_required();
         let schema = fixtures.fresh_pg_schema();
-        let blob_temp = TempDataRoot::new("l1-sem-pg-blobs");
-        let cfg =
-            fixtures.pg_local_config(sample_installation_id(11), &schema, blob_temp.data_root());
+        let cfg = fixtures
+            .open_pg_s3_config(sample_installation_id(11), &schema)
+            .await;
         let (store, runtime) = CanonicalRuntime::open(cfg)
             .await
             .expect("open PostgreSQL 16 for semantic L1");
@@ -1218,12 +1211,60 @@ async fn l1_long_incompressible_title_fold_succeeds_in_sqlite_and_postgres_v9_in
     {
         let fixtures = StorageTestFixtures::load_required();
         let schema = fixtures.fresh_pg_schema();
-        let blob_temp = TempDataRoot::new("l1-long-title-pg-blobs");
-        let cfg =
-            fixtures.pg_local_config(sample_installation_id(42), &schema, blob_temp.data_root());
+        let cfg = fixtures
+            .open_pg_s3_config(sample_installation_id(42), &schema)
+            .await;
         let (store, runtime) = CanonicalRuntime::open(cfg).await.expect("open PG16");
         run_case(store).await;
         runtime.shutdown().await.expect("shutdown PG16");
         fixtures.drop_pg_schema(&schema).await;
     }
+}
+
+#[tokio::test]
+async fn canonical_open_rejects_hybrid_storage_profiles() {
+    use notarium_canonical::{
+        BlobBackendConfig, S3BucketModePolicy, SqlBackendConfig, WriterConfig,
+        config::{default_backup_budget, default_postgres_backup_budget},
+    };
+    use notarium_core::error::ValidationReason;
+    use std::time::Duration;
+
+    let fixtures = StorageTestFixtures::load_required();
+    let temp = TempDataRoot::new("hybrid-profiles");
+    let schema = fixtures.fresh_pg_schema();
+
+    // Hybrid 1: PostgreSQL + Local CAS must be rejected before opening sockets or locks.
+    let pg_local = CanonicalConfig {
+        installation_id: sample_installation_id(91),
+        sql: SqlBackendConfig::postgres_default(fixtures.pg_connect_config(), &schema),
+        blobs: BlobBackendConfig::Local {
+            data_root: temp.data_root(),
+        },
+        writer: WriterConfig::default(),
+        snapshot_retention: Duration::from_secs(60),
+        default_backup_budget: default_postgres_backup_budget(),
+    };
+    assert_validation_err(
+        &CanonicalRuntime::open(pg_local).await,
+        ValidationReason::InvalidState,
+    );
+
+    // Hybrid 2: SQLite + S3 CAS must be rejected before opening sockets or locks.
+    let s3_cfg = fixtures.s3_config(
+        "notarium-hybrid-unused",
+        S3BucketModePolicy::DetectFromBucket,
+    );
+    let sqlite_s3 = CanonicalConfig {
+        installation_id: sample_installation_id(92),
+        sql: SqlBackendConfig::sqlite_default(temp.data_root()),
+        blobs: BlobBackendConfig::S3(Box::new(s3_cfg)),
+        writer: WriterConfig::default(),
+        snapshot_retention: Duration::from_secs(60),
+        default_backup_budget: default_backup_budget(),
+    };
+    assert_validation_err(
+        &CanonicalRuntime::open(sqlite_s3).await,
+        ValidationReason::InvalidState,
+    );
 }

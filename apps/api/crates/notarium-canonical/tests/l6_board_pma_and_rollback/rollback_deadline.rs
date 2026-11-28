@@ -51,7 +51,9 @@ async fn rollback_deadline_spans_room_reservations_and_writer_ack_on_both_backen
         let root = TempDataRoot::new("l6-rollback-room-deadline");
         let schema = fixtures.fresh_pg_schema();
         let config = if postgres {
-            fixtures.pg_local_config(sample_installation_id(78), &schema, root.data_root())
+            fixtures
+                .open_pg_s3_config(sample_installation_id(78), &schema)
+                .await
         } else {
             CanonicalConfig::local_default(sample_installation_id(78), root.data_root())
         };
@@ -325,7 +327,9 @@ async fn rollback_room_plan_replans_on_concurrent_open_and_clean_close_both_back
         let root = TempDataRoot::new("l6-rollback-room-race");
         let schema = fixtures.fresh_pg_schema();
         let config = if postgres {
-            fixtures.pg_local_config(sample_installation_id(81), &schema, root.data_root())
+            fixtures
+                .open_pg_s3_config(sample_installation_id(81), &schema)
+                .await
         } else {
             CanonicalConfig::local_default(sample_installation_id(81), root.data_root())
         };

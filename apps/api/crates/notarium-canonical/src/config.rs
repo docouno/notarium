@@ -197,6 +197,15 @@ pub struct CanonicalConfig {
 }
 
 impl CanonicalConfig {
+    /// Enforce the two supported storage profiles (`LocalSqlite` or `CloudPostgresS3`).
+    pub fn validate_storage_profile(&self) -> DomainResult<()> {
+        match (&self.sql, &self.blobs) {
+            (SqlBackendConfig::Sqlite { .. }, BlobBackendConfig::Local { .. })
+            | (SqlBackendConfig::Postgres { .. }, BlobBackendConfig::S3(_)) => Ok(()),
+            _ => Err(DomainError::validation(ValidationReason::InvalidState)),
+        }
+    }
+
     pub(crate) fn validate_timer_intervals(&self) -> DomainResult<()> {
         let now = std::time::Instant::now();
         let fits = |delay: Duration| now.checked_add(delay).is_some();

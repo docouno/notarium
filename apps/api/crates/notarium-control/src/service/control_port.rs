@@ -294,9 +294,6 @@ impl ControlPort for ControlPlane {
     ) -> PortFuture<'_, ControlPage<ScheduleRunReceipt>> {
         Box::pin(self.control.list_expired_schedule_runs(ctx, now, page))
     }
-    fn scheduler_clock(&self, ctx: MaintenanceContext) -> PortFuture<'_, Timestamp> {
-        Box::pin(self.control.scheduler_clock(ctx))
-    }
     fn get_schedule_run(
         &self,
         ctx: ScheduleRunContext,

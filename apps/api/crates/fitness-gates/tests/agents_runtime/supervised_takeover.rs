@@ -480,7 +480,7 @@ async fn fenced_ownership_recovers_pending_inputs(
         .await
         .unwrap()
         .unwrap();
-    let body = "A staged message from the previous owner's queue. ".repeat(20);
+    let body = "A staged message from the previous owner's queue. ".repeat(700);
     let digest = ContentDigest::from_bytes(*blake3::hash(body.as_bytes()).as_bytes());
     let enqueue = |index| {
         primary.enqueue_input(

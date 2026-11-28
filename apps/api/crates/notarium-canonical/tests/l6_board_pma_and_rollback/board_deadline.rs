@@ -39,7 +39,9 @@ async fn board_move_deadline_covers_planner_retry_room_and_writer_ack_on_both_ba
         let root = TempDataRoot::new("board-deadline");
         let schema = fixtures.fresh_pg_schema();
         let config = if postgres {
-            fixtures.pg_local_config(sample_installation_id(89), &schema, root.data_root())
+            fixtures
+                .open_pg_s3_config(sample_installation_id(89), &schema)
+                .await
         } else {
             CanonicalConfig::local_default(sample_installation_id(89), root.data_root())
         };
@@ -208,7 +210,9 @@ async fn edit_note_bounds_room_dispatch_on_both_backends() {
         let root = TempDataRoot::new("edit-room-deadline");
         let schema = fixtures.fresh_pg_schema();
         let config = if postgres {
-            fixtures.pg_local_config(sample_installation_id(76), &schema, root.data_root())
+            fixtures
+                .open_pg_s3_config(sample_installation_id(76), &schema)
+                .await
         } else {
             CanonicalConfig::local_default(sample_installation_id(76), root.data_root())
         };

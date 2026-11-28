@@ -265,6 +265,12 @@ pub(super) async fn series(args: &[String]) {
             .await
             .expect("reserve unique schema");
         cfg.sql = SqlBackendConfig::postgres_default(opts, &schema);
+        let bucket = fixtures.fresh_s3_bucket("interactive");
+        let s3_cfg = fixtures.s3_config(bucket);
+        admin_ensure_bucket(&s3_cfg, Some("Enabled"))
+            .await
+            .expect("ensure interactive benchmark S3 bucket");
+        cfg.blobs = BlobBackendConfig::S3(Box::new(s3_cfg));
         pg = Some(conn);
     } else {
         assert_eq!(a[0], "sqlite")

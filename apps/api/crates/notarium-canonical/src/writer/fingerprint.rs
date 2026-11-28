@@ -43,7 +43,6 @@ struct LegacyFingerprint {
     rename_kind: Option<&'static str>,
     schema: Option<(FolderId, String, Option<RevisionId>)>,
     chat_refs: Option<ContentDigest>,
-    staged_size: Option<(ContentDigest, u64)>,
 }
 
 fn hash_parts(previous: ContentDigest, parts: &[&[u8]]) -> ContentDigest {
@@ -133,7 +132,6 @@ impl UnboundCommand {
                     rename_kind: None,
                     schema: None,
                     chat_refs: None,
-                    staged_size: None,
                 }),
             })));
         }
@@ -166,33 +164,21 @@ impl UnboundCommand {
 
     pub(crate) fn with_chat_body(mut self, body: &ChatInputBody, refs: &[NoteRef]) -> Self {
         let ref_digest = chat_reference_digest(refs);
-        let size = match body {
-            ChatInputBody::Text(s) => s.len() as u64,
-            ChatInputBody::Staged(staged) => staged.byte_len(),
-        };
+        let ChatInputBody::Text(s) = body;
+        let size = s.len() as u64;
         self.0.command_hash = hash_parts(
             self.0.command_hash,
             &[&size.to_be_bytes(), ref_digest.as_bytes()],
         );
         if let Some(proof) = self.0.legacy_proof_mut() {
-            // Without references the old suffix is unambiguous for a staged body:
-            // a staging lease is 16 bytes and the shortest possible reference is 24.
             // An inline body can only overlap a reference if its final 24 bytes
             // consist entirely of characters permitted in a canonical or legacy ID.
             let needs_refs = !refs.is_empty()
-                || match body {
-                    ChatInputBody::Text(s) => {
-                        s.len() >= 24
-                            && s.as_bytes()[s.len() - 24..]
-                                .iter()
-                                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
-                    }
-                    ChatInputBody::Staged(_) => false,
-                };
+                || (s.len() >= 24
+                    && s.as_bytes()[s.len() - 24..]
+                        .iter()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-')));
             proof.chat_refs = needs_refs.then_some(ref_digest);
-            if let ChatInputBody::Staged(staged) = body {
-                proof.staged_size = Some((staged.digest(), staged.byte_len()));
-            }
         }
         self
     }
@@ -279,15 +265,6 @@ impl CommandIdentitySpec {
             };
         }
         let incarnation = scope.incarnation.as_bytes().as_slice();
-        if let Some((digest, size)) = proof.staged_size {
-            let bytes: Option<i64> = fetch!(
-                "SELECT raw_size FROM blob_catalog WHERE space_id=$1 AND content_blake3=$2",
-                digest.as_bytes().as_slice()
-            );
-            if bytes.and_then(|v| u64::try_from(v).ok()) != Some(size) {
-                return Ok(false);
-            }
-        }
         if let Some(expected) = &proof.revision {
             let parent: Option<Option<String>> = fetch!(
                 "SELECT parent_rev_id FROM revisions WHERE space_id=$1 AND history_incarnation=$2

@@ -700,7 +700,7 @@ CREATE TABLE IF NOT EXISTS chat_entries (
             kind <> 'redacted'
             AND redacted_at_seq IS NULL
             AND (
-                (inline_text IS NOT NULL AND length(CAST(inline_text AS BLOB)) <= 512 AND payload_blake3 IS NULL)
+                (inline_text IS NOT NULL AND length(CAST(inline_text AS BLOB)) <= 32768 AND payload_blake3 IS NULL)
                 OR (inline_text IS NULL AND payload_blake3 IS NOT NULL)
             )
         )
@@ -770,7 +770,7 @@ CREATE TABLE IF NOT EXISTS chat_pending_inputs (
     ext_space_tainted INTEGER NOT NULL DEFAULT 0 CHECK (ext_space_tainted IN (0, 1)),
     PRIMARY KEY (space_id, thread_id, input_id),
     CHECK (
-        (inline_text IS NOT NULL AND length(CAST(inline_text AS BLOB)) <= 512 AND payload_blake3 IS NULL)
+        (inline_text IS NOT NULL AND length(CAST(inline_text AS BLOB)) <= 32768 AND payload_blake3 IS NULL)
         OR (inline_text IS NULL AND payload_blake3 IS NOT NULL)
     ),
     FOREIGN KEY (space_id, thread_id) REFERENCES chat_threads (space_id, thread_id)

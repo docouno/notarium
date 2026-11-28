@@ -1790,23 +1790,8 @@ fn canonical_seams_enforce_command_ranges_chat_staging_and_nanosecond_timestamps
     assert!(!DomainError::validation(ValidationReason::InvalidCutoff).requires_resync());
     assert!(!DomainError::validation(ValidationReason::NotReady).requires_resync());
 
-    assert!(
-        StagedChatBlob::attest_canonical(
-            scope(1).space_id,
-            PrincipalId::from_bytes([1; 16]),
-            ContentDigest::from_bytes([1; 32]),
-            512,
-        )
-        .is_err()
-    );
-    let staged = StagedChatBlob::attest_canonical(
-        scope(1).space_id,
-        PrincipalId::from_bytes([1; 16]),
-        ContentDigest::from_bytes([2; 32]),
-        513,
-    )
-    .unwrap();
-    assert_eq!(staged.byte_len(), 513);
+    assert_eq!(ChatInputBody::INLINE_MAX_BYTES, 32 * 1024);
+    assert_eq!(ChatInputBody::MAX_ENTRY_BYTES, 256 * 1024);
 
     let ts = Timestamp::parse("2026-11-15T12:34:56.123456789Z").unwrap();
     let roundtrip = Timestamp::from_unix_parts(ts.unix_seconds(), ts.nanosecond()).unwrap();

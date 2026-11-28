@@ -52,6 +52,11 @@ pub(crate) struct PgFixture {
     pg_user: String,
     pg_password: String,
     pg_database: String,
+    s3_socket_container: PathBuf,
+    s3_endpoint: String,
+    s3_region: String,
+    s3_access_key: String,
+    s3_secret_key: String,
 }
 
 impl PgFixture {
@@ -83,6 +88,30 @@ impl PgFixture {
         }
     }
 
+    pub async fn s3_blobs(&self, prefix: &str) -> BlobBackendConfig {
+        let mut cfg = notarium_canonical::S3Config {
+            endpoint: self.s3_endpoint.clone(),
+            region: self.s3_region.clone(),
+            bucket: "notarium-bench-shared".to_owned(),
+            application_prefix: String::new(),
+            addressing: notarium_canonical::S3AddressingStyle::PathStyle,
+            credentials: notarium_canonical::S3Credentials {
+                access_key_id: self.s3_access_key.clone(),
+                secret_access_key: self.s3_secret_key.clone(),
+                session_token: None,
+            },
+            custom_ca_pem: None,
+            unix_socket: Some(self.s3_socket_container.clone()),
+            bucket_mode_policy: notarium_canonical::S3BucketModePolicy::DetectFromBucket,
+            request_timeout: Duration::from_secs(10),
+        };
+        notarium_canonical::blobs::s3::admin_ensure_bucket(&cfg, Some("Enabled"))
+            .await
+            .expect("ensure benchmark MinIO bucket");
+        cfg.application_prefix = format!("{prefix}/");
+        BlobBackendConfig::S3(Box::new(cfg))
+    }
+
     pub async fn open_pool(&self) -> PgPool {
         sqlx::postgres::PgPoolOptions::new()
             .max_connections(12)
@@ -107,7 +136,7 @@ pub(crate) async fn open_canonical(
                 pg.connect_config(),
                 "test_projection_canonical",
             ),
-            blobs: BlobBackendConfig::Local { data_root: root },
+            blobs: pg.s3_blobs("test_projection_canonical").await,
             writer: WriterConfig::default(),
             snapshot_retention: Duration::from_secs(300),
             default_backup_budget: default_postgres_backup_budget(),

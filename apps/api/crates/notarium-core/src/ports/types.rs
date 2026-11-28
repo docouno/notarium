@@ -494,64 +494,15 @@ pub enum ChatBody {
     Blob(ContentDigest),
     Redacted,
 }
-/// Canonical proof that a chat body exceeding 512 UTF-8 bytes has been staged in
-/// this Space's CAS for the declared author; raw unowned digests cannot be attached.
-/// ```compile_fail
-/// use notarium_core::ports::StagedChatBlob;
-/// let _: StagedChatBlob = serde_json::from_str("{}").unwrap();
-/// ```
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct StagedChatBlob {
-    space: SpaceId,
-    owner: PrincipalId,
-    digest: ContentDigest,
-    byte_len: u64,
-    lease: Option<[u8; 16]>,
-}
-impl StagedChatBlob {
-    pub const INLINE_MAX_BYTES: u64 = 512;
-    pub fn attest_canonical(
-        space: SpaceId,
-        owner: PrincipalId,
-        digest: ContentDigest,
-        byte_len: u64,
-    ) -> DomainResult<Self> {
-        if byte_len <= Self::INLINE_MAX_BYTES {
-            return Err(DomainError::validation(ValidationReason::InvalidRange));
-        }
-        Ok(Self {
-            space,
-            owner,
-            digest,
-            byte_len,
-            lease: None,
-        })
-    }
-    /// Selects a specific durable staging reference; canonical verifies it on consumption.
-    pub fn with_lease(mut self, lease: [u8; 16]) -> Self {
-        self.lease = Some(lease);
-        self
-    }
-    pub fn lease(&self) -> Option<[u8; 16]> {
-        self.lease
-    }
-    pub fn space(&self) -> &SpaceId {
-        &self.space
-    }
-    pub fn owner(&self) -> &PrincipalId {
-        &self.owner
-    }
-    pub fn digest(&self) -> ContentDigest {
-        self.digest
-    }
-    pub fn byte_len(&self) -> u64 {
-        self.byte_len
-    }
-}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ChatInputBody {
     Text(String),
-    Staged(StagedChatBlob),
+}
+impl ChatInputBody {
+    /// Threshold above which canonical chat storage spills the UTF-8 body to CAS.
+    pub const INLINE_MAX_BYTES: u64 = 32 * 1024;
+    /// Hard upper bound for a single chat entry body accepted by canonical write paths.
+    pub const MAX_ENTRY_BYTES: usize = 256 * 1024;
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChatEntry {

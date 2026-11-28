@@ -94,9 +94,7 @@ pub(super) fn prepare(input: &mut AppendChat) -> Result<BodyFormat, PortError> {
         {
             return Err(DomainError::validation(ValidationReason::InvalidState).into());
         }
-        let ChatInputBody::Text(text) = &input.body else {
-            return Err(DomainError::validation(ValidationReason::InvalidState).into());
-        };
+        let ChatInputBody::Text(text) = &input.body;
         let encoded = serde_json::to_string(&ProposalTurn {
             text: text.clone(),
             envelope,
@@ -108,33 +106,30 @@ pub(super) fn prepare(input: &mut AppendChat) -> Result<BodyFormat, PortError> {
     if input.proposed_effect.is_some() {
         return Err(DomainError::validation(ValidationReason::InvalidState).into());
     }
-    if let ChatInputBody::Text(text) = &input.body {
-        if input.kind == ChatEntryKind::Model
-            && (input.interruption.is_some()
-                || !input.tool_calls.is_empty()
-                || text.starts_with('\u{FDD0}')
-                || text.contains('\0'))
-        {
-            let mut ids = BTreeSet::new();
-            if input.tool_calls.len() > MAX_TURN_CALLS
-                || input.tool_calls.iter().any(|call| {
-                    CommandKey::parse(call.id.as_str()).is_err() || !ids.insert(call.id.as_str())
-                })
-            {
-                return Err(DomainError::validation(ValidationReason::InvalidState).into());
-            }
-            let encoded = serde_json::to_string(&ModelTurn {
-                text: text.clone(),
-                interruption: input.interruption,
-                tool_calls: std::mem::take(&mut input.tool_calls),
+    let ChatInputBody::Text(text) = &input.body;
+    if input.kind == ChatEntryKind::Model
+        && (input.interruption.is_some()
+            || !input.tool_calls.is_empty()
+            || text.starts_with('\u{FDD0}')
+            || text.contains('\0'))
+    {
+        let mut ids = BTreeSet::new();
+        if input.tool_calls.len() > MAX_TURN_CALLS
+            || input.tool_calls.iter().any(|call| {
+                CommandKey::parse(call.id.as_str()).is_err() || !ids.insert(call.id.as_str())
             })
-            .map_err(|error| internal_not_committed("encode_chat_model_turn", error.to_string()))?;
-            return encode(input, MODEL_MARKER, encoded, BodyFormat::Model);
-        }
-        if text.contains('\0') {
+        {
             return Err(DomainError::validation(ValidationReason::InvalidState).into());
         }
-    } else if !input.tool_calls.is_empty() {
+        let encoded = serde_json::to_string(&ModelTurn {
+            text: text.clone(),
+            interruption: input.interruption,
+            tool_calls: std::mem::take(&mut input.tool_calls),
+        })
+        .map_err(|error| internal_not_committed("encode_chat_model_turn", error.to_string()))?;
+        return encode(input, MODEL_MARKER, encoded, BodyFormat::Model);
+    }
+    if text.contains('\0') {
         return Err(DomainError::validation(ValidationReason::InvalidState).into());
     }
     Ok(BodyFormat::Plain)
@@ -569,6 +564,8 @@ pub(crate) async fn load_current_chat_for_egress_tx(
         .await
 }
 
+const MAX_CHAT_READ_HYDRATE_BYTES: usize = 16 * 1024 * 1024;
+
 pub(super) async fn hydrate_body(
     store: &CanonicalStore,
     scope: &HistoryScope,
@@ -576,8 +573,12 @@ pub(super) async fn hydrate_body(
     digest: Option<Vec<u8>>,
     budget: &CallBudget,
     started: tokio::time::Instant,
+    max_bytes: u64,
 ) -> Result<String, PortError> {
     if let Some(inline) = inline {
+        if inline.len() as u64 > max_bytes {
+            return Err(DomainError::validation(ValidationReason::BudgetExceeded).into());
+        }
         return Ok(inline);
     }
     let digest: [u8; 32] = digest
@@ -589,10 +590,11 @@ pub(super) async fn hydrate_body(
     let deadline = crate::domain::common::CommandDeadline::start(&remaining, "hydrate_chat_body");
     let raw = deadline
         .prepare_read(&remaining, || {
-            store.read_verified_blob_with_budget(
+            store.read_verified_blob_bounded(
                 scope,
                 ContentDigest::from_bytes(digest),
                 Some(&remaining),
+                max_bytes,
             )
         })
         .await?;
@@ -751,15 +753,41 @@ pub(super) async fn hydrate_payloads_bounded(
         }
         let reader = PageReader::Snapshots(store, budget, deadline);
         fold_stored_proof(reader, &space.scope, thread, &mut row, Some(&mut memo)).await?;
-        let body = hydrate_body(
+        let decode_cap = match max_bytes {
+            Some(limit) => limit.saturating_add(2 * 1024 * 1024),
+            None => MAX_CHAT_READ_HYDRATE_BYTES,
+        }
+        .saturating_sub(hydrated_bytes) as u64;
+        let body = match hydrate_body(
             store,
             &space.scope,
             row.inline_text.clone(),
             row.payload_blake3.clone(),
             budget,
             started,
+            decode_cap,
         )
-        .await?;
+        .await
+        {
+            Ok(body) => body,
+            Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
+                if diagnostic.reason == ValidationReason::BudgetExceeded
+                    && max_bytes.is_some()
+                    && results.len() >= 2 =>
+            {
+                let next_starts_non_tool_group =
+                    matches!(row.kind.as_str(), "human" | "model" | "compaction");
+                if (has_valid_cut && next_starts_non_tool_group)
+                    || next_starts_non_tool_group
+                    || !in_model_group
+                {
+                    truncated_at = last_seq;
+                    break;
+                }
+                return Err(DomainError::validation(ValidationReason::BudgetExceeded).into());
+            }
+            Err(err) => return Err(err),
+        };
         hydrated_bytes = hydrated_bytes.saturating_add(body.len());
         let ModelTurn {
             text,
@@ -885,6 +913,7 @@ pub(super) async fn read_chat_proposal(
         model.payload_blake3.clone(),
         &budget,
         started,
+        MAX_TURN_BYTES as u64,
     )
     .await?;
     let call_id = CommandKey::parse(
@@ -906,6 +935,7 @@ pub(super) async fn read_chat_proposal(
         tool.payload_blake3.clone(),
         &budget,
         started,
+        MAX_TURN_BYTES as u64,
     )
     .await?;
     let ProposalTurn {

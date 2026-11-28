@@ -743,8 +743,9 @@ async fn l7_projection_refs_sqlite_covering_pages_and_erasure() {
 async fn l7_projection_refs_postgres_bounded_pages_and_erasure() {
     let fixtures = StorageTestFixtures::load_required();
     let schema = fixtures.fresh_pg_schema();
-    let temp = TempDataRoot::new("projection-chat-postgres");
-    let config = fixtures.pg_local_config(sample_installation_id(0x94), &schema, temp.data_root());
+    let config = fixtures
+        .open_pg_s3_config(sample_installation_id(0x94), &schema)
+        .await;
     let (store, runtime) = CanonicalRuntime::open(config.clone()).await.unwrap();
     let legacy = plant_v6_chat_entries(&store).await;
     runtime.shutdown().await.unwrap();

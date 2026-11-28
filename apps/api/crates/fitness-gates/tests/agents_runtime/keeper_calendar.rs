@@ -452,7 +452,6 @@ pub(super) async fn calendar_scope_and_orphan(fixture: &mut RuntimeFixture, spac
                 slot: orphan_slot,
                 current_role: orphan.definition.approved_role,
                 expected: orphan.revision,
-                next_slot: None,
             },
         )
         .await

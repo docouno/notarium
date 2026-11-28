@@ -585,46 +585,55 @@ pub(super) async fn pin_schedule(
             &ctx.budget.cancellation,
         )
         .await?;
-    let pinned = async {
-        let (history, abilities) = {
-            let mut tx = guard.connection();
-            let space = load_space_record(&mut tx, space).await?;
-            if space.space.lifecycle != SpaceLifecycle::Active || grant.read_classes.is_empty() {
-                return Err(DomainError::ResourceNotFound.into());
-            }
-            if let Some(project) = &grant.project_root {
-                let reference = FolderRef {
-                    space_id: space.space.id.clone(),
-                    folder_id: project.clone(),
-                };
-                let (_, row) = folder_metadata(&mut tx, ctx.auth(), &space, reference).await?;
-                if !row.is_project {
+    let snapshot_deadline = guard.snapshot_deadline();
+    let pinned = {
+        let query = async {
+            let (history, abilities) = {
+                let mut tx = guard.connection();
+                let space = load_space_record(&mut tx, space).await?;
+                if space.space.lifecycle != SpaceLifecycle::Active || grant.read_classes.is_empty()
+                {
                     return Err(DomainError::ResourceNotFound.into());
                 }
-            }
-            let mut abilities = Vec::with_capacity(refs.len());
-            let mut live_ancestry = crate::domain::common::FolderAncestryCache::default();
-            for reference in refs {
-                let current = descriptor_with_cache(
-                    &mut tx,
-                    ctx.auth(),
-                    &space,
-                    &reference.id,
-                    None,
-                    &mut live_ancestry,
-                )
-                .await?;
-                if current.reference != reference {
-                    return Err(DomainError::ResourceNotFound.into());
+                if let Some(project) = &grant.project_root {
+                    let reference = FolderRef {
+                        space_id: space.space.id.clone(),
+                        folder_id: project.clone(),
+                    };
+                    let (_, row) = folder_metadata(&mut tx, ctx.auth(), &space, reference).await?;
+                    if !row.is_project {
+                        return Err(DomainError::ResourceNotFound.into());
+                    }
                 }
-                abilities.push(current);
-            }
-            (space.scope, abilities)
+                let mut abilities = Vec::with_capacity(refs.len());
+                let mut live_ancestry = crate::domain::common::FolderAncestryCache::default();
+                for reference in refs {
+                    let current = descriptor_with_cache(
+                        &mut tx,
+                        ctx.auth(),
+                        &space,
+                        &reference.id,
+                        None,
+                        &mut live_ancestry,
+                    )
+                    .await?;
+                    if current.reference != reference {
+                        return Err(DomainError::ResourceNotFound.into());
+                    }
+                    abilities.push(current);
+                }
+                (space.scope, abilities)
+            };
+            guard.check()?;
+            Ok::<_, PortError>((history, abilities))
         };
-        guard.check()?;
-        Ok::<_, PortError>((history, abilities))
-    }
-    .await;
+        tokio::select! {
+            biased;
+            _ = ctx.budget.cancellation.cancelled() => Err(super::egress::cancelled()),
+            _ = tokio::time::sleep_until(snapshot_deadline) => Err(super::egress::expired()),
+            result = query => result,
+        }
+    };
     let (history, abilities) = match pinned {
         Ok(pair) => pair,
         Err(error) => {

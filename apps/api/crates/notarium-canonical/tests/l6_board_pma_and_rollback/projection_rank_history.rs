@@ -157,8 +157,9 @@ async fn l6_note_only_rollback_tombstones_both_rank_endpoints() {
 
     let fixtures = StorageTestFixtures::load_required();
     let schema = fixtures.fresh_pg_schema();
-    let root = TempDataRoot::new("rank-removal-postgres");
-    let config = fixtures.pg_local_config(sample_installation_id(92), &schema, root.data_root());
+    let config = fixtures
+        .open_pg_s3_config(sample_installation_id(92), &schema)
+        .await;
     let (store, runtime) = CanonicalRuntime::open(config).await.unwrap();
     check_note_only_rollback_deletes_ranks(&store, true).await;
     runtime.shutdown().await.unwrap();
@@ -179,7 +180,9 @@ async fn l6_v6_rank_anchor_is_atomic_survives_restore_and_is_erased_by_purge() {
     for postgres in [false, true] {
         let temp = TempDataRoot::new("rank-anchor-migration");
         let config = if postgres {
-            fixtures.pg_local_config(installation.clone(), &schema, temp.data_root())
+            fixtures
+                .open_pg_s3_config(installation.clone(), &schema)
+                .await
         } else {
             CanonicalConfig::local_default(installation.clone(), temp.data_root())
         };
@@ -537,7 +540,7 @@ async fn l6_numeric_move_replays_v6_receipt_and_preserves_mixed_neighbor_ranks()
         let temp = TempDataRoot::new("numeric-board-upgrade");
         let installation = sample_installation_id(86);
         let config = if postgres {
-            fixtures.pg_local_config(installation, &schema, temp.data_root())
+            fixtures.open_pg_s3_config(installation, &schema).await
         } else {
             CanonicalConfig::local_default(installation, temp.data_root())
         };

@@ -930,8 +930,9 @@ async fn sqlite_projection_reads() {
 async fn postgres_projection_reads() {
     let fixtures = StorageTestFixtures::load_required();
     let schema = fixtures.fresh_pg_schema();
-    let path = TempDataRoot::new("projection-reads-postgres");
-    let config = fixtures.pg_local_config(sample_installation_id(2), &schema, path.data_root());
+    let config = fixtures
+        .open_pg_s3_config(sample_installation_id(2), &schema)
+        .await;
     let (store, runtime) = CanonicalRuntime::open(config).await.unwrap();
     run_projection_reads(&store).await;
     runtime.shutdown().await.unwrap();

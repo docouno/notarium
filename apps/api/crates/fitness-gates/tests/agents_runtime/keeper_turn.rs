@@ -19,7 +19,7 @@ use std::{
 use tokio::{net::TcpListener, time::timeout};
 
 use super::runtime_ability_cases::{
-    approve_disclosure, identity, loopback_provider, read_request, send_ollama,
+    approve_disclosure, identity, loopback_provider_with_output, read_request, send_ollama,
 };
 
 const CATEGORIES: [&str; 9] = [
@@ -196,7 +196,7 @@ async fn keeper_turn_reconsent(fixture: &mut RuntimeFixture) {
         .unwrap();
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let local = loopback_provider(fixture, &human, &listener, 194, true).await;
+    let local = loopback_provider_with_output(fixture, &human, &listener, 194, true, 1024).await;
     let classes = [DocClass::Skill, DocClass::AgentMemory, DocClass::UserDoc].into();
     approve_disclosure(
         fixture,
@@ -398,7 +398,7 @@ async fn keeper_turn_reconsent(fixture: &mut RuntimeFixture) {
             })
             .collect::<Vec<_>>()
     );
-    let saved_text = "Recorded the planned observation. ".repeat(20);
+    let saved_text = "Recorded the planned observation. ".repeat(1000);
     send_ollama(
         &mut wire,
         json!({"role":"assistant","content":saved_text}),

@@ -52,7 +52,7 @@ use notarium_core::{
         InterceptedMutation, InterceptionResult, JobQuery, JobState, LiveCollabInterceptor,
         Mutation, NoteWritePort, PageLimit, PendingChatInput, PortFuture, Preconditions,
         QueueInputOutcome, RedactChatEntry, RollbackReservation, ServiceAuthority, ServicePurpose,
-        SpaceContext, StagedChatBlob,
+        SpaceContext,
     },
     query::ReadRequest,
     receipt::{CausalBasis, ChangeCursor, CommandIdentity, ReceiptSet},
@@ -384,7 +384,6 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
         incarnation: sample_incarnation(0x71),
     };
     let owner = sample_principal_id(0x11);
-    let other_user = sample_principal_id(0x22);
     let root_folder = sample_folder_id(0x01);
 
     store
@@ -440,7 +439,7 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
         .await
         .expect("create project");
 
-    // 1. Create Personal chat thread and test 512B vs 513B multi-byte UTF-8 inline/CAS boundary.
+    // 1. Create Personal chat thread and test 32 KiB vs 32 KiB + 1B multi-byte UTF-8 inline/CAS boundary.
     let thread = sample_thread_id(0x31);
     let created = store
         .create_chat(
@@ -463,9 +462,12 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
     assert_eq!(created.head, ThreadEntrySeq::ZERO);
     assert!(!created.tainted);
 
-    // Exact 512 UTF-8 bytes ending with 4-byte emoji '🦀' (508 ASCII + 4B emoji = 512B) -> Inline!
-    let exact_512 = format!("{}🦀", "a".repeat(508));
-    assert_eq!(exact_512.len(), 512);
+    // Exact 32 KiB UTF-8 bytes ending with 4-byte emoji '🦀' (32764 ASCII + 4B emoji = 32768B) -> Inline!
+    let exact_32k = format!(
+        "{}🦀",
+        "a".repeat(ChatInputBody::INLINE_MAX_BYTES as usize - 4)
+    );
+    assert_eq!(exact_32k.len(), ChatInputBody::INLINE_MAX_BYTES as usize);
     let e1 = store
         .append_chat(
             owner_ctx(&scope, owner.clone()),
@@ -481,24 +483,23 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
                     thread: thread.clone(),
                     parent: ThreadEntrySeq::ZERO,
                     kind: ChatEntryKind::Human,
-                    body: ChatInputBody::Text(exact_512.clone()),
+                    body: ChatInputBody::Text(exact_32k.clone()),
                     referenced_notes: Vec::new(),
                     tainted: false,
                 },
             ),
         )
         .await
-        .expect("512B UTF-8 inline append")
+        .expect("32KiB UTF-8 inline append")
         .value;
-    assert_eq!(e1.body, ChatBody::Inline(exact_512.clone()));
+    assert_eq!(e1.body, ChatBody::Inline(exact_32k.clone()));
     assert_eq!(e1.depth, 0);
     assert!(e1.is_chain_node);
     assert!(e1.ancestors.is_empty());
 
-    // 513 UTF-8 bytes with `ChatInputBody::Text` must fail closed (`InvalidRange`)!
-    let body_513 = format!("{}🦀b", "a".repeat(508));
-    assert_eq!(body_513.len(), 513);
-    let too_big_inline = store
+    // Payloads > 256 KiB (`ChatInputBody::MAX_ENTRY_BYTES`) must fail closed (`InvalidRange`)!
+    let too_big_body = "x".repeat(ChatInputBody::MAX_ENTRY_BYTES + 1);
+    let too_big_res = store
         .append_chat(
             owner_ctx(&scope, owner.clone()),
             next_mutation(
@@ -513,159 +514,29 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
                     thread: thread.clone(),
                     parent: e1.seq,
                     kind: ChatEntryKind::Model,
-                    body: ChatInputBody::Text(body_513.clone()),
+                    body: ChatInputBody::Text(too_big_body),
                     referenced_notes: Vec::new(),
                     tainted: false,
                 },
             ),
         )
         .await;
-    assert_validation_err(&too_big_inline, ValidationReason::InvalidRange);
+    assert_validation_err(&too_big_res, ValidationReason::InvalidRange);
 
-    // `stage_chat_blob` rejects <= 512B!
-    let bad_stage = store
-        .stage_chat_blob(owner_ctx(&scope, owner.clone()), &exact_512)
-        .await;
-    assert_validation_err(&bad_stage, ValidationReason::InvalidRange);
-
-    // Unowned / forged `StagedChatBlob::attest_canonical` rejected!
-    let unowned_staged = StagedChatBlob::attest_canonical(
-        scope.space_id.clone(),
-        owner.clone(),
-        ContentDigest::from_bytes([0xEE; 32]),
-        600,
-    )
-    .unwrap();
-    let unowned_res = store
-        .append_chat(
-            owner_ctx(&scope, owner.clone()),
-            next_mutation(
-                &scope,
-                &owner,
-                AppendChat {
-                    tool_calls: Vec::new(),
-                    provenance: None,
-                    interruption: None,
-                    proposed_diff: None,
-                    proposed_effect: None,
-                    thread: thread.clone(),
-                    parent: e1.seq,
-                    kind: ChatEntryKind::Model,
-                    body: ChatInputBody::Staged(unowned_staged),
-                    referenced_notes: Vec::new(),
-                    tainted: false,
-                },
-            ),
-        )
-        .await;
-    assert!(unowned_res.is_err(), "unowned digest must be rejected");
-
-    // Wrong-author `StagedChatBlob` rejected (`InvalidAuthority`)!
-    let wrong_owner_staged = StagedChatBlob::attest_canonical(
-        scope.space_id.clone(),
-        other_user.clone(),
-        ContentDigest::from_bytes([0xDD; 32]),
-        600,
-    )
-    .unwrap();
-    let wrong_owner_res = store
-        .append_chat(
-            owner_ctx(&scope, owner.clone()),
-            next_mutation(
-                &scope,
-                &owner,
-                AppendChat {
-                    tool_calls: Vec::new(),
-                    provenance: None,
-                    interruption: None,
-                    proposed_diff: None,
-                    proposed_effect: None,
-                    thread: thread.clone(),
-                    parent: e1.seq,
-                    kind: ChatEntryKind::Model,
-                    body: ChatInputBody::Staged(wrong_owner_staged),
-                    referenced_notes: Vec::new(),
-                    tainted: false,
-                },
-            ),
-        )
-        .await;
-    assert_validation_err(&wrong_owner_res, ValidationReason::InvalidAuthority);
-
-    // Legitimate `stage_chat_blob` (>512B) + `append_chat` succeeds and stores `ChatBody::Blob(digest)`!
-    let stage_ctx = owner_ctx(&scope, owner.clone());
-    let source_request = stage_ctx.budget.request.clone();
-    let staged_513 = store
-        .stage_chat_blob(stage_ctx.clone(), &body_513)
-        .await
-        .expect("stage 513B chat blob");
-    let duplicate = store
-        .stage_chat_blob(stage_ctx.clone(), &body_513)
-        .await
-        .unwrap();
-    let other_request = owner_ctx(&scope, owner.clone()).budget.request;
-    let digest = staged_513.digest();
-    let first = store
-        .next_staged_chat_blob(stage_ctx.clone(), source_request.clone(), digest, None)
-        .await
-        .unwrap()
-        .unwrap();
-    let second = store
-        .next_staged_chat_blob(
-            stage_ctx.clone(),
-            source_request.clone(),
-            digest,
-            first.lease(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-    assert_ne!(first, second);
-    assert!([first.clone(), second.clone()].contains(&staged_513));
-    assert!([first, second.clone()].contains(&duplicate));
-    assert!(
-        store
-            .next_staged_chat_blob(
-                stage_ctx.clone(),
-                source_request.clone(),
-                digest,
-                second.lease()
-            )
-            .await
-            .unwrap()
-            .is_none()
+    // Payloads > 32 KiB (`ChatInputBody::INLINE_MAX_BYTES`) and <= 256 KiB transparently
+    // stage a CAS blob inside `append_chat` and store `ChatBody::Blob(digest)`!
+    let body_over_32k = format!(
+        "{}🦀b",
+        "a".repeat(ChatInputBody::INLINE_MAX_BYTES as usize - 4)
     );
-    assert!(
-        store
-            .next_staged_chat_blob(stage_ctx.clone(), other_request, digest, None)
-            .await
-            .unwrap()
-            .is_none()
-    );
-    let tainted_ctx = owner_ctx(&scope, owner.clone());
-    tainted_ctx.auth().taint().mark_external_read();
-    assert!(
-        store
-            .next_staged_chat_blob(tainted_ctx, source_request.clone(), digest, None)
-            .await
-            .unwrap()
-            .is_none()
-    );
-    store
-        .discard_staged_chat_blob(stage_ctx.clone(), duplicate.clone())
-        .await
-        .unwrap();
-    store
-        .discard_staged_chat_blob(stage_ctx.clone(), duplicate)
-        .await
-        .unwrap();
     assert_eq!(
-        store
-            .next_staged_chat_blob(stage_ctx, source_request, digest, None)
-            .await
-            .unwrap(),
-        Some(staged_513.clone())
+        body_over_32k.len(),
+        ChatInputBody::INLINE_MAX_BYTES as usize + 1
     );
+    let expected_blob_digest = store
+        .prepare_blob(body_over_32k.as_bytes())
+        .unwrap()
+        .digest();
     let e2 = store
         .append_chat(
             owner_ctx(&scope, owner.clone()),
@@ -681,7 +552,7 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
                     thread: thread.clone(),
                     parent: e1.seq,
                     kind: ChatEntryKind::Model,
-                    body: ChatInputBody::Staged(staged_513.clone()),
+                    body: ChatInputBody::Text(body_over_32k),
                     referenced_notes: vec![NoteRef {
                         space_id: scope.space_id.clone(),
                         note_id: ref_note.clone(),
@@ -691,9 +562,9 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
             ),
         )
         .await
-        .expect("append staged 513B chat")
+        .expect("append transparent >32KiB chat blob")
         .value;
-    assert_eq!(e2.body, ChatBody::Blob(staged_513.digest()));
+    assert_eq!(e2.body, ChatBody::Blob(expected_blob_digest));
     assert_eq!(e2.depth, 1);
     assert_eq!(e2.parent, Some(e1.seq));
     assert!(e2.ancestors.is_empty());
@@ -1064,8 +935,8 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
         }
         let handle = tokio::spawn(async move {
             let body = if idx % 2 == 0 {
-                // >512B body exercises CAS staging and cleanup on queue overflow!
-                format!("large-pending-{idx}-{}", "x".repeat(600))
+                // >32 KiB body exercises CAS staging and cleanup on queue overflow!
+                format!("large-pending-{idx}-{}", "x".repeat(33_000))
             } else {
                 format!("inline-pending-{idx}")
             };
@@ -1115,7 +986,7 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
                         .assert_discarded(
                             store,
                             &scope,
-                            &format!("large-pending-{idx}-{}", "x".repeat(600)),
+                            &format!("large-pending-{idx}-{}", "x".repeat(33_000)),
                             false,
                         )
                         .await;
@@ -1148,18 +1019,18 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
         "17th Full queue_chat_input must leak zero CAS blob_refs"
     );
 
-    // Pick a >512B queued item to verify CAS ref transfer on consume!
+    // Pick a >32 KiB queued item to verify CAS ref transfer on consume!
     let target_pending = queued_ids
         .iter()
         .find(|id| large_candidates.contains(*id))
         .cloned()
-        .expect("at least one >512B pending item queued");
+        .expect("at least one >32 KiB pending item queued");
 
     let shared_idx = (0..17u8)
         .find(|idx| PendingInputId::from_bytes([0x80 + *idx; 16]) == target_pending)
         .unwrap();
-    let shared = format!("large-pending-{shared_idx}-{}", "x".repeat(600));
-    let never_staged = "always-full".repeat(75);
+    let shared = format!("large-pending-{shared_idx}-{}", "x".repeat(33_000));
+    let never_staged = "always-full".repeat(3100);
     let fresh_input = |body: String, id| {
         next_mutation(
             &scope,
@@ -1208,7 +1079,7 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
             .unwrap(),
         shared.as_bytes()
     );
-    let denied_body = "missing-thread".repeat(80);
+    let denied_body = "missing-thread".repeat(2500);
     let mut missing = fresh_input(denied_body.clone(), 0xef);
     missing.input.thread = sample_thread_id(0xde);
     assert!(matches!(
@@ -1255,7 +1126,7 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
     assert_eq!(retained, 0);
     // Both requests may pass preflight for the last slot. The enabled-bucket
     // fixture holds their data PUTs until both private publications are registered.
-    let race_body = "concurrent final queue slot".repeat(40);
+    let race_body = "concurrent final queue slot".repeat(1300);
     let prepared = store.prepare_blob(race_body.as_bytes()).unwrap();
     if let QueuePhysical::S3(audit) = &physical {
         let hash = blake3::hash(&prepared.s3_parts()[0].compressed);
@@ -1418,7 +1289,7 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
         .await
         .expect("hydrate the top-ranked live chat entry");
     assert_eq!(hits.len(), 1);
-    assert_eq!(hits[0].text, exact_512);
+    assert_eq!(hits[0].text, exact_32k);
     assert!(truncated);
     // Parity with `read_chat`: a tainted thread head (`ext_space_tainted_mask != 0`)
     // taints the caller even when the matched entry itself was untainted.
@@ -1600,13 +1471,8 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
     // 4. Redaction (`redact_chat_entry`):
     // Append a Compaction entry on branch A (descendant of `e2`) AND a Compaction entry on sibling
     // branch B (NOT a descendant of `e2`, and having HIGHER `entry_seq` than `e2`!).
-    let blob = store
-        .stage_chat_blob(
-            owner_ctx(&scope, owner.clone()),
-            &"branch A compaction summary".repeat(24),
-        )
-        .await
-        .unwrap();
+    let comp_a_body = "branch A compaction summary ".repeat(1200);
+    let comp_a_digest = store.prepare_blob(comp_a_body.as_bytes()).unwrap().digest();
     let summary = next_mutation(
         &scope,
         &owner,
@@ -1619,7 +1485,7 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
             thread: thread.clone(),
             parent: cur_a,
             kind: ChatEntryKind::Compaction,
-            body: ChatInputBody::Staged(blob.clone()),
+            body: ChatInputBody::Text(comp_a_body),
             referenced_notes: vec![NoteRef {
                 space_id: scope.space_id.clone(),
                 note_id: ref_note.clone(),
@@ -1716,8 +1582,7 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
         .value;
     branch_b_tip = comp_b.seq;
 
-    // Release staging lease on `staged_513` first? Wait: let's check how `stage_chat_blob` + `append_chat`
-    // manages `StagedChat` vs `ChatEntry` ref_count, and redact `e2`!
+    // Redact `e2` and verify descendant compaction invalidation and blob retirement.
     let latest_thread = store
         .read_chat(
             owner_ctx(&scope, owner.clone()),
@@ -1802,7 +1667,7 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
         invalidated: comp_a.seq,
         child,
         valid: comp_b.seq,
-        digest: blob.digest(),
+        digest: comp_a_digest,
     };
     stale.check(store).await;
 
@@ -3522,7 +3387,6 @@ async fn l7_sqlite_chats_jobs_collab_and_crash_fenced_recovery() {
     let config = CanonicalConfig::local_default(sample_installation_id(0x70), temp.data_root());
 
     let staging_thread = sample_thread_id(0xd4);
-    let staged_pair;
     let stale;
     {
         let (store, runtime) = CanonicalRuntime::open(config.clone())
@@ -3613,20 +3477,6 @@ async fn l7_sqlite_chats_jobs_collab_and_crash_fenced_recovery() {
             )
             .await
             .unwrap();
-        let content = "same staged body".repeat(70);
-        let tainted_writer = owner_ctx(&crash_scope, owner.clone());
-        tainted_writer.auth().taint().mark_external_read();
-        let tainted = store
-            .stage_chat_blob(tainted_writer, &content)
-            .await
-            .unwrap();
-        let clean = store
-            .stage_chat_blob(owner_ctx(&crash_scope, owner.clone()), &content)
-            .await
-            .unwrap();
-        assert_eq!(clean.digest(), tainted.digest());
-        staged_pair = [(clean, false), (tainted, true)];
-
         runtime.shutdown().await.expect("shutdown SQLite runtime");
     }
 
@@ -3642,8 +3492,12 @@ async fn l7_sqlite_chats_jobs_collab_and_crash_fenced_recovery() {
     let owner = sample_principal_id(0x19);
     let crash_note = sample_note_id(0xD9);
 
-    for (staged, expected_taint) in staged_pair {
-        let reader = owner_ctx(&crash_scope, owner.clone());
+    let large_body = "same large chat body ".repeat(1700);
+    for expected_taint in [false, true] {
+        let writer = owner_ctx(&crash_scope, owner.clone());
+        if expected_taint {
+            writer.auth().taint().mark_external_read();
+        }
         let request = next_mutation(
             &crash_scope,
             &owner,
@@ -3656,17 +3510,18 @@ async fn l7_sqlite_chats_jobs_collab_and_crash_fenced_recovery() {
                 thread: staging_thread.clone(),
                 parent: ThreadEntrySeq::ZERO,
                 kind: ChatEntryKind::Human,
-                body: ChatInputBody::Staged(staged),
+                body: ChatInputBody::Text(large_body.clone()),
                 referenced_notes: Vec::new(),
                 tainted: false,
             },
         );
         let result = store2
-            .append_chat(reader.clone(), request.clone())
+            .append_chat(writer.clone(), request.clone())
             .await
             .unwrap();
+        assert!(matches!(result.value.body, ChatBody::Blob(_)));
         assert_eq!(result.value.tainted, expected_taint);
-        assert_eq!(reader.auth().taint().is_tainted(), expected_taint);
+        assert_eq!(writer.auth().taint().is_tainted(), expected_taint);
         let fresh = owner_ctx(&crash_scope, owner.clone());
         let replay = store2.append_chat(fresh.clone(), request).await.unwrap();
         assert_eq!(replay.receipt, result.receipt);
@@ -4003,7 +3858,7 @@ async fn exercise_interrupted_queue_upload(
         ThreadEntrySeq::ZERO,
     )
     .await;
-    let body = "payload spanning queue takeover".repeat(24);
+    let body = "payload spanning queue takeover".repeat(1100);
     let prepared = old.prepare_blob(body.as_bytes()).unwrap();
     let (reached, until_put) = tokio::sync::oneshot::channel();
     let (release, resume) = tokio::sync::oneshot::channel();
@@ -4219,7 +4074,7 @@ async fn chat_receipts_preserve_body_and_reference_boundaries() {
         let root = TempDataRoot::new("chat-reference-identity");
         let installation = sample_installation_id(0x64);
         let cfg = if postgres {
-            fixtures.pg_local_config(installation, &schema, root.data_root())
+            fixtures.open_pg_s3_config(installation, &schema).await
         } else {
             CanonicalConfig::local_default(installation, root.data_root())
         };
@@ -4365,7 +4220,7 @@ async fn batched_chat_search_hydration_handles_multi_thread_deep_chains_and_bran
         let root = TempDataRoot::new("chat-search-batched-hydration");
         let installation = sample_installation_id(0x65);
         let cfg = if postgres {
-            fixtures.pg_local_config(installation, &schema, root.data_root())
+            fixtures.open_pg_s3_config(installation, &schema).await
         } else {
             CanonicalConfig::local_default(installation, root.data_root())
         };
@@ -4669,4 +4524,98 @@ async fn batched_chat_search_hydration_handles_multi_thread_deep_chains_and_bran
         runtime.shutdown().await.unwrap();
     }
     fixtures.drop_pg_schema(&schema).await;
+}
+
+#[tokio::test]
+async fn chat_hydration_rejects_oversized_blob_before_decompression() {
+    let temp = TempDataRoot::new("chat-hydration-budget-cap");
+    let cfg = CanonicalConfig::local_default(sample_installation_id(0x66), temp.data_root());
+    let (store, runtime) = CanonicalRuntime::open(cfg).await.unwrap();
+    let scope = HistoryScope {
+        space_id: sample_space_id(0x66),
+        incarnation: sample_incarnation(0x66),
+    };
+    let owner = sample_principal_id(0x66);
+    store
+        .create_space(CreateSpaceSpec {
+            space_id: scope.space_id.clone(),
+            incarnation: scope.incarnation,
+            root_folder_id: sample_folder_id(0x66),
+            slug: "hydrate-cap".into(),
+            kind: SpaceKind::Personal,
+            owner: owner.clone(),
+            active_epoch: LeaseEpoch::new(1).unwrap(),
+            initial_last_seq: SpaceSeq::ZERO,
+            created_at: None,
+        })
+        .await
+        .unwrap();
+    let ctx = owner_ctx(&scope, owner.clone());
+    let thread = sample_thread_id(0x66);
+    store
+        .create_chat(
+            ctx.clone(),
+            next_mutation(
+                &scope,
+                &owner,
+                CreateChat {
+                    thread: thread.clone(),
+                    kind: ChatThreadKind::Personal,
+                    owner: owner.clone(),
+                    project_folder: None,
+                    title: "Hydration cap".into(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let body = "b".repeat(ChatInputBody::INLINE_MAX_BYTES as usize + 128);
+    let entry = store
+        .append_chat(
+            ctx.clone(),
+            next_mutation(
+                &scope,
+                &owner,
+                AppendChat {
+                    tool_calls: Vec::new(),
+                    provenance: None,
+                    interruption: None,
+                    proposed_diff: None,
+                    proposed_effect: None,
+                    thread: thread.clone(),
+                    parent: ThreadEntrySeq::ZERO,
+                    kind: ChatEntryKind::Human,
+                    body: ChatInputBody::Text(body),
+                    referenced_notes: Vec::new(),
+                    tainted: false,
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .value;
+    assert!(matches!(entry.body, ChatBody::Blob(_)));
+
+    // Inflate `blob_catalog.raw_size` past the 16 MiB per-read chat hydration budget:
+    // `read_chat_contents` must reject with `BudgetExceeded` before decompressing.
+    let updated = store
+        .execute_diagnostic_write_sql_for_test(
+            "UPDATE blob_catalog SET raw_size = 20971520 WHERE space_id = (SELECT space_id FROM spaces LIMIT 1)",
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated, 1);
+
+    let res = store
+        .read_chat_contents(
+            ctx,
+            notarium_core::ports::ChatContentRead {
+                thread,
+                leaf: entry.seq,
+                entries: vec![entry.seq],
+            },
+        )
+        .await;
+    assert_validation_err(&res, ValidationReason::BudgetExceeded);
+    runtime.shutdown().await.unwrap();
 }

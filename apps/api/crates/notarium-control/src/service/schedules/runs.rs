@@ -91,13 +91,10 @@ impl ControlService {
         Box::pin(async move {
             ctx.authority.require(ServicePurpose::Scheduler)?;
             let slot = ms(request.slot)?;
-            let next_slot = request.next_slot.map(ms).transpose()?;
             let observed_at = self.clock.now_ms()?;
-            if next_slot.is_some_and(|next| next <= slot) || slot > observed_at {
+            if slot > observed_at {
                 return Err(invalid(ValidationReason::InvalidTimestamp));
             }
-            // Option serializes a present value just as the original timestamp
-            // did, preserving replay of pre-upgrade claim fingerprints.
             let fingerprint = blake3::hash(json(&(1, &request))?.as_bytes()).as_bytes().to_vec();
             let budget = OperationBudget::new(ctx.budget.clone());
             let observed = self.observe_schedule(&budget, &request.schedule).await?;
@@ -165,7 +162,7 @@ impl ControlService {
                     let expected = request.expected.get();
                     let current = row.revision as u64;
                     let repairing = row.next_slot_utc_ms == Some(slot) && current == expected;
-                    let repaired = row.next_slot_utc_ms == next_slot && current == expected.saturating_add(1);
+                    let repaired = row.next_slot_utc_ms != Some(slot) && current == expected.saturating_add(1);
                     if previous.claimed_schedule_revision as u64 >= expected || !(repairing || repaired) {
                         return Err(DomainError::IdempotencyKeyReused.into());
                     }
@@ -197,7 +194,7 @@ impl ControlService {
                 } else {
                     None
                 };
-                if row.next_slot_utc_ms == next_slot
+                if row.next_slot_utc_ms != Some(slot)
                     && info.revision.get().checked_sub(1) == Some(request.expected.get())
                     && let Some(outcome) = skipped
                 {
@@ -207,15 +204,27 @@ impl ControlService {
                 if row.next_slot_utc_ms != Some(slot) {
                     return Err(invalid(ValidationReason::ScopeMismatch));
                 }
+                // Control authoritatively computes the next due slot under the writer lock
+                // from its own clock, eliminating cross-clock retries on the scheduler.
                 let trusted_instant = Timestamp::from_unix_parts(locked_now.div_euclid(1000), 0)?;
-                if calendar.next_ms(request.slot.max(trusted_instant))? != next_slot {
+                let next_slot = calendar.next_ms(request.slot.max(trusted_instant))?;
+                if next_slot.is_some_and(|next| next <= slot) {
                     return Err(invalid(ValidationReason::InvalidTimestamp));
                 }
+                let next_slot_ts = next_slot
+                    .map(|value| {
+                        let secs = value.div_euclid(1000);
+                        let nanos = u32::try_from(value.rem_euclid(1000))
+                            .map_err(|_| invalid(ValidationReason::InvalidTimestamp))?
+                            .saturating_mul(1_000_000);
+                        Timestamp::from_unix_parts(secs, nanos).map_err(PortError::from)
+                    })
+                    .transpose()?;
                 if let Some(outcome) = skipped {
                     advance(tx.inner_mut(), &request.schedule, next_slot, &row, locked_now).await?;
                     return Ok((outcome, Vec::new(), None));
                 }
-                validate(&info.definition, request.next_slot, RunLimits::HARD_CEILING, false)?;
+                validate(&info.definition, next_slot_ts, RunLimits::HARD_CEILING, false)?;
 
                 let scope = ScheduleScope::from(&info.definition);
                 let log_id = schedule_log_id(
@@ -299,7 +308,7 @@ impl ControlService {
                 record.validate()?;
                 record.insert(tx.inner_mut()).await?;
                 info.revision = advance(tx.inner_mut(), &request.schedule, next_slot, &row, now).await?;
-                info.next_slot = request.next_slot;
+                info.next_slot = next_slot_ts;
                 let context = SpaceContext::new(keeper, history, CallBudget {
                     request: ctx.budget.request.clone(),
                     cancellation: Cancellation::default(),

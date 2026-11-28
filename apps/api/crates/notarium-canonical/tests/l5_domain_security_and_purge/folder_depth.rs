@@ -762,13 +762,9 @@ async fn wide_subtree_probes_children_by_parent_before_analyze() {
 
     let fixtures = StorageTestFixtures::load_required();
     let schema = fixtures.fresh_pg_schema();
-    let pg_local = TempDataRoot::new("l5-folder-depth-pg");
-    let mut cfg = CanonicalConfig::local_default(sample_installation_id(2), pg_local.data_root());
-    cfg.sql = notarium_canonical::SqlBackendConfig::postgres_default(
-        fixtures.pg_connect_config(),
-        &schema,
-    );
-    cfg.default_backup_budget = notarium_canonical::config::default_postgres_backup_budget();
+    let cfg = fixtures
+        .open_pg_s3_config(sample_installation_id(2), &schema)
+        .await;
     let (store, runtime) = CanonicalRuntime::open(cfg).await.unwrap();
     let (scope, source) = wide_tree(&store).await;
     // Exercise paged projection_read folder children (> 200 real children -> HEADS_PG) on real PG16!

@@ -131,9 +131,6 @@ pub struct ClaimSchedule {
     pub slot: Timestamp,
     pub current_role: AbilityRef,
     pub expected: ControlRevision,
-    /// Computed by the scheduler after the claimed slot and current time.
-    /// None denotes a finite calendar with no further occurrences.
-    pub next_slot: Option<Timestamp>,
 }
 #[derive(Clone, Debug)]
 pub enum ScheduleClaim {

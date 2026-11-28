@@ -1115,19 +1115,20 @@ async fn restores_historical_postgres_spools_and_rejects_invalid_headers() {
         assert_eq!(queue.columns.len(), queue_columns);
         let cut = decoded.witness.histories.first().unwrap();
         assert_eq!(cut.scope.space_id, sample_space_id(space_id));
-        let blob_root = TempDataRoot::new("historical-chat-cas");
-        let mut config = case
+        let config = case
             .restored_config(&fixture, &case.temp_root.data_root())
             .await;
         // Recreate the old writer's stale rows in the materialized v3 database.
         // Runtime bootstrap is the same entry point used for in-place upgrades.
         let mut migrated_db = if version == 3 {
+            use notarium_canonical::blobs::s3::{ReqwestS3Transport, S3RawRequest, S3Transport};
             let SqlBackendConfig::Postgres { schema, .. } = &config.sql else {
                 unreachable!()
             };
-            config.blobs = BlobBackendConfig::Local {
-                data_root: blob_root.data_root(),
+            let BlobBackendConfig::S3(s3_cfg) = &config.blobs else {
+                unreachable!("PostgreSQL archive tests use CloudPostgresS3")
             };
+            let transport = ReqwestS3Transport::new(s3_cfg).unwrap();
             let mut conn = case.pg_cleanup.as_ref().unwrap().0.open_raw_pg().await;
             sqlx::query(sqlx::AssertSqlSafe(format!("SET search_path TO {schema}")))
                 .execute(&mut conn)
@@ -1152,6 +1153,13 @@ async fn restores_historical_postgres_spools_and_rejects_invalid_headers() {
                 .execute(&mut conn)
                 .await
                 .unwrap();
+            sqlx::query(
+                "UPDATE blob_publications SET codec = 's3_chunked_v1'
+                 WHERE space_id IN (SELECT space_id FROM spaces WHERE slug IN ('stale-alone','stale-shared'))",
+            )
+            .execute(&mut conn)
+            .await
+            .unwrap();
             let mut scopes = Vec::new();
             for slug in ["stale-alone", "stale-shared"] {
                 let (id, inc): (String, Vec<u8>) =
@@ -1166,9 +1174,46 @@ async fn restores_historical_postgres_spools_and_rejects_invalid_headers() {
                         inc.try_into().unwrap(),
                     ),
                 };
-                let path = blob_root.data_root().blob(&scope.space_id, digest);
-                fs::create_dir_all(path.parent().unwrap()).unwrap();
-                fs::write(path, &frame).unwrap();
+                let prefix = if s3_cfg.application_prefix.is_empty() {
+                    String::new()
+                } else {
+                    format!("{}/", s3_cfg.application_prefix.trim_matches('/'))
+                };
+                let key = format!(
+                    "{prefix}spaces/{}/cas-v1/pub1/part-0.zst",
+                    scope.space_id.as_str()
+                );
+                let put = transport
+                    .send(S3RawRequest {
+                        method: http::Method::PUT,
+                        key: Some(key.clone()),
+                        query: Vec::new(),
+                        headers: Vec::new(),
+                        body: bytes::Bytes::from(frame.clone()),
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(put.status, 200, "seed S3 object for legacy v3 upgrade");
+                let version_id = put
+                    .headers
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("x-amz-version-id"))
+                    .map(|(_, v)| v.clone());
+                sqlx::query(
+                    "INSERT INTO blob_parts (
+                        space_id, publication_id, part_index, raw_size, compressed_size,
+                        part_blake3, physical_key, observed_version_id, upload_confirmed
+                    ) VALUES ($1, 'pub1', 0, $2, $3, $4, $5, $6, 1)",
+                )
+                .bind(scope.space_id.as_str())
+                .bind(raw.len() as i64)
+                .bind(frame.len() as i64)
+                .bind(digest.as_bytes().as_slice())
+                .bind(&key)
+                .bind(version_id.as_deref())
+                .execute(&mut conn)
+                .await
+                .unwrap();
                 scopes.push(scope);
             }
             Some((conn, scopes, digest, raw))
@@ -1271,19 +1316,6 @@ async fn restores_historical_postgres_spools_and_rejects_invalid_headers() {
                     notarium_core::DomainError::ResourceNotFound
                 ))
             ));
-            let stale_path = blob_root.data_root().blob(&scopes[0].space_id, *digest);
-            assert!(stale_path.exists());
-            // Force the second unlink to fail until the first is observable.
-            let blocker = blob_root
-                .data_root()
-                .root()
-                .join("blobs/.quarantine")
-                .join(format!(
-                    "{}.{}.corrupt",
-                    scopes[0].space_id.as_str(),
-                    digest.to_hex()
-                ));
-            fs::create_dir_all(&blocker).unwrap();
             let rotated = HistoryScope {
                 space_id: scopes[0].space_id.clone(),
                 incarnation: sample_incarnation(0xD1),
@@ -1302,21 +1334,7 @@ async fn restores_historical_postgres_spools_and_rejects_invalid_headers() {
                 restored.get_space(&rotated.space_id).await.unwrap().scope,
                 rotated
             );
-            tokio::time::timeout(Duration::from_secs(5), async {
-                while stale_path.exists() {
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-            })
-            .await
-            .unwrap();
             let status_sql = "SELECT status FROM blob_retirements WHERE space_id=$1";
-            let status: String = sqlx::query_scalar(status_sql)
-                .bind(rotated.space_id.as_str())
-                .fetch_one(&mut *db)
-                .await
-                .unwrap();
-            assert_eq!(status, "pending");
-            fs::remove_dir(&blocker).unwrap();
             tokio::time::timeout(Duration::from_secs(10), async {
                 loop {
                     let status: String = sqlx::query_scalar(status_sql)
@@ -3166,9 +3184,10 @@ async fn run_memory_subprocess_mode(mode: &str) {
         "seed_pg_64m" => {
             let fixtures = StorageTestFixtures::load_required();
             let schema = env::var(SUBPROC_SCHEMA_ENV).unwrap();
-            let spool_root = DataRoot::new(env::var(SUBPROC_PATH_ENV).unwrap());
             let expected_hex = env::var(SUBPROC_DIGEST_ENV).unwrap();
-            let cfg = fixtures.pg_local_config(sample_installation_id(0x73), &schema, spool_root);
+            let cfg = fixtures
+                .open_pg_s3_config(sample_installation_id(0x73), &schema)
+                .await;
             let (store, runtime) = CanonicalRuntime::open(cfg).await.unwrap();
             seed_64m_and_50_medium_rows(&store, &expected_hex).await;
             runtime.shutdown().await.unwrap();
@@ -3178,9 +3197,11 @@ async fn run_memory_subprocess_mode(mode: &str) {
             let schema = env::var(SUBPROC_SCHEMA_ENV).unwrap();
             let spool_root = DataRoot::new(env::var(SUBPROC_PATH_ENV).unwrap());
             let expected_hex = env::var(SUBPROC_DIGEST_ENV).unwrap();
-            let cfg =
-                fixtures.pg_local_config(sample_installation_id(0x73), &schema, spool_root.clone());
+            let cfg = fixtures
+                .open_pg_s3_config(sample_installation_id(0x73), &schema)
+                .await;
             let (store, runtime) = CanonicalRuntime::open(cfg).await.unwrap();
+            store.set_backup_spool_dir(spool_root.staging().join("backups"));
             let before_hwm = read_proc_vm_hwm_kib();
 
             let budget = store.default_backup_budget();

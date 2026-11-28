@@ -13,12 +13,35 @@ struct Cursor {
     last: String,
     slot: i64,
 }
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TimedCursor {
+    version: u8,
+    scope: ContentDigest,
+    at: i64,
+    last: String,
+    slot: i64,
+}
 fn cursor(page: &ControlPageRequest, scope: ContentDigest) -> Result<Option<Cursor>, PortError> {
     let cursor: Option<Cursor> = page.continuation().map(parse).transpose()?;
     if cursor
         .as_ref()
         .is_some_and(|v| v.version != 1 || v.scope != scope)
     {
+        return Err(invalid(ValidationReason::CursorStale));
+    }
+    Ok(cursor)
+}
+fn timed_cursor(
+    page: &ControlPageRequest,
+    scope: ContentDigest,
+    requested: i64,
+    control_now: i64,
+) -> Result<Option<TimedCursor>, PortError> {
+    let cursor: Option<TimedCursor> = page.continuation().map(parse).transpose()?;
+    if cursor.as_ref().is_some_and(|v| {
+        v.version != 1 || v.scope != scope || v.at > requested || v.at > control_now
+    }) {
         return Err(invalid(ValidationReason::CursorStale));
     }
     Ok(cursor)
@@ -271,15 +294,6 @@ impl ControlService {
             )
             .await
     }
-    pub async fn scheduler_clock(&self, ctx: MaintenanceContext) -> Result<Timestamp, PortError> {
-        ctx.authority.require(ServicePurpose::Scheduler)?;
-        let now_ms = self.clock.now_ms()?;
-        let secs = now_ms.div_euclid(1000);
-        let nanos = u32::try_from(now_ms.rem_euclid(1000))
-            .map_err(|_| invalid(ValidationReason::InvalidTimestamp))?
-            .saturating_mul(1_000_000);
-        Ok(Timestamp::from_unix_parts(secs, nanos)?)
-    }
     pub async fn list_due_schedules(
         &self,
         ctx: MaintenanceContext,
@@ -287,11 +301,15 @@ impl ControlService {
         page: ControlPageRequest,
     ) -> Result<ControlPage<AgentSchedule>, PortError> {
         ctx.authority.require(ServicePurpose::Scheduler)?;
-        let at = floor_ms(now)?.min(self.clock.now_ms()?);
+        let requested = floor_ms(now)?;
+        let control_now = self.clock.now_ms()?;
         let scope = ContentDigest::from_bytes(
-            *blake3::hash(json(&(1, "due", &self.installation, at))?.as_bytes()).as_bytes(),
+            *blake3::hash(json(&(1, "due", &self.installation, requested))?.as_bytes()).as_bytes(),
         );
-        let cursor = cursor(&page, scope)?;
+        let cursor = timed_cursor(&page, scope, requested, control_now)?;
+        let at = cursor
+            .as_ref()
+            .map_or_else(|| requested.min(control_now), |c| c.at);
         let slot = cursor.as_ref().map_or(i64::MIN, |c| c.slot);
         let id = cursor.as_ref().map_or("", |c| c.last.as_str());
         let budget = OperationBudget::new(ctx.budget);
@@ -303,9 +321,10 @@ impl ControlService {
         let selected: Vec<_> = rows.into_iter().take(usize::from(page.limit())).collect();
         let continuation = if has_more {
             let last = selected.last().expect("positive page");
-            Some(json(&Cursor {
+            Some(json(&TimedCursor {
                 version: 1,
                 scope,
+                at,
                 last: last.schedule_id.clone(),
                 slot: last
                     .next_slot_utc_ms
@@ -329,12 +348,18 @@ impl ControlService {
         page: ControlPageRequest,
     ) -> Result<ControlPage<ScheduleRunReceipt>, PortError> {
         ctx.authority.require(ServicePurpose::Scheduler)?;
-        let at = floor_ms(now)?.min(self.clock.now_ms()?);
+        let requested = floor_ms(now)?;
+        let control_now = self.clock.now_ms()?;
         let scope = ContentDigest::from_bytes(
-            *blake3::hash(json(&(1, "expired-schedule-runs", &self.installation, at))?.as_bytes())
-                .as_bytes(),
+            *blake3::hash(
+                json(&(1, "expired-schedule-runs", &self.installation, requested))?.as_bytes(),
+            )
+            .as_bytes(),
         );
-        let cursor = cursor(&page, scope)?;
+        let cursor = timed_cursor(&page, scope, requested, control_now)?;
+        let at = cursor
+            .as_ref()
+            .map_or_else(|| requested.min(control_now), |c| c.at);
         let expires = cursor.as_ref().map_or(i64::MIN, |value| value.slot);
         let id = cursor.as_ref().map_or("", |value| value.last.as_str());
         let budget = OperationBudget::new(ctx.budget);
@@ -347,9 +372,10 @@ impl ControlService {
         let continuation = if rows.len() > usize::from(page.limit()) {
             rows.pop();
             let last = rows.last().expect("positive page");
-            Some(json(&Cursor {
+            Some(json(&TimedCursor {
                 version: 1,
                 scope,
+                at,
                 last: last.run_id.clone(),
                 slot: last.expires_at,
             })?)

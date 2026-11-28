@@ -576,13 +576,14 @@ A repeated accepted intent reports its existing call state, even after configura
 changes; different input rejects the reused key. No stream is replayed or resent.
 After reservation, the service rechecks current authority/configuration/consent,
 changes intent to sending and acquires its live registration in one SQL transaction.
-Canonical egress pins the participating Spaces while revalidating sources,
-encoding the request body, and completing outbound preflight and request-body
-upload; `mark_dispatched` releases the canonical Space locks and cleanly rolls
-back the PostgreSQL disclosure read transaction before waiting on upstream
-response headers (TTFB),
-while `RevocationHub` cancels in-flight HTTP calls on concurrent revocation.
-Restore waits for outstanding disclosures before switching generations.
+Canonical egress revalidates participating sources inside a short read-only
+repeatable-read snapshot bounded by the caller and SQLite WAL reader deadlines.
+On PostgreSQL the read-only snapshot connection returns immediately to the pool
+after verification (no `FOR SHARE` or advisory locks are held across Control
+transactions or upstream network I/O); on SQLite an in-memory disclosure pin
+guards local mutations until `mark_dispatched`, while `RevocationHub` cancels
+in-flight HTTP calls on concurrent revocation. Restore waits for outstanding
+local disclosures before switching generations.
 The transport handle exists before awaiting response headers. Shutdown acknowledgement
 precedes release of canonical/registry leases and the independent five-second audit
 finalizer. `ProviderConfig.max_active_calls` (default 64 per `ProviderService`
@@ -707,15 +708,17 @@ Run limits default to 25 steps, 100,000 tokens and 300 seconds. The composition 
 `ControlConfig.schedule_limits` within hard ceilings of 1,000 steps, 10,000,000 tokens
 and one hour. These limits bound a whole run. Provider budgets apply separately to
 each call. A Keeper can write AgentMemory documents and its bound log.
-The Keeper scheduler uses `compute_next_slot` and owns the ticker, prompt
-loading and tool loop. See [scheduled Keepers](agents.md#scheduled-keepers).
+The Keeper scheduler owns the ticker, prompt loading and tool loop, while
+Control authoritatively computes each next slot under the claim transaction.
+See [scheduled Keepers](agents.md#scheduled-keepers).
 
 Trusted `Scheduler` authority lists due schedules, claims slots and records terminal
 results. A claim checks the expected revision, saved slot, current owner/membership,
 Space/project and all approved package revisions. Role or skill drift pauses the
-schedule. The unique `(schedule, slot)` run and next-slot advancement commit
-together. The next slot is computed after the current time, so a series of missed
-windows produces one catch-up run. A legacy late-fold slot advances without a run
+schedule. Control computes the next occurrence from the schedule calendar and
+`max(slot, now)` inside the claim transaction, so the unique `(schedule, slot)`
+run and next-slot advancement commit together without scheduler clock-probing
+retries, and a series of missed windows produces one catch-up run. A legacy late-fold slot advances without a run
 when its early occurrence already has a receipt for that schedule and UTC slot
 (including across configuration edits).
 Finite calendars issue their last due slot and store a null next slot. Only the new
@@ -757,7 +760,9 @@ record the outcome even after expiry or schedule deletion. Repeating the same
 terminal result returns the original receipt. A different result conflicts. An owner
 or trusted scheduler can inspect bounded run pages. The
 scheduler also lists expired unfinished runs for reconciliation with
-`Unknown`. Due, expiry and audit pages use keyset pagination over live SQL.
+`Unknown`. Due, expiry and audit pages use keyset pagination over live SQL; due
+and expiry cursors pin the page-1 cutoff timestamp so advancing Control time
+between pages does not invalidate continuation.
 
 ## Content-free telemetry and retention
 

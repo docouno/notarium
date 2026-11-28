@@ -1757,6 +1757,17 @@ async fn flush_single_batch(
         }
     };
 
+    if let BatchExecOutcome::UnknownCommit { pg_barrier, .. } = &mut exec_result
+        && let Some(barrier) = pg_barrier.take()
+    {
+        // The ambiguous PG connection and PgTransactionLease have already dropped,
+        // freeing the pool slot even when `pool_size == 1`. Wait for a FOR SHARE
+        // barrier on touched Space rows before dropping `active_effects` so a
+        // concurrent revocation cannot settle ahead of a late server-side COMMIT.
+        store.await_pg_unknown_commit_barrier(&barrier.spaces).await;
+        drop(barrier.active_effects);
+    }
+
     match &exec_result {
         BatchExecOutcome::Committed {
             visibility_windows, ..
@@ -1773,6 +1784,7 @@ async fn flush_single_batch(
                 exec_result = BatchExecOutcome::UnknownCommit {
                     slots,
                     diag_reason: format!("projection erasure pending: {error:?}"),
+                    pg_barrier: None,
                 };
             }
         }
@@ -1840,7 +1852,9 @@ async fn flush_single_batch(
                 }
             }
         }
-        BatchExecOutcome::UnknownCommit { slots, diag_reason } => {
+        BatchExecOutcome::UnknownCommit {
+            slots, diag_reason, ..
+        } => {
             let mut slot_iter = slots.into_iter();
             for target in reply_targets {
                 match target {
@@ -1916,6 +1930,11 @@ async fn flush_single_batch(
     }
 }
 
+pub(crate) struct PgUnknownCommitBarrier {
+    spaces: Vec<SpaceId>,
+    active_effects: Vec<(usize, Box<dyn RevocationLease>)>,
+}
+
 pub(crate) enum BatchExecOutcome {
     Committed {
         slots: Vec<ItemOutcomeSlot>,
@@ -1926,6 +1945,7 @@ pub(crate) enum BatchExecOutcome {
     UnknownCommit {
         slots: Vec<ItemOutcomeSlot>,
         diag_reason: String,
+        pg_barrier: Option<PgUnknownCommitBarrier>,
     },
     AbortedBeforeCommit(PortError),
 }
@@ -2174,6 +2194,7 @@ async fn execute_batch_on_conn(
         return BatchExecOutcome::UnknownCommit {
             slots,
             diag_reason: "fault_injected_commit_rollback".to_owned(),
+            pg_barrier: None,
         };
     }
     // Optional test-only per-Space pre-commit delay (proves Space B progresses while Space A is slow,
@@ -2327,9 +2348,9 @@ async fn execute_batch_on_conn(
         store.inner.latch_sqlite_aux_tables_populated();
         seq.finish();
     }
-    drop(active_effects);
     match commit_res {
         Ok(()) => {
+            drop(active_effects);
             for action in after_commit {
                 action.settle(true);
             }
@@ -2378,6 +2399,7 @@ async fn execute_batch_on_conn(
                 return BatchExecOutcome::UnknownCommit {
                     slots,
                     diag_reason: "fault_injected_commit_response_loss".to_owned(),
+                    pg_barrier: None,
                 };
             }
             BatchExecOutcome::Committed {
@@ -2388,24 +2410,35 @@ async fn execute_batch_on_conn(
             }
         }
         Err(commit_err) => {
+            // Defer dropping `active_effects` until after the ambiguous PG socket
+            // closes and a FOR SHARE barrier confirms any late COMMIT has settled.
+            let pg_barrier = if store.is_postgres() && !active_effects.is_empty() {
+                let touched_spaces: Vec<SpaceId> = space_states
+                    .iter()
+                    .filter(|&(_, entry)| matches!(entry, SpaceBatchEntry::Loaded { .. }))
+                    .map(|(sid, _)| sid.clone())
+                    .collect();
+                Some(PgUnknownCommitBarrier {
+                    spaces: touched_spaces,
+                    active_effects,
+                })
+            } else {
+                drop(active_effects);
+                None
+            };
             for action in after_commit {
                 action.settle(false);
             }
             drop(batch_retained_tickets);
             drop(batch_retained_guards);
-            // On PostgreSQL an uncertain COMMIT error may still complete on the
-            // server asynchronously; deleting a newly published local blob on
-            // another connection before the server settles would orphan a live
-            // committed revision. Only schedule immediate orphan cleanup on SQLite.
-            if !matches!(
-                store.inner.sql,
-                crate::runtime::SqlDriverState::Postgres { .. }
-            ) {
+            // Local CAS is only paired with SQLite; schedule immediate orphan cleanup there.
+            if !store.is_postgres() {
                 store.schedule_unretained_local_files_cleanup(newly_published);
             }
             BatchExecOutcome::UnknownCommit {
                 slots,
                 diag_reason: format!("{commit_err:?}"),
+                pg_barrier,
             }
         }
     }

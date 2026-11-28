@@ -17,17 +17,12 @@ async fn wait_for_blocked_session(db: &mut sqlx::PgConnection) {
 async fn postgres_rollback_deadline_covers_safe_point_and_replay() {
     let fixtures = StorageTestFixtures::load_required();
     let schema = fixtures.fresh_pg_schema();
-    let root = TempDataRoot::new("l6-rollback-deadline");
-    let mut config = CanonicalConfig::local_default(sample_installation_id(76), root.data_root());
-    let mut sql = notarium_canonical::SqlBackendConfig::postgres_default(
-        fixtures.pg_connect_config(),
-        &schema,
-    );
-    if let notarium_canonical::SqlBackendConfig::Postgres { pool_size, .. } = &mut sql {
+    let mut config = fixtures
+        .open_pg_s3_config(sample_installation_id(76), &schema)
+        .await;
+    if let notarium_canonical::SqlBackendConfig::Postgres { pool_size, .. } = &mut config.sql {
         *pool_size = 1;
     }
-    config.sql = sql;
-    config.default_backup_budget = notarium_canonical::config::default_postgres_backup_budget();
     let (store, runtime) = CanonicalRuntime::open(config).await.unwrap();
     let owner = sample_principal_id(76);
     let (scope, _) = seed_space(
@@ -109,12 +104,9 @@ async fn postgres_read_admission_statements_and_snapshot_have_distinct_deadlines
     };
     let fixtures = StorageTestFixtures::load_required();
     let schema = fixtures.fresh_pg_schema();
-    let root = TempDataRoot::new("l6-pg-read-budgets");
-    let mut config = CanonicalConfig::local_default(sample_installation_id(77), root.data_root());
-    config.sql = notarium_canonical::SqlBackendConfig::postgres_default(
-        fixtures.pg_connect_config(),
-        &schema,
-    );
+    let mut config = fixtures
+        .open_pg_s3_config(sample_installation_id(77), &schema)
+        .await;
     let statement = Duration::from_millis(120);
     if let notarium_canonical::SqlBackendConfig::Postgres {
         pool_size,
@@ -125,7 +117,6 @@ async fn postgres_read_admission_statements_and_snapshot_have_distinct_deadlines
         *pool_size = 1;
         *statement_timeout = statement;
     }
-    config.default_backup_budget = notarium_canonical::config::default_postgres_backup_budget();
     let (store, runtime) = CanonicalRuntime::open(config).await.unwrap();
     let owner = sample_principal_id(77);
     let (scope, _) = seed_space(
