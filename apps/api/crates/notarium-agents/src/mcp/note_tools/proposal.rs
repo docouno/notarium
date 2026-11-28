@@ -42,6 +42,8 @@ pub(in crate::mcp) enum PreparedNoteAction {
     Edit {
         route: NoteRoute,
         plan: notarium_core::patch::CarrierPatchPlan,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        edited_view: Option<notarium_core::ids::ViewKey>,
     },
     Delete {
         route: NoteRoute,
@@ -167,7 +169,7 @@ pub(in crate::mcp) async fn preview_proposal(
     viewer: &mut ToolCallContext<'_>,
     action: &PreparedNoteAction,
 ) -> Result<Option<UnifiedPreview>, PortError> {
-    let PreparedNoteAction::Edit { route, plan } = action else {
+    let PreparedNoteAction::Edit { route, plan, .. } = action else {
         return Ok(None);
     };
     let result = async {
@@ -227,13 +229,14 @@ fn count_lines(text: &str) -> usize {
 
 /// Render a multi-hunk unified diff directly from `ByteSpan` edits without
 /// cloning the full target document. Bounds unchanged context lines and huge
-/// single-line edits so changed bytes remain visible within the 32 KiB cap,
-/// and reports `truncated = true` whenever any byte or hunk is omitted.
+/// single-line edits so changed bytes remain visible within the display cap
+/// (leaving JSON-escaping headroom under `MAX_DISPLAY_BYTES`), and reports
+/// `truncated = true` whenever any byte or hunk is omitted.
 fn unified_preview_from_plan(
     before: &str,
     plan: &notarium_core::patch::CarrierPatchPlan,
 ) -> Option<UnifiedPreview> {
-    const PREVIEW_CAP_BYTES: usize = super::super::proposals::MAX_DISPLAY_BYTES;
+    const PREVIEW_CAP_BYTES: usize = 20 * 1024;
     const CONTEXT_LINES: usize = 3;
     const MAX_CONTEXT_LINE_BYTES: usize = 512;
     const LARGE_REGION_THRESHOLD: usize = 8 * 1024;
@@ -301,6 +304,7 @@ fn unified_preview_from_plan(
                 && lines[last_excl - 1].1 == end
                 && before.as_bytes().get(end - 1) == Some(&b'\n')
                 && !replacement.ends_with('\n')
+                && (!replacement.is_empty() || start > lines[first].0)
             {
                 last_excl += 1;
             }
@@ -585,12 +589,14 @@ fn unified_preview_from_plan(
                 if post_elided {
                     old_snippet.push_str("...");
                 }
-                if !old_snippet.ends_with('\n') {
-                    old_snippet.push('\n');
-                }
-                for line in old_snippet.split_inclusive('\n') {
-                    if !push_diff_line(&mut output, '-', line, None, &mut truncated) {
-                        break 'hunks;
+                if !old_snippet.is_empty() {
+                    if !old_snippet.ends_with('\n') {
+                        old_snippet.push('\n');
+                    }
+                    for line in old_snippet.split_inclusive('\n') {
+                        if !push_diff_line(&mut output, '-', line, None, &mut truncated) {
+                            break 'hunks;
+                        }
                     }
                 }
                 let mut new_snippet = String::new();
@@ -606,12 +612,14 @@ fn unified_preview_from_plan(
                 if post_elided {
                     new_snippet.push_str("...");
                 }
-                if !new_snippet.ends_with('\n') {
-                    new_snippet.push('\n');
-                }
-                for line in new_snippet.split_inclusive('\n') {
-                    if !push_diff_line(&mut output, '+', line, None, &mut truncated) {
-                        break 'hunks;
+                if !new_snippet.is_empty() {
+                    if !new_snippet.ends_with('\n') {
+                        new_snippet.push('\n');
+                    }
+                    for line in new_snippet.split_inclusive('\n') {
+                        if !push_diff_line(&mut output, '+', line, None, &mut truncated) {
+                            break 'hunks;
+                        }
                     }
                 }
             }
@@ -711,7 +719,7 @@ fn preview_keeps_changed_lines_and_final_newline_semantics() {
     assert!(multi.diff.contains("-old\n+new\n"));
     assert!(multi.diff.len() < 512);
 
-    // Exact 32 KiB cap even with missing trailing newline marker.
+    // Exact 20 KiB cap even with missing trailing newline marker (leaves JSON headroom under 32 KiB).
     let huge_before = "a".repeat(100_000);
     let capped = unified_preview_from_plan(
         &huge_before,
@@ -722,7 +730,21 @@ fn preview_keeps_changed_lines_and_final_newline_semantics() {
     )
     .unwrap();
     assert!(capped.truncated);
-    assert!(capped.diff.len() <= 32 * 1024);
+    assert!(capped.diff.len() <= 20 * 1024);
+
+    // Whole-line deletion before a huge next line must not pull the next line into the diff.
+    let del_before = format!("line1\n{}\n", "x".repeat(10_000));
+    let del_preview =
+        unified_preview_from_plan(&del_before, &plan_for(&del_before, vec![(0, 6, "")])).unwrap();
+    assert!(del_preview.diff.contains("-line1\n"));
+    assert!(!del_preview.diff.contains("-xxxx"));
+    assert!(!del_preview.diff.contains("+xxxx"));
+
+    // Large insertion into an empty document must not emit a phantom deleted blank line.
+    let ins_preview =
+        unified_preview_from_plan("", &plan_for("", vec![(0, 0, &"a".repeat(10_000))])).unwrap();
+    assert!(!ins_preview.diff.contains("\n-\n"));
+    assert!(ins_preview.diff.contains("\n+aaaa"));
 }
 
 pub(super) async fn authorize_folder(
@@ -1108,8 +1130,13 @@ pub(in crate::mcp) async fn plan_proposal(
             } else {
                 std::collections::BTreeMap::new()
             };
+            let edited_view = input.edited_view_key()?;
             let plan = input.plan(original, before.document.class(), &route, &schema)?;
-            PreparedNoteAction::Edit { route, plan }
+            PreparedNoteAction::Edit {
+                route,
+                plan,
+                edited_view,
+            }
         }
         ToolName::DeleteNote => {
             let input: NoteInput = decode(arguments)?;
@@ -1251,7 +1278,11 @@ pub(in crate::mcp) async fn apply_proposal(
 ) -> Result<Value, PortError> {
     match action {
         PreparedNoteAction::Create(creates) => create::proposal::apply(owner, creates, step).await,
-        PreparedNoteAction::Edit { route, plan } => {
+        PreparedNoteAction::Edit {
+            route,
+            plan,
+            edited_view,
+        } => {
             let (scope, identity) = step(&route.scope, "edit_note", 0)?;
             let before = snapshot(
                 owner,
@@ -1264,13 +1295,39 @@ pub(in crate::mcp) async fn apply_proposal(
             if before.document.class() == DocClass::EncryptedNote {
                 return Err(DomainError::ResourceNotFound.into());
             }
-            let _ = before.document.explicit_read(scope.auth())?;
+            let original = before.document.explicit_read(scope.auth())?;
             if before.document.digest() != plan.base_content_hash {
                 return Err(DomainError::RevisionConflict {
                     current: before.document.revision().clone(),
                     lineage: None,
                 }
                 .into());
+            }
+            if let Some(view_key) = edited_view {
+                let changed = notarium_syntax::patch::apply(original, &plan)?;
+                let changed_body = notarium_syntax::carrier::Carrier::scan(&changed)?.body;
+                let changed_md = notarium_syntax::markdown::analyze(&changed, changed_body)?;
+                let reparsed = notarium_syntax::nota::analyze(
+                    &changed,
+                    changed_body,
+                    &route.note,
+                    &changed_md,
+                    false,
+                )?;
+                let block = reparsed
+                    .blocks
+                    .iter()
+                    .find(|block| block.id.as_ref() == Some(&view_key))
+                    .ok_or_else(|| invalid(ValidationReason::InvalidView))?;
+                if block.state != notarium_core::document::ViewState::Ready {
+                    return Err(invalid(ValidationReason::InvalidView));
+                }
+                let config = block
+                    .config
+                    .as_ref()
+                    .ok_or_else(|| invalid(ValidationReason::InvalidView))?;
+                let live_schema = owner.registry.engine.space_schema(scope.clone()).await?;
+                notarium_syntax::nota::spec::validate_view_config(config, &view_key, &live_schema)?;
             }
             let result = owner
                 .registry

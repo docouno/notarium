@@ -344,9 +344,8 @@ async fn ability_folder(
     call: &ToolCallContext<'_>,
     history: &HistoryScope,
     parent: Option<FolderId>,
-) -> Result<FolderId, PortError> {
-    Ok(call
-        .registry
+) -> Result<notarium_core::ports::EnsuredFolder, PortError> {
+    call.registry
         .engine
         .ensure_folder_path(
             writer(call, history).await?,
@@ -359,9 +358,7 @@ async fn ability_folder(
                 },
             },
         )
-        .await?
-        .folder
-        .folder_id)
+        .await
 }
 
 fn post_commit_step_error(label: &str, error: PortError, committed: bool) -> PortError {
@@ -1633,7 +1630,7 @@ async fn ensure_ability_folder_journaled(
         .map_err(|error| {
             super::super::note_tools::batch_operational_error(err_label, error, false)
         })?;
-    let folder = ability_folder(call, scope, parent).await.map_err(|error| {
+    let ensured = ability_folder(call, scope, parent).await.map_err(|error| {
         super::super::note_tools::batch_operational_error(
             err_label,
             error,
@@ -1641,8 +1638,8 @@ async fn ensure_ability_folder_journaled(
         )
     })?;
     let recorded = JournaledAbilityFolder::Detailed {
-        folder,
-        created: !existed,
+        folder: ensured.folder.folder_id,
+        created: ensured.created,
     };
     call.record_journal_with_key(label, &call.request_key, call.request_hash, &recorded)
         .await

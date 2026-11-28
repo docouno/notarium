@@ -275,6 +275,13 @@ impl SearchEngine {
         };
         let pass1_overflow = strict_overflow || vector_overflow || (weak_overflow && !floor_filled);
         let graph_depth = recall.map_or(0, |recall| recall.graph_depth);
+        let hydrate_limit = if recall.is_some() {
+            top_k
+                .saturating_mul(4)
+                .clamp(32, usize::from(PageLimit::MAX))
+        } else {
+            top_k
+        };
         let mut candidates = ranking::fuse(notes.hits, vectors.hits, browse);
         let mut selected = if graph_depth == 0 {
             Some(
@@ -283,7 +290,7 @@ impl SearchEngine {
                         self,
                         std::mem::take(&mut candidates).into_iter(),
                         |candidate| &candidate.note,
-                        top_k + 1,
+                        hydrate_limit + 1,
                         can_widen,
                     )
                     .await?,
@@ -394,7 +401,7 @@ impl SearchEngine {
                         self,
                         candidates.into_iter(),
                         |candidate| &candidate.note,
-                        top_k + 1,
+                        hydrate_limit + 1,
                         false,
                     )
                     .await?
@@ -412,7 +419,7 @@ impl SearchEngine {
                 text: &request.text,
                 selected,
                 tokenizer,
-                top_k,
+                top_k: hydrate_limit,
                 delivery,
             })
             .await?;
@@ -459,6 +466,7 @@ impl SearchEngine {
                 &ctx,
                 clock,
                 hits,
+                top_k,
                 delivery,
                 &mut chat_hits,
                 aligned.cut.canonical_seq,

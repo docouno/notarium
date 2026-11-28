@@ -157,6 +157,7 @@ impl McpToolResult {
         if result.content[0].text.len() > proposals::MAX_DISPLAY_BYTES {
             let mut payload = result.structured_content;
             payload["unifiedPreview"] = Value::Null;
+            payload["unifiedPreviewTruncated"] = Value::Bool(true);
             payload["previewTruncated"] = Value::Bool(true);
             result = Self::new(tool, payload, None, result.provenance)?;
         }

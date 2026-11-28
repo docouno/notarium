@@ -564,6 +564,17 @@ async fn upgrade_from_0001_to_0002_preserves_populated_rows_both_dialects() {
         .execute(&pool)
         .await
         .unwrap();
+        let deleted_schedule_id = ScheduleId::from_bytes([0x18; 16]).to_string();
+        sqlx::query(
+            "INSERT INTO agent_schedules(schedule_id,owner_id,space_id,project_folder_id,title,init_prompt,cron_expr,timezone,approved_role,paused_reason,write_class_mask,budgets,misfire_policy,next_slot_utc_ms,deleted_at,config_revision,revision,created_at,updated_at) \
+             VALUES($1,$2,$3,NULL,'Legacy Deleted Title','Legacy Deleted Prompt','0 0 9 * * *','UTC','{}',NULL,1,'{}','coalesce_latest',2000,900,1,2,100,900)",
+        )
+        .bind(&deleted_schedule_id)
+        .bind(&user_id)
+        .bind(&space_id)
+        .execute(&pool)
+        .await
+        .unwrap();
         // A valid 0001 provider_call_log row with a 2020-byte call_id and 36-byte run_id
         // has run_id + call_id = 2056 bytes (>2048); 0002 must preserve it on upgrade.
         let legacy_call_id = "c".repeat(2020);
@@ -644,6 +655,16 @@ async fn upgrade_from_0001_to_0002_preserves_populated_rows_both_dialects() {
         .await
         .unwrap();
         assert_eq!(preserved_call_rows, 1);
+        let (del_title, del_prompt): (String, String) =
+            sqlx::query_as("SELECT title, init_prompt FROM agent_schedules WHERE schedule_id=$1")
+                .bind(ScheduleId::from_bytes([0x18; 16]).to_string())
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert!(
+            del_title.is_empty() && del_prompt.is_empty(),
+            "SQLite 0002 upgrade must scrub both title and init_prompt on deleted schedules, got ({del_title:?}, {del_prompt:?})"
+        );
         // Verify schedule_due partial index and nullable terminal next_slot_utc_ms work after 0002.
         sqlx::query("UPDATE agent_schedules SET next_slot_utc_ms=NULL WHERE schedule_id=$1")
             .bind(&schedule_id)
@@ -755,6 +776,17 @@ async fn upgrade_from_0001_to_0002_preserves_populated_rows_both_dialects() {
         .execute(&mut *conn)
         .await
         .unwrap();
+        let deleted_schedule_id = ScheduleId::from_bytes([0x18; 16]).to_string();
+        sqlx::query(
+            "INSERT INTO v1_control.agent_schedules(schedule_id,owner_id,space_id,project_folder_id,title,init_prompt,cron_expr,timezone,approved_role,paused_reason,write_class_mask,budgets,misfire_policy,next_slot_utc_ms,deleted_at,config_revision,revision,created_at,updated_at) \
+             VALUES($1,$2,$3,NULL,'Legacy Deleted Title','Legacy Deleted Prompt','0 0 9 * * *','UTC','{}',NULL,1,'{}','coalesce_latest',2000,900,1,2,100,900)",
+        )
+        .bind(&deleted_schedule_id)
+        .bind(&user_id)
+        .bind(&space_id)
+        .execute(&mut *conn)
+        .await
+        .unwrap();
         let legacy_call_id = "c".repeat(2020);
         sqlx::query(
             "INSERT INTO v1_control.provider_call_log(call_id,owner_id,principal,run_id,scope_id,intent_key,request_hash,resource_id,credential_id,policy_epochs,participating_spaces,model_id,reserved_tokens,bucket_keys,delivery_state,outcome,usage_source,input_tokens,output_tokens,diagnostic,dispatch_owner,created_at,settled_at) \
@@ -832,6 +864,17 @@ async fn upgrade_from_0001_to_0002_preserves_populated_rows_both_dialects() {
         .await
         .unwrap();
         assert_eq!(preserved_call_rows, 1);
+        let (del_title, del_prompt): (String, String) = sqlx::query_as(
+            "SELECT title, init_prompt FROM v1_control.agent_schedules WHERE schedule_id=$1",
+        )
+        .bind(ScheduleId::from_bytes([0x18; 16]).to_string())
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+        assert!(
+            del_title.is_empty() && del_prompt.is_empty(),
+            "PostgreSQL 0002 upgrade must scrub both title and init_prompt on deleted schedules, got ({del_title:?}, {del_prompt:?})"
+        );
         let due_idx: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM pg_indexes WHERE schemaname='v1_control' AND tablename='agent_schedules' AND indexname='schedule_due'",
         )

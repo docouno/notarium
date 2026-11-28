@@ -155,6 +155,7 @@ pub(crate) struct HubInner {
     peers: Mutex<HashMap<u64, PeerRegistration>>,
     pending_revoke_settlement: Mutex<PendingRevokeSettlement>,
     unsettled_shutdown_rooms: Mutex<HashSet<(HistoryScope, NoteId)>>,
+    revocation_events: Arc<Mutex<CollabEventTracker>>,
     accept_closed: Cancellation,
     shutdown: Cancellation,
 }
@@ -214,6 +215,7 @@ impl CollabHub {
             peers: Mutex::default(),
             pending_revoke_settlement: Mutex::default(),
             unsettled_shutdown_rooms: Mutex::default(),
+            revocation_events: Arc::new(Mutex::new(CollabEventTracker::default())),
             accept_closed: Cancellation::default(),
             shutdown: Cancellation::default(),
         });
@@ -241,7 +243,7 @@ impl CollabHub {
         Arc::new(CollabRevocations {
             hub: Arc::downgrade(&self.0),
             registry,
-            events: std::sync::Mutex::new(CollabEventTracker::default()),
+            events: Arc::clone(&self.0.revocation_events),
         })
     }
 
@@ -480,8 +482,31 @@ impl CollabHub {
         selector: &RevocationSelector,
         reason: RevocationReason,
     ) -> Result<(), PortError> {
+        self.revoke_inner(ctx, selector, reason, true, None).await
+    }
+
+    async fn revoke_inner(
+        &self,
+        ctx: &MaintenanceContext,
+        selector: &RevocationSelector,
+        reason: RevocationReason,
+        evict_peers: bool,
+        evicted_event: Option<&RequestId>,
+    ) -> Result<(), PortError> {
         ctx.authority.require(ServicePurpose::Revocation)?;
-        let mut affected = self.0.evict_matching(selector);
+        let mut affected = if evict_peers {
+            let evicted = self.0.evict_matching(selector);
+            if let Some(event_id) = evicted_event {
+                self.0
+                    .revocation_events
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner())
+                    .mark_peers_evicted(event_id.clone());
+            }
+            evicted
+        } else {
+            HashSet::new()
+        };
         let (pending_rooms, snapshot_seq) = self.0.matching_pending_revoke_settlement(selector);
         affected.extend(pending_rooms);
         let close_space = match (selector, reason) {
@@ -2000,7 +2025,10 @@ const MAX_COLLAB_APPLIED_EVENTS: usize = 16_384;
 struct CollabEventTracker {
     applied: HashSet<RequestId>,
     order: std::collections::VecDeque<RequestId>,
-    in_flight: HashMap<RequestId, Arc<tokio::sync::Notify>>,
+    peers_evicted: HashSet<RequestId>,
+    peers_evicted_order: std::collections::VecDeque<RequestId>,
+    next_token: u64,
+    in_flight: HashMap<RequestId, (u64, tokio::sync::watch::Receiver<bool>)>,
 }
 
 impl CollabEventTracker {
@@ -2014,12 +2042,24 @@ impl CollabEventTracker {
             }
         }
     }
+
+    fn mark_peers_evicted(&mut self, id: RequestId) {
+        if self.peers_evicted.insert(id.clone()) {
+            self.peers_evicted_order.push_back(id);
+            while self.peers_evicted_order.len() > MAX_COLLAB_APPLIED_EVENTS {
+                if let Some(oldest) = self.peers_evicted_order.pop_front() {
+                    self.peers_evicted.remove(&oldest);
+                }
+            }
+        }
+    }
 }
 
 struct CollabEventGuard<'a> {
     tracker: &'a std::sync::Mutex<CollabEventTracker>,
     id: RequestId,
-    notify: Arc<tokio::sync::Notify>,
+    token: u64,
+    done: tokio::sync::watch::Sender<bool>,
     applied: bool,
 }
 
@@ -2032,18 +2072,19 @@ impl Drop for CollabEventGuard<'_> {
         if state
             .in_flight
             .get(&self.id)
-            .is_some_and(|existing| Arc::ptr_eq(existing, &self.notify))
+            .is_some_and(|(token, _)| *token == self.token)
         {
             state.in_flight.remove(&self.id);
         }
-        self.notify.notify_waiters();
+        drop(state);
+        let _ = self.done.send(true);
     }
 }
 
 struct CollabRevocations {
     hub: Weak<HubInner>,
     registry: Arc<dyn SessionRevocationPort>,
-    events: std::sync::Mutex<CollabEventTracker>,
+    events: Arc<std::sync::Mutex<CollabEventTracker>>,
 }
 
 impl SessionRevocationPort for CollabRevocations {
@@ -2090,35 +2131,41 @@ impl SessionRevocationPort for CollabRevocations {
         reason: RevocationReason,
     ) -> PortFuture<'_, ()> {
         Box::pin(async move {
+            ctx.authority.require(ServicePurpose::Revocation)?;
             let event_id = ctx.budget.request.clone();
             let deadline = Instant::now()
                 .checked_add(ctx.budget.remaining)
                 .unwrap_or_else(|| Instant::now() + Duration::from_secs(365 * 24 * 3600));
-            let mut guard = loop {
+            let (mut guard, peers_already_evicted) = loop {
                 if ctx.budget.cancellation.is_cancelled() {
                     return Err(operation_error(
                         b"collab_revocation_cancelled",
                         CommitEffect::NotCommitted,
                     ));
                 }
-                let waiter = {
+                let mut waiter = {
                     let mut state = self.events.lock().unwrap_or_else(|err| err.into_inner());
                     if state.applied.contains(&event_id) {
                         return Ok(());
                     }
-                    if let Some(existing) = state.in_flight.get(&event_id) {
-                        Arc::clone(existing)
+                    if let Some((_, existing)) = state.in_flight.get(&event_id) {
+                        existing.clone()
                     } else {
-                        let notify = Arc::new(tokio::sync::Notify::new());
-                        state
-                            .in_flight
-                            .insert(event_id.clone(), Arc::clone(&notify));
-                        break CollabEventGuard {
-                            tracker: &self.events,
-                            id: event_id.clone(),
-                            notify,
-                            applied: false,
-                        };
+                        state.next_token = state.next_token.wrapping_add(1);
+                        let token = state.next_token;
+                        let (done, rx) = tokio::sync::watch::channel(false);
+                        state.in_flight.insert(event_id.clone(), (token, rx));
+                        let already_evicted = state.peers_evicted.contains(&event_id);
+                        break (
+                            CollabEventGuard {
+                                tracker: &self.events,
+                                id: event_id.clone(),
+                                token,
+                                done,
+                                applied: false,
+                            },
+                            already_evicted,
+                        );
                     }
                 };
                 let remaining = deadline.saturating_duration_since(Instant::now());
@@ -2136,14 +2183,39 @@ impl SessionRevocationPort for CollabRevocations {
                     () = tokio::time::sleep(remaining) => {
                         return Err(deadline_error(b"collab_revocation_wait"));
                     }
-                    () = waiter.notified() => {}
+                    _ = waiter.wait_for(|&done| done) => {}
                 }
             };
-            self.registry
-                .revoke(ctx.clone(), selector.clone(), reason)
-                .await?;
+            let remaining_ctx =
+                |base: &MaintenanceContext| -> Result<MaintenanceContext, PortError> {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(deadline_error(b"collab_revocation_wait"));
+                    }
+                    let mut next = base.clone();
+                    next.budget.remaining = remaining;
+                    Ok(next)
+                };
+            if !peers_already_evicted {
+                self.registry
+                    .revoke(remaining_ctx(&ctx)?, selector.clone(), reason)
+                    .await?;
+            }
             if let Some(hub) = self.hub.upgrade() {
-                CollabHub(hub).revoke(&ctx, &selector, reason).await?;
+                CollabHub(hub)
+                    .revoke_inner(
+                        &remaining_ctx(&ctx)?,
+                        &selector,
+                        reason,
+                        !peers_already_evicted,
+                        Some(&event_id),
+                    )
+                    .await?;
+            } else if !peers_already_evicted {
+                self.events
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner())
+                    .mark_peers_evicted(event_id.clone());
             }
             guard.applied = true;
             Ok(())

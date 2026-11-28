@@ -62,7 +62,7 @@ CREATE TABLE agent_schedule_runs (
 ) STRICT;
 
 INSERT INTO agent_schedules(schedule_id,owner_id,space_id,project_folder_id,title,init_prompt,cron_expr,timezone,approved_role,paused_reason,write_class_mask,budgets,misfire_policy,next_slot_utc_ms,deleted_at,config_revision,revision,created_at,updated_at)
-SELECT schedule_id,owner_id,space_id,project_folder_id,CASE WHEN deleted_at IS NOT NULL THEN '' ELSE title END,init_prompt,cron_expr,timezone,approved_role,paused_reason,write_class_mask,budgets,misfire_policy,next_slot_utc_ms,deleted_at,config_revision,revision,created_at,updated_at FROM agent_schedules_v1;
+SELECT schedule_id,owner_id,space_id,project_folder_id,CASE WHEN deleted_at IS NOT NULL THEN '' ELSE title END,CASE WHEN deleted_at IS NOT NULL THEN '' ELSE init_prompt END,cron_expr,timezone,approved_role,paused_reason,write_class_mask,budgets,misfire_policy,next_slot_utc_ms,deleted_at,config_revision,revision,created_at,updated_at FROM agent_schedules_v1;
 INSERT INTO agent_schedule_runs(run_id,schedule_id,slot_utc_ms,lease_epoch,claim_request_hash,claimed_schedule_revision,reserved_next_slot,status,started_at,finished_at,safe_result,owner_auth_version,config_revision,admission_epoch,history_scope,expires_at)
 SELECT run_id,schedule_id,slot_utc_ms,lease_epoch,claim_request_hash,claimed_schedule_revision,reserved_next_slot,status,started_at,finished_at,safe_result,owner_auth_version,config_revision,admission_epoch,history_scope,expires_at FROM agent_schedule_runs_v1;
 

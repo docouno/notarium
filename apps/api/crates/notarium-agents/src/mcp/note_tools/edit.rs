@@ -45,6 +45,13 @@ impl EditInput {
     pub(super) fn edits_view(&self) -> bool {
         self.view.is_some()
     }
+
+    pub(super) fn edited_view_key(&self) -> Result<Option<ViewKey>, PortError> {
+        self.view
+            .as_ref()
+            .map(|view| Ok(view.reference(&self.note)?.key))
+            .transpose()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]

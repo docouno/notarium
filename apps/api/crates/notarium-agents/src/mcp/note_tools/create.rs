@@ -74,6 +74,8 @@ pub(super) struct CreateProject {
     pub(super) scope: HistoryScope,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) project_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) project_prefix_digest: Option<(u16, ContentDigest)>,
 }
 
 struct CreatePlacement {
@@ -102,10 +104,13 @@ pub(super) async fn observe_project(
 ) -> Result<CreateProject, PortError> {
     let project = session::resolve_project_for_direct_write(call, handle).await?;
     let scope = session::space(call, &project.folder.space_id).await?;
+    let base = folder_base(call, &scope, &project.folder.folder_id).await?;
+    let project_prefix_digest = super::project_prefix_digest(&base.path)?;
     Ok(CreateProject {
         reference: project.folder,
         scope: scope.scope().clone(),
         project_path: None,
+        project_prefix_digest,
     })
 }
 
@@ -683,7 +688,10 @@ async fn execute(
         &scope,
         Some(placement.project.reference.folder_id.clone()),
         prepared.raw_path.clone(),
-        super::DestinationPrefix::OptionalProjectPath(&placement.path),
+        super::DestinationPrefix::OptionalProjectPath {
+            live_path: &placement.path,
+            saved_digest: placement.project.project_prefix_digest,
+        },
         DocClass::UserDoc,
         &prepared.command,
         "create_destination",
@@ -762,8 +770,11 @@ pub(super) async fn create_one(
         Some(&placement.project.reference.folder_id),
         &prepared,
     )
-    .await?;
-    let mut committed_any = false;
+    .await
+    .map_err(|error| {
+        batch_operational_error("notarium.mcp.create-note.v1", error, placement.replayed)
+    })?;
+    let mut committed_any = placement.replayed;
     let (committed, parent) =
         execute(call, &placement, &prepared, carrier, &mut committed_any).await?;
     result(call, &placement, &prepared, committed, parent)

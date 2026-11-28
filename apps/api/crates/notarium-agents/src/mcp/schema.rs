@@ -539,20 +539,15 @@ impl Input {
                 max,
                 max_bytes: Some(bytes),
             } => {
-                let ascii_max = (*max).min(*bytes);
-                let two_byte_max = (*max).min(bytes / 2);
-                let bmp_max = (*max).min(bytes / 3);
-                let any_max = (*max).min(bytes / 4);
+                // JSON Schema `maxLength` counts Unicode scalar values rather than
+                // UTF-8 bytes, so publish the tightest sound code-point ceiling
+                // without rejecting valid mixed-script strings; runtime validation
+                // enforces the exact UTF-8 byte bound.
+                let codepoint_max = (*max).min(*bytes);
                 json!({
                     "type": "string",
                     "minLength": min,
-                    "maxLength": ascii_max,
-                    "anyOf": [
-                        {"maxLength": any_max},
-                        {"maxLength": bmp_max, "pattern": "^[\\u0000-\\ud7ff\\ue000-\\uffff]*$"},
-                        {"maxLength": two_byte_max, "pattern": "^[\\u0000-\\u07ff]*$"},
-                        {"maxLength": ascii_max, "pattern": "^[\\u0000-\\u007f]*$"}
-                    ]
+                    "maxLength": codepoint_max,
                 })
             }
             Self::Text {
@@ -825,9 +820,11 @@ mod tests {
             .validate(&mut json!({"session":{"name":"alpha"}}))
             .unwrap();
 
-        // search/recall byte_string enforces 4096 UTF-8 byte ceiling and publishes matching anyOf bounds.
+        // search/recall byte_string enforces exact 4096 UTF-8 byte ceiling at runtime
+        // while publishing a sound maxLength bound that admits mixed-script UTF-8.
         let search_schema = ToolName::Search.descriptor().input_schema;
-        assert!(search_schema["properties"]["query"]["anyOf"].is_array());
+        assert_eq!(search_schema["properties"]["query"]["maxLength"], 4096);
+        assert!(search_schema["properties"]["query"].get("anyOf").is_none());
         let two_byte_over = "\u{044F}".repeat(2049);
         assert!(
             ToolName::Search
@@ -838,6 +835,20 @@ mod tests {
         ToolName::Search
             .validate(&mut json!({"query": two_byte_exact}))
             .unwrap();
+        let mixed_script = format!("{}\u{044F}", "a".repeat(2048));
+        ToolName::Search
+            .validate(&mut json!({"query": mixed_script}))
+            .unwrap();
+        let mixed_exact_4096 = format!("{}\u{044F}", "a".repeat(4094));
+        ToolName::Search
+            .validate(&mut json!({"query": mixed_exact_4096}))
+            .unwrap();
+        let mixed_over_4096 = format!("{}\u{044F}", "a".repeat(4095));
+        assert!(
+            ToolName::Search
+                .validate(&mut json!({"query": mixed_over_4096}))
+                .is_err()
+        );
         let ascii_exact = "a".repeat(4096);
         ToolName::Search
             .validate(&mut json!({"query": ascii_exact}))

@@ -372,6 +372,52 @@ async fn redaction_mid_step_preserves_incomplete_step_in_catch_up() {
     );
 }
 
+#[tokio::test]
+async fn failure_before_redaction_and_late_model_ack_track_incomplete_step() {
+    // 1. Run fails after streaming deltas, then redaction wipes frames before
+    //    the subscriber observes the terminal frame -> checkpoint keeps step 0.
+    let buffer = Arc::new(stream());
+    let mut subscriber = buffer.subscribe(None);
+    let _ = checkpoint(&mut subscriber).await;
+    buffer.begin_step(0).unwrap();
+    buffer
+        .text_delta(0, "partial output before failure")
+        .unwrap();
+    assert_eq!(encoded(&frame(&mut subscriber).await)["type"], "text_delta");
+    buffer.fail(RunFailure::Cancelled).unwrap();
+    let hold = buffer.pause_for_redaction();
+    drop(hold);
+    let reset = checkpoint(&mut subscriber).await;
+    assert_eq!(reset.incomplete_step, Some(0));
+    assert_eq!(
+        reset.terminal,
+        Some(RunTerminal::Failed {
+            code: RunFailure::Cancelled
+        })
+    );
+
+    // 2. After mid-step redaction, a Human entry seq=3 races ahead of the
+    //    Model ACK seq=2 -> late Model ACK must still clear incomplete_step.
+    let buffer2 = Arc::new(stream());
+    let mut sub2 = buffer2.subscribe(None);
+    let _ = checkpoint(&mut sub2).await;
+    buffer2.begin_step(0).unwrap();
+    buffer2.text_delta(0, "in-flight output").unwrap();
+    assert_eq!(encoded(&frame(&mut sub2).await)["type"], "text_delta");
+    let hold2 = buffer2.pause_for_redaction();
+    drop(hold2);
+    let human_ahead = entry(&buffer2, 2, 3, ChatEntryKind::Human);
+    buffer2.committed(&human_ahead, None).unwrap();
+    let cp_before_ack = checkpoint(&mut sub2).await;
+    assert_eq!(cp_before_ack.committed_leaf, seq(3));
+    assert_eq!(cp_before_ack.incomplete_step, Some(0));
+    let late_model = entry(&buffer2, 1, 2, ChatEntryKind::Model);
+    buffer2.committed(&late_model, Some(0)).unwrap();
+    let cp_after_ack = checkpoint(&mut sub2).await;
+    assert_eq!(cp_after_ack.committed_leaf, seq(3));
+    assert_eq!(cp_after_ack.incomplete_step, None);
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(32))]
 

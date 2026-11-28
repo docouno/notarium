@@ -584,6 +584,71 @@ async fn admit_trashed_replay_folder(
     .await
 }
 
+async fn authorize_settled_unchanged_replay(
+    call: &ToolCallContext<'_>,
+    fenced: &SpaceContext,
+    scope: &HistoryScope,
+    folder: &FolderRef,
+) -> Result<(), PortError> {
+    if let Ok(live) = call
+        .registry
+        .catalog
+        .folder(call.account(), folder.clone())
+        .await
+    {
+        if live.reference != *folder
+            || live.space.id != scope.space_id
+            || live.lifecycle == notarium_core::model::Lifecycle::Purged
+        {
+            return Err(DomainError::ResourceNotFound.into());
+        }
+        fenced
+            .auth()
+            .can_view_folder(&live.space, &folder.folder_id, &live.ancestor_folders)?;
+        let facts = notarium_core::auth::ResourceFacts {
+            space: live.space,
+            class: DocClass::UserDoc,
+            project: None,
+            ancestor_folders: live.ancestor_folders,
+            folder_write_locked: live.write_locked,
+            ability_package: None,
+        };
+        fenced.auth().authorize_direct_write(&facts, &facts)?;
+        return Ok(());
+    }
+    let trashed_account = notarium_core::ports::AccountContext::new(
+        fenced.auth().with_preflight_taint(),
+        call.budget(),
+    );
+    let trashed = call
+        .registry
+        .catalog
+        .trashed_folder_ancestry(trashed_account, folder.clone())
+        .await?;
+    if trashed.reference != *folder {
+        return Err(DomainError::ResourceNotFound.into());
+    }
+    let space = call
+        .registry
+        .catalog
+        .space(call.budget(), scope.space_id.clone())
+        .await?;
+    scope.check(&space.history)?;
+    fenced
+        .auth()
+        .can_view_folder(&space.space, &folder.folder_id, &trashed.ancestors)?;
+    let facts = notarium_core::auth::ResourceFacts {
+        space: space.space,
+        class: DocClass::UserDoc,
+        project: trashed.project,
+        ancestor_folders: trashed.ancestors,
+        folder_write_locked: false,
+        ability_package: None,
+    };
+    fenced.auth().authorize_direct_write(&facts, &facts)?;
+    Ok(())
+}
+
 pub(super) async fn handle(
     call: &mut ToolCallContext<'_>,
     name: ToolName,
@@ -788,13 +853,21 @@ pub(super) async fn handle(
         .await?
         .unwrap_or(false);
     if unchanged_settled {
+        let fenced = call.corpus_writer(scope.clone()).await?;
         let snapshot = match snapshot_by_id(call, &scope, &folder).await {
             Ok(current) => Some(current),
+            Err(PortError::Domain(DomainError::ResourceNotFound)) => None,
             Err(error) if in_app && corpus::hidden(&error) => {
+                // Verify live write authority even when provider disclosure is hidden.
+                let folder_ref = FolderRef {
+                    space_id: route.scope.space_id.clone(),
+                    folder_id: folder.clone(),
+                };
+                authorize_settled_unchanged_replay(call, &fenced, &route.scope, &folder_ref)
+                    .await?;
                 tracing::debug!(code = error.code(), "folder unchanged replay unavailable");
                 return Ok(json!({"outcome": "unchanged"}));
             }
-            Err(PortError::Domain(DomainError::ResourceNotFound)) if !in_app => None,
             Err(error) => return Err(error),
         };
         let mut result = json!({
@@ -803,18 +876,31 @@ pub(super) async fn handle(
             "versionToken": route.revision,
         });
         if let Some(current) = snapshot {
-            let fenced = call.corpus_writer(scope.clone()).await?;
             call.registry
                 .catalog
                 .authorize_folder_subtree_write(fenced, folder.clone(), current.revision.clone())
                 .await?;
             let stable_ancestors = if current.revision == route.revision {
-                ancestors_unchanged(call, &scope, &current, &route.ancestor_revisions).await?
+                match ancestors_unchanged(call, &scope, &current, &route.ancestor_revisions).await {
+                    Ok(stable) => stable,
+                    Err(error) if in_app && corpus::hidden(&error) => {
+                        tracing::debug!(code = error.code(), "folder unchanged replay unavailable");
+                        return Ok(json!({"outcome": "unchanged"}));
+                    }
+                    Err(error) => return Err(error),
+                }
             } else {
                 false
             };
             if current.revision == route.revision && stable_ancestors {
-                let proof = corpus::folder_metadata(call, &scope, &current).await?;
+                let proof = match corpus::folder_metadata(call, &scope, &current).await {
+                    Ok(proof) => proof,
+                    Err(error) if in_app && corpus::hidden(&error) => {
+                        tracing::debug!(code = error.code(), "folder unchanged replay unavailable");
+                        return Ok(json!({"outcome": "unchanged"}));
+                    }
+                    Err(error) => return Err(error),
+                };
                 result["path"] = proof["path"].clone();
                 if name == ToolName::RenameProject {
                     let space = proof["spaceSlug"]
@@ -829,6 +915,19 @@ pub(super) async fn handle(
             } else if in_app
                 && let Err(error) = corpus::folder_metadata(call, &scope, &current).await
             {
+                if corpus::hidden(&error) {
+                    tracing::debug!(code = error.code(), "folder unchanged replay unavailable");
+                    return Ok(json!({"outcome": "unchanged"}));
+                }
+                return Err(error);
+            }
+        } else {
+            let folder_ref = FolderRef {
+                space_id: route.scope.space_id.clone(),
+                folder_id: folder.clone(),
+            };
+            authorize_settled_unchanged_replay(call, &fenced, &route.scope, &folder_ref).await?;
+            if in_app && let Err(error) = admit_trashed_replay_folder(call, &scope, &folder).await {
                 if corpus::hidden(&error) {
                     tracing::debug!(code = error.code(), "folder unchanged replay unavailable");
                     return Ok(json!({"outcome": "unchanged"}));

@@ -344,12 +344,12 @@ async fn projects(call: &mut ToolCallContext<'_>) -> Result<Value, PortError> {
                         .spaces()
                         .get(&space.space.id)
                         .and_then(|grant| grant.project_root.clone());
-                    let space_wide = if project_root.is_some() {
-                        false
+                    let space_wide_proof = if project_root.is_some() {
+                        None
                     } else {
                         match call.provider_selection(&scope, None).await {
                             Ok(Some(sel)) if sel.project_only.is_none() => {
-                                match project_metadata(
+                                project_metadata(
                                     call,
                                     scope.clone(),
                                     CatalogDisclosure::SpaceProjects(space.history.clone()),
@@ -357,25 +357,45 @@ async fn projects(call: &mut ToolCallContext<'_>) -> Result<Value, PortError> {
                                     true,
                                 )
                                 .await?
-                                {
-                                    Some((_, taint)) => {
-                                        if let Some(taint) = taint {
-                                            pending_taints.push(taint);
-                                        }
-                                        true
-                                    }
-                                    None => false,
-                                }
                             }
-                            Ok(_) => false,
+                            Ok(_) => None,
                             Err(PortError::Domain(DomainError::Provider {
                                 error: ProviderErrorCode::Unavailable,
-                            })) => false,
-                            Err(error) if corpus::hidden(&error) => false,
+                            })) => None,
+                            Err(error) if corpus::hidden(&error) => None,
                             Err(error) => return Err(error),
                         }
                     };
+                    if let Some((proof, taint)) = space_wide_proof {
+                        if let Some(taint) = taint {
+                            pending_taints.push(taint);
+                        }
+                        let space_slug = required_text(&proof, "slug")?.to_owned();
+                        let entries = proof["projects"]
+                            .as_array()
+                            .ok_or_else(|| invalid(ValidationReason::InvalidState))?;
+                        total_consented = total_consented.saturating_add(entries.len());
+                        if total_consented > MAX_PROJECTS {
+                            return Err(invalid(ValidationReason::BudgetExceeded));
+                        }
+                        for entry in entries {
+                            let folder_id = required_text(entry, "folderId")?;
+                            let slug = required_text(entry, "projectSlug")?;
+                            let name = required_text(entry, "name")?;
+                            let handle = format!("{space_slug}/{slug}");
+                            let item = json!({
+                                "projectId": folder_id,
+                                "spaceId": space.space.id,
+                                "handle": handle,
+                                "slug": slug,
+                                "name": name,
+                            });
+                            items.push((handle, item));
+                        }
+                        continue;
+                    }
                     let mut candidate_folders: Vec<FolderRef> = Vec::new();
+                    let project_scoped = project_root.is_some();
                     if let Some(folder_id) = project_root {
                         let folder = FolderRef {
                             space_id: space.space.id.clone(),
@@ -388,43 +408,10 @@ async fn projects(call: &mut ToolCallContext<'_>) -> Result<Value, PortError> {
                             .await
                         {
                             Ok(_) => {
-                                total_consented = total_consented.saturating_add(1);
-                                if total_consented > MAX_PROJECTS {
-                                    return Err(invalid(ValidationReason::BudgetExceeded));
-                                }
                                 candidate_folders.push(folder);
                             }
                             Err(error) if corpus::hidden(&error) => {}
                             Err(error) => return Err(error),
-                        }
-                    } else if space_wide {
-                        let mut next: Option<String> = None;
-                        for _ in 0..=MAX_PROJECTS {
-                            let page = call
-                                .registry
-                                .catalog
-                                .projects(
-                                    scope.with_preflight_taint(),
-                                    ControlPageRequest::new(CONTROL_PAGE, next.clone())?,
-                                )
-                                .await?;
-                            if page.items.len() > usize::from(CONTROL_PAGE) {
-                                return Err(invalid(ValidationReason::InvalidState));
-                            }
-                            total_consented = total_consented.saturating_add(page.items.len());
-                            if total_consented > MAX_PROJECTS {
-                                return Err(invalid(ValidationReason::BudgetExceeded));
-                            }
-                            for card in page.items {
-                                candidate_folders.push(card.folder);
-                            }
-                            let Some(cursor) = page.continuation else {
-                                break;
-                            };
-                            if next.as_ref() == Some(&cursor) {
-                                return Err(invalid(ValidationReason::InvalidState));
-                            }
-                            next = Some(cursor);
                         }
                     } else {
                         let mut next: Option<String> = None;
@@ -462,13 +449,19 @@ async fn projects(call: &mut ToolCallContext<'_>) -> Result<Value, PortError> {
                             scope.clone(),
                             source,
                             Some(folder.clone()),
-                            !space_wide,
+                            true,
                         )
                         .await?
                         else {
                             continue;
                         };
-                        if !space_wide && let Some(taint) = taint {
+                        if project_scoped {
+                            total_consented = total_consented.saturating_add(1);
+                            if total_consented > MAX_PROJECTS {
+                                return Err(invalid(ValidationReason::BudgetExceeded));
+                            }
+                        }
+                        if let Some(taint) = taint {
                             pending_taints.push(taint);
                         }
                         let space_slug = required_text(&proof, "spaceSlug")?.to_owned();

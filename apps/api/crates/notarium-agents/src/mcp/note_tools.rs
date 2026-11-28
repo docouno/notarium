@@ -612,8 +612,35 @@ impl DestinationPrecheck {
 
 enum DestinationPrefix<'a> {
     None,
-    OptionalProjectPath(&'a str),
+    OptionalProjectPath {
+        live_path: &'a str,
+        saved_digest: Option<(u16, notarium_core::ids::ContentDigest)>,
+    },
     RequiredProjectRoot,
+}
+
+fn normalized_prefix_digest(segments: &[&str]) -> notarium_core::ids::ContentDigest {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"notarium.mcp.project-prefix.v1\0");
+    hasher.update(&(segments.len() as u64).to_le_bytes());
+    for seg in segments {
+        let key = notarium_syntax::unicode::lookup_key(seg);
+        hasher.update(&(key.len() as u64).to_le_bytes());
+        hasher.update(key.as_bytes());
+    }
+    notarium_core::ids::ContentDigest::from_bytes(*hasher.finalize().as_bytes())
+}
+
+pub(super) fn project_prefix_digest(
+    path: &str,
+) -> Result<Option<(u16, notarium_core::ids::ContentDigest)>, PortError> {
+    let segments: Vec<&str> = path.split('/').filter(|seg| !seg.is_empty()).collect();
+    if segments.is_empty() {
+        return Ok(None);
+    }
+    let count = u16::try_from(segments.len())
+        .map_err(|_| invalid(ValidationReason::InvalidPathComponent))?;
+    Ok(Some((count, normalized_prefix_digest(&segments))))
 }
 
 async fn resolve_stripped_segments(
@@ -626,11 +653,24 @@ async fn resolve_stripped_segments(
 ) -> Result<u16, PortError> {
     match prefix {
         DestinationPrefix::None => Ok(0),
-        DestinationPrefix::OptionalProjectPath(project_path) => {
-            if !project_path.is_empty()
-                && corpus::strip_folder_prefix(raw_path, project_path).is_some()
-            {
-                segment_count(project_path)
+        DestinationPrefix::OptionalProjectPath {
+            live_path,
+            saved_digest,
+        } => {
+            if !live_path.is_empty() && corpus::strip_folder_prefix(raw_path, live_path).is_some() {
+                segment_count(live_path)
+            } else if let Some((count, expected)) = *saved_digest {
+                let segments: Vec<&str> =
+                    raw_path.split('/').filter(|seg| !seg.is_empty()).collect();
+                let count_usize = usize::from(count);
+                if count_usize > 0
+                    && segments.len() >= count_usize
+                    && normalized_prefix_digest(&segments[..count_usize]) == expected
+                {
+                    Ok(count)
+                } else {
+                    Ok(0)
+                }
             } else if allow_trashed_root
                 && let Some(base_id) = base.as_ref()
                 && let Some(first_seg) = raw_path

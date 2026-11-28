@@ -31116,7 +31116,7 @@ async fn run_mcp_chat_replay_and_isolation_seams(pg: bool) {
     .expect("first rename_folder(A, A) must succeed")
     .structured_content;
     assert_eq!(noop_1["outcome"], "unchanged");
-    let _renamed_b = call_mcp(
+    let renamed_b = call_mcp(
         &fixture.registry,
         &owner,
         [0xED, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
@@ -31128,13 +31128,14 @@ async fn run_mcp_chat_replay_and_isolation_seams(pg: bool) {
         }),
     )
     .await
-    .expect("rename_folder(A, B) must succeed");
+    .expect("rename_folder(A, B) must succeed")
+    .structured_content;
     let noop_2 = call_mcp(
         &fixture.registry,
         &owner,
         noop_key,
         "rename_folder",
-        noop_args,
+        noop_args.clone(),
     )
     .await
     .expect("replaying unchanged rename_folder(A, A) after rename to B must succeed")
@@ -31144,6 +31145,56 @@ async fn run_mcp_chat_replay_and_isolation_seams(pg: bool) {
     assert!(
         noop_2.get("path").is_none(),
         "replayed unchanged rename_folder must not leak later path B: {noop_2}"
+    );
+    // Settled unchanged replay MUST still verify live write authority when the
+    // folder is trashed (e.g. a demoted Viewer must fail closed, never return unchanged).
+    let renamed_b_id = FolderId::parse(noop_1["folderId"].as_str().unwrap()).unwrap();
+    let renamed_b_rev = RevisionId::parse(renamed_b["versionToken"].as_str().unwrap()).unwrap();
+    let space_epoch = fixture
+        .canonical
+        .read_space(&scope.space_id)
+        .await
+        .unwrap()
+        .active_epoch;
+    fixture
+        .canonical
+        .set_folder_lifecycle(
+            &scope,
+            space_epoch,
+            &renamed_b_id,
+            &renamed_b_rev,
+            notarium_core::model::Lifecycle::Trashed,
+            &actor,
+            None,
+        )
+        .await
+        .expect("trashing stable-b must succeed");
+    let mut viewer_grants = owner.auth().spaces().clone();
+    if let Some(grant) = viewer_grants.get_mut(&scope.space_id) {
+        grant.role = SpaceRole::Viewer;
+        grant.write_classes.clear();
+    }
+    let viewer_auth = notarium_core::auth::EngineAuthContext::for_human(
+        notarium_core::auth::VerifiedHuman::attest(
+            owner.auth().principal().clone(),
+            owner.auth().grant().clone(),
+            viewer_grants,
+            false,
+        ),
+    );
+    let viewer_ctx = AccountContext::new(viewer_auth, budget());
+    let demoted_noop = call_mcp(
+        &fixture.registry,
+        &viewer_ctx,
+        noop_key,
+        "rename_folder",
+        noop_args,
+    )
+    .await;
+    assert!(
+        demoted_noop.is_err(),
+        "demoted Viewer replaying settled unchanged rename_folder on trashed folder must fail closed, got {:?}",
+        demoted_noop.map(|r| r.structured_content)
     );
 
     // 8. `create_note` bounds auto-generated slug from an 8192-char H1 to <=128 bytes.

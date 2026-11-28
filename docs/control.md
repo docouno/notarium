@@ -59,9 +59,12 @@ migration connection close. Caller cancellation does not release an owned writer
 or bootstrap task early. Arbitrary external SQL does not participate in these fences.
 
 All text is NUL-free. Each declared primary, unique or secondary index key has a
-shared 2 KiB data budget: UTF-8 bytes for text, bytes for blobs, and eight bytes
-per numeric column. The importer and both SQL schemas enforce the same bound,
-so values accepted by SQLite remain representable in PostgreSQL B-tree indexes.
+shared 2 KiB data budget (with a 2,088-byte allowance on
+`provider_call_log(run_id, call_id)` to preserve `0001 -> 0002` upgrades well
+within PostgreSQL's B-tree tuple ceiling): UTF-8 bytes for text, bytes for
+blobs, and eight bytes per numeric column. The importer and both SQL schemas
+enforce the same bound, so values accepted by SQLite remain representable in
+PostgreSQL B-tree indexes.
 Optional retrieval scores accept only finite floating-point values or null;
 NaN and infinities are rejected before binding, preserving JSON export semantics.
 
@@ -706,7 +709,7 @@ Timezones use the IANA `chrono-tz` catalog. Slot
 calculation and validation share the same civil-time rules. A nonexistent local
 time is skipped and a repeated local time maps to its earlier UTC instant.
 Trusted scheduling reads floor sub-millisecond timestamps to whole milliseconds.
-Soft-deleting a schedule clears `init_prompt` on the tombstone row.
+Soft-deleting a schedule clears both `title` and `init_prompt` on the tombstone row.
 
 Run limits default to 25 steps, 100,000 tokens and 300 seconds. The composition sets
 `ControlConfig.schedule_limits` within hard ceilings of 1,000 steps, 10,000,000 tokens

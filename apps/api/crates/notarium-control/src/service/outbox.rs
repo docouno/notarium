@@ -20,7 +20,7 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
-use tokio::sync::Notify;
+use tokio::sync::watch;
 
 const MAX_TRACKED_DELIVERED_EVENTS: usize = 16_384;
 const BACKGROUND_REVOKE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -29,7 +29,8 @@ const BACKGROUND_REVOKE_TIMEOUT: Duration = Duration::from_secs(30);
 struct DeliveryState {
     delivered: HashSet<RequestId>,
     order: VecDeque<RequestId>,
-    in_flight: HashMap<RequestId, Arc<Notify>>,
+    next_token: u64,
+    in_flight: HashMap<RequestId, (u64, watch::Receiver<bool>)>,
 }
 
 impl DeliveryState {
@@ -58,7 +59,8 @@ enum DeliverySlot<'a> {
 struct InFlightGuard<'a> {
     tracker: &'a RevocationDeliveryTracker,
     id: RequestId,
-    notify: Arc<Notify>,
+    token: u64,
+    done: watch::Sender<bool>,
     delivered: bool,
 }
 
@@ -81,18 +83,20 @@ impl Drop for InFlightGuard<'_> {
         if state
             .in_flight
             .get(&self.id)
-            .is_some_and(|existing| Arc::ptr_eq(existing, &self.notify))
+            .is_some_and(|(token, _)| *token == self.token)
         {
             state.in_flight.remove(&self.id);
         }
-        self.notify.notify_waiters();
+        drop(state);
+        let _ = self.done.send(true);
     }
 }
 
 struct OwnedInFlightGuard {
     tracker: Arc<RevocationDeliveryTracker>,
     id: RequestId,
-    notify: Arc<Notify>,
+    token: u64,
+    done: watch::Sender<bool>,
     delivered: bool,
 }
 
@@ -115,11 +119,12 @@ impl Drop for OwnedInFlightGuard {
         if state
             .in_flight
             .get(&self.id)
-            .is_some_and(|existing| Arc::ptr_eq(existing, &self.notify))
+            .is_some_and(|(token, _)| *token == self.token)
         {
             state.in_flight.remove(&self.id);
         }
-        self.notify.notify_waiters();
+        drop(state);
+        let _ = self.done.send(true);
     }
 }
 
@@ -134,49 +139,55 @@ impl RevocationDeliveryTracker {
 
     async fn begin_owned(self: &Arc<Self>, id: RequestId) -> Option<OwnedInFlightGuard> {
         loop {
-            let waiter = {
+            let mut waiter = {
                 let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
                 if state.delivered.contains(&id) {
                     return None;
                 }
-                if let Some(existing) = state.in_flight.get(&id) {
-                    Arc::clone(existing)
+                if let Some((_, existing)) = state.in_flight.get(&id) {
+                    existing.clone()
                 } else {
-                    let notify = Arc::new(Notify::new());
-                    state.in_flight.insert(id.clone(), Arc::clone(&notify));
+                    state.next_token = state.next_token.wrapping_add(1);
+                    let token = state.next_token;
+                    let (done, rx) = watch::channel(false);
+                    state.in_flight.insert(id.clone(), (token, rx));
                     return Some(OwnedInFlightGuard {
                         tracker: Arc::clone(self),
                         id,
-                        notify,
+                        token,
+                        done,
                         delivered: false,
                     });
                 }
             };
-            waiter.notified().await;
+            let _ = waiter.wait_for(|&done| done).await;
         }
     }
 
     async fn begin<'a>(&'a self, id: &RequestId) -> DeliverySlot<'a> {
         loop {
-            let waiter = {
+            let mut waiter = {
                 let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
                 if state.delivered.contains(id) {
                     return DeliverySlot::AlreadyDelivered;
                 }
-                if let Some(existing) = state.in_flight.get(id) {
-                    Arc::clone(existing)
+                if let Some((_, existing)) = state.in_flight.get(id) {
+                    existing.clone()
                 } else {
-                    let notify = Arc::new(Notify::new());
-                    state.in_flight.insert(id.clone(), Arc::clone(&notify));
+                    state.next_token = state.next_token.wrapping_add(1);
+                    let token = state.next_token;
+                    let (done, rx) = watch::channel(false);
+                    state.in_flight.insert(id.clone(), (token, rx));
                     return DeliverySlot::Claimed(InFlightGuard {
                         tracker: self,
                         id: id.clone(),
-                        notify,
+                        token,
+                        done,
                         delivered: false,
                     });
                 }
             };
-            waiter.notified().await;
+            let _ = waiter.wait_for(|&done| done).await;
         }
     }
 }
@@ -310,19 +321,27 @@ impl ControlService {
             tx.hold_revocation_fence(fence);
         }
         budget.check(CommitEffect::NotCommitted)?;
-        // Run COMMIT -> revoke -> release fences inside one spawned task so
-        // caller cancellation after COMMIT starts cannot drop provider fences
-        // before every newly committed revocation event is delivered.
+        // Run COMMIT -> revoke -> release fences -> persist durable ACK inside
+        // one spawned task so caller cancellation after COMMIT starts cannot
+        // drop provider fences before every newly committed revocation event is
+        // attempted or lose the durable `delivered_at` ACK.
         let revoker = Arc::clone(&self.revoker);
         let tracker = Arc::clone(&self.revocation_tracker);
+        let store = self.store.clone();
+        let clock = Arc::clone(&self.clock);
+        let ack_request_id = events
+            .first()
+            .cloned()
+            .unwrap_or_else(|| RequestId::from_bytes([0; 16]));
         let settle_handle = tokio::spawn(async move {
             let fences = tx.commit_keeping_fences().await?;
-            let mut delivered_ids = Vec::with_capacity(to_revoke.len());
-            let revoke_result: Result<(), PortError> = async {
-                for (event_id, request, selector, reason) in to_revoke {
+            let mut delivered_ids = already_delivered_ids;
+            delivered_ids.reserve(to_revoke.len());
+            let mut first_error: Option<PortError> = None;
+            for (event_id, request, selector, reason) in to_revoke {
+                let step_result = tokio::time::timeout(BACKGROUND_REVOKE_TIMEOUT, async {
                     let Some(mut guard) = tracker.begin_owned(request.clone()).await else {
-                        delivered_ids.push(event_id);
-                        continue;
+                        return Ok(true);
                     };
                     revoker
                         .revoke(
@@ -342,47 +361,70 @@ impl ControlService {
                             unavailable("control revocation delivery", CommitEffect::Unknown)
                         })?;
                     guard.mark_delivered();
-                    delivered_ids.push(event_id);
+                    Ok::<bool, PortError>(true)
+                })
+                .await;
+                match step_result {
+                    Ok(Ok(true)) => delivered_ids.push(event_id),
+                    Ok(Ok(false)) => {}
+                    Ok(Err(error)) => {
+                        if first_error.is_none() {
+                            first_error = Some(error);
+                        }
+                    }
+                    Err(_) => {
+                        if first_error.is_none() {
+                            first_error = Some(unavailable(
+                                "control revocation delivery timeout",
+                                CommitEffect::Unknown,
+                            ));
+                        }
+                    }
                 }
-                Ok(())
             }
-            .await;
             drop(fences);
-            revoke_result?;
-            Ok::<Vec<String>, PortError>(delivered_ids)
+            if !delivered_ids.is_empty() {
+                let ack_budget = OperationBudget::new(CallBudget {
+                    request: ack_request_id,
+                    remaining: BACKGROUND_REVOKE_TIMEOUT,
+                    cancellation: Cancellation::default(),
+                });
+                let mark_delivered: Result<(), PortError> = async {
+                    let mut mark_tx = store.write(ack_budget.clone()).await?;
+                    let now = clock.now_ms()?;
+                    ack_budget
+                        .run(
+                            async {
+                                for event_id in &delivered_ids {
+                                    execute!(
+                                        mark_tx.inner_mut(),
+                                        "UPDATE revocation_events SET attempts=attempts+1, delivered_at=$1 WHERE event_id=$2 AND delivered_at IS NULL",
+                                        "UPDATE v1_control.revocation_events SET attempts=attempts+1, delivered_at=$1 WHERE event_id=$2 AND delivered_at IS NULL";
+                                        now,
+                                        event_id
+                                    )?;
+                                }
+                                Ok(())
+                            },
+                            CommitEffect::Unknown,
+                        )
+                        .await?;
+                    ack_budget.commit_tx(mark_tx).await
+                }
+                .await;
+                // If recording `delivered_at` fails transiently, `flush_event` /
+                // `drain_revocations` will retry idempotently while the tracker
+                // prevents duplicate delivery within this process.
+                let _ = mark_delivered;
+            }
+            if let Some(error) = first_error {
+                return Err(error);
+            }
+            Ok::<(), PortError>(())
         });
-        let mut delivered_ids = budget
+        budget
             .await_spawned(settle_handle, "control commit revocation worker")
             .await?;
-        delivered_ids.extend(already_delivered_ids);
-        if !delivered_ids.is_empty() {
-            let mark_delivered: Result<(), PortError> = async {
-                let mut mark_tx = self.store.write(budget.clone()).await?;
-                let now = self.clock.now_ms()?;
-                budget
-                    .run(
-                        async {
-                            for event_id in &delivered_ids {
-                                execute!(
-                                    mark_tx.inner_mut(),
-                                    "UPDATE revocation_events SET attempts=attempts+1, delivered_at=$1 WHERE event_id=$2 AND delivered_at IS NULL",
-                                    "UPDATE v1_control.revocation_events SET attempts=attempts+1, delivered_at=$1 WHERE event_id=$2 AND delivered_at IS NULL";
-                                    now,
-                                    event_id
-                                )?;
-                            }
-                            Ok(())
-                        },
-                        CommitEffect::Unknown,
-                    )
-                    .await?;
-                budget.commit_tx(mark_tx).await
-            }
-            .await;
-            // If recording `delivered_at` fails transiently, `flush_event` will
-            // retry idempotently while the authority has already applied the event.
-            let _ = mark_delivered;
-        }
         Ok(())
     }
     pub(super) async fn flush_event(
@@ -523,5 +565,43 @@ fn unknown_after_revocation(error: PortError, label: &'static str) -> PortError 
         PortError::Unavailable(_) => PortError::Unavailable(make()),
         PortError::Internal(_) => PortError::Internal(make()),
         PortError::Domain(_) => unavailable(label, CommitEffect::Unknown),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn delivery_tracker_watch_waiters_never_lose_wakeup() {
+        let tracker = Arc::new(RevocationDeliveryTracker::default());
+        for i in 0u8..64 {
+            let id = RequestId::from_bytes([i; 16]);
+            let mut holder = tracker
+                .begin_owned(id.clone())
+                .await
+                .expect("first caller claims event");
+            let t1 = Arc::clone(&tracker);
+            let id1 = id.clone();
+            let waiter1 = tokio::spawn(async move { t1.begin_owned(id1).await });
+            let t2 = Arc::clone(&tracker);
+            let id2 = id.clone();
+            let waiter2 = tokio::spawn(async move {
+                matches!(t2.begin(&id2).await, DeliverySlot::AlreadyDelivered)
+            });
+            tokio::task::yield_now().await;
+            holder.mark_delivered();
+            drop(holder);
+            let r1 = tokio::time::timeout(Duration::from_secs(5), waiter1)
+                .await
+                .expect("waiter1 must wake without lost-wakeup deadlock")
+                .unwrap();
+            let r2 = tokio::time::timeout(Duration::from_secs(5), waiter2)
+                .await
+                .expect("waiter2 must wake without lost-wakeup deadlock")
+                .unwrap();
+            assert!(r1.is_none());
+            assert!(r2);
+        }
     }
 }

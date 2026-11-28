@@ -26,8 +26,8 @@ ALTER TABLE v1_control.agent_schedules
     ADD CHECK ((deleted_at IS NULL AND octet_length(title) BETWEEN 1 AND 512) OR (deleted_at IS NOT NULL AND octet_length(title) <= 512)),
     ADD CHECK (deleted_at IS NOT NULL OR coalesce(octet_length(owner_id),0) + coalesce(octet_length(space_id),0) + coalesce(octet_length(project_folder_id),0) + coalesce(octet_length(schedule_id),0) <= 2048);
 UPDATE v1_control.agent_schedules
-    SET title = ''
-    WHERE deleted_at IS NOT NULL AND title <> '';
+    SET title = '', init_prompt = ''
+    WHERE deleted_at IS NOT NULL AND (title <> '' OR init_prompt <> '');
 ALTER TABLE v1_control.provider_call_log
     ADD CHECK (coalesce(octet_length(run_id),0) + coalesce(octet_length(call_id),0) <= 2088);
 ALTER TABLE v1_control.provider_attachments

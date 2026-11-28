@@ -609,7 +609,19 @@ impl ContentPart {
         document: Arc<ClassifiedDocument>,
         chunk: ChunkDescriptor,
     ) -> DomainResult<Self> {
-        if chunk.source != document.digest
+        let metadata = Arc::new(document.metadata());
+        Self::from_chunk_shared(&document, metadata, chunk)
+    }
+
+    pub fn from_chunk_shared(
+        document: &ClassifiedDocument,
+        metadata: Arc<ClassifiedMetadata>,
+        chunk: ChunkDescriptor,
+    ) -> DomainResult<Self> {
+        if metadata.reference() != document.reference()
+            || metadata.revision() != document.revision()
+            || metadata.digest() != document.digest()
+            || chunk.source != document.digest
             || chunk.spans.is_empty()
             || render_chunk(&document.content, &chunk.context, &chunk.spans)? != chunk.text
         {
@@ -620,7 +632,6 @@ impl ContentPart {
                 ValidationReason::TokenBudgetExceeded,
             ));
         }
-        let metadata = Arc::new(document.metadata());
         Ok(Self {
             document: metadata,
             chunk,

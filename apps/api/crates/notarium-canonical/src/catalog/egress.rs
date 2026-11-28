@@ -961,20 +961,25 @@ fn space_content(
     Ok(CanonicalMetadataContent::from_canonical(current, text)?)
 }
 
+const MAX_SPACE_PROJECTS_DISCLOSURE: usize = 4096;
+
 async fn space_projects_content(
     tx: &mut BackendConn<'_>,
     auth: &EngineAuthContext,
     space: &SpaceRecord,
 ) -> Result<CanonicalMetadataContent, PortError> {
     auth.authorize_folder_read(&space.space, &space.root_folder_id, &[])?;
+    let fetch_limit = (MAX_SPACE_PROJECTS_DISCLOSURE + 1) as i64;
     let rows: Vec<(String, String, String, Option<String>)> = match tx {
         BackendConn::Sqlite(conn) => sqlx::query_as(
             "SELECT folder_id, head_rev_id, display_name, project_slug
              FROM folder_heads
              WHERE space_id = ? AND lifecycle_state = 'active' AND is_project = 1
-             ORDER BY folder_id ASC",
+             ORDER BY folder_id ASC
+             LIMIT ?",
         )
         .bind(space.space.id.as_str())
+        .bind(fetch_limit)
         .fetch_all(&mut **conn)
         .await
         .map_err(|e| internal_not_committed("sqlite_space_projects_digest", e.to_string()))?,
@@ -982,24 +987,30 @@ async fn space_projects_content(
             "SELECT folder_id, head_rev_id, display_name, project_slug
              FROM folder_heads
              WHERE space_id = $1 AND lifecycle_state = 'active' AND is_project = 1
-             ORDER BY folder_id COLLATE \"C\" ASC",
+             ORDER BY folder_id COLLATE \"C\" ASC
+             LIMIT $2",
         )
         .bind(space.space.id.as_str())
+        .bind(fetch_limit)
         .fetch_all(&mut **conn)
         .await
         .map_err(|e| pg_read_error("pg_space_projects_digest", e))?,
     };
-    let text = serde_json::json!({
-        "id": space.space.id,
-        "slug": space.slug,
-        "kind": space.space.kind,
-        "activeProjectCount": rows.len(),
-    })
-    .to_string();
+    if rows.len() > MAX_SPACE_PROJECTS_DISCLOSURE {
+        return Err(DomainError::validation(ValidationReason::BudgetExceeded).into());
+    }
+    let mut projects_json = Vec::with_capacity(rows.len());
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"notarium.egress.space-projects.v1\0");
-    hasher.update(&(text.len() as u64).to_le_bytes());
-    hasher.update(text.as_bytes());
+    let kind_str = match space.space.kind {
+        notarium_core::auth::SpaceKind::Personal => "personal",
+        notarium_core::auth::SpaceKind::Shared => "shared",
+    };
+    for header in [space.space.id.as_str(), space.slug.as_str(), kind_str] {
+        hasher.update(&(header.len() as u64).to_le_bytes());
+        hasher.update(header.as_bytes());
+    }
+    hasher.update(&(rows.len() as u64).to_le_bytes());
     for (folder_id, head_rev_id, display_name, project_slug) in &rows {
         let slug = project_slug.as_deref().unwrap_or("");
         for field in [
@@ -1011,7 +1022,19 @@ async fn space_projects_content(
             hasher.update(&(field.len() as u64).to_le_bytes());
             hasher.update(field.as_bytes());
         }
+        projects_json.push(serde_json::json!({
+            "folderId": folder_id,
+            "projectSlug": slug,
+            "name": display_name,
+        }));
     }
+    let text = serde_json::json!({
+        "id": space.space.id,
+        "slug": space.slug,
+        "kind": space.space.kind,
+        "projects": projects_json,
+    })
+    .to_string();
     let digest = ContentDigest::from_bytes(*hasher.finalize().as_bytes());
     let current = ProviderCurrentContent::SpaceProjects {
         history: space.scope.clone(),

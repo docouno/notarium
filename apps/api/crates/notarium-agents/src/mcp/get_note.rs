@@ -449,9 +449,6 @@ async fn graph(
             Err(error) => return Err(error),
         }
     }
-    let incomplete = graph.cut.projected_seq < head.max(graph.cut.canonical_seq)
-        || admitted_truncated
-        || (external && graph.truncated);
     let edges: Vec<_> = graph
         .edges
         .into_iter()
@@ -464,6 +461,12 @@ async fn graph(
             _ => None,
         })
         .collect();
+    const MAX_GRAPH_EDGES: usize = 16_000;
+    let admitted_edge_truncated = graph.truncated && edges.len() >= MAX_GRAPH_EDGES;
+    let incomplete = graph.cut.projected_seq < head.max(graph.cut.canonical_seq)
+        || admitted_truncated
+        || admitted_edge_truncated
+        || (external && graph.truncated);
     Ok(json!({"status": if incomplete { "incomplete" } else { "ready" }, "edges": edges}))
 }
 

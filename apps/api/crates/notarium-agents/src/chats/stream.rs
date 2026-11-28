@@ -359,12 +359,22 @@ impl StepStreamBuffer {
         }
         let mut state = lock(&self.state);
         if state.visibility_floor != 0 {
+            let mut changed = false;
+            if entry.kind == ChatEntryKind::Model
+                && entry.run.as_ref() == Some(&self.run)
+                && state.redacted_incomplete_step.is_some()
+            {
+                state.redacted_incomplete_step = None;
+                changed = true;
+            }
             if entry.seq > state.committed_leaf {
                 state.committed_leaf = entry.seq;
-                if entry.kind == ChatEntryKind::Model && entry.run.as_ref() == Some(&self.run) {
-                    state.redacted_incomplete_step = None;
-                }
                 state.reset_visibility();
+                changed = true;
+            } else if changed {
+                state.reset_visibility();
+            }
+            if changed {
                 self.changed.send_replace(state.end);
             }
             return Ok(false);
@@ -398,12 +408,22 @@ impl StepStreamBuffer {
         }
         let mut state = lock(&self.state);
         if state.visibility_floor != 0 {
+            let mut changed = false;
+            if entry.kind == ChatEntryKind::Model
+                && entry.run.as_ref() == Some(&self.run)
+                && state.redacted_incomplete_step.is_some()
+            {
+                state.redacted_incomplete_step = None;
+                changed = true;
+            }
             if entry.seq > state.committed_leaf {
                 state.committed_leaf = entry.seq;
-                if entry.kind == ChatEntryKind::Model && entry.run.as_ref() == Some(&self.run) {
-                    state.redacted_incomplete_step = None;
-                }
                 state.reset_visibility();
+                changed = true;
+            } else if changed {
+                state.reset_visibility();
+            }
+            if changed {
                 self.changed.send_replace(state.end);
             }
             return Ok(false);
@@ -583,6 +603,14 @@ impl StepStreamBuffer {
             return Err(invalid_state());
         }
         let frame = state.frame(payload, tainted)?;
+        if matches!(terminal, RunTerminal::Failed { .. })
+            && let Some(step) = state
+                .transient
+                .filter(|transient| transient.start < state.end)
+                .map(|transient| transient.step)
+        {
+            state.redacted_incomplete_step = Some(step);
+        }
         state.terminal = Some(terminal);
         state.transient = None;
         self.insert(&mut state, frame);

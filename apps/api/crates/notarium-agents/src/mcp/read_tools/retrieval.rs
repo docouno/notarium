@@ -318,10 +318,12 @@ pub(super) async fn retrieve(
             let multi_target = targets.len() > 1;
             let result = if recall {
                 let (recall_budget, recall_max_per_source) = if multi_target {
-                    // Across multiple Spaces, keep `max_per_source` active so
-                    // oversized chunks do not crowd out eligible chunks while
-                    // global Pass-1/Pass-2 packing enforces `budget` below.
-                    (131_072, max_per_source)
+                    // Across multiple Spaces, avoid premature per-source chunk
+                    // eviction in the local engine so global Pass-1/Pass-2
+                    // packing below can still pick smaller individually
+                    // eligible chunks while enforcing `budget` and
+                    // `max_per_source` once globally.
+                    (131_072, None)
                 } else {
                     (budget, max_per_source)
                 };
@@ -361,7 +363,19 @@ pub(super) async fn retrieve(
             }
             const MAX_IN_APP_CANDIDATES: usize = 4096;
             const MAX_CANDIDATE_BYTES: usize = 16 * 1024 * 1024;
-            for hit in result.hits {
+            let hit_byte_size = |hit: &notarium_core::ports::SearchHit| -> usize {
+                hit.card
+                    .title
+                    .len()
+                    .saturating_add(hit.card.path.len())
+                    .saturating_add(
+                        hit.chunks
+                            .iter()
+                            .map(|chunk| chunk.text().len())
+                            .sum::<usize>(),
+                    )
+            };
+            for mut hit in result.hits {
                 let metadata = hit.card.document.provenance();
                 if metadata.reference().space_id != target.scope.space_id || !hit.score.is_finite()
                 {
@@ -376,27 +390,30 @@ pub(super) async fn retrieve(
                         title_only_framing_tokens(note_id) <= budget
                     } else {
                         let first_charge = framing_tokens(note_id, true);
-                        hit.chunks.iter().any(|chunk| {
+                        let tail_charge = framing_tokens(note_id, false);
+                        let any_first = hit.chunks.iter().any(|chunk| {
                             let tokens = chunk.part().tokens();
                             tokens <= source_budget && tokens.saturating_add(first_charge) <= budget
-                        })
+                        });
+                        if any_first {
+                            let before_len = hit.chunks.len();
+                            hit.chunks.retain(|chunk| {
+                                let tokens = chunk.part().tokens();
+                                tokens <= source_budget
+                                    && tokens.saturating_add(tail_charge) <= budget
+                            });
+                            if hit.chunks.len() < before_len {
+                                truncated = true;
+                            }
+                        }
+                        any_first
                     };
                     if !eligible {
                         truncated = true;
                         continue;
                     }
                 }
-                let hit_bytes = hit
-                    .card
-                    .title
-                    .len()
-                    .saturating_add(hit.card.path.len())
-                    .saturating_add(
-                        hit.chunks
-                            .iter()
-                            .map(|chunk| chunk.text().len())
-                            .sum::<usize>(),
-                    );
+                let hit_bytes = hit_byte_size(&hit);
                 candidate_bytes = candidate_bytes.saturating_add(hit_bytes);
                 if (!external && candidates.len() >= MAX_IN_APP_CANDIDATES)
                     || candidate_bytes > MAX_CANDIDATE_BYTES
@@ -408,6 +425,9 @@ pub(super) async fn retrieve(
             if external && candidates.len() > MAX_CANDIDATES {
                 candidates.sort_by(rank);
                 candidates.truncate(MAX_CANDIDATES);
+                candidate_bytes = candidates
+                    .iter()
+                    .fold(0usize, |acc, c| acc.saturating_add(hit_byte_size(&c.hit)));
                 truncated = true;
             }
         }

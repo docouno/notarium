@@ -340,12 +340,17 @@ impl SearchEngine {
                 } else {
                     3
                 };
+                let shared_metadata = Arc::new(document.metadata());
                 let mut chunks = Vec::new();
                 let mut hit_bytes = card.title.len().saturating_add(card.path.len());
                 let mut budget_hit = false;
                 for descriptor in descriptors.into_iter().take(maximum) {
-                    let Some(part) = ContentPart::from_chunk(document.clone(), descriptor).ok()
-                    else {
+                    let Some(part) = ContentPart::from_chunk_shared(
+                        &document,
+                        Arc::clone(&shared_metadata),
+                        descriptor,
+                    )
+                    .ok() else {
                         continue;
                     };
                     let Ok(search_part) = ClassEgressFence::search_part(part, &hydrate_auth) else {
@@ -366,8 +371,9 @@ impl SearchEngine {
                 }
                 drop(content);
                 drop(document);
-                if hydrated_bytes.saturating_add(hit_bytes) > MAX_HYDRATED_EXCERPT_BYTES
-                    && !hits.is_empty()
+                if (budget_hit && chunks.is_empty())
+                    || (hydrated_bytes.saturating_add(hit_bytes) > MAX_HYDRATED_EXCERPT_BYTES
+                        && !hits.is_empty())
                 {
                     truncated = true;
                     break 'batches;
@@ -386,11 +392,13 @@ impl SearchEngine {
         Ok((hits, truncated))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn finish_hits(
         &self,
         ctx: &SpaceContext,
         clock: &Clock,
         hits: Vec<SearchHit>,
+        top_k: usize,
         delivery: QueryDelivery<'_>,
         chats: &mut Vec<ChatSearchHit>,
         mut visibility_head: SpaceSeq,
@@ -440,7 +448,7 @@ impl SearchEngine {
             .collect();
         let truncated = delivery
             .recall
-            .is_some_and(|recall| pack(&mut visible, recall, delivery.recipient));
+            .is_some_and(|recall| pack(&mut visible, recall, delivery.recipient, top_k));
         // Commit cross-space taint onto the caller's live auth ONLY for
         // hits that survived live visibility and recall packing.
         visible.retain(|hit| {
@@ -626,8 +634,10 @@ fn pack(
     hits: &mut Vec<SearchHit>,
     recall: Recall,
     recipient: Option<&dyn notarium_core::ports::SearchRecipient>,
+    max_notes: usize,
 ) -> bool {
     let mut keep_title_only = vec![false; hits.len()];
+    let mut admitted_note = vec![false; hits.len()];
     let mut remaining = recall.tokens;
     let cap = recall.max_per_source.map_or(remaining, u32::from);
     let mut source_remaining = vec![cap; hits.len()];
@@ -646,17 +656,25 @@ fn pack(
         })
     };
     let mut truncated = false;
-    for (((hit, mask), source), keep_title) in hits
+    let mut admitted_notes = 0usize;
+    for ((((hit, mask), source), keep_title), is_admitted) in hits
         .iter()
         .zip(&mut selected)
         .zip(&mut source_remaining)
         .zip(&mut keep_title_only)
+        .zip(&mut admitted_note)
     {
+        if admitted_notes >= max_notes {
+            truncated = true;
+            continue;
+        }
         if hit.chunks.is_empty() {
             let frame = title_only_framing(hit);
             if frame <= remaining {
                 remaining -= frame;
                 *keep_title = true;
+                *is_admitted = true;
+                admitted_notes += 1;
             } else {
                 truncated = true;
             }
@@ -676,12 +694,18 @@ fn pack(
             }
             truncated = true;
         }
-        if !admitted {
+        if admitted {
+            *is_admitted = true;
+            admitted_notes += 1;
+        } else {
             truncated = true;
         }
     }
     let mut tail = Vec::new();
     for (note_rank, hit) in hits.iter().enumerate() {
+        if !admitted_note[note_rank] {
+            continue;
+        }
         for (rank, &chosen) in selected[note_rank].iter().enumerate() {
             if chosen {
                 continue;
@@ -855,6 +879,7 @@ mod pack_tests {
                 max_per_source: Some(200),
             },
             None,
+            usize::MAX,
         );
         assert!(truncated);
         assert_eq!(
@@ -902,6 +927,7 @@ mod pack_tests {
                 max_per_source: None,
             },
             Some(&recipient),
+            usize::MAX,
         );
         assert!(truncated, "3rd title-only hit exceeds framing token budget");
         assert_eq!(
@@ -909,5 +935,30 @@ mod pack_tests {
             2,
             "only title-only hits fitting framing token budget must survive"
         );
+
+        // Skipping an oversized lead hit must still admit the next eligible hit up to max_notes.
+        let mut recall_hits = vec![make_hit(21, 10.0, &[300]), make_hit(22, 9.0, &[80, 70])];
+        let recall_trunc = pack(
+            &mut recall_hits,
+            Recall {
+                graph_depth: 1,
+                tokens: 200,
+                max_per_source: Some(200),
+            },
+            None,
+            1,
+        );
+        assert!(recall_trunc);
+        assert_eq!(recall_hits.len(), 1);
+        assert_eq!(
+            recall_hits[0]
+                .card
+                .document
+                .provenance()
+                .reference()
+                .note_id,
+            NoteId::from_bytes([22; 16])
+        );
+        assert_eq!(recall_hits[0].chunks.len(), 2);
     }
 }
