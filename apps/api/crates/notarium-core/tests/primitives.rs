@@ -49,6 +49,24 @@ fn all_domain_brands_preserve_v1_and_legacy_identity() {
 }
 
 #[test]
+fn legacy_episode_prefix_preserves_the_original_identity() {
+    let legacy = "ses_A0b1C2d3E4_-";
+    let episode = EpisodeId::parse(legacy).unwrap();
+    assert_eq!(serde_json::to_value(episode).unwrap(), legacy);
+    assert_eq!(
+        serde_json::from_value::<EpisodeId>(serde_json::json!(legacy))
+            .unwrap()
+            .as_str(),
+        legacy,
+    );
+    assert!(EpisodeId::parse_v1(legacy).is_err());
+    assert!(NoteId::parse(legacy).is_err());
+    for invalid in ["ses_A0b1C2d3E4_", "ses_A0b1C2d3E4_+", "ses_A0b1C2d3E4_--"] {
+        assert!(EpisodeId::parse(invalid).is_err());
+    }
+}
+
+#[test]
 fn counters_cannot_overflow_sql_or_cross_history_on_restore() {
     assert_eq!(
         SpaceSeq::MAX.checked_next(),

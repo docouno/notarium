@@ -97,13 +97,26 @@ Explicit structured view commands may reject an invalid requested configuration
 atomically. Authentication, protected metadata and encrypted-carrier checks
 remain strict.
 
+`patch_view_block` addresses a ready block by its stable view key. It can
+edit source fields, common view fields and options (preserving sibling keys
+and comments inside `source:` and `options:` mappings) and validates the
+resulting `nota` view specification via `notarium_syntax::nota::spec` against
+the Space field schema before returning a patch. The block keeps its ID,
+and the surrounding Markdown retains its original bytes. The proposed carrier
+is reparsed before the patch is returned, including fences inside quotations
+and lists. MCP exposes this operation through `edit_note.view`. Its ordinary
+text-edit modes preserve existing view blocks. Detailed note reads use a
+bounded view projection for display and retain the original carrier in the
+structured response.
+
 A missing ID is inserted only into a closed, unambiguous mapping. The seed uses
 note identity, missing-block source identity/ordinal and a policy version, with
 deterministic collision handling. Existing IDs are never silently repaired or
 regenerated after moving a block. Duplicate explicit IDs invalidate all affected
 occurrences. If existing IDs cannot be reserved unambiguously, insertion is
 deferred with diagnostics while raw save remains allowed. Unknown options are
-preserved; semantic query compilation belongs to projections.
+preserved; semantic view-spec compilation lives in `notarium_syntax::nota::spec`
+while execution against projected rows belongs to projections.
 The unchanged hash prefix is prepared once per missing ID; reservation retries
 clone its state and append the counter, without rehashing the whole YAML payload.
 If concrete ID insertion is unsupported, the block receives a local diagnostic

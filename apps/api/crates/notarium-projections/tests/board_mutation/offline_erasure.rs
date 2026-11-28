@@ -368,6 +368,11 @@ async fn append(
             mutation(
                 owner,
                 AppendChat {
+                    tool_calls: Vec::new(),
+                    interruption: None,
+                    provenance: None,
+                    proposed_diff: None,
+                    proposed_effect: None,
                     thread: thread.clone(),
                     parent,
                     kind,

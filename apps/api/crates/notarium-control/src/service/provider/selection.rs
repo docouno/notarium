@@ -301,6 +301,8 @@ impl SearchDefaultWitness {
     }
 }
 
+pub(crate) const LIST_PROVIDER_PROJECT_TARGETS_SQLITE_SQL: &str = "SELECT target_project FROM provider_attachments INDEXED BY attachment_project WHERE resource_id=$1 AND target_space=$2 AND target_kind='project' AND target_project>$3 AND state='approved' AND resource_epoch=$5 AND (($6 IS NULL AND credential_epoch IS NULL) OR credential_epoch=$6) AND (expires_at IS NULL OR expires_at>$4) ORDER BY target_project LIMIT $7";
+
 pub(super) async fn search_default(
     tx: &mut Transaction,
     space: &Space,
@@ -417,6 +419,14 @@ pub(super) async fn policy(
     // Current-auth revalidation already holds shared Space admission. Policy
     // checks must not upgrade it after taking resource/credential locks.
     check_member(tx, auth, &space.id).await?;
+    if let Some(root) = auth
+        .spaces()
+        .get(&space.id)
+        .and_then(|grant| grant.project_root.as_ref())
+        && project.is_some_and(|p| &p.folder_id != root)
+    {
+        return Err(DomainError::AccessDenied.into());
+    }
     if space.lifecycle != SpaceLifecycle::Active {
         return Err(unavailable());
     }
@@ -845,6 +855,133 @@ impl ProviderService {
         }
         Ok(space)
     }
+    pub async fn list_provider_project_targets(
+        &self,
+        ctx: SpaceContext,
+        resource: ProviderResourceId,
+        page: ControlPageRequest,
+    ) -> Result<ControlPage<FolderRef>, PortError> {
+        self.control.reject_search_indexing(ctx.auth())?;
+        let budget = OperationBudget::new(ctx.budget.clone());
+        let (mut tx, auth) = self
+            .control
+            .open_revalidated_read(&budget, &ctx.budget.request, ctx.auth())
+            .await?;
+        let result = budget
+            .run(
+                async {
+                    let grant = auth
+                        .spaces()
+                        .get(&ctx.scope().space_id)
+                        .ok_or(DomainError::ResourceNotFound)?;
+                    if grant.read_classes.is_empty() {
+                        return Err(DomainError::ResourceNotFound.into());
+                    }
+                    let after = page.continuation().unwrap_or("");
+                    if after.len() > 2048 || after.contains('\0') {
+                        return Err(invalid(ValidationReason::CursorStale));
+                    }
+                    let now = self.control.clock.now_ms()?;
+                    let Ok(resource_row) = resource_read(tx.inner_mut(), resource.as_str()).await else {
+                        return Ok(ControlPage {
+                            items: Vec::new(),
+                            continuation: None,
+                        });
+                    };
+                    let owner_active = rows!(
+                        tx.inner_mut(),
+                        (i64,),
+                        fetch_one,
+                        "SELECT count(*) FROM users WHERE user_id=$1 AND disabled_at IS NULL",
+                        "SELECT count(*) FROM v1_control.users WHERE user_id=$1 AND disabled_at IS NULL";
+                        &resource_row.owner_id
+                    )?
+                    .0;
+                    if owner_active != 1 {
+                        return Ok(ControlPage {
+                            items: Vec::new(),
+                            continuation: None,
+                        });
+                    }
+                    let Ok(credential) =
+                        credential_for_selection(tx.inner_mut(), &resource_row).await
+                    else {
+                        return Ok(ControlPage {
+                            items: Vec::new(),
+                            continuation: None,
+                        });
+                    };
+                    let credential_epoch = credential.as_ref().map(|row| row.consent_epoch);
+                    if let Some(root) = &grant.project_root {
+                        if root.as_str() <= after {
+                            return Ok(ControlPage {
+                                items: Vec::new(),
+                                continuation: None,
+                            });
+                        }
+                        let row = rows!(
+                            tx.inner_mut(),
+                            ProviderAttachmentsRow,
+                            fetch_optional,
+                            "SELECT * FROM provider_attachments WHERE resource_id=$1 AND target_kind='project' AND target_space=$2 AND target_project=$3",
+                            "SELECT * FROM v1_control.provider_attachments WHERE resource_id=$1 AND target_kind='project' AND target_space=$2 AND target_project=$3";
+                            resource.as_str(),
+                            ctx.scope().space_id.as_str(),
+                            root.as_str()
+                        )?;
+                        let items = if row
+                            .as_ref()
+                            .is_some_and(|r| active(r, &resource_row, credential_epoch, now))
+                        {
+                            vec![FolderRef {
+                                space_id: ctx.scope().space_id.clone(),
+                                folder_id: root.clone(),
+                            }]
+                        } else {
+                            Vec::new()
+                        };
+                        return Ok(ControlPage {
+                            items,
+                            continuation: None,
+                        });
+                    }
+                    let limit = i64::from(page.limit());
+                    let fetched = rows!(
+                        tx.inner_mut(),
+                        (String,),
+                        fetch_all,
+                        LIST_PROVIDER_PROJECT_TARGETS_SQLITE_SQL,
+                        "SELECT target_project FROM v1_control.provider_attachments WHERE resource_id=$1 AND target_space=$2 AND target_kind='project' AND target_project>$3 AND state='approved' AND resource_epoch=$5 AND (($6::BIGINT IS NULL AND credential_epoch IS NULL) OR credential_epoch=$6) AND (expires_at IS NULL OR expires_at>$4) ORDER BY target_project LIMIT $7";
+                        resource.as_str(),
+                        ctx.scope().space_id.as_str(),
+                        after,
+                        now,
+                        resource_row.consent_epoch,
+                        credential_epoch,
+                        limit + 1
+                    )?;
+                    let has_more = fetched.len() > usize::from(page.limit());
+                    let mut items = Vec::with_capacity(fetched.len().min(usize::from(page.limit())));
+                    let mut last: Option<String> = None;
+                    for (proj,) in fetched.into_iter().take(usize::from(page.limit())) {
+                        let folder_id = FolderId::parse(&proj)?;
+                        last = Some(proj);
+                        items.push(FolderRef {
+                            space_id: ctx.scope().space_id.clone(),
+                            folder_id,
+                        });
+                    }
+                    Ok::<_, PortError>(ControlPage {
+                        items,
+                        continuation: if has_more { last } else { None },
+                    })
+                },
+                CommitEffect::NotCommitted,
+            )
+            .await;
+        budget.run(tx.finish(), CommitEffect::NotCommitted).await?;
+        result
+    }
     pub async fn select_provider(
         &self,
         ctx: SpaceContext,
@@ -852,8 +989,37 @@ impl ProviderService {
     ) -> Result<ProviderSelection, PortError> {
         self.control.reject_search_indexing(ctx.auth())?;
         let budget = OperationBudget::new(ctx.budget.clone());
+        // Revalidate caller membership and Space grant before probing live
+        // canonical Space/project history.
+        let (pre_tx, pre_auth) = self
+            .control
+            .open_revalidated_read(&budget, &ctx.budget.request, ctx.auth())
+            .await?;
+        budget
+            .run(pre_tx.rollback(), CommitEffect::NotCommitted)
+            .await?;
+        let Some(pre_grant) = pre_auth.spaces().get(&ctx.scope().space_id) else {
+            return Err(unavailable());
+        };
+        if let Some(project) = request.project.as_ref() {
+            if project.space_id != ctx.scope().space_id {
+                return Err(invalid(ValidationReason::ScopeMismatch));
+            }
+            if pre_grant
+                .project_root
+                .as_ref()
+                .is_some_and(|root| root != &project.folder_id)
+            {
+                return Err(DomainError::ResourceNotFound.into());
+            }
+        }
+        let pre_ctx = SpaceContext::new(
+            pre_auth,
+            ctx.scope().clone(),
+            budget.context(ctx.budget.request.clone()),
+        )?;
         let space = self
-            .selection_catalog(&ctx, request.project.as_ref())
+            .selection_catalog(&pre_ctx, request.project.as_ref())
             .await?;
         let wanted_kind = model_kind_name(request.kind);
         let (mut tx, auth) = self
@@ -875,7 +1041,7 @@ impl ProviderService {
                 let preferred=self.preference(tx.inner_mut(),&auth,&space.space.id,request.project.as_ref(),wanted_kind).await?;
                 (ProviderResourceId::parse(&preferred.resource_id)?,Some(ModelProfileId::parse(&preferred.model_id)?))
             };
-            let resource=resource_read(tx.inner_mut(),id.as_str()).await?;
+            let resource=resource_read(tx.inner_mut(),id.as_str()).await.map_err(|_| unavailable())?;
             let owner_active = rows!(tx.inner_mut(),(i64,),fetch_one,"SELECT count(*) FROM users WHERE user_id=$1 AND disabled_at IS NULL","SELECT count(*) FROM v1_control.users WHERE user_id=$1 AND disabled_at IS NULL";&resource.owner_id)?.0;
             if owner_active != 1 {
                 return Err(unavailable());
@@ -888,8 +1054,25 @@ impl ProviderService {
                 return Err(unavailable());
             }
             let admission=policy(tx.inner_mut(),&auth,&resource,credential_epoch,&space.space,request.project.as_ref(),now,false).await?;
-            let runtime_epochs=runtime_epochs(&resource,credential.as_ref())?;
-            Ok(ProviderSelection{provider:id,model:model_id,runtime_epochs,project:request.project,policy:admission.policy})
+            let completion = (loaded.model.kind == ProviderModelKind::Completion).then_some(CompletionModelLimits {
+                max_input_tokens: loaded.model.max_input_tokens,
+                max_output_tokens: loaded.model.max_output_tokens,
+                supports_tools: loaded.model.tools,
+            });
+            let revocation_scope = ProviderRevocationScope {
+                owner: PrincipalId::parse(&resource.owner_id)?,
+                credential: resource.credential_id.as_deref().map(CredentialId::parse).transpose()?,
+            };
+            Ok(ProviderSelection{
+                provider:id,
+                model:model_id,
+                runtime_epochs: runtime_epochs(&resource, credential.as_ref())?,
+                project:request.project,
+                project_only:admission.project_only,
+                policy:admission.policy,
+                completion,
+                revocation_scope,
+            })
         },CommitEffect::NotCommitted).await?;
         budget
             .run(tx.rollback(), CommitEffect::NotCommitted)
@@ -935,22 +1118,42 @@ impl ProviderService {
         let budget = OperationBudget::new(ctx.budget.clone());
         self.management(&ctx).await?;
         let input = request.input;
-        let catalog = match &input.scope {
+        let target_space = match &input.scope {
+            ProviderPreferenceScope::Personal => None,
+            ProviderPreferenceScope::Space(space) => Some(space.clone()),
+            ProviderPreferenceScope::Project(project) => Some(project.space_id.clone()),
+        };
+        let catalog_precheck = match &input.scope {
             ProviderPreferenceScope::Personal => None,
             ProviderPreferenceScope::Space(space) => Some(
                 self.target_catalog(&ctx, &ProviderAttachmentTarget::Space(space.clone()))
-                    .await?,
+                    .await,
             ),
             ProviderPreferenceScope::Project(project) => Some(
                 self.target_catalog(&ctx, &ProviderAttachmentTarget::Project(project.clone()))
-                    .await?,
+                    .await,
             ),
         };
         let command = Command::new(request.identity, "set-provider-preference", &input)?;
         let auth = ctx.auth().clone();
+        let auth_check = auth.clone();
         let clock = self.control.clock.clone();
         ctx.budget = budget.context(ctx.budget.request.clone());
-        self.mutate(ctx,command,move |tx,owner,now|Box::pin(async move {
+        self.mutate_authorized(
+            ctx,
+            command,
+            move |tx, _| {
+                Box::pin(async move {
+                    if let Some(space_id) = &target_space {
+                        super::super::spaces::admission(tx, space_id, true).await?;
+                        check_member(tx, &auth_check, space_id).await?;
+                        require_owner(tx, &auth_check, space_id).await?;
+                    }
+                    Ok(())
+                })
+            },
+            move |tx,owner,now|Box::pin(async move {
+            let catalog = catalog_precheck.transpose()?;
             // A shared default is replaced across resource owners. Serialize
             // that scope before taking any provider configuration row locks.
             if let Some(catalog)=&catalog {
@@ -970,15 +1173,17 @@ impl ProviderService {
                 Some(space) => SearchDefaultWitness::capture(tx, &space, clock.now_ms()?).await?,
                 None => None,
             };
-            let resource=resource(tx,input.resource.as_str()).await?;let credential_epoch=epochs(tx,&resource).await?;
+            let resource=resource(tx,input.resource.as_str()).await?;
+            super::inventory::resource_visible(tx,&auth,&owner.user_id,&resource).await?;
+            let credential_epoch=epochs(tx,&resource).await?;
             let loaded=model_info(&model(tx,&resource.id,input.model.as_str()).await?)?;
-            if !matches_preference_kind(&loaded.model.kind, input.kind) {
-                return Err(invalid(ValidationReason::InvalidQuery));
-            }
             if let Some(catalog)=&catalog {
                 let project=match &input.scope{ProviderPreferenceScope::Project(project)=>Some(project),_=>None};
                 shared_attachment(tx,&resource,credential_epoch,&catalog.space.id,project,now,true).await?;
-            } else {super::inventory::resource_visible(tx,&owner.user_id,&resource).await?;}
+            }
+            if !matches_preference_kind(&loaded.model.kind, input.kind) {
+                return Err(invalid(ValidationReason::InvalidQuery));
+            }
             let (kind,id)=preference_scope(&input.scope,auth.principal());
             let wanted_kind = model_kind_name(input.kind);
             // Space/project preferences belong to that scope and model_kind. The

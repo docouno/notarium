@@ -122,6 +122,7 @@ pub fn plan_notes(
             &query.classes,
             lifecycle,
             &query.filter,
+            &query.tag,
             &query.sort,
             schema_revision,
         ),
@@ -199,7 +200,14 @@ pub fn note_universe(
         .spaces()
         .get(&space.id)
         .ok_or(DomainError::ResourceNotFound)?;
-    let classes = class_union(index, &grant.read_classes)?;
+    let mut classes = class_union(index, &grant.read_classes)?;
+    if matches!(auth.kind(), notarium_core::auth::PrincipalKind::Keeper(_)) {
+        let mut unpinned = posting(index, &PostingKey::DocClass(DocClass::Skill))?;
+        for ability in auth.readonly_abilities() {
+            unpinned.andnot_inplace(&posting(index, &PostingKey::Ability(ability.clone()))?);
+        }
+        classes.andnot_inplace(&unpinned);
+    }
     let mut visible = match &grant.project_root {
         None => classes,
         Some(folder) => {
@@ -277,6 +285,12 @@ pub fn note_source_candidates(
     mut universe: Bitmap,
 ) -> Result<Bitmap, PortError> {
     universe.and_inplace(&class_union(index, &query.classes)?);
+    if let Some(tag) = &query.tag {
+        universe = index
+            .tag_candidates(tag, &universe)
+            .map_err(index_failure)?
+            .into_possible();
+    }
     if let Some(folder) = &query.folder {
         universe.and_inplace(&folder_notes(index, folder, query.recursive)?);
     } else if !query.recursive {
@@ -362,7 +376,7 @@ fn class_union(index: &IndexView, classes: &BTreeSet<DocClass>) -> Result<Bitmap
     Ok(result)
 }
 
-fn folder_notes(
+pub(crate) fn folder_notes(
     index: &IndexView,
     folder: &FolderId,
     recursive: bool,
@@ -609,9 +623,11 @@ pub struct SelectedRow {
 pub struct Selection {
     pub rows: Vec<SelectedRow>,
     pub groups: Vec<GroupCount>,
+    pub total: u64,
     pub has_more: bool,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub async fn select_window(input: WindowInput<'_>) -> Result<Selection, PortError> {
     select_view_window(input, None, None).await
 }
@@ -708,14 +724,14 @@ pub(crate) async fn select_view_window(
             )?;
         }
     }
-    overlay_window(&input, &mut window, &mut counts)?;
+    let total = matching.cardinality() + overlay_window(&input, &mut window, &mut counts)?;
     let groups = if grouped {
         counts.finish(input.columns)
     } else {
         Vec::new()
     };
     let rows = window.finish()?;
-    Ok(finish_window(rows, groups, input.limit))
+    Ok(finish_window(rows, groups, total, input.limit))
 }
 
 async fn select_header_window(
@@ -725,9 +741,11 @@ async fn select_header_window(
     rank_view: Option<&ViewRef>,
 ) -> Result<Selection, PortError> {
     let mut counts = GroupCounts::new(input.columns);
+    let mut total = 0;
     let capacity = usize::from(input.limit.get()) + 1;
     let mut rows = Vec::with_capacity(capacity);
     for (group, ids) in partitions {
+        total += ids.cardinality();
         if grouped {
             counts.increment(group, ids.cardinality());
         }
@@ -745,7 +763,7 @@ async fn select_header_window(
         for row in rows {
             merged.push(row)?;
         }
-        overlay_window(input, &mut merged, &mut counts)?;
+        total += overlay_window(input, &mut merged, &mut counts)?;
         rows = merged.finish()?;
     }
     let groups = if grouped {
@@ -753,7 +771,7 @@ async fn select_header_window(
     } else {
         Vec::new()
     };
-    Ok(finish_window(rows, groups, input.limit))
+    Ok(finish_window(rows, groups, total, input.limit))
 }
 
 async fn candidate_ranks(
@@ -1044,7 +1062,8 @@ fn overlay_window(
     input: &WindowInput<'_>,
     window: &mut RowWindow<'_>,
     counts: &mut GroupCounts,
-) -> Result<(), PortError> {
+) -> Result<u64, PortError> {
+    let mut total = 0;
     for (&dense, note) in input.overlay {
         if !input.candidates.contains(dense) {
             continue;
@@ -1054,6 +1073,7 @@ fn overlay_window(
         }
         let fields = note.evaluated_fields()?;
         if input.filter.matches(&fields) {
+            total += 1;
             collect_row(
                 input,
                 window,
@@ -1065,12 +1085,13 @@ fn overlay_window(
             )?;
         }
     }
-    Ok(())
+    Ok(total)
 }
 
 fn finish_window(
     mut rows: Vec<SelectedRow>,
     groups: Vec<GroupCount>,
+    total: u64,
     limit: PageLimit,
 ) -> Selection {
     let has_more = rows.len() > usize::from(limit.get());
@@ -1078,6 +1099,7 @@ fn finish_window(
     Selection {
         rows,
         groups,
+        total,
         has_more,
     }
 }
@@ -1141,7 +1163,7 @@ async fn query_rows(
         .collect()
 }
 
-fn dense_pages(bitmap: &Bitmap) -> impl Iterator<Item = Vec<u32>> + '_ {
+pub(crate) fn dense_pages(bitmap: &Bitmap) -> impl Iterator<Item = Vec<u32>> + '_ {
     let mut ids = bitmap.iter();
     std::iter::from_fn(move || {
         let ids: Vec<_> = ids.by_ref().take(200).collect();

@@ -516,7 +516,22 @@ impl CanonicalChangeSubscription {
                         ).bind(rec.scope.space_id.as_str()).bind(rec.scope.incarnation.as_bytes().as_slice())
                          .bind(start.get() as i64).bind(rec.last_seq.get() as i64)
                          .fetch_one(&mut **conn).await.map_err(|e| crate::runtime::pg_read_error("pg_poll_purge_notice", e))?,
-                        BackendConn::Sqlite(_) => has_erased_change_payload_in_range_tx(tx, &rec.scope, start, rec.last_seq).await?,
+                        BackendConn::Sqlite(conn) => {
+                            let has_purge: bool = sqlx::query_scalar::<_, i64>(
+                                "SELECT EXISTS (SELECT 1 FROM change_log WHERE space_id=?
+                                 AND history_incarnation=? AND space_seq>? AND space_seq<=? AND op_kind='purge')",
+                            )
+                            .bind(rec.scope.space_id.as_str())
+                            .bind(rec.scope.incarnation.as_bytes().as_slice())
+                            .bind(start.get() as i64)
+                            .bind(rec.last_seq.get() as i64)
+                            .fetch_one(&mut **conn)
+                            .await
+                            .map_err(|e| internal_not_committed("sqlite_poll_purge_notice", e.to_string()))?
+                                != 0;
+                            has_purge
+                                || has_erased_change_payload_in_range_tx(tx, &rec.scope, start, rec.last_seq).await?
+                        }
                     }
                 } else {
                     false
@@ -828,22 +843,31 @@ impl ChangeBroadcast for CanonicalStore {
 pub(crate) enum ChangeCaller<'a> {
     Maintenance(&'a MaintenanceContext),
     Space(&'a SpaceContext),
+    Activity(&'a SpaceContext),
 }
 
 impl<'a> ChangeCaller<'a> {
     fn budget(&self) -> &'a notarium_core::ports::CallBudget {
         match self {
             Self::Maintenance(ctx) => &ctx.budget,
-            Self::Space(ctx) => &ctx.budget,
+            Self::Space(ctx) | Self::Activity(ctx) => &ctx.budget,
         }
     }
 
     fn enforce_space_scope(&self, target_scope: &HistoryScope) -> DomainResult<()> {
-        if let Self::Space(sctx) = self {
+        if let Self::Space(sctx) | Self::Activity(sctx) = self {
             if sctx.scope().space_id != target_scope.space_id {
                 return Err(DomainError::ResourceNotFound);
             }
             sctx.scope().check(target_scope)?;
+            if sctx
+                .auth()
+                .spaces()
+                .get(&target_scope.space_id)
+                .is_none_or(|grant| grant.read_classes.is_empty())
+            {
+                return Err(DomainError::ResourceNotFound);
+            }
         }
         Ok(())
     }
@@ -968,8 +992,9 @@ impl CanonicalStore {
         limit: PageLimit,
     ) -> Result<ChangePage, PortError> {
         let budget = caller.budget();
+        let with_provenance = matches!(caller, ChangeCaller::Activity(_));
         let space_auth = match caller {
-            ChangeCaller::Space(ctx) => Some(ctx.auth().clone()),
+            ChangeCaller::Space(ctx) | ChangeCaller::Activity(ctx) => Some(ctx.auth().clone()),
             ChangeCaller::Maintenance(_) => None,
         };
 
@@ -995,12 +1020,9 @@ impl CanonicalStore {
                 }
 
                 if after.after == validated_through {
-                    let safe_ack = last_complete_command_end_at_or_below_tx(
-                        tx,
-                        &after.scope,
-                        after.after,
-                    )
-                    .await?;
+                    let safe_ack =
+                        last_complete_command_end_at_or_below_tx(tx, &after.scope, after.after)
+                            .await?;
                     return Ok(ChangePage {
                         changes: Vec::new(),
                         next: after,
@@ -1015,76 +1037,222 @@ impl CanonicalStore {
                 let after_i64 = after.after.get() as i64;
                 let through_i64 = validated_through.get() as i64;
 
+                let preload_revisions = space_auth.is_some() || with_provenance;
                 let raw_rows: Vec<RawChangeLogRow> = match tx {
                     BackendConn::Sqlite(conn) => {
-                        let rows = sqlx::query(
-                            "SELECT space_seq, command_first_seq, command_last_seq, entity_type,
-                                    entity_id, op_kind, rev_id, lifecycle_state, doc_class, payload_id
-                             FROM change_log
-                             WHERE space_id = ? AND history_incarnation = ?
-                               AND space_seq > ? AND space_seq <= ?
-                             ORDER BY space_seq ASC
-                             LIMIT ?",
-                        )
-                        .bind(after.scope.space_id.as_str())
-                        .bind(after.scope.incarnation.as_bytes().as_slice())
-                        .bind(after_i64)
-                        .bind(through_i64)
-                        .bind(fetch_cap)
-                        .fetch_all(&mut **conn)
-                        .await
-                        .map_err(|err| {
-                            internal_not_committed("sqlite_read_change_log", err.to_string())
-                        })?;
+                        let sql = if preload_revisions {
+                            "SELECT cl.space_seq, cl.command_first_seq, cl.command_last_seq,
+                                    cl.entity_type, cl.entity_id, cl.op_kind, cl.rev_id,
+                                    cl.lifecycle_state, cl.doc_class, cl.payload_id,
+                                    cp.codec AS cp_codec, cp.erased_by_purge AS cp_erased,
+                                    cp.effect_msgpack AS cp_msgpack,
+                                    r.rev_id AS rev_hit_id, r.space_seq AS rev_space_seq,
+                                    r.visibility_seq AS rev_vis_seq,
+                                    r.content_blake3 AS rev_blake3,
+                                    r.metadata_msgpack AS rev_meta,
+                                    r.actor_id AS rev_actor,
+                                    r.agent_run_id AS rev_run_id,
+                                    r.restored_from_rev_id AS rev_restored,
+                                    r.created_at_sec AS rev_sec,
+                                    r.created_at_nsec AS rev_nsec
+                             FROM change_log cl
+                             LEFT JOIN change_payloads cp
+                               ON cp.space_id = cl.space_id AND cp.payload_id = cl.payload_id
+                             LEFT JOIN revisions r
+                               ON r.space_id = cl.space_id AND r.rev_id = cl.rev_id
+                              AND cl.entity_type = 'note'
+                              AND r.entity_type = 'note' AND r.entity_key = cl.entity_id
+                              AND r.visibility_seq = cl.command_last_seq
+                              AND r.space_seq = cl.command_last_seq
+                             WHERE cl.space_id = ? AND cl.history_incarnation = ?
+                               AND cl.space_seq > ? AND cl.space_seq <= ?
+                             ORDER BY cl.space_seq ASC
+                             LIMIT ?"
+                        } else {
+                            "SELECT cl.space_seq, cl.command_first_seq, cl.command_last_seq,
+                                    cl.entity_type, cl.entity_id, cl.op_kind, cl.rev_id,
+                                    cl.lifecycle_state, cl.doc_class, cl.payload_id,
+                                    cp.codec AS cp_codec, cp.erased_by_purge AS cp_erased,
+                                    cp.effect_msgpack AS cp_msgpack,
+                                    CAST(NULL AS TEXT) AS rev_hit_id,
+                                    CAST(NULL AS INTEGER) AS rev_space_seq,
+                                    CAST(NULL AS INTEGER) AS rev_vis_seq,
+                                    CAST(NULL AS BLOB) AS rev_blake3,
+                                    CAST(NULL AS BLOB) AS rev_meta,
+                                    CAST(NULL AS TEXT) AS rev_actor,
+                                    CAST(NULL AS TEXT) AS rev_run_id,
+                                    CAST(NULL AS TEXT) AS rev_restored,
+                                    CAST(NULL AS INTEGER) AS rev_sec,
+                                    CAST(NULL AS INTEGER) AS rev_nsec
+                             FROM change_log cl
+                             LEFT JOIN change_payloads cp
+                               ON cp.space_id = cl.space_id AND cp.payload_id = cl.payload_id
+                             WHERE cl.space_id = ? AND cl.history_incarnation = ?
+                               AND cl.space_seq > ? AND cl.space_seq <= ?
+                             ORDER BY cl.space_seq ASC
+                             LIMIT ?"
+                        };
+                        let rows = sqlx::query(sql)
+                            .bind(after.scope.space_id.as_str())
+                            .bind(after.scope.incarnation.as_bytes().as_slice())
+                            .bind(after_i64)
+                            .bind(through_i64)
+                            .bind(fetch_cap)
+                            .fetch_all(&mut **conn)
+                            .await
+                            .map_err(|err| {
+                                internal_not_committed("sqlite_read_change_log", err.to_string())
+                            })?;
 
                         rows.into_iter()
-                            .map(|r| RawChangeLogRow {
-                                space_seq: r.get("space_seq"),
-                                command_first_seq: r.get("command_first_seq"),
-                                command_last_seq: r.get("command_last_seq"),
-                                entity_type: r.get("entity_type"),
-                                entity_id: r.get("entity_id"),
-                                op_kind: r.get("op_kind"),
-                                rev_id: r.get("rev_id"),
-                                lifecycle_state: r.get("lifecycle_state"),
-                                doc_class: r.get("doc_class"),
-                                payload_id: r.get("payload_id"),
+                            .map(|r| {
+                                let payload = r.get::<Option<String>, _>("cp_codec").map(|codec| {
+                                    RawChangePayload {
+                                        codec,
+                                        erased_by_purge: r
+                                            .get::<Option<i64>, _>("cp_erased")
+                                            .unwrap_or(0)
+                                            as i32,
+                                        effect_msgpack: r.get("cp_msgpack"),
+                                    }
+                                });
+                                let preloaded_rev =
+                                    r.get::<Option<String>, _>("rev_hit_id").map(|rev_id| {
+                                        RawRevisionHit {
+                                            rev_id,
+                                            space_seq: r.get("rev_space_seq"),
+                                            visibility_seq: r.get("rev_vis_seq"),
+                                            content_blake3: r.get("rev_blake3"),
+                                            metadata_msgpack: r.get("rev_meta"),
+                                            actor_id: r.get("rev_actor"),
+                                            agent_run_id: r.get("rev_run_id"),
+                                            restored_from_rev_id: r.get("rev_restored"),
+                                            created_at_sec: r.get("rev_sec"),
+                                            created_at_nsec: r.get::<i64, _>("rev_nsec") as i32,
+                                        }
+                                    });
+                                RawChangeLogRow {
+                                    space_seq: r.get("space_seq"),
+                                    command_first_seq: r.get("command_first_seq"),
+                                    command_last_seq: r.get("command_last_seq"),
+                                    entity_type: r.get("entity_type"),
+                                    entity_id: r.get("entity_id"),
+                                    op_kind: r.get("op_kind"),
+                                    rev_id: r.get("rev_id"),
+                                    lifecycle_state: r.get("lifecycle_state"),
+                                    doc_class: r.get("doc_class"),
+                                    payload_id: r.get("payload_id"),
+                                    payload,
+                                    preloaded_rev,
+                                }
                             })
                             .collect()
                     }
                     BackendConn::Postgres(conn) => {
-                        let rows = sqlx::query(
-                            "SELECT space_seq, command_first_seq, command_last_seq, entity_type,
-                                    entity_id, op_kind, rev_id, lifecycle_state, doc_class, payload_id
-                             FROM change_log
-                             WHERE space_id = $1 AND history_incarnation = $2
-                               AND space_seq > $3 AND space_seq <= $4
-                             ORDER BY space_seq ASC
-                             LIMIT $5",
-                        )
-                        .bind(after.scope.space_id.as_str())
-                        .bind(after.scope.incarnation.as_bytes().as_slice())
-                        .bind(after_i64)
-                        .bind(through_i64)
-                        .bind(fetch_cap)
-                        .fetch_all(&mut **conn)
-                        .await
-                        .map_err(|err| {
-                            crate::runtime::pg_read_error("pg_read_change_log", err)
-                        })?;
+                        let sql = if preload_revisions {
+                            "SELECT cl.space_seq, cl.command_first_seq, cl.command_last_seq,
+                                    cl.entity_type, cl.entity_id, cl.op_kind, cl.rev_id,
+                                    cl.lifecycle_state, cl.doc_class, cl.payload_id,
+                                    cp.codec AS cp_codec, cp.erased_by_purge AS cp_erased,
+                                    cp.effect_msgpack AS cp_msgpack,
+                                    r.rev_id AS rev_hit_id, r.space_seq AS rev_space_seq,
+                                    r.visibility_seq AS rev_vis_seq,
+                                    r.content_blake3 AS rev_blake3,
+                                    r.metadata_msgpack AS rev_meta,
+                                    r.actor_id AS rev_actor,
+                                    r.agent_run_id AS rev_run_id,
+                                    r.restored_from_rev_id AS rev_restored,
+                                    r.created_at_sec AS rev_sec,
+                                    r.created_at_nsec AS rev_nsec
+                             FROM change_log cl
+                             LEFT JOIN change_payloads cp
+                               ON cp.space_id = cl.space_id AND cp.payload_id = cl.payload_id
+                             LEFT JOIN revisions r
+                               ON r.space_id = cl.space_id AND r.rev_id = cl.rev_id
+                              AND cl.entity_type = 'note'
+                              AND r.entity_type = 'note' AND r.entity_key = cl.entity_id
+                              AND r.visibility_seq = cl.command_last_seq
+                              AND r.space_seq = cl.command_last_seq
+                             WHERE cl.space_id = $1 AND cl.history_incarnation = $2
+                               AND cl.space_seq > $3 AND cl.space_seq <= $4
+                             ORDER BY cl.space_seq ASC
+                             LIMIT $5"
+                        } else {
+                            "SELECT cl.space_seq, cl.command_first_seq, cl.command_last_seq,
+                                    cl.entity_type, cl.entity_id, cl.op_kind, cl.rev_id,
+                                    cl.lifecycle_state, cl.doc_class, cl.payload_id,
+                                    cp.codec AS cp_codec, cp.erased_by_purge AS cp_erased,
+                                    cp.effect_msgpack AS cp_msgpack,
+                                    NULL::TEXT AS rev_hit_id,
+                                    NULL::BIGINT AS rev_space_seq,
+                                    NULL::BIGINT AS rev_vis_seq,
+                                    NULL::BYTEA AS rev_blake3,
+                                    NULL::BYTEA AS rev_meta,
+                                    NULL::TEXT AS rev_actor,
+                                    NULL::TEXT AS rev_run_id,
+                                    NULL::TEXT AS rev_restored,
+                                    NULL::BIGINT AS rev_sec,
+                                    NULL::INTEGER AS rev_nsec
+                             FROM change_log cl
+                             LEFT JOIN change_payloads cp
+                               ON cp.space_id = cl.space_id AND cp.payload_id = cl.payload_id
+                             WHERE cl.space_id = $1 AND cl.history_incarnation = $2
+                               AND cl.space_seq > $3 AND cl.space_seq <= $4
+                             ORDER BY cl.space_seq ASC
+                             LIMIT $5"
+                        };
+                        let rows = sqlx::query(sql)
+                            .bind(after.scope.space_id.as_str())
+                            .bind(after.scope.incarnation.as_bytes().as_slice())
+                            .bind(after_i64)
+                            .bind(through_i64)
+                            .bind(fetch_cap)
+                            .fetch_all(&mut **conn)
+                            .await
+                            .map_err(|err| {
+                                crate::runtime::pg_read_error("pg_read_change_log", err)
+                            })?;
 
                         rows.into_iter()
-                            .map(|r| RawChangeLogRow {
-                                space_seq: r.get("space_seq"),
-                                command_first_seq: r.get("command_first_seq"),
-                                command_last_seq: r.get("command_last_seq"),
-                                entity_type: r.get("entity_type"),
-                                entity_id: r.get("entity_id"),
-                                op_kind: r.get("op_kind"),
-                                rev_id: r.get("rev_id"),
-                                lifecycle_state: r.get("lifecycle_state"),
-                                doc_class: r.get("doc_class"),
-                                payload_id: r.get("payload_id"),
+                            .map(|r| {
+                                let payload = r.get::<Option<String>, _>("cp_codec").map(|codec| {
+                                    RawChangePayload {
+                                        codec,
+                                        erased_by_purge: r
+                                            .get::<Option<i32>, _>("cp_erased")
+                                            .unwrap_or(0),
+                                        effect_msgpack: r.get("cp_msgpack"),
+                                    }
+                                });
+                                let preloaded_rev =
+                                    r.get::<Option<String>, _>("rev_hit_id").map(|rev_id| {
+                                        RawRevisionHit {
+                                            rev_id,
+                                            space_seq: r.get("rev_space_seq"),
+                                            visibility_seq: r.get("rev_vis_seq"),
+                                            content_blake3: r.get("rev_blake3"),
+                                            metadata_msgpack: r.get("rev_meta"),
+                                            actor_id: r.get("rev_actor"),
+                                            agent_run_id: r.get("rev_run_id"),
+                                            restored_from_rev_id: r.get("rev_restored"),
+                                            created_at_sec: r.get("rev_sec"),
+                                            created_at_nsec: r.get("rev_nsec"),
+                                        }
+                                    });
+                                RawChangeLogRow {
+                                    space_seq: r.get("space_seq"),
+                                    command_first_seq: r.get("command_first_seq"),
+                                    command_last_seq: r.get("command_last_seq"),
+                                    entity_type: r.get("entity_type"),
+                                    entity_id: r.get("entity_id"),
+                                    op_kind: r.get("op_kind"),
+                                    rev_id: r.get("rev_id"),
+                                    lifecycle_state: r.get("lifecycle_state"),
+                                    doc_class: r.get("doc_class"),
+                                    payload_id: r.get("payload_id"),
+                                    payload,
+                                    preloaded_rev,
+                                }
                             })
                             .collect()
                     }
@@ -1097,8 +1265,94 @@ impl CanonicalStore {
                     &raw_rows[..]
                 };
 
-                let mut access = space_auth.as_ref().map(|auth|
-                    crate::domain::change_visibility::ChangeVisibility::new(&space_rec, auth));
+                let mut access = if let Some(auth) = space_auth.as_ref() {
+                    let vis =
+                        crate::domain::change_visibility::ChangeVisibility::new(&space_rec, auth);
+                    let mut preloaded_notes = std::collections::HashSet::new();
+                    let mut note_id_list = Vec::new();
+                    for row in page_rows {
+                        if row.entity_type == "note"
+                            && let Ok(nid) = NoteId::parse(&row.entity_id)
+                            && preloaded_notes.insert(nid.clone())
+                        {
+                            note_id_list.push(nid);
+                        }
+                    }
+                    let folder_cuts: Vec<i64> = match (page_rows.first(), page_rows.last()) {
+                        (Some(first), Some(last))
+                            if first.command_last_seq < last.command_last_seq =>
+                        {
+                            let first_cut = first.command_last_seq;
+                            let last_cut = last.command_last_seq;
+                            match tx {
+                                BackendConn::Sqlite(conn) => sqlx::query_scalar(
+                                    "SELECT DISTINCT command_last_seq FROM change_log
+                                     WHERE space_id = ? AND history_incarnation = ?
+                                       AND space_seq > ? AND space_seq <= ?
+                                       AND entity_type = 'folder'
+                                     ORDER BY command_last_seq ASC",
+                                )
+                                .bind(after.scope.space_id.as_str())
+                                .bind(after.scope.incarnation.as_bytes().as_slice())
+                                .bind(first_cut)
+                                .bind(last_cut)
+                                .fetch_all(&mut **conn)
+                                .await
+                                .map_err(|err| {
+                                    internal_not_committed(
+                                        "sqlite_read_folder_cuts",
+                                        err.to_string(),
+                                    )
+                                })?,
+                                BackendConn::Postgres(conn) => sqlx::query_scalar(
+                                    "SELECT DISTINCT command_last_seq FROM change_log
+                                     WHERE space_id = $1 AND history_incarnation = $2
+                                       AND space_seq > $3 AND space_seq <= $4
+                                       AND entity_type = 'folder'
+                                     ORDER BY command_last_seq ASC",
+                                )
+                                .bind(after.scope.space_id.as_str())
+                                .bind(after.scope.incarnation.as_bytes().as_slice())
+                                .bind(first_cut)
+                                .bind(last_cut)
+                                .fetch_all(&mut **conn)
+                                .await
+                                .map_err(|err| {
+                                    crate::runtime::pg_read_error("pg_read_folder_cuts", err)
+                                })?,
+                            }
+                        }
+                        _ => Vec::new(),
+                    };
+                    let fenced_notes = crate::runtime::purge_fenced_note_ids_tx(
+                        tx,
+                        &after.scope.space_id,
+                        &note_id_list,
+                    )
+                    .await?;
+                    let note_heads = if !vis.all_notes_visible() && !note_id_list.is_empty() {
+                        Some(
+                            crate::domain::common::load_note_heads_batch_tx(
+                                tx,
+                                &after.scope.space_id,
+                                &note_id_list,
+                            )
+                            .await?,
+                        )
+                    } else {
+                        None
+                    };
+                    Some(
+                        vis.with_preload(crate::domain::change_visibility::ChangePagePreload {
+                            folder_cuts,
+                            preloaded_notes,
+                            fenced_notes,
+                            note_heads,
+                        }),
+                    )
+                } else {
+                    None
+                };
                 let mut payload_cache: HashMap<String, MutationEffect> = HashMap::new();
                 let mut changes = Vec::with_capacity(page_rows.len());
                 let mut latest_complete_in_page: Option<SpaceSeq> = None;
@@ -1130,8 +1384,32 @@ impl CanonicalStore {
                             if let Some(cached) = payload_cache.get(pid) {
                                 cached.clone()
                             } else {
-                                let loaded =
-                                    load_decoded_effect_tx(tx, &after.scope, pid, command_range, None).await?;
+                                let loaded = match decode_change_payload_row(
+                                    &after.scope,
+                                    pid,
+                                    row.payload.as_ref().map(|p| {
+                                        (
+                                            p.codec.as_str(),
+                                            p.erased_by_purge,
+                                            p.effect_msgpack.as_deref(),
+                                        )
+                                    }),
+                                    command_range,
+                                    None,
+                                ) {
+                                    // Activity can still show independently authorized revision metadata
+                                    // from this command, including siblings of a purged note.
+                                    Err(PortError::Domain(DomainError::ValidationFailed {
+                                        diagnostic,
+                                    })) if with_provenance
+                                        && diagnostic.reason == ValidationReason::PurgeResync =>
+                                    {
+                                        MutationEffect::AwaitProjection {
+                                            reason: AwaitReason::UnavailableVersion,
+                                        }
+                                    }
+                                    result => result?,
+                                };
                                 payload_cache.insert(pid.clone(), loaded.clone());
                                 loaded
                             }
@@ -1150,9 +1428,78 @@ impl CanonicalStore {
                         lifecycle,
                         class,
                         effect,
+                        provenance: None,
                     };
-                    if let Some(access) = &mut access && !access.filter(tx, &mut change).await? {
-                        continue;
+                    let preloaded_rev = row
+                        .preloaded_rev
+                        .as_ref()
+                        .map(|hit| {
+                            crate::runtime::decode_stored_revision_row(
+                                &hit.rev_id,
+                                hit.space_seq,
+                                hit.visibility_seq,
+                                hit.content_blake3.clone(),
+                                &hit.metadata_msgpack,
+                                &hit.actor_id,
+                                hit.agent_run_id.as_deref(),
+                                hit.restored_from_rev_id.as_deref(),
+                                hit.created_at_sec,
+                                hit.created_at_nsec,
+                            )
+                        })
+                        .transpose()?;
+                    if let Some(access) = &mut access {
+                        if !access
+                            .filter_page_change(
+                                tx,
+                                &mut change,
+                                preloaded_rev.as_ref(),
+                                with_provenance,
+                            )
+                            .await?
+                        {
+                            continue;
+                        }
+                    } else if with_provenance
+                        && change.lifecycle != Lifecycle::Purged
+                        && change.class != Some(notarium_core::classes::DocClass::EncryptedNote)
+                        && let EntityId::Note(note) = &change.entity
+                    {
+                        let record = match read_immutable_revision_tx(
+                            tx,
+                            &after.scope,
+                            "note",
+                            note.as_str(),
+                            last_seq,
+                        )
+                        .await
+                        {
+                            Err(PortError::Domain(DomainError::ResourceNotFound)) => continue,
+                            result => result?,
+                        };
+                        if let Some(record) = record
+                            && record.revision_id == change.revision
+                            && let RevisionMetadataPayload::Note(meta) = record.metadata.payload
+                        {
+                            let ancestry = crate::domain::common::FolderAncestryCache::at_cut(
+                                &after.scope,
+                                last_seq,
+                            )
+                            .load_ancestry_tx(
+                                tx,
+                                &after.scope.space_id,
+                                &meta.parent_folder_id,
+                                false,
+                            )
+                            .await?;
+                            change.provenance = Some(ancestry.note_provenance(
+                                note,
+                                &meta.slug,
+                                meta.title,
+                                record.actor_id,
+                                record.created_at,
+                            ));
+                        }
                     }
                     changes.push(change);
                 }
@@ -1196,7 +1543,7 @@ impl CanonicalStore {
     ) -> Result<ChangeSeed, PortError> {
         let budget = caller.budget();
         let space_auth = match caller {
-            ChangeCaller::Space(sctx) => Some(sctx.auth().clone()),
+            ChangeCaller::Space(sctx) | ChangeCaller::Activity(sctx) => Some(sctx.auth().clone()),
             ChangeCaller::Maintenance(_) => None,
         };
         let store_cl = self.clone();
@@ -1334,7 +1681,7 @@ impl CanonicalStore {
                                     )
                                     .into());
                                 };
-                                let (snap_facts, _) = historical
+                                let (snap_facts, ancestry) = historical
                                     .build_resource_facts_tx(
                                         tx,
                                         &space_rec.space,
@@ -1344,10 +1691,17 @@ impl CanonicalStore {
                                         false,
                                     )
                                     .await?;
+                                let recorded_lifecycle = crate::domain::common::combine_lifecycle(
+                                    note_meta.lifecycle,
+                                    ancestry.folder_lifecycle,
+                                );
+                                if recorded_lifecycle == Lifecycle::Purged {
+                                    continue;
+                                }
 
                                 if let Some(auth) = &auth_in
-                                    && (auth.authorize_read(&live_facts).is_err()
-                                        || auth.authorize_read(&snap_facts).is_err())
+                                    && (auth.can_view_resource(&live_facts).is_err()
+                                        || auth.can_view_resource(&snap_facts).is_err())
                                 {
                                     continue;
                                 }
@@ -1362,6 +1716,13 @@ impl CanonicalStore {
                                     break 'notes_scan;
                                 }
 
+                                if let Some(auth) = &auth_in
+                                    && (auth.authorize_read(&live_facts).is_err()
+                                        || auth.authorize_read(&snap_facts).is_err())
+                                {
+                                    continue;
+                                }
+
                                 let digest = note_meta
                                     .content_digest
                                     .or(rev_rec.content_digest)
@@ -1369,6 +1730,13 @@ impl CanonicalStore {
                                         DomainError::validation(ValidationReason::CursorStale)
                                     })?;
 
+                                let provenance = ancestry.note_provenance(
+                                    &note_meta.note_id,
+                                    &note_meta.slug,
+                                    note_meta.title.clone(),
+                                    rev_rec.actor_id,
+                                    rev_rec.created_at,
+                                );
                                 collected_notes.push(PendingSeedNote {
                                     note_id: note_meta.note_id.clone(),
                                     revision_id: rev_rec.revision_id,
@@ -1376,8 +1744,10 @@ impl CanonicalStore {
                                         != space_rec.root_folder_id)
                                         .then(|| note_meta.parent_folder_id.clone()),
                                     facts: snap_facts,
+                                    recorded_lifecycle,
                                     meta: note_meta,
                                     digest,
+                                    provenance,
                                 });
                             }
                             if (candidates.len() as i64) < batch_size {
@@ -1427,7 +1797,7 @@ impl CanonicalStore {
                                     kind,
                                     owner_id,
                                     project_folder_id,
-                                    title: _,
+                                    title,
                                     head_leaf_seq,
                                     tainted,
                                 }) = rev_rec.metadata.payload
@@ -1442,6 +1812,7 @@ impl CanonicalStore {
                                     && auth
                                         .can_view_chat_thread(
                                             &space_rec.space,
+                                            &thread_id,
                                             kind,
                                             &owner_id,
                                             project_folder_id.as_ref(),
@@ -1469,6 +1840,8 @@ impl CanonicalStore {
                                     kind,
                                     owner: owner_id,
                                     project_folder: project_folder_id,
+                                    title,
+                                    active_run: None,
                                     head: head_leaf_seq,
                                     revision: rev_rec.revision_id,
                                     tainted,
@@ -1516,7 +1889,7 @@ impl CanonicalStore {
                 },
                 pending.revision_id,
                 pending.facts,
-                pending.meta.lifecycle,
+                pending.recorded_lifecycle,
                 carrier,
                 pending.digest,
             )?;
@@ -1527,6 +1900,7 @@ impl CanonicalStore {
                 byte_size: pending.meta.byte_size,
                 fields: pending.meta.evaluated_fields,
                 diagnostics: pending.meta.diagnostics,
+                provenance: Some(pending.provenance),
             });
         }
 
@@ -1569,22 +1943,16 @@ impl CanonicalStore {
                 if let Some(auth) = &space_auth {
                     let mut any_tainted = false;
                     for thread in &thread_items {
-                        let (project, tainted) = crate::domain::lookup_thread_visibility_tx(
+                        let tainted = crate::chats::can_view_live_thread_tx(
                             tx,
-                            &space.space.id,
-                            thread.id.as_str(),
+                            &space.space,
+                            auth,
+                            &thread.id,
                         )
-                        .await?
-                        .ok_or(DomainError::ResourceNotFound)?;
+                        .await?;
                         auth.can_view_chat_thread(
                             &space.space,
-                            thread.kind,
-                            &thread.owner,
-                            project.as_ref(),
-                            tainted,
-                        )?;
-                        auth.can_view_chat_thread(
-                            &space.space,
+                            &thread.id,
                             thread.kind,
                             &thread.owner,
                             thread.project_folder.as_ref(),
@@ -1613,8 +1981,29 @@ struct PendingSeedNote {
     note_id: NoteId,
     revision_id: RevisionId,
     facts: ResourceFacts,
+    recorded_lifecycle: Lifecycle,
     meta: NoteRevisionMetadata,
     digest: ContentDigest,
+    provenance: notarium_core::ports::NoteProvenance,
+}
+
+struct RawChangePayload {
+    codec: String,
+    erased_by_purge: i32,
+    effect_msgpack: Option<Vec<u8>>,
+}
+
+struct RawRevisionHit {
+    rev_id: String,
+    space_seq: i64,
+    visibility_seq: i64,
+    content_blake3: Option<Vec<u8>>,
+    metadata_msgpack: Vec<u8>,
+    actor_id: String,
+    agent_run_id: Option<String>,
+    restored_from_rev_id: Option<String>,
+    created_at_sec: i64,
+    created_at_nsec: i32,
 }
 
 struct RawChangeLogRow {
@@ -1628,6 +2017,8 @@ struct RawChangeLogRow {
     lifecycle_state: String,
     doc_class: Option<String>,
     payload_id: Option<String>,
+    payload: Option<RawChangePayload>,
+    preloaded_rev: Option<RawRevisionHit>,
 }
 
 fn parse_change_entity(entity_type: &str, entity_id: &str) -> Result<EntityId, PortError> {
@@ -1747,6 +2138,23 @@ async fn load_decoded_effect_tx(
         }
     };
 
+    decode_change_payload_row(
+        scope,
+        payload_id,
+        raw.as_ref()
+            .map(|(codec, erased, bytes)| (codec.as_str(), *erased, bytes.as_deref())),
+        command_range,
+        command_kind,
+    )
+}
+
+fn decode_change_payload_row(
+    scope: &HistoryScope,
+    payload_id: &str,
+    raw: Option<(&str, i32, Option<&[u8]>)>,
+    command_range: CommandSeqRange,
+    command_kind: Option<&str>,
+) -> Result<MutationEffect, PortError> {
     let Some((codec, erased, bytes_opt)) = raw else {
         return Err(internal_not_committed(
             "missing_change_payload",
@@ -1769,7 +2177,7 @@ async fn load_decoded_effect_tx(
         ));
     }
 
-    let env = EffectEnvelopeV1::decode(&bytes)?;
+    let env = EffectEnvelopeV1::decode(bytes)?;
     // Restores rebind the enclosing journal to a new history without rewriting
     // preserved immutable payloads. The command lookup already checks that history.
     if env.scope.space_id != scope.space_id
@@ -2093,13 +2501,16 @@ async fn list_note_keys_at_or_below_cutoff_tx(
 ) -> Result<Vec<String>, PortError> {
     // The enclosing snapshot has checked the space incarnation. Head identity and
     // creation sequence survive edits, trash and purge; revisions supply the state at the cut.
-    const PAGE: &str = "SELECT note_id FROM note_heads
+    const PAGE_SQLITE: &str = "SELECT note_id FROM note_heads
         WHERE space_id = $1 AND note_id > $2 AND created_seq <= $3
         ORDER BY note_id LIMIT $4";
+    const PAGE_PG: &str = "SELECT note_id FROM note_heads
+        WHERE space_id = $1 AND note_id COLLATE \"C\" > $2 AND created_seq <= $3
+        ORDER BY note_id COLLATE \"C\" LIMIT $4";
     let after = after_key.unwrap_or(""); // All NoteIds are nonempty.
     let cut = cutoff.get() as i64;
     match tx {
-        BackendConn::Sqlite(conn) => sqlx::query_scalar(PAGE)
+        BackendConn::Sqlite(conn) => sqlx::query_scalar(PAGE_SQLITE)
             .bind(scope.space_id.as_str())
             .bind(after)
             .bind(cut)
@@ -2107,7 +2518,7 @@ async fn list_note_keys_at_or_below_cutoff_tx(
             .fetch_all(&mut **conn)
             .await
             .map_err(|err| internal_not_committed("sqlite_seed_note_keys", err.to_string())),
-        BackendConn::Postgres(conn) => sqlx::query_scalar(PAGE)
+        BackendConn::Postgres(conn) => sqlx::query_scalar(PAGE_PG)
             .bind(scope.space_id.as_str())
             .bind(after)
             .bind(cut)
@@ -2125,13 +2536,16 @@ pub(crate) async fn list_thread_keys_at_or_below_cutoff_tx(
     after_key: Option<&str>,
     limit: i64,
 ) -> Result<Vec<String>, PortError> {
-    const PAGE: &str = "SELECT thread_id FROM chat_threads
+    const PAGE_SQLITE: &str = "SELECT thread_id FROM chat_threads
         WHERE space_id = $1 AND thread_id > $2 AND created_seq <= $3 AND history_incarnation = $4
         ORDER BY thread_id LIMIT $5";
+    const PAGE_PG: &str = "SELECT thread_id FROM chat_threads
+        WHERE space_id = $1 AND thread_id COLLATE \"C\" > $2 AND created_seq <= $3 AND history_incarnation = $4
+        ORDER BY thread_id COLLATE \"C\" LIMIT $5";
     let after = after_key.unwrap_or(""); // All ChatThreadIds are nonempty.
     let cut = cutoff.get() as i64;
     match tx {
-        BackendConn::Sqlite(conn) => sqlx::query_scalar(PAGE)
+        BackendConn::Sqlite(conn) => sqlx::query_scalar(PAGE_SQLITE)
             .bind(scope.space_id.as_str())
             .bind(after)
             .bind(cut)
@@ -2140,7 +2554,7 @@ pub(crate) async fn list_thread_keys_at_or_below_cutoff_tx(
             .fetch_all(&mut **conn)
             .await
             .map_err(|err| internal_not_committed("sqlite_seed_thread_keys", err.to_string())),
-        BackendConn::Postgres(conn) => sqlx::query_scalar(PAGE)
+        BackendConn::Postgres(conn) => sqlx::query_scalar(PAGE_PG)
             .bind(scope.space_id.as_str())
             .bind(after)
             .bind(cut)

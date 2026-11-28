@@ -433,6 +433,7 @@ mod tests {
                         },
                         preconditions: Preconditions::default(),
                         input: CreateNote {
+                            folder_page: false,
                             note: id.clone(),
                             parent: None,
                             slug: slug.into(),

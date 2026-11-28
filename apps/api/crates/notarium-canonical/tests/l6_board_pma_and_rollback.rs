@@ -6,6 +6,8 @@ mod applied;
 mod board_deadline;
 #[path = "l6_board_pma_and_rollback/historical_deadline.rs"]
 mod historical_deadline;
+#[path = "l6_board_pma_and_rollback/note_states.rs"]
+mod note_states;
 #[path = "l6_board_pma_and_rollback/pg_deadline.rs"]
 mod pg_deadline;
 #[path = "l6_board_pma_and_rollback/projection_rank_history.rs"]
@@ -41,12 +43,11 @@ use notarium_core::{
     },
     model::{HistoryScope, Lifecycle},
     ports::{
-        AssociatedBoardExpectation, BoardGroupFieldKind, BoardMoveFacts, BoardMoveFactsSpec,
-        BoardMutationFactsProvider, BoardPlannerAuthority, BoardViewRollbackFacts, CallBudget,
-        Cancellation, CreateNote, EditNote, EvaluatedBoardGroup, EvaluatedBoardRow, GetNote,
-        GroupKey, MoveBoardCard, Mutation, NoteRevision, NoteWritePort, PortFuture, Preconditions,
-        RankExpectation, RankNeighbor, RenameNote, RollbackAgentRun, RollbackBoardFacts,
-        RollbackBoardFactsRequest, SemanticPlacement, SpaceContext, ViewRef,
+        BoardGroupFieldKind, BoardMoveFacts, BoardMoveFactsSpec, BoardMutationFactsProvider,
+        BoardPlannerAuthority, CallBudget, Cancellation, CreateNote, DeleteDisposition, DeleteNote,
+        EditNote, EvaluatedBoardGroup, EvaluatedBoardRow, GetNote, GroupKey, MoveBoardCard,
+        Mutation, NoteRevision, NoteWritePort, PortFuture, Preconditions, RankExpectation,
+        RankNeighbor, RenameNote, SemanticPlacement, SpaceContext, ViewRef,
     },
     query::{FieldObservation, FieldValue},
     receipt::{AwaitReason, CausalBasis, CommandIdentity, MutationEffect, ReceiptSet},
@@ -153,7 +154,6 @@ struct CanonicalTestBoardPlanner {
     tracked_notes: Mutex<BTreeSet<NoteId>>,
     forge_authority_once: AtomicBool,
     inject_stale_cutoff_once: AtomicBool,
-    stale_rollback_responses: AtomicUsize,
     evaluate_move_calls: AtomicUsize,
     move_waits: Mutex<Option<Vec<std::time::Duration>>>,
     move_pause_once: Mutex<Option<MovePlannerPause>>,
@@ -166,7 +166,6 @@ impl CanonicalTestBoardPlanner {
             tracked_notes: Mutex::new(tracked_notes.into_iter().collect()),
             forge_authority_once: AtomicBool::new(false),
             inject_stale_cutoff_once: AtomicBool::new(false),
-            stale_rollback_responses: AtomicUsize::new(0),
             evaluate_move_calls: AtomicUsize::new(0),
             move_waits: Mutex::new(None),
             move_pause_once: Mutex::new(None),
@@ -398,167 +397,6 @@ impl BoardMutationFactsProvider for CanonicalTestBoardPlanner {
             ))
         })
     }
-
-    fn evaluate_rollback<'a>(
-        &'a self,
-        authority: &'a BoardPlannerAuthority,
-        ctx: SpaceContext,
-        request: RollbackBoardFactsRequest,
-    ) -> PortFuture<'a, RollbackBoardFacts> {
-        Box::pin(async move {
-            if self
-                .stale_rollback_responses
-                .try_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
-                    count.checked_sub(1)
-                })
-                .is_ok()
-            {
-                return Err(DomainError::validation(ValidationReason::CursorStale).into());
-            }
-            let scope = ctx.scope().clone();
-            let space_rec = self.store.read_space(&scope.space_id).await?;
-            let tracked: Vec<NoteId> = self
-                .tracked_notes
-                .lock()
-                .expect("lock")
-                .iter()
-                .cloned()
-                .collect();
-
-            let mut post_restore_membership = BTreeMap::new();
-            for planned in &request.eligible_notes {
-                if planned.planned_lifecycle != Lifecycle::Active {
-                    post_restore_membership.insert(planned.note.clone(), None);
-                    continue;
-                }
-                let status_str = match planned.planned_fields.get("status") {
-                    Some(Some(YamlValue::String(s))) => Some(s.as_str()),
-                    _ => None,
-                };
-                post_restore_membership.insert(
-                    planned.note.clone(),
-                    Self::group_from_status_str(status_str),
-                );
-            }
-
-            let mut views_map = BTreeMap::new();
-            for view in request.views {
-                let view_snap = self
-                    .store
-                    .get_note(
-                        ctx.clone(),
-                        GetNote {
-                            note: view.note.clone(),
-                            revision: None,
-                            causal: CausalBasis::Exact(ReceiptSet::default()),
-                        },
-                    )
-                    .await?;
-                let view_rev = view_snap.document.metadata().revision().clone();
-                let overlays = self
-                    .store
-                    .inspect_view_overlays_for_test(&scope.space_id, &view)
-                    .await?;
-
-                type RollbackGroupEntry = (Option<String>, EvaluatedBoardRow);
-                let mut by_group: Vec<(GroupKey, Vec<RollbackGroupEntry>)> = Vec::new();
-                for g_seed in [
-                    GroupKey::Value(ScalarValue::String("todo".to_owned())),
-                    GroupKey::Value(ScalarValue::String("doing".to_owned())),
-                    GroupKey::Value(ScalarValue::String("done".to_owned())),
-                ] {
-                    by_group.push((g_seed, Vec::new()));
-                }
-
-                for nid in &tracked {
-                    let snap = match self
-                        .store
-                        .get_note(
-                            ctx.clone(),
-                            GetNote {
-                                note: nid.clone(),
-                                revision: None,
-                                causal: CausalBasis::Exact(ReceiptSet::default()),
-                            },
-                        )
-                        .await
-                    {
-                        Ok(snap) => snap,
-                        Err(PortError::Domain(
-                            DomainError::ResourceNotFound | DomainError::AccessDenied,
-                        )) => continue,
-                        Err(error) => return Err(error),
-                    };
-                    let listing = snap.document.listing(ctx.auth())?;
-                    if listing.lifecycle() != Lifecycle::Active {
-                        continue;
-                    }
-                    let status_opt = match snap.fields.get("status") {
-                        Some(FieldObservation::Ok(FieldValue::Scalar(ScalarValue::String(s)))) => {
-                            Some(s.as_str())
-                        }
-                        _ => None,
-                    };
-                    let Some(grp) = Self::group_from_status_str(status_opt) else {
-                        continue;
-                    };
-                    let ov_opt = overlays.get(nid);
-                    let exp_rank = match ov_opt {
-                        Some(ov) => RankExpectation::Existing(ov.rank_rev_id.clone()),
-                        None => RankExpectation::Absent,
-                    };
-                    let rank_sort = ov_opt
-                        .filter(|ov| ov.group == grp)
-                        .map(|ov| ov.sort_rank_lexo.clone());
-                    let row = EvaluatedBoardRow {
-                        note: nid.clone(),
-                        expected_note: listing.revision().clone(),
-                        expected_rank: exp_rank,
-                        base_order_binding: Self::binding_for(nid.as_str(), nid),
-                    };
-                    if let Some((_, list)) = by_group.iter_mut().find(|(g, _)| *g == grp) {
-                        list.push((rank_sort, row));
-                    } else {
-                        by_group.push((grp, vec![(rank_sort, row)]));
-                    }
-                }
-
-                let mut groups = Vec::with_capacity(by_group.len());
-                for (grp, mut entries) in by_group {
-                    entries.sort_by(|a, b| {
-                        let ra = a.0.as_deref().unwrap_or("~");
-                        let rb = b.0.as_deref().unwrap_or("~");
-                        ra.cmp(rb).then_with(|| a.1.note.cmp(&b.1.note))
-                    });
-                    groups.push(EvaluatedBoardGroup {
-                        group: grp,
-                        rows: entries.into_iter().map(|(_, r)| r).collect(),
-                    });
-                }
-
-                views_map.insert(
-                    view.clone(),
-                    BoardViewRollbackFacts {
-                        view,
-                        view_revision: view_rev,
-                        schema_revision: None,
-                        descriptor_fingerprint: ContentDigest::from_bytes([0u8; 32]),
-                        group_field: "status".to_owned(),
-                        group_field_kind: BoardGroupFieldKind::String,
-                        groups,
-                        post_restore_membership: post_restore_membership.clone(),
-                    },
-                );
-            }
-
-            Ok(RollbackBoardFacts::attest(
-                authority,
-                scope,
-                space_rec.last_seq,
-                views_map,
-            ))
-        })
-    }
 }
 
 #[test]
@@ -693,6 +531,7 @@ async fn run_move_board_card_suite(store: &CanonicalStore) -> BoardEffects {
                 &scope,
                 &owner,
                 CreateNote {
+                    folder_page: false,
                     note: view_note.clone(),
                     parent: Some(project.clone()),
                     slug: "sprint-board".to_owned(),
@@ -724,6 +563,7 @@ async fn run_move_board_card_suite(store: &CanonicalStore) -> BoardEffects {
                     &scope,
                     &owner,
                     CreateNote {
+                        folder_page: false,
                         note: nid.clone(),
                         parent: (nid == &card_3).then(|| project.clone()),
                         slug: slug.to_owned(),
@@ -969,6 +809,7 @@ async fn run_move_board_card_suite(store: &CanonicalStore) -> BoardEffects {
                     &scope,
                     &owner,
                     CreateNote {
+                        folder_page: false,
                         note: note.clone(),
                         parent: None,
                         slug: format!("large-{id}"),
@@ -1179,6 +1020,7 @@ async fn run_rollback_agent_run_suite(store: &CanonicalStore) {
                 &scope,
                 &owner,
                 CreateNote {
+                    folder_page: false,
                     note: view_note.clone(),
                     parent: None,
                     slug: "agent-board".to_owned(),
@@ -1221,6 +1063,7 @@ async fn run_rollback_agent_run_suite(store: &CanonicalStore) {
                 &scope,
                 &owner,
                 CreateNote {
+                    folder_page: false,
                     note: n_anchor.clone(),
                     parent: None,
                     slug: "anchor-card".to_owned(),
@@ -1241,6 +1084,7 @@ async fn run_rollback_agent_run_suite(store: &CanonicalStore) {
                 &scope,
                 &owner,
                 CreateNote {
+                    folder_page: false,
                     note: n_pre.clone(),
                     parent: None,
                     slug: "roadmap".to_owned(),
@@ -1301,6 +1145,7 @@ async fn run_rollback_agent_run_suite(store: &CanonicalStore) {
                 &scope,
                 &owner,
                 CreateNote {
+                    folder_page: false,
                     note: n_manual.clone(),
                     parent: None,
                     slug: "manual-note".to_owned(),
@@ -1319,6 +1164,7 @@ async fn run_rollback_agent_run_suite(store: &CanonicalStore) {
                 &scope,
                 &owner,
                 CreateNote {
+                    folder_page: false,
                     note: n_room.clone(),
                     parent: None,
                     slug: "room-note".to_owned(),
@@ -1331,7 +1177,8 @@ async fn run_rollback_agent_run_suite(store: &CanonicalStore) {
         .expect("create n_room");
 
     // --- Agent Run `run_id` executes mutations ---
-    // (a) Rename `n_pre` away from `"roadmap"` -> `"roadmap-legacy"`, move it `todo -> doing`, then edit `status: archived` (OutsideView!).
+    // (a) Verify agent cannot call `move_board_card` directly, then rename `n_pre` away from
+    // `"roadmap"` -> `"roadmap-legacy"` and edit `status: archived` via `edit_note`.
     let pre_renamed = store
         .rename_note(
             run_ctx.clone(),
@@ -1348,33 +1195,40 @@ async fn run_rollback_agent_run_suite(store: &CanonicalStore) {
         .await
         .expect("run renames n_pre");
 
-    let _pre_moved_doing = store
-        .move_board_card(
-            run_ctx.clone(),
-            next_mutation(
-                &scope,
-                &owner,
-                MoveBoardCard {
-                    view: view.clone(),
-                    note: n_pre.clone(),
-                    group: doing_grp.clone(),
-                    before: None,
-                    after: None,
-                    fields: BTreeMap::from([(
-                        "status".to_owned(),
-                        Some(YamlValue::String("doing".to_owned())),
-                    )]),
-                    expected_note: pre_renamed.value.revision,
-                    expected_view: view_c.value.revision.clone(),
-                    expected_rank: RankExpectation::Existing(pre_board_v0.value.rank_revision),
-                },
-            ),
-        )
-        .await
-        .expect("run moves n_pre to doing");
+    assert!(
+        matches!(
+            store
+                .move_board_card(
+                    run_ctx.clone(),
+                    next_mutation(
+                        &scope,
+                        &owner,
+                        MoveBoardCard {
+                            view: view.clone(),
+                            note: n_pre.clone(),
+                            group: doing_grp.clone(),
+                            before: None,
+                            after: None,
+                            fields: BTreeMap::from([(
+                                "status".to_owned(),
+                                Some(YamlValue::String("doing".to_owned())),
+                            )]),
+                            expected_note: pre_renamed.value.revision.clone(),
+                            expected_view: view_c.value.revision.clone(),
+                            expected_rank: RankExpectation::Existing(
+                                pre_board_v0.value.rank_revision.clone()
+                            ),
+                        },
+                    ),
+                )
+                .await,
+            Err(PortError::Domain(DomainError::AccessDenied))
+        ),
+        "agent runs must be rejected from move_board_card"
+    );
 
-    // Edit `n_pre` to `status: archived` (now `OutsideView` at rollback time!).
-    let pre_doing_snap = store
+    // Edit `n_pre` to `status: archived` (OutsideView at rollback time).
+    let pre_before_archive = store
         .get_note(
             human_ctx.clone(),
             GetNote {
@@ -1384,9 +1238,9 @@ async fn run_rollback_agent_run_suite(store: &CanonicalStore) {
             },
         )
         .await
-        .expect("get n_pre in doing");
+        .expect("get n_pre before archive");
     let archive_plan = extract::finalize_document(
-        pre_doing_snap
+        pre_before_archive
             .document
             .explicit_read(human_ctx.auth())
             .expect("read"),
@@ -1398,7 +1252,7 @@ async fn run_rollback_agent_run_suite(store: &CanonicalStore) {
         }],
     )
     .expect("archive plan");
-    let pre_archived = store
+    let _pre_archived = store
         .edit_note(
             run_ctx.clone(),
             next_mutation(
@@ -1413,7 +1267,8 @@ async fn run_rollback_agent_run_suite(store: &CanonicalStore) {
         .await
         .expect("run archives n_pre");
 
-    // (b) Create `n_created` taking `slug = "roadmap"` in the SAME root folder and place it on the board!
+    // (b) Create `n_created` taking `slug = "roadmap"` in the SAME root folder; human then places
+    // `n_created` on the board so we verify trash-first rollback removes its overlay and emits a rank tombstone!
     let created_c = store
         .create_note(
             run_ctx.clone(),
@@ -1421,6 +1276,7 @@ async fn run_rollback_agent_run_suite(store: &CanonicalStore) {
                 &scope,
                 &owner,
                 CreateNote {
+                    folder_page: false,
                     note: n_created.clone(),
                     parent: None,
                     slug: "roadmap".to_owned(),
@@ -1433,7 +1289,7 @@ async fn run_rollback_agent_run_suite(store: &CanonicalStore) {
         .expect("run creates n_created at slug roadmap");
     let created_board = store
         .move_board_card(
-            run_ctx.clone(),
+            human_ctx.clone(),
             next_mutation(
                 &scope,
                 &owner,
@@ -1451,7 +1307,7 @@ async fn run_rollback_agent_run_suite(store: &CanonicalStore) {
             ),
         )
         .await
-        .expect("run places n_created on board");
+        .expect("human places n_created on board");
 
     // (c) Run edits `n_manual`, then `foreign_human` edits `n_manual` afterward -> `skipped_manual_edits`!
     let manual_plan_run = extract::finalize_document(
@@ -1551,16 +1407,10 @@ async fn run_rollback_agent_run_suite(store: &CanonicalStore) {
         .await
         .expect("open live room on n_room");
 
-    // Inspect current overlays & run revision to supply exact preconditions to `RollbackAgentRun`.
     let cur_overlays = store
         .inspect_view_overlays_for_test(&scope.space_id, &view)
         .await
         .expect("inspect overlays before rollback");
-    let expected_run_rev = store
-        .inspect_agent_run_revision_for_test(&scope.space_id, &run_id)
-        .await
-        .expect("inspect run rev")
-        .expect("run head exists");
 
     let lineage_before_rb = store
         .execute_diagnostic_read_sql_for_test(
@@ -1574,8 +1424,8 @@ async fn run_rollback_agent_run_suite(store: &CanonicalStore) {
         .await
         .expect("read lineage_epoch before rollback");
     assert_eq!(
-        lineage_before_rb, 5,
-        "closed collab_sessions.lineage_epoch must advance 3 -> 4 (board field patch) -> 5 (direct edit)"
+        lineage_before_rb, 4,
+        "closed collab_sessions.lineage_epoch must advance 3 -> 4 (direct edit)"
     );
 
     let mut trashed_metadata = note_metadata_at(
@@ -1589,52 +1439,8 @@ async fn run_rollback_agent_run_suite(store: &CanonicalStore) {
     assert!(trashed_metadata.evaluated_fields.contains_key("status"));
     let restored_metadata = note_metadata_at(store, &scope, &pre_v0.value, &pre_v0.receipt).await;
 
-    let board_rollback = next_mutation(
-        &scope,
-        &owner,
-        RollbackAgentRun {
-            run: run_id.clone(),
-            expected_run_revision: expected_run_rev,
-            expected_entities: vec![
-                NoteRevision {
-                    note: n_pre.clone(),
-                    revision: pre_archived.value.revision,
-                },
-                NoteRevision {
-                    note: n_created.clone(),
-                    revision: created_board.value.revision.revision,
-                },
-                NoteRevision {
-                    note: n_manual.clone(),
-                    revision: manual_foreign_ed.value.revision,
-                },
-                NoteRevision {
-                    note: n_room.clone(),
-                    revision: room_run_ed.value.revision,
-                },
-            ],
-            associated_board_expectations: vec![
-                AssociatedBoardExpectation {
-                    view: view.clone(),
-                    note: n_pre.clone(),
-                    expected_rank: RankExpectation::Existing(
-                        cur_overlays[&n_pre].rank_rev_id.clone(),
-                    ),
-                    expected_placement_revision: cur_overlays[&n_pre].placement_revision.clone(),
-                },
-                AssociatedBoardExpectation {
-                    view: view.clone(),
-                    note: n_created.clone(),
-                    expected_rank: RankExpectation::Existing(
-                        cur_overlays[&n_created].rank_rev_id.clone(),
-                    ),
-                    expected_placement_revision: cur_overlays[&n_created]
-                        .placement_revision
-                        .clone(),
-                },
-            ],
-        },
-    );
+    let _ = (manual_foreign_ed, room_run_ed);
+    let board_rollback = next_mutation(&scope, &owner, run_id.clone());
     let mut grants = human_ctx.auth().spaces().clone();
     grants
         .get_mut(&scope.space_id)
@@ -1649,26 +1455,19 @@ async fn run_rollback_agent_run_suite(store: &CanonicalStore) {
     .unwrap();
     assert!(matches!(
         store
-            .rollback_agent_run(write_only.clone(), board_rollback.clone())
+            .rollback_agent_run_by_id(write_only.clone(), board_rollback.clone())
             .await,
         Err(PortError::Domain(DomainError::ResourceNotFound))
     ));
-    planner.stale_rollback_responses.store(5, Ordering::SeqCst);
-    assert!(matches!(
-        store.rollback_agent_run(human_ctx.clone(), board_rollback.clone()).await,
-        Err(PortError::Domain(DomainError::ValidationFailed { diagnostic })) if diagnostic.reason == ValidationReason::CursorStale
-    ));
-    assert_eq!(
-        planner.stale_rollback_responses.swap(0, Ordering::SeqCst),
-        1
-    );
     let rollback_committed = store
-        .rollback_agent_run(human_ctx.clone(), board_rollback.clone())
+        .rollback_agent_run_by_id(human_ctx.clone(), board_rollback.clone())
         .await
-        .expect("rollback_agent_run");
+        .expect("rollback_agent_run_by_id");
 
     assert!(matches!(
-        store.rollback_agent_run(write_only, board_rollback).await,
+        store
+            .rollback_agent_run_by_id(write_only, board_rollback)
+            .await,
         Err(PortError::Domain(DomainError::ResourceNotFound))
     ));
     let rb = rollback_committed.value;
@@ -1680,10 +1479,14 @@ async fn run_rollback_agent_run_suite(store: &CanonicalStore) {
         note_metadata_at(store, &scope, &rb.trashed[0], &rollback_committed.receipt).await,
         trashed_metadata
     );
-    assert_eq!(
-        note_metadata_at(store, &scope, &rb.restored[0], &rollback_committed.receipt).await,
-        restored_metadata
+    let mut actual_restored =
+        note_metadata_at(store, &scope, &rb.restored[0], &rollback_committed.receipt).await;
+    assert!(
+        actual_restored.logical_updated_at.is_some(),
+        "rollback restore revision must carry pre-run logical_updated_at"
     );
+    actual_restored.logical_updated_at = restored_metadata.logical_updated_at;
+    assert_eq!(actual_restored, restored_metadata);
     assert_eq!(rb.skipped_manual_edits, vec![n_manual]);
     assert_eq!(rb.skipped_room_active, vec![n_room.clone()]);
 
@@ -1813,8 +1616,8 @@ async fn run_rollback_agent_run_suite(store: &CanonicalStore) {
         .await
         .expect("read lineage_epoch");
     assert_eq!(
-        lineage_after, 6,
-        "closed collab_sessions.lineage_epoch must advance 5 -> 6 on rollback"
+        lineage_after, 5,
+        "closed collab_sessions.lineage_epoch must advance 4 -> 5 on rollback"
     );
 
     let restored_from_cnt = store
@@ -1839,7 +1642,7 @@ async fn run_rollback_agent_run_suite(store: &CanonicalStore) {
     // Rolling back Run 2 MUST abort atomically with `PathConflict` without partially mutating anything!
     let run_2 = sample_run_id(10);
     let run_2_ctx = agent_run_ctx(&human_ctx, run_2.clone());
-    let run2_ren = store
+    let _run2_ren = store
         .rename_note(
             run_2_ctx,
             next_mutation(
@@ -1863,6 +1666,7 @@ async fn run_rollback_agent_run_suite(store: &CanonicalStore) {
                 &scope,
                 &owner,
                 CreateNote {
+                    folder_page: false,
                     note: blocker_note,
                     parent: None,
                     slug: "roadmap".to_owned(), // Foreign note occupies `"roadmap"`!
@@ -1874,11 +1678,6 @@ async fn run_rollback_agent_run_suite(store: &CanonicalStore) {
         .await
         .expect("foreign blocker note takes slug roadmap");
 
-    let run2_rev = store
-        .inspect_agent_run_revision_for_test(&scope.space_id, &run_2)
-        .await
-        .expect("run_2 rev")
-        .expect("exists");
     let seq_before_abort = store
         .read_space(&scope.space_id)
         .await
@@ -1886,29 +1685,14 @@ async fn run_rollback_agent_run_suite(store: &CanonicalStore) {
         .last_seq;
 
     let conflict_rb = store
-        .rollback_agent_run(
-            human_ctx,
-            next_mutation(
-                &scope,
-                &owner,
-                RollbackAgentRun {
-                    run: run_2,
-                    expected_run_revision: run2_rev,
-                    expected_entities: vec![NoteRevision {
-                        note: n_pre,
-                        revision: run2_ren.value.revision,
-                    }],
-                    associated_board_expectations: Vec::new(),
-                },
-            ),
-        )
+        .rollback_agent_run_by_id(human_ctx, next_mutation(&scope, &owner, run_2))
         .await;
     assert!(
         matches!(
             conflict_rb,
             Err(PortError::Domain(DomainError::PathConflict { .. }))
         ),
-        "post-trash slug collision must abort RollbackAgentRun with PathConflict, got {conflict_rb:?}"
+        "post-trash slug collision must abort rollback with PathConflict, got {conflict_rb:?}"
     );
     let seq_after_abort = store
         .read_space(&scope.space_id)
@@ -1917,17 +1701,8 @@ async fn run_rollback_agent_run_suite(store: &CanonicalStore) {
         .last_seq;
     assert_eq!(
         seq_before_abort, seq_after_abort,
-        "aborted RollbackAgentRun must leave last_seq untouched"
+        "aborted rollback must leave last_seq untouched"
     );
-    projection_rank_history::check_board_exit_tombstones_rank(
-        store,
-        &scope,
-        &owner,
-        &planner,
-        &view,
-        view_c.value.revision,
-    )
-    .await;
     check_rollback_destination_authority(store, &scope, &owner).await;
 }
 
@@ -2044,6 +1819,7 @@ async fn check_rollback_destination_authority(
                 scope,
                 owner,
                 CreateNote {
+                    folder_page: false,
                     note: note.clone(),
                     parent: Some(destination.clone()),
                     slug: "moved-between-projects".into(),
@@ -2055,7 +1831,7 @@ async fn check_rollback_destination_authority(
         .await
         .unwrap();
     let run = sample_run_id(208);
-    let moved = store
+    let _moved = store
         .move_note(
             agent_run_ctx(&human, run.clone()),
             next_mutation(
@@ -2070,30 +1846,16 @@ async fn check_rollback_destination_authority(
         )
         .await
         .unwrap();
-    let revision = store
-        .inspect_agent_run_revision_for_test(&scope.space_id, &run)
-        .await
-        .unwrap()
-        .unwrap();
-    let rollback = next_mutation(
-        scope,
-        owner,
-        RollbackAgentRun {
-            run,
-            expected_run_revision: revision.clone(),
-            expected_entities: vec![moved.value],
-            associated_board_expectations: vec![],
-        },
-    );
-    let mut stale = rollback.clone();
-    stale.input.expected_run_revision = RevisionId::from_bytes([93; 16]);
+    let rollback = next_mutation(scope, owner, run);
     store
         .set_folder_write_lock(human.clone(), current.clone(), true)
         .await
         .unwrap();
     let cut = store.read_space(&scope.space_id).await.unwrap().last_seq;
     assert!(matches!(
-        store.rollback_agent_run(human.clone(), stale.clone()).await,
+        store
+            .rollback_agent_run_by_id(human.clone(), rollback.clone())
+            .await,
         Err(PortError::Domain(DomainError::SpaceReadOnly))
     ));
     assert_eq!(
@@ -2104,17 +1866,13 @@ async fn check_rollback_destination_authority(
         .set_folder_write_lock(human.clone(), current.clone(), false)
         .await
         .unwrap();
-    assert!(
-        matches!(store.rollback_agent_run(human.clone(), stale).await,
-        Err(PortError::Domain(DomainError::RevisionConflict { current, .. })) if current == revision)
-    );
     store
         .set_folder_write_lock(human.clone(), destination.clone(), true)
         .await
         .unwrap();
     let before = store.read_space(&scope.space_id).await.unwrap().last_seq;
     let denied = store
-        .rollback_agent_run(human.clone(), rollback.clone())
+        .rollback_agent_run_by_id(human.clone(), rollback.clone())
         .await;
     assert!(
         matches!(denied, Err(PortError::Domain(DomainError::SpaceReadOnly))),
@@ -2143,16 +1901,24 @@ async fn check_rollback_destination_authority(
     )
     .unwrap();
     let before = store.read_space(&scope.space_id).await.unwrap().last_seq;
-    let denied = store.rollback_agent_run(pinned, rollback.clone()).await;
+    let denied = store
+        .rollback_agent_run_by_id(pinned, rollback.clone())
+        .await;
     assert!(
-        matches!(denied, Err(PortError::Domain(DomainError::SpaceReadOnly))),
+        matches!(
+            denied,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ),
         "out-of-project rollback destination: {denied:?}"
     );
     assert_eq!(
         store.read_space(&scope.space_id).await.unwrap().last_seq,
         before
     );
-    let restored = store.rollback_agent_run(human, rollback).await.unwrap();
+    let restored = store
+        .rollback_agent_run_by_id(human, rollback)
+        .await
+        .unwrap();
     assert_eq!(restored.value.restored.len(), 1);
     assert_eq!(restored.value.restored[0].note, note);
 }
@@ -2173,6 +1939,7 @@ async fn check_rollback_with_dirty_room(
                 scope,
                 owner,
                 CreateNote {
+                    folder_page: false,
                     note: note.clone(),
                     parent: None,
                     slug: "unsettled".into(),
@@ -2232,28 +1999,8 @@ async fn check_rollback_with_dirty_room(
         .await
         .unwrap();
     assert!(closed.carrier_dirty);
-    let run_rev = store
-        .inspect_agent_run_revision_for_test(&scope.space_id, &run)
-        .await
-        .unwrap()
-        .unwrap();
     let result = store
-        .rollback_agent_run(
-            human,
-            next_mutation(
-                scope,
-                owner,
-                RollbackAgentRun {
-                    run,
-                    expected_run_revision: run_rev,
-                    expected_entities: vec![NoteRevision {
-                        note: note.clone(),
-                        revision: created.value.revision,
-                    }],
-                    associated_board_expectations: Vec::new(),
-                },
-            ),
-        )
+        .rollback_agent_run_by_id(human, next_mutation(scope, owner, run))
         .await
         .unwrap();
     assert_eq!(
@@ -2290,58 +2037,506 @@ async fn note_metadata_at(
     meta
 }
 
-async fn check_legacy_rollback(
+async fn check_self_trashed_agent_memory_rollback_reopens_slot(
     store: &CanonicalStore,
-    ctx: &SpaceContext,
-    command: &Mutation<RollbackAgentRun>,
-    committed: &notarium_core::ports::Committed<notarium_core::ports::RollbackResult>,
-    postgres: bool,
+    scope: &HistoryScope,
+    owner: &PrincipalId,
 ) {
-    assert!(command.input.associated_board_expectations.is_empty());
-    let mut payload = blake3::Hasher::new();
-    payload.update(command.input.run.as_str().as_bytes());
-    payload.update(&[0]);
-    payload.update(command.input.expected_run_revision.as_str().as_bytes());
-    for expected in &command.input.expected_entities {
-        payload.update(&[0]);
-        payload.update(expected.note.as_str().as_bytes());
-        payload.update(expected.revision.as_str().as_bytes());
-    }
-    let mut hash = blake3::Hasher::new();
-    hash.update(b"notarium-cmd-v1:rollback_agent_run\0");
-    hash.update(command.identity.hash.as_bytes());
-    hash.update(&[0]);
-    hash.update(payload.finalize().as_bytes());
-    let hex = hash.finalize().to_hex();
-    let literal = if postgres {
-        format!("decode('{hex}','hex')")
-    } else {
-        format!("X'{hex}'")
+    use notarium_core::{
+        model::FolderRef,
+        ports::{
+            AccountContext, AppendMemory, ControlCatalogPort, MemoryAppendOutcome, MemoryTarget,
+            MemoryWriteMode,
+        },
     };
-    assert_eq!(store.execute_diagnostic_write_sql_for_test(&format!(
-        "UPDATE command_receipts SET command_hash={literal} WHERE space_id='{}' AND actor_id='{}' AND idempotency_key='{}'",
-        ctx.scope().space_id.as_str(), command.identity.actor.as_str(), command.identity.key.as_str()
-    )).await.unwrap(),1);
-    let replayed = store
-        .rollback_agent_run(ctx.clone(), command.clone())
+
+    let human = owner_ctx(scope, owner.clone());
+    let project = sample_folder_id(233);
+    store
+        .create_folder(notarium_canonical::CreateFolderSpec {
+            scope: scope.clone(),
+            active_epoch: LeaseEpoch::new(1).unwrap(),
+            folder_id: project.clone(),
+            parent: None,
+            slug: "mem-slot-proj".into(),
+            display_name: "Memory Slot Project".into(),
+            is_project: true,
+            project_slug: Some("mem-slot-proj".into()),
+            actor: owner.clone(),
+            timestamp: None,
+        })
         .await
         .unwrap();
-    assert_eq!(replayed.receipt, committed.receipt);
-    assert_eq!(replayed.value, committed.value);
-    let mut changed = command.clone();
-    changed.input.expected_entities.reverse();
+
+    let run = sample_run_id(47);
+    let agent = agent_run_ctx(&human, run.clone());
+    let agent_account = AccountContext::new(agent.auth().clone(), make_budget());
+    let target = MemoryTarget::Project {
+        folder: FolderRef {
+            space_id: scope.space_id.clone(),
+            folder_id: project,
+        },
+    };
+    let snap = store
+        .inspect_memory_target(agent_account.clone(), target.clone(), "decisions".into())
+        .await
+        .unwrap();
+    let mem_note = snap.resolved.note.note_id.clone();
+
+    let created = store
+        .append_memory(
+            agent.clone(),
+            next_mutation(
+                scope,
+                owner,
+                AppendMemory {
+                    target: snap.resolved.clone(),
+                    text: "Temporary decision".into(),
+                    summary: Some("Temporary".into()),
+                    mode: MemoryWriteMode::CreateIfMissing,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(created.value.outcome, MemoryAppendOutcome::Created);
+
+    let self_trashed = store
+        .delete_note(
+            agent,
+            next_mutation(
+                scope,
+                owner,
+                DeleteNote {
+                    note: mem_note.clone(),
+                    disposition: DeleteDisposition::Trash,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let rolled = store
+        .rollback_agent_run_by_id(human.clone(), next_mutation(scope, owner, run))
+        .await
+        .unwrap();
+    assert_eq!(rolled.value.trashed.len(), 1);
+    assert_eq!(rolled.value.trashed[0].note, mem_note);
+    assert_ne!(
+        rolled.value.trashed[0].revision, self_trashed.value.revision,
+        "rolling back a self-trashed AgentMemory note must emit a rollback tombstone at the rollback cut"
+    );
+    let rec = store
+        .read_entity_revision_at_cutoff(
+            scope,
+            "note",
+            mem_note.as_str(),
+            Some(rolled.receipt.seq()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(rec.revision_id, rolled.value.trashed[0].revision);
+    assert_eq!(rec.visibility_seq, rolled.receipt.seq());
+    assert!(
+        rec.agent_run_id.is_none(),
+        "rollback tombstone for self-trashed AgentMemory must clear agent_run_id"
+    );
+
+    // End-to-end verification: MEMORY_UNDONE_SLOT_SQL must reopen the slot for a fresh append_memory.
+    let human_account = AccountContext::new(human.auth().clone(), make_budget());
+    let reopened = store
+        .inspect_memory_target(human_account, target.clone(), "decisions".into())
+        .await
+        .unwrap();
+    assert!(
+        reopened.revision.is_none(),
+        "undone self-trashed memory slot must inspect as absent"
+    );
+    let recreated = store
+        .append_memory(
+            human.clone(),
+            next_mutation(
+                scope,
+                owner,
+                AppendMemory {
+                    target: reopened.resolved,
+                    text: "Reopened decision".into(),
+                    summary: Some("Reopened".into()),
+                    mode: MemoryWriteMode::CreateIfMissing,
+                },
+            ),
+        )
+        .await
+        .expect("reopened self-trashed AgentMemory slot must accept fresh append_memory");
+    assert_eq!(recreated.value.outcome, MemoryAppendOutcome::Created);
+
+    // Case 2: Agent creates an AgentMemory note in `project`, moves it into a child folder,
+    // and trashes it within the same run. Rollback must restore the tombstone's parent/slug
+    // back to `project` so `inspect_memory_target` and `append_memory` can reopen the slot.
+    let child_folder = sample_folder_id(237);
+    store
+        .create_folder(notarium_canonical::CreateFolderSpec {
+            scope: scope.clone(),
+            active_epoch: LeaseEpoch::new(1).unwrap(),
+            folder_id: child_folder.clone(),
+            parent: Some(match &target {
+                MemoryTarget::Project { folder } => folder.folder_id.clone(),
+                MemoryTarget::User { .. } => unreachable!(),
+            }),
+            slug: "mem-slot-child".into(),
+            display_name: "Memory Slot Child".into(),
+            is_project: false,
+            project_slug: None,
+            actor: owner.clone(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+
+    let moved_run = sample_run_id(49);
+    let moved_agent = agent_run_ctx(&human, moved_run.clone());
+    let moved_agent_account = AccountContext::new(moved_agent.auth().clone(), make_budget());
+    let moved_snap = store
+        .inspect_memory_target(moved_agent_account, target.clone(), "architecture".into())
+        .await
+        .unwrap();
+    let moved_note = moved_snap.resolved.note.note_id.clone();
+
+    store
+        .append_memory(
+            moved_agent.clone(),
+            next_mutation(
+                scope,
+                owner,
+                AppendMemory {
+                    target: moved_snap.resolved,
+                    text: "Moved temporary note".into(),
+                    summary: Some("Moved".into()),
+                    mode: MemoryWriteMode::CreateIfMissing,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    store
+        .move_note(
+            moved_agent.clone(),
+            next_mutation(
+                scope,
+                owner,
+                notarium_core::ports::MoveNote {
+                    note: moved_note.clone(),
+                    parent: Some(child_folder),
+                    slug: "relocated-memory".into(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    store
+        .delete_note(
+            moved_agent,
+            next_mutation(
+                scope,
+                owner,
+                DeleteNote {
+                    note: moved_note.clone(),
+                    disposition: DeleteDisposition::Trash,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+
+    // Write-locking the origin project must reject rolling back the moved AgentMemory note
+    // before mutating state; unlocking lets rollback restore both parent and original slug.
+    let origin_project = match &target {
+        MemoryTarget::Project { folder } => folder.folder_id.clone(),
+        MemoryTarget::User { .. } => unreachable!(),
+    };
+    let moved_rb_cmd = next_mutation(scope, owner, moved_run);
+    store
+        .set_folder_write_lock(human.clone(), origin_project.clone(), true)
+        .await
+        .unwrap();
     assert!(matches!(
-        store.rollback_agent_run(ctx.clone(), changed).await,
-        Err(PortError::Domain(DomainError::IdempotencyKeyReused))
+        store
+            .rollback_agent_run_by_id(human.clone(), moved_rb_cmd.clone())
+            .await,
+        Err(PortError::Domain(DomainError::SpaceReadOnly))
+    ));
+    store
+        .set_folder_write_lock(human.clone(), origin_project.clone(), false)
+        .await
+        .unwrap();
+
+    let moved_rolled = store
+        .rollback_agent_run_by_id(human.clone(), moved_rb_cmd.clone())
+        .await
+        .unwrap();
+    assert_eq!(moved_rolled.value.trashed.len(), 1);
+    assert_eq!(moved_rolled.value.trashed[0].note, moved_note);
+    let moved_replayed = store
+        .rollback_agent_run_by_id(human.clone(), moved_rb_cmd)
+        .await
+        .expect("immediate replay of moved AgentMemory rollback must succeed");
+    assert_eq!(moved_replayed.receipt, moved_rolled.receipt);
+
+    let reopened_moved = store
+        .inspect_memory_target(
+            AccountContext::new(human.auth().clone(), make_budget()),
+            target.clone(),
+            "architecture".into(),
+        )
+        .await
+        .expect("moved + self-trashed AgentMemory slot must reopen at its project root");
+    assert!(reopened_moved.revision.is_none());
+    let recreated_moved = store
+        .append_memory(
+            human,
+            next_mutation(
+                scope,
+                owner,
+                AppendMemory {
+                    target: reopened_moved.resolved,
+                    text: "Recreated at project root".into(),
+                    summary: Some("Recreated".into()),
+                    mode: MemoryWriteMode::CreateIfMissing,
+                },
+            ),
+        )
+        .await
+        .expect("reopened moved AgentMemory slot must accept fresh append_memory");
+    assert_eq!(recreated_moved.value.outcome, MemoryAppendOutcome::Created);
+    let recreated_meta = store
+        .get_note(
+            owner_ctx(scope, owner.clone()),
+            GetNote {
+                note: moved_note,
+                revision: None,
+                causal: CausalBasis::Exact(
+                    ReceiptSet::new([recreated_moved.receipt.clone()]).unwrap(),
+                ),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        recreated_meta.parent.as_ref(),
+        Some(&origin_project),
+        "reopened AgentMemory note must reside in its original project root"
+    );
+    assert!(
+        recreated_meta
+            .provenance
+            .as_ref()
+            .expect("provenance")
+            .path
+            .ends_with("/memory-architecture.md"),
+        "reopened AgentMemory note must keep its canonical category slug: {:?}",
+        recreated_meta.provenance
+    );
+}
+
+async fn check_zero_note_run_rollback_isolation(
+    store: &CanonicalStore,
+    scope: &HistoryScope,
+    owner: &PrincipalId,
+) {
+    let human = owner_ctx(scope, owner.clone());
+    let proj_a = sample_folder_id(234);
+    let proj_b = sample_folder_id(235);
+    let proj_b_sub = sample_folder_id(236);
+    for (id, slug) in [(&proj_a, "zero-rb-a"), (&proj_b, "zero-rb-b")] {
+        store
+            .create_folder(notarium_canonical::CreateFolderSpec {
+                scope: scope.clone(),
+                active_epoch: LeaseEpoch::new(1).unwrap(),
+                folder_id: id.clone(),
+                parent: None,
+                slug: slug.into(),
+                display_name: slug.into(),
+                is_project: true,
+                project_slug: Some(slug.into()),
+                actor: owner.clone(),
+                timestamp: None,
+            })
+            .await
+            .unwrap();
+    }
+    store
+        .create_folder(notarium_canonical::CreateFolderSpec {
+            scope: scope.clone(),
+            active_epoch: LeaseEpoch::new(1).unwrap(),
+            folder_id: proj_b_sub.clone(),
+            parent: Some(proj_b),
+            slug: "zero-rb-b-sub".into(),
+            display_name: "zero-rb-b-sub".into(),
+            is_project: false,
+            project_slug: None,
+            actor: owner.clone(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+    // Create an agent run that only mutates a folder in Project B (0 note revisions, agent_run_heads row exists).
+    let folder_run = sample_run_id(48);
+    let agent = agent_run_ctx(&human, folder_run.clone());
+    store
+        .rename_folder(
+            agent,
+            next_mutation(
+                scope,
+                owner,
+                notarium_core::ports::RenameFolder {
+                    folder: proj_b_sub,
+                    name: "zero-rb-b-sub-renamed".into(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+
+    // Write-only caller (`read_classes = {}`) and project-pinned caller (`project_root = Some(proj_a)`)
+    // must receive ResourceNotFound without advancing last_seq (no existence oracle, no cross-project noop write).
+    let mut wo_grants = human.auth().spaces().clone();
+    wo_grants
+        .get_mut(&scope.space_id)
+        .unwrap()
+        .read_classes
+        .clear();
+    let write_only = SpaceContext::new(
+        human.auth().for_pat(wo_grants).unwrap(),
+        scope.clone(),
+        make_budget(),
+    )
+    .unwrap();
+
+    let mut pinned_grants = human.auth().spaces().clone();
+    pinned_grants.get_mut(&scope.space_id).unwrap().project_root = Some(proj_a);
+    let pinned = SpaceContext::new(
+        human.auth().for_pat(pinned_grants).unwrap(),
+        scope.clone(),
+        make_budget(),
+    )
+    .unwrap();
+
+    // Multi-space write PAT whose grant in THIS space has `write_classes = {}` (with writable
+    // classes in a second space so `bearer_scope == Some(BearerScope::Write)`) must fail with
+    // SpaceReadOnly rather than committing or replaying a zero-note rollback.
+    let mut multi_space_grants = human.auth().spaces().clone();
+    let other_space_grant = multi_space_grants.get(&scope.space_id).unwrap().clone();
+    multi_space_grants.insert(sample_space_id(239), other_space_grant);
+    let multi_space_human = EngineAuthContext::for_human(VerifiedHuman::attest(
+        owner.clone(),
+        GrantId::from_bytes([8u8; 16]),
+        multi_space_grants,
+        true,
+    ));
+    let mut ro_pat_grants = multi_space_human.spaces().clone();
+    ro_pat_grants
+        .get_mut(&scope.space_id)
+        .unwrap()
+        .write_classes
+        .clear();
+    let no_write_classes = SpaceContext::new(
+        multi_space_human.for_pat(ro_pat_grants).unwrap(),
+        scope.clone(),
+        make_budget(),
+    )
+    .unwrap();
+
+    let root_folder_id = store
+        .read_space(&scope.space_id)
+        .await
+        .unwrap()
+        .root_folder_id;
+    let cmd = next_mutation(scope, owner, folder_run);
+    let before = store.read_space(&scope.space_id).await.unwrap().last_seq;
+    assert!(matches!(
+        store
+            .rollback_agent_run_by_id(write_only.clone(), cmd.clone())
+            .await,
+        Err(PortError::Domain(DomainError::ResourceNotFound))
+    ));
+    assert!(matches!(
+        store
+            .rollback_agent_run_by_id(pinned.clone(), cmd.clone())
+            .await,
+        Err(PortError::Domain(DomainError::ResourceNotFound))
+    ));
+    assert!(matches!(
+        store
+            .rollback_agent_run_by_id(no_write_classes.clone(), cmd.clone())
+            .await,
+        Err(PortError::Domain(DomainError::SpaceReadOnly))
     ));
     assert_eq!(
-        store
-            .read_space(&ctx.scope().space_id)
-            .await
-            .unwrap()
-            .last_seq,
-        committed.receipt.seq()
+        store.read_space(&scope.space_id).await.unwrap().last_seq,
+        before
     );
+    // Write-locked root folder must also block zero-note rollbacks with SpaceReadOnly.
+    store
+        .set_folder_write_lock(human.clone(), root_folder_id.clone(), true)
+        .await
+        .unwrap();
+    let before_locked = store.read_space(&scope.space_id).await.unwrap().last_seq;
+    assert!(matches!(
+        store
+            .rollback_agent_run_by_id(human.clone(), cmd.clone())
+            .await,
+        Err(PortError::Domain(DomainError::SpaceReadOnly))
+    ));
+    assert_eq!(
+        store.read_space(&scope.space_id).await.unwrap().last_seq,
+        before_locked
+    );
+    store
+        .set_folder_write_lock(human.clone(), root_folder_id.clone(), false)
+        .await
+        .unwrap();
+
+    // Space-wide owner can execute the noop rollback; downgraded callers and locked roots must be denied on replay.
+    let committed = store
+        .rollback_agent_run_by_id(human.clone(), cmd.clone())
+        .await
+        .expect("space-wide owner rolls back zero-note run");
+    assert!(committed.value.restored.is_empty() && committed.value.trashed.is_empty());
+    assert!(matches!(
+        store
+            .rollback_agent_run_by_id(write_only, cmd.clone())
+            .await,
+        Err(PortError::Domain(DomainError::ResourceNotFound))
+    ));
+    assert!(matches!(
+        store.rollback_agent_run_by_id(pinned, cmd.clone()).await,
+        Err(PortError::Domain(DomainError::ResourceNotFound))
+    ));
+    assert!(matches!(
+        store
+            .rollback_agent_run_by_id(no_write_classes, cmd.clone())
+            .await,
+        Err(PortError::Domain(DomainError::SpaceReadOnly))
+    ));
+    store
+        .set_folder_write_lock(human.clone(), root_folder_id.clone(), true)
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .rollback_agent_run_by_id(human.clone(), cmd.clone())
+            .await,
+        Err(PortError::Domain(DomainError::SpaceReadOnly))
+    ));
+    store
+        .set_folder_write_lock(human.clone(), root_folder_id, false)
+        .await
+        .unwrap();
+    let replayed = store
+        .rollback_agent_run_by_id(human, cmd)
+        .await
+        .expect("unlocked owner replays zero-note rollback");
+    assert_eq!(replayed.receipt, committed.receipt);
 }
 
 async fn run_note_only_rollback_suite(
@@ -2369,6 +2564,7 @@ async fn run_note_only_rollback_suite(
                 &scope,
                 &owner,
                 CreateNote {
+                    folder_page: false,
                     note: n_ed.clone(),
                     parent: None,
                     slug: "note-only-pre".to_owned(),
@@ -2414,6 +2610,7 @@ async fn run_note_only_rollback_suite(
                 &scope,
                 &owner,
                 CreateNote {
+                    folder_page: false,
                     note: n_cr.clone(),
                     parent: None,
                     slug: "note-only-created".to_owned(),
@@ -2434,6 +2631,7 @@ async fn run_note_only_rollback_suite(
                 &scope,
                 &owner,
                 CreateNote {
+                    folder_page: false,
                     note: sample_note_id(203),
                     parent: None,
                     slug: "opaque-created".into(),
@@ -2464,6 +2662,7 @@ async fn run_note_only_rollback_suite(
                 &scope,
                 &owner,
                 CreateNote {
+                    folder_page: false,
                     note: unrelated.clone(),
                     parent: None,
                     slug: "unrelated-live".into(),
@@ -2544,38 +2743,12 @@ async fn run_note_only_rollback_suite(
         .execute(&mut *db)
         .await
         .unwrap();
-
-        // Record which public rollback route actually performed the room update.
-        sqlx::raw_sql("CREATE TABLE room_rollback_calls (used_root_function BOOLEAN NOT NULL);
-            CREATE FUNCTION observe_room_rollback() RETURNS trigger LANGUAGE plpgsql AS $fn$
-            BEGIN
-                INSERT INTO room_rollback_calls VALUES (position('notarium_pg_lean_commit_v3(' IN current_query()) > 0);
-                RETURN NEW;
-            END;
-            $fn$;
-            CREATE TRIGGER observe_room_rollback AFTER UPDATE OF lineage_epoch ON collab_sessions
-            FOR EACH ROW EXECUTE FUNCTION observe_room_rollback()")
-            .execute(&mut *db).await.unwrap();
         Some(shared_digest)
     } else {
         None
     };
-    let run_rev = store
-        .inspect_agent_run_revision_for_test(&scope.space_id, &run_id)
-        .await
-        .unwrap()
-        .unwrap();
 
-    let rollback = next_mutation(
-        &scope,
-        &owner,
-        RollbackAgentRun {
-            run: run_id,
-            expected_run_revision: run_rev,
-            expected_entities: vec![ed.value.clone(), cr.value.clone(), opaque.value.clone()],
-            associated_board_expectations: Vec::new(),
-        },
-    );
+    let rollback = next_mutation(&scope, &owner, run_id);
     let mut grants = human_ctx.auth().spaces().clone();
     grants
         .get_mut(&scope.space_id)
@@ -2595,7 +2768,9 @@ async fn run_note_only_rollback_suite(
     .unwrap();
     let before = store.read_space(&scope.space_id).await.unwrap().last_seq;
     assert!(matches!(
-        store.rollback_agent_run(restricted, rollback.clone()).await,
+        store
+            .rollback_agent_run_by_id(restricted, rollback.clone())
+            .await,
         Err(PortError::Domain(DomainError::SpaceReadOnly))
     ));
     assert_eq!(
@@ -2614,13 +2789,23 @@ async fn run_note_only_rollback_suite(
     );
 
     let rb = store
-        .rollback_agent_run(human_ctx.clone(), rollback.clone())
+        .rollback_agent_run_by_id(human_ctx.clone(), rollback.clone())
         .await
         .expect("note-only rollback");
-    check_legacy_rollback(store, &human_ctx, &rollback, &rb, pg.is_some()).await;
+    let replayed = store
+        .rollback_agent_run_by_id(human_ctx.clone(), rollback)
+        .await
+        .expect("idempotent rollback replay");
+    assert_eq!(replayed.receipt, rb.receipt);
+    assert_eq!(replayed.value, rb.value);
     assert_eq!(rb.value.restored.len(), 1);
     assert_eq!(rb.value.trashed.len(), 2);
-    let restored = note_metadata_at(store, &scope, &rb.value.restored[0], &rb.receipt).await;
+    let mut restored = note_metadata_at(store, &scope, &rb.value.restored[0], &rb.receipt).await;
+    assert!(
+        restored.logical_updated_at.is_some(),
+        "note-only rollback restore revision must carry pre-run logical_updated_at"
+    );
+    restored.logical_updated_at = pre_meta.logical_updated_at;
     assert_eq!(restored, pre_meta);
     assert_eq!(restored.parent_folder_id, root_folder);
     assert!(restored.is_root_child);
@@ -2712,14 +2897,10 @@ async fn run_note_only_rollback_suite(
         ).bind(scope.space_id.as_str()).bind(n_ed.as_str()).bind(&shared_digest).fetch_one(&mut *db).await.unwrap();
         assert!(clean.0 && clean.1 > 0);
         assert_eq!(clean.1, clean.2);
-        let calls: Vec<bool> =
-            sqlx::query_scalar("SELECT used_root_function FROM room_rollback_calls")
-                .fetch_all(&mut *db)
-                .await
-                .unwrap();
-        assert_eq!(calls, [true]);
     }
     check_rollback_with_dirty_room(store, &scope, &owner).await;
+    check_self_trashed_agent_memory_rollback_reopens_slot(store, &scope, &owner).await;
+    check_zero_note_run_rollback_isolation(store, &scope, &owner).await;
     let got = store
         .get_note(
             human_ctx.clone(),
@@ -2768,6 +2949,415 @@ async fn l6_note_only_rollback_dual_dialect_parity() {
             .await
             .unwrap();
         run_note_only_rollback_suite(&store, Some(&mut conn)).await;
+        runtime.shutdown().await.expect("shutdown pg+s3");
+        fixtures.drop_pg_schema(&schema).await;
+    }
+}
+
+async fn run_sibling_slug_swap_rollback_suite(store: &CanonicalStore) {
+    let owner = sample_principal_id(46);
+    let (scope, _root) = seed_space(
+        store,
+        sample_space_id(46),
+        sample_incarnation(46),
+        owner.clone(),
+    )
+    .await;
+    let human_ctx = owner_ctx(&scope, owner.clone());
+
+    for (mode_idx, mix_folder) in [(0u8, false), (1u8, true)] {
+        let base = 210u8 + mode_idx * 20;
+        let folder_id = FolderId::from_bytes([base; 16]);
+        let (folder_ref, _, _) = store
+            .create_folder(notarium_canonical::CreateFolderSpec {
+                scope: scope.clone(),
+                active_epoch: LeaseEpoch::new(1).unwrap(),
+                folder_id: folder_id.clone(),
+                parent: None,
+                slug: format!("rb-swap-dir-{mode_idx}"),
+                display_name: format!("RB Swap Dir {mode_idx}"),
+                is_project: false,
+                project_slug: None,
+                actor: owner.clone(),
+                timestamp: None,
+            })
+            .await
+            .expect("create folder");
+        let parent = Some(folder_ref.folder_id.clone());
+        let mix_dir = if mix_folder {
+            let mix_id = FolderId::from_bytes([base + 15; 16]);
+            store
+                .create_folder(notarium_canonical::CreateFolderSpec {
+                    scope: scope.clone(),
+                    active_epoch: LeaseEpoch::new(1).unwrap(),
+                    folder_id: mix_id.clone(),
+                    parent: parent.clone(),
+                    slug: "mix-sub-orig".into(),
+                    display_name: "Mix Sub Orig".into(),
+                    is_project: false,
+                    project_slug: None,
+                    actor: owner.clone(),
+                    timestamp: None,
+                })
+                .await
+                .expect("create mix subfolder");
+            Some(mix_id)
+        } else {
+            None
+        };
+
+        // Scenario 1: Intra-batch sibling slug swap (A: alpha -> tmp, B: beta -> alpha, A: tmp -> beta).
+        let a = NoteId::from_bytes([base, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        let b = NoteId::from_bytes([base, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+        assert!(a.as_str() < b.as_str());
+        for (nid, slug, title) in [(&a, "alpha", "Alpha"), (&b, "beta", "Beta")] {
+            store
+                .create_note(
+                    human_ctx.clone(),
+                    next_mutation(
+                        &scope,
+                        &owner,
+                        CreateNote {
+                            folder_page: false,
+                            note: nid.clone(),
+                            parent: parent.clone(),
+                            slug: slug.into(),
+                            class: DocClass::UserDoc,
+                            carrier: format!("# {title}\n"),
+                        },
+                    ),
+                )
+                .await
+                .unwrap();
+        }
+        let swap_run = sample_run_id(base + 1);
+        let swap_ctx = agent_run_ctx(&human_ctx, swap_run.clone());
+        let a_tmp = store
+            .move_note(
+                swap_ctx.clone(),
+                next_mutation(
+                    &scope,
+                    &owner,
+                    notarium_core::ports::MoveNote {
+                        note: a.clone(),
+                        parent: parent.clone(),
+                        slug: "tmp".into(),
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        let b_alpha = store
+            .move_note(
+                swap_ctx.clone(),
+                next_mutation(
+                    &scope,
+                    &owner,
+                    notarium_core::ports::MoveNote {
+                        note: b.clone(),
+                        parent: parent.clone(),
+                        slug: "alpha".into(),
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        let a_beta = store
+            .move_note(
+                swap_ctx.clone(),
+                next_mutation(
+                    &scope,
+                    &owner,
+                    notarium_core::ports::MoveNote {
+                        note: a.clone(),
+                        parent: parent.clone(),
+                        slug: "beta".into(),
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        if let Some(mix_id) = &mix_dir {
+            let renamed = store
+                .rename_folder(
+                    swap_ctx.clone(),
+                    next_mutation(
+                        &scope,
+                        &owner,
+                        notarium_core::ports::RenameFolder {
+                            folder: mix_id.clone(),
+                            name: "mix-sub-1".into(),
+                        },
+                    ),
+                )
+                .await
+                .unwrap();
+            let _ = renamed;
+        }
+        let _ = (a_tmp, a_beta, b_alpha);
+        let rb = store
+            .rollback_agent_run_by_id(human_ctx.clone(), next_mutation(&scope, &owner, swap_run))
+            .await
+            .expect("sibling slug swap rollback must succeed");
+        assert_eq!(rb.value.restored.len(), 2);
+        let a_after = note_metadata_at(
+            store,
+            &scope,
+            rb.value.restored.iter().find(|r| r.note == a).unwrap(),
+            &rb.receipt,
+        )
+        .await;
+        let b_after = note_metadata_at(
+            store,
+            &scope,
+            rb.value.restored.iter().find(|r| r.note == b).unwrap(),
+            &rb.receipt,
+        )
+        .await;
+        assert_eq!(a_after.slug, "alpha");
+        assert_eq!(b_after.slug, "beta");
+
+        // Scenario 2: 2-step rename chain (NoteId(c) < NoteId(d): c: c-one -> c-gamma, d: c-two -> c-one).
+        let c = NoteId::from_bytes([base, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        let d = NoteId::from_bytes([base, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+        assert!(c.as_str() < d.as_str());
+        for (nid, slug) in [(&c, "c-one"), (&d, "c-two")] {
+            store
+                .create_note(
+                    human_ctx.clone(),
+                    next_mutation(
+                        &scope,
+                        &owner,
+                        CreateNote {
+                            folder_page: false,
+                            note: nid.clone(),
+                            parent: parent.clone(),
+                            slug: slug.into(),
+                            class: DocClass::UserDoc,
+                            carrier: format!("# {slug}\n"),
+                        },
+                    ),
+                )
+                .await
+                .unwrap();
+        }
+        let chain_run = sample_run_id(base + 2);
+        let chain_ctx = agent_run_ctx(&human_ctx, chain_run.clone());
+        let c_moved = store
+            .move_note(
+                chain_ctx.clone(),
+                next_mutation(
+                    &scope,
+                    &owner,
+                    notarium_core::ports::MoveNote {
+                        note: c.clone(),
+                        parent: parent.clone(),
+                        slug: "c-gamma".into(),
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        let d_moved = store
+            .move_note(
+                chain_ctx.clone(),
+                next_mutation(
+                    &scope,
+                    &owner,
+                    notarium_core::ports::MoveNote {
+                        note: d.clone(),
+                        parent: parent.clone(),
+                        slug: "c-one".into(),
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        if let Some(mix_id) = &mix_dir {
+            store
+                .rename_folder(
+                    chain_ctx.clone(),
+                    next_mutation(
+                        &scope,
+                        &owner,
+                        notarium_core::ports::RenameFolder {
+                            folder: mix_id.clone(),
+                            name: "mix-sub-2".into(),
+                        },
+                    ),
+                )
+                .await
+                .unwrap();
+        }
+        let _ = (c_moved, d_moved);
+        let rb = store
+            .rollback_agent_run_by_id(human_ctx.clone(), next_mutation(&scope, &owner, chain_run))
+            .await
+            .expect("rename chain rollback must succeed");
+        assert_eq!(rb.value.restored.len(), 2);
+        let c_after = note_metadata_at(
+            store,
+            &scope,
+            rb.value.restored.iter().find(|r| r.note == c).unwrap(),
+            &rb.receipt,
+        )
+        .await;
+        let d_after = note_metadata_at(
+            store,
+            &scope,
+            rb.value.restored.iter().find(|r| r.note == d).unwrap(),
+            &rb.receipt,
+        )
+        .await;
+        assert_eq!(c_after.slug, "c-one");
+        assert_eq!(d_after.slug, "c-two");
+
+        // Scenario 3: Trash + slug reuse (NoteId(e) < NoteId(f): e active at reuse-slug,
+        // f trashed at reuse-slug; run trashes e and restores f at reuse-slug).
+        let e = NoteId::from_bytes([base, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        let f = NoteId::from_bytes([base, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+        assert!(e.as_str() < f.as_str());
+        store
+            .create_note(
+                human_ctx.clone(),
+                next_mutation(
+                    &scope,
+                    &owner,
+                    CreateNote {
+                        folder_page: false,
+                        note: f.clone(),
+                        parent: parent.clone(),
+                        slug: "reuse-slug".into(),
+                        class: DocClass::UserDoc,
+                        carrier: "# F\n".into(),
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        store
+            .delete_note(
+                human_ctx.clone(),
+                next_mutation(
+                    &scope,
+                    &owner,
+                    notarium_core::ports::DeleteNote {
+                        note: f.clone(),
+                        disposition: notarium_core::ports::DeleteDisposition::Trash,
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        store
+            .create_note(
+                human_ctx.clone(),
+                next_mutation(
+                    &scope,
+                    &owner,
+                    CreateNote {
+                        folder_page: false,
+                        note: e.clone(),
+                        parent: parent.clone(),
+                        slug: "reuse-slug".into(),
+                        class: DocClass::UserDoc,
+                        carrier: "# E\n".into(),
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        let reuse_run = sample_run_id(base + 3);
+        let reuse_ctx = agent_run_ctx(&human_ctx, reuse_run.clone());
+        let e_trashed = store
+            .delete_note(
+                reuse_ctx.clone(),
+                next_mutation(
+                    &scope,
+                    &owner,
+                    notarium_core::ports::DeleteNote {
+                        note: e.clone(),
+                        disposition: notarium_core::ports::DeleteDisposition::Trash,
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        let f_restored = store
+            .delete_note(
+                reuse_ctx.clone(),
+                next_mutation(
+                    &scope,
+                    &owner,
+                    notarium_core::ports::DeleteNote {
+                        note: f.clone(),
+                        disposition: notarium_core::ports::DeleteDisposition::Restore,
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        if let Some(mix_id) = &mix_dir {
+            store
+                .rename_folder(
+                    reuse_ctx.clone(),
+                    next_mutation(
+                        &scope,
+                        &owner,
+                        notarium_core::ports::RenameFolder {
+                            folder: mix_id.clone(),
+                            name: "mix-sub-3".into(),
+                        },
+                    ),
+                )
+                .await
+                .unwrap();
+        }
+        let _ = (e_trashed, f_restored);
+        let rb = store
+            .rollback_agent_run_by_id(human_ctx.clone(), next_mutation(&scope, &owner, reuse_run))
+            .await
+            .expect("trash+reuse rollback must succeed");
+        let e_after = note_metadata_at(
+            store,
+            &scope,
+            rb.value.restored.iter().find(|r| r.note == e).unwrap(),
+            &rb.receipt,
+        )
+        .await;
+        let f_after = note_metadata_at(
+            store,
+            &scope,
+            rb.value.restored.iter().find(|r| r.note == f).unwrap(),
+            &rb.receipt,
+        )
+        .await;
+        assert_eq!(e_after.lifecycle, Lifecycle::Active);
+        assert_eq!(e_after.slug, "reuse-slug");
+        assert_eq!(f_after.lifecycle, Lifecycle::Trashed);
+    }
+}
+
+#[tokio::test]
+async fn l6_rollback_sibling_slug_swap_and_chains_dual_dialect_parity() {
+    {
+        let root = TempDataRoot::new("l6-swap-sqlite");
+        let cfg = CanonicalConfig::local_default(sample_installation_id(11), root.data_root());
+        let (store, runtime) = CanonicalRuntime::open(cfg).await.expect("open sqlite");
+        run_sibling_slug_swap_rollback_suite(&store).await;
+        runtime.shutdown().await.expect("shutdown sqlite");
+    }
+    {
+        let fixtures = StorageTestFixtures::load_required();
+        let schema = fixtures.fresh_pg_schema();
+        let bucket = fixtures.fresh_s3_bucket("l6swp");
+        let s3_cfg = fixtures.s3_config(&bucket, S3BucketModePolicy::DetectFromBucket);
+        admin_ensure_bucket(&s3_cfg, Some("Enabled"))
+            .await
+            .expect("ensure S3 bucket");
+        let cfg = fixtures.pg_s3_config(sample_installation_id(12), &schema, s3_cfg);
+        let (store, runtime) = CanonicalRuntime::open(cfg).await.expect("open pg+s3");
+        run_sibling_slug_swap_rollback_suite(&store).await;
         runtime.shutdown().await.expect("shutdown pg+s3");
         fixtures.drop_pg_schema(&schema).await;
     }

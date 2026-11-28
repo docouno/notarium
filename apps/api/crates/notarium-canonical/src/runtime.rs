@@ -1,4 +1,5 @@
 mod auxiliary;
+pub(crate) mod disclosure;
 mod lease;
 
 use std::{
@@ -115,7 +116,8 @@ use notarium_core::{ids::RequestId, ports::Cancellation};
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum SqlDriverState {
     Sqlite {
-        writer: Mutex<Option<crate::sqlite_fast::SqliteWriterPair>>,
+        writer: Arc<Mutex<Option<crate::sqlite_fast::SqliteWriterPair>>>,
+        disclosures: disclosure::DisclosureLocks,
         fast_read_pool: crate::sqlite_fast::SqliteFastReadPool,
         read_pool: SqlitePool,
         #[allow(dead_code)]
@@ -123,7 +125,6 @@ pub(crate) enum SqlDriverState {
     },
     Postgres {
         pool: StorePgPool,
-        fast_write_conn: std::sync::Mutex<Option<StorePgConnection>>,
         fast_read_conn: std::sync::Mutex<Option<StorePgConnection>>,
         can_cache_fast_conn: bool,
         #[allow(dead_code)]
@@ -138,6 +139,7 @@ pub(crate) struct CanonicalInner {
     pub sql: SqlDriverState,
     pub blobs: BlobBackendDriver,
     writer_leases: std::sync::Mutex<std::collections::HashMap<SpaceId, LeaseEpoch>>,
+    pub chat_run_generation: String,
     pub writer_coord: OnceLock<Arc<WriteCoordinator>>,
     pub wal_coord: OnceLock<Arc<SqliteWalCoordinator>>,
     #[cfg(feature = "test-support")]
@@ -161,6 +163,9 @@ pub(crate) struct CanonicalInner {
     >,
     pub retirement_workers: crate::blobs::retirement_worker::RetirementWorkers,
     pub backup_cleanups: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    pub deferred_local_orphan_cleanups: std::sync::Mutex<DeferredLocalOrphans>,
+    pub backup_cleanups_closed: AtomicBool,
+    pub aux_workers: Arc<tokio::sync::RwLock<()>>,
     pub last_backup_memory_stats:
         std::sync::Mutex<Option<crate::backup::BackupExporterMemoryStats>>,
     pub backup_step_delay_us: std::sync::atomic::AtomicU64,
@@ -183,6 +188,13 @@ pub(crate) struct CanonicalInner {
     pub sqlite_has_any_collab_sessions: AtomicBool,
     pub shutting_down: AtomicBool,
     pub owner_locks: Mutex<Vec<DataRootOwnerLock>>,
+}
+
+#[derive(Default)]
+pub(crate) struct DeferredLocalOrphans {
+    pub items: std::collections::BTreeSet<(SpaceId, ContentDigest)>,
+    pub overflow_spaces: std::collections::BTreeSet<SpaceId>,
+    pub release_gen: u64,
 }
 
 /// RAII seqlock guard around every SQLite `COMMIT`.
@@ -345,6 +357,20 @@ impl CanonicalInner {
         Ok(())
     }
 
+    pub(crate) fn yield_pg_writer(&self) -> Option<crate::dialect::postgres::WriterSlotWait<'_>> {
+        match &self.sql {
+            SqlDriverState::Postgres { pool, .. } => Some(pool.yield_writer()),
+            SqlDriverState::Sqlite { .. } => None,
+        }
+    }
+
+    pub(crate) async fn writer_safe_point(
+        &self,
+    ) -> Result<crate::writer::WriterSafePointGuard, PortError> {
+        let _waiting = self.yield_pg_writer();
+        Ok(self.writer()?.acquire_safe_point().await)
+    }
+
     pub(crate) fn writer(&self) -> Result<&Arc<WriteCoordinator>, PortError> {
         self.writer_coord.get().ok_or_else(|| {
             internal_not_committed(
@@ -469,6 +495,7 @@ impl CanonicalRuntime {
         config: CanonicalConfig,
         custom_s3_transport: Option<Arc<dyn S3Transport>>,
     ) -> Result<(CanonicalStore, Self), PortError> {
+        config.validate_storage_profile()?;
         config.validate_timer_intervals()?;
         let mut locks = Vec::new();
         match (&config.sql, &config.blobs) {
@@ -483,13 +510,10 @@ impl CanonicalRuntime {
                     locks.push(DataRootOwnerLock::acquire(blob_root)?);
                 }
             }
-            (SqlBackendConfig::Sqlite { data_root, .. }, BlobBackendConfig::S3(_)) => {
-                locks.push(DataRootOwnerLock::acquire(data_root)?);
-            }
-            (SqlBackendConfig::Postgres { .. }, BlobBackendConfig::Local { data_root }) => {
-                locks.push(DataRootOwnerLock::acquire(data_root)?);
-            }
             (SqlBackendConfig::Postgres { .. }, BlobBackendConfig::S3(_)) => {}
+            _ => {
+                unreachable!("validated storage profile allows only LocalSqlite or CloudPostgresS3")
+            }
         }
 
         let blobs = BlobBackendDriver::open(&config.blobs, custom_s3_transport).await?;
@@ -525,11 +549,14 @@ impl CanonicalRuntime {
                     let db_path = data_root.canonical();
                     (
                         SqlDriverState::Sqlite {
-                            writer: Mutex::new(Some(crate::sqlite_fast::SqliteWriterPair {
-                                sqlx_conn: writer,
-                                rusqlite_conn: Some(rusqlite_writer),
-                                db_path: db_path.clone(),
-                            })),
+                            disclosures: Default::default(),
+                            writer: Arc::new(Mutex::new(Some(
+                                crate::sqlite_fast::SqliteWriterPair {
+                                    sqlx_conn: writer,
+                                    rusqlite_conn: Some(rusqlite_writer),
+                                    db_path: db_path.clone(),
+                                },
+                            ))),
                             fast_read_pool: crate::sqlite_fast::SqliteFastReadPool::new(
                                 db_path,
                                 fast_readers,
@@ -559,7 +586,6 @@ impl CanonicalRuntime {
                     (
                         SqlDriverState::Postgres {
                             pool,
-                            fast_write_conn: std::sync::Mutex::new(None),
                             fast_read_conn: std::sync::Mutex::new(None),
                             can_cache_fast_conn: *pool_size > 2,
                             schema: validated_schema,
@@ -579,6 +605,7 @@ impl CanonicalRuntime {
             sql,
             blobs,
             writer_leases: Default::default(),
+            chat_run_generation: crate::codec::new_prefixed_hex_id("crg_")?,
             writer_coord: OnceLock::new(),
             wal_coord: OnceLock::new(),
             #[cfg(feature = "test-support")]
@@ -599,6 +626,9 @@ impl CanonicalRuntime {
             lease_recoveries: Default::default(),
             retirement_workers: Default::default(),
             backup_cleanups: std::sync::Mutex::new(Vec::new()),
+            deferred_local_orphan_cleanups: std::sync::Mutex::new(DeferredLocalOrphans::default()),
+            backup_cleanups_closed: AtomicBool::new(false),
+            aux_workers: Arc::new(tokio::sync::RwLock::new(())),
             last_backup_memory_stats: std::sync::Mutex::new(None),
             backup_step_delay_us: std::sync::atomic::AtomicU64::new(0),
             sqlite_writer_commit_gen: std::sync::atomic::AtomicU64::new(0),
@@ -683,6 +713,7 @@ impl CanonicalRuntime {
     }
 
     async fn drain_shutdown(self) -> Result<(), PortError> {
+        let _draining = self.inner.yield_pg_writer();
         self.inner.live_visibility.close_and_drain().await;
         // Closing a backup phase can schedule a final join or artifact cleanup.
         // Admission already closed when shutdown was requested.
@@ -705,6 +736,40 @@ impl CanonicalRuntime {
         if let Some(coord) = self.inner.writer_coord.get() {
             coord.drain_and_shutdown().await;
         }
+        // Reject new auxiliary writers and wait for every in-flight auxiliary worker
+        // (including post-rollback `on_pre_commit_abort` hooks and undelivered staging
+        // leases) to finish before closing local CAS cleanup admission.
+        let _aux_drained = self.inner.aux_workers.write().await;
+        // Close cleanup admission under `backup_cleanups` lock and drain all pending
+        // local CAS orphan cleanup tasks BEFORE the final deferred orphan sweep and
+        // BEFORE shutting down WAL / SQL pools and releasing `DataRootOwnerLock`, so
+        // every cleanup task sees an open read gate and any item deferred by a drained
+        // task is swept before ownership ends.
+        loop {
+            let pending = {
+                let mut tasks = self
+                    .inner
+                    .backup_cleanups
+                    .lock()
+                    .expect("backup cleanups mutex");
+                self.inner
+                    .backup_cleanups_closed
+                    .store(true, Ordering::SeqCst);
+                std::mem::take(&mut *tasks)
+            };
+            if pending.is_empty() {
+                break;
+            }
+            for task in pending {
+                let _ = task.await;
+            }
+        }
+        // Non-blocking final sweep so external retained tickets never deadlock shutdown.
+        CanonicalStore {
+            inner: self.inner.clone(),
+        }
+        .sweep_deferred_local_orphans_async(false)
+        .await;
         if let Some(wal) = self.inner.wal_coord.get() {
             wal.shutdown().await;
         }
@@ -714,8 +779,12 @@ impl CanonicalRuntime {
                 writer,
                 fast_read_pool,
                 read_pool,
+                disclosures,
                 ..
             } => {
+                // The next owner may reopen this data root as soon as shutdown
+                // returns. Settle existing disclosures before releasing ownership.
+                let _disclosures = disclosures.unscoped_mutation().await;
                 fast_read_pool.close_all().await;
                 read_pool.close().await;
                 let mut guard = writer.lock().await;
@@ -731,19 +800,13 @@ impl CanonicalRuntime {
             }
             SqlDriverState::Postgres {
                 pool,
-                fast_write_conn,
                 fast_read_conn,
                 ..
             } => {
-                let cached_w = fast_write_conn
-                    .lock()
-                    .expect("pg fast_write_conn mutex")
-                    .take();
                 let cached_r = fast_read_conn
                     .lock()
                     .expect("pg fast_read_conn mutex")
                     .take();
-                drop(cached_w);
                 drop(cached_r);
                 pool.close().await;
             }
@@ -773,6 +836,68 @@ impl CanonicalStore {
     /// backend rather than a multi-writer PostgreSQL database.
     pub fn is_local_sqlite(&self) -> bool {
         matches!(self.inner.sql, SqlDriverState::Sqlite { .. })
+    }
+
+    /// Waits on PostgreSQL until any in-flight transaction that locked the
+    /// touched `spaces` rows `FOR NO KEY UPDATE` has either committed or aborted.
+    ///
+    /// Called only after an ambiguous `COMMIT` outcome while `RevocationLease`
+    /// guards are still held, and strictly AFTER the ambiguous writer socket
+    /// has been closed and returned to the pool so `pool_size = 1` cannot
+    /// deadlock. Never cancelled by `backup_shutdown`, because `drain_shutdown`
+    /// drains both the writer coordinator and auxiliary workers before closing
+    /// the PostgreSQL pool; releasing `RevocationLease` early would let a
+    /// concurrent revocation settle ahead of a late server-side `COMMIT`.
+    pub(crate) async fn await_pg_unknown_commit_barrier(&self, spaces: &[SpaceId]) {
+        let SqlDriverState::Postgres { pool, .. } = &self.inner.sql else {
+            return;
+        };
+        if spaces.is_empty() {
+            return;
+        }
+        let mut space_ids: Vec<&str> = spaces.iter().map(SpaceId::as_str).collect();
+        space_ids.sort_unstable();
+        space_ids.dedup();
+        let mut backoff = Duration::from_millis(25);
+        let max_backoff = Duration::from_secs(1);
+
+        loop {
+            let attempt = async {
+                let mut pooled = match pool.acquire().await {
+                    Ok(conn) => conn,
+                    Err(sqlx::Error::PoolClosed) => return Ok::<bool, ()>(true),
+                    Err(_) => return Err(()),
+                };
+                let mut lease = PgTransactionLease::new(&mut pooled);
+                sqlx::raw_sql("BEGIN")
+                    .execute(lease.conn())
+                    .await
+                    .map_err(|_| ())?;
+                sqlx::query(
+                    "SELECT 1 FROM spaces WHERE space_id = ANY($1) ORDER BY space_id FOR SHARE",
+                )
+                .bind(&space_ids)
+                .fetch_all(lease.conn())
+                .await
+                .map_err(|_| ())?;
+                sqlx::raw_sql("ROLLBACK")
+                    .execute(lease.conn())
+                    .await
+                    .map_err(|_| ())?;
+                lease.complete();
+                Ok::<bool, ()>(true)
+            };
+            if matches!(attempt.await, Ok(true)) {
+                return;
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(max_backoff);
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    pub async fn await_pg_unknown_commit_barrier_for_test(&self, spaces: &[SpaceId]) {
+        self.await_pg_unknown_commit_barrier(spaces).await;
     }
 
     /// Monotonic SQLite writer commit generation, or `None` on multi-writer
@@ -947,6 +1072,19 @@ impl CanonicalStore {
     }
 
     pub(crate) fn ensure_open(&self) -> Result<(), PortError> {
+        if self.inner.shutting_down.load(Ordering::SeqCst)
+            || self.inner.backup_shutdown.is_cancelled()
+        {
+            return Err(unavailable_retryable(
+                "canonical_shutting_down",
+                "canonical runtime is shutting down",
+                Duration::from_millis(100),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn ensure_not_terminating(&self) -> Result<(), PortError> {
         if self.inner.shutting_down.load(Ordering::SeqCst) {
             return Err(unavailable_retryable(
                 "canonical_shutting_down",
@@ -961,26 +1099,84 @@ impl CanonicalStore {
     where
         F: for<'c> FnOnce(&'c mut BackendConn<'_>) -> crate::BoxFuture<'c, Result<T, PortError>>,
     {
-        self.with_visibility_write_tx(None, op, Ok).await
+        self.with_write_tx_for_space(None, op).await
+    }
+
+    pub(crate) async fn with_write_tx_for_space<F, T>(
+        &self,
+        space: Option<SpaceId>,
+        op: F,
+    ) -> Result<T, PortError>
+    where
+        F: for<'c> FnOnce(&'c mut BackendConn<'_>) -> crate::BoxFuture<'c, Result<T, PortError>>,
+    {
+        self.with_visibility_write_tx(space, None, op, Ok).await
+    }
+
+    pub(crate) async fn with_write_tx_for_space_during_shutdown<F, T>(
+        &self,
+        space: Option<SpaceId>,
+        op: F,
+    ) -> Result<T, PortError>
+    where
+        F: for<'c> FnOnce(&'c mut BackendConn<'_>) -> crate::BoxFuture<'c, Result<T, PortError>>,
+    {
+        self.with_visibility_write_tx_inner(space, None, op, Ok, true)
+            .await
     }
 
     pub(crate) async fn with_visibility_write_tx<F, T, R>(
         &self,
         space: Option<SpaceId>,
+        visible_space: Option<SpaceId>,
         op: F,
         after_commit: impl FnOnce(T) -> Result<R, PortError>,
     ) -> Result<R, PortError>
     where
         F: for<'c> FnOnce(&'c mut BackendConn<'_>) -> crate::BoxFuture<'c, Result<T, PortError>>,
     {
-        self.ensure_open()?;
+        self.with_visibility_write_tx_inner(space, visible_space, op, after_commit, false)
+            .await
+    }
+
+    async fn with_visibility_write_tx_inner<F, T, R>(
+        &self,
+        space: Option<SpaceId>,
+        visible_space: Option<SpaceId>,
+        op: F,
+        after_commit: impl FnOnce(T) -> Result<R, PortError>,
+        allow_during_shutdown: bool,
+    ) -> Result<R, PortError>
+    where
+        F: for<'c> FnOnce(&'c mut BackendConn<'_>) -> crate::BoxFuture<'c, Result<T, PortError>>,
+    {
+        if allow_during_shutdown {
+            self.ensure_not_terminating()?;
+        } else {
+            self.ensure_open()?;
+        }
+        // Never hold the writer safe point or a database connection while waiting
+        // for a provider that has already pinned this Space.
+        let _space;
+        let _unscoped;
+        if let SqlDriverState::Sqlite { disclosures, .. } = &self.inner.sql {
+            match space {
+                Some(id) => _space = disclosures.mutation(&id).await,
+                None => _unscoped = disclosures.unscoped_mutation().await,
+            }
+        }
         let _commit_gate = if let Some(writer) = self.inner.writer_coord.get() {
             Some(writer.acquire_commit_read_guard().await)
         } else {
             None
         };
-        self.with_write_tx_unfenced(space.map(|space| vec![space]), op, after_commit)
-            .await
+        self.with_write_tx_unfenced_inner(
+            visible_space.map(|space| vec![space]),
+            op,
+            after_commit,
+            allow_during_shutdown,
+        )
+        .await
     }
 
     pub(crate) async fn with_write_tx_unfenced<F, T, R>(
@@ -992,7 +1188,25 @@ impl CanonicalStore {
     where
         F: for<'c> FnOnce(&'c mut BackendConn<'_>) -> crate::BoxFuture<'c, Result<T, PortError>>,
     {
-        self.ensure_open()?;
+        self.with_write_tx_unfenced_inner(spaces, op, after_commit, false)
+            .await
+    }
+
+    async fn with_write_tx_unfenced_inner<F, T, R>(
+        &self,
+        spaces: Option<Vec<SpaceId>>,
+        op: F,
+        after_commit: impl FnOnce(T) -> Result<R, PortError>,
+        allow_during_shutdown: bool,
+    ) -> Result<R, PortError>
+    where
+        F: for<'c> FnOnce(&'c mut BackendConn<'_>) -> crate::BoxFuture<'c, Result<T, PortError>>,
+    {
+        if allow_during_shutdown {
+            self.ensure_not_terminating()?;
+        } else {
+            self.ensure_open()?;
+        }
         let mut visibility = match spaces {
             Some(spaces) => Some(self.inner.live_visibility.for_write(spaces).await),
             None => None,
@@ -1012,7 +1226,13 @@ impl CanonicalStore {
                     .await?;
                 let mut conn = BackendConn::Sqlite(&mut pair.sqlx_conn);
                 let mut transaction = WriteTransaction::begin(&mut conn).await?;
-                let value = op(&mut transaction.conn()).await?;
+                let value = match op(&mut transaction.conn()).await {
+                    Ok(value) => value,
+                    Err(error) => {
+                        transaction.rollback().await;
+                        return Err(error);
+                    }
+                };
                 if let Some(visibility) = visibility.as_mut() {
                     visibility.committing();
                 }
@@ -1347,6 +1567,14 @@ impl CanonicalStore {
         self.with_read_tx_budget(None, op).await
     }
 
+    pub(crate) async fn with_read_tx_during_shutdown<F, T>(&self, op: F) -> Result<T, PortError>
+    where
+        F: for<'c> FnOnce(&'c mut BackendConn<'_>) -> crate::BoxFuture<'c, Result<T, PortError>>,
+    {
+        self.execute_read_transaction_inner(None, None, op, true)
+            .await
+    }
+
     pub(crate) async fn with_read_tx_budget<F, T>(
         &self,
         budget: Option<&CallBudget>,
@@ -1376,7 +1604,7 @@ impl CanonicalStore {
                 .projection_read_metrics
                 .measure(std::any::type_name::<F>());
             let result = self
-                .execute_read_transaction(budget, extra_pg_sql, op)
+                .execute_read_transaction_inner(budget, extra_pg_sql, op, false)
                 .await;
             if let Some(measurement) = &mut measurement {
                 measurement.complete(result.as_ref().err().map(PortError::code));
@@ -1384,20 +1612,25 @@ impl CanonicalStore {
             result
         }
         #[cfg(not(feature = "test-support"))]
-        self.execute_read_transaction(budget, extra_pg_sql, op)
+        self.execute_read_transaction_inner(budget, extra_pg_sql, op, false)
             .await
     }
 
-    async fn execute_read_transaction<F, T>(
+    async fn execute_read_transaction_inner<F, T>(
         &self,
         budget: Option<&CallBudget>,
         extra_pg_sql: Option<&'static str>,
         op: F,
+        allow_during_shutdown: bool,
     ) -> Result<T, PortError>
     where
         F: for<'c> FnOnce(&'c mut BackendConn<'_>) -> crate::BoxFuture<'c, Result<T, PortError>>,
     {
-        self.ensure_open()?;
+        if allow_during_shutdown {
+            self.ensure_not_terminating()?;
+        } else {
+            self.ensure_open()?;
+        }
         match &self.inner.sql {
             SqlDriverState::Sqlite { read_pool, .. } => {
                 let wal = self.inner.wal_coord.get().ok_or_else(|| {
@@ -1501,6 +1734,7 @@ impl CanonicalStore {
     pub async fn create_space(&self, spec: CreateSpaceSpec) -> Result<SpaceRecord, PortError> {
         let inner = Arc::clone(&self.inner);
         self.with_auxiliary_command(
+            spec.space_id.clone(),
             None,
             move |record: SpaceRecord| {
                 inner.grant_writer_epoch(&record.space.id, record.active_epoch);
@@ -1552,6 +1786,7 @@ impl CanonicalStore {
         let writer_owner = Arc::clone(&inner);
         let broadcast_scope = spec.scope.clone();
         self.with_auxiliary_visibility_command(
+            spec.scope.space_id.clone(),
             Some(spec.scope.space_id.clone()),
             None,
             move |out: (FolderRef, RevisionId, SpaceSeq)| {
@@ -1640,6 +1875,7 @@ impl CanonicalStore {
 
                 let meta_bytes = RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Folder(
                     FolderRevisionMetadata {
+                        confirmation: None,
                         folder_id: spec_cl.folder_id.clone(),
                         parent_folder_id: Some(parent_id.clone()),
                         is_root: false,
@@ -1807,6 +2043,7 @@ impl CanonicalStore {
         let writer_owner = Arc::clone(&inner);
         let broadcast_scope = scope.clone();
         self.with_auxiliary_visibility_command(
+            scope.space_id.clone(),
             Some(scope.space_id.clone()),
             None,
             move |out: (RevisionId, SpaceSeq)| {
@@ -1858,16 +2095,16 @@ impl CanonicalStore {
                                      SELECT folder_id, 0 FROM folder_heads
                                       WHERE space_id = ?1 AND folder_id = ?2
                                      UNION ALL
-                                     SELECT f.folder_id, s.depth + 1 FROM folder_heads f
-                                     JOIN sub s ON f.parent_folder_id = s.folder_id
-                                      WHERE f.space_id = ?1 AND s.depth < 257
+                                     SELECT f.folder_id, s.depth + 1 FROM sub s
+                                     CROSS JOIN folder_heads f
+                                      WHERE f.space_id = ?1 AND f.parent_folder_id = s.folder_id AND s.depth < 257
                                  )
                                  SELECT 1 FROM sub s
-                                 JOIN note_heads n
-                                   ON n.space_id = ?1 AND n.parent_folder_id = s.folder_id
-                                 JOIN collab_sessions c
-                                   ON c.space_id = ?1 AND c.note_id = n.note_id
-                                 WHERE c.room_state IN ('active', 'fenced')
+                                 CROSS JOIN note_heads n
+                                 CROSS JOIN collab_sessions c
+                                 WHERE n.space_id = ?1 AND n.parent_folder_id = s.folder_id
+                                   AND c.space_id = ?1 AND c.note_id = n.note_id
+                                   AND c.room_state IN ('active', 'fenced')
                                  LIMIT 1",
                             )
                             .bind(scope_cl.space_id.as_str())
@@ -2005,6 +2242,7 @@ impl CanonicalStore {
 
                 let meta_bytes = RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Folder(
                     FolderRevisionMetadata {
+                        confirmation: None,
                         folder_id: folder_cl.clone(),
                         parent_folder_id: Some(parent_id),
                         is_root: false,
@@ -2173,6 +2411,7 @@ pub(crate) struct FolderHeadRow {
     pub write_locked: bool,
     pub lifecycle: Lifecycle,
     pub head_rev_id: RevisionId,
+    pub updated_seq: Option<SpaceSeq>,
 }
 
 async fn fetch_space_by_id_or_slug(
@@ -2215,6 +2454,7 @@ pub(crate) async fn create_space_tx(
     let root_rev_id = new_revision_id()?;
     let root_meta =
         RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Folder(FolderRevisionMetadata {
+            confirmation: None,
             folder_id: spec.root_folder_id.clone(),
             parent_folder_id: None,
             is_root: true,
@@ -2839,6 +3079,7 @@ pub(crate) async fn load_folder_head_row(
         write_lock_json,
         lc_raw,
         head_rev_raw,
+        updated_seq_raw,
     ): (
         Option<String>,
         i32,
@@ -2853,12 +3094,13 @@ pub(crate) async fn load_folder_head_row(
         Option<String>,
         String,
         String,
+        i64,
     ) = match tx {
         BackendConn::Sqlite(conn) => {
             let row = sqlx::query(
                 "SELECT parent_folder_id, is_root, slug, slug_fold, display_name,
                         is_project, project_slug, project_slug_fold, description,
-                        cover_note_id, write_lock_json, lifecycle_state, head_rev_id
+                        cover_note_id, write_lock_json, lifecycle_state, head_rev_id, updated_seq
                  FROM folder_heads WHERE space_id = ? AND folder_id = ?",
             )
             .bind(space_id.as_str())
@@ -2881,13 +3123,14 @@ pub(crate) async fn load_folder_head_row(
                 row.get("write_lock_json"),
                 row.get("lifecycle_state"),
                 row.get("head_rev_id"),
+                row.get("updated_seq"),
             )
         }
         BackendConn::Postgres(conn) => {
             let row = sqlx::query(
                 "SELECT parent_folder_id, is_root, slug, slug_fold, display_name,
                         is_project, project_slug, project_slug_fold, description,
-                        cover_note_id, write_lock_json, lifecycle_state, head_rev_id
+                        cover_note_id, write_lock_json, lifecycle_state, head_rev_id, updated_seq
                  FROM folder_heads WHERE space_id = $1 AND folder_id = $2",
             )
             .bind(space_id.as_str())
@@ -2910,6 +3153,7 @@ pub(crate) async fn load_folder_head_row(
                 row.get("write_lock_json"),
                 row.get("lifecycle_state"),
                 row.get("head_rev_id"),
+                row.get("updated_seq"),
             )
         }
     };
@@ -2930,6 +3174,7 @@ pub(crate) async fn load_folder_head_row(
     let head_rev_id = RevisionId::parse(&head_rev_raw)
         .map_err(|_| internal_not_committed("corrupt_folder_rev", "invalid head_rev_id"))?;
     let lifecycle = lifecycle_from_db(&lc_raw)?;
+    let updated_seq = crate::codec::i64_to_space_seq(updated_seq_raw)?;
 
     Ok(FolderHeadRow {
         folder_id: folder_id.clone(),
@@ -2946,6 +3191,7 @@ pub(crate) async fn load_folder_head_row(
         write_locked: write_lock_json.is_some(),
         lifecycle,
         head_rev_id,
+        updated_seq: Some(updated_seq),
     })
 }
 
@@ -3586,7 +3832,34 @@ pub(crate) async fn read_immutable_revision_tx(
         return Ok(None);
     };
 
-    let revision_id = RevisionId::parse(&rev_raw)
+    Ok(Some(decode_stored_revision_row(
+        &rev_raw,
+        s_seq_raw,
+        v_seq_raw,
+        digest_opt,
+        &meta_bytes,
+        &actor_raw,
+        run_opt.as_deref(),
+        restored_opt.as_deref(),
+        sec,
+        nsec,
+    )?))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_stored_revision_row(
+    rev_raw: &str,
+    s_seq_raw: i64,
+    v_seq_raw: i64,
+    digest_opt: Option<Vec<u8>>,
+    meta_bytes: &[u8],
+    actor_raw: &str,
+    run_opt: Option<&str>,
+    restored_opt: Option<&str>,
+    sec: i64,
+    nsec: i32,
+) -> Result<StoredRevisionRecord, PortError> {
+    let revision_id = RevisionId::parse(rev_raw)
         .map_err(|_| internal_not_committed("corrupt_rev_id", "invalid rev_id"))?;
     let space_seq = i64_to_space_seq(s_seq_raw)?;
     let visibility_seq = i64_to_space_seq(v_seq_raw)?;
@@ -3599,25 +3872,25 @@ pub(crate) async fn read_immutable_revision_tx(
         }
         None => None,
     };
-    let metadata = RevisionMetadataEnvelope::decode(&meta_bytes)?;
-    let actor_id = PrincipalId::parse(&actor_raw)
+    let metadata = RevisionMetadataEnvelope::decode(meta_bytes)?;
+    let actor_id = PrincipalId::parse(actor_raw)
         .map_err(|_| internal_not_committed("corrupt_rev_actor", "invalid actor_id"))?;
     let agent_run_id = match run_opt {
         Some(s) => Some(
-            AgentRunId::parse(&s)
+            AgentRunId::parse(s)
                 .map_err(|_| internal_not_committed("corrupt_rev_run", "invalid agent_run_id"))?,
         ),
         None => None,
     };
     let restored_from_rev_id = match restored_opt {
-        Some(s) => Some(RevisionId::parse(&s).map_err(|_| {
+        Some(s) => Some(RevisionId::parse(s).map_err(|_| {
             internal_not_committed("corrupt_restored_rev", "invalid restored_from_rev_id")
         })?),
         None => None,
     };
     let created_at = decode_timestamp_parts(sec, nsec)?;
 
-    Ok(Some(StoredRevisionRecord {
+    Ok(StoredRevisionRecord {
         revision_id,
         space_seq,
         visibility_seq,
@@ -3627,7 +3900,7 @@ pub(crate) async fn read_immutable_revision_tx(
         agent_run_id,
         restored_from_rev_id,
         created_at,
-    }))
+    })
 }
 
 #[cfg(test)]

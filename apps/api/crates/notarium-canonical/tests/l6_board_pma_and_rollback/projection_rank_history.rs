@@ -1,114 +1,5 @@
 use super::*;
 
-pub(super) async fn check_board_exit_tombstones_rank(
-    store: &CanonicalStore,
-    scope: &HistoryScope,
-    owner: &PrincipalId,
-    planner: &CanonicalTestBoardPlanner,
-    view: &ViewRef,
-    view_revision: RevisionId,
-) {
-    let human = owner_ctx(scope, owner.clone());
-    let card = sample_note_id(120);
-    let original = store
-        .create_note(
-            human.clone(),
-            next_mutation(
-                scope,
-                owner,
-                CreateNote {
-                    note: card.clone(),
-                    parent: None,
-                    slug: "card-outside-view".to_owned(),
-                    class: DocClass::UserDoc,
-                    carrier: "---\nstatus: archived\n---\nCard\n".to_owned(),
-                },
-            ),
-        )
-        .await
-        .unwrap();
-    planner.tracked_notes.lock().unwrap().insert(card.clone());
-    let run = sample_run_id(12);
-    let moved = store
-        .move_board_card(
-            agent_run_ctx(&human, run.clone()),
-            next_mutation(
-                scope,
-                owner,
-                MoveBoardCard {
-                    view: view.clone(),
-                    note: card.clone(),
-                    group: GroupKey::Value(ScalarValue::String("holding".to_owned())),
-                    before: None,
-                    after: None,
-                    fields: BTreeMap::from([(
-                        "status".to_owned(),
-                        Some(YamlValue::String("holding".to_owned())),
-                    )]),
-                    expected_note: original.value.revision,
-                    expected_view: view_revision,
-                    expected_rank: RankExpectation::Absent,
-                },
-            ),
-        )
-        .await
-        .unwrap();
-    let overlays = store
-        .inspect_view_overlays_for_test(&scope.space_id, view)
-        .await
-        .unwrap();
-    let restored = store
-        .rollback_agent_run(
-            human.clone(),
-            next_mutation(
-                scope,
-                owner,
-                RollbackAgentRun {
-                    expected_run_revision: store
-                        .inspect_agent_run_revision_for_test(&scope.space_id, &run)
-                        .await
-                        .unwrap()
-                        .unwrap(),
-                    run,
-                    expected_entities: vec![moved.value.revision],
-                    associated_board_expectations: vec![AssociatedBoardExpectation {
-                        note: card.clone(),
-                        view: view.clone(),
-                        expected_rank: RankExpectation::Existing(moved.value.rank_revision.clone()),
-                        expected_placement_revision: overlays[&card].placement_revision.clone(),
-                    }],
-                },
-            ),
-        )
-        .await
-        .unwrap();
-    assert_eq!(restored.receipt.seq().get() - moved.receipt.seq().get(), 2);
-    assert!(restored.value.trashed.is_empty());
-    assert_eq!(restored.value.restored[0].note, card);
-    assert!(store.is_live_visible(&human, &card).await.unwrap());
-    assert!(
-        !store
-            .inspect_view_overlays_for_test(&scope.space_id, view)
-            .await
-            .unwrap()
-            .contains_key(&card)
-    );
-    let tombstone = store
-        .read_entity_revision_at_cutoff(
-            scope,
-            "rank",
-            &format!("{}:{}:{card}", view.note, view.key),
-            Some(restored.receipt.seq()),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(matches!(
-        tombstone.metadata.payload,
-        notarium_canonical::codec::RevisionMetadataPayload::Rank(rank) if rank.removed
-    ));
-}
-
 async fn check_note_only_rollback_deletes_ranks(store: &CanonicalStore, postgres: bool) {
     use notarium_core::ports::{DeleteDisposition, DeleteNote};
 
@@ -142,6 +33,7 @@ async fn check_note_only_rollback_deletes_ranks(store: &CanonicalStore, postgres
                     &scope,
                     &owner,
                     CreateNote {
+                        folder_page: false,
                         note: note.clone(),
                         parent: None,
                         slug: slug.to_owned(),
@@ -216,23 +108,7 @@ async fn check_note_only_rollback_deletes_ranks(store: &CanonicalStore, postgres
         pairs.push((view, target, prior));
     }
     let rollback = store
-        .rollback_agent_run(
-            human,
-            next_mutation(
-                &scope,
-                &owner,
-                RollbackAgentRun {
-                    expected_run_revision: store
-                        .inspect_agent_run_revision_for_test(&scope.space_id, &run)
-                        .await
-                        .unwrap()
-                        .unwrap(),
-                    run,
-                    expected_entities,
-                    associated_board_expectations: Vec::new(),
-                },
-            ),
-        )
+        .rollback_agent_run_by_id(human, next_mutation(&scope, &owner, run))
         .await
         .unwrap();
     let cut = rollback.receipt.seq();
@@ -281,8 +157,9 @@ async fn l6_note_only_rollback_tombstones_both_rank_endpoints() {
 
     let fixtures = StorageTestFixtures::load_required();
     let schema = fixtures.fresh_pg_schema();
-    let root = TempDataRoot::new("rank-removal-postgres");
-    let config = fixtures.pg_local_config(sample_installation_id(92), &schema, root.data_root());
+    let config = fixtures
+        .open_pg_s3_config(sample_installation_id(92), &schema)
+        .await;
     let (store, runtime) = CanonicalRuntime::open(config).await.unwrap();
     check_note_only_rollback_deletes_ranks(&store, true).await;
     runtime.shutdown().await.unwrap();
@@ -303,7 +180,9 @@ async fn l6_v6_rank_anchor_is_atomic_survives_restore_and_is_erased_by_purge() {
     for postgres in [false, true] {
         let temp = TempDataRoot::new("rank-anchor-migration");
         let config = if postgres {
-            fixtures.pg_local_config(installation.clone(), &schema, temp.data_root())
+            fixtures
+                .open_pg_s3_config(installation.clone(), &schema)
+                .await
         } else {
             CanonicalConfig::local_default(installation.clone(), temp.data_root())
         };
@@ -345,6 +224,7 @@ async fn l6_v6_rank_anchor_is_atomic_survives_restore_and_is_erased_by_purge() {
                     &scope,
                     &owner,
                     CreateNote {
+                        folder_page: false,
                         note,
                         parent: None,
                         slug: slug.to_owned(),
@@ -413,7 +293,10 @@ async fn l6_v6_rank_anchor_is_atomic_survives_restore_and_is_erased_by_purge() {
         drop(store);
         runtime.shutdown().await.unwrap();
 
-        let remove_projection = include_str!("../fixtures/schema-v6-remove-projection.sql");
+        let downgrade_schema = concat!(
+            include_str!("../fixtures/schema-v6-remove-projection.sql"),
+            include_str!("../fixtures/schema-v8-remove-agents.sql")
+        );
         let old_hash = hex::decode(CANONICAL_V6_HASH).unwrap();
         let invalid_height = height.get() as i64 + 1;
         let downgrade = "UPDATE schema_meta SET schema_version=6, manifest_checksum=$1";
@@ -434,7 +317,7 @@ async fn l6_v6_rank_anchor_is_atomic_survives_restore_and_is_erased_by_purge() {
                 .execute(&mut db)
                 .await
                 .unwrap();
-            sqlx::raw_sql(remove_projection)
+            sqlx::raw_sql(downgrade_schema)
                 .execute(&mut db)
                 .await
                 .unwrap();
@@ -476,7 +359,7 @@ async fn l6_v6_rank_anchor_is_atomic_survives_restore_and_is_erased_by_purge() {
             set_height!(db, height.get() as i64);
         } else {
             let mut db = temp.open_raw_sqlite().await;
-            sqlx::raw_sql(remove_projection)
+            sqlx::raw_sql(downgrade_schema)
                 .execute(&mut db)
                 .await
                 .unwrap();
@@ -657,7 +540,7 @@ async fn l6_numeric_move_replays_v6_receipt_and_preserves_mixed_neighbor_ranks()
         let temp = TempDataRoot::new("numeric-board-upgrade");
         let installation = sample_installation_id(86);
         let config = if postgres {
-            fixtures.pg_local_config(installation, &schema, temp.data_root())
+            fixtures.open_pg_s3_config(installation, &schema).await
         } else {
             CanonicalConfig::local_default(installation, temp.data_root())
         };
@@ -682,6 +565,7 @@ async fn l6_numeric_move_replays_v6_receipt_and_preserves_mixed_neighbor_ranks()
                             &scope,
                             &owner,
                             CreateNote {
+                                folder_page: false,
                                 note,
                                 parent: None,
                                 slug: format!("numeric-{i}"),
@@ -743,7 +627,7 @@ async fn l6_numeric_move_replays_v6_receipt_and_preserves_mixed_neighbor_ranks()
         let v6_group = grouped.finalize().to_hex().to_string();
         macro_rules! downgrade {
             ($db:expr) => {{
-                sqlx::raw_sql(include_str!("../fixtures/schema-v6-remove-projection.sql")).execute(&mut $db).await.unwrap();
+                sqlx::raw_sql(concat!(include_str!("../fixtures/schema-v6-remove-projection.sql"), include_str!("../fixtures/schema-v8-remove-agents.sql"))).execute(&mut $db).await.unwrap();
                 sqlx::query("UPDATE schema_meta SET schema_version=6,manifest_checksum=$1")
                     .bind(hex::decode(support::CANONICAL_V6_HASH).unwrap()).execute(&mut $db).await.unwrap();
                 let rows = sqlx::query("UPDATE command_receipts SET command_hash=$1 WHERE idempotency_key=$2 AND command_hash<>$1")

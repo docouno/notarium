@@ -33,9 +33,17 @@ impl Command {
         operation: &'static str,
         payload: impl Serialize,
     ) -> Result<Self, PortError> {
+        Self::new_with_limit(identity, operation, payload, 65536)
+    }
+    pub fn new_with_limit(
+        identity: AccountCommandIdentity,
+        operation: &'static str,
+        payload: impl Serialize,
+        max_bytes: usize,
+    ) -> Result<Self, PortError> {
         let bytes = serde_json::to_vec(&(1, operation, identity.hash, identity.expected, payload))
             .map_err(|_| invalid(ValidationReason::InvalidQuery))?;
-        if bytes.len() > 65536 {
+        if bytes.len() > max_bytes {
             return Err(invalid(ValidationReason::InvalidLimit));
         }
         Ok(Self {

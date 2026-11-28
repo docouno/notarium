@@ -416,6 +416,7 @@ impl CanonicalStore {
         let space = scope.space_id.clone();
         let store = self.clone();
         self.with_visibility_write_tx(
+            Some(space.clone()),
             Some(space),
             move |tx| {
                 Box::pin(async move {

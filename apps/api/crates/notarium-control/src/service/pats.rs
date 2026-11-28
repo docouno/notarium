@@ -36,6 +36,7 @@ fn metadata(row: PatsRow, max: u16) -> Result<PatInfo, PortError> {
             "write" => BearerScope::Write,
             _ => return Err(denied()),
         },
+        ability_write: row.ability_write == 1,
         selected_spaces: selected(row.selected_spaces.as_deref(), max)?
             .map(|s| s.into_iter().collect()),
         expires_at_ms: row.expires_at,
@@ -58,6 +59,9 @@ impl ControlService {
         ctx: AccountContext,
         request: CreatePat,
     ) -> Result<ControlCommit<IssuedPat>, PortError> {
+        if request.ability_write && request.scope != BearerScope::Write {
+            return Err(invalid(ValidationReason::InvalidAuthority));
+        }
         if request.name.is_empty()
             || request.name.len() > 256
             || request.name.contains('\0')
@@ -74,27 +78,73 @@ impl ControlService {
             .run(
                 async {
                     let (_, current) = self
-                        .manager(tx.inner_mut(), ctx.auth(), ctx.auth().principal())
+                        .manager_allow_space_narrowed(
+                            tx.inner_mut(),
+                            ctx.auth(),
+                            ctx.auth().principal(),
+                        )
                         .await?;
                     expect_revision(&current, request.expected)?;
                     let now = self.clock.now_ms()?;
                     if request.expires_at_ms.is_some_and(|time| time <= now) {
                         return Err(invalid(ValidationReason::InvalidTimestamp));
                     }
+                    let auth = self
+                        .human_context(
+                            tx.inner_mut(),
+                            &current,
+                            ctx.auth().credential().cloned().ok_or_else(denied)?,
+                            ctx.auth().grant().clone(),
+                            false,
+                            false,
+                            true,
+                        )
+                        .await?;
+                    // Minted bearers resolve against live `DocClass::all()` grants;
+                    // reject any class-narrowed caller before issuance.
+                    let all_classes = notarium_core::classes::DocClass::all();
+                    let check_caller_grant = |id: &SpaceId,
+                                              caller_grant: &notarium_core::auth::SpaceGrant|
+                     -> Result<(), PortError> {
+                        if caller_grant.read_classes != all_classes {
+                            return Err(access_denied());
+                        }
+                        if request.scope == BearerScope::Write {
+                            let live_writable = auth
+                                .spaces()
+                                .get(id)
+                                .map(|g| g.role != notarium_core::auth::SpaceRole::Viewer)
+                                .unwrap_or(
+                                    caller_grant.role != notarium_core::auth::SpaceRole::Viewer,
+                                );
+                            if live_writable
+                                && (caller_grant.role == notarium_core::auth::SpaceRole::Viewer
+                                    || caller_grant.write_classes != all_classes)
+                            {
+                                return Err(access_denied());
+                            }
+                        }
+                        Ok(())
+                    };
                     if let Some(spaces) = &request.selected_spaces {
-                        let auth = self
-                            .human_context(
-                                tx.inner_mut(),
-                                &current,
-                                ctx.auth().credential().cloned().ok_or_else(denied)?,
-                                ctx.auth().grant().clone(),
-                                false,
-                                false,
-                                true,
-                            )
-                            .await?;
-                        if spaces.iter().any(|id| !auth.spaces().contains_key(id)) {
+                        if spaces
+                            .iter()
+                            .any(|id| !ctx.auth().spaces().contains_key(id))
+                            || spaces.iter().any(|id| !auth.spaces().contains_key(id))
+                        {
                             return Err(DomainError::ResourceNotFound.into());
+                        }
+                        for id in spaces {
+                            let caller_grant =
+                                ctx.auth().spaces().get(id).ok_or_else(access_denied)?;
+                            check_caller_grant(id, caller_grant)?;
+                        }
+                    } else {
+                        if ctx.auth().is_space_narrowed() {
+                            return Err(access_denied());
+                        }
+                        for (id, caller_grant) in ctx.auth().spaces() {
+                            check_caller_grant(id, caller_grant)?;
                         }
                     }
                     let spaces = request.selected_spaces.map(|spaces| {
@@ -115,6 +165,7 @@ impl ControlService {
                         user_id: current.user_id.clone(),
                         name: request.name,
                         scope: scope(request.scope).into(),
+                        ability_write: i64::from(request.ability_write),
                         selected_spaces,
                         expires_at: request.expires_at_ms,
                         last_used_at: None,
@@ -143,7 +194,7 @@ impl ControlService {
                 CommitEffect::NotCommitted,
             )
             .await?;
-        budget.run(tx.commit(), CommitEffect::Unknown).await?;
+        budget.commit_tx(tx).await?;
         Ok(result)
     }
     pub async fn list_pats(
@@ -166,6 +217,9 @@ impl ControlService {
                     let (_, current) = self
                         .manager_read(rtx.inner_mut(), ctx.auth(), &account)
                         .await?;
+                    if ctx.auth().is_space_narrowed() {
+                        return Err(access_denied());
+                    }
                     if let Some(cursor) = &cursor {
                         if cursor.version != 1 || cursor.owner != account {
                             return Err(invalid(ValidationReason::ScopeMismatch));
@@ -229,27 +283,37 @@ impl ControlService {
         command.require(ctx.auth().principal(), &request.input.account)?;
         let budget = OperationBudget::new(ctx.budget.clone());
         let mut tx = self.store.write(budget.clone()).await?;
-        let (revision,saved)=budget.run(async {
+        let (revision,saved,enqueued)=budget.run(async {
             let (_,current)=self.manager(tx.inner_mut(),ctx.auth(),&request.input.account).await?;
-            if let Some(replay)=command.replay::<()>(tx.inner_mut()).await? {return Ok(replay);}
+            if ctx.auth().is_space_narrowed() {return Err(access_denied());}
+            if let Some((revision,saved))=command.replay::<()>(tx.inner_mut()).await? {return Ok((revision,saved,Vec::new()));}
             expect_revision(&current,command.identity.expected)?;
-            let pat=pat(tx.inner_mut(),request.input.token.as_str()).await?;
+            let pat = match pat(tx.inner_mut(), request.input.token.as_str()).await {
+                Ok(pat) => pat,
+                Err(PortError::Domain(DomainError::AuthenticationFailed)) => {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+                Err(err) => return Err(err),
+            };
             if pat.user_id!=current.user_id {return Err(DomainError::ResourceNotFound.into());}
             let now=self.clock.now_ms()?;
             let mut events=super::outbox::pending(tx.inner_mut(),RevocationSelector::Grant(grant("pat",&pat.token_id))).await?;
+            let mut enqueued=Vec::new();
             let revision=if pat.revoked_at.is_none() {
                 execute!(tx.inner_mut(),"UPDATE pats SET revoked_at=$1 WHERE token_id=$2","UPDATE v1_control.pats SET revoked_at=$1 WHERE token_id=$2";now,&pat.token_id)?;
                 let revision=next(current.revision)?;
                 execute!(tx.inner_mut(),"UPDATE users SET revision=$1 WHERE user_id=$2","UPDATE v1_control.users SET revision=$1 WHERE user_id=$2";revision,&current.user_id)?;
-                events.push(super::outbox::enqueue(tx.inner_mut(),RevocationSelector::Grant(grant("pat",&pat.token_id)),RevocationReason::CredentialRemoved,revision,now).await?);
+                let event = super::outbox::enqueue(tx.inner_mut(),RevocationSelector::Grant(grant("pat",&pat.token_id)),RevocationReason::CredentialRemoved,revision,now).await?;
+                enqueued.push(event.clone());
+                events.push(event);
                 revision
             } else {current.revision};
             let revision=ControlRevision::new(revision as u64)?;
             let saved=SavedResult{value:(),events};
             command.save(tx.inner_mut(),revision,&saved,now).await?;
-            Ok((revision,saved))
+            Ok((revision,saved,enqueued))
         },CommitEffect::NotCommitted).await?;
-        self.commit_revocations(tx, &budget, &saved.events).await?;
+        self.commit_revocations(tx, &budget, &enqueued).await?;
         for event in &saved.events {
             self.flush_event(&budget, event).await?;
         }

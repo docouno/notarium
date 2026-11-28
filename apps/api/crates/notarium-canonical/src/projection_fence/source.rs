@@ -24,10 +24,11 @@ pub(super) struct FolderRow {
     pub parent: Option<FolderId>,
     pub lifecycle: Lifecycle,
     pub write_locked: bool,
+    pub is_project: bool,
 }
 
 type NoteColumns = (String, Option<String>, String, String, Option<String>);
-type FolderColumns = (String, Option<String>, String, bool);
+type FolderColumns = (String, Option<String>, String, bool, bool);
 
 impl TryFrom<NoteColumns> for NoteRow {
     type Error = PortError;
@@ -46,12 +47,15 @@ impl TryFrom<NoteColumns> for NoteRow {
 impl TryFrom<FolderColumns> for FolderRow {
     type Error = PortError;
 
-    fn try_from((id, parent, lifecycle, write_locked): FolderColumns) -> Result<Self, PortError> {
+    fn try_from(
+        (id, parent, lifecycle, write_locked, is_project): FolderColumns,
+    ) -> Result<Self, PortError> {
         Ok(Self {
             id: FolderId::parse(&id)?,
             parent: parent.as_deref().map(FolderId::parse).transpose()?,
             lifecycle: lifecycle_from_db(&lifecycle)?,
             write_locked,
+            is_project,
         })
     }
 }
@@ -61,7 +65,7 @@ const NOTE_PAGE: &str = "SELECT note_id, parent_folder_id, doc_class, lifecycle_
     ORDER BY note_id LIMIT $3";
 
 const FOLDER_PAGE: &str = "SELECT folder_id, parent_folder_id, lifecycle_state,
-    write_lock_json IS NOT NULL FROM folder_heads WHERE space_id=$1 AND folder_id>$2
+    write_lock_json IS NOT NULL, is_project <> 0 FROM folder_heads WHERE space_id=$1 AND folder_id>$2
     ORDER BY folder_id LIMIT $3";
 
 fn page_budget(budget: &CallBudget, deadline: tokio::time::Instant) -> CallBudget {
@@ -188,7 +192,7 @@ SELECT n.note_id, h.parent_folder_id, COALESCE(h.doc_class,'user-doc'),
        COALESCE(h.lifecycle_state,'purged'), h.ability_id
 FROM notes n LEFT JOIN note_heads h ON h.space_id=$1 AND h.note_id=n.note_id";
 
-const FOLDERS_DELTA: &str = "SELECT folder_id, parent_folder_id, lifecycle_state, write_lock_json IS NOT NULL
+const FOLDERS_DELTA: &str = "SELECT folder_id, parent_folder_id, lifecycle_state, write_lock_json IS NOT NULL, is_project <> 0
     FROM folder_heads WHERE space_id=$1 AND folder_id IN (
         SELECT entity_id FROM change_log WHERE space_id=$1 AND space_seq>$2 AND space_seq<=$3 AND entity_type='folder'
     )";

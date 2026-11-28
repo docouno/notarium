@@ -173,8 +173,34 @@ async fn exercise(pg: bool) {
         .await
         .unwrap();
     assert_eq!(full.detail.unwrap().resources.len(), 1);
+    // Space-narrowed PATs cannot inspect account-wide agent call logs.
+    assert!(matches!(
+        service
+            .get_agent_call(delegated.clone(), RequestId::from_bytes([2; 16]))
+            .await,
+        Err(notarium_core::error::PortError::Domain(
+            notarium_core::DomainError::AccessDenied
+        ))
+    ));
+    assert!(matches!(
+        service
+            .list_agent_calls(
+                delegated.clone(),
+                ControlPageRequest::new(10, None).unwrap()
+            )
+            .await,
+        Err(notarium_core::error::PortError::Domain(
+            notarium_core::DomainError::AccessDenied
+        ))
+    ));
+    // An un-narrowed PAT whose Space grants lack read_classes still filters hidden resources.
+    let mut no_read_grants = ctx.auth().spaces().clone();
+    for grant in no_read_grants.values_mut() {
+        grant.read_classes.clear();
+    }
+    let unreadable = AccountContext::new(ctx.auth().for_pat(no_read_grants).unwrap(), budget());
     let limited = service
-        .get_agent_call(delegated.clone(), RequestId::from_bytes([2; 16]))
+        .get_agent_call(unreadable, RequestId::from_bytes([2; 16]))
         .await
         .unwrap();
     assert!(limited.detail.unwrap().resources.is_empty());
@@ -508,6 +534,7 @@ async fn cleanup_operational_tables(pg: bool) {
                     last_seen_at: Some(old),
                 },
                 TargetRecord::OauthGrants {
+                    ability_write: 0,
                     grant_id: OAuthGrantId::from_bytes([68; 16]).to_string(),
                     user_id: owner.to_string(),
                     client_id: "client_gc_fixture".into(),
@@ -550,6 +577,7 @@ async fn cleanup_operational_tables(pg: bool) {
                     rotated_to: None,
                 },
                 TargetRecord::OauthAccessTokens {
+                    ability_write: 0,
                     token_id: "707070707070".into(),
                     token_hash: vec![70; 32],
                     grant_id: OAuthGrantId::from_bytes([68; 16]).to_string(),
@@ -642,7 +670,8 @@ async fn cleanup_operational_tables(pg: bool) {
                     write_class_mask: 1,
                     budgets: serde_json::to_string(&RunLimits::default()).unwrap(),
                     misfire_policy: "coalesce_latest".into(),
-                    next_slot_utc_ms: old - (old % 60_000),
+                    approved_skills: "[]".into(),
+                    next_slot_utc_ms: Some(old - (old % 60_000)),
                     deleted_at: Some(old),
                     revision: 1,
                     config_revision: 1,
@@ -656,7 +685,10 @@ async fn cleanup_operational_tables(pg: bool) {
                     lease_epoch: 1,
                     claim_request_hash: vec![75; 32],
                     claimed_schedule_revision: 0,
-                    reserved_next_slot: old - (old % 60_000) + 60_000,
+                    approved_skills: "[]".into(),
+                    keeper_log_id: None,
+                    keeper_project_folder_id: None,
+                    reserved_next_slot: Some(old - (old % 60_000) + 60_000),
                     status: "succeeded".into(),
                     started_at: old,
                     finished_at: Some(old + 1000),

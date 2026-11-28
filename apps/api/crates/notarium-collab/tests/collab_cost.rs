@@ -93,6 +93,7 @@ async fn collab_cost() {
                 mutation(
                     &owner,
                     notarium_core::ports::CreateNote {
+                        folder_page: false,
                         note: NoteId::from_bytes(id_bytes),
                         parent: None,
                         slug: format!("rss-room-{seed:03}"),

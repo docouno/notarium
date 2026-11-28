@@ -617,13 +617,16 @@ impl S3BlobStore {
                 "S3ChunkedV1 manifest must contain at least 1 part",
             ));
         }
-
-        let total_cap = usize::try_from(expected_total_raw_size).map_err(|_| {
-            internal_not_committed("corrupt_s3_total_raw_size", "raw_size exceeds usize")
-        })?;
-        let mut assembled = Vec::with_capacity(total_cap.min(256 * 1024));
-        let mut total_hasher = blake3::Hasher::new();
-
+        if expected_total_raw_size > crate::blobs::MAX_BLOB_DECODE_BYTES {
+            return Err(internal_not_committed(
+                "blob_decode_limit_exceeded",
+                format!(
+                    "expected total raw size {expected_total_raw_size} exceeds decode cap {}",
+                    crate::blobs::MAX_BLOB_DECODE_BYTES
+                ),
+            ));
+        }
+        let mut manifest_raw_sum = 0u64;
         for (expected_idx, part) in parts.iter().enumerate() {
             if part.part_index as usize != expected_idx {
                 return Err(internal_not_committed(
@@ -634,6 +637,29 @@ impl S3BlobStore {
                     ),
                 ));
             }
+            manifest_raw_sum = manifest_raw_sum.checked_add(part.raw_size).ok_or_else(|| {
+                internal_not_committed(
+                    "corrupt_s3_manifest_raw_size",
+                    "manifest part raw_size sum overflowed u64",
+                )
+            })?;
+        }
+        if manifest_raw_sum != expected_total_raw_size {
+            return Err(internal_not_committed(
+                "corrupt_s3_manifest_raw_size",
+                format!(
+                    "manifest part raw_size sum {manifest_raw_sum} != catalog raw_size {expected_total_raw_size}"
+                ),
+            ));
+        }
+
+        let total_cap = usize::try_from(expected_total_raw_size).map_err(|_| {
+            internal_not_committed("corrupt_s3_total_raw_size", "raw_size exceeds usize")
+        })?;
+        let mut assembled = Vec::with_capacity(total_cap.min(256 * 1024));
+        let mut total_hasher = blake3::Hasher::new();
+
+        for part in parts {
             self.ensure_valid_cas_key(&part.physical_key)?;
 
             let resp = self
@@ -771,7 +797,7 @@ impl S3BlobStore {
                 let pub_done = target.publication_id.clone();
                 let part_idx = target.part_index;
                 store
-                    .with_write_tx(|tx| {
+                    .with_write_tx_for_space(Some(scope.space_id.clone()), |tx| {
                         Box::pin(async move {
                             lock_and_check_space_tx(tx, &scope_done, active_epoch).await?;
                             mark_retirement_target_completed_tx(
@@ -849,7 +875,7 @@ impl S3BlobStore {
                     let part_idx = target.part_index;
                     let vids_save = data_vids.clone();
                     store
-                        .with_write_tx(|tx| {
+                        .with_write_tx_for_space(Some(scope.space_id.clone()), |tx| {
                             Box::pin(async move {
                                 lock_and_check_space_tx(tx, &scope_save, active_epoch).await?;
                                 persist_s3_target_version_ids_tx(
@@ -920,7 +946,7 @@ impl S3BlobStore {
                 let pub_done = target.publication_id.clone();
                 let part_idx = target.part_index;
                 store
-                    .with_write_tx(|tx| {
+                    .with_write_tx_for_space(Some(scope.space_id.clone()), |tx| {
                         Box::pin(async move {
                             lock_and_check_space_tx(tx, &scope_done, active_epoch).await?;
                             mark_retirement_target_completed_tx(
@@ -1755,5 +1781,94 @@ mod tests {
         assert_eq!(parsed.entries[0].version_id, "v2");
         assert!(!parsed.entries[1].is_latest);
         assert_eq!(parsed.entries[1].version_id, "v1");
+    }
+
+    #[tokio::test]
+    async fn chunked_read_rejects_manifest_raw_size_mismatch_before_any_get() {
+        #[derive(Debug)]
+        struct PanicOnSendTransport;
+
+        impl S3Transport for PanicOnSendTransport {
+            fn send<'a>(
+                &'a self,
+                _req: S3RawRequest,
+            ) -> BoxFuture<'a, Result<S3RawResponse, PortError>> {
+                panic!("manifest raw_size validation must fail before any S3 GET");
+            }
+        }
+
+        let store = S3BlobStore {
+            config: S3Config {
+                endpoint: "http://127.0.0.1:9000".into(),
+                region: "us-east-1".into(),
+                bucket: "unit-test".into(),
+                application_prefix: String::new(),
+                addressing: S3AddressingStyle::PathStyle,
+                credentials: S3Credentials {
+                    access_key_id: "k".into(),
+                    secret_access_key: "s".into(),
+                    session_token: None,
+                },
+                custom_ca_pem: None,
+                unix_socket: None,
+                bucket_mode_policy: S3BucketModePolicy::DetectFromBucket,
+                request_timeout: Duration::from_secs(5),
+            },
+            normalized_prefix: String::new(),
+            bucket_mode: S3BucketMode::Enabled,
+            transport: Arc::new(PanicOnSendTransport),
+        };
+        let mismatched = vec![
+            S3ManifestPart {
+                part_index: 0,
+                raw_size: 4 * 1024 * 1024,
+                compressed_size: 128,
+                part_blake3: ContentDigest::from_bytes([1; 32]),
+                physical_key: "spaces/sp_1/cas-v1/pub_1/0".into(),
+            },
+            S3ManifestPart {
+                part_index: 1,
+                raw_size: 4 * 1024 * 1024,
+                compressed_size: 128,
+                part_blake3: ContentDigest::from_bytes([2; 32]),
+                physical_key: "spaces/sp_1/cas-v1/pub_1/1".into(),
+            },
+        ];
+        let err = store
+            .read_verified_chunked(ContentDigest::from_bytes([3; 32]), 1024, &mismatched)
+            .await
+            .expect_err("sum(part.raw_size) != catalog raw_size must fail before GET");
+        assert!(
+            matches!(
+                err,
+                PortError::Internal(ref failure)
+                    if failure.effect() == notarium_core::error::CommitEffect::NotCommitted
+            ),
+            "unexpected error: {err:?}"
+        );
+
+        let over_cap = vec![S3ManifestPart {
+            part_index: 0,
+            raw_size: crate::blobs::MAX_BLOB_DECODE_BYTES + 1,
+            compressed_size: 128,
+            part_blake3: ContentDigest::from_bytes([4; 32]),
+            physical_key: "spaces/sp_1/cas-v1/pub_1/0".into(),
+        }];
+        let cap_err = store
+            .read_verified_chunked(
+                ContentDigest::from_bytes([5; 32]),
+                crate::blobs::MAX_BLOB_DECODE_BYTES + 1,
+                &over_cap,
+            )
+            .await
+            .expect_err("expected_total_raw_size > MAX_BLOB_DECODE_BYTES must fail before GET");
+        assert!(
+            matches!(
+                cap_err,
+                PortError::Internal(ref failure)
+                    if failure.effect() == notarium_core::error::CommitEffect::NotCommitted
+            ),
+            "unexpected error: {cap_err:?}"
+        );
     }
 }

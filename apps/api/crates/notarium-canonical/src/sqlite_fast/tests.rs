@@ -8,6 +8,63 @@ use notarium_core::{
 use std::sync::mpsc;
 use tokio::sync::oneshot;
 
+#[tokio::test]
+async fn native_rollback_checks_the_lease_before_publishing_sql_and_room_state() {
+    struct Lease(bool);
+    impl RevocationLease for Lease {
+        fn check(&self) -> Result<(), PortError> {
+            if self.0 {
+                Ok(())
+            } else {
+                Err(deadline_not_committed("test_expired", "test lease expired"))
+            }
+        }
+    }
+
+    let (store, runtime, _, path) = fixture().await;
+    for admitted in [false, true] {
+        let conn = open_rusqlite_writer_connection(&path.join("v1/canonical.sqlite")).unwrap();
+        conn.execute_batch(
+            "CREATE TEMP TABLE changes (n INTEGER); BEGIN IMMEDIATE; INSERT INTO changes VALUES (1)",
+        )
+        .unwrap();
+        let published = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let room_state = published.clone();
+        let committed = Arc::new(AtomicBool::new(false));
+        let result = finish_fast_sql_stage(
+            &conn,
+            BTreeMap::new(),
+            PendingDirSyncs::default(),
+            Vec::new(),
+            Vec::new(),
+            vec![CommitAction::ConfirmedOrUnknown(Box::new(move || {
+                room_state.store(true, Ordering::SeqCst);
+            }))],
+            Arc::clone(&committed),
+            Vec::new(),
+            None,
+            &store.inner,
+            false,
+            Some(&Lease(admitted)),
+            false,
+        );
+        assert!(match result {
+            FastSqlStageResult::CommittedDirectly { .. } => admitted,
+            FastSqlStageResult::AbortedBeforeCommit(PortError::DeadlineExceeded(_)) => !admitted,
+            _ => false,
+        });
+        assert!(conn.is_autocommit());
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM changes", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, i64::from(admitted));
+        assert_eq!(published.load(Ordering::SeqCst), admitted);
+        assert_eq!(committed.load(Ordering::Acquire), admitted);
+    }
+    runtime.shutdown().await.unwrap();
+    std::fs::remove_dir_all(path).unwrap();
+}
+
 async fn fixture() -> (
     CanonicalStore,
     CanonicalRuntime,

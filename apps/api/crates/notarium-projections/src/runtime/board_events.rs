@@ -78,6 +78,7 @@ struct BoardNoteFacts {
     class: DocClass,
     ability: Option<AbilityId>,
     ancestors: Vec<FolderId>,
+    project: Option<FolderId>,
     write_locked: bool,
 }
 
@@ -87,6 +88,7 @@ impl BoardNoteFacts {
             class: note.doc_class,
             ability: note.ability_id.clone(),
             ancestors: location.ids,
+            project: location.project,
             write_locked: location.write_locked,
         }
     }
@@ -96,6 +98,7 @@ impl BoardNoteFacts {
             .can_view_resource(&ResourceFacts {
                 space: permit.space().clone(),
                 class: self.class,
+                project: self.project.clone(),
                 ancestor_folders: self.ancestors.clone(),
                 folder_write_locked: self.write_locked,
                 ability_package: self.ability.clone(),
@@ -146,8 +149,14 @@ impl BoardSourceFacts {
         if self.requires_folder_grant && !full_folder {
             return None;
         }
+        let keeper_skill_scoped =
+            matches!(auth.kind(), notarium_core::auth::PrincipalKind::Keeper(_))
+                && self.source_classes.contains(&DocClass::Skill);
         Some(
-            if full_folder && self.source_classes.is_subset(&grant.read_classes) {
+            if full_folder
+                && self.source_classes.is_subset(&grant.read_classes)
+                && !keeper_skill_scoped
+            {
                 BoardAudience::Full
             } else {
                 BoardAudience::Scoped

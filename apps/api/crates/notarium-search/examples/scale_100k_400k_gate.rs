@@ -214,6 +214,7 @@ fn build(
             },
             fixture.revisions[ordinal as usize].clone(),
             ResourceFacts {
+                project: None,
                 space: fixture.space.clone(),
                 class: DocClass::UserDoc,
                 ancestor_folders: vec![folder_id.clone(), fixture.root_folder.clone()],

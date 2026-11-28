@@ -13,16 +13,17 @@ pub(super) fn scope(raw: &str) -> Result<OAuthScope, PortError> {
     if raw.len() > 128 {
         return Err(rejected(OAuthErrorCode::InvalidScope));
     }
-    let (mut read, mut write, mut offline) = (false, false, false);
+    let (mut read, mut write, mut offline, mut ability_write) = (false, false, false, false);
     for part in raw.split(' ') {
         match part {
             "read" => read = true,
             "write" => write = true,
             "offline_access" => offline = true,
+            "mcp:ability-write" => ability_write = true,
             _ => return Err(rejected(OAuthErrorCode::InvalidScope)),
         }
     }
-    if !read && !write {
+    if !write && (!read || ability_write) {
         return Err(rejected(OAuthErrorCode::InvalidScope));
     }
     Ok(OAuthScope {
@@ -32,6 +33,7 @@ pub(super) fn scope(raw: &str) -> Result<OAuthScope, PortError> {
             BearerScope::Read
         },
         offline_access: offline,
+        ability_write,
     })
 }
 pub(super) fn scope_name(scope: BearerScope) -> &'static str {
@@ -240,10 +242,18 @@ mod tests {
             scope("read write offline_access").unwrap(),
             OAuthScope {
                 access: BearerScope::Write,
-                offline_access: true
+                offline_access: true,
+                ability_write: false,
             }
         );
-        for denied in ["", "offline_access", "admin", "read\twrite"] {
+        assert!(scope("write mcp:ability-write").unwrap().ability_write);
+        for denied in [
+            "",
+            "offline_access",
+            "admin",
+            "read\twrite",
+            "read mcp:ability-write",
+        ] {
             assert!(scope(denied).is_err());
         }
     }

@@ -184,6 +184,65 @@ impl IndexView {
             .has_posting(&bucket_marker(&[TAG_NAMESPACE]), false)
     }
 
+    /// Exact direct-tag postings are already sorted in each index layer.
+    /// Bucketed checkpoints require verification against the projected rows.
+    pub(crate) fn visible_tags(
+        &self,
+        visible: &Bitmap,
+        limit: usize,
+    ) -> Result<Option<Vec<String>>, IndexError> {
+        if self.tags_bucketed() {
+            return Ok(None);
+        }
+        let prefix = [TAG_NAMESPACE];
+        let mut tags = std::collections::BTreeSet::new();
+        let mut error = None;
+        let mut visit = |key: &[u8]| {
+            let Ok(tag) = std::str::from_utf8(&key[1..]) else {
+                error = Some(IndexError::Untrusted("invalid tag posting"));
+                return false;
+            };
+            if tags.len() == limit
+                && tags
+                    .last()
+                    .is_some_and(|last: &String| tag >= last.as_str())
+            {
+                return false;
+            }
+            match self.ordinary_posting_in(key, visible) {
+                Ok(rows) if !rows.is_empty() => {
+                    tags.insert(tag.to_owned());
+                    if tags.len() > limit {
+                        tags.pop_last();
+                    }
+                }
+                Ok(_) => (),
+                Err(e) => {
+                    error = Some(e);
+                    return false;
+                }
+            }
+            true
+        };
+        self.base.visit_posting_keys(&prefix, &mut visit);
+        for layer in self.l0.iter_layers_newest_first() {
+            for key in layer
+                .postings
+                .range(prefix.to_vec()..)
+                .map(|(key, _)| key)
+                .take_while(|key| key.starts_with(&prefix))
+            {
+                if !visit(key) {
+                    break;
+                }
+            }
+        }
+        match error {
+            Some(error) => Err(error),
+            None => Ok(Some(tags.into_iter().collect())),
+        }
+    }
+
     pub fn posting(&self, key: &PostingKey) -> Result<Bitmap, IndexError> {
         if let PostingKey::ClusterMembers(cluster) = key {
             let mut main = match &self.l0.cluster_overlay {

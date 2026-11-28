@@ -459,6 +459,11 @@ async fn redaction_incomplete_cleanup_during_model_refresh_blocks_ack(
             mutation(
                 &ctx,
                 AppendChat {
+                    tool_calls: Vec::new(),
+                    interruption: None,
+                    provenance: None,
+                    proposed_diff: None,
+                    proposed_effect: None,
                     thread: thread.clone(),
                     parent: ThreadEntrySeq::ZERO,
                     kind: ChatEntryKind::Human,
@@ -1391,6 +1396,7 @@ async fn concurrent_trash_during_search_and_recall_skips_vanished_notes(
         .recall(
             ctx.clone(),
             RecallQuery {
+                max_per_source: None,
                 query: query("anchorvanishterm"),
                 graph_depth: 2,
                 token_budget: 2048,

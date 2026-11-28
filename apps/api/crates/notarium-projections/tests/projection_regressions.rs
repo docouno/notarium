@@ -30,7 +30,7 @@ use notarium_core::{
         DeleteNote, EditNote, EventBusPort, GroupCount, GroupKey, JobState, LinkReadPort,
         MaintenanceContext, MoveBoardCard, MoveFolder, Mutation, NoteQuery, NoteReadPort,
         NoteRevision, NoteWritePort, PageLimit, Preconditions, RankExpectation, RankNeighbor,
-        RenameFolder, ServiceAuthority, ServicePurpose, SpaceContext, SpaceEvent, SpaceEventKind,
+        RenameProject, ServiceAuthority, ServicePurpose, SpaceContext, SpaceEvent, SpaceEventKind,
         StructuralReadPort, ViewGraphPort, ViewQuery, ViewRef,
     },
     query::{
@@ -190,6 +190,7 @@ async fn create_note(
             mutation(
                 ctx,
                 CreateNote {
+                    folder_page: false,
                     note: NoteId::from_bytes(rand16()),
                     parent,
                     slug: slug.to_owned(),
@@ -537,6 +538,7 @@ async fn is_live_visible_hydrate_and_note_links_enforce_cross_space_taint_and_au
                         ctx.clone(),
                         ReadRequest::Open {
                             query: NoteQuery {
+                                tag: None,
                                 folder: None,
                                 recursive: true,
                                 classes: DocClass::all(),
@@ -561,6 +563,7 @@ async fn is_live_visible_hydrate_and_note_links_enforce_cross_space_taint_and_au
                         GraphQuery {
                             tier: GraphTier::Superclusters,
                             filter,
+                            causal: None,
                         },
                     )
                     .await
@@ -605,7 +608,7 @@ async fn folder_by_path_ignores_trashed_collision_and_list_notes_hydrates_cover_
         )
         .await
         .unwrap();
-    let (live_dir, live_rev) = create_folder(&store, &owner, None, "docs", false).await;
+    let (live_dir, live_rev) = create_folder(&store, &owner, None, "docs", true).await;
     let cover = create_note(
         &store,
         &owner,
@@ -621,7 +624,7 @@ async fn folder_by_path_ignores_trashed_collision_and_list_notes_hydrates_cover_
         Some(live_dir.clone()),
         "item",
         DocClass::UserDoc,
-        "---\ntitle: Item\nstatus: ok\n---\nBody\n".into(),
+        "---\ntitle: Item\ntags: [Visible]\nstatus: ok\n---\nBody\n".into(),
     )
     .await;
     // Attach cover_note_id to the folder and issue a canonical folder mutation so the
@@ -640,13 +643,14 @@ async fn folder_by_path_ignores_trashed_collision_and_list_notes_hydrates_cover_
     }
     let mut rename = mutation(
         &owner,
-        RenameFolder {
+        RenameProject {
             folder: live_dir.clone(),
             name: "docs".into(),
+            display_name: None,
         },
     );
     rename.preconditions.revision = Some(live_rev);
-    store.rename_folder(owner.clone(), rename).await.unwrap();
+    store.rename_project(owner.clone(), rename).await.unwrap();
 
     // Board/table view addressing the folder by path "/docs" must resolve cleanly
     // despite the trashed folder that previously held the same path.
@@ -706,6 +710,7 @@ async fn folder_by_path_ignores_trashed_collision_and_list_notes_hydrates_cover_
     // ProjectedNoteReadPort::list_notes populates FolderPage.page for a visible cover note.
     let read_port = ProjectedNoteReadPort::new(engine.clone());
     let query = NoteQuery {
+        tag: None,
         folder: Some(live_dir.clone()),
         recursive: false,
         classes: DocClass::all(),
@@ -728,6 +733,38 @@ async fn folder_by_path_ignores_trashed_collision_and_list_notes_hydrates_cover_
         )
         .await
         .unwrap();
+    assert_eq!(folder_page.total, 1);
+    assert_eq!(folder_page.children.items.len(), 1);
+    assert_eq!(folder_page.children.items[0].tags, ["visible"]);
+    let project = notarium_core::model::FolderRef {
+        space_id: scope.space_id.clone(),
+        folder_id: live_dir.clone(),
+    };
+    let counts = read_port
+        .project_note_counts(
+            owner.clone(),
+            project.clone(),
+            CausalBasis::Await(Default::default()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(counts.counts.get(&DocClass::UserDoc), Some(&2));
+    assert_eq!(counts.known_tags, ["visible"]);
+    let mut filtered = query.clone();
+    filtered.tag = Some("missing".to_owned());
+    let empty = read_port
+        .list_notes(
+            owner.clone(),
+            ReadRequest::Open {
+                query: filtered,
+                causal: CausalBasis::Await(Default::default()),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(empty.total, 0);
+    assert!(empty.children.items.is_empty());
+
     let cover_snapshot = folder_page
         .page
         .expect("visible folder cover note must be hydrated in FolderPage.page");
@@ -781,13 +818,14 @@ async fn folder_by_path_ignores_trashed_collision_and_list_notes_hydrates_cover_
         .unwrap();
     }
     store
-        .rename_folder(
+        .rename_project(
             owner.clone(),
             mutation(
                 &owner,
-                RenameFolder {
+                RenameProject {
                     folder: live_dir.clone(),
                     name: "docs".into(),
+                    display_name: None,
                 },
             ),
         )
@@ -928,6 +966,7 @@ async fn lagged_folder_visibility_yields_to_writers_and_rejects_a_mixed_head() {
             GraphQuery {
                 tier: GraphTier::Superclusters,
                 filter: empty_filter(),
+                causal: None,
             },
         )
         .await
@@ -944,6 +983,7 @@ async fn lagged_folder_visibility_yields_to_writers_and_rejects_a_mixed_head() {
             tags: Vec::new(),
         },
         filter: empty_filter(),
+        causal: None,
     };
     let cancelled = SpaceContext::new(reader.auth().clone(), scope.clone(), budget()).unwrap();
     let mut pending = engine.query_graph(cancelled.clone(), graph.clone());
@@ -1603,6 +1643,11 @@ async fn shared_space_personal_chat_does_not_leak_and_exact_number_board_parity(
             mutation(
                 &owner_a,
                 AppendChat {
+                    tool_calls: Vec::new(),
+                    interruption: None,
+                    provenance: None,
+                    proposed_diff: None,
+                    proposed_effect: None,
                     thread: thread.clone(),
                     parent: ThreadEntrySeq::ZERO,
                     kind: ChatEntryKind::Human,
@@ -1948,6 +1993,11 @@ async fn personal_chat_audience_isolation_and_deferred_backlink_taint() {
             mutation(
                 &owner_a,
                 AppendChat {
+                    tool_calls: Vec::new(),
+                    interruption: None,
+                    provenance: None,
+                    proposed_diff: None,
+                    proposed_effect: None,
                     thread: thread.clone(),
                     parent: ThreadEntrySeq::ZERO,
                     kind: ChatEntryKind::Human,
@@ -2020,6 +2070,11 @@ async fn personal_chat_audience_isolation_and_deferred_backlink_taint() {
             mutation(
                 &owner_a_cross,
                 AppendChat {
+                    tool_calls: Vec::new(),
+                    interruption: None,
+                    provenance: None,
+                    proposed_diff: None,
+                    proposed_effect: None,
                     thread: cross_thread,
                     parent: ThreadEntrySeq::ZERO,
                     kind: ChatEntryKind::Human,
@@ -2342,6 +2397,11 @@ async fn event_scrub_on_redact_chat_and_restricted_subscriber_floor() {
             mutation(
                 &owner,
                 AppendChat {
+                    tool_calls: Vec::new(),
+                    interruption: None,
+                    provenance: None,
+                    proposed_diff: None,
+                    proposed_effect: None,
                     thread: thread.clone(),
                     parent: ThreadEntrySeq::ZERO,
                     kind: ChatEntryKind::Human,
@@ -2630,6 +2690,7 @@ async fn root_non_recursive_listing_supercluster_csprng_and_decommission_gate() 
             mutation(
                 &owner2,
                 CreateNote {
+                    folder_page: false,
                     note: proj_note.note.clone(),
                     parent: None,
                     slug: "n1".into(),
@@ -2646,6 +2707,7 @@ async fn root_non_recursive_listing_supercluster_csprng_and_decommission_gate() 
             mutation(
                 &owner2,
                 CreateNote {
+                    folder_page: false,
                     note: sub_note.note.clone(),
                     parent: None,
                     slug: "n2".into(),
@@ -2676,6 +2738,7 @@ async fn root_non_recursive_listing_supercluster_csprng_and_decommission_gate() 
             owner.clone(),
             ReadRequest::Open {
                 query: NoteQuery {
+                    tag: None,
                     folder: None,
                     recursive: false,
                     classes: DocClass::all(),
@@ -2722,6 +2785,7 @@ async fn root_non_recursive_listing_supercluster_csprng_and_decommission_gate() 
             proj_ctx.clone(),
             ReadRequest::Open {
                 query: NoteQuery {
+                    tag: None,
                     folder: None,
                     recursive: false,
                     classes: DocClass::all(),
@@ -2749,6 +2813,7 @@ async fn root_non_recursive_listing_supercluster_csprng_and_decommission_gate() 
             GraphQuery {
                 tier: GraphTier::Superclusters,
                 filter: empty_filter(),
+                causal: None,
             },
         )
         .await
@@ -2764,6 +2829,7 @@ async fn root_non_recursive_listing_supercluster_csprng_and_decommission_gate() 
             GraphQuery {
                 tier: GraphTier::Superclusters,
                 filter: empty_filter(),
+                causal: None,
             },
         )
         .await
@@ -2783,6 +2849,7 @@ async fn root_non_recursive_listing_supercluster_csprng_and_decommission_gate() 
             GraphQuery {
                 tier: GraphTier::Superclusters,
                 filter: empty_filter(),
+                causal: None,
             },
         )
         .await
@@ -2919,6 +2986,7 @@ async fn hydrate_older_snapshot_checks_recorded_facts_and_schema_move_updates_fe
             public_ctx.clone(),
             ReadRequest::Open {
                 query: NoteQuery {
+                    tag: None,
                     folder: None,
                     recursive: true,
                     classes: DocClass::all(),
@@ -3119,6 +3187,11 @@ async fn backlink_lookahead_taints_and_tainted_mutation_hides_foreign_personal_c
             mutation(
                 &owner_local,
                 AppendChat {
+                    tool_calls: Vec::new(),
+                    interruption: None,
+                    provenance: None,
+                    proposed_diff: None,
+                    proposed_effect: None,
                     thread: local_thread,
                     parent: ThreadEntrySeq::ZERO,
                     kind: ChatEntryKind::Human,
@@ -3185,6 +3258,11 @@ async fn backlink_lookahead_taints_and_tainted_mutation_hides_foreign_personal_c
             mutation(
                 &owner_foreign_cross,
                 AppendChat {
+                    tool_calls: Vec::new(),
+                    interruption: None,
+                    provenance: None,
+                    proposed_diff: None,
+                    proposed_effect: None,
                     thread: foreign_thread,
                     parent: ThreadEntrySeq::ZERO,
                     kind: ChatEntryKind::Human,
@@ -3336,6 +3414,11 @@ async fn backlink_lookahead_taints_and_tainted_mutation_hides_foreign_personal_c
             mutation(
                 &b_ctx,
                 AppendChat {
+                    tool_calls: Vec::new(),
+                    interruption: None,
+                    provenance: None,
+                    proposed_diff: None,
+                    proposed_effect: None,
                     thread: private_in_shared,
                     parent: ThreadEntrySeq::ZERO,
                     kind: ChatEntryKind::Human,

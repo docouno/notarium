@@ -3,7 +3,7 @@ use notarium_core::{
     ids::{ChatThreadId, JobId, LineageEpoch, PendingInputId, ThreadEntrySeq},
     ports::{
         CancelJob, ChatPort, ChatThreadKind, ContentJobKind, ContentJobPort, CreateChat, ForkChat,
-        PendingChatInput, RollbackAgentRun,
+        PendingChatInput,
     },
 };
 
@@ -15,7 +15,7 @@ async fn mutation_envelopes_validate_before_replay_on_both_drivers() {
         let root = TempDataRoot::new("mutation-predicates");
         let installation = sample_installation_id(92);
         let cfg = if postgres {
-            fixtures.pg_local_config(installation, &schema, root.data_root())
+            fixtures.open_pg_s3_config(installation, &schema).await
         } else {
             CanonicalConfig::local_default(installation, root.data_root())
         };
@@ -33,6 +33,7 @@ async fn mutation_envelopes_validate_before_replay_on_both_drivers() {
             &scope,
             &owner,
             CreateNote {
+                folder_page: false,
                 note: sample_note_id(92),
                 parent: None,
                 slug: "draft".into(),
@@ -87,11 +88,14 @@ async fn mutation_envelopes_validate_before_replay_on_both_drivers() {
         invalid!(
             publish_ability_package,
             PublishAbilityPackage {
+                attached_skills: vec![],
                 ability: AbilityId::from_bytes([92; 16]),
                 kind: AbilityKind::Skill,
                 entrypoint: note.clone(),
                 files: vec![],
                 expected_package_revision: None,
+                expected_entrypoint_revision: None,
+                requires_explicit_binding: false,
             },
             pre
         );
@@ -119,16 +123,7 @@ async fn mutation_envelopes_validate_before_replay_on_both_drivers() {
             },
             pre
         );
-        invalid!(
-            rollback_agent_run,
-            RollbackAgentRun {
-                run,
-                expected_run_revision: revision.clone(),
-                expected_entities: vec![],
-                associated_board_expectations: vec![]
-            },
-            pre
-        );
+        invalid!(rollback_agent_run_by_id, run, pre);
         invalid!(create_job, ContentJobKind::Backup, pre);
         invalid!(
             cancel_job,

@@ -19,6 +19,8 @@ pub enum OAuthErrorCode {
 pub struct OAuthScope {
     pub access: BearerScope,
     pub offline_access: bool,
+    #[serde(default)]
+    pub ability_write: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -147,6 +149,7 @@ pub struct OAuthGrantInfo {
     pub client_id: String,
     pub resource: String,
     pub scope: BearerScope,
+    pub ability_write: bool,
     pub selected_spaces: Option<Vec<SpaceId>>,
     pub revoked_at_ms: Option<i64>,
     pub created_at_ms: i64,

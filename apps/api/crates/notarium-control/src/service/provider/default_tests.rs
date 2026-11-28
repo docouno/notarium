@@ -466,6 +466,7 @@ async fn project_activation(pg: bool) {
                 ProjectInfo {
                     folder: p.clone(),
                     name: "Catalog project".into(),
+                    project_slug: "catalog-project".into(),
                 },
             );
     }

@@ -314,6 +314,7 @@ impl CanonicalStore {
 
                         let meta = RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Note(
                             NoteRevisionMetadata {
+                                folder_page: false,
                                 note_id: spec.note_id.clone(),
                                 parent_folder_id: parent_id,
                                 is_root_child,
@@ -330,6 +331,7 @@ impl CanonicalStore {
                                 raw_fields,
                                 evaluated_fields: spec.fields.clone(),
                                 diagnostics,
+                                logical_updated_at: None,
                             },
                         ))
                         .encode()?;

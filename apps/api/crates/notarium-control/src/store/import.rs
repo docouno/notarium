@@ -122,7 +122,26 @@ impl TargetImport {
                         .inner();
                     for record in records {
                         self.lease.check()?;
-                        record.insert(tx).await?;
+                        if let TargetRecord::AgentSchedules {
+                            title,
+                            init_prompt,
+                            deleted_at: Some(_),
+                            ..
+                        } = record
+                            && (!title.is_empty() || !init_prompt.is_empty())
+                        {
+                            let mut sanitized = record.clone();
+                            if let TargetRecord::AgentSchedules {
+                                title, init_prompt, ..
+                            } = &mut sanitized
+                            {
+                                title.clear();
+                                init_prompt.clear();
+                            }
+                            sanitized.insert(tx).await?;
+                        } else {
+                            record.insert(tx).await?;
+                        }
                     }
                     self.lease.check()
                 },

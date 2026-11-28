@@ -353,6 +353,7 @@ fn canonical_fixture_methods_are_only_enabled_for_tests() {
     let actual = metadata();
     let packages = actual["packages"].as_array().unwrap();
     for target_crate in [
+        "notarium-agents",
         "notarium-canonical",
         "notarium-projections",
         "notarium-search",
@@ -363,24 +364,25 @@ fn canonical_fixture_methods_are_only_enabled_for_tests() {
             .unwrap();
         let target_pkg = &packages[index];
         let dependencies = target_pkg["dependencies"].as_array().unwrap();
-        let own_tests = dependencies
+        if let Some(own_tests) = dependencies
             .iter()
             .position(|dep| dep["name"] == target_crate)
-            .unwrap();
-        assert_eq!(dependencies[own_tests]["features"], json!(["test-support"]));
+        {
+            assert_eq!(dependencies[own_tests]["features"], json!(["test-support"]));
+            for kind in [Value::Null, json!("build")] {
+                let mut altered = actual.clone();
+                altered["packages"][index]["dependencies"][own_tests]["kind"] = kind;
+                assert!(
+                    validate_metadata(&altered, &root())
+                        .unwrap_err()
+                        .contains("forbidden edge")
+                );
+            }
+        }
         assert!(
             target_pkg["features"]["default"].is_null()
                 || target_pkg["features"]["default"] == json!([])
         );
-        for kind in [Value::Null, json!("build")] {
-            let mut altered = actual.clone();
-            altered["packages"][index]["dependencies"][own_tests]["kind"] = kind;
-            assert!(
-                validate_metadata(&altered, &root())
-                    .unwrap_err()
-                    .contains("forbidden edge")
-            );
-        }
         let mut altered_default = actual.clone();
         altered_default["packages"][index]["features"]["default"] = json!(["test-support"]);
         assert!(
@@ -440,6 +442,7 @@ fn fixture_api_gate_rejects_transitive_features_gate_defaults_and_renamed_deps()
     // 1. Transitive feature inside a fixture crate (`default -> internal -> test-support`),
     //    plus indirect dependency / feature forwarding of `internal`.
     for target_crate in [
+        "notarium-agents",
         "notarium-canonical",
         "notarium-projections",
         "notarium-search",
@@ -663,8 +666,10 @@ fn pure_libraries_forbid_unsafe_code_even_if_an_inner_module_tries_to_allow_it()
     for name in [
         "notarium-core",
         "notarium-syntax",
+        "notarium-control",
         "notarium-canonical",
         "notarium-collab",
+        "notarium-agents",
     ] {
         let source =
             fs::read_to_string(root().join("crates").join(name).join("src/lib.rs")).unwrap();

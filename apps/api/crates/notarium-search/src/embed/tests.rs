@@ -871,6 +871,7 @@ async fn remote_parts_distinguish_permanent_denial_from_transient_provider_error
                 },
                 RevisionId::from_bytes([12; 16]),
                 ResourceFacts {
+                    project: None,
                     space: space.clone(),
                     class,
                     ancestor_folders: vec![],

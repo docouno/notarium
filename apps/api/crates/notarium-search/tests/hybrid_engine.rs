@@ -14,11 +14,17 @@ use notarium_canonical::{
     runtime::{CreateFolderSpec, CreateSpaceSpec},
 };
 use notarium_core::{
-    auth::{SpaceGrant, SpaceKind, SpaceRole},
+    auth::{
+        AuthenticatedCredential, ChatAudience, EngineAuthContext, SpaceGrant, SpaceKind, SpaceRole,
+        VerifiedHuman,
+    },
     classes::DocClass,
     epoch::{DataRoot, SearchIndexKind},
     error::PortError,
-    ids::{ChatThreadId, FolderId, LeaseEpoch, NoteId, SpaceSeq, ThreadEntrySeq},
+    ids::{
+        AgentRunId, ChatThreadId, FolderId, LeaseEpoch, NoteId, ScheduleId, SpaceSeq,
+        ThreadEntrySeq,
+    },
     model::{HistoryScope, Lifecycle},
     ports::{
         AppendChat, ChatEntryKind, ChatInputBody, ChatPort, ChatRead, ChatThreadKind, CreateChat,
@@ -95,6 +101,16 @@ async fn acknowledged(
     scope: &HistoryScope,
     seq: SpaceSeq,
 ) -> SearchManifest {
+    acknowledged_when(store, root, scope, seq, |_| true).await
+}
+
+async fn acknowledged_when(
+    store: &CanonicalStore,
+    root: &DataRoot,
+    scope: &HistoryScope,
+    seq: SpaceSeq,
+    ready: impl Fn(&SearchManifest) -> bool,
+) -> SearchManifest {
     let layout = SearchLayout::open(root, scope.clone()).unwrap();
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
@@ -103,6 +119,7 @@ async fn acknowledged(
                 .is_some_and(|seen| seen >= seq)
                 && let Ok(Some(manifest)) = layout.search_manifest()
                 && manifest.tantivy_seq >= seq
+                && ready(&manifest)
             {
                 return manifest;
             }
@@ -134,6 +151,28 @@ fn files(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     let mut result = BTreeMap::new();
     walk(root, root, &mut result);
     result
+}
+
+fn assert_files_unchanged(before: &BTreeMap<PathBuf, Vec<u8>>, root: &Path) {
+    let after = files(root);
+    assert_eq!(
+        before.keys().collect::<Vec<_>>(),
+        after.keys().collect::<Vec<_>>(),
+        "file set changed under {}",
+        root.display()
+    );
+    for (name, old) in before {
+        let new = &after[name];
+        assert!(
+            old == new,
+            "{} changed from {} bytes ({}) to {} bytes ({})",
+            root.join(name).display(),
+            old.len(),
+            blake3::hash(old),
+            new.len(),
+            blake3::hash(new)
+        );
+    }
 }
 
 fn assert_absent(path: &Path, marker: &str) {
@@ -292,7 +331,13 @@ async fn run_scenario(store: Arc<CanonicalStore>, root: DataRoot, tag: u8) {
     let vector_mode = VectorMode::DeterministicTest { dimension: 64 };
     let engine = SearchEngine::start(SearchConfig::new(root.clone(), vector_mode.clone()), deps);
     engine.start_space(scope.clone()).unwrap();
-    let before_lag = acknowledged(&store, &root, scope, seeded.last_seq).await;
+    // The lexical cut can be published while the background worker still appends vectors.
+    let vectors_ready = |manifest: &SearchManifest| {
+        manifest.vector_seq == Some(manifest.tantivy_seq)
+            && !manifest.embeddings_pending
+            && manifest.vector_replay_after.is_none()
+    };
+    let before_lag = acknowledged_when(&store, &root, scope, seeded.last_seq, vectors_ready).await;
     let attempts = carriers
         .seed_deadline_attempts
         .lock()
@@ -332,7 +377,9 @@ async fn run_scenario(store: Arc<CanonicalStore>, root: DataRoot, tag: u8) {
         .expect("the search subscriber observed a broadcast overrun");
     let after_lag = acknowledged(&store, &root, scope, high).await;
     assert_eq!(after_lag.tantivy_commit, before_lag.tantivy_commit);
-    assert_eq!(old_vectors, files(&vectors));
+    assert_eq!(before_lag.vector_seq, after_lag.vector_seq);
+    assert!(!after_lag.embeddings_pending);
+    assert_files_unchanged(&old_vectors, &vectors);
 
     let initial = engine.search(ctx.clone(), query("needle")).await.unwrap();
     assert_eq!(initial.hits[0].card.title, "Install guide");
@@ -535,7 +582,7 @@ async fn run_scenario(store: Arc<CanonicalStore>, root: DataRoot, tag: u8) {
         snapshot.advance(range.last_seq);
     }
     pages.release();
-    let before_move = acknowledged(&store, &root, scope, range.last_seq).await;
+    let before_move = acknowledged_when(&store, &root, scope, range.last_seq, vectors_ready).await;
     let tantivy = root.search(&scope.space_id, SearchIndexKind::Tantivy);
     let old_vectors = files(&vectors);
     let viewer = context_with_grant(
@@ -581,7 +628,9 @@ async fn run_scenario(store: Arc<CanonicalStore>, root: DataRoot, tag: u8) {
         .advance(moved.receipt.seq());
     let after_move = acknowledged(&store, &root, scope, moved.receipt.seq()).await;
     assert_eq!(before_move.tantivy_commit, after_move.tantivy_commit);
-    assert_eq!(old_vectors, files(&vectors));
+    assert_eq!(before_move.vector_seq, after_move.vector_seq);
+    assert!(!after_move.embeddings_pending);
+    assert_files_unchanged(&old_vectors, &vectors);
     let mut scoped = query("laterrevisiontoken");
     scoped.folder = Some(archive.clone());
     let contained = engine.search(ctx.clone(), scoped).await.unwrap();
@@ -624,6 +673,11 @@ async fn run_scenario(store: Arc<CanonicalStore>, root: DataRoot, tag: u8) {
             mutation(
                 &ctx,
                 AppendChat {
+                    tool_calls: Vec::new(),
+                    interruption: None,
+                    provenance: None,
+                    proposed_diff: None,
+                    proposed_effect: None,
                     thread: thread.clone(),
                     parent: ThreadEntrySeq::ZERO,
                     kind: ChatEntryKind::Human,
@@ -831,6 +885,7 @@ async fn run_scenario(store: Arc<CanonicalStore>, root: DataRoot, tag: u8) {
         .recall(
             ctx.clone(),
             RecallQuery {
+                max_per_source: None,
                 query: query("laterrevisiontoken"),
                 graph_depth: 1,
                 token_budget: 64,
@@ -852,6 +907,7 @@ async fn run_scenario(store: Arc<CanonicalStore>, root: DataRoot, tag: u8) {
     for token_budget in [0, 131_073] {
         assert!(matches!(
             engine.recall(ctx.clone(), RecallQuery {
+                max_per_source: None,
                 query: query("laterrevisiontoken"),
                 graph_depth: 0,
                 token_budget,
@@ -864,6 +920,7 @@ async fn run_scenario(store: Arc<CanonicalStore>, root: DataRoot, tag: u8) {
         .recall(
             ctx,
             RecallQuery {
+                max_per_source: None,
                 query: query("laterrevisiontoken"),
                 graph_depth: 1,
                 token_budget: 1,
@@ -873,6 +930,203 @@ async fn run_scenario(store: Arc<CanonicalStore>, root: DataRoot, tag: u8) {
         .unwrap();
     assert!(exhausted.hits.is_empty() && exhausted.truncated);
     engine.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn graph_admission_checks_only_neighbors_needed_for_each_visit() {
+    use notarium_core::ports::{PortFuture, SearchRecipient};
+    use std::sync::atomic::AtomicUsize;
+    struct Recipient {
+        denied: BTreeSet<NoteId>,
+        calls: AtomicUsize,
+    }
+    impl SearchRecipient for Recipient {
+        fn admit<'a>(
+            &'a self,
+            card: &'a notarium_core::classes::ClassifiedMetadata,
+        ) -> PortFuture<'a, bool> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async move { Ok(!self.denied.contains(&card.reference().note_id)) })
+        }
+    }
+
+    let _guard = INTEGRATION_LOCK.lock().await;
+    let data = TempDataRoot::new("graph-admission");
+    let (store, runtime) = CanonicalRuntime::open(CanonicalConfig::local_default(
+        sample_installation_id(93),
+        data.data_root(),
+    ))
+    .await
+    .unwrap();
+    let store = Arc::new(store);
+    let owner = sample_principal_id(93);
+    let folder = sample_folder_id(93);
+    let epoch = LeaseEpoch::new(1).unwrap();
+    let scope = store
+        .create_space(CreateSpaceSpec {
+            space_id: sample_space_id(93),
+            incarnation: sample_incarnation(93),
+            root_folder_id: folder.clone(),
+            slug: "graph-admission".into(),
+            kind: SpaceKind::Personal,
+            owner: owner.clone(),
+            active_epoch: epoch,
+            initial_last_seq: SpaceSeq::ZERO,
+            created_at: None,
+        })
+        .await
+        .unwrap()
+        .scope;
+    let id = |index: u32| NoteId::from_bytes(u128::from(index).to_be_bytes());
+    let mut view = View::new(scope.clone(), folder.clone());
+    let narrow = 16 + 8 * 128;
+    let last = narrow + 32;
+    let mut batch = Vec::new();
+    let mut live = BTreeSet::new();
+    let mut cutoff = SpaceSeq::ZERO;
+    for i in 0..last + 7 {
+        let note_id = id(i);
+        view.index(note_id.clone(), folder.clone());
+        live.insert(note_id.clone());
+        let title = if i < 16 {
+            "Graphfanoutmarker"
+        } else {
+            "Neighbor"
+        };
+        batch.push(note(&note_id, &folder, title, "Evidence."));
+        if batch.len() == 64 || i + 1 == last + 7 {
+            let (written, _) = store
+                .commit_synthetic_note_batch_for_test(
+                    &scope,
+                    epoch,
+                    &owner,
+                    std::mem::take(&mut batch),
+                )
+                .await
+                .unwrap();
+            cutoff = written.last_seq;
+            view.advance(cutoff);
+        }
+    }
+    // Eight seeds have 64 outgoing and 64 different incoming neighbors.
+    // Their second half matters only when admission rejects a prefix match.
+    for seed in 0..8 {
+        for offset in 0..128 {
+            let neighbor = 16 + seed * 128 + offset;
+            if offset < 64 {
+                view.link(seed, neighbor);
+            } else {
+                view.link(neighbor, seed);
+            }
+        }
+    }
+    for neighbor in narrow..last {
+        view.link(8, neighbor);
+    }
+    for i in 0..7 {
+        view.link(9 + i, last + i);
+    }
+    // One leaf is reachable from two seeds and in both directions for seed 9.
+    view.link(9, last + 1);
+    view.link(last + 1, 9);
+    let projection = Arc::new(Projection {
+        store: store.clone(),
+        snapshot: RwLock::new(view),
+        live: RwLock::new(live),
+    });
+    let engine = SearchEngine::start(
+        SearchConfig::new(data.data_root(), VectorMode::Disabled),
+        SearchDependencies::new(store.clone(), projection),
+    );
+    let ctx = context(&scope, &owner);
+    let request = |depth| RecallQuery {
+        query: SearchQuery {
+            top_k: PageLimit::new(200).unwrap(),
+            causal: CausalBasis::Await(AwaitWatermarks::at(scope.clone(), cutoff)),
+            ..query("graphfanoutmarker")
+        },
+        graph_depth: depth,
+        token_budget: 131_072,
+        max_per_source: None,
+    };
+    let scores = |result: &notarium_core::ports::SearchResult| {
+        result
+            .hits
+            .iter()
+            .map(|hit| {
+                (
+                    hit.card.document.provenance().reference().note_id.clone(),
+                    hit.score,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    for depth in [1, 2] {
+        let ordinary = engine.recall(ctx.clone(), request(depth)).await.unwrap();
+        let baseline = scores(&ordinary);
+        assert!(baseline.iter().any(|(note, _)| note == &id(last + 6)));
+        let all = Recipient {
+            denied: BTreeSet::new(),
+            calls: AtomicUsize::new(0),
+        };
+        let full = engine
+            .recall_for(ctx.clone(), request(depth), Some(&all))
+            .await
+            .unwrap();
+        let actual = scores(&full);
+        for i in 0..baseline.len().max(actual.len()) {
+            let expected = baseline.get(i);
+            let found = actual.get(i);
+            assert!(
+                found == expected,
+                "all sources admitted at depth {depth}, rank {}: expected {expected:?}, actual {found:?} (ordinary length {}, recipient length {})",
+                i + 1,
+                baseline.len(),
+                actual.len()
+            );
+        }
+        assert_eq!(all.calls.into_inner(), 16 + 8 * 64 + 32 + 7);
+        if depth == 1 {
+            let shared = baseline
+                .iter()
+                .find(|(note, _)| note == &id(last + 1))
+                .unwrap()
+                .1;
+            let expected =
+                0.25 / (70.0 * (1.0 + 3.0_f64.ln())) + 0.25 / (71.0 * (1.0 + 2.0_f64.ln()));
+            assert!((shared - expected).abs() < 1e-9);
+        }
+    }
+    // The second case leaves one slot open over three consecutive tail
+    // denials. The next allowed note fills it without spending later slots.
+    for (denied, replacements) in [
+        (vec![16, 17], vec![80, 81]),
+        (vec![16, 80, 81, 82], vec![83]),
+    ] {
+        let partial = Recipient {
+            denied: denied.iter().copied().map(id).collect(),
+            calls: AtomicUsize::new(0),
+        };
+        let found = engine
+            .recall_for(ctx.clone(), request(1), Some(&partial))
+            .await
+            .unwrap();
+        let hits: BTreeSet<_> = scores(&found).into_iter().map(|(note, _)| note).collect();
+        assert!(hits.contains(&id(last + 6)));
+        for accepted in &replacements {
+            assert!(hits.contains(&id(*accepted)));
+        }
+        for skipped in &denied {
+            assert!(!hits.contains(&id(*skipped)));
+        }
+        assert!(!hits.contains(&id(replacements.last().unwrap() + 1)));
+        assert_eq!(
+            partial.calls.into_inner(),
+            16 + 8 * 64 + 32 + 7 + denied.len()
+        );
+    }
+    engine.shutdown().await;
+    runtime.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1084,6 +1338,11 @@ async fn reader_capacity(store: Arc<CanonicalStore>, root: DataRoot) {
             mutation(
                 &chat_ctx,
                 AppendChat {
+                    tool_calls: Vec::new(),
+                    interruption: None,
+                    provenance: None,
+                    proposed_diff: None,
+                    proposed_effect: None,
                     thread: thread.clone(),
                     parent: ThreadEntrySeq::ZERO,
                     kind: ChatEntryKind::Human,
@@ -1246,6 +1505,7 @@ async fn chat_candidate_visibility(store: Arc<CanonicalStore>, root: DataRoot) {
     let folder = sample_folder_id(0x67);
     let project = sample_folder_id(0x68);
     let destination = sample_folder_id(0x69);
+    let other_project = sample_folder_id(0x6a);
     let lease = LeaseEpoch::new(1).unwrap();
     let space = store
         .create_space(CreateSpaceSpec {
@@ -1280,6 +1540,21 @@ async fn chat_candidate_visibility(store: Arc<CanonicalStore>, root: DataRoot) {
         .create_folder(CreateFolderSpec {
             scope: space.scope.clone(),
             active_epoch: lease,
+            folder_id: other_project.clone(),
+            parent: None,
+            slug: "other-project".to_owned(),
+            display_name: "Other Project".to_owned(),
+            is_project: true,
+            project_slug: Some("other-project".to_owned()),
+            actor: owner.clone(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+    store
+        .create_folder(CreateFolderSpec {
+            scope: space.scope.clone(),
+            active_epoch: lease,
             folder_id: destination.clone(),
             parent: None,
             slug: "destination".into(),
@@ -1289,6 +1564,16 @@ async fn chat_candidate_visibility(store: Arc<CanonicalStore>, root: DataRoot) {
             actor: owner.clone(),
             timestamp: None,
         })
+        .await
+        .unwrap();
+    let moved_note = sample_note_id(0x6a);
+    store
+        .commit_synthetic_note_batch_for_test(
+            &space.scope,
+            lease,
+            &owner,
+            vec![note(&moved_note, &destination, "Movable note", "moveterm")],
+        )
         .await
         .unwrap();
     let owner_ctx = context(&space.scope, &owner);
@@ -1303,7 +1588,37 @@ async fn chat_candidate_visibility(store: Arc<CanonicalStore>, root: DataRoot) {
         },
     );
     let shared = ChatThreadId::from_bytes([0x67; 16]);
-    let movable = ChatThreadId::from_bytes([0x6a; 16]);
+    let other_project_chat = ChatThreadId::from_bytes([0x6a; 16]);
+    let log = ChatThreadId::from_bytes([0x6b; 16]);
+    let run = AgentRunId::from_bytes([0x59; 16]);
+    let keeper = EngineAuthContext::for_human(
+        VerifiedHuman::attest(
+            other.clone(),
+            other_ctx.auth().grant().clone(),
+            other_ctx.auth().spaces().clone(),
+            false,
+        )
+        .with_credential(AuthenticatedCredential::ScheduledRun {
+            schedule: ScheduleId::from_bytes([0x59; 16]),
+            run: run.clone(),
+            lease,
+        }),
+    )
+    .for_keeper(
+        run.clone(),
+        space.scope.space_id.clone(),
+        None,
+        BTreeSet::new(),
+    )
+    .unwrap()
+    .with_verified_keeper_log(log.clone())
+    .unwrap();
+    let keeper = notarium_core::ports::SpaceContext::new(
+        keeper,
+        space.scope.clone(),
+        other_ctx.budget.clone(),
+    )
+    .unwrap();
     let mut last = SpaceSeq::ZERO;
     for (thread, ctx, kind, folder, body) in [
         (
@@ -1328,13 +1643,21 @@ async fn chat_candidate_visibility(store: Arc<CanonicalStore>, root: DataRoot) {
             "rankingterm rankingterm".to_owned(),
         ),
         (
-            movable.clone(),
+            other_project_chat.clone(),
             &owner_ctx,
             ChatThreadKind::SpaceGroup,
-            Some(destination.clone()),
-            "moveterm".to_owned(),
+            Some(other_project.clone()),
+            "otherprojectterm".to_owned(),
+        ),
+        (
+            log.clone(),
+            &keeper,
+            ChatThreadKind::KeeperLog,
+            None,
+            "logterm".to_owned(),
         ),
     ] {
+        let keeper_entry = kind == ChatThreadKind::KeeperLog;
         store
             .create_chat(
                 ctx.clone(),
@@ -1357,9 +1680,18 @@ async fn chat_candidate_visibility(store: Arc<CanonicalStore>, root: DataRoot) {
                 mutation(
                     ctx,
                     AppendChat {
+                        tool_calls: Vec::new(),
+                        interruption: None,
+                        provenance: keeper_entry.then(Default::default),
+                        proposed_diff: None,
+                        proposed_effect: None,
                         thread,
                         parent: ThreadEntrySeq::ZERO,
-                        kind: ChatEntryKind::Human,
+                        kind: if keeper_entry {
+                            ChatEntryKind::Model
+                        } else {
+                            ChatEntryKind::Human
+                        },
                         body: ChatInputBody::Text(body),
                         referenced_notes: Vec::new(),
                         tainted: false,
@@ -1372,12 +1704,14 @@ async fn chat_candidate_visibility(store: Arc<CanonicalStore>, root: DataRoot) {
     }
     let mut view = View::new(space.scope.clone(), folder.clone());
     view.project(project.clone(), folder.clone());
+    view.project(other_project.clone(), folder.clone());
     view.folder(destination.clone(), folder);
+    view.index(moved_note.clone(), destination.clone());
     view.advance(last);
     let projection = Arc::new(Projection {
         store: store.clone(),
         snapshot: RwLock::new(view),
-        live: RwLock::new(BTreeSet::new()),
+        live: RwLock::new(BTreeSet::from([moved_note.clone()])),
     });
     let engine = SearchEngine::start(
         SearchConfig::new(root.clone(), VectorMode::Disabled),
@@ -1395,28 +1729,22 @@ async fn chat_candidate_visibility(store: Arc<CanonicalStore>, root: DataRoot) {
     let other_results = engine.search(other_ctx.clone(), req.clone()).await.unwrap();
     assert_eq!(other_results.chat_hits[0].kind, ChatThreadKind::Personal);
     let private = &other_results.chat_hits[0];
-    let run = notarium_core::ids::AgentRunId::from_bytes([0x59; 16]);
-    for confined in [
-        other_ctx
-            .auth()
-            .for_agent_run(
-                run.clone(),
-                space.scope.space_id.clone(),
-                notarium_core::auth::ChatAudience::Shared,
-                other_ctx.auth().spaces().clone(),
-            )
-            .unwrap(),
-        other_ctx
-            .auth()
-            .for_keeper(run, space.scope.space_id.clone(), None, BTreeSet::new())
-            .unwrap(),
-    ] {
-        let ctx = notarium_core::ports::SpaceContext::new(
-            confined,
-            space.scope.clone(),
-            other_ctx.budget.clone(),
+    let shared_run = other_ctx
+        .auth()
+        .for_agent_run(
+            run,
+            space.scope.space_id.clone(),
+            ChatAudience::Shared,
+            other_ctx.auth().spaces().clone(),
         )
         .unwrap();
+    let shared_run = notarium_core::ports::SpaceContext::new(
+        shared_run,
+        space.scope.clone(),
+        other_ctx.budget.clone(),
+    )
+    .unwrap();
+    for (ctx, expected) in [(shared_run, Some(&shared)), (keeper.clone(), None)] {
         let (rows, _) = store
             .hydrate_live_visible_chat_hits(
                 &ctx,
@@ -1427,10 +1755,48 @@ async fn chat_candidate_visibility(store: Arc<CanonicalStore>, root: DataRoot) {
             .unwrap();
         assert!(rows.is_empty());
         let results = engine.search(ctx, req.clone()).await.unwrap();
-        assert_eq!(results.chat_hits.len(), 1);
-        assert_eq!(results.chat_hits[0].thread, shared);
+        assert!(results.chat_hits.iter().map(|hit| &hit.thread).eq(expected));
         assert!(!results.truncated);
     }
+    let keeper_owner_shared_run = notarium_core::ports::SpaceContext::new(
+        other_ctx
+            .auth()
+            .for_agent_run(
+                AgentRunId::from_bytes([0x99; 16]),
+                space.scope.space_id.clone(),
+                ChatAudience::Shared,
+                other_ctx.auth().spaces().clone(),
+            )
+            .unwrap(),
+        space.scope.clone(),
+        other_ctx.budget.clone(),
+    )
+    .unwrap();
+    let shared_log_hits = engine
+        .search(
+            keeper_owner_shared_run,
+            SearchQuery {
+                text: "logterm".into(),
+                ..req.clone()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        shared_log_hits.chat_hits.is_empty(),
+        "Shared-audience AgentRun must not see its own principal's KeeperLog in chat search"
+    );
+    let log_hits = engine
+        .search(
+            keeper,
+            SearchQuery {
+                text: "logterm".into(),
+                ..req.clone()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(log_hits.chat_hits.iter().map(|hit| &hit.thread).eq([&log]));
     let viewer = context_with_grant(
         &space.scope,
         &other,
@@ -1443,6 +1809,36 @@ async fn chat_candidate_visibility(store: Arc<CanonicalStore>, root: DataRoot) {
     );
     let viewer_results = engine.search(viewer.clone(), req.clone()).await.unwrap();
     assert_eq!(viewer_results.chat_hits[0].thread, shared);
+    let mut other_project_req = query("otherprojectterm");
+    other_project_req.include_chats = true;
+    other_project_req.folder = Some(project.clone());
+    assert!(
+        engine
+            .search(owner_ctx.clone(), other_project_req.clone())
+            .await
+            .unwrap()
+            .chat_hits
+            .is_empty()
+    );
+    other_project_req.folder = Some(other_project.clone());
+    assert_eq!(
+        engine
+            .search(owner_ctx.clone(), other_project_req.clone())
+            .await
+            .unwrap()
+            .chat_hits[0]
+            .thread,
+        other_project_chat
+    );
+    other_project_req.folder = None;
+    assert!(
+        engine
+            .search(viewer.clone(), other_project_req)
+            .await
+            .unwrap()
+            .chat_hits
+            .is_empty()
+    );
     let mut moved_request = query("moveterm");
     moved_request.include_chats = true;
     moved_request.folder = Some(project.clone());
@@ -1451,7 +1847,7 @@ async fn chat_candidate_visibility(store: Arc<CanonicalStore>, root: DataRoot) {
             .search(owner_ctx.clone(), moved_request.clone())
             .await
             .unwrap()
-            .chat_hits
+            .hits
             .is_empty()
     );
     let layout = SearchLayout::open(&root, space.scope.clone()).unwrap();
@@ -1478,19 +1874,27 @@ async fn chat_candidate_visibility(store: Arc<CanonicalStore>, root: DataRoot) {
     }
     let after = acknowledged(&store, &root, &space.scope, moved.receipt.seq()).await;
     assert_eq!(before.tantivy_commit, after.tantivy_commit);
-    assert_eq!(old_files, files(&index));
+    assert_files_unchanged(&old_files, &index);
     let moved = engine
         .search(owner_ctx, moved_request.clone())
         .await
         .unwrap();
-    assert_eq!(moved.chat_hits[0].thread, movable);
-    assert!(
+    assert_eq!(
+        moved.hits[0].card.document.provenance().reference().note_id,
+        moved_note
+    );
+    assert_eq!(
         engine
             .search(viewer.clone(), moved_request)
             .await
             .unwrap()
-            .chat_hits
-            .is_empty()
+            .hits[0]
+            .card
+            .document
+            .provenance()
+            .reference()
+            .note_id,
+        moved_note
     );
     assert_eq!(
         engine.search(viewer, req).await.unwrap().chat_hits[0].thread,
@@ -1644,6 +2048,11 @@ async fn tainted_chat_below_limit(
             mutation(
                 &ctx,
                 AppendChat {
+                    tool_calls: Vec::new(),
+                    interruption: None,
+                    provenance: None,
+                    proposed_diff: None,
+                    proposed_effect: None,
                     thread: thread.clone(),
                     parent: ThreadEntrySeq::ZERO,
                     kind: ChatEntryKind::Human,
@@ -1661,6 +2070,11 @@ async fn tainted_chat_below_limit(
             mutation(
                 &ctx,
                 AppendChat {
+                    tool_calls: Vec::new(),
+                    interruption: None,
+                    provenance: None,
+                    proposed_diff: None,
+                    proposed_effect: None,
                     thread: tainted_thread.clone(),
                     parent: ThreadEntrySeq::ZERO,
                     kind: ChatEntryKind::Model,
@@ -1943,6 +2357,11 @@ async fn writer_saturation_retires_redacted_chat_across_pages(
             mutation(
                 &chat_ctx,
                 AppendChat {
+                    tool_calls: Vec::new(),
+                    interruption: None,
+                    provenance: None,
+                    proposed_diff: None,
+                    proposed_effect: None,
                     thread: thread.clone(),
                     parent: ThreadEntrySeq::ZERO,
                     kind: ChatEntryKind::Human,
@@ -2550,6 +2969,11 @@ async fn lexical_evidence_and_live_chat_pagination() {
                 mutation(
                     &ctx,
                     AppendChat {
+                        tool_calls: Vec::new(),
+                        interruption: None,
+                        provenance: None,
+                        proposed_diff: None,
+                        proposed_effect: None,
                         thread: thread.clone(),
                         parent,
                         kind: ChatEntryKind::Human,
@@ -2596,6 +3020,7 @@ async fn lexical_evidence_and_live_chat_pagination() {
         .recall(
             ctx.clone(),
             RecallQuery {
+                max_per_source: None,
                 query: query("RareWidget::dispatch"),
                 graph_depth: 0,
                 token_budget: tokens,
@@ -2609,6 +3034,28 @@ async fn lexical_evidence_and_live_chat_pagination() {
             .text()
             .contains("RareWidget::dispatch")
     );
+
+    let source_limit = u16::try_from(tokens - 1).unwrap();
+    let capped = engine
+        .recall(
+            ctx.clone(),
+            RecallQuery {
+                query: query("RareWidget::dispatch"),
+                graph_depth: 0,
+                token_budget: 131_072,
+                max_per_source: Some(source_limit),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(capped.truncated);
+    assert!(capped.hits.iter().all(|hit| {
+        hit.chunks
+            .iter()
+            .map(|part| part.part().tokens())
+            .sum::<u32>()
+            <= u32::from(source_limit)
+    }));
 
     let mut request = query("pageterm");
     request.include_chats = true;
@@ -2637,6 +3084,11 @@ async fn lexical_evidence_and_live_chat_pagination() {
                 mutation(
                     &ctx,
                     AppendChat {
+                        tool_calls: Vec::new(),
+                        interruption: None,
+                        provenance: None,
+                        proposed_diff: None,
+                        proposed_effect: None,
                         thread: thread.clone(),
                         parent,
                         kind: ChatEntryKind::Model,
@@ -2656,7 +3108,23 @@ async fn lexical_evidence_and_live_chat_pagination() {
         "delivering an earlier message records the new sticky thread taint"
     );
 
+    let fork = |actor: &notarium_core::ports::SpaceContext| {
+        mutation(
+            actor,
+            notarium_core::ports::ForkChat {
+                thread: thread.clone(),
+                parent: first,
+            },
+        )
+    };
+    assert!(ctx.auth().taint().is_tainted());
+    assert!(matches!(
+        store.fork_chat(ctx.clone(), fork(&ctx)).await,
+        Err(PortError::Domain(notarium_core::DomainError::ValidationFailed { diagnostic }))
+            if diagnostic.reason == notarium_core::error::ValidationReason::InvalidState
+    ));
     let fork_reader = context(&scope, &owner);
+    let fork_owner = context(&scope, &owner);
     carriers.hold_hydrated_chat.store(true, Ordering::SeqCst);
     let (mixed, ()) = tokio::join!(engine.search(fork_reader.clone(), mixed), async {
         tokio::time::timeout(Duration::from_secs(3), carriers.chat_held.notified())
@@ -2667,16 +3135,7 @@ async fn lexical_evidence_and_live_chat_pagination() {
             "preparing a snippet cannot taint its caller"
         );
         store
-            .fork_chat(
-                ctx.clone(),
-                mutation(
-                    &ctx,
-                    notarium_core::ports::ForkChat {
-                        thread,
-                        parent: first,
-                    },
-                ),
-            )
+            .fork_chat(fork_owner.clone(), fork(&fork_owner))
             .await
             .unwrap();
         carriers.release_chat.notify_one();
@@ -2703,6 +3162,176 @@ async fn lexical_evidence_and_live_chat_pagination() {
     assert_eq!(relaxed.chat_hits.len(), 1);
     assert_eq!(relaxed.chat_hits[0].entry, first);
     pages.release();
+    engine.shutdown().await;
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recall_widening_preserves_authorized_graph_neighbors() {
+    use notarium_core::ports::{PortFuture, SearchRecipient};
+    struct DenySet {
+        denied: BTreeSet<NoteId>,
+    }
+    impl SearchRecipient for DenySet {
+        fn admit<'a>(
+            &'a self,
+            card: &'a notarium_core::classes::ClassifiedMetadata,
+        ) -> PortFuture<'a, bool> {
+            Box::pin(async move { Ok(!self.denied.contains(&card.reference().note_id)) })
+        }
+    }
+
+    let _guard = INTEGRATION_LOCK.lock().await;
+    let data = TempDataRoot::new("recall-widening-neighbors");
+    let (store, runtime) = CanonicalRuntime::open(CanonicalConfig::local_default(
+        sample_installation_id(94),
+        data.data_root(),
+    ))
+    .await
+    .unwrap();
+    let store = Arc::new(store);
+    let owner = sample_principal_id(94);
+    let folder = sample_folder_id(94);
+    let epoch = LeaseEpoch::new(1).unwrap();
+    let scope = store
+        .create_space(CreateSpaceSpec {
+            space_id: sample_space_id(94),
+            incarnation: sample_incarnation(94),
+            root_folder_id: folder.clone(),
+            slug: "recall-widening".into(),
+            kind: SpaceKind::Personal,
+            owner: owner.clone(),
+            active_epoch: epoch,
+            initial_last_seq: SpaceSeq::ZERO,
+            created_at: None,
+        })
+        .await
+        .unwrap()
+        .scope;
+    let id = |index: u32| NoteId::from_bytes(u128::from(index + 1).to_be_bytes());
+    let mut view = View::new(scope.clone(), folder.clone());
+    let mut live = BTreeSet::new();
+    let mut denied = BTreeSet::new();
+    let mut batch = Vec::new();
+    let mut cutoff = SpaceSeq::ZERO;
+
+    // 16 authorized seeds (0..16) with higher TF so they rank in pass 1,
+    // 16 * 61 = 976 denied neighbors (16..992) with lower node indices than the
+    // 16 * 4 = 64 authorized neighbors (992..1056) so expanding all 16 seeds
+    // consumes exactly 16 * 65 = 1,040 == MAX_GRAPH_PAGES visits, plus 385
+    // lower-ranked denied lexical matches (1056..1441) that overflow pass 1
+    // (16 + 385 = 401 > 400) and trigger recipient widening with top_k = 100.
+    const SEEDS: u32 = 16;
+    const DENIED_PER_SEED: u32 = 61;
+    const ALLOWED_PER_SEED: u32 = 4;
+    const DENIED_NEIGHBORS_START: u32 = SEEDS;
+    const ALLOWED_NEIGHBORS_START: u32 = DENIED_NEIGHBORS_START + SEEDS * DENIED_PER_SEED;
+    const DENIED_LEXICAL_START: u32 = ALLOWED_NEIGHBORS_START + SEEDS * ALLOWED_PER_SEED;
+    const DENIED_LEXICAL_COUNT: u32 = 385;
+    let total = DENIED_LEXICAL_START + DENIED_LEXICAL_COUNT;
+    for i in 0..total {
+        let note_id = id(i);
+        view.index(note_id.clone(), folder.clone());
+        live.insert(note_id.clone());
+        let (title, body) = if i < SEEDS {
+            (
+                format!("Authorized Seed {i}"),
+                "widenmarker widenmarker widenmarker shared anchor".to_owned(),
+            )
+        } else if i < ALLOWED_NEIGHBORS_START {
+            denied.insert(note_id.clone());
+            (
+                format!("Denied Neighbor {i}"),
+                "blocked linked note without lexical match".to_owned(),
+            )
+        } else if i < DENIED_LEXICAL_START {
+            (
+                format!("Authorized Neighbor {i}"),
+                "linked evidence note without lexical match".to_owned(),
+            )
+        } else {
+            denied.insert(note_id.clone());
+            (
+                format!("Denied Match {i}"),
+                "widenmarker blocked lexical match padding tail".to_owned(),
+            )
+        };
+        batch.push(note(&note_id, &folder, &title, &body));
+        if batch.len() == 64 || i + 1 == total {
+            let (written, _) = store
+                .commit_synthetic_note_batch_for_test(
+                    &scope,
+                    epoch,
+                    &owner,
+                    std::mem::take(&mut batch),
+                )
+                .await
+                .unwrap();
+            cutoff = written.last_seq;
+            view.advance(cutoff);
+        }
+    }
+    for seed in 0..SEEDS {
+        for offset in 0..DENIED_PER_SEED {
+            view.link(
+                seed,
+                DENIED_NEIGHBORS_START + seed * DENIED_PER_SEED + offset,
+            );
+        }
+        for offset in 0..ALLOWED_PER_SEED {
+            // Link incoming so neighbor_page returns all 61 outgoing denied + 4 incoming
+            // authorized neighbors (65 per seed = 1,040 == MAX_GRAPH_PAGES).
+            view.link(
+                ALLOWED_NEIGHBORS_START + seed * ALLOWED_PER_SEED + offset,
+                seed,
+            );
+        }
+    }
+    let projection = Arc::new(Projection {
+        store: store.clone(),
+        snapshot: RwLock::new(view),
+        live: RwLock::new(live),
+    });
+    let engine = SearchEngine::start(
+        SearchConfig::new(data.data_root(), VectorMode::Disabled),
+        SearchDependencies::new(store.clone(), projection),
+    );
+    let ctx = context(&scope, &owner);
+    let req = RecallQuery {
+        query: SearchQuery {
+            top_k: PageLimit::new(100).unwrap(),
+            causal: CausalBasis::Await(AwaitWatermarks::at(scope.clone(), cutoff)),
+            ..query("widenmarker")
+        },
+        graph_depth: 1,
+        token_budget: 131_072,
+        max_per_source: None,
+    };
+    let recipient = DenySet { denied };
+    let recalled = engine
+        .recall_for(ctx, req, Some(&recipient))
+        .await
+        .expect("recall_for widening must succeed");
+    assert!(
+        !recalled.truncated,
+        "single post-widening graph expansion must fit within MAX_GRAPH_PAGES without truncation"
+    );
+    let hit_ids: BTreeSet<_> = recalled
+        .hits
+        .iter()
+        .map(|hit| hit.card.document.provenance().reference().note_id.clone())
+        .collect();
+    assert_eq!(
+        hit_ids.len(),
+        80,
+        "recipient widening must preserve all 16 seeds and 64 authorized graph neighbors"
+    );
+    for i in 0..SEEDS {
+        assert!(hit_ids.contains(&id(i)), "missing authorized seed {i}");
+    }
+    for i in ALLOWED_NEIGHBORS_START..DENIED_LEXICAL_START {
+        assert!(hit_ids.contains(&id(i)), "missing authorized neighbor {i}");
+    }
     engine.shutdown().await;
     runtime.shutdown().await.unwrap();
 }

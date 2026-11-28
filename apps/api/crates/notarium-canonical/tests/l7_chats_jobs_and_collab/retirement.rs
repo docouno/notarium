@@ -79,11 +79,10 @@ async fn held_redactions(
 ) -> HeldRedaction {
     let (scope, actor, thread) = create_thread(store, seed).await;
     let ctx = owner_ctx(&scope, actor.clone());
-    let text = format!("body {seed} ").repeat(85);
+    let text = format!("body {seed} ").repeat(4200);
     let digest = store.prepare_blob(text.as_bytes()).unwrap().digest();
     let mut leaves = vec![ThreadEntrySeq::ZERO];
     for _ in 0..2 {
-        let staged = store.stage_chat_blob(ctx.clone(), &text).await.unwrap();
         let next = store
             .append_chat(
                 ctx.clone(),
@@ -91,10 +90,15 @@ async fn held_redactions(
                     &scope,
                     &actor,
                     AppendChat {
+                        tool_calls: Vec::new(),
+                        provenance: None,
+                        interruption: None,
+                        proposed_diff: None,
+                        proposed_effect: None,
                         thread: thread.clone(),
                         parent: *leaves.last().unwrap(),
                         kind: ChatEntryKind::Human,
-                        body: ChatInputBody::Staged(staged),
+                        body: ChatInputBody::Text(text.clone()),
                         referenced_notes: vec![],
                         tainted: false,
                     },
@@ -254,24 +258,45 @@ async fn redaction_with_backup_hold_preserves_shared_owners_and_reclaims_after_r
                 .await;
         }
         // Previous releases could persist a zero-owner active digest without a retirement.
-        let (legacy, actor, _) = create_thread(&store, 0xda).await;
-        let old_body = "retained before the last owner was released ".repeat(20);
-        let saved = store
-            .stage_chat_blob(owner_ctx(&legacy, actor.clone()), &old_body)
+        let (legacy, actor, legacy_thread) = create_thread(&store, 0xda).await;
+        let old_body = "retained before the last owner was released ".repeat(850);
+        let old_digest = store.prepare_blob(old_body.as_bytes()).unwrap().digest();
+        let old_entry = store
+            .append_chat(
+                owner_ctx(&legacy, actor.clone()),
+                next_mutation(
+                    &legacy,
+                    &actor,
+                    AppendChat {
+                        tool_calls: Vec::new(),
+                        provenance: None,
+                        interruption: None,
+                        proposed_diff: None,
+                        proposed_effect: None,
+                        thread: legacy_thread.clone(),
+                        parent: ThreadEntrySeq::ZERO,
+                        kind: ChatEntryKind::Human,
+                        body: ChatInputBody::Text(old_body.clone()),
+                        referenced_notes: vec![],
+                        tainted: false,
+                    },
+                ),
+            )
             .await
-            .unwrap();
+            .unwrap()
+            .value;
         let released = store
             .release_blob_owner_references(
                 &legacy,
                 LeaseEpoch::new(1).unwrap(),
-                notarium_canonical::blobs::BlobOwnerKind::StagedChat,
-                actor.as_str(),
+                notarium_canonical::blobs::BlobOwnerKind::ChatEntry,
+                &format!("{}:{}", legacy_thread.as_str(), old_entry.seq.get()),
             )
             .await
             .unwrap();
-        assert_eq!(released, vec![saved.digest()]);
+        assert_eq!(released, vec![old_digest]);
         assert!(matches!(
-            store.read_verified_blob(&legacy, saved.digest()).await,
+            store.read_verified_blob(&legacy, old_digest).await,
             Err(PortError::Domain(DomainError::ResourceNotFound))
         ));
         let HeldRedaction {
@@ -326,9 +351,8 @@ async fn committed_redaction_and_replay_return_while_local_stager_holds_bytes() 
     let (store, runtime) = CanonicalRuntime::open(cfg).await.unwrap();
     let (scope, actor, thread) = create_thread(&store, 0xe1).await;
     let ctx = owner_ctx(&scope, actor.clone());
-    let text = "local stage keeps this digest pinned ".repeat(24);
+    let text = "local stage keeps this digest pinned ".repeat(1000);
     let prepared = store.prepare_blob(text.as_bytes()).unwrap();
-    let staged = store.stage_chat_blob(ctx.clone(), &text).await.unwrap();
     let appended = store
         .append_chat(
             ctx.clone(),
@@ -336,10 +360,15 @@ async fn committed_redaction_and_replay_return_while_local_stager_holds_bytes() 
                 &scope,
                 &actor,
                 AppendChat {
+                    tool_calls: Vec::new(),
+                    provenance: None,
+                    interruption: None,
+                    proposed_diff: None,
+                    proposed_effect: None,
                     thread: thread.clone(),
                     parent: ThreadEntrySeq::ZERO,
                     kind: ChatEntryKind::Human,
-                    body: ChatInputBody::Staged(staged),
+                    body: ChatInputBody::Text(text),
                     referenced_notes: vec![],
                     tainted: false,
                 },
@@ -428,8 +457,17 @@ async fn retrying_owner_keeps_its_upload_and_cleans_a_dropped_caller_executor() 
         )
         .await
         .unwrap();
+    claim_run(
+        &store,
+        owner_ctx(&scope, actor.clone()),
+        ChatAudience::Personal,
+        &thread,
+        &sample_run_id(0xdf),
+        ThreadEntrySeq::ZERO,
+    )
+    .await;
     for lose_caller in [false, true] {
-        let text = format!("published by a short-lived executor {lose_caller} ").repeat(24);
+        let text = format!("published by a short-lived executor {lose_caller} ").repeat(900);
         let prepared = store.prepare_blob(text.as_bytes()).unwrap();
         let (reached, put) = tokio::sync::oneshot::channel();
         let (release, resume) = tokio::sync::oneshot::channel();
@@ -547,13 +585,16 @@ async fn lease_turnover_respects_budget_and_recovers_beyond_a_local_pin() {
         let root = TempDataRoot::new("lease-interruption");
         let schema = fixtures.fresh_pg_schema();
         let cfg = if pg {
-            fixtures.pg_local_config(sample_installation_id(0xe2), &schema, root.data_root())
+            fixtures
+                .open_pg_s3_config(sample_installation_id(0xe2), &schema)
+                .await
         } else {
             CanonicalConfig::local_default(sample_installation_id(0xe2), root.data_root())
         };
         let (store, runtime) = CanonicalRuntime::open(cfg).await.unwrap();
         for cancel in [false, true] {
-            let (scope, actor, _) = create_thread(&store, if cancel { 0xe3 } else { 0xe4 }).await;
+            let (scope, actor, thread) =
+                create_thread(&store, if cancel { 0xe3 } else { 0xe4 }).await;
             let mut ctx = support::maintenance_ctx(ServicePurpose::Revocation);
             if cancel {
                 ctx.budget.cancellation.cancel();
@@ -601,19 +642,39 @@ async fn lease_turnover_respects_budget_and_recovers_beyond_a_local_pin() {
                 old
             );
 
-            let text = "an unowned local publication held by a live staging ticket ".repeat(20);
+            let text = "an unowned publication held by a live staging ticket ".repeat(700);
             let prepared = store.prepare_blob(text.as_bytes()).unwrap();
-            store
-                .stage_chat_blob(owner_ctx(&scope, actor.clone()), &text)
+            let entry = store
+                .append_chat(
+                    owner_ctx(&scope, actor.clone()),
+                    next_mutation(
+                        &scope,
+                        &actor,
+                        AppendChat {
+                            tool_calls: Vec::new(),
+                            provenance: None,
+                            interruption: None,
+                            proposed_diff: None,
+                            proposed_effect: None,
+                            thread: thread.clone(),
+                            parent: ThreadEntrySeq::ZERO,
+                            kind: ChatEntryKind::Human,
+                            body: ChatInputBody::Text(text),
+                            referenced_notes: vec![],
+                            tainted: false,
+                        },
+                    ),
+                )
                 .await
-                .unwrap();
+                .unwrap()
+                .value;
             let pin = store.stage_blob(&scope, old, &prepared).await.unwrap();
             let released = store
                 .release_blob_owner_references(
                     &scope,
                     old,
-                    BlobOwnerKind::StagedChat,
-                    actor.as_str(),
+                    BlobOwnerKind::ChatEntry,
+                    &format!("{}:{}", thread.as_str(), entry.seq.get()),
                 )
                 .await
                 .unwrap();
@@ -629,17 +690,19 @@ async fn lease_turnover_respects_budget_and_recovers_beyond_a_local_pin() {
             let target = scope.clone();
             let task =
                 tokio::spawn(async move { active.advance_space_lease(&ctx, &target, next).await });
-            tokio::time::timeout(Duration::from_secs(2), async {
-                while pending(&store).await == 0 {
-                    tokio::task::yield_now().await;
+            if !pg {
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while pending(&store).await == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                if cancel {
+                    token.cancel();
                 }
-            })
-            .await
-            .unwrap();
-            if cancel {
-                token.cancel();
             }
-            let granted = tokio::time::timeout(Duration::from_secs(2), task)
+            let granted = tokio::time::timeout(Duration::from_secs(5), task)
                 .await
                 .unwrap()
                 .unwrap()
@@ -653,19 +716,23 @@ async fn lease_turnover_respects_budget_and_recovers_beyond_a_local_pin() {
                     .active_epoch,
                 next
             );
-            assert!(
-                root.data_root()
-                    .blob(&scope.space_id, prepared.digest())
-                    .is_file()
-            );
+            if !pg {
+                assert!(
+                    root.data_root()
+                        .blob(&scope.space_id, prepared.digest())
+                        .is_file()
+                );
+            }
             drop(pin);
             wait_for_cleanup(&store).await;
-            assert!(
-                !root
-                    .data_root()
-                    .blob(&scope.space_id, prepared.digest())
-                    .exists()
-            );
+            if !pg {
+                assert!(
+                    !root
+                        .data_root()
+                        .blob(&scope.space_id, prepared.digest())
+                        .exists()
+                );
+            }
             assert_validation_err(
                 &store.stage_blob(&scope, old, &prepared).await,
                 ValidationReason::InvalidAuthority,
@@ -694,20 +761,15 @@ async fn postgres_inflight_lease_commit_keeps_its_grant_with_the_initiator() {
     use notarium_core::error::{CommitEffect, RetryAdvice};
     use sqlx::Connection;
     let fixtures = StorageTestFixtures::load_required();
-    let first = TempDataRoot::new("lease-ack-old");
-    let second = TempDataRoot::new("lease-ack-new");
     let schema = fixtures.fresh_pg_schema();
     let install = sample_installation_id(0xe5);
-    let (old, old_runtime) = CanonicalRuntime::open(fixtures.pg_local_config(
-        install.clone(),
-        &schema,
-        first.data_root(),
-    ))
-    .await
-    .unwrap();
+    let (old, old_runtime) =
+        CanonicalRuntime::open(fixtures.open_pg_s3_config(install.clone(), &schema).await)
+            .await
+            .unwrap();
     let (scope, _, _) = create_thread(&old, 0xe5).await;
     let (owner, runtime) =
-        CanonicalRuntime::open(fixtures.pg_local_config(install, &schema, second.data_root()))
+        CanonicalRuntime::open(fixtures.open_pg_s3_config(install, &schema).await)
             .await
             .unwrap();
     let mut admin = fixtures.open_raw_pg().await;
@@ -819,7 +881,7 @@ async fn lease_reports_permanent_recovery_failure_after_grant() {
         let schema = fixtures.fresh_pg_schema();
         let install = sample_installation_id(0xe7);
         let cfg = if pg {
-            fixtures.pg_local_config(install, &schema, root.data_root())
+            fixtures.open_pg_s3_config(install, &schema).await
         } else {
             CanonicalConfig::local_default(install, root.data_root())
         };
@@ -932,168 +994,185 @@ async fn restored_retirements_release_terminal_workers_and_serve_other_spaces() 
     let fixtures = StorageTestFixtures::load_required();
     let old = LeaseEpoch::new(1).unwrap();
     let granted = LeaseEpoch::new(2).unwrap();
-    for pg in [false, true] {
-        let root = TempDataRoot::new("restored-terminal-retirements");
-        let schema = fixtures.fresh_pg_schema();
-        let installation = sample_installation_id(0xc7);
-        let config = if pg {
-            fixtures.pg_local_config(installation, &schema, root.data_root())
-        } else {
-            CanonicalConfig::local_default(installation, root.data_root())
-        };
-        let (store, runtime) = CanonicalRuntime::open(config).await.unwrap();
-        let mut spaces = Vec::new();
-        for seed in 0xc0..=0xc8 {
-            let (scope, actor, _) = create_thread(&store, seed).await;
-            let text = format!("physical retirement for Space {seed} ").repeat(40);
-            let digest = store.prepare_blob(text.as_bytes()).unwrap().digest();
-            store
-                .stage_chat_blob(owner_ctx(&scope, actor.clone()), &text)
-                .await
-                .unwrap();
-            let released = store
-                .release_blob_owner_references(
+    // Local filesystem quarantine blockers exist strictly in the LocalSqlite profile.
+    let root = TempDataRoot::new("restored-terminal-retirements");
+    let installation = sample_installation_id(0xc7);
+    let config = CanonicalConfig::local_default(installation, root.data_root());
+    let (store, runtime) = CanonicalRuntime::open(config).await.unwrap();
+    let mut spaces = Vec::new();
+    for seed in 0xc0..=0xc8 {
+        let (scope, actor, thread) = create_thread(&store, seed).await;
+        let text = format!("physical retirement for Space {seed} ").repeat(1100);
+        let digest = store.prepare_blob(text.as_bytes()).unwrap().digest();
+        let entry = store
+            .append_chat(
+                owner_ctx(&scope, actor.clone()),
+                next_mutation(
                     &scope,
-                    old,
-                    BlobOwnerKind::StagedChat,
-                    actor.as_str(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(released, vec![digest]);
-            let path = root.data_root().blob(&scope.space_id, digest);
-            assert!(path.is_file());
-            let head = store.read_space(&scope.space_id).await.unwrap().last_seq;
-            let target = ChangeCursor {
-                scope: HistoryScope {
-                    space_id: scope.space_id,
-                    incarnation: sample_incarnation(seed - 32),
-                },
-                after: head,
-            };
-            spaces.push((target, path));
-        }
-        // Restore schedules the sorted Spaces with four concurrent scanners.
-        spaces.sort_by(|a, b| a.0.scope.space_id.cmp(&b.0.scope.space_id));
-        let mut obstructions = Vec::new();
-        for (cut, path) in &spaces[..8] {
-            let digest = path.file_stem().unwrap().to_str().unwrap();
-            let blocker = root
-                .data_root()
-                .root()
-                .join("blobs/.quarantine")
-                .join(format!("{}.{digest}.corrupt", cut.scope.space_id.as_str()));
-            std::fs::create_dir_all(&blocker).unwrap();
-            obstructions.push(blocker);
-        }
-        store
-            .restore_cursors(
-                support::maintenance_ctx(ServicePurpose::Restore),
-                spaces.iter().map(|(cut, _)| cut.clone()).collect(),
+                    &actor,
+                    AppendChat {
+                        tool_calls: Vec::new(),
+                        provenance: None,
+                        interruption: None,
+                        proposed_diff: None,
+                        proposed_effect: None,
+                        thread: thread.clone(),
+                        parent: ThreadEntrySeq::ZERO,
+                        kind: ChatEntryKind::Human,
+                        body: ChatInputBody::Text(text),
+                        referenced_notes: vec![],
+                        tainted: false,
+                    },
+                ),
+            )
+            .await
+            .unwrap()
+            .value;
+        let released = store
+            .release_blob_owner_references(
+                &scope,
+                old,
+                BlobOwnerKind::ChatEntry,
+                &format!("{}:{}", thread.as_str(), entry.seq.get()),
             )
             .await
             .unwrap();
-
-        // Eight blocked physical objects must release the restore scan slots.
-        // The ninth Space completes with every obstruction still in place.
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while spaces.iter().any(|(_, path)| path.exists())
-                || store.active_retirement_workers_for_test() != 8
-            {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("healthy Space must progress past all eight blocked Spaces");
-        assert_eq!(pending(&store).await, 8);
-
-        // Corrupt durable metadata for four IDs. Their physical workers must
-        // stop. The other four remain eligible for automatic recovery.
-        set_target_versions(
-            &fixtures,
-            &root,
-            pg.then_some(schema.as_str()),
-            &spaces[4..8],
-            Some("invalid"),
-        )
-        .await;
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while store.active_retirement_workers_for_test() != 4 {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("terminal metadata failure must release each worker");
-        for blocker in obstructions {
-            std::fs::remove_dir(blocker).unwrap();
-        }
-        tokio::time::timeout(Duration::from_secs(15), async {
-            while !store.storage_cleanup_idle_for_test() {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("all automatic work must finish after repairing the filesystem");
-        assert!(spaces[..4].iter().all(|(_, path)| !path.exists()));
-        assert!(spaces[4..8].iter().all(|(_, path)| !path.exists()));
-        assert_eq!(store.active_retirement_workers_for_test(), 0);
-        assert_eq!(pending(&store).await, 4);
-        for (cut, _) in &spaces {
-            let observed = store.read_space(&cut.scope.space_id).await.unwrap();
-            assert_eq!(observed.scope, cut.scope);
-            assert_eq!(observed.active_epoch, granted);
-        }
-
-        let ctx = support::maintenance_ctx(ServicePurpose::Revocation);
-        let outcome = store
-            .advance_space_lease(&ctx, &spaces[4].0.scope, granted)
-            .await;
-        assert!(
-            matches!(outcome, Err(PortError::Internal(e)) if e.effect()==CommitEffect::Unknown && e.retry()==RetryAdvice::Never)
-        );
-        assert_eq!(store.active_retirement_workers_for_test(), 0);
-        assert_eq!(pending(&store).await, 4);
-        set_target_versions(
-            &fixtures,
-            &root,
-            pg.then_some(schema.as_str()),
-            &spaces[4..8],
-            None,
-        )
-        .await;
-        for (cut, path) in &spaces[4..8] {
-            assert_eq!(
-                store
-                    .advance_space_lease(&ctx, &cut.scope, granted)
-                    .await
-                    .unwrap(),
-                granted
-            );
-            assert!(!path.exists());
-        }
-        assert_eq!(pending(&store).await, 0);
-        runtime.shutdown().await.unwrap();
-        if pg {
-            fixtures.drop_pg_schema(&schema).await;
-        }
+        assert_eq!(released, vec![digest]);
+        let path = root.data_root().blob(&scope.space_id, digest);
+        assert!(path.is_file());
+        let head = store.read_space(&scope.space_id).await.unwrap().last_seq;
+        let target = ChangeCursor {
+            scope: HistoryScope {
+                space_id: scope.space_id,
+                incarnation: sample_incarnation(seed - 32),
+            },
+            after: head,
+        };
+        spaces.push((target, path));
     }
+    // Restore schedules the sorted Spaces with four concurrent scanners.
+    spaces.sort_by(|a, b| a.0.scope.space_id.cmp(&b.0.scope.space_id));
+    let mut obstructions = Vec::new();
+    for (cut, path) in &spaces[..8] {
+        let digest = path.file_stem().unwrap().to_str().unwrap();
+        let blocker = root
+            .data_root()
+            .root()
+            .join("blobs/.quarantine")
+            .join(format!("{}.{digest}.corrupt", cut.scope.space_id.as_str()));
+        std::fs::create_dir_all(&blocker).unwrap();
+        obstructions.push(blocker);
+    }
+    store
+        .restore_cursors(
+            support::maintenance_ctx(ServicePurpose::Restore),
+            spaces.iter().map(|(cut, _)| cut.clone()).collect(),
+        )
+        .await
+        .unwrap();
+
+    // Eight blocked physical objects must release the restore scan slots.
+    // The ninth Space completes with every obstruction still in place.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while spaces.iter().any(|(_, path)| path.exists())
+            || store.active_retirement_workers_for_test() != 8
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("healthy Space must progress past all eight blocked Spaces");
+    assert_eq!(pending(&store).await, 8);
+
+    // Corrupt durable metadata for four IDs. Their physical workers must
+    // stop. The other four remain eligible for automatic recovery.
+    set_target_versions(&fixtures, &root, None, &spaces[4..8], Some("invalid")).await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while store.active_retirement_workers_for_test() != 4 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("terminal metadata failure must release each worker");
+    for blocker in obstructions {
+        std::fs::remove_dir(blocker).unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while !store.storage_cleanup_idle_for_test() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("all automatic work must finish after repairing the filesystem");
+    assert!(spaces[..4].iter().all(|(_, path)| !path.exists()));
+    assert!(spaces[4..8].iter().all(|(_, path)| !path.exists()));
+    assert_eq!(store.active_retirement_workers_for_test(), 0);
+    assert_eq!(pending(&store).await, 4);
+    for (cut, _) in &spaces {
+        let observed = store.read_space(&cut.scope.space_id).await.unwrap();
+        assert_eq!(observed.scope, cut.scope);
+        assert_eq!(observed.active_epoch, granted);
+    }
+
+    let ctx = support::maintenance_ctx(ServicePurpose::Revocation);
+    let outcome = store
+        .advance_space_lease(&ctx, &spaces[4].0.scope, granted)
+        .await;
+    assert!(
+        matches!(outcome, Err(PortError::Internal(e)) if e.effect()==CommitEffect::Unknown && e.retry()==RetryAdvice::Never)
+    );
+    assert_eq!(store.active_retirement_workers_for_test(), 0);
+    assert_eq!(pending(&store).await, 4);
+    set_target_versions(&fixtures, &root, None, &spaces[4..8], None).await;
+    for (cut, path) in &spaces[4..8] {
+        assert_eq!(
+            store
+                .advance_space_lease(&ctx, &cut.scope, granted)
+                .await
+                .unwrap(),
+            granted
+        );
+        assert!(!path.exists());
+    }
+    assert_eq!(pending(&store).await, 0);
+    runtime.shutdown().await.unwrap();
 }
 
 async fn seed_startup_retirement(config: &CanonicalConfig) -> (HistoryScope, ContentDigest) {
     let (store, runtime) = CanonicalRuntime::open(config.clone()).await.unwrap();
-    let (scope, actor, _) = create_thread(&store, 0xe9).await;
-    let body = "last owner released before restart ".repeat(24);
-    let staged = store
-        .stage_chat_blob(owner_ctx(&scope, actor.clone()), &body)
+    let (scope, actor, thread) = create_thread(&store, 0xe9).await;
+    let body = "last owner released before restart ".repeat(1100);
+    let digest = store.prepare_blob(body.as_bytes()).unwrap().digest();
+    let entry = store
+        .append_chat(
+            owner_ctx(&scope, actor.clone()),
+            next_mutation(
+                &scope,
+                &actor,
+                AppendChat {
+                    tool_calls: Vec::new(),
+                    provenance: None,
+                    interruption: None,
+                    proposed_diff: None,
+                    proposed_effect: None,
+                    thread: thread.clone(),
+                    parent: ThreadEntrySeq::ZERO,
+                    kind: ChatEntryKind::Human,
+                    body: ChatInputBody::Text(body),
+                    referenced_notes: vec![],
+                    tainted: false,
+                },
+            ),
+        )
         .await
-        .unwrap();
-    let digest = staged.digest();
+        .unwrap()
+        .value;
     let released = store
         .release_blob_owner_references(
             &scope,
             LeaseEpoch::new(1).unwrap(),
-            notarium_canonical::blobs::BlobOwnerKind::StagedChat,
-            actor.as_str(),
+            notarium_canonical::blobs::BlobOwnerKind::ChatEntry,
+            &format!("{}:{}", thread.as_str(), entry.seq.get()),
         )
         .await
         .unwrap();
@@ -1159,15 +1238,14 @@ impl S3Transport for StalledStartupMarker {
 }
 
 #[tokio::test]
-async fn detached_sqlite_startup_retires_an_interrupted_current_epoch_upload() {
+async fn cloud_reopen_retires_an_interrupted_current_epoch_upload() {
     let fixtures = StorageTestFixtures::load_required();
-    let root = TempDataRoot::new("detached-startup-discard");
-    let mut config = CanonicalConfig::local_default(sample_installation_id(0xea), root.data_root());
+    let schema = fixtures.fresh_pg_schema();
     let bucket = fixtures.fresh_s3_bucket("detached-discard");
     let s3 = fixtures.s3_config(&bucket, S3BucketModePolicy::DetectFromBucket);
     admin_ensure_bucket(&s3, Some("Enabled")).await.unwrap();
     let audit = Arc::new(QueueS3Audit::new(&s3));
-    config.blobs = notarium_canonical::BlobBackendConfig::S3(Box::new(s3));
+    let config = fixtures.pg_s3_config(sample_installation_id(0xea), &schema, s3);
     let (store, runtime) =
         CanonicalRuntime::open_with_s3_transport(config.clone(), Some(audit.clone()))
             .await
@@ -1182,6 +1260,7 @@ async fn detached_sqlite_startup_retires_an_interrupted_current_epoch_upload() {
                 &scope,
                 &actor,
                 CreateNote {
+                    folder_page: false,
                     note: note.clone(),
                     parent: None,
                     slug: "pending-purge".into(),
@@ -1192,7 +1271,17 @@ async fn detached_sqlite_startup_retires_an_interrupted_current_epoch_upload() {
         )
         .await
         .unwrap();
-    let body = "current-epoch private queue upload ".repeat(32);
+    let run = sample_run_id(0xea);
+    claim_run(
+        &store,
+        ctx.clone(),
+        ChatAudience::Personal,
+        &thread,
+        &run,
+        ThreadEntrySeq::ZERO,
+    )
+    .await;
+    let body = "current-epoch private queue upload ".repeat(1100);
     let prepared = store.prepare_blob(body.as_bytes()).unwrap();
     let (reached, uploaded) = tokio::sync::oneshot::channel();
     let (release, resume) = tokio::sync::oneshot::channel();
@@ -1213,7 +1302,7 @@ async fn detached_sqlite_startup_retires_an_interrupted_current_epoch_upload() {
                 sender: actor.clone(),
                 body,
                 queued_base_leaf: ThreadEntrySeq::ZERO,
-                in_flight_run: sample_run_id(0xea),
+                in_flight_run: run,
                 mentions_agent: false,
             },
         ),
@@ -1285,20 +1374,29 @@ async fn detached_sqlite_startup_retires_an_interrupted_current_epoch_upload() {
         prepared.s3_parts()[0].compressed.as_ref()
     );
     // Drop the interrupted caller after shutdown has stopped its retirement workers.
-    // The new owner must recover the durable discard.
+    // The new owner must recover the durable discard upon taking the next lease epoch.
     runtime.shutdown().await.unwrap();
     drop(upload);
     assert!(release.send(()).is_err());
     drop(store);
 
     let (reopened, runtime) = CanonicalRuntime::open(config).await.unwrap();
+    let next_epoch = LeaseEpoch::new(2).unwrap();
+    reopened
+        .advance_space_lease(
+            &support::maintenance_ctx(ServicePurpose::Revocation),
+            &scope,
+            next_epoch,
+        )
+        .await
+        .unwrap();
     assert_eq!(
         reopened
             .read_space(&scope.space_id)
             .await
             .unwrap()
             .active_epoch,
-        epoch
+        next_epoch
     );
     assert_eq!(
         reopened
@@ -1315,14 +1413,13 @@ async fn detached_sqlite_startup_retires_an_interrupted_current_epoch_upload() {
     assert_eq!(latest.status, 200);
     assert!(TerminalMarkerMeta::is_terminal_marker(&latest.body));
     runtime.shutdown().await.unwrap();
+    fixtures.drop_pg_schema(&schema).await;
 }
 
 #[tokio::test]
-async fn sqlite_startup_cancels_unpublished_work_when_open_is_dropped() {
+async fn cloud_lease_takeover_cancels_stalled_s3_retirement_when_dropped() {
     let fixtures = StorageTestFixtures::load_required();
-    let tmp = TempDataRoot::new("drop-startup");
-    let root = tmp.data_root();
-    let mut cfg = CanonicalConfig::local_default(sample_installation_id(0xe9), root.clone());
+    let schema = fixtures.fresh_pg_schema();
     let bucket = fixtures.fresh_s3_bucket("drop-startup");
     let s3 = fixtures.s3_config(&bucket, S3BucketModePolicy::DetectFromBucket);
     admin_ensure_bucket(&s3, None).await.unwrap();
@@ -1331,37 +1428,38 @@ async fn sqlite_startup_cancels_unpublished_work_when_open_is_dropped() {
         started: tokio::sync::Notify::new(),
         active: tokio::sync::Semaphore::new(1),
     });
-    cfg.blobs = notarium_canonical::BlobBackendConfig::S3(Box::new(s3));
-    seed_startup_retirement(&cfg).await;
-    let mut opening = Box::pin(CanonicalRuntime::open_with_s3_transport(
-        cfg.clone(),
-        Some(transport.clone()),
-    ));
+    let cfg = fixtures.pg_s3_config(sample_installation_id(0xe9), &schema, s3);
+    let (scope, _) = seed_startup_retirement(&cfg).await;
+    let (stalled_store, stalled_runtime) =
+        CanonicalRuntime::open_with_s3_transport(cfg.clone(), Some(transport.clone()))
+            .await
+            .unwrap();
+    let next = LeaseEpoch::new(2).unwrap();
+    let rev_ctx = support::maintenance_ctx(ServicePurpose::Revocation);
+    let mut advancing = Box::pin(stalled_store.advance_space_lease(&rev_ctx, &scope, next));
     tokio::time::timeout(Duration::from_secs(5), async {
         tokio::select! {
-            result = &mut opening => panic!("open returned before interrupted marker: {result:?}"),
+            result = &mut advancing => panic!("advance returned before stalled marker: {result:?}"),
             () = transport.started.notified() => {}
         }
     })
     .await
-    .expect("startup reaches durable retirement");
-    assert!(notarium_canonical::DataRootOwnerLock::acquire(&root).is_err());
+    .expect("lease recovery reaches durable S3 retirement");
     assert_eq!(transport.active.available_permits(), 0);
-    drop(opening);
-
-    let owner = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if let Ok(lock) = notarium_canonical::DataRootOwnerLock::acquire(&root) {
-                break lock;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("cancelled opening releases ownership while the marker is stalled");
+    drop(advancing);
+    stalled_runtime.shutdown().await.unwrap();
     assert_eq!(transport.active.available_permits(), 1);
-    drop(owner);
+
     let (store, runtime) = CanonicalRuntime::open(cfg).await.unwrap();
+    store
+        .advance_space_lease(
+            &support::maintenance_ctx(ServicePurpose::Revocation),
+            &scope,
+            next.checked_next().unwrap(),
+        )
+        .await
+        .unwrap();
     assert_eq!(pending(&store).await, 0);
     runtime.shutdown().await.unwrap();
+    fixtures.drop_pg_schema(&schema).await;
 }

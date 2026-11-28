@@ -245,6 +245,7 @@ pub(super) async fn check(
                 scope,
                 actor,
                 CreateNote {
+                    folder_page: false,
                     note: note.clone(),
                     class: DocClass::UserDoc,
                     parent: None,
@@ -583,6 +584,7 @@ async fn check_planned_observation_conflict_replay(store: &CanonicalStore, ctx: 
                 ctx.scope(),
                 ctx.auth().principal(),
                 CreateNote {
+                    folder_page: false,
                     note: note.clone(),
                     parent: None,
                     slug: "planned-observation-race".into(),
@@ -676,6 +678,7 @@ async fn check_move_pin(store: &CanonicalStore, ctx: &SpaceContext, room: &Pause
         scope,
         actor,
         BatchItem::Create(CreateNote {
+            folder_page: false,
             note: note.clone(),
             parent: None,
             slug: "before-room-move".into(),
@@ -1046,6 +1049,7 @@ async fn check_room_command_commit(store: &CanonicalStore, ctx: &SpaceContext, r
                 scope,
                 actor,
                 CreateNote {
+                    folder_page: false,
                     note: note.clone(),
                     parent: None,
                     slug: "room-carrier-command".into(),
@@ -1132,26 +1136,7 @@ async fn check_room_command_commit(store: &CanonicalStore, ctx: &SpaceContext, r
         .unwrap();
     assert_eq!(closed.room_state, CollabRoomState::Closed);
     let rollback = store
-        .rollback_agent_run(
-            ctx.clone(),
-            next_mutation(
-                scope,
-                actor,
-                RollbackAgentRun {
-                    expected_run_revision: store
-                        .inspect_agent_run_revision_for_test(&scope.space_id, &run)
-                        .await
-                        .unwrap()
-                        .unwrap(),
-                    run,
-                    expected_entities: vec![NoteRevision {
-                        note: note.clone(),
-                        revision: settled.carrier_rev_id.clone(),
-                    }],
-                    associated_board_expectations: vec![],
-                },
-            ),
-        )
+        .rollback_agent_run_by_id(ctx.clone(), next_mutation(scope, actor, run))
         .await
         .unwrap();
     assert!(rollback.value.skipped_manual_edits.is_empty());
@@ -1407,6 +1392,7 @@ async fn committed_room_observation_survives_process_exit() {
                 &scope,
                 &actor,
                 CreateNote {
+                    folder_page: false,
                     note: note.clone(),
                     parent: None,
                     slug: "crash-room-note".into(),

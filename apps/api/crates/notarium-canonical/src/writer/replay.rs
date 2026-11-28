@@ -4,9 +4,9 @@ use notarium_core::{
     auth::{EngineAuthContext, ResourceFacts, Space},
     classes::DocClass,
     error::PortError,
-    ids::{ChatThreadId, FolderId, JobId, NoteId},
+    ids::{AgentRunId, ChatThreadId, FolderId, JobId, NoteId, ThreadEntrySeq},
     model::{HistoryScope, NoteRef},
-    ports::LinkTarget,
+    ports::{CanonicalEffectAdmission, LinkTarget, ResolvedMemoryTarget},
 };
 
 use super::CommandIdentitySpec;
@@ -22,28 +22,45 @@ use crate::{
 #[derive(Clone, Debug)]
 pub(crate) enum ReplayResource {
     Write(NoteId),
+    WriteUnpurged(NoteId),
     Read(NoteId),
     View(NoteId),
     Create(NoteId, Option<FolderId>, DocClass),
     Move(NoteId, Option<FolderId>),
     WriteFolder(Option<FolderId>),
+    WriteFolderSubtree(FolderId),
     ReadLinkFolder(FolderId, NoteId),
 }
 
 #[derive(Clone, Debug)]
 pub(crate) enum ReplayPolicy {
     Documents(Vec<ReplayResource>),
+    RollbackRun(AgentRunId),
     Schema(Vec<ReplayResource>),
-    Chat(ChatThreadId, Vec<NoteRef>, bool),
+    Memory(ResolvedMemoryTarget),
+    Chat(ChatThreadId, Option<ThreadEntrySeq>, Vec<NoteRef>),
     Job(Option<JobId>, Vec<NoteId>),
 }
 
+#[derive(Debug)]
+pub(crate) struct ReplayAuthority {
+    pub(crate) auth: EngineAuthContext,
+    pub(crate) policy: ReplayPolicy,
+    pub(crate) canonical_effect: Option<CanonicalEffectAdmission>,
+}
+
 /// A domain fingerprint becomes usable by the writer only after binding a policy.
-pub(crate) struct UnboundCommand(pub(crate) CommandIdentitySpec);
+pub(crate) struct UnboundCommand(
+    pub(crate) CommandIdentitySpec,
+    Option<CanonicalEffectAdmission>,
+);
 
 impl UnboundCommand {
-    pub(crate) fn command_hash(&self) -> notarium_core::ids::ContentDigest {
-        self.0.command_hash
+    pub(crate) fn new(
+        spec: CommandIdentitySpec,
+        canonical_effect: Option<CanonicalEffectAdmission>,
+    ) -> Self {
+        Self(spec, canonical_effect)
     }
 
     pub(crate) fn with_policy(
@@ -51,7 +68,11 @@ impl UnboundCommand {
         auth: &EngineAuthContext,
         policy: ReplayPolicy,
     ) -> CommandIdentitySpec {
-        self.0.authority = Some(std::sync::Arc::new((auth.clone(), policy)));
+        self.0.authority = Some(std::sync::Arc::new(ReplayAuthority {
+            auth: auth.clone(),
+            policy,
+            canonical_effect: self.1,
+        }));
         self.0
     }
 
@@ -106,7 +127,19 @@ impl UnboundCommand {
         thread: &ChatThreadId,
         reads: Vec<NoteRef>,
     ) -> CommandIdentitySpec {
-        self.with_policy(auth, ReplayPolicy::Chat(thread.clone(), reads, false))
+        self.with_policy(auth, ReplayPolicy::Chat(thread.clone(), None, reads))
+    }
+
+    pub(crate) fn for_chat_leaf(
+        self,
+        auth: &EngineAuthContext,
+        thread: &ChatThreadId,
+        leaf: ThreadEntrySeq,
+    ) -> CommandIdentitySpec {
+        self.with_policy(
+            auth,
+            ReplayPolicy::Chat(thread.clone(), Some(leaf), Vec::new()),
+        )
     }
 
     pub(crate) fn for_link(
@@ -129,26 +162,112 @@ impl UnboundCommand {
 }
 
 impl CommandIdentitySpec {
+    pub(crate) async fn authorize_confirmed_chat_step(
+        &self,
+        tx: &mut BackendConn<'_>,
+        scope: &HistoryScope,
+        committing: bool,
+    ) -> Result<(), PortError> {
+        let Some(super::fingerprint::CommandProof::Confirmed { step, kind }) =
+            self.fingerprint_proof.as_deref()
+        else {
+            return Ok(());
+        };
+        let Some(ReplayAuthority { auth, .. }) = self.authority.as_deref() else {
+            return Err(DomainError::validation(
+                notarium_core::error::ValidationReason::InvalidAuthority,
+            )
+            .into());
+        };
+        if step.identity().actor != self.actor || step.identity().key != self.command_key {
+            return Err(DomainError::validation(
+                notarium_core::error::ValidationReason::InvalidAuthority,
+            )
+            .into());
+        }
+        crate::chats::verify_confirmed_chat_step_tx(tx, auth, scope, step, kind, committing).await
+    }
+
+    /// A purge can remove the revisions that once attributed a skipped note to
+    /// the run. Older detailed and sanitized envelopes still name that note.
+    pub(crate) fn rollback_disclosures(
+        &self,
+        scope: &HistoryScope,
+        receipt: &super::StoredReceiptRow,
+    ) -> Result<std::collections::BTreeSet<NoteId>, PortError> {
+        let mut notes = std::collections::BTreeSet::new();
+        if receipt.command_hash == self.command_hash
+            && receipt.status == "completed"
+            && self
+                .authority
+                .as_deref()
+                .is_some_and(|a| matches!(a.policy, ReplayPolicy::RollbackRun(_)))
+        {
+            let wire: crate::domain::common::StoredCommittedRollbackV1 =
+                rmp_serde::from_slice(&receipt.response_blob).map_err(|err| {
+                    crate::codec::internal_not_committed(
+                        "decode_replayed_rollback",
+                        err.to_string(),
+                    )
+                })?;
+            scope.check(wire.receipt.scope())?;
+            notes.extend(wire.disclosed_notes().cloned());
+        }
+        Ok(notes)
+    }
+
+    pub(crate) async fn authorize_rollback_disclosures(
+        &self,
+        tx: &mut BackendConn<'_>,
+        scope: &HistoryScope,
+        receipt: &super::StoredReceiptRow,
+    ) -> Result<(), PortError> {
+        let notes = self.rollback_disclosures(scope, receipt)?;
+        if notes.is_empty() {
+            return Ok(());
+        }
+        let auth = &self.authority.as_ref().expect("rollback authority").auth;
+        let space = load_space_record(tx, &scope.space_id).await?;
+        space.scope.check(scope)?;
+        let ids = notes.iter().cloned().collect::<Vec<_>>();
+        if crate::runtime::are_any_notes_purge_fenced_tx(tx, &scope.space_id, &ids).await? {
+            return Err(DomainError::ResourceNotFound.into());
+        }
+        for note in notes {
+            authorize_resource(tx, &space, auth, &ReplayResource::Read(note)).await?;
+        }
+        Ok(())
+    }
+
     pub(crate) async fn authorize_replay(
         &self,
         tx: &mut BackendConn<'_>,
         scope: &HistoryScope,
     ) -> Result<(), PortError> {
-        let Some((auth, policy)) = self.authority.as_deref() else {
+        self.authorize_confirmed_chat_step(tx, scope, false).await?;
+        let Some(ReplayAuthority { auth, policy, .. }) = self.authority.as_deref() else {
             return Ok(());
         };
         let srec = load_space_record(tx, &scope.space_id).await?;
         srec.scope.check(scope)?;
         match policy {
-            ReplayPolicy::Chat(thread, reads, legacy_staged) => {
-                crate::chats::authorize_chat_replay_tx(
-                    tx,
-                    &srec.space,
-                    auth,
-                    thread,
-                    *legacy_staged,
-                )
-                .await?;
+            ReplayPolicy::RollbackRun(run) => {
+                // `rollback_agent_run_by_id` replay intentionally enforces live active-folder
+                // visibility on the run's current sources (see `rollback_receipts`).
+                crate::domain::rollback::authorize_rollback_run_replay_tx(tx, &srec, auth, run)
+                    .await?;
+            }
+            ReplayPolicy::Memory(target) => {
+                let (_, head) =
+                    crate::catalog::memory::authorized_slot(tx, auth, &srec, target).await?;
+                if head.is_none_or(|head| head.lifecycle != notarium_core::model::Lifecycle::Active)
+                {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+            }
+            ReplayPolicy::Chat(thread, leaf, reads) => {
+                crate::chats::authorize_chat_replay_tx(tx, &srec.space, auth, thread, *leaf)
+                    .await?;
                 for note in reads {
                     if note.space_id == srec.space.id {
                         authorize_resource(
@@ -159,9 +278,31 @@ impl CommandIdentitySpec {
                         )
                         .await?;
                     } else {
-                        if !auth.spaces().contains_key(&note.space_id) {
+                        if auth
+                            .spaces()
+                            .get(&note.space_id)
+                            .is_none_or(|g| g.read_classes.is_empty())
+                        {
                             return Err(DomainError::ResourceNotFound.into());
                         }
+                        let target_space = crate::runtime::load_space_record(tx, &note.space_id)
+                            .await
+                            .map_err(|err| match err {
+                                PortError::Domain(DomainError::ResourceNotFound) => err,
+                                other => other,
+                            })?;
+                        if target_space.space.lifecycle
+                            != notarium_core::auth::SpaceLifecycle::Active
+                        {
+                            return Err(DomainError::ResourceNotFound.into());
+                        }
+                        authorize_resource(
+                            tx,
+                            &target_space,
+                            auth,
+                            &ReplayResource::Read(note.note_id.clone()),
+                        )
+                        .await?;
                         auth.taint().mark_external_read();
                     }
                 }
@@ -204,23 +345,54 @@ async fn authorize_resource(
     let note = match target {
         ReplayResource::WriteFolder(folder) => {
             let folder = folder.as_ref().unwrap_or(&srec.root_folder_id);
-            let (facts, _) = build_resource_facts_tx(
+            let (facts, ancestry) = build_resource_facts_tx(
                 tx,
                 &srec.space,
                 folder,
                 folder_mutation_class(auth, &srec.space.id)?,
                 None,
-                true,
+                false,
             )
             .await?;
+            if ancestry.folder_lifecycle == notarium_core::model::Lifecycle::Purged {
+                return Err(DomainError::ResourceNotFound.into());
+            }
+            auth.can_view_folder(&srec.space, folder, &ancestry.ancestors)?;
             return Ok(auth.authorize_direct_write(&facts, &facts)?);
+        }
+        ReplayResource::WriteFolderSubtree(folder) => {
+            let (facts, ancestry) = build_resource_facts_tx(
+                tx,
+                &srec.space,
+                folder,
+                folder_mutation_class(auth, &srec.space.id)?,
+                None,
+                false,
+            )
+            .await?;
+            if ancestry.folder_lifecycle == notarium_core::model::Lifecycle::Purged {
+                return Err(DomainError::ResourceNotFound.into());
+            }
+            auth.can_view_folder(&srec.space, folder, &ancestry.ancestors)?;
+            auth.authorize_direct_write(&facts, &facts)?;
+            return crate::domain::folders::authorize_folder_subtree_tx(
+                tx,
+                &srec.space.id,
+                folder,
+                auth,
+                true,
+            )
+            .await;
         }
         ReplayResource::ReadLinkFolder(folder, source) => {
             let head =
                 crate::domain::common::load_note_head_row_tx(tx, &srec.space.id, source).await?;
-            let (facts, _) =
-                build_resource_facts_tx(tx, &srec.space, folder, head.doc_class, None, true)
+            let (facts, ancestry) =
+                build_resource_facts_tx(tx, &srec.space, folder, head.doc_class, None, false)
                     .await?;
+            if ancestry.folder_lifecycle == notarium_core::model::Lifecycle::Purged {
+                return Err(DomainError::ResourceNotFound.into());
+            }
             return Ok(auth.authorize_read(&facts)?);
         }
         ReplayResource::View(note) => {
@@ -230,33 +402,52 @@ async fn authorize_resource(
         }
         ReplayResource::Read(note)
         | ReplayResource::Write(note)
+        | ReplayResource::WriteUnpurged(note)
         | ReplayResource::Create(note, ..)
         | ReplayResource::Move(note, ..) => note,
     };
+    if matches!(
+        target,
+        ReplayResource::Read(_) | ReplayResource::View(_) | ReplayResource::WriteUnpurged(_)
+    ) && crate::runtime::is_note_purge_fenced_tx(tx, &srec.space.id, note.as_str()).await?
+    {
+        return Err(DomainError::ResourceNotFound.into());
+    }
     let head = load_note_head_row_opt_tx(tx, &srec.space.id, note).await?;
     if let Some((parent, class)) = destination(target, head.as_ref().map(|h| h.doc_class)) {
-        let (facts, _) = build_resource_facts_tx(
+        let (facts, ancestry) = build_resource_facts_tx(
             tx,
             &srec.space,
             parent.unwrap_or(&srec.root_folder_id),
             class,
             None,
-            true,
+            false,
         )
         .await?;
+        if ancestry.folder_lifecycle == notarium_core::model::Lifecycle::Purged {
+            return Err(DomainError::ResourceNotFound.into());
+        }
         auth.authorize_direct_write(&facts, &facts)?;
     }
     if let Some(head) = head {
-        let (facts, _) = build_resource_facts_tx(
+        let (facts, ancestry) = build_resource_facts_tx(
             tx,
             &srec.space,
             &head.parent_folder_id,
             head.doc_class,
             head.ability_id,
-            true,
+            false,
         )
         .await?;
-        authorize_head(auth, target, &facts, head.lifecycle)?;
+        if ancestry.folder_lifecycle == notarium_core::model::Lifecycle::Purged {
+            return Err(DomainError::ResourceNotFound.into());
+        }
+        authorize_head(
+            auth,
+            target,
+            &facts,
+            crate::domain::common::combine_lifecycle(head.lifecycle, ancestry.folder_lifecycle),
+        )?;
     } else if !matches!(target, ReplayResource::Create(..)) {
         return Err(DomainError::ResourceNotFound.into());
     }
@@ -282,6 +473,13 @@ pub(crate) fn authorize_head(
 ) -> Result<(), PortError> {
     if matches!(target, ReplayResource::View(_))
         && lifecycle != notarium_core::model::Lifecycle::Active
+    {
+        return Err(DomainError::ResourceNotFound.into());
+    }
+    if matches!(
+        target,
+        ReplayResource::Read(_) | ReplayResource::WriteUnpurged(_)
+    ) && lifecycle == notarium_core::model::Lifecycle::Purged
     {
         return Err(DomainError::ResourceNotFound.into());
     }

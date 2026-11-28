@@ -835,6 +835,15 @@ impl SessionRevocationPort for MiniRevocationRegistry {
         Box::pin(async move { Ok(Box::new(MiniLease(cancellation)) as Box<dyn RevocationLease>) })
     }
 
+    fn register_canonical_effect(
+        &self,
+        _ctx: MaintenanceContext,
+        _selectors: Vec<RevocationSelector>,
+        _cancellation: Cancellation,
+    ) -> PortFuture<'_, Arc<dyn notarium_core::ports::CanonicalEffectRegistration>> {
+        Box::pin(async { Err(DomainError::AccessDenied.into()) })
+    }
+
     fn fence_provider(
         &self,
         _ctx: MaintenanceContext,
@@ -1691,6 +1700,7 @@ async fn sqlite_savepoint_batch_enforces_idempotency_replay_and_key_reuse() {
     let mut c_ok = mutation(
         &owner,
         CreateNote {
+            folder_page: false,
             note: NoteId::from_bytes([133; 16]),
             parent: None,
             slug: "idemp-a".into(),
@@ -1702,6 +1712,7 @@ async fn sqlite_savepoint_batch_enforces_idempotency_replay_and_key_reuse() {
     let mut c_diff = mutation(
         &owner,
         CreateNote {
+            folder_page: false,
             note: NoteId::from_bytes([134; 16]),
             parent: None,
             slug: "idemp-b".into(),
@@ -1715,6 +1726,7 @@ async fn sqlite_savepoint_batch_enforces_idempotency_replay_and_key_reuse() {
     let col_a = mutation(
         &owner,
         CreateNote {
+            folder_page: false,
             note: NoteId::from_bytes([135; 16]),
             parent: None,
             slug: "same-slug-sp".into(),
@@ -1725,6 +1737,7 @@ async fn sqlite_savepoint_batch_enforces_idempotency_replay_and_key_reuse() {
     let col_b = mutation(
         &owner,
         CreateNote {
+            folder_page: false,
             note: NoteId::from_bytes([136; 16]),
             parent: None,
             slug: "same-slug-sp".into(),

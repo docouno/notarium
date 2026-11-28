@@ -48,21 +48,29 @@ impl ControlService {
         let command = Command::new(request.identity, "set-favorite", &request.input)?;
         command.require(ctx.auth().principal(), ctx.auth().principal())?;
         ctx.auth().authorize_human_management()?;
+        require_unpinned_human(ctx.auth())?;
         let budget = OperationBudget::new(ctx.budget.clone());
-        if request.input.saved {
+        let visible_precheck = if request.input.saved {
             let current = self.current_account(&ctx, &budget).await?;
-            budget
-                .run(
-                    self.favorite_visible(&current, &request.input.reference),
-                    CommitEffect::NotCommitted,
-                )
-                .await?;
-        }
+            Some(
+                budget
+                    .run(
+                        self.favorite_visible(&current, &request.input.reference),
+                        CommitEffect::NotCommitted,
+                    )
+                    .await,
+            )
+        } else {
+            None
+        };
         let mut tx = self.store.write(budget.clone()).await?;
         let revision = budget.run(async {
             let auth = self.revalidate(tx.inner_mut(), ctx.auth()).await?;
             auth.authorize_human_management()?;
             if let Some((revision, _)) = command.replay::<()>(tx.inner_mut()).await? { return Ok(revision); }
+            if let Some(check) = visible_precheck {
+                check?;
+            }
             let owner = user(tx.inner_mut(), auth.principal().as_str()).await?;
             expect_revision(&owner, command.identity.expected)?;
             let (kind, space, entity) = match &request.input.reference {
@@ -83,7 +91,7 @@ impl ControlService {
             command.save(tx.inner_mut(), revision, &SavedResult { value: (), events: vec![] }, self.clock.now_ms()?).await?;
             Ok(revision)
         }, CommitEffect::NotCommitted).await?;
-        budget.run(tx.commit(), CommitEffect::Unknown).await?;
+        budget.commit_tx(tx).await?;
         Ok(ControlCommit {
             revision,
             value: (),
@@ -94,51 +102,171 @@ impl ControlService {
         ctx: AccountContext,
         page: ControlPageRequest,
     ) -> Result<ControlPage<FavoriteInfo>, PortError> {
+        const MAX_SCAN: usize = 4096;
         let budget = OperationBudget::new(ctx.budget.clone());
         let (mut tx, auth) = self
             .open_revalidated_read(&budget, &ctx.budget.request, ctx.auth())
             .await?;
         let current = AccountContext::new(auth, budget.context(ctx.budget.request.clone()));
-        let db_result = budget.run(async {
-            let scope = self.context_digest(tx.inner_mut(), &current, "favorites").await?;
-            let cursor: Option<Cursor> = page.continuation().map(|value| serde_json::from_str(value).map_err(|_| invalid(ValidationReason::InvalidQuery))).transpose()?;
-            if cursor.as_ref().is_some_and(|cursor| cursor.version != 1 || cursor.scope != scope || !matches!(cursor.kind.as_str(), "note" | "folder")) { return Err(invalid(ValidationReason::CursorStale)); }
-            let mut values = match &cursor {
-                None => rows!(tx.inner_mut(),FavoritesRow,fetch_all,"SELECT * FROM favorites WHERE owner_id=$1 ORDER BY rank,space_id,entity_kind,entity_id LIMIT $2","SELECT * FROM v1_control.favorites WHERE owner_id=$1 ORDER BY rank,space_id,entity_kind,entity_id LIMIT $2";current.auth().principal().as_str(),i64::from(page.limit())+1)?,
-                Some(cursor) => rows!(tx.inner_mut(),FavoritesRow,fetch_all,"SELECT * FROM favorites WHERE owner_id=$1 AND (rank,space_id,entity_kind,entity_id)>($2,$3,$4,$5) ORDER BY rank,space_id,entity_kind,entity_id LIMIT $6","SELECT * FROM v1_control.favorites WHERE owner_id=$1 AND (rank,space_id,entity_kind,entity_id)>($2,$3,$4,$5) ORDER BY rank,space_id,entity_kind,entity_id LIMIT $6";current.auth().principal().as_str(),cursor.rank,cursor.space.as_str(),&cursor.kind,&cursor.entity,i64::from(page.limit())+1)?,
-            };
-            let continuation = if values.len() > usize::from(page.limit()) {
-                values.pop(); let last = values.last().expect("positive page limit");
-                Some(serde_json::to_string(&Cursor { version: 1, scope, rank: last.rank, space: SpaceId::parse(&last.space_id)?, kind: last.entity_kind.clone(), entity: last.entity_id.clone() }).map_err(|_| invalid(ValidationReason::InvalidState))?)
-            } else { None };
-            Ok::<_, PortError>((values, continuation))
-        }, CommitEffect::NotCommitted).await;
-        budget
-            .run(tx.rollback(), CommitEffect::NotCommitted)
-            .await?;
-        let (values, continuation) = db_result?;
-        budget
+        let init_result = budget
             .run(
                 async {
-                    let mut items = Vec::with_capacity(values.len());
-                    for row in values {
-                        let reference = reference(&row)?;
-                        match self.favorite_visible(&current, &reference).await {
-                            Ok(()) => items.push(FavoriteInfo {
-                                reference,
-                                rank: row.rank,
-                            }),
-                            Err(error) if hidden(&error) => (),
-                            Err(error) => return Err(error),
-                        }
+                    let scope = self
+                        .context_digest(tx.inner_mut(), &current, "favorites")
+                        .await?;
+                    let cursor: Option<Cursor> = page
+                        .continuation()
+                        .map(|value| {
+                            serde_json::from_str(value)
+                                .map_err(|_| invalid(ValidationReason::InvalidQuery))
+                        })
+                        .transpose()?;
+                    if cursor.as_ref().is_some_and(|cursor| {
+                        cursor.version != 1
+                            || cursor.scope != scope
+                            || !matches!(cursor.kind.as_str(), "note" | "folder")
+                    }) {
+                        return Err(invalid(ValidationReason::CursorStale));
                     }
-                    Ok(ControlPage {
-                        items,
-                        continuation,
-                    })
+                    Ok::<_, PortError>((scope, cursor))
                 },
                 CommitEffect::NotCommitted,
             )
-            .await
+            .await;
+        budget
+            .run(tx.rollback(), CommitEffect::NotCommitted)
+            .await?;
+        let (scope, mut after) = init_result?;
+        let target = usize::from(page.limit());
+        let batch_limit = i64::from(page.limit()).saturating_add(1).max(16);
+        let mut items = Vec::with_capacity(target);
+        let mut seen = std::collections::BTreeSet::new();
+        let mut last_visible: Option<Cursor> = None;
+        let mut has_more = false;
+        let mut scanned = 0usize;
+        loop {
+            let fetch_limit = batch_limit.min(
+                i64::try_from((MAX_SCAN + 1).saturating_sub(scanned))
+                    .unwrap_or(1)
+                    .max(1),
+            );
+            let mut tx = self.store.read(budget.clone()).await?;
+            let batch_result = budget
+                .run(
+                    async {
+                        let rows = match &after {
+                            None => rows!(
+                                tx.inner_mut(),
+                                FavoritesRow,
+                                fetch_all,
+                                "SELECT * FROM favorites WHERE owner_id=$1 ORDER BY rank,space_id,entity_kind,entity_id LIMIT $2",
+                                "SELECT * FROM v1_control.favorites WHERE owner_id=$1 ORDER BY rank,space_id,entity_kind,entity_id LIMIT $2";
+                                current.auth().principal().as_str(),
+                                fetch_limit
+                            )?,
+                            Some(cursor) => rows!(
+                                tx.inner_mut(),
+                                FavoritesRow,
+                                fetch_all,
+                                "SELECT * FROM favorites WHERE owner_id=$1 AND (rank,space_id,entity_kind,entity_id)>($2,$3,$4,$5) ORDER BY rank,space_id,entity_kind,entity_id LIMIT $6",
+                                "SELECT * FROM v1_control.favorites WHERE owner_id=$1 AND (rank,space_id,entity_kind,entity_id)>($2,$3,$4,$5) ORDER BY rank,space_id,entity_kind,entity_id LIMIT $6";
+                                current.auth().principal().as_str(),
+                                cursor.rank,
+                                cursor.space.as_str(),
+                                &cursor.kind,
+                                &cursor.entity,
+                                fetch_limit
+                            )?,
+                        };
+                        Ok::<_, PortError>(rows)
+                    },
+                    CommitEffect::NotCommitted,
+                )
+                .await;
+            budget
+                .run(tx.rollback(), CommitEffect::NotCommitted)
+                .await?;
+            let batch = batch_result?;
+            let batch_len = batch.len();
+            for row in batch {
+                scanned = scanned.saturating_add(1);
+                if scanned > MAX_SCAN {
+                    return Err(invalid(ValidationReason::BudgetExceeded));
+                }
+                let space = SpaceId::parse(&row.space_id)?;
+                let row_cursor = Cursor {
+                    version: 1,
+                    scope,
+                    rank: row.rank,
+                    space: space.clone(),
+                    kind: row.entity_kind.clone(),
+                    entity: row.entity_id.clone(),
+                };
+                after = Some(Cursor {
+                    version: 1,
+                    scope,
+                    rank: row_cursor.rank,
+                    space: row_cursor.space.clone(),
+                    kind: row_cursor.kind.clone(),
+                    entity: row_cursor.entity.clone(),
+                });
+                if !seen.insert((
+                    row.space_id.clone(),
+                    row.entity_kind.clone(),
+                    row.entity_id.clone(),
+                )) {
+                    continue;
+                }
+                if current
+                    .auth()
+                    .spaces()
+                    .get(&space)
+                    .is_none_or(|grant| grant.read_classes.is_empty())
+                {
+                    continue;
+                }
+                let reference = reference(&row)?;
+                let visible = budget
+                    .run(
+                        async {
+                            match self.favorite_visible(&current, &reference).await {
+                                Ok(()) => Ok(true),
+                                Err(error) if hidden(&error) => Ok(false),
+                                Err(error) => Err(error),
+                            }
+                        },
+                        CommitEffect::NotCommitted,
+                    )
+                    .await?;
+                if !visible {
+                    continue;
+                }
+                if items.len() == target {
+                    has_more = true;
+                    break;
+                }
+                items.push(FavoriteInfo {
+                    reference,
+                    rank: row.rank,
+                });
+                last_visible = Some(row_cursor);
+            }
+            if has_more || batch_len < usize::try_from(fetch_limit).unwrap_or(usize::MAX) {
+                break;
+            }
+        }
+        let continuation = if has_more {
+            let last = last_visible.expect("positive page limit");
+            Some(
+                serde_json::to_string(&last)
+                    .map_err(|_| invalid(ValidationReason::InvalidState))?,
+            )
+        } else {
+            None
+        };
+        Ok(ControlPage {
+            items,
+            continuation,
+        })
     }
 }

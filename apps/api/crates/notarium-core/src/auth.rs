@@ -1,6 +1,13 @@
 //! Pure authorization policy. Only control adapters may attest authentication facts.
 //! These types intentionally do not implement Deserialize.
-use crate::{DomainError, DomainResult, classes::DocClass, error::ValidationReason, ids::*};
+use crate::{
+    DomainError, DomainResult,
+    classes::DocClass,
+    error::ValidationReason,
+    ids::*,
+    model::FolderRef,
+    ports::{BearerScope, RevocationSelector},
+};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -94,6 +101,13 @@ pub enum PrincipalKind {
     SearchIndexing,
 }
 
+/// Independent authority used for explicit human confirmation of a proposal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProposalHumanAccess {
+    ReadOnly,
+    Write,
+}
+
 #[derive(Clone, Debug)]
 pub struct SpaceGrant {
     pub role: SpaceRole,
@@ -138,6 +152,47 @@ impl VerifiedHuman {
     }
 }
 
+/// The authenticated lineage of a PAT or OAuth access token.
+pub enum BearerCredential {
+    Pat(CredentialTokenId),
+    OAuth {
+        token: CredentialTokenId,
+        grant: OAuthGrantId,
+        family: Option<OAuthFamilyId>,
+    },
+}
+
+/// The authentication owner attests a live bearer record and its effective
+/// membership and consent intersection. This witness cannot be deserialized.
+pub struct VerifiedBearer {
+    principal: PrincipalId,
+    grant: GrantId,
+    credential: BearerCredential,
+    spaces: BTreeMap<SpaceId, SpaceGrant>,
+    scope: BearerScope,
+    ability_write: bool,
+}
+
+impl VerifiedBearer {
+    pub fn attest(
+        principal: PrincipalId,
+        grant: GrantId,
+        credential: BearerCredential,
+        spaces: BTreeMap<SpaceId, SpaceGrant>,
+        scope: BearerScope,
+        approved_ability_write: bool,
+    ) -> Self {
+        Self {
+            principal,
+            grant,
+            credential,
+            spaces,
+            scope,
+            ability_write: approved_ability_write,
+        }
+    }
+}
+
 /// Clones and forks share a monotonic fence; no handle can restore write access.
 #[derive(Clone, Debug, Default)]
 pub struct BranchTaint(Arc<AtomicBool>);
@@ -158,19 +213,33 @@ impl BranchTaint {
     }
 }
 
+static EMPTY_ABILITIES: BTreeSet<AbilityId> = BTreeSet::new();
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct KeeperAuthScope {
+    readonly_abilities: BTreeSet<AbilityId>,
+    readonly_system_abilities: BTreeSet<AbilityId>,
+    readonly_abilities_in_project_only: bool,
+    keeper_log: Option<ChatThreadId>,
+}
+
 #[derive(Clone, Debug)]
 pub struct EngineAuthContext {
     principal: PrincipalId,
     grant: GrantId,
     kind: PrincipalKind,
     spaces: BTreeMap<SpaceId, SpaceGrant>,
+    spaces_narrowed: bool,
     human_management: bool,
+    proposal_read: bool,
     ability_write: bool,
     write_space: Option<SpaceId>,
     chat_audience: Option<ChatAudience>,
+    chat_episode: Option<EpisodeId>,
     taint: BranchTaint,
-    readonly_abilities: BTreeSet<AbilityId>,
+    keeper: Option<Box<KeeperAuthScope>>,
     credential: Option<AuthenticatedCredential>,
+    bearer_scope: Option<BearerScope>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -184,6 +253,9 @@ pub enum ChatAudience {
 pub struct ResourceFacts {
     pub space: Space,
     pub class: DocClass,
+    /// Nearest enclosing canonical project, if any. Scoped authorization
+    /// still checks the complete ancestry below.
+    pub project: Option<FolderId>,
     pub ancestor_folders: Vec<FolderId>,
     pub folder_write_locked: bool,
     pub ability_package: Option<AbilityId>,
@@ -196,14 +268,68 @@ impl EngineAuthContext {
             grant: verified.grant,
             kind: PrincipalKind::DirectHuman,
             spaces: verified.spaces,
+            spaces_narrowed: false,
             human_management: verified.human_management,
+            proposal_read: false,
             ability_write: verified.human_management && verified.ability_write,
             write_space: None,
             chat_audience: None,
+            chat_episode: None,
             taint: BranchTaint::default(),
-            readonly_abilities: BTreeSet::new(),
+            keeper: None,
             credential: verified.credential,
+            bearer_scope: None,
         }
+    }
+    pub fn for_bearer(verified: VerifiedBearer) -> Self {
+        let (kind, credential) = match verified.credential {
+            BearerCredential::Pat(id) => (PrincipalKind::Pat, AuthenticatedCredential::Pat(id)),
+            BearerCredential::OAuth {
+                token,
+                grant,
+                family,
+            } => (
+                PrincipalKind::OAuth {
+                    source: verified.grant.clone(),
+                    narrowed: true,
+                },
+                AuthenticatedCredential::OAuth {
+                    token,
+                    grant,
+                    family,
+                },
+            ),
+        };
+        let mut spaces = verified.spaces;
+        if verified.scope == BearerScope::Read {
+            for grant in spaces.values_mut() {
+                grant.write_classes.clear();
+            }
+        }
+        Self {
+            principal: verified.principal,
+            grant: verified.grant,
+            kind,
+            ability_write: verified.scope == BearerScope::Write
+                && verified.ability_write
+                && Self::has_writable_space(&spaces),
+            spaces,
+            spaces_narrowed: false,
+            human_management: false,
+            proposal_read: false,
+            write_space: None,
+            chat_audience: None,
+            chat_episode: None,
+            taint: BranchTaint::default(),
+            keeper: None,
+            credential: Some(credential),
+            bearer_scope: Some(verified.scope),
+        }
+    }
+    fn has_writable_space(spaces: &BTreeMap<SpaceId, SpaceGrant>) -> bool {
+        spaces
+            .values()
+            .any(|grant| grant.role != SpaceRole::Viewer && !grant.write_classes.is_empty())
     }
     /// Internal read-only context scoped to one Space for remote search indexing.
     /// Never carries human management, write privileges, or encrypted-note reads.
@@ -228,12 +354,16 @@ impl EngineAuthContext {
                     project_root: None,
                 },
             )]),
+            spaces_narrowed: true,
             human_management: false,
+            proposal_read: false,
             ability_write: false,
             write_space: None,
             chat_audience: None,
+            chat_episode: None,
             taint: BranchTaint::default(),
-            readonly_abilities: BTreeSet::new(),
+            keeper: None,
+            bearer_scope: None,
             credential: Some(AuthenticatedCredential::SearchIndexing { space, provider }),
         }
     }
@@ -251,6 +381,21 @@ impl EngineAuthContext {
         audience: ChatAudience,
         requested: BTreeMap<SpaceId, SpaceGrant>,
     ) -> DomainResult<Self> {
+        if matches!(self.kind, PrincipalKind::Keeper(_)) || self.keeper_log().is_some() {
+            return Err(DomainError::validation(ValidationReason::ScopeMismatch));
+        }
+        self.for_agent_run_inner(run, thread_space, audience, requested)
+    }
+    fn for_agent_run_inner(
+        &self,
+        run: AgentRunId,
+        thread_space: SpaceId,
+        audience: ChatAudience,
+        requested: BTreeMap<SpaceId, SpaceGrant>,
+    ) -> DomainResult<Self> {
+        if self.keeper_log().is_some() {
+            return Err(DomainError::validation(ValidationReason::ScopeMismatch));
+        }
         if self.is_search_indexing() {
             return Err(DomainError::AccessDenied);
         }
@@ -266,6 +411,7 @@ impl EngineAuthContext {
         };
         if effective_audience == ChatAudience::Shared {
             derived.spaces.retain(|space, _| space == &thread_space);
+            derived.spaces_narrowed = true;
             for grant in derived.spaces.values_mut() {
                 grant.read_classes.remove(&DocClass::Profile);
                 grant.write_classes.remove(&DocClass::Profile);
@@ -282,8 +428,11 @@ impl EngineAuthContext {
         derived.kind = PrincipalKind::AgentRun(run);
         derived.write_space = Some(thread_space);
         derived.chat_audience = Some(effective_audience);
+        derived.chat_episode = self.chat_episode.clone();
         if self.kind == PrincipalKind::DirectHuman {
-            derived.taint = BranchTaint::default();
+            let taint = BranchTaint::default();
+            taint.merge(&self.taint);
+            derived.taint = taint;
         }
         Ok(derived)
     }
@@ -294,6 +443,33 @@ impl EngineAuthContext {
         project_root: Option<FolderId>,
         readonly_abilities: BTreeSet<AbilityId>,
     ) -> DomainResult<Self> {
+        self.for_keeper_with_abilities(
+            run,
+            space,
+            project_root,
+            readonly_abilities,
+            BTreeSet::new(),
+        )
+    }
+    pub fn for_keeper_with_abilities(
+        &self,
+        run: AgentRunId,
+        space: SpaceId,
+        project_root: Option<FolderId>,
+        readonly_abilities: BTreeSet<AbilityId>,
+        readonly_system_abilities: BTreeSet<AbilityId>,
+    ) -> DomainResult<Self> {
+        if matches!(self.kind, PrincipalKind::AgentRun(_))
+            || self.chat_episode.is_some()
+            || (!matches!(self.kind, PrincipalKind::Keeper(_)) && self.chat_audience.is_some())
+            || self.keeper_log().is_some()
+            || matches!(
+                &self.credential,
+                Some(AuthenticatedCredential::ScheduledRun { run: cred_run, .. }) if cred_run != &run
+            )
+        {
+            return Err(DomainError::validation(ValidationReason::ScopeMismatch));
+        }
         if self.is_search_indexing() {
             return Err(DomainError::AccessDenied);
         }
@@ -305,29 +481,51 @@ impl EngineAuthContext {
         if grant.project_root.is_some() && grant.project_root != project_root {
             return Err(DomainError::validation(ValidationReason::ScopeMismatch));
         }
-        let may_pin_dependencies =
+        let may_pin_outside_project =
             self.kind == PrincipalKind::DirectHuman && grant.project_root.is_none();
+        let may_pin_in_project =
+            !matches!(self.kind, PrincipalKind::Keeper(_)) && grant.project_root.is_some();
         grant.project_root = project_root;
         grant
             .write_classes
             .retain(|class| *class == DocClass::AgentMemory);
-        let mut derived = self.for_agent_run(
+        let mut derived = self.for_agent_run_inner(
             run.clone(),
             space.clone(),
             ChatAudience::Personal,
             BTreeMap::from([(space, grant)]),
         )?;
         derived.kind = PrincipalKind::Keeper(run);
-        derived.readonly_abilities = if may_pin_dependencies {
-            readonly_abilities
+        derived.spaces_narrowed = true;
+        let (owned, in_project_only) = if may_pin_outside_project {
+            (readonly_abilities, false)
+        } else if may_pin_in_project {
+            (readonly_abilities, true)
         } else {
             // A delegated run can retain an approved package exception, never
             // create a new exception to its parent's project boundary.
-            readonly_abilities
-                .intersection(&self.readonly_abilities)
+            (
+                readonly_abilities
+                    .intersection(self.readonly_abilities())
+                    .cloned()
+                    .collect(),
+                self.readonly_abilities_in_project_only(),
+            )
+        };
+        let system = if !matches!(self.kind, PrincipalKind::Keeper(_)) {
+            readonly_system_abilities
+        } else {
+            readonly_system_abilities
+                .intersection(self.readonly_system_abilities())
                 .cloned()
                 .collect()
         };
+        derived.keeper = Some(Box::new(KeeperAuthScope {
+            readonly_abilities: owned,
+            readonly_system_abilities: system,
+            readonly_abilities_in_project_only: in_project_only,
+            keeper_log: self.keeper_log().cloned(),
+        }));
         Ok(derived)
     }
     pub fn for_oauth(
@@ -335,6 +533,14 @@ impl EngineAuthContext {
         source: GrantId,
         requested: BTreeMap<SpaceId, SpaceGrant>,
     ) -> DomainResult<Self> {
+        if matches!(
+            self.kind,
+            PrincipalKind::Keeper(_) | PrincipalKind::AgentRun(_)
+        ) || self.keeper_log().is_some()
+            || self.chat_audience.is_some()
+        {
+            return Err(DomainError::validation(ValidationReason::ScopeMismatch));
+        }
         if self.is_search_indexing() {
             return Err(DomainError::AccessDenied);
         }
@@ -343,18 +549,158 @@ impl EngineAuthContext {
             source,
             narrowed: true,
         };
+        derived.bearer_scope = Some(
+            if self.bearer_scope != Some(BearerScope::Read)
+                && Self::has_writable_space(&derived.spaces)
+            {
+                BearerScope::Write
+            } else {
+                BearerScope::Read
+            },
+        );
         Ok(derived)
     }
     /// Personal access tokens are delegated credentials, never interactive humans.
     pub fn for_pat(&self, requested: BTreeMap<SpaceId, SpaceGrant>) -> DomainResult<Self> {
+        if matches!(
+            self.kind,
+            PrincipalKind::Keeper(_) | PrincipalKind::AgentRun(_)
+        ) || self.keeper_log().is_some()
+            || self.chat_audience.is_some()
+        {
+            return Err(DomainError::validation(ValidationReason::ScopeMismatch));
+        }
         if self.is_search_indexing() {
             return Err(DomainError::AccessDenied);
         }
         let mut derived = self.narrow(requested)?;
         derived.kind = PrincipalKind::Pat;
+        derived.bearer_scope = Some(
+            if self.bearer_scope != Some(BearerScope::Read)
+                && Self::has_writable_space(&derived.spaces)
+            {
+                BearerScope::Write
+            } else {
+                BearerScope::Read
+            },
+        );
         Ok(derived)
     }
+
+    /// Keep the same authenticated credential and confine this operation to one
+    /// project. Canonical writes check live folder ancestry against this pin.
+    pub fn restrict_to_project(&self, project: &FolderRef) -> DomainResult<Self> {
+        let mut grant = self
+            .spaces
+            .get(&project.space_id)
+            .ok_or(DomainError::ResourceNotFound)?
+            .clone();
+        if grant
+            .project_root
+            .as_ref()
+            .is_some_and(|root| root != &project.folder_id)
+        {
+            return Err(DomainError::SpaceReadOnly);
+        }
+        grant.project_root = Some(project.folder_id.clone());
+        let spaces = BTreeMap::from([(project.space_id.clone(), grant)]);
+        let spaces_narrowed = true;
+        let ability_write = self.ability_write && Self::has_writable_space(&spaces);
+        Ok(Self {
+            spaces,
+            spaces_narrowed,
+            ability_write,
+            ..self.clone()
+        })
+    }
+    /// Monotonically mark this context as space-narrowed so downstream
+    /// account-wide management endpoints cannot widen its Space set.
+    pub fn mark_spaces_narrowed(mut self) -> Self {
+        self.spaces_narrowed = true;
+        self
+    }
+    /// Monotonically narrow one Space grant's readable document classes (never widens).
+    pub fn restrict_read_classes(
+        &self,
+        space: &SpaceId,
+        allowed: &BTreeSet<DocClass>,
+    ) -> DomainResult<Self> {
+        let mut grant = self
+            .spaces
+            .get(space)
+            .ok_or(DomainError::ResourceNotFound)?
+            .clone();
+        grant.read_classes.retain(|class| allowed.contains(class));
+        let mut spaces = self.spaces.clone();
+        spaces.insert(space.clone(), grant);
+        Ok(Self {
+            spaces,
+            ..self.clone()
+        })
+    }
+
+    /// Derive a read-only preflight context with a detached `BranchTaint`
+    /// initialized from the caller's current taint state (never clearing
+    /// pre-existing taint and stripping all write/management privileges).
+    /// Callers MUST still enforce `ClassEgressFence` / `authorize_read` /
+    /// `authorize_folder_read` on the live `EngineAuthContext` for every
+    /// item actually admitted into a response.
+    pub fn with_preflight_taint(&self) -> Self {
+        let taint = BranchTaint::default();
+        if self.taint.is_tainted() {
+            taint.mark_external_read();
+        }
+        let mut spaces = self.spaces.clone();
+        for grant in spaces.values_mut() {
+            grant.role = SpaceRole::Viewer;
+            grant.write_classes.clear();
+        }
+        Self {
+            spaces,
+            human_management: false,
+            ability_write: false,
+            taint,
+            ..self.clone()
+        }
+    }
+
+    /// Clone this auth context with a detached `BranchTaint` initialized from
+    /// the caller's current taint state, preserving all grants and rights.
+    /// Tool boundaries use this to stage cross-space taint and commit it back
+    /// to the caller's `BranchTaint` only when a call succeeds or crosses an
+    /// irreversible probing boundary.
+    pub fn with_staged_taint(&self) -> Self {
+        let taint = BranchTaint::default();
+        if self.taint.is_tainted() {
+            taint.mark_external_read();
+        }
+        Self {
+            taint,
+            ..self.clone()
+        }
+    }
+
+    /// Narrow readable/writable spaces to the intersection with `allowed`.
+    pub fn restrict_to_spaces(&self, allowed: &BTreeSet<SpaceId>) -> Self {
+        let mut spaces = self.spaces.clone();
+        spaces.retain(|space_id, _| allowed.contains(space_id));
+        let ability_write = self.ability_write && Self::has_writable_space(&spaces);
+        Self {
+            spaces,
+            spaces_narrowed: true,
+            ability_write,
+            ..self.clone()
+        }
+    }
+
+    pub fn is_space_narrowed(&self) -> bool {
+        self.spaces_narrowed
+    }
+
     fn narrow(&self, requested: BTreeMap<SpaceId, SpaceGrant>) -> DomainResult<Self> {
+        if self.proposal_read {
+            return Err(DomainError::AccessDenied);
+        }
         let mut spaces = BTreeMap::new();
         for (id, wanted) in requested {
             let parent = self.spaces.get(&id).ok_or(DomainError::ResourceNotFound)?;
@@ -384,15 +730,30 @@ impl EngineAuthContext {
                 },
             );
         }
+        let spaces_narrowed = self.spaces_narrowed || spaces.len() < self.spaces.len();
         Ok(Self {
             spaces,
+            spaces_narrowed,
             human_management: false,
             ability_write: false,
+            bearer_scope: self.bearer_scope,
             ..self.clone()
         })
     }
     pub fn principal(&self) -> &PrincipalId {
         &self.principal
+    }
+    /// Retain the credential and its existing ceilings in one admitted Space.
+    pub fn restrict_to_space(&self, space: &SpaceId) -> DomainResult<Self> {
+        let grant = self
+            .spaces
+            .get(space)
+            .ok_or(DomainError::ResourceNotFound)?;
+        let mut scoped = self.clone();
+        scoped.spaces = BTreeMap::from([(space.clone(), grant.clone())]);
+        scoped.spaces_narrowed = true;
+        scoped.ability_write &= Self::has_writable_space(&scoped.spaces);
+        Ok(scoped)
     }
     /// The authentication owner supplies freshly verified durable authority.
     /// Keep the caller's delegation, project pin, taint and write-Space pin while
@@ -402,6 +763,7 @@ impl EngineAuthContext {
             || self.grant != current.grant
             || self.credential != current.credential
             || self.credential.is_none()
+            || self.keeper_log() != current.keeper_log()
             || (self.kind == PrincipalKind::SearchIndexing)
                 != (current.kind == PrincipalKind::SearchIndexing)
         {
@@ -411,24 +773,73 @@ impl EngineAuthContext {
             .spaces
             .iter()
             .filter_map(|(id, fresh)| {
-                self.spaces.get(id).map(|old| {
-                    let mut wanted = fresh.clone();
-                    wanted.project_root = old.project_root.clone();
-                    (id.clone(), wanted)
-                })
+                let old = self.spaces.get(id)?;
+                if let (Some(old_root), Some(fresh_root)) = (&old.project_root, &fresh.project_root)
+                    && old_root != fresh_root
+                {
+                    return None;
+                }
+                let mut wanted = fresh.clone();
+                wanted.project_root = old.project_root.clone().or(wanted.project_root);
+                Some((id.clone(), wanted))
             })
             .collect();
         let mut result = self.narrow(requested)?;
-        result.human_management = self.human_management && current.human_management;
-        result.ability_write =
-            result.human_management && self.ability_write && current.ability_write;
+        if matches!(self.kind, PrincipalKind::Keeper(_)) || self.keeper_log().is_some() {
+            result.keeper = Some(Box::new(KeeperAuthScope {
+                readonly_abilities: self
+                    .readonly_abilities()
+                    .intersection(current.readonly_abilities())
+                    .cloned()
+                    .collect(),
+                readonly_system_abilities: self
+                    .readonly_system_abilities()
+                    .intersection(current.readonly_system_abilities())
+                    .cloned()
+                    .collect(),
+                readonly_abilities_in_project_only: self.readonly_abilities_in_project_only()
+                    || current.readonly_abilities_in_project_only(),
+                keeper_log: self.keeper_log().cloned(),
+            }));
+        }
+        result.spaces_narrowed = self.spaces_narrowed
+            || current.spaces_narrowed
+            || result.spaces.len() < current.spaces.len();
+        result.human_management = self.human_management() && current.human_management();
+        result.bearer_scope = match (self.bearer_scope, current.bearer_scope) {
+            (Some(BearerScope::Read), _) | (_, Some(BearerScope::Read)) => Some(BearerScope::Read),
+            (Some(BearerScope::Write), Some(BearerScope::Write)) => Some(BearerScope::Write),
+            (None, Some(BearerScope::Write)) => Some(BearerScope::Write),
+            (Some(BearerScope::Write), None) => Some(BearerScope::Read),
+            (None, None) => None,
+        };
+        result.ability_write = self.has_cap(Cap::AbilityWrite)
+            && current.has_cap(Cap::AbilityWrite)
+            && (result.human_management
+                || (result.bearer_scope == Some(BearerScope::Write)
+                    && Self::has_writable_space(&result.spaces)));
         if current.chat_audience == Some(ChatAudience::Shared) {
             result.chat_audience = Some(ChatAudience::Shared);
+            for grant in result.spaces.values_mut() {
+                grant.read_classes.remove(&DocClass::Profile);
+                grant.write_classes.remove(&DocClass::Profile);
+            }
         }
         Ok(result)
     }
     pub fn chat_audience(&self) -> Option<ChatAudience> {
         self.chat_audience
+    }
+    pub fn chat_episode(&self) -> Option<&EpisodeId> {
+        self.chat_episode.as_ref()
+    }
+    /// Bind an `AgentRun` context to the exact chat-thread episode opened by
+    /// the supervisor so Shared-Space runs can only read their own episode.
+    pub fn with_chat_episode(mut self, episode: EpisodeId) -> Self {
+        if matches!(self.kind, PrincipalKind::AgentRun(_)) && self.chat_episode.is_none() {
+            self.chat_episode = Some(episode);
+        }
+        self
     }
     pub fn grant(&self) -> &GrantId {
         &self.grant
@@ -436,14 +847,115 @@ impl EngineAuthContext {
     pub fn credential(&self) -> Option<&AuthenticatedCredential> {
         self.credential.as_ref()
     }
+    /// The authenticated scope is independent of the number of live memberships.
+    pub fn bearer_scope(&self) -> Option<BearerScope> {
+        self.bearer_scope
+    }
     pub fn kind(&self) -> &PrincipalKind {
         &self.kind
     }
     pub fn readonly_abilities(&self) -> &BTreeSet<AbilityId> {
-        &self.readonly_abilities
+        self.keeper
+            .as_deref()
+            .map_or(&EMPTY_ABILITIES, |k| &k.readonly_abilities)
+    }
+    pub fn readonly_system_abilities(&self) -> &BTreeSet<AbilityId> {
+        self.keeper
+            .as_deref()
+            .map_or(&EMPTY_ABILITIES, |k| &k.readonly_system_abilities)
+    }
+    pub fn readonly_abilities_in_project_only(&self) -> bool {
+        self.keeper
+            .as_deref()
+            .is_some_and(|k| k.readonly_abilities_in_project_only)
+    }
+    pub fn keeper_log(&self) -> Option<&ChatThreadId> {
+        self.keeper.as_deref().and_then(|k| k.keeper_log.as_ref())
+    }
+    /// Bind the log from a verified schedule-run record at the control boundary.
+    pub fn with_verified_keeper_log(mut self, thread: ChatThreadId) -> DomainResult<Self> {
+        if !matches!(
+            (&self.kind, self.credential()),
+            (PrincipalKind::Keeper(run), Some(AuthenticatedCredential::ScheduledRun { run: verified, .. }))
+                if run == verified
+        ) || self
+            .keeper_log()
+            .is_some_and(|existing| existing != &thread)
+        {
+            return Err(DomainError::AuthenticationFailed);
+        }
+        self.keeper
+            .get_or_insert_with(|| Box::new(KeeperAuthScope::default()))
+            .keeper_log = Some(thread);
+        Ok(self)
     }
     pub fn spaces(&self) -> &BTreeMap<SpaceId, SpaceGrant> {
         &self.spaces
+    }
+    /// Scope a live actor's revocation identity to these admitted Spaces.
+    pub fn selectors_for_revocation<'a>(
+        &self,
+        spaces: impl IntoIterator<Item = &'a SpaceId>,
+    ) -> DomainResult<BTreeSet<RevocationSelector>> {
+        let mut selectors = BTreeSet::from([
+            RevocationSelector::Principal(self.principal.clone()),
+            RevocationSelector::Grant(self.grant.clone()),
+        ]);
+        match self.credential().ok_or(DomainError::AuthenticationFailed)? {
+            AuthenticatedCredential::Session(id) => {
+                selectors.insert(RevocationSelector::Session(id.clone()));
+            }
+            AuthenticatedCredential::OAuth {
+                token,
+                grant,
+                family,
+            } => {
+                selectors.insert(RevocationSelector::OAuthAccess(token.clone()));
+                selectors.insert(RevocationSelector::OAuthGrant(grant.clone()));
+                if let Some(family) = family {
+                    selectors.insert(RevocationSelector::OAuthFamily(family.clone()));
+                }
+            }
+            AuthenticatedCredential::ScheduledRun { schedule, run, .. } => {
+                selectors.insert(RevocationSelector::Schedule(schedule.clone()));
+                selectors.insert(RevocationSelector::ScheduledRun(run.clone()));
+            }
+            AuthenticatedCredential::Pat(_)
+            | AuthenticatedCredential::SearchIndexing { .. }
+            | AuthenticatedCredential::TrustedNone => (),
+        }
+        if let (PrincipalKind::AgentRun(run) | PrincipalKind::Keeper(run), Some(space)) =
+            (self.kind(), self.pinned_write_space())
+        {
+            selectors.insert(RevocationSelector::AgentRun {
+                space: space.clone(),
+                run: run.clone(),
+            });
+        }
+        for space in spaces {
+            if !self.spaces.contains_key(space) {
+                return Err(DomainError::ResourceNotFound);
+            }
+            selectors.insert(RevocationSelector::Space(space.clone()));
+            selectors.insert(RevocationSelector::Membership {
+                space: space.clone(),
+                principal: self.principal.clone(),
+            });
+        }
+        Ok(selectors)
+    }
+    pub fn pinned_write_space(&self) -> Option<&SpaceId> {
+        self.write_space.as_ref()
+    }
+    /// A remote query uses the caller's active Space and cannot carry external reads.
+    pub fn authorize_remote_embedding_query(&self, space: &SpaceId) -> DomainResult<()> {
+        if self.taint.is_tainted() {
+            return Err(DomainError::CrossSpaceTainted);
+        }
+        if self.write_space.as_ref().is_some_and(|pin| pin != space) {
+            return Err(DomainError::AccessDenied);
+        }
+        Ok(())
     }
     pub fn taint(&self) -> &BranchTaint {
         &self.taint
@@ -454,15 +966,77 @@ impl EngineAuthContext {
             && self.kind == PrincipalKind::DirectHuman
     }
     pub fn authorize_human_management(&self) -> DomainResult<()> {
-        if self.human_management() {
+        if !self.human_management() {
+            return Err(DomainError::AccessDenied);
+        }
+        if self.taint.is_tainted() {
+            return Err(DomainError::CrossSpaceTainted);
+        }
+        Ok(())
+    }
+    /// Check trusted interactive input before re-reading its live credential.
+    pub fn authorize_proposal_confirmation(&self) -> DomainResult<()> {
+        if !self.human_management() {
+            return Err(DomainError::AccessDenied);
+        }
+        if !matches!(
+            self.credential(),
+            Some(AuthenticatedCredential::Session(_) | AuthenticatedCredential::TrustedNone)
+        ) {
+            return Err(DomainError::AuthenticationFailed);
+        }
+        if self.taint.is_tainted() {
+            return Err(DomainError::CrossSpaceTainted);
+        }
+        Ok(())
+    }
+
+    /// Authentication owner only. Each confirmation context starts with the
+    /// latch of a separately verified human, while retaining the input ceiling.
+    pub fn for_proposal_human(
+        prior: &Self,
+        live: VerifiedHuman,
+        access: ProposalHumanAccess,
+    ) -> DomainResult<Self> {
+        prior.authorize_proposal_confirmation()?;
+        let mut fresh = Self::for_human(live);
+        fresh.authorize_proposal_confirmation()?;
+        let narrowed = prior.intersect_current(&fresh)?;
+        fresh.spaces = narrowed.spaces;
+        fresh.spaces_narrowed = narrowed.spaces_narrowed;
+        fresh.write_space = narrowed.write_space;
+        fresh.ability_write = false;
+        if access == ProposalHumanAccess::ReadOnly {
+            fresh.human_management = false;
+            fresh.proposal_read = true;
+            for grant in fresh.spaces.values_mut() {
+                grant.role = SpaceRole::Viewer;
+                grant.write_classes.clear();
+            }
+        }
+        Ok(fresh)
+    }
+
+    /// Dedicated read authority for the canonical proposal witness.
+    pub fn authorize_proposal_read(&self) -> DomainResult<()> {
+        if self.kind == PrincipalKind::DirectHuman && self.proposal_read {
             Ok(())
         } else {
-            Err(DomainError::AccessDenied)
+            Err(DomainError::ResourceNotFound)
         }
     }
     pub fn has_cap(&self, cap: Cap) -> bool {
         match cap {
-            Cap::AbilityWrite => self.ability_write && self.human_management(),
+            Cap::AbilityWrite => {
+                !self.is_search_indexing()
+                    && self.ability_write
+                    && matches!(
+                        self.kind,
+                        PrincipalKind::DirectHuman
+                            | PrincipalKind::Pat
+                            | PrincipalKind::OAuth { .. }
+                    )
+            }
         }
     }
     pub fn authorize_ability_mutation(&self) -> DomainResult<()> {
@@ -510,12 +1084,18 @@ impl EngineAuthContext {
         let is_pinned_ability = resource
             .ability_package
             .as_ref()
-            .is_some_and(|id| self.readonly_abilities.contains(id));
+            .is_some_and(|id| self.readonly_abilities().contains(id));
+        if matches!(self.kind, PrincipalKind::Keeper(_))
+            && resource.class == DocClass::Skill
+            && !is_pinned_ability
+        {
+            return Err(DomainError::ResourceNotFound);
+        }
         if grant
             .project_root
             .as_ref()
             .is_some_and(|root| !resource.ancestor_folders.contains(root))
-            && !is_pinned_ability
+            && !(is_pinned_ability && !self.readonly_abilities_in_project_only())
         {
             return Err(DomainError::ResourceNotFound);
         }
@@ -546,44 +1126,55 @@ impl EngineAuthContext {
         }
         Ok(())
     }
-    /// Metadata visibility check for a chat thread that never mutates shared branch taint.
-    /// Content reading and backlink delivery must call `mark_chat_read_taint`
-    /// (or `authorize_chat_thread_read`) only for admitted rows.
+    /// Candidate filter for the current principal's personal threads, before a
+    /// search result supplies a specific thread identity.
+    pub fn can_view_own_personal_chat(
+        &self,
+        space: &Space,
+        project: Option<&FolderId>,
+        tainted: bool,
+    ) -> DomainResult<()> {
+        if self.chat_audience == Some(ChatAudience::Shared)
+            || matches!(self.kind, PrincipalKind::Keeper(_))
+            || self.keeper_log().is_some()
+        {
+            return Err(DomainError::ResourceNotFound);
+        }
+        self.can_view_chat(space, project, tainted)
+    }
+
+    /// Check thread visibility without marking a candidate as a delivered read.
     pub fn can_view_chat_thread(
         &self,
         space: &Space,
+        thread: &ChatThreadId,
         kind: crate::ports::ChatThreadKind,
         owner: &PrincipalId,
         project: Option<&FolderId>,
         tainted: bool,
     ) -> DomainResult<()> {
-        if self.is_search_indexing() {
+        use crate::ports::ChatThreadKind;
+        if kind != ChatThreadKind::SpaceGroup && owner != &self.principal {
             return Err(DomainError::ResourceNotFound);
         }
-        let grant = self
-            .spaces
-            .get(&space.id)
-            .ok_or(DomainError::ResourceNotFound)?;
-        if space.lifecycle != SpaceLifecycle::Active {
+        if kind == ChatThreadKind::Personal {
+            return self.can_view_own_personal_chat(space, project, tainted);
+        }
+        if kind == ChatThreadKind::KeeperLog && self.chat_audience == Some(ChatAudience::Shared) {
             return Err(DomainError::ResourceNotFound);
         }
-        if kind == crate::ports::ChatThreadKind::Personal
-            && (owner != &self.principal
-                || self.chat_audience == Some(ChatAudience::Shared)
-                || (matches!(self.kind, PrincipalKind::Keeper(_))
-                    && space.kind == SpaceKind::Shared))
+        if (matches!(self.kind, PrincipalKind::Keeper(_)) || self.keeper_log().is_some())
+            && (kind != ChatThreadKind::KeeperLog
+                || self.keeper_log() != Some(thread)
+                || self
+                    .spaces
+                    .get(&space.id)
+                    .and_then(|grant| grant.project_root.as_ref())
+                    != project)
         {
             return Err(DomainError::ResourceNotFound);
         }
-        if let Some(root) = &grant.project_root
-            && project != Some(root)
-        {
-            return Err(DomainError::ResourceNotFound);
-        }
-        if tainted && space.kind == SpaceKind::Shared {
-            return Err(DomainError::CrossSpaceTainted);
-        }
-        Ok(())
+        self.can_view_chat(space, project, tainted)
     }
     /// Marks branch taint after a chat thread has passed visibility checks and is
     /// actually delivered to the caller.
@@ -597,12 +1188,13 @@ impl EngineAuthContext {
     pub fn authorize_chat_thread_read(
         &self,
         space: &Space,
+        thread: &ChatThreadId,
         kind: crate::ports::ChatThreadKind,
         owner: &PrincipalId,
         project: Option<&FolderId>,
         tainted: bool,
     ) -> DomainResult<()> {
-        self.can_view_chat_thread(space, kind, owner, project, tainted)?;
+        self.can_view_chat_thread(space, thread, kind, owner, project, tainted)?;
         self.mark_chat_read_taint(space, tainted);
         Ok(())
     }
@@ -635,7 +1227,7 @@ impl EngineAuthContext {
             .spaces
             .get(&space.id)
             .ok_or(DomainError::ResourceNotFound)?;
-        if space.lifecycle != SpaceLifecycle::Active {
+        if space.lifecycle != SpaceLifecycle::Active || grant.read_classes.is_empty() {
             return Err(DomainError::ResourceNotFound);
         }
         if let Some(root) = &grant.project_root
@@ -656,6 +1248,9 @@ impl EngineAuthContext {
             .ok_or(DomainError::ResourceNotFound)?;
         if space.lifecycle != SpaceLifecycle::Active
             || grant.role == SpaceRole::Viewer
+            || self.bearer_scope == Some(BearerScope::Read)
+            || (matches!(self.kind, PrincipalKind::Pat | PrincipalKind::OAuth { .. })
+                && self.bearer_scope != Some(BearerScope::Write))
             || self.is_search_indexing()
             || self
                 .write_space
@@ -681,15 +1276,27 @@ impl EngineAuthContext {
         after: &ResourceFacts,
     ) -> DomainResult<()> {
         for resource in [before, after] {
-            self.authorize_space_write(&resource.space)?;
-            let grant = &self.spaces[&resource.space.id];
-            if resource.folder_write_locked
-                || !grant.write_classes.contains(&resource.class)
-                || grant
+            let grant = self
+                .spaces
+                .get(&resource.space.id)
+                .ok_or(DomainError::ResourceNotFound)?;
+            let is_pinned_ability = resource
+                .ability_package
+                .as_ref()
+                .is_some_and(|id| self.readonly_abilities().contains(id));
+            if resource.space.lifecycle == SpaceLifecycle::Active
+                && (grant
                     .project_root
                     .as_ref()
                     .is_some_and(|root| !resource.ancestor_folders.contains(root))
+                    || (matches!(self.kind, PrincipalKind::Keeper(_))
+                        && resource.class == DocClass::Skill
+                        && !is_pinned_ability))
             {
+                return Err(DomainError::ResourceNotFound);
+            }
+            self.authorize_space_write(&resource.space)?;
+            if resource.folder_write_locked || !grant.write_classes.contains(&resource.class) {
                 return Err(DomainError::SpaceReadOnly);
             }
             if resource.class == DocClass::Skill || resource.ability_package.is_some() {
@@ -700,5 +1307,108 @@ impl EngineAuthContext {
             return Err(DomainError::validation(ValidationReason::ScopeMismatch));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod keeper_narrowing_tests {
+    use super::*;
+
+    fn sample_human() -> (SpaceId, EngineAuthContext) {
+        let space = SpaceId::from_bytes([0x41; 16]);
+        let spaces = BTreeMap::from([(
+            space.clone(),
+            SpaceGrant {
+                role: SpaceRole::Owner,
+                read_classes: DocClass::all(),
+                write_classes: DocClass::all(),
+                project_root: None,
+            },
+        )]);
+        let human = VerifiedHuman::attest(
+            PrincipalId::from_bytes([0x42; 16]),
+            GrantId::from_bytes([0x43; 16]),
+            spaces,
+            true,
+        )
+        .with_human_management(true)
+        .with_credential(AuthenticatedCredential::Session(AuthSessionId::from_bytes(
+            [0x48; 16],
+        )));
+        (space, EngineAuthContext::for_human(human))
+    }
+
+    #[test]
+    fn keeper_without_keeper_log_cannot_mint_sub_principals_and_preserves_readonly_abilities() {
+        let (space, human) = sample_human();
+        let allowed_ability = AbilityId::from_bytes([0x44; 16]);
+        let dropped_ability = AbilityId::from_bytes([0x49; 16]);
+        let run = AgentRunId::from_bytes([0x45; 16]);
+        let keeper = human
+            .for_keeper(
+                run.clone(),
+                space.clone(),
+                None,
+                BTreeSet::from([allowed_ability.clone(), dropped_ability]),
+            )
+            .expect("keeper context");
+        assert!(keeper.keeper_log().is_none());
+
+        assert!(matches!(
+            keeper.for_agent_run(
+                AgentRunId::from_bytes([0x46; 16]),
+                space.clone(),
+                ChatAudience::Personal,
+                keeper.spaces().clone(),
+            ),
+            Err(DomainError::ValidationFailed { diagnostic })
+                if diagnostic.reason == ValidationReason::ScopeMismatch
+        ));
+        assert!(matches!(
+            keeper.for_oauth(GrantId::from_bytes([0x47; 16]), keeper.spaces().clone()),
+            Err(DomainError::ValidationFailed { diagnostic })
+                if diagnostic.reason == ValidationReason::ScopeMismatch
+        ));
+        assert!(matches!(
+            keeper.for_pat(keeper.spaces().clone()),
+            Err(DomainError::ValidationFailed { diagnostic })
+                if diagnostic.reason == ValidationReason::ScopeMismatch
+        ));
+
+        let live_keeper = human
+            .for_keeper(run, space, None, BTreeSet::from([allowed_ability.clone()]))
+            .expect("live keeper context");
+        let intersected = keeper
+            .intersect_current(&live_keeper)
+            .expect("intersect keeper");
+        assert!(matches!(intersected.kind(), PrincipalKind::Keeper(_)));
+        assert_eq!(
+            intersected.readonly_abilities(),
+            &BTreeSet::from([allowed_ability])
+        );
+        assert!(intersected.keeper_log().is_none());
+    }
+
+    #[test]
+    fn shared_agent_run_and_single_space_project_pin_mark_spaces_narrowed() {
+        let (space, human) = sample_human();
+        assert!(!human.is_space_narrowed());
+
+        let shared = human
+            .for_agent_run(
+                AgentRunId::from_bytes([0x4A; 16]),
+                space.clone(),
+                ChatAudience::Shared,
+                human.spaces().clone(),
+            )
+            .expect("shared run");
+        assert!(shared.is_space_narrowed());
+
+        let project = FolderRef {
+            space_id: space,
+            folder_id: FolderId::from_bytes([0x4B; 16]),
+        };
+        let pinned = human.restrict_to_project(&project).expect("project pin");
+        assert!(pinned.is_space_narrowed());
     }
 }

@@ -6,7 +6,7 @@ use notarium_core::{
     },
     classes::DocClass,
     document::{estimate_conservative_tokens, estimate_token_twelfths},
-    ids::{AgentRunId, GrantId, KeyId, PrincipalId, ProviderResourceId, SpaceId},
+    ids::{AgentRunId, ChatThreadId, GrantId, KeyId, PrincipalId, ProviderResourceId, SpaceId},
     ports::{
         BackupBudget, BackupProgress, BackupRetentionBudget, BackupRetentionProgress,
         ChatThreadKind,
@@ -242,18 +242,34 @@ fn search_indexing_authority_cannot_delegate_or_view_chats_or_cross_intersect() 
         lifecycle: SpaceLifecycle::Active,
         kind: SpaceKind::Shared,
     };
+    let thread = ChatThreadId::from_bytes([28; 16]);
     for space in [&personal_space, &shared_space] {
         assert_eq!(
-            auth.can_view_chat_thread(space, ChatThreadKind::Personal, &principal, None, false),
+            auth.can_view_chat_thread(
+                space,
+                &thread,
+                ChatThreadKind::Personal,
+                &principal,
+                None,
+                false
+            ),
             Err(DomainError::ResourceNotFound)
         );
         assert_eq!(
-            auth.can_view_chat_thread(space, ChatThreadKind::SpaceGroup, &principal, None, false),
+            auth.can_view_chat_thread(
+                space,
+                &thread,
+                ChatThreadKind::SpaceGroup,
+                &principal,
+                None,
+                false
+            ),
             Err(DomainError::ResourceNotFound)
         );
         assert_eq!(
             auth.authorize_chat_thread_read(
                 space,
+                &thread,
                 ChatThreadKind::Personal,
                 &principal,
                 None,
@@ -323,6 +339,7 @@ fn search_indexing_authority_cannot_delegate_or_view_chats_or_cross_intersect() 
         Err(DomainError::SpaceReadOnly)
     );
     let facts = ResourceFacts {
+        project: None,
         space: personal_space,
         class: DocClass::UserDoc,
         ancestor_folders: vec![],

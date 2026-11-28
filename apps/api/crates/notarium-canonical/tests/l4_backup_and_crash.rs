@@ -2,6 +2,8 @@
 
 #[path = "l4_backup_and_crash/restore.rs"]
 mod restore;
+#[path = "fixtures/schema-history.rs"]
+mod schema_history;
 mod support;
 
 use std::{
@@ -18,10 +20,10 @@ use std::{
 };
 
 use notarium_canonical::{
-    BackupArtifactEncoding, BlobBackendConfig, CanonicalConfig, CanonicalRuntime, CanonicalStore,
-    CollabRoomState, CreateSpaceSpec, DataRootOwnerLock, OpenCollabSession, PostgresSpoolValue,
-    S3BucketModePolicy, SqlBackendConfig, WriterConfig, blobs::s3::admin_ensure_bucket,
-    decode_postgres_spool_v1, default_backup_budget,
+    BackupArtifactEncoding, BlobBackendConfig, CANONICAL_SCHEMA_VERSION, CanonicalConfig,
+    CanonicalRuntime, CanonicalStore, CollabRoomState, CreateSpaceSpec, DataRootOwnerLock,
+    OpenCollabSession, PostgresSpoolValue, S3BucketModePolicy, SqlBackendConfig, WriterConfig,
+    blobs::s3::admin_ensure_bucket, decode_postgres_spool_v1, default_backup_budget,
 };
 use notarium_core::{
     auth::{EngineAuthContext, SpaceGrant, SpaceKind, SpaceRole, VerifiedHuman},
@@ -29,16 +31,16 @@ use notarium_core::{
     epoch::DataRoot,
     error::{CommitEffect, OperationalFailure, PortError, RetryAdvice, ValidationReason},
     ids::{
-        ArtifactId, BackupId, CommandKey, ContentDigest, GrantId, InstallationId, LeaseEpoch,
-        NoteId, PrincipalId, RequestId, SpaceSeq,
+        ArtifactId, BackupId, ChatThreadId, CommandKey, ContentDigest, GrantId, InstallationId,
+        LeaseEpoch, NoteId, PrincipalId, RequestId, SpaceSeq, ThreadEntrySeq,
     },
     model::HistoryScope,
     ports::{
         BackupBudget, BackupHold, BackupParticipantPort, BackupSnapshot, BackupSpool,
-        BackupWitness, CallBudget, Cancellation, ChangeBroadcast, ChangeNotice, CreateNote,
-        DeleteDisposition, DeleteNote, GetNote, MaintenanceContext, Mutation, NoteWritePort,
-        PausedBackup, PortFuture, Preconditions, PreparedBackup, RenameNote, ServicePurpose,
-        SpaceContext,
+        BackupWitness, CallBudget, Cancellation, ChangeBroadcast, ChangeNotice, ChatBody,
+        ChatEntryKind, ChatPort, ChatRead, CreateNote, DeleteDisposition, DeleteNote, GetNote,
+        MaintenanceContext, Mutation, NoteWritePort, PageLimit, PausedBackup, PortFuture,
+        Preconditions, PreparedBackup, RenameNote, ServicePurpose, SpaceContext,
     },
     receipt::{CausalBasis, ChangeCursor, CommandIdentity, ReceiptSet},
 };
@@ -488,17 +490,13 @@ impl BackendCase {
                 .execute(&mut *tx)
                 .await
                 .unwrap();
-            if decoded.schema_version == 7 {
-                sqlx::raw_sql(include_str!("fixtures/schema-v7-chat-refs.sql"))
-                    .execute(&mut *tx)
-                    .await
-                    .unwrap();
-            }
-            if decoded.schema_version <= 6 {
-                sqlx::raw_sql(include_str!("fixtures/schema-v6-remove-projection.sql"))
-                    .execute(&mut *tx)
-                    .await
-                    .unwrap();
+            if decoded.schema_version < CANONICAL_SCHEMA_VERSION {
+                for ddl in schema_history::remove_later_features(
+                    decoded.schema_version,
+                    &decoded.manifest_checksum.to_hex(),
+                ) {
+                    sqlx::raw_sql(*ddl).execute(&mut *tx).await.unwrap();
+                }
             }
             if decoded.schema_version <= 5 {
                 sqlx::raw_sql(
@@ -1087,19 +1085,21 @@ async fn failed_temp_unlink_retains_its_recovery_marker() {
 
 #[tokio::test]
 async fn restores_historical_postgres_spools_and_rejects_invalid_headers() {
-    // Each file came from its version's PostgreSQL participant with a single synthetic Space.
+    // The common archives and projection v7 are snapshots from the original participants.
+    // The three suffixed archives contain rows exported from their historical PostgreSQL DDL.
     let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
     let case = BackendCase::open_pg_s3().await;
-    for (version, install, space_id, slug, table_count, queue_columns) in [
-        (1, 1, 11, "review-space", 34, 13),
-        (2, 0x62, 0xB2, "backup-178", 35, 14),
-        (3, 0x62, 0xB2, "backup-178", 36, 14),
-        (4, 0x62, 0xB2, "backup-178", 36, 14),
-        (5, 0x62, 0xB2, "backup-178", 36, 14),
-        (6, 0x62, 0xB2, "backup-178", 36, 14),
-        (7, 0x62, 0xB2, "backup-178", 39, 14),
+    for (version, suffix, install, space_id, slug, table_count, queue_columns) in [
+        (1, "", 1, 11, "review-space", 34, 13),
+        (2, "", 0x62, 0xB2, "backup-178", 35, 14),
+        (3, "", 0x62, 0xB2, "backup-178", 36, 14),
+        (4, "", 0x62, 0xB2, "backup-178", 36, 14),
+        (5, "", 0x62, 0xB2, "backup-178", 36, 14),
+        (6, "", 0x62, 0xB2, "backup-178", 36, 14),
+        (7, "", 0x62, 0xB2, "backup-178", 39, 14),
+        (8, "-projection", 0x62, 0xB2, "backup-178", 39, 14),
     ] {
-        let fixture = directory.join(format!("schema-v{version}.pgspool"));
+        let fixture = directory.join(format!("schema-v{version}{suffix}.pgspool"));
         let decoded = decode_postgres_spool_v1(&fixture).unwrap();
         assert_eq!(decoded.schema_version, version);
         assert_eq!(
@@ -1115,19 +1115,20 @@ async fn restores_historical_postgres_spools_and_rejects_invalid_headers() {
         assert_eq!(queue.columns.len(), queue_columns);
         let cut = decoded.witness.histories.first().unwrap();
         assert_eq!(cut.scope.space_id, sample_space_id(space_id));
-        let blob_root = TempDataRoot::new("historical-chat-cas");
-        let mut config = case
+        let config = case
             .restored_config(&fixture, &case.temp_root.data_root())
             .await;
         // Recreate the old writer's stale rows in the materialized v3 database.
         // Runtime bootstrap is the same entry point used for in-place upgrades.
         let mut migrated_db = if version == 3 {
+            use notarium_canonical::blobs::s3::{ReqwestS3Transport, S3RawRequest, S3Transport};
             let SqlBackendConfig::Postgres { schema, .. } = &config.sql else {
                 unreachable!()
             };
-            config.blobs = BlobBackendConfig::Local {
-                data_root: blob_root.data_root(),
+            let BlobBackendConfig::S3(s3_cfg) = &config.blobs else {
+                unreachable!("PostgreSQL archive tests use CloudPostgresS3")
             };
+            let transport = ReqwestS3Transport::new(s3_cfg).unwrap();
             let mut conn = case.pg_cleanup.as_ref().unwrap().0.open_raw_pg().await;
             sqlx::query(sqlx::AssertSqlSafe(format!("SET search_path TO {schema}")))
                 .execute(&mut conn)
@@ -1152,6 +1153,13 @@ async fn restores_historical_postgres_spools_and_rejects_invalid_headers() {
                 .execute(&mut conn)
                 .await
                 .unwrap();
+            sqlx::query(
+                "UPDATE blob_publications SET codec = 's3_chunked_v1'
+                 WHERE space_id IN (SELECT space_id FROM spaces WHERE slug IN ('stale-alone','stale-shared'))",
+            )
+            .execute(&mut conn)
+            .await
+            .unwrap();
             let mut scopes = Vec::new();
             for slug in ["stale-alone", "stale-shared"] {
                 let (id, inc): (String, Vec<u8>) =
@@ -1166,9 +1174,46 @@ async fn restores_historical_postgres_spools_and_rejects_invalid_headers() {
                         inc.try_into().unwrap(),
                     ),
                 };
-                let path = blob_root.data_root().blob(&scope.space_id, digest);
-                fs::create_dir_all(path.parent().unwrap()).unwrap();
-                fs::write(path, &frame).unwrap();
+                let prefix = if s3_cfg.application_prefix.is_empty() {
+                    String::new()
+                } else {
+                    format!("{}/", s3_cfg.application_prefix.trim_matches('/'))
+                };
+                let key = format!(
+                    "{prefix}spaces/{}/cas-v1/pub1/part-0.zst",
+                    scope.space_id.as_str()
+                );
+                let put = transport
+                    .send(S3RawRequest {
+                        method: http::Method::PUT,
+                        key: Some(key.clone()),
+                        query: Vec::new(),
+                        headers: Vec::new(),
+                        body: bytes::Bytes::from(frame.clone()),
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(put.status, 200, "seed S3 object for legacy v3 upgrade");
+                let version_id = put
+                    .headers
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("x-amz-version-id"))
+                    .map(|(_, v)| v.clone());
+                sqlx::query(
+                    "INSERT INTO blob_parts (
+                        space_id, publication_id, part_index, raw_size, compressed_size,
+                        part_blake3, physical_key, observed_version_id, upload_confirmed
+                    ) VALUES ($1, 'pub1', 0, $2, $3, $4, $5, $6, 1)",
+                )
+                .bind(scope.space_id.as_str())
+                .bind(raw.len() as i64)
+                .bind(frame.len() as i64)
+                .bind(digest.as_bytes().as_slice())
+                .bind(&key)
+                .bind(version_id.as_deref())
+                .execute(&mut conn)
+                .await
+                .unwrap();
                 scopes.push(scope);
             }
             Some((conn, scopes, digest, raw))
@@ -1179,7 +1224,7 @@ async fn restores_historical_postgres_spools_and_rejects_invalid_headers() {
             CanonicalRuntime::open(config.clone())
                 .await
                 .unwrap_or_else(|error| {
-                    panic!("open materialized PostgreSQL v{version} archive: {error:?}")
+                    panic!("open materialized PostgreSQL v{version}{suffix} archive: {error:?}")
                 });
         if let SqlBackendConfig::Postgres { schema, .. } = &config.sql {
             let mut db = case.pg_cleanup.as_ref().unwrap().0.open_raw_pg().await;
@@ -1192,6 +1237,71 @@ async fn restores_historical_postgres_spools_and_rejects_invalid_headers() {
             .await
             .unwrap();
             assert_eq!(key, ("status".to_owned(), "space_id".to_owned()));
+            if version == 6 || !suffix.is_empty() {
+                sqlx::query(sqlx::AssertSqlSafe(format!("SET search_path TO {schema}")))
+                    .execute(&mut db)
+                    .await
+                    .unwrap();
+                let schema_version: i32 =
+                    sqlx::query_scalar("SELECT schema_version FROM schema_meta")
+                        .fetch_one(&mut db)
+                        .await
+                        .unwrap();
+                assert_eq!(
+                    u32::try_from(schema_version).unwrap(),
+                    CANONICAL_SCHEMA_VERSION
+                );
+                let entries: Vec<(i64, Option<i32>, i32, Option<String>)> = sqlx::query_as(
+                    "SELECT entry_seq, human_origin, body_format, provenance_json
+                     FROM chat_entries ORDER BY entry_seq",
+                )
+                .fetch_all(&mut db)
+                .await
+                .unwrap();
+                assert_eq!(
+                    entries,
+                    [
+                        (1, Some(1), 0, None),
+                        (2, (suffix == "-agent").then_some(1), 0, None),
+                        (3, Some(0), 0, None)
+                    ]
+                );
+                if !suffix.is_empty() {
+                    let references: Vec<(i64, String, i64)> = sqlx::query_as(
+                        "SELECT entry_seq, target_note_id, created_space_seq FROM chat_entry_note_refs",
+                    )
+                    .fetch_all(&mut db)
+                    .await
+                    .unwrap();
+                    assert_eq!(references, [(1, sample_note_id(0x45).to_string(), 2)]);
+                }
+                let branch = restored
+                    .read_chat(
+                        owner_ctx(&cut.scope, sample_principal_id(space_id)),
+                        ChatRead {
+                            thread: ChatThreadId::from_bytes([0xC6; 16]),
+                            leaf: ThreadEntrySeq::new(3).unwrap(),
+                            before: None,
+                            max_entries: PageLimit::new(3).unwrap(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(branch.thread.title, "Historical chat");
+                let bodies: Vec<_> = branch
+                    .entries
+                    .into_iter()
+                    .map(|entry| (entry.kind, entry.body))
+                    .collect();
+                assert_eq!(
+                    bodies,
+                    [
+                        (ChatEntryKind::Human, ChatBody::Inline("Question".into())),
+                        (ChatEntryKind::Redacted, ChatBody::Redacted),
+                        (ChatEntryKind::Model, ChatBody::Inline("Answer".into())),
+                    ]
+                );
+            }
         }
         if let Some((db, scopes, digest, raw)) = migrated_db.as_mut() {
             let result: i32 =
@@ -1206,19 +1316,6 @@ async fn restores_historical_postgres_spools_and_rejects_invalid_headers() {
                     notarium_core::DomainError::ResourceNotFound
                 ))
             ));
-            let stale_path = blob_root.data_root().blob(&scopes[0].space_id, *digest);
-            assert!(stale_path.exists());
-            // Force the second unlink to fail until the first is observable.
-            let blocker = blob_root
-                .data_root()
-                .root()
-                .join("blobs/.quarantine")
-                .join(format!(
-                    "{}.{}.corrupt",
-                    scopes[0].space_id.as_str(),
-                    digest.to_hex()
-                ));
-            fs::create_dir_all(&blocker).unwrap();
             let rotated = HistoryScope {
                 space_id: scopes[0].space_id.clone(),
                 incarnation: sample_incarnation(0xD1),
@@ -1237,21 +1334,7 @@ async fn restores_historical_postgres_spools_and_rejects_invalid_headers() {
                 restored.get_space(&rotated.space_id).await.unwrap().scope,
                 rotated
             );
-            tokio::time::timeout(Duration::from_secs(5), async {
-                while stale_path.exists() {
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-            })
-            .await
-            .unwrap();
             let status_sql = "SELECT status FROM blob_retirements WHERE space_id=$1";
-            let status: String = sqlx::query_scalar(status_sql)
-                .bind(rotated.space_id.as_str())
-                .fetch_one(&mut *db)
-                .await
-                .unwrap();
-            assert_eq!(status, "pending");
-            fs::remove_dir(&blocker).unwrap();
             tokio::time::timeout(Duration::from_secs(10), async {
                 loop {
                     let status: String = sqlx::query_scalar(status_sql)
@@ -1692,6 +1775,7 @@ async fn l4_paired_backup_cut_holds_budgets_cleanup_and_restore_cursors_dual_dia
                         &scope,
                         &actor,
                         CreateNote {
+                            folder_page: false,
                             note: note_1,
                             parent: None,
                             slug: "note-select1-control".to_owned(),
@@ -1720,6 +1804,7 @@ async fn l4_paired_backup_cut_holds_budgets_cleanup_and_restore_cursors_dual_dia
                         &scope,
                         &actor,
                         CreateNote {
+                            folder_page: false,
                             note: note_1,
                             parent: None,
                             slug: "note-select1-control".to_owned(),
@@ -1799,6 +1884,7 @@ async fn l4_paired_backup_cut_holds_budgets_cleanup_and_restore_cursors_dual_dia
                     &scope,
                     &actor,
                     CreateNote {
+                        folder_page: false,
                         note: note_pre_pause.clone(),
                         parent: None,
                         slug: "note-pre-pause".to_owned(),
@@ -1836,6 +1922,7 @@ async fn l4_paired_backup_cut_holds_budgets_cleanup_and_restore_cursors_dual_dia
                         &scope_bg,
                         &actor_bg,
                         CreateNote {
+                            folder_page: false,
                             note: note_post_cl,
                             parent: None,
                             slug: "note-post-resume".to_owned(),
@@ -1924,6 +2011,7 @@ async fn l4_paired_backup_cut_holds_budgets_cleanup_and_restore_cursors_dual_dia
                             &scope,
                             &actor,
                             CreateNote {
+                                folder_page: false,
                                 note: nid,
                                 parent: None,
                                 slug: format!("wal-unpinned-probe-{idx}"),
@@ -2169,6 +2257,7 @@ async fn l4_paired_backup_cut_holds_budgets_cleanup_and_restore_cursors_dual_dia
                     &new_scope,
                     &actor,
                     CreateNote {
+                        folder_page: false,
                         note: NoteId::from_bytes([0x39; 16]),
                         parent: None,
                         slug: "new-incarnation-same-seq".to_owned(),
@@ -2284,6 +2373,7 @@ async fn l4_paired_backup_cut_holds_budgets_cleanup_and_restore_cursors_dual_dia
                     &scope,
                     &actor,
                     CreateNote {
+                        folder_page: false,
                         note: note_step1.clone(),
                         parent: None,
                         slug: "interrupted-purge-blocks-hold".to_owned(),
@@ -2366,6 +2456,7 @@ async fn l4_paired_backup_cut_holds_budgets_cleanup_and_restore_cursors_dual_dia
                     &scope,
                     &actor,
                     CreateNote {
+                        folder_page: false,
                         note: note_after_abort,
                         parent: None,
                         slug: "after-second-participant-abort".to_owned(),
@@ -2490,6 +2581,7 @@ async fn l4_paired_backup_cut_holds_budgets_cleanup_and_restore_cursors_dual_dia
                                 &scope_w,
                                 &actor_w,
                                 CreateNote {
+                                    folder_page: false,
                                     note: NoteId::from_bytes([0x90 + k; 16]),
                                     parent: None,
                                     slug: format!("wal-budget-grow-{k}"),
@@ -2562,6 +2654,7 @@ async fn l4_paired_backup_cut_holds_budgets_cleanup_and_restore_cursors_dual_dia
                     &scope,
                     &actor,
                     CreateNote {
+                        folder_page: false,
                         note: secret_note.clone(),
                         parent: None,
                         slug: format!("slug-{secret_token}").to_ascii_lowercase(),
@@ -3091,9 +3184,10 @@ async fn run_memory_subprocess_mode(mode: &str) {
         "seed_pg_64m" => {
             let fixtures = StorageTestFixtures::load_required();
             let schema = env::var(SUBPROC_SCHEMA_ENV).unwrap();
-            let spool_root = DataRoot::new(env::var(SUBPROC_PATH_ENV).unwrap());
             let expected_hex = env::var(SUBPROC_DIGEST_ENV).unwrap();
-            let cfg = fixtures.pg_local_config(sample_installation_id(0x73), &schema, spool_root);
+            let cfg = fixtures
+                .open_pg_s3_config(sample_installation_id(0x73), &schema)
+                .await;
             let (store, runtime) = CanonicalRuntime::open(cfg).await.unwrap();
             seed_64m_and_50_medium_rows(&store, &expected_hex).await;
             runtime.shutdown().await.unwrap();
@@ -3103,9 +3197,11 @@ async fn run_memory_subprocess_mode(mode: &str) {
             let schema = env::var(SUBPROC_SCHEMA_ENV).unwrap();
             let spool_root = DataRoot::new(env::var(SUBPROC_PATH_ENV).unwrap());
             let expected_hex = env::var(SUBPROC_DIGEST_ENV).unwrap();
-            let cfg =
-                fixtures.pg_local_config(sample_installation_id(0x73), &schema, spool_root.clone());
+            let cfg = fixtures
+                .open_pg_s3_config(sample_installation_id(0x73), &schema)
+                .await;
             let (store, runtime) = CanonicalRuntime::open(cfg).await.unwrap();
+            store.set_backup_spool_dir(spool_root.staging().join("backups"));
             let before_hwm = read_proc_vm_hwm_kib();
 
             let budget = store.default_backup_budget();
@@ -3214,6 +3310,7 @@ async fn seed_64m_and_50_medium_rows(store: &CanonicalStore, expected_hex: &str)
                 &space.scope,
                 &actor,
                 CreateNote {
+                    folder_page: false,
                     note: note.clone(),
                     parent: None,
                     slug: "peer-64m-carrier".to_owned(),
@@ -3430,6 +3527,7 @@ async fn run_sigkill_victim_child() {
                 &space.scope,
                 &actor,
                 CreateNote {
+                    folder_page: false,
                     note: collab_note.clone(),
                     parent: None,
                     slug: "collab-victim-note".to_owned(),
@@ -3471,6 +3569,7 @@ async fn run_sigkill_victim_child() {
                 &space.scope,
                 &actor,
                 CreateNote {
+                    folder_page: false,
                     note: purge_note.clone(),
                     parent: None,
                     slug: "purge-victim-note".to_owned(),

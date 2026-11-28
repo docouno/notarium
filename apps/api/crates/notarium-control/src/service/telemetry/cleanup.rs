@@ -1,4 +1,8 @@
 use super::*;
+
+pub(crate) const DELETE_SCHEDULE_RUNS_RETENTION_SQLITE_SQL: &str = "DELETE FROM agent_schedule_runs WHERE run_id IN (SELECT r.run_id FROM agent_schedule_runs r WHERE r.status IN ('succeeded','failed','unknown') AND r.finished_at IS NOT NULL AND r.finished_at<=$1 AND NOT EXISTS(SELECT 1 FROM agent_schedules s WHERE s.schedule_id=r.schedule_id AND s.deleted_at IS NULL AND r.slot_utc_ms BETWEEN s.next_slot_utc_ms-$3 AND s.next_slot_utc_ms) ORDER BY r.finished_at,r.run_id LIMIT $2)";
+pub(crate) const DELETE_SCHEDULES_RETENTION_SQLITE_SQL: &str = "DELETE FROM agent_schedules WHERE schedule_id IN (SELECT s.schedule_id FROM agent_schedules s WHERE s.deleted_at IS NOT NULL AND s.deleted_at<=$1 AND NOT EXISTS(SELECT 1 FROM agent_schedule_runs r WHERE r.schedule_id=s.schedule_id) ORDER BY s.deleted_at,s.schedule_id LIMIT $2)";
+
 impl ControlService {
     pub async fn cleanup_telemetry(
         &self,
@@ -181,7 +185,7 @@ impl ControlService {
                         execute!(
                             tx.inner_mut(),
                             "UPDATE oauth_refresh_families SET revoked_at=$1,reason_code='expired' WHERE family_id=$2 AND revoked_at IS NULL AND NOT EXISTS(SELECT 1 FROM oauth_refresh_tokens t WHERE t.family_id=$2)",
-                            "UPDATE v1_control.oauth_refresh_families SET revoked_at=$1,reason_code='expired' WHERE family_id=$2 AND revoked_at IS NULL AND NOT EXISTS(SELECT 1 FROM v1_control.oauth_refresh_tokens t WHERE t.family_id=$2)";
+                            "UPDATE v1_control.oauth_refresh_families SET revoked_at=$1,reason_code='expired' WHERE family_id IN (SELECT f.family_id FROM v1_control.oauth_refresh_families f WHERE f.family_id=$2 AND f.revoked_at IS NULL AND NOT EXISTS(SELECT 1 FROM v1_control.oauth_refresh_tokens t WHERE t.family_id=f.family_id) FOR UPDATE OF f SKIP LOCKED)";
                             cutoff_7d, &fid
                         )?;
                     }
@@ -227,18 +231,23 @@ impl ControlService {
                             compact, remaining
                         )? as i64;
                     }
+                    // A legacy due may be the late UTC instant of a repeated civil
+                    // time. Each Chrono offset has absolute value below 24 hours,
+                    // so the two instants differ by less than 48 hours. Preserve
+                    // this small window across configuration changes until the
+                    // schedule advances; claims resolve the exact civil instant.
                     if remaining > 0 {
                         remaining -= execute!(
                             tx.inner_mut(),
-                            "DELETE FROM agent_schedule_runs WHERE run_id IN (SELECT run_id FROM agent_schedule_runs WHERE status IN ('succeeded','failed','unknown') AND finished_at IS NOT NULL AND finished_at<=$1 ORDER BY finished_at,run_id LIMIT $2)",
-                            "DELETE FROM v1_control.agent_schedule_runs WHERE run_id IN (SELECT run_id FROM v1_control.agent_schedule_runs WHERE status IN ('succeeded','failed','unknown') AND finished_at IS NOT NULL AND finished_at<=$1 ORDER BY finished_at,run_id LIMIT $2 FOR UPDATE SKIP LOCKED)";
-                            compact, remaining
+                            DELETE_SCHEDULE_RUNS_RETENTION_SQLITE_SQL,
+                            "DELETE FROM v1_control.agent_schedule_runs WHERE run_id IN (SELECT r.run_id FROM v1_control.agent_schedule_runs r WHERE r.status IN ('succeeded','failed','unknown') AND r.finished_at IS NOT NULL AND r.finished_at<=$1 AND NOT EXISTS(SELECT 1 FROM v1_control.agent_schedules s WHERE s.schedule_id=r.schedule_id AND s.deleted_at IS NULL AND r.slot_utc_ms BETWEEN s.next_slot_utc_ms-$3 AND s.next_slot_utc_ms) ORDER BY r.finished_at,r.run_id LIMIT $2 FOR UPDATE OF r SKIP LOCKED)";
+                            compact, remaining, 2 * DAY
                         )? as i64;
                     }
                     if remaining > 0 {
                         remaining -= execute!(
                             tx.inner_mut(),
-                            "DELETE FROM agent_schedules WHERE schedule_id IN (SELECT s.schedule_id FROM agent_schedules s WHERE s.deleted_at IS NOT NULL AND s.deleted_at<=$1 AND NOT EXISTS(SELECT 1 FROM agent_schedule_runs r WHERE r.schedule_id=s.schedule_id) ORDER BY s.deleted_at,s.schedule_id LIMIT $2)",
+                            DELETE_SCHEDULES_RETENTION_SQLITE_SQL,
                             "DELETE FROM v1_control.agent_schedules WHERE schedule_id IN (SELECT s.schedule_id FROM v1_control.agent_schedules s WHERE s.deleted_at IS NOT NULL AND s.deleted_at<=$1 AND NOT EXISTS(SELECT 1 FROM v1_control.agent_schedule_runs r WHERE r.schedule_id=s.schedule_id) ORDER BY s.deleted_at,s.schedule_id LIMIT $2 FOR UPDATE OF s SKIP LOCKED)";
                             compact, remaining
                         )? as i64;
@@ -250,7 +259,7 @@ impl ControlService {
                 CommitEffect::NotCommitted,
             )
             .await?;
-        budget.run(tx.commit(), CommitEffect::Unknown).await?;
+        budget.commit_tx(tx).await?;
         Ok(result)
     }
 }

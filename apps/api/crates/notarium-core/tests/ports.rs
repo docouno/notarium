@@ -118,6 +118,10 @@ impl ReadFixture {
             manifest.insert(file.path, file.digest);
             let mut facts = resource_facts(DocClass::Skill);
             facts.ability_package = Some(package.ability.clone());
+            let location = AbilityResourceLocation {
+                placement: AbilityPlacement::OwnedPersonal(auth().principal().clone()),
+                facts,
+            };
             let resource = ClassifiedAbilityResource::from_canonical(
                 AbilityResourceRef {
                     space: scope(1).space_id,
@@ -125,7 +129,11 @@ impl ReadFixture {
                     package_revision: revision.clone(),
                     resource: name.clone(),
                 },
-                facts,
+                AbilityResourceProvenance {
+                    current: location.clone(),
+                    published: location,
+                    promoted_from: None,
+                },
                 Lifecycle::Active,
                 file.content,
                 file.digest,
@@ -149,6 +157,7 @@ fn resource_facts(class: DocClass) -> ResourceFacts {
             kind: SpaceKind::Personal,
         },
         class,
+        project: None,
         ancestor_folders: vec![],
         folder_write_locked: false,
         ability_package: None,
@@ -172,9 +181,47 @@ fn note_snapshot(byte: u8, class: DocClass, lifecycle: Lifecycle) -> NoteSnapsho
         byte_size: 13,
         fields: BTreeMap::new(),
         diagnostics: vec![],
+        provenance: None,
     }
 }
 impl NoteReadPort for ReadFixture {
+    fn resolve_folder_path(
+        &self,
+        ctx: SpaceContext,
+        base: Option<FolderId>,
+        path: String,
+    ) -> PortFuture<'_, Option<FolderSnapshot>> {
+        support::RejectingPorts.resolve_folder_path(ctx, base, path)
+    }
+    fn list_child_folders(
+        &self,
+        ctx: SpaceContext,
+        base: Option<FolderId>,
+        after: Option<FolderId>,
+        at_seq: Option<SpaceSeq>,
+        limit: PageLimit,
+    ) -> PortFuture<'_, ChildFolders> {
+        support::RejectingPorts.list_child_folders(ctx, base, after, at_seq, limit)
+    }
+    fn resolve_note_target(
+        &self,
+        ctx: SpaceContext,
+        parent: Option<FolderId>,
+        slug_title_or_id: String,
+    ) -> PortFuture<'_, Option<NoteRef>> {
+        support::RejectingPorts.resolve_note_target(ctx, parent, slug_title_or_id)
+    }
+    fn space_schema(&self, ctx: SpaceContext) -> PortFuture<'_, BTreeMap<String, FieldSchema>> {
+        support::RejectingPorts.space_schema(ctx)
+    }
+    fn project_note_counts(
+        &self,
+        ctx: SpaceContext,
+        project: FolderRef,
+        causal: CausalBasis,
+    ) -> PortFuture<'_, ProjectNoteCounts> {
+        support::RejectingPorts.project_note_counts(ctx, project, causal)
+    }
     fn get_note(&self, ctx: SpaceContext, request: GetNote) -> PortFuture<'_, NoteSnapshot> {
         Box::pin(async move {
             ctx.check_current(&scope(1))?;
@@ -187,6 +234,20 @@ impl NoteReadPort for ReadFixture {
             Ok(note.clone())
         })
     }
+    fn get_note_metadata(
+        &self,
+        ctx: SpaceContext,
+        request: GetNote,
+    ) -> PortFuture<'_, NoteMetadataSnapshot> {
+        Box::pin(async move {
+            let snapshot = self.get_note(ctx, request).await?;
+            Ok(NoteMetadataSnapshot {
+                metadata: snapshot.document.metadata(),
+                parent: snapshot.parent,
+                provenance: snapshot.provenance,
+            })
+        })
+    }
     fn list_notes(
         &self,
         ctx: SpaceContext,
@@ -197,7 +258,7 @@ impl NoteReadPort for ReadFixture {
             let ReadRequest::Open { query, .. } = request else {
                 return Err(DomainError::ResourceNotFound.into());
             };
-            let items = self
+            let items: Vec<NoteListCard> = self
                 .notes
                 .iter()
                 .filter(|n| {
@@ -209,6 +270,8 @@ impl NoteReadPort for ReadFixture {
                         document: n.document.listing(ctx.auth())?,
                         title: "Title".into(),
                         path: "note.md".into(),
+                        tags: vec![],
+                        view_type: None,
                     })
                 })
                 .collect::<notarium_core::DomainResult<_>>()?;
@@ -218,6 +281,7 @@ impl NoteReadPort for ReadFixture {
                     folder_id: FolderId::from_bytes([1; 16]),
                 },
                 page: None,
+                total: items.len() as u64,
                 children: CursorPage {
                     items,
                     next: None,
@@ -353,6 +417,8 @@ fn paginated_seed_and_jobs_preserve_their_own_identity_types_and_cut() {
                     kind: ChatThreadKind::Personal,
                     owner: PrincipalId::from_bytes([1; 16]),
                     project_folder: None,
+                    title: String::new(),
+                    active_run: None,
                     head: ThreadEntrySeq::ZERO,
                     revision: RevisionId::from_bytes([n; 16]),
                     tainted: false,
@@ -474,6 +540,7 @@ fn trash_is_readable_and_listable_without_secondary_content_capabilities() {
                 recursive: true,
                 classes: DocClass::all(),
                 lifecycle: LifecycleMask::Trashed,
+                tag: None,
                 filter: FieldFilterAstV1 {
                     version: 1,
                     predicate: Predicate::All(vec![]),
@@ -515,10 +582,13 @@ fn package_reads_select_exact_entrypoint_and_auxiliary_revisions() {
     let mut fixture = ReadFixture::default();
     for n in [1, 2] {
         let package = PublishAbilityPackage {
+            attached_skills: vec![],
             ability: ability.clone(),
             kind: AbilityKind::Skill,
             entrypoint: NoteId::from_bytes([1; 16]),
             expected_package_revision: None,
+            expected_entrypoint_revision: None,
+            requires_explicit_binding: false,
             files: ["SKILL.md", "resources/rules.md"]
                 .into_iter()
                 .map(|path| AbilityFile {
@@ -898,7 +968,7 @@ fn mcp_coverage_has_28_named_operations_and_typed_method_witnesses() {
         <dyn ControlPort>::list_projects,
         <dyn ControlPort>::get_ability,
         <dyn ControlPort>::update_ability_binding,
-        <dyn ControlPort>::resolve_memory_target,
+        <dyn ControlPort>::inspect_memory_target,
     );
     let _ = (
         <dyn EnginePort>::list_notes,
@@ -1029,6 +1099,7 @@ fn cluster_identity_survives_membership_changes_and_selects_a_typed_lens() {
             version: 1,
             predicate: Predicate::All(vec![]),
         },
+        causal: None,
     };
     let old = ClusterGraphFixture {
         cut: fixture_read().cut,
@@ -1246,6 +1317,7 @@ impl StructuralReadPort for StructuralFixture {
                             kind: SpaceKind::Personal,
                         },
                         class: DocClass::UserDoc,
+                        project: None,
                         ancestor_folders: vec![],
                         folder_write_locked: false,
                         ability_package: None,
@@ -1718,23 +1790,8 @@ fn canonical_seams_enforce_command_ranges_chat_staging_and_nanosecond_timestamps
     assert!(!DomainError::validation(ValidationReason::InvalidCutoff).requires_resync());
     assert!(!DomainError::validation(ValidationReason::NotReady).requires_resync());
 
-    assert!(
-        StagedChatBlob::attest_canonical(
-            scope(1).space_id,
-            PrincipalId::from_bytes([1; 16]),
-            ContentDigest::from_bytes([1; 32]),
-            512,
-        )
-        .is_err()
-    );
-    let staged = StagedChatBlob::attest_canonical(
-        scope(1).space_id,
-        PrincipalId::from_bytes([1; 16]),
-        ContentDigest::from_bytes([2; 32]),
-        513,
-    )
-    .unwrap();
-    assert_eq!(staged.byte_len(), 513);
+    assert_eq!(ChatInputBody::INLINE_MAX_BYTES, 32 * 1024);
+    assert_eq!(ChatInputBody::MAX_ENTRY_BYTES, 256 * 1024);
 
     let ts = Timestamp::parse("2026-11-15T12:34:56.123456789Z").unwrap();
     let roundtrip = Timestamp::from_unix_parts(ts.unix_seconds(), ts.nanosecond()).unwrap();

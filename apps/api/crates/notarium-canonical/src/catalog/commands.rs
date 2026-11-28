@@ -69,6 +69,11 @@ async fn execute(
     let deadline = CommandDeadline::start(&budget, "catalog_write");
     deadline.remaining(&budget)?;
     let hash = command.fingerprint(&id)?;
+    let space_id = match &command {
+        Command::Provision { space, .. } => &space.id,
+        Command::Lifecycle { scope, .. } => &scope.space_id,
+    }
+    .clone();
     let inner = store.inner.clone();
     let grants = store.inner.clone();
     let work_budget = budget.clone();
@@ -78,6 +83,7 @@ async fn execute(
     };
     store
         .with_auxiliary_visibility_command(
+            space_id,
             visible_space,
             Some((&budget, deadline)),
             move |(result, grant): (CatalogSpace, Option<(SpaceId, LeaseEpoch)>)| {
@@ -134,6 +140,7 @@ async fn execute(
                         return Ok((
                             CatalogSpace {
                                 space,
+                                slug: current.slug,
                                 history,
                                 last_seq,
                             },

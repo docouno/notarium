@@ -842,13 +842,16 @@ fn note_from_row(
         note_id: metadata.note_id.clone(),
         digest: carrier_digest,
     };
+    let updated_at = metadata
+        .logical_updated_at
+        .unwrap_or(timestamp(updated_sec, updated_nsec)?);
     Ok(ProjectionNote {
         revision_actor: PrincipalId::parse(&actor.ok_or_else(stale)?)?,
         metadata,
         revision_id,
         visibility_seq: i64_to_space_seq(visible)?,
         created_at: timestamp(created_sec, created_nsec)?,
-        updated_at: timestamp(updated_sec, updated_nsec)?,
+        updated_at,
         rank_version,
         header_diagnostic,
         carrier,

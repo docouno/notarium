@@ -73,7 +73,7 @@ pub(super) async fn check(store: &CanonicalStore, scope: &HistoryScope, owner: &
         RenameProject {
             folder: project.clone(),
             name: "renamed-project".into(),
-            display_name: "Renamed project".into(),
+            display_name: Some("Renamed project".into()),
         },
     );
     assert!(matches!(

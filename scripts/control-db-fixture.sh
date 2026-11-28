@@ -9,8 +9,9 @@ case ${1:-} in
         fi
         exit 0
         ;;
-    run) shift ;;
-    *) echo 'usage: control-db-fixture.sh prepare | run COMMAND [ARG...]' >&2; exit 2 ;;
+    run) data_mount=--tmpfs=/var/lib/postgresql/data:rw; shift ;;
+    run-durable) data_mount=--mount=type=volume,dst=/var/lib/postgresql/data,volume-nocopy; shift ;;
+    *) echo 'usage: control-db-fixture.sh prepare | run COMMAND [ARG...] | run-durable COMMAND [ARG...]' >&2; exit 2 ;;
 esac
 umask 022
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -27,7 +28,7 @@ cleanup() {
         docker logs "$name" > "$run/postgres.log" 2>&1 || true
     fi
     docker exec -u 0 "$name" sh -c 'chmod 0777 /var/run/postgresql && rm -rf /var/run/postgresql/* /var/run/postgresql/.[!.]*' > /dev/null 2>&1 || true
-    docker rm -f "$name" > /dev/null 2>&1 || true
+    docker rm -fv "$name" > /dev/null 2>&1 || true
     rm -f .artifacts/control-db-fixture/active.json
     if [ "$result" -eq 0 ]; then
         rm -rf "$run"
@@ -39,7 +40,7 @@ mkdir "$run/socket"
 chmod 0777 "$run/socket"
 docker run --detach --name "$name" --network none \
     --mount "type=bind,src=$root/$run/socket,dst=/var/run/postgresql" \
-    --tmpfs /var/lib/postgresql/data:rw \
+    "$data_mount" \
     --env POSTGRES_HOST_AUTH_METHOD=trust "$image" \
     -c listen_addresses= -c max_connections=100 -c shared_buffers=32MB > "$run/container-id"
 attempt=0

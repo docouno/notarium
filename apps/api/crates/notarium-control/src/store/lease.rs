@@ -1,6 +1,6 @@
 //! Transaction lifetimes remain bounded even when the consumer stops polling.
 use super::{Transaction, WriteTransaction};
-use crate::error::{database, invalid};
+use crate::error::{database, database_not_committed, invalid};
 use notarium_core::{
     error::{CommitEffect, OperationalFailure, PortError, RetryAdvice, ValidationReason},
     ids::ContentDigest,
@@ -76,6 +76,35 @@ impl OperationBudget {
             result = operation => result,
         }
     }
+    /// Commits a write transaction under the operation budget. If the budget is
+    /// already cancelled or expired before `COMMIT` is spawned, the transaction
+    /// rolls back on drop and `CommitEffect::NotCommitted` is preserved; once
+    /// `spawn_commit` hands ownership to the commit task, cancellation or
+    /// timeout reports `CommitEffect::Unknown`.
+    pub async fn commit_tx(&self, tx: WriteTransaction) -> Result<(), PortError> {
+        self.check(CommitEffect::NotCommitted)?;
+        let handle = tx.spawn_commit();
+        let sleep_for = self.remaining_now();
+        tokio::select! {
+            biased;
+            () = self.cancellation.cancelled() => Err(PortError::Cancelled(budget_failure(CommitEffect::Unknown))),
+            () = tokio::time::sleep(sleep_for) => Err(PortError::DeadlineExceeded(budget_failure(CommitEffect::Unknown))),
+            result = handle => result.map_err(|_| crate::error::unavailable("control commit worker", CommitEffect::Unknown))?,
+        }
+    }
+    pub async fn await_spawned<T>(
+        &self,
+        handle: tokio::task::JoinHandle<Result<T, PortError>>,
+        worker: &'static str,
+    ) -> Result<T, PortError> {
+        let sleep_for = self.remaining_now();
+        tokio::select! {
+            biased;
+            () = self.cancellation.cancelled() => Err(PortError::Cancelled(budget_failure(CommitEffect::Unknown))),
+            () = tokio::time::sleep(sleep_for) => Err(PortError::DeadlineExceeded(budget_failure(CommitEffect::Unknown))),
+            result = handle => result.map_err(|_| crate::error::unavailable(worker, CommitEffect::Unknown))?,
+        }
+    }
     pub async fn configure(&self, tx: &mut Transaction) -> Result<(), PortError> {
         // Override pool-default 250ms statement_timeout as well as idle timeout
         // so bounded cuts/imports/exports honour their explicit operation budget.
@@ -95,7 +124,7 @@ impl OperationBudget {
             .bind(&setting)
             .execute(&mut **tx)
             .await
-            .map_err(database)?;
+            .map_err(database_not_committed)?;
         }
         Ok(())
     }

@@ -1,16 +1,40 @@
 use std::{
     fs::{self, File},
+    future::Future,
     io::Read,
     num::NonZeroUsize,
+    pin::Pin,
+    sync::atomic::AtomicBool,
     time::Duration,
 };
 
+use notarium_canonical::blobs::s3::{ReqwestS3Transport, S3RawRequest, S3RawResponse, S3Transport};
 use notarium_core::{
     error::ValidationReason,
     ports::{PageLimit, PortStream, SpaceEvent, StructuralReadPort},
 };
 
 use super::*;
+
+#[derive(Debug)]
+struct BlockingReadS3Transport {
+    inner: ReqwestS3Transport,
+    block_gets: Arc<AtomicBool>,
+}
+
+impl S3Transport for BlockingReadS3Transport {
+    fn send<'a>(
+        &'a self,
+        req: S3RawRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<S3RawResponse, PortError>> + Send + 'a>> {
+        if self.block_gets.load(Ordering::SeqCst) && req.method.as_str() == "GET" {
+            return Box::pin(async {
+                Err(DomainError::validation(ValidationReason::InvalidState).into())
+            });
+        }
+        self.inner.send(req)
+    }
+}
 
 #[tokio::test]
 async fn quiet_checkpoint_repair_sqlite() {
@@ -25,7 +49,7 @@ async fn quiet_checkpoint_repair_sqlite() {
     let derived = DerivedStore::open_sqlite(&root, ProjectionGeneration::new(1).unwrap())
         .await
         .unwrap();
-    exercise(&store, derived, &root).await;
+    exercise(&store, derived, &root, None).await;
     canonical.shutdown().await.unwrap();
 }
 
@@ -37,16 +61,27 @@ async fn quiet_checkpoint_repair_postgres() {
     let id = hex::encode(&random_bytes()[..6]);
     let canonical_schema = format!("test_repair_{id}");
     let derived_schema = format!("test_repair_{id}_d");
-    let (store, canonical) = CanonicalRuntime::open(CanonicalConfig {
-        installation_id: InstallationId::from_bytes(random_bytes()),
-        sql: SqlBackendConfig::postgres_default(fixture.canonical(), &canonical_schema),
-        blobs: BlobBackendConfig::Local {
-            data_root: root.clone(),
+    let blobs = fixture.s3_blobs(&canonical_schema).await;
+    let s3_cfg = match &blobs {
+        BlobBackendConfig::S3(cfg) => cfg.clone(),
+        BlobBackendConfig::Local { .. } => unreachable!("expected S3 backend"),
+    };
+    let block_gets = Arc::new(AtomicBool::new(false));
+    let transport = Arc::new(BlockingReadS3Transport {
+        inner: ReqwestS3Transport::new(&s3_cfg).unwrap(),
+        block_gets: block_gets.clone(),
+    });
+    let (store, canonical) = CanonicalRuntime::open_with_s3_transport(
+        CanonicalConfig {
+            installation_id: InstallationId::from_bytes(random_bytes()),
+            sql: SqlBackendConfig::postgres_default(fixture.canonical(), &canonical_schema),
+            blobs,
+            writer: WriterConfig::default(),
+            snapshot_retention: Duration::from_secs(60),
+            default_backup_budget: default_postgres_backup_budget(),
         },
-        writer: WriterConfig::default(),
-        snapshot_retention: Duration::from_secs(60),
-        default_backup_budget: default_postgres_backup_budget(),
-    })
+        Some(transport),
+    )
     .await
     .unwrap();
     let pool = PgPoolOptions::new()
@@ -61,7 +96,7 @@ async fn quiet_checkpoint_repair_postgres() {
     )
     .await
     .unwrap();
-    exercise(&store, derived, &root).await;
+    exercise(&store, derived, &root, Some(&block_gets)).await;
     canonical.shutdown().await.unwrap();
     for schema in [
         canonical_schema,
@@ -75,7 +110,12 @@ async fn quiet_checkpoint_repair_postgres() {
     }
 }
 
-async fn exercise(store: &CanonicalStore, derived: DerivedStore, root: &DataRoot) {
+async fn exercise(
+    store: &CanonicalStore,
+    derived: DerivedStore,
+    root: &DataRoot,
+    block_s3_gets: Option<&AtomicBool>,
+) {
     let generation = derived.generation();
     let (scope, owner) = open_space(store).await;
     let (other_scope, other_owner) = open_space(store).await;
@@ -114,9 +154,15 @@ async fn exercise(store: &CanonicalStore, derived: DerivedStore, root: &DataRoot
         .await
         .unwrap();
     let digest = source.rows[0].metadata.content_digest.unwrap();
-    let blob = root.blob(&scope.space_id, digest);
-    let hidden = blob.with_extension("hidden-during-checkpoint-repair");
-    fs::rename(&blob, &hidden).unwrap();
+    let local_hidden = if let Some(flag) = block_s3_gets {
+        flag.store(true, Ordering::SeqCst);
+        None
+    } else {
+        let blob = root.blob(&scope.space_id, digest);
+        let hidden = blob.with_extension("hidden-during-checkpoint-repair");
+        fs::rename(&blob, &hidden).unwrap();
+        Some((blob, hidden))
+    };
 
     for corrupt in [false, true] {
         let path = find_checkpoint_file(root, generation, &scope.space_id, seq).unwrap();
@@ -275,7 +321,12 @@ async fn exercise(store: &CanonicalStore, derived: DerivedStore, root: &DataRoot
             "retiring the old mapping cannot unlink its replacement"
         );
     }
-    fs::rename(&hidden, &blob).unwrap();
+    if let Some(flag) = block_s3_gets {
+        flag.store(false, Ordering::SeqCst);
+    }
+    if let Some((blob, hidden)) = local_hidden {
+        fs::rename(&hidden, &blob).unwrap();
+    }
     runtime.shutdown().await.unwrap();
 }
 

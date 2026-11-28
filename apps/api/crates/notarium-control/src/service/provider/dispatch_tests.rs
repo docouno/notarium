@@ -27,15 +27,20 @@ use std::{
 #[derive(Default)]
 struct Egress {
     current: Mutex<Vec<ProviderCurrentContent>>,
+    dependencies: Mutex<ProviderEgressDependencies>,
     deny: AtomicBool,
     active: Arc<AtomicUsize>,
+    admitted: Arc<AtomicUsize>,
     cancellations: Mutex<Vec<Cancellation>>,
 }
 struct EgressLease {
     project_folders: BTreeSet<FolderId>,
     current: Vec<ProviderCurrentContent>,
     project: Option<FolderRef>,
+    secondary_projects: Vec<FolderRef>,
     active: Arc<AtomicUsize>,
+    admitted: Arc<AtomicUsize>,
+    dispatched: bool,
     cancellation: Cancellation,
 }
 impl Drop for EgressLease {
@@ -53,6 +58,17 @@ impl ProviderEgressLease for EgressLease {
     fn project_folders(&self) -> &BTreeSet<FolderId> {
         &self.project_folders
     }
+    fn secondary_projects(&self) -> &[FolderRef] {
+        &self.secondary_projects
+    }
+    fn mark_dispatched(&mut self) -> PortFuture<'_, ()> {
+        assert!(!std::mem::replace(&mut self.dispatched, true));
+        self.admitted.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Ok(()) })
+    }
+    fn close(&mut self) -> PortFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
     fn check(&self) -> notarium_core::DomainResult<()> {
         if self.cancellation.is_cancelled() {
             Err(DomainError::AccessDenied)
@@ -62,6 +78,14 @@ impl ProviderEgressLease for EgressLease {
     }
 }
 impl ProviderEgressCatalogPort for Egress {
+    fn chat_dependencies(
+        &self,
+        _: AccountContext,
+        _: Vec<ProviderOrigin>,
+    ) -> PortFuture<'_, ProviderEgressDependencies> {
+        Box::pin(async move { Ok(self.dependencies.lock().unwrap().clone()) })
+    }
+
     fn acquire_egress(
         &self,
         _: AccountContext,
@@ -72,14 +96,20 @@ impl ProviderEgressCatalogPort for Egress {
             if self.deny.load(Ordering::SeqCst) {
                 return Err(DomainError::AccessDenied.into());
             }
-            let current = self
-                .current
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|item| request.origins.contains(&item.origin()))
-                .cloned()
-                .collect();
+            let current = {
+                let catalog = self.current.lock().unwrap();
+                request
+                    .origins
+                    .iter()
+                    .map(|origin| {
+                        catalog
+                            .iter()
+                            .find(|item| item.origin() == *origin)
+                            .cloned()
+                            .ok_or_else(|| invalid(ValidationReason::SourceMismatch))
+                    })
+                    .collect::<Result<_, _>>()?
+            };
             self.active.fetch_add(1, Ordering::SeqCst);
             self.cancellations
                 .lock()
@@ -89,7 +119,10 @@ impl ProviderEgressCatalogPort for Egress {
                 project_folders: request.project_folders,
                 current,
                 project: request.project,
+                secondary_projects: request.secondary_projects,
                 active: self.active.clone(),
+                admitted: self.admitted.clone(),
+                dispatched: false,
                 cancellation,
             }) as Box<dyn ProviderEgressLease>)
         })
@@ -133,6 +166,16 @@ impl SessionRevocationPort for TaintOnRegistration {
             }
             Ok(lease)
         })
+    }
+
+    fn register_canonical_effect(
+        &self,
+        ctx: MaintenanceContext,
+        selectors: Vec<RevocationSelector>,
+        cancellation: Cancellation,
+    ) -> PortFuture<'_, Arc<dyn CanonicalEffectRegistration>> {
+        self.inner
+            .register_canonical_effect(ctx, selectors, cancellation)
     }
 
     fn fence_provider(
@@ -387,6 +430,7 @@ impl Setup {
             ResourceFacts {
                 space: catalog.space,
                 class: DocClass::UserDoc,
+                project: None,
                 ancestor_folders: vec![],
                 folder_write_locked: false,
                 ability_package: None,
@@ -465,6 +509,7 @@ impl Setup {
         CompletionRequest {
             intent: CommandKey::from_bytes([id; 16]),
             selection: self.selection.clone(),
+            secondary_projects: vec![],
             messages: vec![CompletionMessage {
                 role: CompletionRole::User,
                 instruction: None,
@@ -531,6 +576,71 @@ async fn complete(
     }
     Ok(events)
 }
+
+async fn compacted_history_dispatches_only_with_its_transitive_proof(setup: &Setup) {
+    let note = ProviderCurrentContent::Note(setup.document.metadata());
+    let space = note.space().unwrap().clone();
+    let thread = ChatThreadId::from_bytes([11; 16]);
+    let entry = |seq, text: &str, dependency| {
+        let seq = ThreadEntrySeq::new(seq).unwrap();
+        let digest = ContentDigest::from_bytes(*blake3::hash(text.as_bytes()).as_bytes());
+        let proof = ChatProvenance {
+            origins: vec![dependency],
+            projects: vec![],
+            compacts_through: None,
+        };
+        let current = ProviderCurrentContent::Chat {
+            space: space.clone(),
+            thread: thread.clone(),
+            entry: seq,
+            digest,
+            project: None,
+            lifecycle: Lifecycle::Active,
+            tainted: false,
+            group_author: None,
+            provenance: Some(proof.clone()),
+        };
+        let content = CanonicalChatContent::from_canonical(
+            space.clone(),
+            thread.clone(),
+            seq,
+            false,
+            text.into(),
+            digest,
+            None,
+        )
+        .with_provenance(Some(proof));
+        (current, content)
+    };
+    let (model, _) = entry(1, "Earlier model", note.origin());
+    let (compaction, summary) = entry(2, "Current summary", model.origin());
+    setup
+        .egress
+        .current
+        .lock()
+        .unwrap()
+        .extend([model, compaction]);
+    let request = |key| {
+        let mut request = setup.completion(key);
+        request.messages[0].parts = vec![ProviderMessage::Chat(
+            ClassEgressFence::chat(summary.clone(), setup.ctx.auth(), &setup.selection.policy)
+                .unwrap(),
+        )];
+        request
+    };
+    assert!(
+        complete(&setup.provider, setup.space.clone(), request(31))
+            .await
+            .is_err()
+    );
+    setup.egress.dependencies.lock().unwrap().origins = vec![note.origin()];
+    assert!(
+        complete(&setup.provider, setup.space.clone(), request(32))
+            .await
+            .is_ok()
+    );
+}
+
 fn completion_reply(kind: ProviderWireKind, mode: u8) -> Reply {
     let input = if mode == 2 { 8193 } else { 7 };
     let output = if mode == 2 { 0 } else { 2 };
@@ -764,6 +874,9 @@ async fn gateway(pg: bool, kind: ProviderWireKind, label: &str) {
             .is_ok(),
         "budget_mismatch records audit spend without cross-user 60s DoS lockout"
     );
+    let before_history = requests.lock().unwrap().len();
+    compacted_history_dispatches_only_with_its_transitive_proof(&setup).await;
+    assert_eq!(requests.lock().unwrap().len(), before_history + 1);
     let query = |intent, class| {
         EmbeddingRequest::query(
             CommandKey::from_bytes([intent; 16]),
@@ -896,6 +1009,7 @@ async fn gateway(pg: bool, kind: ProviderWireKind, label: &str) {
                             name: None,
                         },
                         project_hint: None,
+                        guard: EpisodeRevisionGuard::Account,
                     },
                 },
             )
@@ -1162,6 +1276,7 @@ async fn gateway(pg: bool, kind: ProviderWireKind, label: &str) {
             ProjectInfo {
                 folder: project.clone(),
                 name: "Selected project".into(),
+                project_slug: "selected-project".into(),
             },
         );
     let space = setup
@@ -1170,16 +1285,19 @@ async fn gateway(pg: bool, kind: ProviderWireKind, label: &str) {
         .space(budget(), project.space_id.clone())
         .await
         .unwrap();
+    let nested = FolderId::from_bytes([18; 16]);
+    let inside_facts = ResourceFacts {
+        space: space.space,
+        class: DocClass::UserDoc,
+        project: Some(nested.clone()),
+        ancestor_folders: vec![nested.clone(), project.folder_id.clone()],
+        folder_write_locked: false,
+        ability_package: None,
+    };
     let inside = ClassifiedDocument::from_canonical(
         setup.document.reference().clone(),
         setup.document.revision().clone(),
-        ResourceFacts {
-            space: space.space,
-            class: DocClass::UserDoc,
-            ancestor_folders: vec![project.folder_id.clone()],
-            folder_write_locked: false,
-            ability_package: None,
-        },
+        inside_facts.clone(),
         Lifecycle::Active,
         setup
             .document
@@ -1189,18 +1307,48 @@ async fn gateway(pg: bool, kind: ProviderWireKind, label: &str) {
         setup.document.digest(),
     )
     .unwrap();
-    let mut scoped = setup.embedding(109, &inside);
-    scoped.project = Some(project.clone());
+    let scoped = |id| {
+        let mut request = setup.embedding(id, &inside);
+        request.project = Some(project.clone());
+        request
+    };
     let before = requests.lock().unwrap().len();
-    assert!(matches!(
-        setup.provider.embed(indexing.clone(), scoped).await,
-        Err(PortError::Domain(DomainError::AccessDenied))
-    ));
+    // A change to the nearest project invalidates the original disclosure witness.
+    let stale = setup.provider.embed(indexing.clone(), scoped(109)).await;
+    assert!(
+        matches!(&stale,
+            Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
+                if diagnostic.reason == ValidationReason::SourceMismatch
+        ),
+        "{stale:?}"
+    );
+
+    // Moving the whole nested project preserves its identity while its notes
+    // cease to belong to the selected outer project.
+    let mut moved = inside.metadata();
+    moved
+        .bind_current(
+            ResourceFacts {
+                ancestor_folders: vec![nested],
+                ..inside_facts
+            },
+            Lifecycle::Active,
+        )
+        .unwrap();
+    assert_eq!(inside.origin(), moved.origin());
+    assert!(inside.in_project(&project));
+    assert!(!moved.in_project(&project));
+    *setup.egress.current.lock().unwrap() = vec![ProviderCurrentContent::Note(moved)];
+    let outside = setup.provider.embed(indexing.clone(), scoped(130)).await;
+    assert!(
+        matches!(outside, Err(PortError::Domain(DomainError::AccessDenied))),
+        "{outside:?}"
+    );
     assert_eq!(requests.lock().unwrap().len(), before);
     *setup.egress.current.lock().unwrap() = vec![ProviderCurrentContent::Note(inside.metadata())];
-    let mut scoped = setup.embedding(110, &inside);
-    scoped.project = Some(project);
-    assert!(setup.provider.embed(indexing.clone(), scoped).await.is_ok());
+    let admitted = setup.provider.embed(indexing.clone(), scoped(110)).await;
+    assert!(admitted.is_ok(), "{admitted:?}");
+    assert_eq!(requests.lock().unwrap().len(), before + 1);
     *setup.egress.current.lock().unwrap() =
         vec![ProviderCurrentContent::Note(setup.document.metadata())];
     let count = requests.lock().unwrap().len();
@@ -1367,6 +1515,34 @@ async fn sqlite_ollama_gateway() {
 #[tokio::test]
 async fn postgres_ollama_gateway() {
     gateway(true, ProviderWireKind::Ollama, "dispatch_ollama").await;
+}
+
+#[tokio::test]
+async fn leases_run_preserves_unknown_commit_effect_on_revocation() {
+    let runtime = Runtime::new(budget());
+    let revoked = Cancellation::default();
+    revoked.cancel();
+    let mut leases = Leases {
+        canonical: Some(Box::new(EgressLease {
+            project_folders: BTreeSet::new(),
+            current: Vec::new(),
+            project: None,
+            secondary_projects: Vec::new(),
+            active: Arc::new(AtomicUsize::new(1)),
+            admitted: Arc::new(AtomicUsize::new(0)),
+            dispatched: false,
+            cancellation: revoked,
+        })),
+        registration: None,
+    };
+    let err = leases
+        .run(&runtime, async { Ok::<(), PortError>(()) })
+        .await
+        .expect_err("revoked canonical lease must reject");
+    assert!(
+        is_unknown_effect(&err),
+        "post-submit revocation must report CommitEffect::Unknown, got {err:?}"
+    );
 }
 
 #[path = "admission_tests.rs"]

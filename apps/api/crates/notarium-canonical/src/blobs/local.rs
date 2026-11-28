@@ -45,6 +45,7 @@ pub struct DeferredLocalStaging {
     raw_size: u64,
     compressed_frame: Arc<[u8]>,
     presynced: Option<Arc<Mutex<Option<PreparedLocalStagingEntry>>>>,
+    guard: Option<Arc<LocalSharedGuard>>,
 }
 
 impl std::fmt::Debug for DeferredLocalStaging {
@@ -64,6 +65,7 @@ impl DeferredLocalStaging {
         digest: ContentDigest,
         raw_size: u64,
         compressed_frame: Arc<[u8]>,
+        guard: Arc<LocalSharedGuard>,
     ) -> Self {
         Self {
             local,
@@ -72,6 +74,7 @@ impl DeferredLocalStaging {
             raw_size,
             compressed_frame,
             presynced: None,
+            guard: Some(guard),
         }
     }
 
@@ -82,6 +85,7 @@ impl DeferredLocalStaging {
         raw_size: u64,
         compressed_frame: Arc<[u8]>,
         entry: PreparedLocalStagingEntry,
+        guard: Arc<LocalSharedGuard>,
     ) -> Self {
         Self {
             local,
@@ -90,6 +94,7 @@ impl DeferredLocalStaging {
             raw_size,
             compressed_frame,
             presynced: Some(Arc::new(Mutex::new(Some(entry)))),
+            guard: Some(guard),
         }
     }
 
@@ -130,6 +135,7 @@ impl DeferredLocalStaging {
                 digest,
                 item_dirs,
                 temp_file,
+                _guard: item.guard,
             });
         }
         Ok(entries)
@@ -151,6 +157,7 @@ pub struct PreparedLocalStagingEntry {
     pub digest: ContentDigest,
     pub item_dirs: PendingDirSyncs,
     pub temp_file: Option<DeferredLocalTempFile>,
+    pub _guard: Option<Arc<LocalSharedGuard>>,
 }
 
 #[derive(Debug)]
@@ -630,6 +637,63 @@ impl LocalBlobStore {
         let lock = self.wait_for_digest_lock(space_id, digest).await;
         let guard = lock.write_owned().await;
         LocalExclusiveGuard { _guard: guard }
+    }
+
+    pub fn try_acquire_exclusive_guard(
+        &self,
+        space_id: &SpaceId,
+        digest: ContentDigest,
+    ) -> Option<LocalExclusiveGuard> {
+        let lock = {
+            let mut map = self.guard_shard(digest).try_lock().ok()?;
+            Self::digest_lock(&mut map, space_id, digest)
+        };
+        let guard = lock.try_write_owned().ok()?;
+        Some(LocalExclusiveGuard { _guard: guard })
+    }
+
+    /// Enumerates physical `.zst` blob digests present under `blobs/<space_id>/`
+    /// without following symlinks, for bounded overflow orphan reconciliation.
+    pub fn list_space_digests(&self, space_id: &SpaceId) -> Vec<ContentDigest> {
+        if !safe_component(space_id.as_str()) {
+            return Vec::new();
+        }
+        let space_rel = format!("blobs/{}", space_id.as_str());
+        let Ok(space_dir) = self.open_dir(&space_rel, false) else {
+            return Vec::new();
+        };
+        let Ok(shards) = space_dir.dir.entries() else {
+            return Vec::new();
+        };
+        let mut digests = Vec::new();
+        for shard_entry in shards.flatten() {
+            let Ok(shard_name) = shard_entry.file_name().into_string() else {
+                continue;
+            };
+            if shard_name.len() != 2 || !shard_name.bytes().all(|b| b.is_ascii_hexdigit()) {
+                continue;
+            }
+            let Ok(shard_dir) = space_dir.dir.open_dir_nofollow(&shard_name) else {
+                continue;
+            };
+            let Ok(files) = shard_dir.entries() else {
+                continue;
+            };
+            for file_entry in files.flatten() {
+                let Ok(file_name) = file_entry.file_name().into_string() else {
+                    continue;
+                };
+                let Some(hex) = file_name.strip_suffix(".zst") else {
+                    continue;
+                };
+                if hex.len() == 64
+                    && let Ok(digest) = ContentDigest::parse_hex(hex)
+                {
+                    digests.push(digest);
+                }
+            }
+        }
+        digests
     }
 
     pub fn has_physical_file(

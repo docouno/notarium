@@ -27,7 +27,16 @@ impl ControlService {
                         self.catalog_folder(ctx, folder).await.map(|_| ())
                     }
                     TelemetryResource::Space(space) => {
-                        self.catalog_space(ctx, space).await.map(|_| ())
+                        if ctx
+                            .auth()
+                            .spaces()
+                            .get(space)
+                            .is_none_or(|grant| grant.read_classes.is_empty())
+                        {
+                            Err(DomainError::ResourceNotFound.into())
+                        } else {
+                            self.catalog_space(ctx, space).await.map(|_| ())
+                        }
                     }
                 };
                 match permitted {
@@ -68,10 +77,22 @@ impl ControlService {
         ctx: AccountContext,
         call: RequestId,
     ) -> Result<AgentCallInfo, PortError> {
+        if matches!(
+            ctx.auth().kind(),
+            PrincipalKind::AgentRun(_) | PrincipalKind::Keeper(_)
+        ) || ctx.auth().is_space_narrowed()
+        {
+            return Err(access_denied());
+        }
+        require_unpinned_human(ctx.auth())?;
         let budget = OperationBudget::new(ctx.budget.clone());
         let (mut tx, auth) = self
             .open_revalidated_read(&budget, &ctx.budget.request, ctx.auth())
             .await?;
+        if auth.is_space_narrowed() {
+            let _ = budget.run(tx.finish(), CommitEffect::NotCommitted).await;
+            return Err(access_denied());
+        }
         let (current, row, record) = budget.run(async{
             let current=AccountContext::new(auth,budget.context(ctx.budget.request.clone()));
             let row=rows!(tx.inner_mut(),AgentCallsRow,fetch_optional,"SELECT * FROM agent_calls WHERE call_id=$1 AND owner_id=$2","SELECT * FROM v1_control.agent_calls WHERE call_id=$1 AND owner_id=$2";call.as_str(),current.auth().principal().as_str())?.ok_or(DomainError::ResourceNotFound)?;
@@ -91,10 +112,22 @@ impl ControlService {
         ctx: AccountContext,
         page: ControlPageRequest,
     ) -> Result<ControlPage<AgentCallInfo>, PortError> {
+        if matches!(
+            ctx.auth().kind(),
+            PrincipalKind::AgentRun(_) | PrincipalKind::Keeper(_)
+        ) || ctx.auth().is_space_narrowed()
+        {
+            return Err(access_denied());
+        }
+        require_unpinned_human(ctx.auth())?;
         let budget = OperationBudget::new(ctx.budget.clone());
         let (mut tx, auth) = self
             .open_revalidated_read(&budget, &ctx.budget.request, ctx.auth())
             .await?;
+        if auth.is_space_narrowed() {
+            let _ = budget.run(tx.finish(), CommitEffect::NotCommitted).await;
+            return Err(access_denied());
+        }
         let (current, scope, rows) = budget.run(async{
             let current=AccountContext::new(auth,budget.context(ctx.budget.request.clone()));
             let scope=digest(current.auth(),"agent-calls")?;

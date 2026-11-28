@@ -136,6 +136,13 @@ mod tests {
         bootstrap_sqlite_schema(&mut db, &installation)
             .await
             .unwrap();
+        sqlx::raw_sql(concat!(
+            include_str!("../../../tests/fixtures/schema-v6-remove-projection.sql"),
+            include_str!("../../../tests/fixtures/schema-v8-remove-agents.sql")
+        ))
+        .execute(&mut db)
+        .await
+        .unwrap();
         sqlx::query("UPDATE schema_meta SET schema_version=3,manifest_checksum=?1")
             .bind(hex::decode(V3_HASH).unwrap())
             .execute(&mut db)

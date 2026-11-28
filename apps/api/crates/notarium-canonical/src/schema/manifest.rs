@@ -2,7 +2,7 @@ use std::{collections::BTreeSet, sync::LazyLock};
 
 use notarium_core::ids::ContentDigest;
 
-pub const CANONICAL_SCHEMA_VERSION: u32 = 8;
+pub const CANONICAL_SCHEMA_VERSION: u32 = 10;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LogicalColKind {
@@ -72,7 +72,7 @@ pub const CANONICAL_TABLES: &[TableSpec] = &[
             col("created_at_sec", Int, false),
             col("created_at_nsec", Int, false),
         ],
-        indexes: &["uq_spaces_slug_fold"],
+        indexes: &["uq_spaces_slug_fold", "idx_spaces_personal_owner"],
     },
     TableSpec {
         name: "folder_heads",
@@ -105,6 +105,8 @@ pub const CANONICAL_TABLES: &[TableSpec] = &[
             "uq_folder_heads_active_project",
             "idx_folder_heads_parent_lifecycle",
             "idx_folder_heads_cover",
+            "idx_folder_heads_active_projects_id",
+            "idx_folder_heads_space_updated",
         ],
     },
     TableSpec {
@@ -126,6 +128,7 @@ pub const CANONICAL_TABLES: &[TableSpec] = &[
         indexes: &[
             "idx_folder_aliases_lookup",
             "idx_folder_aliases_projection_seq",
+            "idx_folder_aliases_parent_seq",
         ],
     },
     TableSpec {
@@ -159,6 +162,8 @@ pub const CANONICAL_TABLES: &[TableSpec] = &[
             "uq_note_heads_active_sibling",
             "idx_note_heads_parent_lifecycle",
             "idx_note_heads_created_seq",
+            "idx_note_heads_keyset",
+            "idx_note_heads_space_title_fold",
         ],
     },
     TableSpec {
@@ -250,7 +255,7 @@ pub const CANONICAL_TABLES: &[TableSpec] = &[
             col("created_at_sec", Int, false),
             col("created_at_nsec", Int, false),
         ],
-        indexes: &[],
+        indexes: &["idx_revision_purge_fences_seq"],
     },
     TableSpec {
         name: "ability_packages",
@@ -268,8 +273,10 @@ pub const CANONICAL_TABLES: &[TableSpec] = &[
             col("updated_seq", Int, false),
         ],
         indexes: &[
-            "uq_ability_packages_active_slug",
+            "idx_ability_packages_active_slug",
             "idx_ability_packages_entrypoint",
+            "idx_ability_packages_keyset",
+            "idx_ability_packages_space_kind",
         ],
     },
     TableSpec {
@@ -490,6 +497,7 @@ pub const CANONICAL_TABLES: &[TableSpec] = &[
         indexes: &[
             "idx_command_receipts_expires",
             "idx_receipt_exception_pointer",
+            "idx_command_receipts_seq",
         ],
     },
     TableSpec {
@@ -619,8 +627,15 @@ pub const CANONICAL_TABLES: &[TableSpec] = &[
             col("created_at_nsec", Int, false),
             col("updated_at_sec", Int, false),
             col("updated_at_nsec", Int, false),
+            col("active_run_epoch", Int, true),
+            col("active_run_generation", Text, true),
+            col("redaction_epoch", Int, false),
         ],
-        indexes: &["idx_chat_threads_created_seq"],
+        indexes: &[
+            "idx_chat_threads_created_seq",
+            "idx_chat_threads_keyset",
+            "idx_chat_threads_active_run",
+        ],
     },
     TableSpec {
         name: "chat_entries",
@@ -646,10 +661,14 @@ pub const CANONICAL_TABLES: &[TableSpec] = &[
             col("created_space_seq", Int, false),
             col("redacted_at_seq", Int, true),
             col("checkpoint_stale", Int, false),
+            col("human_origin", Int, true),
+            col("body_format", Int, false),
+            col("provenance_json", Text, true),
         ],
         indexes: &[
             "idx_chat_entries_parent",
             "idx_chat_entries_compaction",
+            "idx_chat_entries_tainted",
             "idx_chat_entries_projection",
             "idx_chat_entries_created_change",
             "idx_chat_entries_redacted_change",
@@ -694,6 +713,7 @@ pub const CANONICAL_TABLES: &[TableSpec] = &[
         indexes: &[
             "uq_chat_pending_inputs_ordinal",
             "idx_chat_pending_inputs_active",
+            "idx_chat_pending_inputs_consumed",
         ],
     },
     TableSpec {
@@ -788,7 +808,7 @@ pub const CANONICAL_TABLES: &[TableSpec] = &[
             col("created_at_ms", Int, false),
             col("updated_at_ms", Int, false),
         ],
-        indexes: &["idx_pending_purges_phase"],
+        indexes: &["idx_pending_purges_phase", "idx_pending_purges_successor"],
     },
     TableSpec {
         name: "account_catalog_receipts",

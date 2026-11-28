@@ -5,7 +5,7 @@ pub mod s3;
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     io::{Cursor, Read},
-    sync::Arc,
+    sync::{Arc, atomic::Ordering},
     time::Duration,
 };
 
@@ -164,8 +164,11 @@ impl PreparedBlobSource {
     }
 
     pub fn prepare(raw: &[u8], codec: BlobCodecTag) -> Result<Self, PortError> {
-        let digest = ContentDigest::from_bytes(*blake3::hash(raw).as_bytes());
         let raw_size = raw.len() as u64;
+        if raw_size > MAX_BLOB_DECODE_BYTES {
+            return Err(DomainError::validation(ValidationReason::InvalidRange).into());
+        }
+        let digest = ContentDigest::from_bytes(*blake3::hash(raw).as_bytes());
 
         match codec {
             BlobCodecTag::LocalZstdV1 => {
@@ -260,6 +263,9 @@ pub fn encode_zstd_level3(raw: &[u8]) -> Result<Vec<u8>, PortError> {
     })
 }
 
+/// Hard upper bound on any single decompressed canonical blob payload (64 MiB).
+pub const MAX_BLOB_DECODE_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Bounded Zstd decompression + exact raw length + full BLAKE3 integrity check.
 pub fn decode_zstd_verified(
     compressed: &[u8],
@@ -267,6 +273,12 @@ pub fn decode_zstd_verified(
     expected_raw_size: u64,
     expected_blake3: ContentDigest,
 ) -> Result<Vec<u8>, PortError> {
+    if expected_raw_size > MAX_BLOB_DECODE_BYTES {
+        return Err(internal_not_committed(
+            "blob_decode_limit_exceeded",
+            format!("raw_size {expected_raw_size} exceeds decode cap {MAX_BLOB_DECODE_BYTES}"),
+        ));
+    }
     if let Some(exp_comp) = expected_compressed_size
         && compressed.len() as u64 != exp_comp
     {
@@ -646,9 +658,197 @@ impl crate::CanonicalStore {
         }
     }
 
+    /// Schedules synchronized orphan local CAS cleanup asynchronously on `backup_executor`
+    /// so callers on `WriteBatchActor` or auxiliary writer paths NEVER block awaiting
+    /// `LocalExclusiveGuard` while holding `writer.lock()`, `live_visibility`, `commit_gate`,
+    /// or `ActiveCanonicalEffect`, or while sibling commands holding `LocalSharedGuard` wait
+    /// in `WriteBatchActor`'s mailbox.
+    pub(crate) fn schedule_unretained_local_files_cleanup(
+        &self,
+        to_cleanup: Vec<(SpaceId, ContentDigest)>,
+    ) {
+        if to_cleanup.is_empty() {
+            return;
+        }
+        if !matches!(self.inner.blobs, BlobBackendDriver::Local(_)) {
+            return;
+        }
+        let store = self.clone();
+        if let Ok(mut tasks) = self.inner.backup_cleanups.lock() {
+            if self.inner.backup_cleanups_closed.load(Ordering::SeqCst) {
+                return;
+            }
+            tasks.retain(|t| !t.is_finished());
+            let handle = self.inner.backup_executor.spawn(async move {
+                store.cleanup_unretained_local_files_async(to_cleanup).await;
+            });
+            tasks.push(handle);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn drain_scheduled_cleanups_for_test(&self) {
+        loop {
+            let pending = {
+                let mut tasks = self
+                    .inner
+                    .backup_cleanups
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                std::mem::take(&mut *tasks)
+            };
+            if pending.is_empty() {
+                break;
+            }
+            for task in pending {
+                let _ = task.await;
+            }
+        }
+    }
+
+    /// Synchronized cleanup for local CAS `.zst` files that were newly renamed into `blobs/`
+    /// by a command or batch whose SQL transaction aborted/rolled back (or had an unknown commit
+    /// outcome). Callers MUST have dropped all their own `StagedBlobTicket`s (`LocalSharedGuard`s)
+    /// and finalized (rolled back or committed) their SQL transaction BEFORE calling this method.
+    /// Acquires `LocalExclusiveGuard` per `(space_id, digest)` and verifies zero backup holds,
+    /// zero live `blob_references`, and no `blob_catalog` row before deleting the physical file.
     pub(crate) async fn cleanup_unretained_local_files_async(
         &self,
         to_cleanup: Vec<(SpaceId, ContentDigest)>,
+    ) {
+        self.cleanup_unretained_local_files_inner(to_cleanup, false)
+            .await;
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn schedule_unretained_local_files_cleanup_for_test(
+        &self,
+        to_cleanup: Vec<(SpaceId, ContentDigest)>,
+    ) {
+        self.schedule_unretained_local_files_cleanup(to_cleanup);
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn deferred_local_orphan_count_for_test(&self) -> usize {
+        self.inner
+            .deferred_local_orphan_cleanups
+            .lock()
+            .expect("deferred local orphan cleanups mutex")
+            .items
+            .len()
+    }
+
+    pub(crate) async fn sweep_deferred_local_orphans_async(&self, wait_for_lock: bool) {
+        let BlobBackendDriver::Local(local) = &self.inner.blobs else {
+            return;
+        };
+        let (items, overflow_spaces) = {
+            let mut deferred = self
+                .inner
+                .deferred_local_orphan_cleanups
+                .lock()
+                .expect("deferred local orphan cleanups mutex");
+            deferred.release_gen = deferred.release_gen.wrapping_add(1);
+            let items: Vec<_> = std::mem::take(&mut deferred.items).into_iter().collect();
+            let overflow_spaces: Vec<_> = std::mem::take(&mut deferred.overflow_spaces)
+                .into_iter()
+                .collect();
+            (items, overflow_spaces)
+        };
+        if !items.is_empty() {
+            self.cleanup_unretained_local_files_inner(items, wait_for_lock)
+                .await;
+        }
+        for space_id in overflow_spaces {
+            let local_cl = Arc::clone(local);
+            let space_enum = space_id.clone();
+            let digests =
+                tokio::task::spawn_blocking(move || local_cl.list_space_digests(&space_enum))
+                    .await
+                    .unwrap_or_default();
+            if !digests.is_empty() {
+                let mut candidates = Vec::new();
+                for chunk in digests.chunks(512) {
+                    let uncataloged = self
+                        .filter_uncataloged_digests_async(&space_id, chunk)
+                        .await;
+                    for digest in uncataloged {
+                        candidates.push((space_id.clone(), digest));
+                    }
+                }
+                if !candidates.is_empty() {
+                    self.cleanup_unretained_local_files_inner(candidates, wait_for_lock)
+                        .await;
+                }
+            }
+        }
+    }
+
+    async fn filter_uncataloged_digests_async(
+        &self,
+        space_id: &SpaceId,
+        chunk: &[ContentDigest],
+    ) -> Vec<ContentDigest> {
+        let space_chk = space_id.clone();
+        let raw_digests: Vec<Vec<u8>> = chunk.iter().map(|d| d.as_bytes().to_vec()).collect();
+        let cataloged_set: Result<HashSet<[u8; 32]>, PortError> = self
+            .with_read_tx_during_shutdown(|tx| {
+                Box::pin(async move {
+                    let mut present = HashSet::new();
+                    match tx {
+                        BackendConn::Sqlite(conn) => {
+                            let hex_list: Vec<String> =
+                                raw_digests.iter().map(hex::encode).collect();
+                            let encoded = serde_json::to_string(&hex_list).map_err(|err| {
+                                internal_not_committed(
+                                    "sqlite_encode_orphan_batch",
+                                    err.to_string(),
+                                )
+                            })?;
+                            let rows: Vec<Vec<u8>> = sqlx::query_scalar(
+                                "SELECT content_blake3 FROM blob_catalog
+                                 WHERE space_id = ?1
+                                   AND blob_state <> 'retired'
+                                   AND content_blake3 IN (SELECT unhex(value) FROM json_each(?2))",
+                            )
+                            .bind(space_chk.as_str())
+                            .bind(encoded)
+                            .fetch_all(&mut **conn)
+                            .await
+                            .map_err(|err| {
+                                internal_not_committed(
+                                    "sqlite_batch_orphan_catalog",
+                                    err.to_string(),
+                                )
+                            })?;
+                            for bytes in rows {
+                                if let Ok(arr) = <[u8; 32]>::try_from(bytes.as_slice()) {
+                                    present.insert(arr);
+                                }
+                            }
+                        }
+                        BackendConn::Postgres(_) => {
+                            unreachable!("local orphan sweep requires LocalSqlite profile");
+                        }
+                    }
+                    Ok(present)
+                })
+            })
+            .await;
+        match cataloged_set {
+            Ok(present) => chunk
+                .iter()
+                .copied()
+                .filter(|d| !present.contains(d.as_bytes()))
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    async fn cleanup_unretained_local_files_inner(
+        &self,
+        to_cleanup: Vec<(SpaceId, ContentDigest)>,
+        wait_for_lock: bool,
     ) {
         if to_cleanup.is_empty() {
             return;
@@ -656,13 +856,118 @@ impl crate::CanonicalStore {
         let BlobBackendDriver::Local(local) = &self.inner.blobs else {
             return;
         };
-        let local_cl = Arc::clone(local);
-        let _ = tokio::task::spawn_blocking(move || {
-            for (space_id, digest) in to_cleanup {
-                let _ = local_cl.delete_physical_file(&space_id, digest);
+        let mut seen: HashSet<(SpaceId, ContentDigest)> = HashSet::with_capacity(to_cleanup.len());
+        for (space_id, digest) in to_cleanup {
+            if !seen.insert((space_id.clone(), digest)) {
+                continue;
             }
-        })
-        .await;
+            let guard = if wait_for_lock {
+                local.acquire_exclusive_guard(&space_id, digest).await
+            } else {
+                let Some(guard) = local.try_acquire_exclusive_guard(&space_id, digest) else {
+                    // Retain the candidate when a concurrent shared guard or shard lock is
+                    // momentarily held so a later sweep or shutdown can still reconcile it.
+                    let mut deferred = self
+                        .inner
+                        .deferred_local_orphan_cleanups
+                        .lock()
+                        .expect("deferred local orphan cleanups mutex");
+                    if deferred.items.len() < 4096 {
+                        deferred.items.insert((space_id.clone(), digest));
+                    } else {
+                        deferred.overflow_spaces.insert(space_id.clone());
+                    }
+                    continue;
+                };
+                guard
+            };
+            enum OrphanOutcome {
+                Delete,
+                Keep,
+                HoldActive,
+            }
+            let mut guard_opt = Some(guard);
+            for attempt in 0..4 {
+                let gen_before = self
+                    .inner
+                    .deferred_local_orphan_cleanups
+                    .lock()
+                    .expect("deferred local orphan cleanups mutex")
+                    .release_gen;
+                let space_chk = space_id.clone();
+                let outcome = self
+                    .with_read_tx_during_shutdown(|tx| {
+                        Box::pin(async move {
+                            let hold_active = has_backup_holds_tx(tx, &space_chk).await?;
+                            ensure_zero_reachable_refs_tx(tx, &space_chk, digest).await?;
+                            let cataloged: Option<i64> = match tx {
+                                BackendConn::Sqlite(conn) => sqlx::query_scalar(
+                                    "SELECT 1 FROM blob_catalog WHERE space_id = ? AND content_blake3 = ? AND blob_state <> 'retired' LIMIT 1",
+                                )
+                                .bind(space_chk.as_str())
+                                .bind(digest.as_bytes().as_slice())
+                                .fetch_optional(&mut **conn)
+                                .await
+                                .map_err(|err| {
+                                    internal_not_committed("sqlite_check_orphan_catalog", err.to_string())
+                                })?,
+                                BackendConn::Postgres(_) => {
+                                    return Err(internal_not_committed(
+                                        "local_cas_on_postgres",
+                                        "local CAS cleanup is unsupported on PostgreSQL",
+                                    ));
+                                }
+                            };
+                            Ok(if cataloged.is_some() {
+                                OrphanOutcome::Keep
+                            } else if hold_active {
+                                OrphanOutcome::HoldActive
+                            } else {
+                                OrphanOutcome::Delete
+                            })
+                        })
+                    })
+                    .await
+                    .unwrap_or(OrphanOutcome::Keep);
+                match outcome {
+                    OrphanOutcome::Delete => {
+                        let local_cl = Arc::clone(local);
+                        let space_del = space_id.clone();
+                        let guard = guard_opt.take().expect("exclusive guard held");
+                        let _ = tokio::task::spawn_blocking(move || {
+                            let _guard = guard;
+                            let _ = local_cl.delete_physical_file(&space_del, digest);
+                        })
+                        .await;
+                        break;
+                    }
+                    OrphanOutcome::HoldActive => {
+                        let retry_now = {
+                            let mut deferred = self
+                                .inner
+                                .deferred_local_orphan_cleanups
+                                .lock()
+                                .expect("deferred local orphan cleanups mutex");
+                            if deferred.release_gen != gen_before && attempt < 3 {
+                                true
+                            } else {
+                                if deferred.items.len() < 4096 {
+                                    deferred.items.insert((space_id.clone(), digest));
+                                } else {
+                                    deferred.overflow_spaces.insert(space_id.clone());
+                                }
+                                false
+                            }
+                        };
+                        if retry_now {
+                            continue;
+                        }
+                        break;
+                    }
+                    OrphanOutcome::Keep => break,
+                }
+            }
+        }
     }
 
     /// Wave A0 + A1: materializes unique `.staging/*.part` files and flushes `fdatasync` / `F_FULLFSYNC`
@@ -801,13 +1106,22 @@ impl crate::CanonicalStore {
 
     /// Wave A2: atomically renames ONLY `.staging/*.part` files whose `(space_id, digest)` succeeded
     /// in SQL Stage 1 (`retained_keys`) into `blobs/`, dropping and unlinking any rolled-back items.
+    /// Appends every `(space_id, digest)` newly renamed into `blobs/` to `published_out` (including
+    /// partial renames before an I/O error) so callers can run `cleanup_unretained_local_files_async`
+    /// AFTER SQL rollback and AFTER dropping their `StagedBlobTicket`s.
     pub(crate) async fn rename_synced_local_entries_async(
         &self,
         synced_entries: Vec<PreparedLocalStagingEntry>,
         retained_keys: &HashSet<(String, ContentDigest)>,
+        published_out: &mut Vec<(SpaceId, ContentDigest)>,
     ) -> Result<PendingDirSyncs, PortError> {
         let mut extra_dirs = PendingDirSyncs::default();
-        let mut to_rename = Vec::with_capacity(synced_entries.len());
+        let mut to_rename: Vec<(
+            SpaceId,
+            ContentDigest,
+            local::DeferredLocalTempFile,
+            Option<Arc<local::LocalSharedGuard>>,
+        )> = Vec::with_capacity(synced_entries.len());
         let mut to_unlink = Vec::new();
         let mut seen_renamed: HashSet<(String, ContentDigest)> =
             HashSet::with_capacity(synced_entries.len());
@@ -818,7 +1132,7 @@ impl crate::CanonicalStore {
                 extra_dirs.merge(&entry.item_dirs);
                 if let Some(tf) = entry.temp_file {
                     if seen_renamed.insert(key) {
-                        to_rename.push(tf);
+                        to_rename.push((entry.space_id, entry.digest, tf, entry._guard));
                     } else {
                         to_unlink.push(tf);
                     }
@@ -837,16 +1151,24 @@ impl crate::CanonicalStore {
         }
         if to_rename.len() <= 8 {
             if !to_rename.is_empty() {
-                tokio::task::spawn_blocking(move || -> Result<(), PortError> {
-                    for tf in to_rename {
-                        tf.rename_into_place()?;
+                let (published, err) = tokio::task::spawn_blocking(move || {
+                    let mut done = Vec::with_capacity(to_rename.len());
+                    for (space_id, digest, tf, _guard) in to_rename {
+                        if let Err(e) = tf.rename_into_place() {
+                            return (done, Some(e));
+                        }
+                        done.push((space_id, digest));
                     }
-                    Ok(())
+                    (done, None)
                 })
                 .await
                 .map_err(|err| {
                     internal_not_committed("local_cas_rename_batch_join", err.to_string())
-                })??;
+                })?;
+                published_out.extend(published);
+                if let Some(err) = err {
+                    return Err(err);
+                }
             }
         } else {
             let chunk_size = to_rename.len().div_ceil(16);
@@ -857,18 +1179,23 @@ impl crate::CanonicalStore {
                 if chunk.is_empty() {
                     break;
                 }
-                ren_set.spawn_blocking(move || -> Result<(), PortError> {
-                    for tf in chunk {
-                        tf.rename_into_place()?;
+                ren_set.spawn_blocking(move || {
+                    let mut done = Vec::with_capacity(chunk.len());
+                    for (space_id, digest, tf, _guard) in chunk {
+                        if let Err(e) = tf.rename_into_place() {
+                            return (done, Some(e));
+                        }
+                        done.push((space_id, digest));
                     }
-                    Ok(())
+                    (done, None)
                 });
             }
             let mut first_err: Option<PortError> = None;
             while let Some(res) = ren_set.join_next().await {
                 match res {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => {
+                    Ok((done, None)) => published_out.extend(done),
+                    Ok((done, Some(e))) => {
+                        published_out.extend(done);
                         if first_err.is_none() {
                             first_err = Some(e);
                         }
@@ -895,6 +1222,7 @@ impl crate::CanonicalStore {
     pub(crate) async fn publish_deferred_local_tickets_async(
         &self,
         tickets: &[StagedBlobTicket],
+        published_out: &mut Vec<(SpaceId, ContentDigest)>,
     ) -> Result<PendingDirSyncs, PortError> {
         let mut pending_stagings = Vec::new();
         let mut retained_keys = HashSet::with_capacity(tickets.len());
@@ -912,7 +1240,7 @@ impl crate::CanonicalStore {
         let synced = self
             .prepare_and_sync_local_stagings_async(pending_stagings)
             .await?;
-        self.rename_synced_local_entries_async(synced, &retained_keys)
+        self.rename_synced_local_entries_async(synced, &retained_keys, published_out)
             .await
     }
 
@@ -1016,6 +1344,127 @@ impl crate::CanonicalStore {
         }
     }
 
+    /// Stages multiple prepared CAS payloads for execution inside `WriteBatchActor` in canonical
+    /// sorted, deduplicated `ContentDigest` order so multi-blob batches (`accept_batch`,
+    /// `publish_ability_package`) never acquire `LocalSharedGuard` re-entrantly or out-of-order.
+    pub(crate) async fn stage_blobs_for_batch_sorted(
+        &self,
+        scope: &HistoryScope,
+        active_epoch: LeaseEpoch,
+        prepared_items: &[&PreparedBlobSource],
+    ) -> Result<HashMap<ContentDigest, StagedBlobTicket>, PortError> {
+        self.inner
+            .check_writer_epoch(&scope.space_id, active_epoch)?;
+        if prepared_items.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut unique: Vec<&PreparedBlobSource> = Vec::with_capacity(prepared_items.len());
+        let mut seen: HashSet<ContentDigest> = HashSet::with_capacity(prepared_items.len());
+        for &item in prepared_items {
+            if item.codec != self.blob_codec() {
+                return Err(internal_not_committed(
+                    "blob_codec_mismatch",
+                    "PreparedBlobSource codec does not match store backend",
+                ));
+            }
+            if seen.insert(item.digest) {
+                unique.push(item);
+            }
+        }
+        unique.sort_unstable_by_key(|item| item.digest);
+
+        match &self.inner.blobs {
+            BlobBackendDriver::Local(local) => {
+                let digests: Vec<ContentDigest> = unique.iter().map(|p| p.digest).collect();
+                let guards = local
+                    .acquire_shared_guards_sorted(&scope.space_id, &digests)
+                    .await;
+                let scope_cl = scope.clone();
+                let digests_cl = digests.clone();
+                let existing_pubs: HashMap<ContentDigest, String> = self
+                    .with_read_tx(|tx| {
+                        Box::pin(async move {
+                            let space_rec = load_space_record(tx, &scope_cl.space_id).await?;
+                            space_rec.scope.check(&scope_cl)?;
+                            if space_rec.active_epoch != active_epoch {
+                                return Err(DomainError::validation(
+                                    ValidationReason::InvalidAuthority,
+                                )
+                                .into());
+                            }
+                            let mut pubs = HashMap::new();
+                            for digest in digests_cl {
+                                if let Some(pub_id) =
+                                    check_local_catalog_open_read_tx(tx, &scope_cl.space_id, digest)
+                                        .await?
+                                {
+                                    pubs.insert(digest, pub_id);
+                                }
+                            }
+                            Ok(pubs)
+                        })
+                    })
+                    .await?;
+
+                let mut out = HashMap::with_capacity(unique.len());
+                for item in unique {
+                    let guard = guards.get(&item.digest).cloned().ok_or_else(|| {
+                        internal_not_committed("missing_sorted_guard", "digest guard missing")
+                    })?;
+                    let frame = Arc::clone(item.local_frame.as_ref().ok_or_else(|| {
+                        internal_not_committed("missing_local_frame", "local frame not prepared")
+                    })?);
+                    let deferred = DeferredLocalStaging::new(
+                        Arc::clone(local),
+                        scope.space_id.clone(),
+                        item.digest,
+                        item.raw_size,
+                        frame,
+                        Arc::clone(&guard),
+                    );
+                    let pub_id = match existing_pubs.get(&item.digest) {
+                        Some(id) => id.clone(),
+                        None => new_prefixed_hex_id("pub_")?,
+                    };
+                    out.insert(
+                        item.digest,
+                        StagedBlobTicket {
+                            space_id: scope.space_id.clone(),
+                            incarnation: scope.incarnation,
+                            epoch: active_epoch,
+                            digest: item.digest,
+                            raw_size: item.raw_size,
+                            compressed_size: item.total_compressed_size,
+                            publication_id: pub_id,
+                            codec: BlobCodecTag::LocalZstdV1,
+                            discard: None,
+                            local_pending_dirs: PendingDirSyncs::default(),
+                            _local_guard: Some(guard),
+                            deferred_local_key: Some((
+                                scope.space_id.as_str().to_owned(),
+                                item.digest,
+                            )),
+                            deferred_local_publish: Some(Arc::new(std::sync::Mutex::new(Some(
+                                deferred,
+                            )))),
+                        },
+                    );
+                }
+                Ok(out)
+            }
+            BlobBackendDriver::S3(s3) => {
+                let mut out = HashMap::with_capacity(unique.len());
+                for item in unique {
+                    let ticket = self
+                        .stage_owned_s3_blob(s3, scope, active_epoch, item)
+                        .await?;
+                    out.insert(item.digest, ticket);
+                }
+                Ok(out)
+            }
+        }
+    }
+
     /// Stages a prepared CAS payload for execution inside `WriteBatchActor`, deferring local
     /// `fdatasync` + atomic `rename` to the batch's coalesced Wave A before directory `fsync` and SQL `COMMIT`.
     pub(crate) async fn stage_blob_for_batch(
@@ -1089,7 +1538,9 @@ impl crate::CanonicalStore {
                             digest,
                             item_dirs,
                             temp_file,
+                            _guard: Some(Arc::clone(&guard)),
                         },
+                        Arc::clone(&guard),
                     )
                 } else {
                     DeferredLocalStaging::new(
@@ -1098,6 +1549,7 @@ impl crate::CanonicalStore {
                         digest,
                         raw_size,
                         frame,
+                        Arc::clone(&guard),
                     )
                 };
 
@@ -1187,7 +1639,9 @@ impl crate::CanonicalStore {
                             digest,
                             item_dirs,
                             temp_file,
+                            _guard: Some(Arc::clone(&guard)),
                         },
+                        Arc::clone(&guard),
                     )
                 } else {
                     DeferredLocalStaging::new(
@@ -1196,6 +1650,7 @@ impl crate::CanonicalStore {
                         digest,
                         raw_size,
                         frame,
+                        Arc::clone(&guard),
                     )
                 };
 
@@ -1387,7 +1842,7 @@ impl crate::CanonicalStore {
         // Step 1: Under Space lock + active_epoch, either reuse an Active publication OR durably
         // register the Staging publication and ALL part keys BEFORE sending any HTTP PUT!
         let registration = self
-            .with_write_tx(|tx| {
+            .with_write_tx_for_space(Some(scope.space_id.clone()), |tx| {
                 Box::pin(async move {
                     lock_and_check_space_tx(tx, &scope_cl, active_epoch).await?;
                     let registration = register_s3_staging_or_reuse_tx(
@@ -1440,7 +1895,7 @@ impl crate::CanonicalStore {
             let pub_part = pub_id.clone();
             let part_idx = part.part_index;
             let digest = prepared.digest;
-            self.with_write_tx(|tx| {
+            self.with_write_tx_for_space(Some(scope.space_id.clone()), |tx| {
                 Box::pin(async move {
                     lock_and_check_space_tx(tx, &scope_part, active_epoch).await?;
                     confirm_s3_part_uploaded_tx(
@@ -1491,6 +1946,18 @@ impl crate::CanonicalStore {
         digest: ContentDigest,
         budget: Option<&CallBudget>,
     ) -> Result<Vec<u8>, PortError> {
+        self.read_verified_blob_bounded(scope, digest, budget, MAX_BLOB_DECODE_BYTES)
+            .await
+    }
+
+    pub(crate) async fn read_verified_blob_bounded(
+        &self,
+        scope: &HistoryScope,
+        digest: ContentDigest,
+        budget: Option<&CallBudget>,
+        max_raw_bytes: u64,
+    ) -> Result<Vec<u8>, PortError> {
+        let cap = max_raw_bytes.min(MAX_BLOB_DECODE_BYTES);
         match &self.inner.blobs {
             BlobBackendDriver::Local(local) => {
                 let started = tokio::time::Instant::now();
@@ -1509,6 +1976,9 @@ impl crate::CanonicalStore {
                         })
                     })
                     .await?;
+                if meta.raw_size > cap {
+                    return Err(DomainError::validation(ValidationReason::BudgetExceeded).into());
+                }
                 FastLocalBlobReadPlan::new(
                     Arc::clone(local),
                     scope.space_id.clone(),
@@ -1528,6 +1998,12 @@ impl crate::CanonicalStore {
                             space_rec.scope.check(&scope_cl)?;
                             let meta =
                                 load_active_blob_meta_tx(tx, &scope_cl.space_id, digest).await?;
+                            if meta.raw_size > cap {
+                                return Err(DomainError::validation(
+                                    ValidationReason::BudgetExceeded,
+                                )
+                                .into());
+                            }
                             let pub_id = meta.publication_id.clone().ok_or_else(|| {
                                 internal_not_committed(
                                     "missing_s3_publication_id",
@@ -1588,7 +2064,7 @@ impl crate::CanonicalStore {
         let worker = self.clone();
         let (notify, attempted) = tokio::sync::oneshot::channel();
         let (planned_retirements, handoff) = self
-            .with_write_tx(|tx| {
+            .with_write_tx_for_space(Some(scope.space_id.clone()), |tx| {
                 let scope_in = scope_cl.clone();
                 let digests_in = digests_vec.clone();
                 let purge_in = purge_opt.clone();
@@ -1654,7 +2130,7 @@ impl crate::CanonicalStore {
         let scope_cl = scope.clone();
         let ret_cl = retirement_id.to_owned();
         let (reason, targets) = self
-            .with_write_tx(|tx| {
+            .with_write_tx_for_space(Some(scope.space_id.clone()), |tx| {
                 let scope_in = scope_cl.clone();
                 let ret_in = ret_cl.clone();
                 Box::pin(async move {
@@ -1748,7 +2224,7 @@ impl crate::CanonicalStore {
                     let ret_done = retirement_id.to_owned();
                     let pub_done = target.publication_id.clone();
                     let part_idx = target.part_index;
-                    self.with_write_tx(|tx| {
+                    self.with_write_tx_for_space(Some(scope.space_id.clone()), |tx| {
                         Box::pin(async move {
                             lock_and_check_space_tx(tx, &scope_done, active_epoch).await?;
                             mark_retirement_target_completed_tx(
@@ -1788,7 +2264,7 @@ impl crate::CanonicalStore {
                     // publication had already been retired. Accept only that proven empty case.
                     let scope_done = scope.clone();
                     let ret_done = retirement_id.to_owned();
-                    self.with_write_tx(|tx| Box::pin(async move {
+                    self.with_write_tx_for_space(Some(scope.space_id.clone()), |tx| Box::pin(async move {
                         lock_and_check_space_tx(tx, &scope_done, active_epoch).await?;
                         const OWNERS: &str = "SELECT COUNT(*), COUNT(*) FILTER (WHERE codec <> 's3_chunked_v1' OR state <> 'retired')
                             FROM blob_publications WHERE space_id = $1 AND content_blake3 = $2";
@@ -1813,7 +2289,7 @@ impl crate::CanonicalStore {
 
         let scope_fin = scope.clone();
         let ret_fin = retirement_id.to_owned();
-        self.with_write_tx(|tx| {
+        self.with_write_tx_for_space(Some(scope.space_id.clone()), |tx| {
             Box::pin(async move {
                 lock_and_check_space_tx(tx, &scope_fin, active_epoch).await?;
                 finalize_retirement_tx(tx, &scope_fin.space_id, &ret_fin).await
@@ -1889,10 +2365,10 @@ pub(crate) fn held_retirement() -> PortError {
     )
 }
 
-pub(crate) async fn ensure_no_backup_holds_tx(
+pub(crate) async fn has_backup_holds_tx(
     tx: &mut BackendConn<'_>,
     space_id: &SpaceId,
-) -> Result<(), PortError> {
+) -> Result<bool, PortError> {
     let held: Option<i64> = match tx {
         BackendConn::Sqlite(conn) => {
             sqlx::query_scalar("SELECT 1 FROM backup_holds WHERE space_id = ? LIMIT 1")
@@ -1911,7 +2387,14 @@ pub(crate) async fn ensure_no_backup_holds_tx(
                 .map_err(|err| crate::runtime::pg_read_error("pg_check_backup_holds", err))?
         }
     };
-    if held.is_some() {
+    Ok(held.is_some())
+}
+
+pub(crate) async fn ensure_no_backup_holds_tx(
+    tx: &mut BackendConn<'_>,
+    space_id: &SpaceId,
+) -> Result<(), PortError> {
+    if has_backup_holds_tx(tx, space_id).await? {
         return Err(held_retirement());
     }
     Ok(())
@@ -3338,7 +3821,7 @@ async fn promote_s3_staging_to_active_tx(
     Ok(())
 }
 
-async fn load_active_blob_meta_tx(
+pub(crate) async fn load_active_blob_meta_tx(
     tx: &mut BackendConn<'_>,
     space_id: &SpaceId,
     digest: ContentDigest,

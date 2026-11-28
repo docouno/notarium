@@ -1,0 +1,1286 @@
+//! Account addressing and lossless session bootstrap delivery.
+mod address;
+mod delta;
+
+use super::{EgressTarget, ToolCallContext, ToolName, ability_tools, corpus, decode, invalid};
+use address::visible_projects;
+pub(super) use address::{
+    project_for_folder, readable_space, readable_spaces, resolve_project,
+    resolve_project_for_direct_write, resolve_project_in_space, resolve_space, space,
+};
+pub(super) use delta::BootstrapContinuations;
+
+use notarium_core::{
+    DomainError,
+    auth::{PrincipalKind, SpaceKind, SpaceRole},
+    classes::{ClassEgressFence, DocClass, ProviderCurrentContent},
+    error::{PortError, ValidationReason},
+    ids::{ControlRevision, EpisodeId},
+    model::{FolderRef, NoteRef},
+    ports::{
+        AccountMutation, AckOwner, AgentEpisode, BearerScope, CatalogDisclosure,
+        ControlPageRequest, EpisodeDiagnostic, EpisodeRevisionGuard, EpisodeSelector,
+        EpisodeStartResult, GetNote, MAX_PROJECT_BOOTSTRAP_VALUES, NamedEpisodePreview,
+        NoteMetadataSnapshot, NoteSnapshot, PageLimit, ProviderErrorCode, SpaceContext,
+        StartEpisode,
+    },
+    receipt::CausalBasis,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReadArgs {
+    session: Option<EpisodeId>,
+}
+
+#[derive(Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Format {
+    #[default]
+    Concise,
+    Detailed,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StartArgs {
+    project: Option<String>,
+    role: Option<String>,
+    task: Option<String>,
+    session: Option<SessionLocator>,
+    continuation: Option<String>,
+    delivery_receipt: Option<String>,
+    #[serde(default = "acknowledge_by_default")]
+    acknowledge: bool,
+    #[serde(default)]
+    response_format: Format,
+}
+
+fn acknowledge_by_default() -> bool {
+    true
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionLocator {
+    id: Option<EpisodeId>,
+    name: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StartPlan {
+    // Older journals fingerprinted the observed account revision. Preserve it on replay.
+    expected: ControlRevision,
+    requested: EpisodeId,
+    project: Option<FolderRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_ack: Option<delta::PendingDeliveryAck>,
+}
+
+pub(super) async fn handle(
+    call: &mut ToolCallContext<'_>,
+    name: ToolName,
+    args: Value,
+) -> Result<Value, PortError> {
+    match name {
+        ToolName::Whoami | ToolName::GetMyProjects => {
+            let args: ReadArgs = decode(args)?;
+            if let Some(id) = args.session {
+                call.registry
+                    .control
+                    .get_episode(call.account(), id)
+                    .await?;
+            }
+            match name {
+                ToolName::Whoami => whoami(call).await,
+                _ => projects(call).await,
+            }
+        }
+        ToolName::StartSession => Box::pin(start(call, decode(args)?)).await,
+        _ => Err(invalid(ValidationReason::InvalidQuery)),
+    }
+}
+
+pub(super) async fn selected_project_for_hint(
+    call: &ToolCallContext<'_>,
+    project: Option<&str>,
+    hint: Option<&FolderRef>,
+) -> Result<Option<FolderRef>, PortError> {
+    let target = match project {
+        Some(handle) => Some(resolve_project(call, handle).await?.folder),
+        None => match hint {
+            Some(folder) => Some(project_for_folder(call, folder).await?.folder),
+            None => None,
+        },
+    };
+    let target = match &call.target {
+        EgressTarget::InAppProvider {
+            primary_project, ..
+        } => target.or_else(|| primary_project.clone()),
+        EgressTarget::ExternalMcp => target,
+    };
+    Ok(target)
+}
+
+pub(super) async fn selected_project_for_episode(
+    call: &ToolCallContext<'_>,
+    project: Option<&str>,
+    episode: Option<&AgentEpisode>,
+) -> Result<Option<FolderRef>, PortError> {
+    if project.is_none()
+        && episode.is_some_and(|value| {
+            value
+                .diagnostics
+                .contains(&EpisodeDiagnostic::ProjectUnavailable)
+        })
+    {
+        return Err(DomainError::ResourceNotFound.into());
+    }
+    selected_project_for_hint(
+        call,
+        project,
+        episode.and_then(|value| value.project_hint.as_ref()),
+    )
+    .await
+}
+
+pub(super) async fn selected_project_for_direct_write(
+    call: &ToolCallContext<'_>,
+    project: Option<&str>,
+    episode: Option<&EpisodeId>,
+) -> Result<Option<FolderRef>, PortError> {
+    let Some(pin) = call.auth.pinned_write_space() else {
+        return selected_project(call, project, episode).await;
+    };
+    let loaded = match episode {
+        Some(id) => Some(
+            call.registry
+                .control
+                .get_episode(call.account(), id.clone())
+                .await?,
+        ),
+        None => None,
+    };
+    if project.is_none()
+        && loaded.as_ref().is_some_and(|value| {
+            value
+                .diagnostics
+                .contains(&EpisodeDiagnostic::ProjectUnavailable)
+        })
+    {
+        return Err(DomainError::ResourceNotFound.into());
+    }
+    let target = match project {
+        Some(handle) => Some(resolve_project_for_direct_write(call, handle).await?.folder),
+        None => match loaded
+            .as_ref()
+            .and_then(|value| value.project_hint.as_ref())
+        {
+            Some(folder) => {
+                if &folder.space_id != pin {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+                Some(project_for_folder(call, folder).await?.folder)
+            }
+            None => None,
+        },
+    };
+    let target = match &call.target {
+        EgressTarget::InAppProvider {
+            primary_project, ..
+        } => target.or_else(|| primary_project.clone()),
+        EgressTarget::ExternalMcp => target,
+    };
+    if target
+        .as_ref()
+        .is_some_and(|folder| &folder.space_id != pin)
+    {
+        return Err(DomainError::ResourceNotFound.into());
+    }
+    Ok(target)
+}
+
+pub(super) async fn selected_project(
+    call: &ToolCallContext<'_>,
+    project: Option<&str>,
+    episode: Option<&EpisodeId>,
+) -> Result<Option<FolderRef>, PortError> {
+    let loaded = match episode {
+        Some(id) => Some(
+            call.registry
+                .control
+                .get_episode(call.account(), id.clone())
+                .await?,
+        ),
+        None => None,
+    };
+    selected_project_for_episode(call, project, loaded.as_ref()).await
+}
+
+async fn whoami(call: &mut ToolCallContext<'_>) -> Result<Value, PortError> {
+    let principal = call.registry.control.whoami(call.account()).await?;
+    let kind = match principal.kind {
+        PrincipalKind::DirectHuman => "direct_human",
+        PrincipalKind::Pat => "pat",
+        PrincipalKind::OAuth { .. } => "oauth",
+        PrincipalKind::AgentRun(_) => "agent_run",
+        PrincipalKind::Keeper(_) => "keeper",
+        PrincipalKind::SearchIndexing => return Err(DomainError::AccessDenied.into()),
+    };
+    let external = matches!(call.target, EgressTarget::ExternalMcp);
+    let mut spaces = Vec::new();
+    let mut pending_taints = Vec::new();
+    let collected: Result<(), PortError> = async {
+        for card in readable_spaces(call).await?.into_values() {
+            let space = card.space;
+            let slug = if external {
+                card.slug
+            } else {
+                let ctx = call.space(card.history)?;
+                let project_root = call
+                    .auth
+                    .spaces()
+                    .get(&space.id)
+                    .and_then(|grant| grant.project_root.clone());
+                let (source, project_arg) = match project_root.as_ref() {
+                    Some(folder_id) => {
+                        let folder = FolderRef {
+                            space_id: space.id.clone(),
+                            folder_id: folder_id.clone(),
+                        };
+                        (CatalogDisclosure::Folder(folder.clone()), Some(folder))
+                    }
+                    None => (CatalogDisclosure::Space(ctx.scope().clone()), None),
+                };
+                let Some((proof, taint)) =
+                    project_metadata(call, ctx, source, project_arg, true).await?
+                else {
+                    continue;
+                };
+                if let Some(taint) = taint {
+                    pending_taints.push(taint);
+                }
+                let slug_field = if project_root.is_some() {
+                    "spaceSlug"
+                } else {
+                    "slug"
+                };
+                required_text(&proof, slug_field)?.to_owned()
+            };
+            let space_kind = match space.kind {
+                SpaceKind::Personal => "personal",
+                SpaceKind::Shared => "shared",
+            };
+            let role = match card.role {
+                SpaceRole::Owner => "owner",
+                SpaceRole::Editor => "editor",
+                SpaceRole::Viewer => "viewer",
+            };
+            spaces.push(json!({
+                "spaceId": space.id,
+                "slug": slug,
+                "kind": space_kind,
+                "role": role,
+            }));
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(error) = collected {
+        commit_pending_taints_on_error(call, pending_taints);
+        return Err(error);
+    }
+    for taint in pending_taints {
+        taint.commit()?;
+    }
+    let personal_space = principal.personal_space.filter(|id| {
+        spaces
+            .iter()
+            .any(|space| space["spaceId"].as_str() == Some(id.as_str()))
+    });
+    Ok(json!({
+        "principal": principal.principal,
+        "kind": kind,
+        "personalSpace": personal_space,
+        "spaces": spaces,
+        "hasModel": if external { principal.has_completion_provider } else { true },
+        "capabilities": { "vector": call.registry.vector_search, "trash": true, "revisions": true },
+    }))
+}
+
+async fn projects(call: &mut ToolCallContext<'_>) -> Result<Value, PortError> {
+    const MAX_PROJECTS: usize = 4096;
+    const CONTROL_PAGE: u16 = 200;
+    let spaces = readable_spaces(call).await?;
+    let mut items = Vec::new();
+    let mut pending_taints = Vec::new();
+    let collected: Result<(), PortError> = async {
+        match call.target.clone() {
+            EgressTarget::ExternalMcp => {
+                for card in visible_projects(call).await? {
+                    let Some(space) = spaces.get(&card.folder.space_id) else {
+                        continue;
+                    };
+                    let handle = format!("{}/{}", space.slug, card.project_slug);
+                    let item = json!({
+                        "projectId": card.folder.folder_id,
+                        "spaceId": card.folder.space_id,
+                        "handle": handle,
+                        "slug": card.project_slug,
+                        "name": card.name,
+                    });
+                    items.push((handle, item));
+                }
+            }
+            EgressTarget::InAppProvider { provider, .. } => {
+                let mut total_consented = 0usize;
+                for space in spaces.values() {
+                    let scope = call.space(space.history.clone())?;
+                    let project_root = call
+                        .auth
+                        .spaces()
+                        .get(&space.space.id)
+                        .and_then(|grant| grant.project_root.clone());
+                    let space_wide_proof = if project_root.is_some() {
+                        None
+                    } else {
+                        match call.provider_selection(&scope, None).await {
+                            Ok(Some(sel)) if sel.project_only.is_none() => {
+                                project_metadata(
+                                    call,
+                                    scope.clone(),
+                                    CatalogDisclosure::SpaceProjects(space.history.clone()),
+                                    None,
+                                    true,
+                                )
+                                .await?
+                            }
+                            Ok(_) => None,
+                            Err(PortError::Domain(DomainError::Provider {
+                                error: ProviderErrorCode::Unavailable,
+                            })) => None,
+                            Err(error) if corpus::hidden(&error) => None,
+                            Err(error) => return Err(error),
+                        }
+                    };
+                    if let Some((proof, taint)) = space_wide_proof {
+                        if let Some(taint) = taint {
+                            pending_taints.push(taint);
+                        }
+                        let space_slug = required_text(&proof, "slug")?.to_owned();
+                        let entries = proof["projects"]
+                            .as_array()
+                            .ok_or_else(|| invalid(ValidationReason::InvalidState))?;
+                        total_consented = total_consented.saturating_add(entries.len());
+                        if total_consented > MAX_PROJECTS {
+                            return Err(invalid(ValidationReason::BudgetExceeded));
+                        }
+                        for entry in entries {
+                            let folder_id = required_text(entry, "folderId")?;
+                            let slug = required_text(entry, "projectSlug")?;
+                            let name = required_text(entry, "name")?;
+                            let handle = format!("{space_slug}/{slug}");
+                            let item = json!({
+                                "projectId": folder_id,
+                                "spaceId": space.space.id,
+                                "handle": handle,
+                                "slug": slug,
+                                "name": name,
+                            });
+                            items.push((handle, item));
+                        }
+                        continue;
+                    }
+                    if let Some(folder_id) = project_root {
+                        let folder = FolderRef {
+                            space_id: space.space.id.clone(),
+                            folder_id,
+                        };
+                        match call
+                            .registry
+                            .catalog
+                            .project(scope.with_preflight_taint(), folder.clone())
+                            .await
+                        {
+                            Ok(_) => {
+                                let source = CatalogDisclosure::Folder(folder.clone());
+                                if let Some((proof, taint)) = project_metadata(
+                                    call,
+                                    scope.clone(),
+                                    source,
+                                    Some(folder.clone()),
+                                    true,
+                                )
+                                .await?
+                                {
+                                    if let Some(taint) = taint {
+                                        pending_taints.push(taint);
+                                    }
+                                    total_consented = total_consented.saturating_add(1);
+                                    if total_consented > MAX_PROJECTS {
+                                        return Err(invalid(ValidationReason::BudgetExceeded));
+                                    }
+                                    let space_slug = required_text(&proof, "spaceSlug")?.to_owned();
+                                    let slug = required_text(&proof, "projectSlug")?.to_owned();
+                                    let name = required_text(&proof, "name")?.to_owned();
+                                    let handle = format!("{space_slug}/{slug}");
+                                    let item = json!({
+                                        "projectId": folder.folder_id,
+                                        "spaceId": folder.space_id,
+                                        "handle": handle,
+                                        "slug": slug,
+                                        "name": name,
+                                    });
+                                    items.push((handle, item));
+                                }
+                            }
+                            Err(error) if corpus::hidden(&error) => {}
+                            Err(error) => return Err(error),
+                        }
+                    } else {
+                        let mut next: Option<String> = None;
+                        let mut exhausted = false;
+                        for _ in 0..=MAX_PROJECTS {
+                            let page = call
+                                .registry
+                                .control
+                                .list_provider_project_targets(
+                                    scope.with_preflight_taint(),
+                                    provider.clone(),
+                                    ControlPageRequest::new(CONTROL_PAGE, next.clone())?,
+                                )
+                                .await?;
+                            if page.items.len() > usize::from(CONTROL_PAGE) {
+                                return Err(invalid(ValidationReason::InvalidState));
+                            }
+                            for folder in page.items {
+                                let source = CatalogDisclosure::Folder(folder.clone());
+                                let Some((proof, taint)) = project_metadata(
+                                    call,
+                                    scope.clone(),
+                                    source,
+                                    Some(folder.clone()),
+                                    true,
+                                )
+                                .await?
+                                else {
+                                    continue;
+                                };
+                                if let Some(taint) = taint {
+                                    pending_taints.push(taint);
+                                }
+                                total_consented = total_consented.saturating_add(1);
+                                if total_consented > MAX_PROJECTS {
+                                    return Err(invalid(ValidationReason::BudgetExceeded));
+                                }
+                                let space_slug = required_text(&proof, "spaceSlug")?.to_owned();
+                                let slug = required_text(&proof, "projectSlug")?.to_owned();
+                                let name = required_text(&proof, "name")?.to_owned();
+                                let handle = format!("{space_slug}/{slug}");
+                                let item = json!({
+                                    "projectId": folder.folder_id,
+                                    "spaceId": folder.space_id,
+                                    "handle": handle,
+                                    "slug": slug,
+                                    "name": name,
+                                });
+                                items.push((handle, item));
+                            }
+                            let Some(cursor) = page.continuation else {
+                                exhausted = true;
+                                break;
+                            };
+                            if next.as_ref() == Some(&cursor) {
+                                return Err(invalid(ValidationReason::InvalidState));
+                            }
+                            next = Some(cursor);
+                        }
+                        if !exhausted {
+                            return Err(invalid(ValidationReason::BudgetExceeded));
+                        }
+                    }
+                }
+            }
+        }
+        items.sort_by(|left, right| left.0.cmp(&right.0));
+        if items.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+            return Err(invalid(ValidationReason::InvalidState));
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(error) = collected {
+        commit_pending_taints_on_error(call, pending_taints);
+        return Err(error);
+    }
+    for taint in pending_taints {
+        taint.commit()?;
+    }
+    Ok(json!({ "projects": items.into_iter().map(|(_, value)| value).collect::<Vec<_>>() }))
+}
+
+struct PendingMetadataTaint {
+    scope: SpaceContext,
+    proof: notarium_core::classes::CanonicalMetadataContent,
+    policy: Option<notarium_core::classes::ProviderPolicy>,
+}
+
+impl PendingMetadataTaint {
+    fn commit(self) -> Result<(), PortError> {
+        if let Some(policy) = self.policy {
+            ClassEgressFence::provider_metadata(self.proof, self.scope.auth(), &policy)?;
+        } else {
+            let _ = ClassEgressFence::mcp_metadata(&self.proof, self.scope.auth())?;
+        }
+        Ok(())
+    }
+}
+
+fn commit_pending_taints_on_error(call: &ToolCallContext<'_>, pending: Vec<PendingMetadataTaint>) {
+    let pinned = call.auth.pinned_write_space();
+    for taint in pending {
+        let foreign = pinned.is_some_and(|space| space != &taint.scope.scope().space_id);
+        let _ = taint.commit();
+        if foreign {
+            call.commit_external_read();
+        }
+    }
+}
+
+async fn project_metadata(
+    call: &mut ToolCallContext<'_>,
+    scope: SpaceContext,
+    source: CatalogDisclosure,
+    project: Option<FolderRef>,
+    record_origin: bool,
+) -> Result<Option<(Value, Option<PendingMetadataTaint>)>, PortError> {
+    let auth = call.account();
+    let foreign_space = auth
+        .auth()
+        .pinned_write_space()
+        .is_some_and(|space| space != &scope.scope().space_id);
+    let project = match &call.target {
+        EgressTarget::InAppProvider {
+            primary_project, ..
+        } if auth.auth().pinned_write_space() == Some(&scope.scope().space_id) => {
+            primary_project.clone().or(project)
+        }
+        _ => project,
+    };
+    let selection = match call.provider_selection(&scope, project.clone()).await {
+        Ok(value) => value,
+        Err(PortError::Domain(DomainError::Provider {
+            error: ProviderErrorCode::Unavailable,
+        })) => {
+            return Ok(None);
+        }
+        Err(error) if corpus::hidden(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let proof = match call
+        .registry
+        .catalog
+        .disclosure(call.account().with_preflight_taint(), source)
+        .await
+    {
+        Ok(proof) => proof,
+        Err(error) if corpus::hidden(&error) => return Ok(None),
+        Err(error) => {
+            if foreign_space {
+                call.commit_external_read();
+            }
+            return Err(error);
+        }
+    };
+    let preflight_auth = scope.auth().with_preflight_taint();
+    let mut deferred_policy = None;
+    if let Some(selection) = selection {
+        if let Some(project) = &selection.project_only
+            && !matches!(proof.current(), ProviderCurrentContent::Folder { reference, ancestor_folders, .. }
+                if reference.space_id == project.space_id
+                    && (reference.folder_id == project.folder_id || ancestor_folders.contains(&project.folder_id)))
+        {
+            return Ok(None);
+        }
+        if let Err(error) =
+            ClassEgressFence::provider_metadata(proof.clone(), &preflight_auth, &selection.policy)
+        {
+            let error = PortError::from(error);
+            return if corpus::hidden(&error) {
+                Ok(None)
+            } else {
+                if foreign_space {
+                    call.commit_external_read();
+                }
+                Err(error)
+            };
+        }
+        if record_origin
+            && let Err(error) = call.record_origin(proof.current().origin(), selection.project_only)
+        {
+            if foreign_space {
+                call.commit_external_read();
+            }
+            return Err(error);
+        }
+        deferred_policy = Some(selection.policy);
+    }
+    let text = match ClassEgressFence::mcp_metadata(&proof, &preflight_auth) {
+        Ok(text) => text,
+        Err(error) => {
+            if foreign_space {
+                call.commit_external_read();
+            }
+            return Err(error.into());
+        }
+    };
+    let value = match serde_json::from_str(text) {
+        Ok(value) => value,
+        Err(_) => {
+            if foreign_space {
+                call.commit_external_read();
+            }
+            return Err(invalid(ValidationReason::InvalidState));
+        }
+    };
+    Ok(Some((
+        value,
+        Some(PendingMetadataTaint {
+            scope,
+            proof,
+            policy: deferred_policy,
+        }),
+    )))
+}
+
+fn required_text<'a>(value: &'a Value, key: &str) -> Result<&'a str, PortError> {
+    value[key]
+        .as_str()
+        .ok_or_else(|| invalid(ValidationReason::InvalidState))
+}
+
+async fn start(call: &mut ToolCallContext<'_>, args: StartArgs) -> Result<Value, PortError> {
+    if !matches!(call.target, EgressTarget::ExternalMcp) {
+        return Err(DomainError::AccessDenied.into());
+    }
+    let new_selection = args.session.is_some()
+        || args.project.is_some()
+        || args.role.is_some()
+        || args.task.is_some();
+    if args.continuation.is_some() && new_selection {
+        return Err(invalid(ValidationReason::InvalidQuery));
+    }
+    // Bind the transport idempotency key to the normalized start_session arguments
+    // before branching across continuation, deliveryReceipt, and episode start so
+    // a single key cannot execute two distinct sub-operations.
+    call.journal("invocation", || async { Ok(true) }).await?;
+    if let Some(continuation) = args.continuation.as_deref() {
+        return Ok(json!({
+            "delta": delta::resume(call, continuation, args.delivery_receipt.as_deref(), args.acknowledge).await?
+        }));
+    }
+    let requested = derive_episode_id(call);
+    let validated_selector = if new_selection || args.delivery_receipt.is_none() {
+        let sel = selector(
+            args.session.as_ref(),
+            args.task.as_deref(),
+            requested.clone(),
+        )?;
+        if let Some(handle) = args.project.as_deref() {
+            address::project_handle(handle)?;
+        }
+        if call.auth.taint().is_tainted() {
+            return Err(DomainError::CrossSpaceTainted.into());
+        }
+        Some(sel)
+    } else {
+        None
+    };
+    let existing_plan: Option<StartPlan> = if validated_selector.is_some() {
+        call.lookup_journal::<StartPlan>("start-episode").await?
+    } else {
+        None
+    };
+    let mut preflight_plan: Option<StartPlan> = None;
+    if let Some(sel) = &validated_selector {
+        if existing_plan.is_none() {
+            // Validate all session-start preconditions (delivery ticket, project,
+            // episode target/lifecycle, space-narrowed admission, and role) BEFORE
+            // committing `delta::deliver` or writing the start-episode journal so
+            // deterministic domain errors never advance the delta cursor or collapse
+            // into a `CommitEffect::Unknown / RetrySameCommand` retry loop.
+            let pending_ack = if let Some(receipt) = args.delivery_receipt.as_deref() {
+                delta::prepare_delivery(call, receipt, args.acknowledge).await?
+            } else {
+                None
+            };
+            let project = match args.project.as_deref() {
+                Some(handle) => Some(resolve_project(call, handle).await?.folder),
+                None => None,
+            };
+            let mut named_preview: Option<NamedEpisodePreview> = None;
+            let preflight_episode = match sel {
+                EpisodeSelector::Id(id) | EpisodeSelector::Resume(id) => {
+                    let episode = call
+                        .registry
+                        .control
+                        .get_episode(call.account(), id.clone())
+                        .await?;
+                    check_requested_project(project.as_ref(), &episode)?;
+                    Some(episode)
+                }
+                EpisodeSelector::Name(name) => {
+                    let preview = call
+                        .registry
+                        .control
+                        .named_episode_project_hint(call.account(), name.clone())
+                        .await?;
+                    match &preview {
+                        NamedEpisodePreview::Unique(hint) => {
+                            if let Some(requested_project) = &project
+                                && hint.as_ref() != Some(requested_project)
+                            {
+                                return Err(invalid(ValidationReason::ScopeMismatch));
+                            }
+                        }
+                        NamedEpisodePreview::ProjectUnavailable => {
+                            if project.is_some() {
+                                return Err(invalid(ValidationReason::ScopeMismatch));
+                            }
+                        }
+                        NamedEpisodePreview::NoMatch | NamedEpisodePreview::Ambiguous => {}
+                    }
+                    named_preview = Some(preview);
+                    None
+                }
+                EpisodeSelector::New { .. } => None,
+            };
+            let creates_unmatched = matches!(sel, EpisodeSelector::New { .. })
+                || matches!(named_preview, Some(NamedEpisodePreview::NoMatch));
+            if creates_unmatched && project.is_none() {
+                if !call
+                    .auth
+                    .spaces()
+                    .values()
+                    .any(|grant| !grant.read_classes.is_empty())
+                    || call
+                        .auth
+                        .spaces()
+                        .values()
+                        .any(|grant| grant.project_root.is_some())
+                {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+                if call.auth.is_space_narrowed() {
+                    let personal = call
+                        .registry
+                        .control
+                        .whoami(call.account())
+                        .await?
+                        .personal_space;
+                    let admitted_personal = personal.as_ref().is_some_and(|ps| {
+                        call.auth.spaces().get(ps).is_some_and(|grant| {
+                            !grant.read_classes.is_empty() && grant.project_root.is_none()
+                        })
+                    });
+                    if !admitted_personal {
+                        return Err(DomainError::ResourceNotFound.into());
+                    }
+                }
+            }
+            if let Some(project) = &project {
+                project_for_folder(call, project).await?;
+            }
+            if let Some(role_selector) = args.role.as_deref() {
+                let preview_project = if project.is_some() {
+                    Some(project.clone())
+                } else {
+                    match sel {
+                        EpisodeSelector::Id(_) | EpisodeSelector::Resume(_) => Some(
+                            selected_project_for_episode(call, None, preflight_episode.as_ref())
+                                .await?,
+                        ),
+                        EpisodeSelector::Name(_) => match named_preview.as_ref() {
+                            Some(NamedEpisodePreview::NoMatch) => Some(None),
+                            Some(NamedEpisodePreview::Unique(hint)) => {
+                                Some(selected_project_for_hint(call, None, hint.as_ref()).await?)
+                            }
+                            Some(NamedEpisodePreview::ProjectUnavailable) => {
+                                return Err(DomainError::ResourceNotFound.into());
+                            }
+                            Some(NamedEpisodePreview::Ambiguous) | None => None,
+                        },
+                        EpisodeSelector::New { .. } => Some(None),
+                    }
+                };
+                if let Some(preview_project) = preview_project {
+                    ability_tools::validate_session_role(
+                        call,
+                        role_selector,
+                        preview_project.as_ref(),
+                    )
+                    .await?;
+                }
+            }
+            if preflight_episode
+                .as_ref()
+                .is_some_and(|ep| ep.lifecycle == notarium_core::ports::EpisodeLifecycle::Closed)
+            {
+                return Err(invalid(ValidationReason::InvalidState));
+            }
+            preflight_plan = Some(StartPlan {
+                expected: ControlRevision::ZERO,
+                requested,
+                project,
+                pending_ack,
+            });
+        }
+    } else if let Some(receipt) = args.delivery_receipt.as_deref() {
+        let acknowledged = delta::deliver_journaled(call, receipt, args.acknowledge).await?;
+        return Ok(json!({ "acknowledged": acknowledged }));
+    }
+    const SESSION_LABEL: &str = "notarium.mcp.start-session.v1";
+    let selector = validated_selector.expect("selector validated when starting session");
+    let plan_replayed = existing_plan.is_some();
+    let plan: StartPlan = match existing_plan {
+        Some(plan) => plan,
+        None => {
+            let prepared = preflight_plan.expect("preflight_plan built when not yet journaled");
+            call.journal("start-episode", || async move { Ok(prepared) })
+                .await
+                .map_err(|error| {
+                    super::note_tools::batch_operational_error(SESSION_LABEL, error, false)
+                })?
+        }
+    };
+    let selector = match selector {
+        EpisodeSelector::New { name, .. } => EpisodeSelector::New {
+            name,
+            requested: plan.requested,
+        },
+        other => other,
+    };
+    let opened = call
+        .registry
+        .control
+        .start_or_resume_episode(
+            call.account(),
+            AccountMutation {
+                identity: call.account_identity(plan.expected, "start-episode", 0),
+                input: StartEpisode {
+                    selector,
+                    project_hint: plan.project.clone(),
+                    guard: EpisodeRevisionGuard::Target,
+                },
+            },
+        )
+        .await
+        .map_err(|error| {
+            super::note_tools::batch_operational_error(SESSION_LABEL, error, plan_replayed)
+        })?;
+    let (episode, state) = match opened.value {
+        EpisodeStartResult::New(episode) => (episode, "new"),
+        EpisodeStartResult::Resumed(episode) => (episode, "resumed"),
+        EpisodeStartResult::Forked(episode) => (episode, "forked"),
+        EpisodeStartResult::Ambiguous(choices) => {
+            let recent: Vec<_> = choices
+                .into_iter()
+                .map(|choice| json!({ "id": choice.id, "name": choice.name }))
+                .collect();
+            return Ok(json!({ "recentSessions": recent }));
+        }
+    };
+    async {
+        if let Some(pending) = &plan.pending_ack {
+            delta::acknowledge_prepared(call, pending).await?;
+            if state == "forked"
+                && pending.is_for_parent(episode.parent.as_ref())
+            {
+                let child_pending = pending.for_episode(episode.id.clone());
+                delta::acknowledge_prepared(call, &child_pending).await?;
+            }
+        }
+        if !plan_replayed {
+            check_committed_project(plan.project.as_ref(), &episode)?;
+        }
+        if let Some(project) = &episode.project_hint {
+            project_for_folder(call, project).await?;
+        }
+        let role =
+            ability_tools::activate_session_role(call, &episode, args.role.as_deref()).await?;
+        let context = call
+            .registry
+            .control
+            .bootstrap_context(
+                call.account(),
+                episode.id.clone(),
+                None,
+                ControlPageRequest::new(20, None)?,
+            )
+            .await?;
+        if context.episode.project_hint != episode.project_hint {
+            return Err(invalid(ValidationReason::ScopeMismatch));
+        }
+        let abilities = ability_tools::session_ability_summaries(call, &context.episode).await?;
+
+        let mut selection = Vec::new();
+        let mut favorites = Vec::new();
+        let mut remaining = match args.response_format {
+            Format::Concise => 12 * 1024,
+            Format::Detailed => 32 * 1024,
+        };
+        for reference in &context.selection.pinned {
+            if let Some(note) = bootstrap_note(call, reference).await? {
+                let body = ClassEgressFence::mcp_note(&note.document, call.account().auth())?;
+                let summary = bounded_text(body, remaining.min(4096));
+                remaining -= summary.len();
+                selection.push(json!({
+                    "noteId": reference.note_id,
+                    "spaceId": reference.space_id,
+                    "revision": note.document.revision(),
+                    "title": note.provenance.as_ref().map(|facts| &facts.title),
+                    "content": summary,
+                    "truncated": summary.len() < body.len(),
+                }));
+            }
+        }
+        for reference in &context.selection.favorites {
+            if let Some(note) = bootstrap_note_metadata(call, reference).await? {
+                favorites.push(json!({
+                    "noteId": reference.note_id,
+                    "spaceId": reference.space_id,
+                    "revision": note.metadata.revision(),
+                    "title": note.provenance.as_ref().map(|facts| &facts.title),
+                }));
+            }
+        }
+        let diagnostics: Vec<&str> = context
+            .episode
+            .diagnostics
+            .iter()
+            .map(|diag| match diag {
+                EpisodeDiagnostic::ProjectUnavailable => "project_unavailable",
+                EpisodeDiagnostic::RoleUnavailable => "role_unavailable",
+            })
+            .collect();
+        let mut session = json!({
+            "id": episode.id,
+            "name": episode.name,
+            "state": state,
+            "parentId": episode.parent,
+        });
+        if !diagnostics.is_empty() {
+            session["diagnostics"] = json!(diagnostics);
+        }
+        let mut output = json!({
+            "session": session,
+            "profile": { "alwaysLoad": selection, "favorites": favorites, "truncated": context.continuation.is_some() },
+            "abilities": abilities["items"],
+        });
+        if let Some(next_action) = abilities.get("nextAction").filter(|value| !value.is_null()) {
+            output["nextAction"] = next_action.clone();
+        }
+        if !abilities["nextCursor"].is_null() {
+            output["abilitiesTruncated"] = json!(true);
+        }
+        if let Some(role) = role {
+            output["activeRole"] = role;
+        }
+        if let Some(project) = &episode.project_hint {
+            output["project"] = project_bundle(call, project).await?;
+        }
+        let (owner, acknowledgements, allow_ack) = if args.session.is_some() {
+            (
+                AckOwner::Episode(episode.id.clone()),
+                &context.episode.acknowledgements,
+                args.acknowledge,
+            )
+        } else {
+            // Read-scoped bearers may acknowledge only their own episode cursor,
+            // never advancing the account-wide baseline.
+            let allow_ack = args.acknowledge && call.auth.bearer_scope() != Some(BearerScope::Read);
+            (
+                AckOwner::Account,
+                &context.owner_acknowledgements,
+                allow_ack,
+            )
+        };
+        output["delta"] = if episode.lifecycle == notarium_core::ports::EpisodeLifecycle::Closed {
+            json!({ "changes": [], "complete": true })
+        } else {
+            delta::open(
+                call,
+                episode.id,
+                owner,
+                episode.project_hint,
+                acknowledgements,
+                allow_ack,
+            )
+            .await?
+        };
+        Ok(output)
+    }
+    .await
+    .map_err(|error| super::note_tools::batch_operational_error(SESSION_LABEL, error, true))
+}
+
+fn selector(
+    locator: Option<&SessionLocator>,
+    task: Option<&str>,
+    requested: EpisodeId,
+) -> Result<EpisodeSelector, PortError> {
+    match locator {
+        None => Ok(EpisodeSelector::New {
+            requested,
+            name: task.and_then(session_name),
+        }),
+        Some(SessionLocator {
+            id: Some(id),
+            name: None,
+        }) => Ok(EpisodeSelector::Id(id.clone())),
+        Some(SessionLocator {
+            id: None,
+            name: Some(name),
+        }) => session_name(name)
+            .map(EpisodeSelector::Name)
+            .ok_or_else(|| invalid(ValidationReason::InvalidQuery)),
+        Some(_) => Err(invalid(ValidationReason::InvalidQuery)),
+    }
+}
+
+fn session_name(input: &str) -> Option<String> {
+    let safe: String = input
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect();
+    let safe: String = safe.trim().chars().take(128).collect();
+    (!safe.is_empty()).then_some(safe)
+}
+
+fn derive_episode_id(call: &ToolCallContext<'_>) -> EpisodeId {
+    let key = call.command_key("new-episode", 0);
+    let hash = blake3::hash(key.as_str().as_bytes());
+    let mut id = [0_u8; 16];
+    id.copy_from_slice(&hash.as_bytes()[..16]);
+    EpisodeId::from_bytes(id)
+}
+
+fn check_requested_project(
+    project: Option<&FolderRef>,
+    episode: &AgentEpisode,
+) -> Result<(), PortError> {
+    if project.is_some_and(|project| Some(project) != episode.project_hint.as_ref()) {
+        return Err(invalid(ValidationReason::ScopeMismatch));
+    }
+    Ok(())
+}
+
+fn check_committed_project(
+    project: Option<&FolderRef>,
+    episode: &AgentEpisode,
+) -> Result<(), PortError> {
+    if project.is_some()
+        && episode.project_hint.is_none()
+        && episode
+            .diagnostics
+            .contains(&EpisodeDiagnostic::ProjectUnavailable)
+    {
+        return Ok(());
+    }
+    check_requested_project(project, episode)
+}
+
+async fn project_bundle(
+    call: &ToolCallContext<'_>,
+    reference: &FolderRef,
+) -> Result<Value, PortError> {
+    let project = project_for_folder(call, reference).await?;
+    let scope = space(call, &reference.space_id).await?;
+    let folder = call
+        .registry
+        .engine
+        .resolve_folder_path(
+            scope.clone(),
+            Some(reference.folder_id.clone()),
+            String::new(),
+        )
+        .await?
+        .ok_or(DomainError::ResourceNotFound)?;
+    if folder.reference != *reference || folder.history != *scope.scope() {
+        return Err(invalid(ValidationReason::InvalidState));
+    }
+    let children = call
+        .registry
+        .engine
+        .list_child_folders(
+            scope.clone(),
+            Some(reference.folder_id.clone()),
+            None,
+            None,
+            PageLimit::new(50)?,
+        )
+        .await?;
+    if children.items.len() > 50 {
+        return Err(invalid(ValidationReason::InvalidState));
+    }
+    let folders: Vec<_> = children
+        .items
+        .into_iter()
+        .map(|child| {
+            json!({
+                "folderId": child.reference.folder_id, "path": child.path, "name": child.name,
+            })
+        })
+        .collect();
+    let mut output = json!({
+        "id": reference.folder_id,
+        "spaceId": reference.space_id,
+        "slug": project.project_slug,
+        "name": project.name,
+        "index": { "folders": folders, "truncated": children.next.is_some() },
+    });
+    match call
+        .registry
+        .engine
+        .project_note_counts(scope.clone(), reference.clone(), causal())
+        .await
+    {
+        Ok(counts) => {
+            if counts.project != *reference
+                || counts.cut.scope != *scope.scope()
+                || counts.known_tags.len() > MAX_PROJECT_BOOTSTRAP_VALUES
+                || counts.known_categories.len() > MAX_PROJECT_BOOTSTRAP_VALUES
+            {
+                return Err(invalid(ValidationReason::InvalidState));
+            }
+            let note_count = counts
+                .counts
+                .into_iter()
+                .filter(|(class, _)| *class != DocClass::EncryptedNote)
+                .try_fold(0_u64, |total, (_, count)| total.checked_add(count))
+                .ok_or_else(|| invalid(ValidationReason::InvalidState))?;
+            output["index"]["noteCount"] = json!(note_count);
+            output["index"]["cut"] = json!(counts.cut.projected_seq);
+            output["knownValues"] = json!({
+                "tags": counts.known_tags,
+                "categories": counts.known_categories,
+            });
+        }
+        Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
+            if matches!(
+                diagnostic.reason,
+                ValidationReason::NotReady
+                    | ValidationReason::CursorStale
+                    | ValidationReason::GenerationMismatch
+            ) =>
+        {
+            output["index"]["countsAvailable"] = json!(false);
+        }
+        Err(PortError::Unavailable(_)) => {
+            output["index"]["countsAvailable"] = json!(false);
+        }
+        Err(PortError::DeadlineExceeded(_)) if !call.budget().remaining.is_zero() => {
+            output["index"]["countsAvailable"] = json!(false);
+        }
+        Err(error) => return Err(error),
+    }
+    if let Some(note_id) = folder.cover_note {
+        let cover = NoteRef {
+            space_id: reference.space_id.clone(),
+            note_id,
+        };
+        if let Some(note) = bootstrap_note_metadata(call, &cover).await? {
+            output["folderPage"] = json!({
+                "status": "present",
+                "folderId": reference.folder_id,
+                "folderPath": folder.path,
+                "noteId": cover.note_id,
+                "title": note.provenance.as_ref().map(|facts| &facts.title),
+            });
+        }
+    }
+    Ok(output)
+}
+
+async fn bootstrap_note_metadata(
+    call: &ToolCallContext<'_>,
+    reference: &NoteRef,
+) -> Result<Option<NoteMetadataSnapshot>, PortError> {
+    let scope = space(call, &reference.space_id).await?;
+    let snapshot = match call
+        .registry
+        .engine
+        .get_note_metadata(
+            scope.clone(),
+            GetNote {
+                note: reference.note_id.clone(),
+                revision: None,
+                causal: causal(),
+            },
+        )
+        .await
+    {
+        Ok(snapshot) => snapshot,
+        Err(error) if corpus::hidden(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if snapshot.metadata.reference() != reference {
+        return Err(invalid(ValidationReason::InvalidState));
+    }
+    match ClassEgressFence::mcp_note_metadata(&snapshot.metadata, scope.auth())
+        .map_err(PortError::from)
+    {
+        Ok(_) => Ok(Some(snapshot)),
+        Err(error) if corpus::hidden(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+async fn bootstrap_note(
+    call: &ToolCallContext<'_>,
+    reference: &NoteRef,
+) -> Result<Option<NoteSnapshot>, PortError> {
+    let scope = space(call, &reference.space_id).await?;
+    let snapshot = match call
+        .registry
+        .engine
+        .get_note(
+            scope.clone(),
+            GetNote {
+                note: reference.note_id.clone(),
+                revision: None,
+                causal: causal(),
+            },
+        )
+        .await
+    {
+        Ok(snapshot) => snapshot,
+        Err(error) if corpus::hidden(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if snapshot.document.reference() != reference {
+        return Err(invalid(ValidationReason::InvalidState));
+    }
+    match ClassEgressFence::mcp_note_metadata(&snapshot.document.metadata(), scope.auth())
+        .map_err(PortError::from)
+    {
+        Ok(_) => Ok(Some(snapshot)),
+        Err(error) if corpus::hidden(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn causal() -> CausalBasis {
+    CausalBasis::Await(Default::default())
+}
+
+fn bounded_text(value: &str, limit: usize) -> &str {
+    let mut end = value.len().min(limit);
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}

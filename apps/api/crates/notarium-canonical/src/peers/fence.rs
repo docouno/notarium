@@ -154,7 +154,7 @@ async fn read_durable_fence(
     let scope = scope.clone();
     let note = note.clone();
     store
-        .with_write_tx(move |tx| {
+        .with_write_tx_for_space(Some(scope.space_id.clone()), move |tx| {
             Box::pin(async move {
                 // The Space lock orders this read after the original transaction,
                 // even when its connection died before delivering the COMMIT reply.

@@ -8,6 +8,7 @@ pub(super) struct CreatedNote {
     parent: FolderId,
     slug: String,
     class: DocClass,
+    folder_page: bool,
     digest: ContentDigest,
 }
 
@@ -18,6 +19,7 @@ impl CreatedNote {
             parent: input.parent.as_ref().unwrap_or(root).clone(),
             slug: input.slug.clone(),
             class: input.class,
+            folder_page: input.folder_page,
             digest,
         }
     }
@@ -42,12 +44,13 @@ impl RecordedNote {
         kind: &str,
         payload: &blake3::Hasher,
     ) -> bool {
-        derive_command_identity_spec(identity, kind, payload.finalize().as_bytes()).command_hash()
+        crate::domain::common::command_identity_hash(identity, kind, payload.finalize().as_bytes())
             == self.hash
     }
 
     fn matches_create(&self, identity: &CommandIdentity, create: &CreatedNote) -> bool {
-        if self.parent_revision.is_some()
+        if create.folder_page
+            || self.parent_revision.is_some()
             || create.parent != self.meta.parent_folder_id
             || create.class != self.meta.doc_class
             || create.slug != self.meta.slug
@@ -235,6 +238,44 @@ impl LegacyNoteCommand<'_> {
         Ok(legacy)
     }
 
+    pub(super) async fn replay_if_present(
+        &self,
+        store: &CanonicalStore,
+        ctx: &SpaceContext,
+        identity: &CommandIdentity,
+        current: &CommandIdentitySpec,
+    ) -> Result<Option<Committed<NoteRevision>>, PortError> {
+        let scope = ctx.scope().clone();
+        let spec = current.clone();
+        let stored_hash = store
+            .with_read_tx_budget(Some(&ctx.budget), |tx| {
+                Box::pin(async move {
+                    Ok(crate::writer::lookup_command_receipt_tx(tx, &scope, &spec)
+                        .await?
+                        .map(|row| row.command_hash))
+                })
+            })
+            .await?;
+        let Some(stored_hash) = stored_hash else {
+            return Ok(None);
+        };
+        if matches!(self, Self::Create(create) if !create.folder_page)
+            && stored_hash == current.command_hash
+        {
+            let replayed = try_replay_completed_receipt::<StoredCommittedNoteRevV1>(
+                store,
+                ctx.scope(),
+                current,
+                Some(&ctx.budget),
+            )
+            .await?;
+            return replayed
+                .map(|value| Ok(Some(value.into_committed())))
+                .unwrap_or_else(|| Err(DomainError::IdempotencyKeyReused.into()));
+        }
+        self.replay(store, ctx, identity, current).await.map(Some)
+    }
+
     pub(super) async fn replay(
         &self,
         store: &CanonicalStore,
@@ -275,7 +316,7 @@ pub(super) async fn link_identity(
     let link = item.input.clone();
     let single = format!("src={}\0line={line}", item.input.source.as_str());
     let single_hash =
-        derive_command_identity_spec(&item.identity, "link", single.as_bytes()).command_hash();
+        crate::domain::common::command_identity_hash(&item.identity, "link", single.as_bytes());
     let expected_parent = item.preconditions.revision.clone();
     let (stored_hash, base): (ContentDigest, Option<Vec<u8>>) = store.with_read_tx_budget(Some(&ctx.budget), |tx| Box::pin(async move {
         let mismatch = || PortError::from(DomainError::IdempotencyKeyReused);
@@ -315,7 +356,7 @@ pub(super) async fn link_identity(
             item.input.source.as_str(),
             hex::encode(base)
         );
-        if derive_command_identity_spec(&item.identity, "link", batch.as_bytes()).command_hash()
+        if crate::domain::common::command_identity_hash(&item.identity, "link", batch.as_bytes())
             != stored_hash
         {
             return Err(DomainError::IdempotencyKeyReused.into());

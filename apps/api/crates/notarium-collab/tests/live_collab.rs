@@ -912,6 +912,7 @@ async fn policy_edges(store: &CanonicalStore) {
                 mutation(
                     &owner,
                     CreateNote {
+                        folder_page: false,
                         note: note.clone(),
                         parent: None,
                         slug: format!("non-collaborative-{seed}"),

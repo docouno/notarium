@@ -1,5 +1,5 @@
 //! Provider configuration and wire-independent conversation contracts.
-use super::{PortFuture, context::*, control::*};
+use super::{PortFuture, context::*, control::*, infrastructure::RevocationSelector};
 use crate::{
     DomainError, DomainResult,
     auth::SecretString,
@@ -355,17 +355,28 @@ pub enum ProviderToolSchema {
         choices: Vec<String>,
     },
     Number,
-    Integer,
+    Integer {
+        minimum: Option<i64>,
+        maximum: Option<i64>,
+    },
     Boolean,
+    ConstBool(bool),
     Null,
     Array {
         items: Box<ProviderToolSchema>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        minimum: Option<u32>,
         maximum: u32,
     },
     Object {
         properties: BTreeMap<String, ProviderToolSchema>,
         required: BTreeSet<String>,
     },
+    Map {
+        values: Box<ProviderToolSchema>,
+    },
+    JsonValue,
+    AnyOf(Vec<ProviderToolSchema>),
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ProviderToolDefinition {
@@ -394,6 +405,14 @@ pub enum CompletionFinish {
     Length,
     ToolCalls,
     ContentFilter,
+}
+impl CompletionFinish {
+    pub fn interruption(self) -> Option<Self> {
+        match self {
+            Self::Length | Self::ContentFilter => Some(self),
+            Self::Stop | Self::ToolCalls => None,
+        }
+    }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ProviderDeliveryState {
@@ -563,26 +582,89 @@ pub trait ProviderAdminPort: Send + Sync {
     ) -> PortFuture<'_, ProviderConnectionStatus>;
 }
 
-/// The canonical owner pins current metadata and excludes class, lifecycle and
-/// provenance changes until dispatch releases this lease. Mutations may cancel
-/// the supplied operation and wait for its lease to drop. No body crosses this port.
+/// The selected live model's completion capabilities, exposed without its
+/// provider address, credential material, or wire configuration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompletionModelLimits {
+    pub max_input_tokens: u32,
+    pub max_output_tokens: u32,
+    pub supports_tools: bool,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderRevocationScope {
+    pub owner: PrincipalId,
+    pub credential: Option<CredentialId>,
+}
+impl ProviderRevocationScope {
+    pub fn selectors(&self, resource: &ProviderResourceId) -> BTreeSet<RevocationSelector> {
+        let mut selectors = BTreeSet::from([
+            RevocationSelector::ProviderResource(resource.clone()),
+            RevocationSelector::Principal(self.owner.clone()),
+        ]);
+        if let Some(credential) = &self.credential {
+            selectors.insert(RevocationSelector::Credential(credential.clone()));
+        }
+        selectors
+    }
+}
+
+/// The canonical owner verifies current metadata (class, lifecycle, provenance,
+/// project ancestry and current ability revisions) atomically under a short
+/// read-only snapshot. On local SQLite, an in-memory Space disclosure pin
+/// excludes local canonical mutations until `mark_dispatched()` / `close()`.
+/// On Cloud PostgreSQL, the read-only snapshot returns to the pool immediately
+/// after verification so upstream network I/O never holds PG connections or row
+/// locks, while Control revocations cancel in-flight calls synchronously through
+/// `RevocationHub`. No body crosses this port.
 pub trait ProviderEgressLease: Send {
+    /// Exactly one result per requested origin, in the original request order.
     fn current(&self) -> &[ProviderCurrentContent];
-    /// The canonical owner verifies this active project and pins its lifecycle
-    /// even when the call contains only trusted orchestration instructions.
+    /// The canonical owner verifies this active project under its egress
+    /// snapshot (and excludes local canonical mutations on SQLite until
+    /// `mark_dispatched()` / `close()`), even when the call contains only
+    /// trusted orchestration instructions.
     fn project(&self) -> Option<&FolderRef>;
-    /// Scoped query folders verified inside this project. The lease pins their
-    /// active ancestry until dispatch finishes or is cancelled.
+    fn secondary_projects(&self) -> &[FolderRef];
+    /// The transport accepted the encoded request body. Release any retained
+    /// local SQLite disclosure pin cleanly before waiting for upstream response
+    /// headers; keep revocation registration active until socket close.
+    fn mark_dispatched(&mut self) -> PortFuture<'_, ()>;
+    /// Cleanly release any retained local disclosure pin on teardown without
+    /// marking the call dispatched (for example, on pre-send validation failure).
+    fn close(&mut self) -> PortFuture<'_, ()>;
+    /// Scoped query folders verified inside this project under the canonical
+    /// egress snapshot (and pinned against local mutations on SQLite until
+    /// `mark_dispatched()` / `close()`).
     fn project_folders(&self) -> &BTreeSet<FolderId>;
     fn check(&self) -> DomainResult<()>;
 }
 #[derive(Clone, Debug)]
 pub struct ProviderEgressRequest {
     pub origins: Vec<ProviderOrigin>,
+    pub primary: crate::model::HistoryScope,
     pub project: Option<FolderRef>,
+    pub secondary_projects: Vec<FolderRef>,
     pub project_folders: BTreeSet<FolderId>,
 }
+pub const MAX_PROVIDER_ORIGINS: usize = 4096;
+pub const MAX_PROVIDER_SECONDARY_PROJECTS: usize = 64;
+pub const MAX_PROVIDER_SOURCE_SPACES: usize = 64;
+
+#[derive(Clone, Debug, Default)]
+pub struct ProviderEgressDependencies {
+    pub origins: Vec<ProviderOrigin>,
+    pub projects: Vec<FolderRef>,
+}
+
 pub trait ProviderEgressCatalogPort: Send + Sync {
+    /// Discover additional identities and projects reachable from exact chat
+    /// origins. The dispatch snapshot will revalidate every root and edge.
+    fn chat_dependencies(
+        &self,
+        ctx: AccountContext,
+        roots: Vec<ProviderOrigin>,
+    ) -> PortFuture<'_, ProviderEgressDependencies>;
+
     fn acquire_egress(
         &self,
         ctx: AccountContext,

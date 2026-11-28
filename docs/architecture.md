@@ -25,6 +25,8 @@ commands to provide structural snapshots, note lists, declarative note views
 and graph reads. The [search engine](search.md) subscribes independently
 to canonical changes and consumes the structural read port.
 [Live collaboration](collab.md) provides transport-independent Yrs rooms, durable peer updates and live canonical command interception.
+The [agent library](agents.md) shares one in-process registry across external MCP,
+supervised chats and scheduled Keepers through the engine and control ports.
 
 ## Internal dependency allowlist
 
@@ -53,7 +55,7 @@ tests invoke compiled binaries as external processes. HTTP cannot directly impor
 canonical/projections/search/jobs. Agents cannot directly depend on `tantivy`,
 `ort` or `yrs`. Core has no internal dependencies or I/O behavior. A separate
 native gate rejects parser, storage and runtime dependencies in core, including
-renamed, optional, target, development and build declarations. Core, syntax, canonical and collab all use `forbid(unsafe_code)` so inner modules cannot
+renamed, optional, target, development and build declarations. Core, syntax, control, canonical, collab and agents all use `forbid(unsafe_code)` so inner modules cannot
 override the workspace rule.
 
 Native tests inspect `cargo metadata --no-deps` using package identities and paths,
@@ -62,8 +64,9 @@ declarations. All workspace dependencies must be inherited by an owning crate an
 locked for offline setup. `Cargo.lock` must contain none of `openssl-sys`,
 `native-tls`, `aws-lc-sys`, `cmake`, `cxx`, `usearch` or `tikv-jemalloc-sys`.
 
-TLS uses rustls 0.23 with ring, reqwest 0.13 with `rustls-no-provider`, and tonic
-0.14 with `tls-ring`. Dependencies build in the pinned Rust image without adding
+TLS uses rustls 0.23 with ring (via hyper 1, tokio-rustls 0.26, and
+rustls-platform-verifier 0.7 in `notarium-control`), reqwest 0.13 with
+`rustls-no-provider`, and tonic 0.14 with `tls-ring`. Dependencies build in the pinned Rust image without adding
 C++/OpenSSL tools. Core and syntax tests exercise domain and document behavior.
 Canonical tests exercise dual-dialect storage and CAS. Control storage tests its
 SQL schema, target import/export, authentication, Space authority and crash
@@ -77,6 +80,8 @@ SIMD modules (`mmap_segment.rs` and `simd.rs`), forbids unsafe overrides across
 its remaining modules and safe vector submodules, and gates internal test
 helpers behind `test-support` enforced by `fitness-gates`.
 Collaboration tests cover wire framing, CRDT policy, carrier round-trips and dual-dialect room recovery.
+Agent tests cover tool schemas, stream replay and calendar rules. Fitness tests
+exercise agent services with SQLite, PostgreSQL and offline provider fixtures.
 
 `notarium-control` owns a 45-table baseline in SQLite and the PostgreSQL
 `v1_control` schema. Its typed target records support offline import and paged
@@ -88,9 +93,9 @@ authorization server, and `OidcService` verifies external identity and issues
 native sessions through explicit account bindings. `ProviderService` implements
 encrypted provider configuration, current disclosure admission, bounded completion
 and embedding calls, and durable spending reservations. `ControlPlane` composes that provider with
-its matching account-state service. Episodes, reference contexts, ability overlays,
-schedule claims and content-free telemetry are implemented without a tool loop
-or ticker. `ControlBackup` implements the control participant's writer fence,
+its matching account-state service. Control owns episodes, reference contexts,
+ability overlays, schedule claims and content-free telemetry. Agents owns the
+tool loop and ticker. `ControlBackup` implements the control participant's writer fence,
 pinned snapshots, stable artifacts and cursor rebinding. A paired canonical/control
 backup and archive coordinator remains a separate integration. See
 [control services](control.md).

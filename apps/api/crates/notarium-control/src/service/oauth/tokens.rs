@@ -76,6 +76,7 @@ async fn issue(
         refresh_id: refresh.as_ref().and_then(|r| r.id.clone()),
         resource_uri: grant.resource_uri.clone(),
         scope: grant.scope.clone(),
+        ability_write: grant.ability_write,
         selected_spaces: grant.selected_spaces.clone(),
         issued_at: now,
         expires_at: expires,
@@ -92,6 +93,7 @@ async fn issue(
         scope: OAuthScope {
             access: validation::stored_scope(&grant.scope)?,
             offline_access: family.is_some(),
+            ability_write: grant.ability_write == 1,
         },
         grant: OAuthGrantId::parse(&grant.grant_id)?,
         family: family.cloned(),
@@ -102,16 +104,18 @@ async fn revoke_family(
     row: &OauthRefreshFamiliesRow,
     now: i64,
     reason: &str,
-) -> Result<Vec<RequestId>, PortError> {
+) -> Result<(Vec<RequestId>, Vec<RequestId>), PortError> {
     let selector = RevocationSelector::OAuthFamily(OAuthFamilyId::parse(&row.family_id)?);
     let mut events = outbox::pending(tx, selector.clone()).await?;
+    let mut enqueued = Vec::new();
     if row.revoked_at.is_none() {
         execute!(tx,"UPDATE oauth_refresh_families SET revoked_at=$1,reason_code=$2 WHERE family_id=$3","UPDATE v1_control.oauth_refresh_families SET revoked_at=$1,reason_code=$2 WHERE family_id=$3";now,reason,&row.family_id)?;
-        events.push(
-            outbox::enqueue(tx, selector, RevocationReason::CredentialRemoved, 1, now).await?,
-        );
+        let event =
+            outbox::enqueue(tx, selector, RevocationReason::CredentialRemoved, 1, now).await?;
+        enqueued.push(event.clone());
+        events.push(event);
     }
-    Ok(events)
+    Ok((events, enqueued))
 }
 impl OAuthService {
     pub(super) async fn exchange(
@@ -149,7 +153,7 @@ impl OAuthService {
             } else {None};
             issue(tx.inner_mut(),&grant,family.as_ref(),now).await
         },CommitEffect::NotCommitted).await?;
-        budget.run(tx.commit(), CommitEffect::Unknown).await?;
+        budget.commit_tx(tx).await?;
         Ok(result)
     }
     pub(super) async fn rotate(
@@ -170,7 +174,7 @@ impl OAuthService {
             .transpose()?;
         let budget = OperationBudget::new(call);
         let mut tx = self.control.store.write(budget.clone()).await?;
-        let (result,events)=budget.run(async {
+        let (result,events,enqueued)=budget.run(async {
             let observed=refresh(tx.inner_mut(),id).await?;
             proof(&observed.token_hash,&hash)?;
             let observed_family=family(tx.inner_mut(),&observed.family_id).await?;
@@ -178,16 +182,16 @@ impl OAuthService {
             let user=user(tx.inner_mut(),&observed_grant.user_id).await.map_err(|_|invalid_grant())?;
             let grant=consent(tx.inner_mut(),&observed_family.grant_id).await?;
             let family=lock_family(tx.inner_mut(),&observed.family_id).await?;
-            let current=rows!(tx.inner_mut(),OauthRefreshTokensRow,fetch_one,"SELECT * FROM oauth_refresh_tokens WHERE token_id=$1","SELECT * FROM v1_control.oauth_refresh_tokens WHERE token_id=$1 FOR UPDATE";id)?;
+            let current=rows!(tx.inner_mut(),OauthRefreshTokensRow,fetch_optional,"SELECT * FROM oauth_refresh_tokens WHERE token_id=$1","SELECT * FROM v1_control.oauth_refresh_tokens WHERE token_id=$1 FOR UPDATE";id)?.ok_or_else(invalid_grant)?;
             proof(&current.token_hash,&hash)?;
             let now=self.control.clock.now_ms()?;
             if current.client_id!=request.client_id || current.family_id!=family.family_id || current.expires_at<=now || current.revoked_at.is_some()
                 || grant.client_id!=request.client_id || grant.resource_uri!=request.resource || family.grant_id!=grant.grant_id || grant.revoked_at.is_some() || user.disabled_at.is_some() {return Err(invalid_grant());}
-            let scope=OAuthScope {access:validation::stored_scope(&grant.scope)?,offline_access:true};
+            let scope=OAuthScope {access:validation::stored_scope(&grant.scope)?,offline_access:true,ability_write:grant.ability_write==1};
             if requested_scope.is_some_and(|s|s!=scope) {return Err(rejected(OAuthErrorCode::InvalidScope));}
             if current.used_at.is_some() || current.rotated_to.is_some() || family.revoked_at.is_some() {
-                let events=revoke_family(tx.inner_mut(),&family,now,"refresh_reuse").await?;
-                return Ok((None,events));
+                let (events, enqueued)=revoke_family(tx.inner_mut(),&family,now,"refresh_reuse").await?;
+                return Ok((None,events,enqueued));
             }
             let family_id=OAuthFamilyId::parse(&family.family_id)?;
             let tokens=issue(tx.inner_mut(),&grant,Some(&family_id),now).await?;
@@ -195,10 +199,10 @@ impl OAuthService {
             let successor=successor.ok_or_else(invalid_grant)?;
             let changed=execute!(tx.inner_mut(),"UPDATE oauth_refresh_tokens SET used_at=$1,rotated_to=$2 WHERE token_id=$3 AND used_at IS NULL AND rotated_to IS NULL","UPDATE v1_control.oauth_refresh_tokens SET used_at=$1,rotated_to=$2 WHERE token_id=$3 AND used_at IS NULL AND rotated_to IS NULL";now,successor,id)?;
             if changed!=1 {return Err(invalid_grant());}
-            Ok((Some(tokens),vec![]))
+            Ok((Some(tokens),vec![],vec![]))
         },CommitEffect::NotCommitted).await?;
         self.control
-            .commit_revocations(tx, &budget, &events)
+            .commit_revocations(tx, &budget, &enqueued)
             .await?;
         for event in events {
             self.control.flush_event(&budget, &event).await?;
@@ -227,20 +231,20 @@ impl OAuthService {
         };
         let budget = OperationBudget::new(call);
         let mut tx = self.control.store.write(budget.clone()).await?;
-        let events=budget.run(async {
+        let (events, enqueued)=budget.run(async {
             let (grant_id,family_id)=if kind==TokenKind::Refresh {
                 let row=rows!(tx.inner_mut(),OauthRefreshTokensRow,fetch_optional,"SELECT * FROM oauth_refresh_tokens WHERE token_id=$1","SELECT * FROM v1_control.oauth_refresh_tokens WHERE token_id=$1";id)?;
-                let Some(row)=row else {return Ok(vec![])};
-                if proof(&row.token_hash,&hash).is_err() || row.client_id!=request.client_id {return Ok(vec![]);}
+                let Some(row)=row else {return Ok((vec![], vec![]))};
+                if proof(&row.token_hash,&hash).is_err() || row.client_id!=request.client_id {return Ok((vec![], vec![]));}
                 let family=family(tx.inner_mut(),&row.family_id).await?;
                 (family.grant_id,Some(family.family_id))
             } else {
-                let Some(row)=access(tx.inner_mut(),id).await? else {return Ok(vec![])};
-                if proof(&row.token_hash,&hash).is_err() {return Ok(vec![]);}
+                let Some(row)=access(tx.inner_mut(),id).await? else {return Ok((vec![], vec![]))};
+                if proof(&row.token_hash,&hash).is_err() {return Ok((vec![], vec![]));}
                 (row.grant_id,row.family_id)
             };
             let grant=consent(tx.inner_mut(),&grant_id).await?;
-            if grant.client_id!=request.client_id {return Ok(vec![]);}
+            if grant.client_id!=request.client_id {return Ok((vec![], vec![]));}
             // All token/grant mutations take the same user lock first. A
             // disabled owner may still revoke its own valid token proof.
             user(tx.inner_mut(),&grant.user_id).await?;
@@ -254,15 +258,18 @@ impl OAuthService {
                 proof(&row.token_hash,&hash)?;
                 let selector=RevocationSelector::OAuthAccess(CredentialTokenId::parse(id)?);
                 let mut events=outbox::pending(tx.inner_mut(),selector.clone()).await?;
+                let mut enqueued=Vec::new();
                 if row.revoked_at.is_none() {
                     execute!(tx.inner_mut(),"UPDATE oauth_access_tokens SET revoked_at=$1 WHERE token_id=$2","UPDATE v1_control.oauth_access_tokens SET revoked_at=$1 WHERE token_id=$2";now,id)?;
-                    events.push(outbox::enqueue(tx.inner_mut(),selector,RevocationReason::CredentialRemoved,1,now).await?);
+                    let event = outbox::enqueue(tx.inner_mut(),selector,RevocationReason::CredentialRemoved,1,now).await?;
+                    enqueued.push(event.clone());
+                    events.push(event);
                 }
-                Ok(events)
+                Ok((events, enqueued))
             }
         },CommitEffect::NotCommitted).await?;
         self.control
-            .commit_revocations(tx, &budget, &events)
+            .commit_revocations(tx, &budget, &enqueued)
             .await?;
         for event in events {
             self.control.flush_event(&budget, &event).await?;

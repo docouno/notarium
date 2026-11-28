@@ -384,13 +384,8 @@ async fn detached_postgres_purge_retries_missing_and_reset_generations() {
 async fn postgres_writer_takeover_requires_registered_eraser_after_reopen() {
     let scratch = Scratch::new();
     let root = scratch.root();
-    let successor_scratch = Scratch::new();
-    let successor_root = successor_scratch.root();
     let (config, pool, canonical_schema, prefix) = postgres_fixture(&root).await;
-    let mut successor_config = config.clone();
-    successor_config.blobs = BlobBackendConfig::Local {
-        data_root: successor_root.clone(),
-    };
+    let successor_config = config.clone();
     let (original, writer) = CanonicalRuntime::open(config).await.unwrap();
     // This process has already booted before the first projector registers.
     let (successor, next_writer) = CanonicalRuntime::open(successor_config.clone())
@@ -446,14 +441,6 @@ async fn postgres_writer_takeover_requires_registered_eraser_after_reopen() {
     writer.shutdown().await.unwrap();
     drop(original);
 
-    // The PG fixture gives each process an exclusively owned local CAS.
-    // Hand off the Space's carriers with its writer authority.
-    let space_blobs = Path::new("blobs").join(scope.space_id.as_str());
-    std::fs::rename(
-        root.root().join(&space_blobs),
-        successor_root.root().join(space_blobs),
-    )
-    .unwrap();
     successor
         .advance_space_lease(&revocation, scope, LeaseEpoch::new(2).unwrap())
         .await
@@ -604,7 +591,7 @@ async fn offline_pg_cache_substitution_needs_exact_volume_to_finish_purge() {
     pool.close().await;
 }
 
-async fn s3_blob_backend() -> BlobBackendConfig {
+pub(super) async fn s3_blob_backend_for_prefix(prefix: &str) -> BlobBackendConfig {
     use notarium_canonical::{
         S3AddressingStyle, S3BucketModePolicy, S3Config, S3Credentials,
         blobs::s3::admin_ensure_bucket,
@@ -623,10 +610,10 @@ async fn s3_blob_backend() -> BlobBackendConfig {
         .into_iter()
         .find(|path| path.exists())
         .unwrap();
-    let config = S3Config {
+    let mut config = S3Config {
         endpoint: fixture.s3_endpoint,
         region: fixture.s3_region,
-        bucket: format!("notarium-projection-{}", hex::encode(&entropy()[..6])),
+        bucket: "notarium-test-shared".to_owned(),
         application_prefix: String::new(),
         addressing: S3AddressingStyle::PathStyle,
         credentials: S3Credentials {
@@ -639,8 +626,18 @@ async fn s3_blob_backend() -> BlobBackendConfig {
         bucket_mode_policy: S3BucketModePolicy::DetectFromBucket,
         request_timeout: Duration::from_secs(10),
     };
-    admin_ensure_bucket(&config, Some("Enabled")).await.unwrap();
+    static BUCKET_READY: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+    BUCKET_READY
+        .get_or_init(|| async {
+            admin_ensure_bucket(&config, Some("Enabled")).await.unwrap();
+        })
+        .await;
+    config.application_prefix = format!("{prefix}/");
     BlobBackendConfig::S3(Box::new(config))
+}
+
+async fn s3_blob_backend() -> BlobBackendConfig {
+    s3_blob_backend_for_prefix(&format!("projection-{}", hex::encode(&entropy()[..6]))).await
 }
 
 #[tokio::test]

@@ -37,6 +37,7 @@ pub enum ValidationReason {
     ClassMismatch,
     ClassEgressForbidden,
     ProviderConsentRequired,
+    ProviderContentFiltered,
     ProtectedField,
     InvalidPathComponent,
     FilenameTooLong,

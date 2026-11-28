@@ -25,6 +25,7 @@ impl FenceCensusFixture {
             parent,
             lifecycle: Lifecycle::Active,
             write_locked: false,
+            is_project: false,
         })
     }
 

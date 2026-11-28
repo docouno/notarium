@@ -53,8 +53,7 @@ use notarium_core::{
         DeleteDisposition, DeleteNote, EditNote, EmptyRootAuthorization, EvaluatedBoardGroup,
         EvaluatedBoardRow, GetNote, GroupKey, MaintenanceContext, MoveBoardCard, MoveFolder,
         Mutation, NoteRevision, NoteWritePort, PageLimit, PortFuture, Preconditions,
-        RankExpectation, RankNeighbor, RollbackAgentRun, RollbackBoardFacts,
-        RollbackBoardFactsRequest, SemanticPlacement, ServiceAuthority, ServicePurpose,
+        RankExpectation, RankNeighbor, SemanticPlacement, ServiceAuthority, ServicePurpose,
         SpaceContext, ViewRef,
     },
     receipt::{CausalBasis, CommandIdentity, ReceiptSet},
@@ -879,6 +878,7 @@ async fn run_writer_benchmark_case(
                     &space.scope,
                     &actor,
                     CreateNote {
+                        folder_page: false,
                         note: nid.clone(),
                         parent: None,
                         slug: format!("writer-note-{w}"),
@@ -1132,8 +1132,6 @@ struct PreparedRollbackTemplate {
     scope: HistoryScope,
     owner: PrincipalId,
     run_id: AgentRunId,
-    expected_run_rev: RevisionId,
-    expected_entities: Vec<NoteRevision>,
     rooms: Vec<RollbackRoomExpectation>,
 }
 
@@ -1183,8 +1181,6 @@ async fn seed_rollback_microfixture(store: &CanonicalStore) -> PreparedRollbackT
     let foreign_ctx = owner_ctx(&space.scope, other_human.clone());
     let run_ctx = agent_run_ctx(&human_ctx, run_id.clone());
 
-    let mut expected_entities = Vec::new();
-
     // 18 pre-existing notes
     let mut edited_notes = Vec::with_capacity(18);
     for i in 0..18usize {
@@ -1201,6 +1197,7 @@ async fn seed_rollback_microfixture(store: &CanonicalStore) -> PreparedRollbackT
                     &space.scope,
                     &owner,
                     CreateNote {
+                        folder_page: false,
                         note: nid.clone(),
                         parent: None,
                         slug: format!("pre-note-{i}"),
@@ -1225,6 +1222,7 @@ async fn seed_rollback_microfixture(store: &CanonicalStore) -> PreparedRollbackT
                 &space.scope,
                 &owner,
                 CreateNote {
+                    folder_page: false,
                     note: deleted_nid.clone(),
                     parent: None,
                     slug: "colliding-target".to_owned(),
@@ -1279,7 +1277,7 @@ async fn seed_rollback_microfixture(store: &CanonicalStore) -> PreparedRollbackT
                 vec![(CarrierEditOrigin::Body, span, manual_b)],
             )
             .unwrap();
-            let man_ed = store
+            let _man_ed = store
                 .edit_note(
                     foreign_ctx.clone(),
                     next_mutation(
@@ -1293,22 +1291,17 @@ async fn seed_rollback_microfixture(store: &CanonicalStore) -> PreparedRollbackT
                 )
                 .await
                 .unwrap();
-            expected_entities.push(NoteRevision {
-                note: nid.clone(),
-                revision: man_ed.value.revision,
-            });
         } else {
             let edited = NoteRevision {
                 note: nid.clone(),
                 revision: latest_rev.unwrap(),
             };
-            expected_entities.push(edited.clone());
             room_inputs.push((edited, original.revision.clone(), original_digest));
         }
     }
 
     // Agent run trashes `deleted_nid` (`slug = "colliding-target"`) first...
-    let trashed = store
+    let _trashed = store
         .delete_note(
             run_ctx.clone(),
             next_mutation(
@@ -1322,10 +1315,6 @@ async fn seed_rollback_microfixture(store: &CanonicalStore) -> PreparedRollbackT
         )
         .await
         .unwrap();
-    expected_entities.push(NoteRevision {
-        note: deleted_nid,
-        revision: trashed.value.revision,
-    });
 
     // ...and then creates 2 new 4 KiB notes, with `c == 0` occupying `slug = "colliding-target"`
     // so rollback must trash run-created notes before restoring `deleted_nid` at its original slug.
@@ -1341,13 +1330,14 @@ async fn seed_rollback_microfixture(store: &CanonicalStore) -> PreparedRollbackT
         } else {
             format!("run-created-{c}")
         };
-        let cr = store
+        let _cr = store
             .create_note(
                 run_ctx.clone(),
                 next_mutation(
                     &space.scope,
                     &owner,
                     CreateNote {
+                        folder_page: false,
                         note: nid.clone(),
                         parent: None,
                         slug,
@@ -1358,22 +1348,7 @@ async fn seed_rollback_microfixture(store: &CanonicalStore) -> PreparedRollbackT
             )
             .await
             .unwrap();
-        expected_entities.push(NoteRevision {
-            note: nid,
-            revision: cr.value.revision,
-        });
     }
-
-    // Build the rollback precondition with the fixture's call budget before timing the command.
-    let expected_run_rev = store
-        .inspect_agent_run_revision_with_budget_for_test(
-            &space.scope.space_id,
-            &run_id,
-            Some(&run_ctx.budget),
-        )
-        .await
-        .unwrap()
-        .expect("agent run revision");
 
     let mut rooms = Vec::with_capacity(room_inputs.len());
     let budget = make_budget();
@@ -1408,6 +1383,7 @@ async fn seed_rollback_microfixture(store: &CanonicalStore) -> PreparedRollbackT
                     final_yrs_snapshot: None,
                     compacted_through_update_seq: None,
                     carrier_settlement: None,
+                    unchanged_carrier_digest: None,
                 },
             )
             .await
@@ -1433,8 +1409,6 @@ async fn seed_rollback_microfixture(store: &CanonicalStore) -> PreparedRollbackT
         scope: space.scope,
         owner,
         run_id,
-        expected_run_rev,
-        expected_entities,
         rooms,
     }
 }
@@ -1462,16 +1436,7 @@ async fn measure_fresh_rollbacks(
             )
             .await
             .unwrap();
-        let request = next_mutation(
-            &fixture.scope,
-            &fixture.owner,
-            RollbackAgentRun {
-                run: fixture.run_id,
-                expected_run_revision: fixture.expected_run_rev,
-                expected_entities: fixture.expected_entities,
-                associated_board_expectations: Vec::new(),
-            },
-        );
+        let request = next_mutation(&fixture.scope, &fixture.owner, fixture.run_id);
         let before = store
             .read_space(&fixture.scope.space_id)
             .await
@@ -1480,7 +1445,7 @@ async fn measure_fresh_rollbacks(
         let rollback_ctx = ctx.clone();
         let start = Instant::now();
         let result = store
-            .rollback_agent_run(rollback_ctx, request)
+            .rollback_agent_run_by_id(rollback_ctx, request)
             .await
             .unwrap();
         let elapsed = start.elapsed();
@@ -1619,28 +1584,18 @@ async fn run_sqlite_rollback_benchmark(
 
 async fn run_pg_rollback_benchmark(
     fixtures: &BenchFixtures,
-    work_root: &Path,
-    use_s3: bool,
     iterations: usize,
-    local_p95_limit_us: u32,
+    p95_limit_us: Option<u32>,
 ) -> RollbackProfileMetrics {
-    let tag = if use_s3 { "rbs3" } else { "rbloc" };
-    let live_schema = fixtures.fresh_pg_schema(tag);
-    let local_dir = work_root.join(format!("pg-{tag}-cas"));
-    let _ = fs::remove_dir_all(&local_dir);
-    fs::create_dir_all(&local_dir).unwrap();
+    let live_schema = fixtures.fresh_pg_schema("rbs3");
 
-    let blobs_cfg = if use_s3 {
-        let bucket = fixtures.fresh_s3_bucket(tag);
+    let blobs_cfg = {
+        let bucket = fixtures.fresh_s3_bucket("rbs3");
         let s3_cfg = fixtures.s3_config(bucket);
         admin_ensure_bucket(&s3_cfg, Some("Enabled"))
             .await
             .expect("ensure benchmark S3 bucket");
         BlobBackendConfig::S3(Box::new(s3_cfg))
-    } else {
-        BlobBackendConfig::Local {
-            data_root: DataRoot::new(&local_dir),
-        }
     };
 
     let cfg = CanonicalConfig {
@@ -1653,21 +1608,15 @@ async fn run_pg_rollback_benchmark(
     };
 
     let (store, rt) = CanonicalRuntime::open(cfg).await.unwrap();
-    let backend = if use_s3 {
-        "postgres16_sync+s3_chunked_v1_uds"
-    } else {
-        "postgres16_sync+local_zstd_v1"
-    };
     let metrics = measure_fresh_rollbacks(
         &store,
-        backend,
+        "postgres16_sync+s3_chunked_v1_uds",
         iterations,
-        (!use_s3).then_some(local_p95_limit_us),
+        p95_limit_us,
     )
     .await;
     rt.shutdown().await.unwrap();
     fixtures.drop_pg_schema(&live_schema).await;
-    fs::remove_dir_all(local_dir).unwrap();
     metrics
 }
 
@@ -1753,6 +1702,11 @@ async fn seed_chat_windows(
                     scope,
                     owner,
                     AppendChat {
+                        tool_calls: Vec::new(),
+                        provenance: None,
+                        interruption: None,
+                        proposed_diff: None,
+                        proposed_effect: None,
                         thread: thread.clone(),
                         parent,
                         kind: if turn % 2 == 0 {
@@ -2077,15 +2031,6 @@ impl BoardMutationFactsProvider for FastBenchBoardPlanner {
             ))
         })
     }
-
-    fn evaluate_rollback<'a>(
-        &'a self,
-        _authority: &'a BoardPlannerAuthority,
-        _ctx: SpaceContext,
-        _request: RollbackBoardFactsRequest,
-    ) -> PortFuture<'a, RollbackBoardFacts> {
-        Box::pin(async move { unreachable!("unused in board first-slot benchmark") })
-    }
 }
 
 async fn run_board_first_slot_benchmark(
@@ -2139,6 +2084,7 @@ async fn measure_board_moves(
                 &space.scope,
                 &owner,
                 CreateNote {
+                    folder_page: false,
                     note: view_nid.clone(),
                     parent: None,
                     slug: "kanban".to_owned(),
@@ -2171,6 +2117,7 @@ async fn measure_board_moves(
                     &space.scope,
                     &owner,
                     CreateNote {
+                        folder_page: false,
                         note: nid.clone(),
                         parent: None,
                         slug: slug.clone(),
@@ -2805,6 +2752,12 @@ async fn paired_profiles(
     let schema = fixtures.fresh_pg_schema("paired");
     let (control_db, keyring) = if postgres {
         cfg.sql = SqlBackendConfig::postgres_default(fixtures.pg_connect(), &schema);
+        let bucket = fixtures.fresh_s3_bucket("paired");
+        let s3_cfg = fixtures.s3_config(bucket);
+        admin_ensure_bucket(&s3_cfg, Some("Enabled"))
+            .await
+            .expect("ensure paired benchmark S3 bucket");
+        cfg.blobs = BlobBackendConfig::S3(Box::new(s3_cfg));
         cfg.default_backup_budget = notarium_canonical::config::default_postgres_backup_budget();
         let db = ControlStore::postgres(PostgresConfig::unix_socket(
             fixtures.pg_socket_dir.clone(),
@@ -3122,25 +3075,7 @@ async fn d3(budgets: D3Budgets) {
         rb_sqlite.latency.max_us,
     );
     tokio::time::sleep(Duration::from_millis(3000)).await;
-    let rb_pg_local =
-        run_pg_rollback_benchmark(&fixtures, &work_root, false, rb_iters, budgets.postgres_us)
-            .await;
-    eprintln!(
-        "[D3]   -> PG16+Local   min={:.1} us, p50={:.1} us, p95={:.1} us, p99={:.1} us, max={:.1} us",
-        rb_pg_local.latency.min_us,
-        rb_pg_local.latency.p50_us,
-        rb_pg_local.latency.p95_us,
-        rb_pg_local.latency.p99_us,
-        rb_pg_local.latency.max_us,
-    );
-    let rb_pg_s3 = run_pg_rollback_benchmark(
-        &fixtures,
-        &work_root,
-        true,
-        rb_s3_iters,
-        budgets.postgres_us,
-    )
-    .await;
+    let rb_pg_s3 = run_pg_rollback_benchmark(&fixtures, rb_s3_iters, None).await;
     eprintln!(
         "[D3]   -> PG16+S3(UDS) min={:.1} us, p50={:.1} us, p95={:.1} us, p99={:.1} us, max={:.1} us",
         rb_pg_s3.latency.min_us,
@@ -3149,7 +3084,7 @@ async fn d3(budgets: D3Budgets) {
         rb_pg_s3.latency.p99_us,
         rb_pg_s3.latency.max_us,
     );
-    let rollback_profiles = vec![rb_sqlite, rb_pg_local, rb_pg_s3];
+    let rollback_profiles = vec![rb_sqlite, rb_pg_s3];
 
     // 2. Writer 50w/0r & 50w/200r
     tokio::time::sleep(Duration::from_millis(5500)).await;
@@ -3216,14 +3151,14 @@ async fn d3(budgets: D3Budgets) {
     }
     {
         let pg_schema = fixtures.fresh_pg_schema("chat");
-        let chat_pg_dir = work_root.join("chat-pg-cas");
-        fs::create_dir_all(&chat_pg_dir).unwrap();
+        let s3_cfg = fixtures.s3_config(fixtures.fresh_s3_bucket("chat"));
+        admin_ensure_bucket(&s3_cfg, Some("Enabled"))
+            .await
+            .expect("ensure chat benchmark S3 bucket");
         let (st, rt) = CanonicalRuntime::open(CanonicalConfig {
             installation_id: InstallationId::from_bytes([0x59; 16]),
             sql: SqlBackendConfig::postgres_default(fixtures.pg_connect(), &pg_schema),
-            blobs: BlobBackendConfig::Local {
-                data_root: DataRoot::new(&chat_pg_dir),
-            },
+            blobs: BlobBackendConfig::S3(Box::new(s3_cfg)),
             writer: WriterConfig::default(),
             snapshot_retention: Duration::from_secs(300),
             default_backup_budget: notarium_canonical::config::default_postgres_backup_budget(),
@@ -3233,7 +3168,7 @@ async fn d3(budgets: D3Budgets) {
         chat_read_profiles.extend(
             run_chat_read_benchmarks_for_store(
                 &st,
-                "postgres16_sync+local_zstd_v1",
+                "postgres16_sync+s3_chunked_v1_uds",
                 chat_turns,
                 chat_reads,
                 Some((&fixtures, &pg_schema)),
@@ -3242,7 +3177,6 @@ async fn d3(budgets: D3Budgets) {
         );
         rt.shutdown().await.unwrap();
         fixtures.drop_pg_schema(&pg_schema).await;
-        let _ = fs::remove_dir_all(&chat_pg_dir);
     }
     for cp in &chat_read_profiles {
         eprintln!(
@@ -3280,14 +3214,14 @@ async fn d3(budgets: D3Budgets) {
     }
     {
         let pg_schema = fixtures.fresh_pg_schema("board");
-        let b_dir = work_root.join("board-pg-cas");
-        fs::create_dir_all(&b_dir).unwrap();
+        let s3_cfg = fixtures.s3_config(fixtures.fresh_s3_bucket("board"));
+        admin_ensure_bucket(&s3_cfg, Some("Enabled"))
+            .await
+            .expect("ensure board benchmark S3 bucket");
         let (st, rt) = CanonicalRuntime::open(CanonicalConfig {
             installation_id: InstallationId::from_bytes([0x69; 16]),
             sql: SqlBackendConfig::postgres_default(fixtures.pg_connect(), &pg_schema),
-            blobs: BlobBackendConfig::Local {
-                data_root: DataRoot::new(&b_dir),
-            },
+            blobs: BlobBackendConfig::S3(Box::new(s3_cfg)),
             writer: WriterConfig::default(),
             snapshot_retention: Duration::from_secs(300),
             default_backup_budget: notarium_canonical::config::default_postgres_backup_budget(),
@@ -3295,11 +3229,11 @@ async fn d3(budgets: D3Budgets) {
         .await
         .unwrap();
         board_first_slot_profiles.push(
-            run_board_first_slot_benchmark(&st, "postgres16_sync+local_zstd_v1", board_moves).await,
+            run_board_first_slot_benchmark(&st, "postgres16_sync+s3_chunked_v1_uds", board_moves)
+                .await,
         );
         rt.shutdown().await.unwrap();
         fixtures.drop_pg_schema(&pg_schema).await;
-        let _ = fs::remove_dir_all(&b_dir);
     }
     for bp in &board_first_slot_profiles {
         if let Some(failure) = &bp.failure {
@@ -3349,14 +3283,14 @@ async fn d3(budgets: D3Budgets) {
     }
     {
         let pg_schema = fixtures.fresh_pg_schema("folder");
-        let f_dir = work_root.join("folder-pg-cas");
-        fs::create_dir_all(&f_dir).unwrap();
+        let s3_cfg = fixtures.s3_config(fixtures.fresh_s3_bucket("folder"));
+        admin_ensure_bucket(&s3_cfg, Some("Enabled"))
+            .await
+            .expect("ensure folder benchmark S3 bucket");
         let (st, rt) = CanonicalRuntime::open(CanonicalConfig {
             installation_id: InstallationId::from_bytes([0x7B; 16]),
             sql: SqlBackendConfig::postgres_default(fixtures.pg_connect(), &pg_schema),
-            blobs: BlobBackendConfig::Local {
-                data_root: DataRoot::new(&f_dir),
-            },
+            blobs: BlobBackendConfig::S3(Box::new(s3_cfg)),
             writer: WriterConfig::default(),
             snapshot_retention: Duration::from_secs(300),
             default_backup_budget: notarium_canonical::config::default_postgres_backup_budget(),
@@ -3366,7 +3300,7 @@ async fn d3(budgets: D3Budgets) {
         folder_move_profiles.push(
             run_folder_100k_move_benchmark(
                 &st,
-                "postgres16_sync+local_zstd_v1",
+                "postgres16_sync+s3_chunked_v1_uds",
                 desc_folders,
                 desc_notes,
                 folder_moves,
@@ -3375,7 +3309,6 @@ async fn d3(budgets: D3Budgets) {
         );
         rt.shutdown().await.unwrap();
         fixtures.drop_pg_schema(&pg_schema).await;
-        let _ = fs::remove_dir_all(&f_dir);
     }
     for fp in &folder_move_profiles {
         if let Some(failure) = &fp.failure {

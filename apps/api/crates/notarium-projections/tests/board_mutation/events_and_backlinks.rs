@@ -64,6 +64,7 @@ async fn project_note(
             mutation(
                 owner,
                 CreateNote {
+                    folder_page: false,
                     note: NoteId::from_bytes(random_bytes()),
                     parent: Some(project.clone()),
                     slug: slug.into(),
@@ -160,6 +161,11 @@ pub(super) async fn exercise(store: &CanonicalStore, runtime: &ProjectorRuntime)
             mutation(
                 &owner,
                 AppendChat {
+                    tool_calls: Vec::new(),
+                    interruption: None,
+                    provenance: None,
+                    proposed_diff: None,
+                    proposed_effect: None,
                     thread: thread.clone(),
                     parent: ThreadEntrySeq::ZERO,
                     kind: ChatEntryKind::Human,
@@ -361,6 +367,11 @@ pub(super) async fn exercise_restored_target(
             mutation(
                 &source_ctx,
                 AppendChat {
+                    tool_calls: Vec::new(),
+                    interruption: None,
+                    provenance: None,
+                    proposed_diff: None,
+                    proposed_effect: None,
                     thread: thread.clone(),
                     parent: ThreadEntrySeq::ZERO,
                     kind: ChatEntryKind::Human,

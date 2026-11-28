@@ -15,13 +15,54 @@ use crate::{
     },
 };
 use notarium_core::{
-    auth::{SpaceKind, SpaceLifecycle},
+    auth::{Space, SpaceKind, SpaceLifecycle},
     error::{CommitEffect, PortError, ValidationReason},
     ids::*,
+    model::HistoryScope,
     ports::{control::*, *},
     receipt::AccountCommandIdentity,
 };
 use serde::{Deserialize, Serialize};
+
+#[derive(Serialize, Deserialize)]
+struct SpaceReceipt(
+    Space,
+    HistoryScope,
+    SpaceSeq,
+    #[serde(default)] Option<String>,
+);
+
+#[cfg(test)]
+#[test]
+fn old_space_receipts_decode_without_a_slug() {
+    let id = SpaceId::from_bytes([1; 16]);
+    let history = HistoryScope {
+        space_id: id.clone(),
+        incarnation: HistoryIncarnation::from_bytes([2; 16]),
+    };
+    let space = Space {
+        id,
+        kind: SpaceKind::Shared,
+        lifecycle: SpaceLifecycle::Active,
+    };
+    let raw = serde_json::to_string(&(&space, &history, SpaceSeq::ZERO)).unwrap();
+    let SpaceReceipt(stored_space, stored_history, last_seq, slug) =
+        serde_json::from_str(&raw).unwrap();
+    assert_eq!(stored_space, space);
+    assert_eq!(stored_history, history);
+    assert_eq!(last_seq, SpaceSeq::ZERO);
+    assert!(slug.is_none());
+}
+
+pub(super) fn save_space_receipt(value: &CatalogSpace) -> Result<String, PortError> {
+    serde_json::to_string(&SpaceReceipt(
+        value.space.clone(),
+        value.history.clone(),
+        value.last_seq,
+        Some(value.slug.clone()),
+    ))
+    .map_err(|_| invalid(ValidationReason::InvalidState))
+}
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -135,6 +176,41 @@ pub(super) async fn stage_space(
     Ok(id)
 }
 impl ControlService {
+    pub(super) async fn load_space_receipt(
+        &self,
+        budget: &OperationBudget,
+        request: &RequestId,
+        expected_space: &SpaceId,
+        raw: Option<&str>,
+    ) -> Result<CatalogSpace, PortError> {
+        let SpaceReceipt(space, history, last_seq, slug) =
+            serde_json::from_str(raw.ok_or_else(|| invalid(ValidationReason::InvalidState))?)
+                .map_err(|_| invalid(ValidationReason::InvalidState))?;
+        if space.id != *expected_space || history.space_id != *expected_space {
+            return Err(invalid(ValidationReason::InvalidState));
+        }
+        let slug = match slug {
+            Some(slug) => slug,
+            None => {
+                // Historical receipts predate Space slugs in this DTO.
+                let current = budget
+                    .run(
+                        self.catalog
+                            .space(budget.context(request.clone()), expected_space.clone()),
+                        CommitEffect::Unknown,
+                    )
+                    .await?;
+                current.history.check(&history)?;
+                current.slug
+            }
+        };
+        Ok(CatalogSpace {
+            space,
+            slug,
+            history,
+            last_seq,
+        })
+    }
     pub(super) async fn resume_pending_spaces(
         &self,
         budget: &OperationBudget,
@@ -164,8 +240,7 @@ impl ControlService {
             let pending:PendingSpace=serde_json::from_str(&row.payload).map_err(|_|invalid(ValidationReason::InvalidState))?;
             if pending.version!=1 || pending.space.as_str()!=row.target_space {return Err(invalid(ValidationReason::InvalidState));}
             if row.state=="committed" {
-                let (space,history,last_seq)=serde_json::from_str(row.canonical_receipt.as_deref().ok_or_else(||invalid(ValidationReason::InvalidState))?).map_err(|_|invalid(ValidationReason::InvalidState))?;
-                let catalog=CatalogSpace{space,history,last_seq};
+                let catalog = self.load_space_receipt(budget, id, &pending.space, row.canonical_receipt.as_deref()).await?;
                 if catalog.space.id!=pending.space || catalog.history.space_id!=pending.space || catalog.space.kind!=pending.kind || catalog.space.lifecycle!=SpaceLifecycle::Active {return Err(invalid(ValidationReason::InvalidState));}
                 return Ok(catalog);
             }
@@ -173,7 +248,7 @@ impl ControlService {
             if operation_id(&identity)!=*id {return Err(invalid(ValidationReason::InvalidState));}
             let catalog=budget.run(self.catalog.ensure_space(budget.context(id.clone()),EnsureCatalogSpace{identity,owner:pending.owner.clone(),space:CreateSpace{id:pending.space.clone(),kind:pending.kind,name:pending.name}}),CommitEffect::Unknown).await?;
             if catalog.space.id!=pending.space || catalog.history.space_id!=pending.space || catalog.space.kind!=pending.kind || catalog.space.lifecycle!=SpaceLifecycle::Active {return Err(invalid(ValidationReason::InvalidState));}
-            let receipt=serde_json::to_string(&(catalog.space.clone(),catalog.history.clone(),catalog.last_seq)).map_err(|_|invalid(ValidationReason::InvalidState))?;
+            let receipt=save_space_receipt(&catalog)?;
             let mut tx=self.store.write(budget.clone()).await?;
             budget.run(async {
                 // Recheck the durable operation after the external call. A
@@ -187,7 +262,7 @@ impl ControlService {
                 execute!(tx.inner_mut(),"UPDATE control_operations SET state='committed',canonical_receipt=$1,next_action='done',updated_at=$2 WHERE operation_id=$3","UPDATE v1_control.control_operations SET state='committed',canonical_receipt=$1,next_action='done',updated_at=$2 WHERE operation_id=$3";&receipt,self.clock.now_ms()?,id.as_str())?;
                 Ok(())
             },CommitEffect::Unknown).await?;
-            budget.run(tx.commit(),CommitEffect::Unknown).await?;
+            budget.commit_tx(tx).await?;
             Ok(catalog)
         }.await;
         work.map_err(|_: PortError| {
@@ -253,7 +328,7 @@ impl ControlService {
             let operation=stage_personal(tx.inner_mut(),&row,row.created_at).await?;
             Ok((account_info(&row)?,operation,row.auth_version,row.password_hash))
         },CommitEffect::NotCommitted).await?;
-        budget.run(tx.commit(), CommitEffect::Unknown).await?;
+        budget.commit_tx(tx).await?;
         self.finish_space_operation(&budget, &operation).await?;
         let session = if matches!(self.config.authentication, AuthenticationMode::Password) {
             let work = async {
@@ -273,7 +348,7 @@ impl ControlService {
                         CommitEffect::Unknown,
                     )
                     .await?;
-                budget.run(tx.commit(), CommitEffect::Unknown).await?;
+                budget.commit_tx(tx).await?;
                 Ok(issued)
             }
             .await;
@@ -325,7 +400,7 @@ impl ControlService {
             command.save(tx.inner_mut(),revision,&saved,now).await?;
             Ok((revision,saved))
         },CommitEffect::NotCommitted).await?;
-        budget.run(tx.commit(), CommitEffect::Unknown).await?;
+        budget.commit_tx(tx).await?;
         let space = saved
             .value
             .personal_space

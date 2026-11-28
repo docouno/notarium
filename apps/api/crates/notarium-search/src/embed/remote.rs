@@ -12,6 +12,7 @@ use notarium_core::{
     },
 };
 use std::{
+    collections::BTreeSet,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -49,11 +50,24 @@ impl RemoteEmbedder {
 
     pub async fn query(
         &self,
-        mut ctx: SpaceContext,
-        mut input: EmbeddingQueryInput,
+        ctx: SpaceContext,
+        input: EmbeddingQueryInput,
         implicit: bool,
     ) -> Result<Vec<Option<Vec<f32>>>, EmbeddingError> {
-        if ctx.auth().taint().is_tainted()
+        self.query_with_sources(ctx, input, None, implicit).await
+    }
+
+    pub(crate) async fn query_with_sources(
+        &self,
+        mut ctx: SpaceContext,
+        mut input: EmbeddingQueryInput,
+        required_sources: Option<BTreeSet<DocClass>>,
+        implicit: bool,
+    ) -> Result<Vec<Option<Vec<f32>>>, EmbeddingError> {
+        if ctx
+            .auth()
+            .authorize_remote_embedding_query(&ctx.scope().space_id)
+            .is_err()
             || input.classes.is_empty()
             || input.classes.contains(&DocClass::EncryptedNote)
         {
@@ -74,7 +88,22 @@ impl RemoteEmbedder {
             )
             .await
             .map_err(query_port_error)?;
-        input.classes.retain(|class| disclosed.contains(class));
+        if let Some(required_sources) = required_sources {
+            if required_sources.is_empty()
+                || !required_sources
+                    .iter()
+                    .all(|class| disclosed.contains(class))
+            {
+                return Err(EmbeddingError::ProviderUnavailable);
+            }
+            input.classes.retain(|class| disclosed.contains(class));
+            if input.classes.is_empty() {
+                return Err(EmbeddingError::ProviderUnavailable);
+            }
+            input.classes.extend(required_sources);
+        } else {
+            input.classes.retain(|class| disclosed.contains(class));
+        }
         if input.classes.is_empty() || ctx.auth().taint().is_tainted() {
             return Err(EmbeddingError::ProviderUnavailable);
         }

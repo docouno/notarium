@@ -394,6 +394,7 @@ async fn offers(pg: bool) {
         fixture.catalog.project_entries.lock().unwrap().insert(
             (project.space_id.clone(), project.folder_id.clone()),
             ProjectInfo {
+                project_slug: "project".into(),
                 folder: project.clone(),
                 name: "Project".into(),
             },
@@ -786,6 +787,26 @@ async fn offers(pg: bool) {
         .await
         .is_err()
     );
+    // Project-scoped humans must only see offers targeting their pinned project
+    // in `list_offers`, matching `list_offer_models` which rejects Space offers.
+    let editor_project_a = editor.clone().restrict_to_project(&project_a).unwrap();
+    let pinned_offers = port
+        .list_offers(
+            editor_project_a.clone(),
+            ProviderOfferQuery {
+                project: Some(project_a.clone()),
+                page: page(10, None),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(pinned_offers.items.len(), 1);
+    assert_eq!(pinned_offers.items[0].attachment.id, a.id);
+    assert!(matches!(
+        port.list_offer_models(editor_project_a, space_offer.id.clone(), page(10, None))
+            .await,
+        Err(PortError::Domain(DomainError::ResourceNotFound))
+    ));
 
     port.revoke_attachment(
         owner.clone(),
@@ -819,7 +840,7 @@ async fn offers(pg: bool) {
         .is_empty()
     );
     assert!(
-        port.list_offer_models(editor.clone(), space_offer.id, page(10, None))
+        port.list_offer_models(editor.clone(), space_offer.id.clone(), page(10, None))
             .await
             .is_err()
     );
@@ -882,6 +903,125 @@ async fn offers(pg: bool) {
         port.list_offer_models(editor, a.id, page(10, None))
             .await
             .is_err()
+    );
+    // Stale credential-rotated offer must reject Personal attachment even when
+    // supplying the rotated credential_consent_epoch.
+    let rotated_cred = provider
+        .list_credentials(owner.clone(), page(10, None))
+        .await
+        .unwrap()
+        .items
+        .remove(0);
+    assert!(rotated_cred.consent_epoch > credential.consent_epoch);
+    let stale_personal = port
+        .request_attachment(
+            actors[0].clone(),
+            AccountMutation {
+                identity: identity(&control, &actors[0], 191).await,
+                input: RequestProviderAttachment {
+                    id: RequestId::from_bytes([191; 16]),
+                    expected: None,
+                    resource: resource.id.clone(),
+                    resource_consent_epoch: resource.consent_epoch,
+                    credential_consent_epoch: Some(rotated_cred.consent_epoch),
+                    target: ProviderAttachmentTarget::Personal {
+                        space: shared.history.space_id.clone(),
+                        owner: actors[0].auth().principal().clone(),
+                    },
+                    consent: consent(),
+                    expires_at_ms: None,
+                },
+            },
+        )
+        .await;
+    assert!(
+        matches!(
+            stale_personal,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ),
+        "request_attachment(Personal) against credential-rotated stale offer must fail ResourceNotFound, got {stale_personal:?}"
+    );
+    // Re-approving the offer on the rotated credential restores eligibility,
+    // and disabling the resource must again fail request_attachment(Personal)
+    // with ResourceNotFound (not AccessDenied).
+    let live_space_offer = provider
+        .inspect_attachment(owner.clone(), space_offer.id.clone())
+        .await
+        .unwrap();
+    let fresh_offer = provider
+        .request_attachment(
+            owner.clone(),
+            AccountMutation {
+                identity: identity(&control, &owner, 192).await,
+                input: RequestProviderAttachment {
+                    id: live_space_offer.attachment.id.clone(),
+                    expected: Some(live_space_offer.attachment.revision),
+                    resource: resource.id.clone(),
+                    resource_consent_epoch: resource.consent_epoch,
+                    credential_consent_epoch: Some(rotated_cred.consent_epoch),
+                    target: ProviderAttachmentTarget::Space(shared.history.space_id.clone()),
+                    consent: consent(),
+                    expires_at_ms: None,
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    if fresh_offer.state != ProviderAttachmentState::Approved {
+        approve(&control, &provider, &owner, 193, &fresh_offer).await;
+    }
+    let current_res = current_resource(&provider, &owner).await;
+    provider
+        .update_resource(
+            owner.clone(),
+            AccountMutation {
+                identity: identity(&control, &owner, 194).await,
+                input: UpdateProviderResource {
+                    expected: current_res.revision,
+                    spec: ProviderResourceSpec {
+                        id: current_res.id.clone(),
+                        name: current_res.name,
+                        wire: current_res.wire,
+                        base_url: current_res.base_url,
+                        credential: current_res.credential,
+                        headers: vec![],
+                        limits: current_res.limits,
+                        timeout_ms: current_res.timeout_ms,
+                    },
+                    disabled: true,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let disabled_personal = port
+        .request_attachment(
+            actors[0].clone(),
+            AccountMutation {
+                identity: identity(&control, &actors[0], 195).await,
+                input: RequestProviderAttachment {
+                    id: RequestId::from_bytes([195; 16]),
+                    expected: None,
+                    resource: current_res.id.clone(),
+                    resource_consent_epoch: current_res.consent_epoch,
+                    credential_consent_epoch: Some(rotated_cred.consent_epoch),
+                    target: ProviderAttachmentTarget::Personal {
+                        space: shared.history.space_id.clone(),
+                        owner: actors[0].auth().principal().clone(),
+                    },
+                    consent: consent(),
+                    expires_at_ms: None,
+                },
+            },
+        )
+        .await;
+    assert!(
+        matches!(
+            disabled_personal,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ),
+        "request_attachment(Personal) against disabled offered resource must fail ResourceNotFound, got {disabled_personal:?}"
     );
     control
         .change_space_lifecycle(

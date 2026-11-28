@@ -410,6 +410,11 @@ async fn prepare_redaction(
             mutation(
                 ctx,
                 AppendChat {
+                    provenance: None,
+                    interruption: None,
+                    proposed_diff: None,
+                    proposed_effect: None,
+                    tool_calls: vec![],
                     thread: thread.clone(),
                     parent: ThreadEntrySeq::ZERO,
                     kind: ChatEntryKind::Human,

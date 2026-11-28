@@ -307,6 +307,13 @@ async fn postgres_atomic_budgets_idempotency_and_unknown_spend() {
 
 struct NoEgress;
 impl ProviderEgressCatalogPort for NoEgress {
+    fn chat_dependencies(
+        &self,
+        _: AccountContext,
+        _: Vec<notarium_core::classes::ProviderOrigin>,
+    ) -> PortFuture<'_, ProviderEgressDependencies> {
+        panic!("recovery must not load canonical content")
+    }
     fn acquire_egress(
         &self,
         _: AccountContext,

@@ -1140,7 +1140,7 @@ async fn create_job_impl(
         ContentJobKind::Export { notes, .. } => notes.as_slice(),
         _ => &[],
     };
-    let idemp = derive_command_identity_spec(&request.identity, "create_job", &payload_bytes)
+    let idemp = derive_command_identity_spec(&ctx, &request.identity, "create_job", &payload_bytes)
         .for_job(ctx.auth(), None, export_notes);
 
     let scope = space_rec.scope.clone();
@@ -1851,7 +1851,7 @@ async fn cancel_job_impl(
         request.input.job.as_str(),
         request.input.expected_lease.get()
     );
-    let idemp = derive_command_identity_spec(&request.identity, "cancel_job", fp.as_bytes())
+    let idemp = derive_command_identity_spec(&ctx, &request.identity, "cancel_job", fp.as_bytes())
         .for_job(ctx.auth(), Some(&request.input.job), &[]);
 
     let scope = space_rec.scope.clone();
@@ -2262,8 +2262,10 @@ async fn heartbeat_job_lease_impl(
     let dur_ms = i64::try_from(lease_duration.as_millis().max(1)).unwrap_or(60_000);
 
     let inner = std::sync::Arc::clone(&store.inner);
+    let space = scope.space_id.clone();
+    let timing = Some((budget, deadline));
     store
-        .with_auxiliary_command(Some((budget, deadline)), Ok, move |tx| {
+        .with_auxiliary_command(space, timing, Ok, move |tx| {
             Box::pin(async move {
                 lock_peer_space(tx, &inner, &scope_cl).await?;
 
@@ -2789,10 +2791,11 @@ async fn open_collab_session_impl(
     let inner = std::sync::Arc::clone(&store.inner);
     let room_store = store.clone();
     let timing = Some((budget, deadline));
+    let space = spec.scope.space_id.clone();
     #[cfg(feature = "test-support")]
     let faults = store.writer_faults()?;
     store
-        .with_auxiliary_command(timing, move |transition| {
+        .with_auxiliary_command(space, timing, move |transition| {
             #[cfg(feature = "test-support")]
             if faults.drop_room_open_response_once.swap(false, std::sync::atomic::Ordering::SeqCst) {
                 // COMMIT succeeded. Dropping the unpublished transition keeps
@@ -3289,8 +3292,10 @@ async fn checkpoint_collab_snapshot_impl(
     spec: CheckpointCollabSession,
 ) -> Result<CollabSessionRecord, PortError> {
     let inner = std::sync::Arc::clone(&store.inner);
+    let space = spec.scope.space_id.clone();
+    let timing = Some((budget, deadline));
     store
-        .with_auxiliary_command(Some((budget, deadline)), Ok, move |tx| {
+        .with_auxiliary_command(space, timing, Ok, move |tx| {
             Box::pin(async move {
                 let srec = lock_peer_space(tx, &inner, &spec.scope).await?;
                 if is_note_purge_fenced_tx(tx, &srec.scope.space_id, spec.note.as_str()).await? {
@@ -3425,8 +3430,9 @@ async fn close_collab_snapshot_impl(
     let inner = std::sync::Arc::clone(&store.inner);
     let room_store = store.clone();
     let timing = Some((budget, deadline));
+    let space = spec.scope.space_id.clone();
     store
-        .with_auxiliary_command(timing, RoomTransition::confirmed, move |tx| {
+        .with_auxiliary_command(space, timing, RoomTransition::confirmed, move |tx| {
             let spec_cl = spec;
             Box::pin(async move {
                 let srec = lock_peer_space(tx, &inner, &spec_cl.scope).await?;
@@ -3582,6 +3588,7 @@ async fn fence_collab_session_impl(
     let room_store = store.clone();
     store
         .with_auxiliary_command(
+            spec.scope.space_id.clone(),
             Some((budget, deadline)),
             RoomTransition::confirmed,
             move |tx| {
@@ -3988,6 +3995,7 @@ async fn settle_and_update_collab_session(
                         .await?;
                 let meta = RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Note(
                     NoteRevisionMetadata {
+                        folder_page: anc.cover_note.as_ref() == Some(&note),
                         note_id: note.clone(),
                         parent_folder_id: head.parent_folder_id.clone(),
                         is_root_child: anc.is_root_child,
@@ -4004,6 +4012,7 @@ async fn settle_and_update_collab_session(
                         raw_fields: info.raw_fields,
                         evaluated_fields: eval_fields,
                         diagnostics: info.diagnostics,
+                        logical_updated_at: None,
                     },
                 ))
                 .encode()?;

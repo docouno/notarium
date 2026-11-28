@@ -74,13 +74,21 @@ impl Room {
                 observation,
                 body,
                 header,
-            } => (
-                Some(body),
-                Some(header),
-                None,
-                Some(&observation.base_revision),
-            ),
+            } => {
+                if request.context.confirmed_chat_step().is_some() {
+                    return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
+                }
+                (
+                    Some(body),
+                    Some(header),
+                    None,
+                    Some(&observation.base_revision),
+                )
+            }
             InterceptedPayload::MoveBoardCard { card, .. } => {
+                if request.context.confirmed_chat_step().is_some() {
+                    return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
+                }
                 (None, None, Some(&card.fields), Some(&card.expected_note))
             }
         };

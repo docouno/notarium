@@ -173,6 +173,7 @@ pub async fn create_note(
             mutation(
                 ctx,
                 CreateNote {
+                    folder_page: false,
                     note: NoteId::from_bytes([seed; 16]),
                     parent,
                     slug: format!("collab-note-{seed}"),

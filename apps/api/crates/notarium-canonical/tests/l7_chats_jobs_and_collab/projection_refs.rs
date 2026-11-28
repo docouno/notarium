@@ -38,6 +38,7 @@ async fn create_note_in(
                 scope,
                 owner,
                 CreateNote {
+                    folder_page: false,
                     note: note.clone(),
                     parent: None,
                     slug: format!("projected-note-{seed}"),
@@ -96,6 +97,11 @@ async fn append_refs(
                 ctx.scope(),
                 ctx.auth().principal(),
                 AppendChat {
+                    tool_calls: Vec::new(),
+                    provenance: None,
+                    interruption: None,
+                    proposed_diff: None,
+                    proposed_effect: None,
                     thread: thread.clone(),
                     parent,
                     kind: ChatEntryKind::Human,
@@ -470,7 +476,10 @@ async fn exercise(store: &CanonicalStore) -> (HistoryScope, ProjectionChatEntryK
 const COVERED_COLUMNS: &str =
     "thread_id,entry_seq,revision_id,created_space_seq,redacted_at_seq,kind,
                               CAST(checkpoint_stale AS BIGINT)";
-const V6_REMOVE_PROJECTION: &str = include_str!("../fixtures/schema-v6-remove-projection.sql");
+const V6_SCHEMA_DOWNGRADE: &str = concat!(
+    include_str!("../fixtures/schema-v6-remove-projection.sql"),
+    include_str!("../fixtures/schema-v8-remove-agents.sql")
+);
 
 struct V6Chat {
     scope: HistoryScope,
@@ -590,10 +599,13 @@ async fn covers_v6_references(store: &CanonicalStore, fixture: &V6Chat) -> usize
 // rows even when the original entry still has a legacy inline reference.
 macro_rules! downgrade_chat_refs_v7 {
     ($db:expr, $legacy:expr) => {{
-        sqlx::raw_sql(include_str!("../fixtures/schema-v7-chat-refs.sql"))
-            .execute(&mut $db)
-            .await
-            .unwrap();
+        sqlx::raw_sql(concat!(
+            include_str!("../fixtures/schema-v7-chat-refs.sql"),
+            include_str!("../fixtures/schema-v8-remove-agents.sql")
+        ))
+        .execute(&mut $db)
+        .await
+        .unwrap();
         let removed = sqlx::query(
             "DELETE FROM chat_entry_note_refs WHERE space_id=$1 AND thread_id=$2 AND ref_ordinal=0",
         )
@@ -632,7 +644,7 @@ async fn l7_projection_refs_sqlite_covering_pages_and_erasure() {
     let legacy = plant_v6_chat_entries(&store).await;
     runtime.shutdown().await.unwrap();
     let mut old = temp.open_raw_sqlite().await;
-    sqlx::raw_sql(V6_REMOVE_PROJECTION)
+    sqlx::raw_sql(V6_SCHEMA_DOWNGRADE)
         .execute(&mut old)
         .await
         .unwrap();
@@ -731,8 +743,9 @@ async fn l7_projection_refs_sqlite_covering_pages_and_erasure() {
 async fn l7_projection_refs_postgres_bounded_pages_and_erasure() {
     let fixtures = StorageTestFixtures::load_required();
     let schema = fixtures.fresh_pg_schema();
-    let temp = TempDataRoot::new("projection-chat-postgres");
-    let config = fixtures.pg_local_config(sample_installation_id(0x94), &schema, temp.data_root());
+    let config = fixtures
+        .open_pg_s3_config(sample_installation_id(0x94), &schema)
+        .await;
     let (store, runtime) = CanonicalRuntime::open(config.clone()).await.unwrap();
     let legacy = plant_v6_chat_entries(&store).await;
     runtime.shutdown().await.unwrap();
@@ -743,7 +756,7 @@ async fn l7_projection_refs_postgres_bounded_pages_and_erasure() {
     .execute(&mut db)
     .await
     .unwrap();
-    sqlx::raw_sql(V6_REMOVE_PROJECTION)
+    sqlx::raw_sql(V6_SCHEMA_DOWNGRADE)
         .execute(&mut db)
         .await
         .unwrap();

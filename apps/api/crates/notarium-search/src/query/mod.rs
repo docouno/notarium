@@ -6,7 +6,10 @@ use crate::{
     config::VectorMode,
     embed::{EmbeddingError, RemoteConservativeTokenizerBudget},
     engine::{Clock, Published, SearchEngine, internal, invalid},
-    lexical::{LexicalError, LexicalFilter, LexicalHit, LexicalIndex, OverlayHits, Update},
+    lexical::{
+        LexicalError, LexicalFilter, LexicalIndex, MAX_FALLBACK_FLOOR, OverlayHits, RankedLexical,
+        Update,
+    },
     model::Embedder,
     ports::{EmbeddingBackendTarget, ResolvedEmbeddingTarget},
     vector::{ProjectedVectorFilter, SearchBudget, VectorHit, search_candidate_limit},
@@ -19,8 +22,8 @@ use notarium_core::{
     ids::{FolderId, NoteId, PrincipalId},
     model::{DenseNodeId, FolderRef, SnapshotCut},
     ports::{
-        PortFuture, RecallQuery, SearchDegradation, SearchPort, SearchQuery, SearchResult,
-        SpaceContext, StructuralSnapshot,
+        PageLimit, PortFuture, RecallQuery, SearchDegradation, SearchPort, SearchQuery,
+        SearchRecipient, SearchResult, SpaceContext, StructuralSnapshot,
     },
     query::Predicate,
 };
@@ -30,28 +33,56 @@ use std::{collections::BTreeSet, sync::Arc, time::Duration};
 struct Recall {
     graph_depth: u8,
     tokens: u32,
+    max_per_source: Option<u16>,
+}
+
+#[derive(Clone, Copy)]
+struct QueryDelivery<'a> {
+    recall: Option<Recall>,
+    recipient: Option<&'a dyn SearchRecipient>,
 }
 
 impl SearchPort for SearchEngine {
-    fn search(&self, ctx: SpaceContext, request: SearchQuery) -> PortFuture<'_, SearchResult> {
-        Box::pin(self.run_query(ctx, request, None))
+    fn search_for<'a>(
+        &'a self,
+        ctx: SpaceContext,
+        request: SearchQuery,
+        recipient: Option<&'a dyn SearchRecipient>,
+    ) -> PortFuture<'a, SearchResult> {
+        Box::pin(self.run_query(
+            ctx,
+            request,
+            QueryDelivery {
+                recall: None,
+                recipient,
+            },
+        ))
     }
 
-    fn recall(&self, ctx: SpaceContext, request: RecallQuery) -> PortFuture<'_, SearchResult> {
+    fn recall_for<'a>(
+        &'a self,
+        ctx: SpaceContext,
+        request: RecallQuery,
+        recipient: Option<&'a dyn SearchRecipient>,
+    ) -> PortFuture<'a, SearchResult> {
         Box::pin(async move {
-            if request.graph_depth > 2 {
+            if request.graph_depth > RecallQuery::MAX_GRAPH_DEPTH {
                 return Err(invalid(ValidationReason::InvalidLimit));
             }
-            if !(1..=131_072).contains(&request.token_budget) {
+            if !(1..=131_072).contains(&request.token_budget) || request.max_per_source == Some(0) {
                 return Err(invalid(ValidationReason::TokenBudgetExceeded));
             }
             self.run_query(
                 ctx,
                 request.query,
-                Some(Recall {
-                    graph_depth: request.graph_depth,
-                    tokens: request.token_budget,
-                }),
+                QueryDelivery {
+                    recall: Some(Recall {
+                        graph_depth: request.graph_depth,
+                        tokens: request.token_budget,
+                        max_per_source: request.max_per_source,
+                    }),
+                    recipient,
+                },
             )
             .await
         })
@@ -63,11 +94,11 @@ impl SearchEngine {
         &self,
         ctx: SpaceContext,
         request: SearchQuery,
-        recall: Option<Recall>,
+        delivery: QueryDelivery<'_>,
     ) -> Result<SearchResult, PortError> {
         let clock = Clock::new(&ctx.budget)?;
         clock
-            .within(self.query_at_cut(ctx, request, recall, &clock))
+            .within(self.query_at_cut(ctx, request, delivery, &clock))
             .await
     }
 
@@ -75,9 +106,10 @@ impl SearchEngine {
         &self,
         mut ctx: SpaceContext,
         request: SearchQuery,
-        recall: Option<Recall>,
+        delivery: QueryDelivery<'_>,
         clock: &Clock,
     ) -> Result<SearchResult, PortError> {
+        let recall = delivery.recall;
         let browse = request.text.trim().is_empty();
         let filtered = request.folder.is_some()
             || (!request.classes.is_empty() && request.classes != DocClass::all())
@@ -90,8 +122,11 @@ impl SearchEngine {
                 .classes
                 .iter()
                 .all(|class| *class == DocClass::EncryptedNote);
+        let preflight = true;
         if empty_query || encrypted_only {
-            let snapshot = self.projection(&ctx, request.causal, clock).await?;
+            let snapshot = self
+                .projection(&ctx, request.causal, clock, preflight)
+                .await?;
             let _ = snapshot.filter_notes(&request.filter).await?;
             if let Some(folder) = &request.folder {
                 let _ = snapshot.folder_descendants(folder).await?;
@@ -106,7 +141,9 @@ impl SearchEngine {
         }
         let pinned = self.pin_space(ctx.scope().clone())?;
         let handle = &pinned.handle;
-        let aligned = self.align(&ctx, &request.causal, handle, clock).await?;
+        let aligned = self
+            .align(&ctx, &request.causal, handle, clock, preflight)
+            .await?;
         let snapshot = aligned.snapshot;
         let state = aligned.state;
         let chat_record = if request.include_chats && recall.is_none() && !browse {
@@ -132,11 +169,37 @@ impl SearchEngine {
             .await?,
         );
         let top_k = usize::from(request.top_k.get());
-        let candidate_k = search_candidate_limit(top_k);
+        let ordinary_limit = search_candidate_limit(top_k);
+        let floor = top_k.min(MAX_FALLBACK_FLOOR);
+        let mut admission = hydrate::NoteAdmission {
+            context: &ctx,
+            clock,
+            cut: &aligned.base_cut,
+            overlay: &aligned.overlay,
+            recipient: delivery.recipient.filter(|r| r.filters_notes()),
+            checked: Default::default(),
+        };
+        // A recipient may reject an entire ranked prefix. Start at the ordinary
+        // candidate limit (plus one overflow witness when widening is possible)
+        // and only widen to `RECIPIENT_LIMIT` if recipient filtering actually
+        // rejected hits and left fewer than `top_k + 1` admitted candidates.
+        const RECIPIENT_LIMIT: usize = search_candidate_limit(PageLimit::MAX as usize);
+        let max_probe_k = if admission.recipient.is_some() {
+            let probe_limit = RECIPIENT_LIMIT + 1;
+            filter.nodes.as_ref().map_or(probe_limit, |nodes| {
+                // The base mask bounds distinct indexed notes. Receipts may
+                // introduce new ones. Preserve the ordinary vector chunk depth.
+                nodes
+                    .cardinality()
+                    .saturating_add(aligned.overlay.len() as u64)
+                    .clamp(ordinary_limit as u64, probe_limit as u64) as usize
+            })
+        } else {
+            ordinary_limit
+        };
         let excluded: Arc<BTreeSet<_>> = Arc::new(aligned.overlay.keys().cloned().collect());
-
-        let lexical = async {
-            let overlay = rank_overlay(
+        let overlay_hits = Arc::new(
+            rank_overlay(
                 self,
                 clock,
                 &request,
@@ -145,21 +208,39 @@ impl SearchEngine {
                 state.as_deref(),
                 filtered,
             )
-            .await?;
-            lexical_candidates(
-                clock,
-                snapshot.clone(),
-                state.clone(),
-                filter.clone(),
-                excluded.clone(),
-                request.text.clone(),
-                candidate_k,
-                top_k,
-                filtered,
-                overlay,
-            )
-            .await
+            .await?,
+        );
+
+        let can_widen = admission.recipient.is_some()
+            && ordinary_limit < RECIPIENT_LIMIT
+            && max_probe_k > ordinary_limit + 1;
+        let initial_cap = if can_widen {
+            ordinary_limit
+        } else {
+            RECIPIENT_LIMIT
         };
+        let initial_k = if can_widen {
+            ordinary_limit + 1
+        } else {
+            max_probe_k
+        };
+        let initial_fallback = if admission.recipient.is_some() {
+            initial_k
+        } else {
+            floor
+        };
+        let lexical = lexical_candidates(
+            clock,
+            snapshot.clone(),
+            state.clone(),
+            filter.clone(),
+            excluded.clone(),
+            request.text.clone(),
+            initial_k,
+            initial_fallback,
+            filtered,
+            overlay_hits.clone(),
+        );
         let vectors = self.vector_candidates(VectorRequest {
             ctx: &ctx,
             query: &request,
@@ -169,43 +250,177 @@ impl SearchEngine {
             state: state.clone(),
             handle,
             excluded: excluded.clone(),
-            limit: candidate_k,
+            limit: initial_k,
             browse,
+            source_classes: delivery
+                .recipient
+                .and_then(|recipient| recipient.query_source_classes()),
+            source_project: delivery
+                .recipient
+                .and_then(|recipient| recipient.query_source_project()),
         });
-        let (notes, vectors) = tokio::try_join!(lexical, vectors)?;
+        let (mut notes, mut vectors) = tokio::try_join!(lexical, vectors)?;
+        let strict_overflow = notes.strict_len > initial_cap;
+        let weak_overflow = !strict_overflow && notes.hits.len() > initial_cap;
+        notes.hits.truncate(initial_cap);
+        notes.strict_len = notes.strict_len.min(initial_cap);
+        let vector_overflow =
+            initial_k > initial_cap && ranking::trim_vector_window(&mut vectors.hits, initial_cap);
+        let floor_filled = if admission.recipient.is_some()
+            && (notes.hits.len() > notes.strict_len || weak_overflow)
+        {
+            admission.fill_fallback(self, &mut notes, floor).await?
+        } else {
+            false
+        };
+        let pass1_overflow = strict_overflow || vector_overflow || (weak_overflow && !floor_filled);
+        let graph_depth = recall.map_or(0, |recall| recall.graph_depth);
+        let hydrate_limit = if recall.is_some() {
+            top_k
+                .saturating_mul(4)
+                .clamp(32, usize::from(PageLimit::MAX))
+        } else {
+            top_k
+        };
+        let mut candidates = ranking::fuse(notes.hits, vectors.hits, browse);
+        let mut selected = if graph_depth == 0 {
+            Some(
+                admission
+                    .select(
+                        self,
+                        std::mem::take(&mut candidates).into_iter(),
+                        |candidate| &candidate.note,
+                        hydrate_limit + 1,
+                        can_widen,
+                    )
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let mut window_truncated = if can_widen { false } else { pass1_overflow };
+        let mut embedder = vectors.embedder;
+        let mut degraded = vectors.degraded;
 
-        let mut candidates = ranking::fuse(notes, vectors.hits, browse);
-        if let Some(recall) = recall.filter(|recall| recall.graph_depth != 0) {
+        let need_widen = if !can_widen || !pass1_overflow {
+            false
+        } else if let Some(direct) = &selected {
+            direct.len() <= top_k
+        } else {
+            admission
+                .select(
+                    self,
+                    candidates.iter(),
+                    |candidate| &candidate.note,
+                    top_k + 1,
+                    true,
+                )
+                .await?
+                .len()
+                <= top_k
+        };
+
+        if need_widen {
+            let wide_lexical = lexical_candidates(
+                clock,
+                snapshot.clone(),
+                state.clone(),
+                filter.clone(),
+                excluded.clone(),
+                request.text.clone(),
+                max_probe_k,
+                max_probe_k,
+                filtered,
+                overlay_hits,
+            );
+            let wide_vectors = async {
+                if let Some(prepared) = vectors.prepared.as_ref() {
+                    self.widen_prepared_vectors(
+                        prepared,
+                        clock,
+                        snapshot.clone(),
+                        filter.clone(),
+                        excluded.clone(),
+                        max_probe_k,
+                    )
+                    .await
+                } else {
+                    Ok(VectorCandidates {
+                        hits: Vec::new(),
+                        embedder: embedder.clone(),
+                        degraded,
+                        prepared: None,
+                    })
+                }
+            };
+            let (mut notes, mut wide_vec) = tokio::try_join!(wide_lexical, wide_vectors)?;
+            let strict_overflow = notes.strict_len > RECIPIENT_LIMIT;
+            let weak_overflow = !strict_overflow && notes.hits.len() > RECIPIENT_LIMIT;
+            notes.hits.truncate(RECIPIENT_LIMIT);
+            notes.strict_len = notes.strict_len.min(RECIPIENT_LIMIT);
+            let vector_overflow = max_probe_k > RECIPIENT_LIMIT
+                && ranking::trim_vector_window(&mut wide_vec.hits, RECIPIENT_LIMIT);
+            let floor_filled = if notes.hits.len() > notes.strict_len || weak_overflow {
+                admission.fill_fallback(self, &mut notes, floor).await?
+            } else {
+                false
+            };
+            window_truncated =
+                strict_overflow || vector_overflow || (weak_overflow && !floor_filled);
+            if wide_vec.embedder.is_some() {
+                embedder = wide_vec.embedder;
+            }
+            if wide_vec.degraded.is_some() {
+                degraded = wide_vec.degraded;
+            }
+            candidates = ranking::fuse(notes.hits, wide_vec.hits, browse);
+            selected = None;
+        }
+
+        let graph_truncated = if graph_depth != 0 {
+            let mut graph_budget =
+                ranking::GraphBudget::new(admission.recipient.is_some(), graph_depth);
             ranking::expand(
                 &mut candidates,
                 snapshot.as_ref(),
-                self.services.deps.structural.as_ref(),
-                &ctx,
-                clock,
+                self,
+                &mut admission,
                 &filter,
                 &request.filter.predicate,
-                &aligned.overlay,
-                recall.graph_depth,
+                &mut graph_budget,
             )
-            .await?;
-        }
+            .await?
+        } else {
+            false
+        };
+        let selected = match selected {
+            Some(selected) => selected,
+            None => {
+                admission
+                    .select(
+                        self,
+                        candidates.into_iter(),
+                        |candidate| &candidate.note,
+                        hydrate_limit + 1,
+                        false,
+                    )
+                    .await?
+            }
+        };
+
         let fallback = RemoteConservativeTokenizerBudget::lexical_fallback();
-        let tokenizer = vectors
-            .embedder
+        let tokenizer = embedder
             .as_deref()
             .map(Embedder::tokenizer)
             .unwrap_or(&fallback);
         let (hits, notes_truncated) = self
             .hydrate_notes(hydrate::Hydration {
-                context: &ctx,
+                admission,
                 text: &request.text,
-                clock,
-                cut: &aligned.base_cut,
-                overlay: &aligned.overlay,
-                candidates,
+                selected,
                 tokenizer,
-                top_k,
-                recall,
+                top_k: hydrate_limit,
+                delivery,
             })
             .await?;
         let (mut chat_hits, chat_truncated) = if let Some(state) =
@@ -251,7 +466,8 @@ impl SearchEngine {
                 &ctx,
                 clock,
                 hits,
-                recall,
+                top_k,
+                delivery,
                 &mut chat_hits,
                 aligned.cut.canonical_seq,
             )
@@ -260,8 +476,12 @@ impl SearchEngine {
             hits,
             chat_hits,
             cut: aligned.cut,
-            degraded: vectors.degraded,
-            truncated: notes_truncated || chat_truncated || packing_truncated,
+            degraded,
+            truncated: window_truncated
+                || graph_truncated
+                || notes_truncated
+                || chat_truncated
+                || packing_truncated,
         })
     }
 
@@ -334,6 +554,8 @@ impl SearchEngine {
             handle,
             excluded,
             limit,
+            source_classes,
+            source_project,
             ..
         } = input;
         let waiting_for_vectors = state.reopening_vectors || needs_embedder_reload;
@@ -437,9 +659,12 @@ impl SearchEngine {
             };
             if let EmbeddingBackendTarget::Remote { project, .. } = &target.backend
                 && (ctx.auth().taint().is_tainted()
-                    || project
-                        .as_ref()
-                        .is_some_and(|expected| query_project.as_ref() != Some(expected)))
+                    || project.as_ref().is_some_and(|expected| {
+                        query_project.as_ref() != Some(expected)
+                            || source_project
+                                .as_ref()
+                                .is_some_and(|confined| confined.as_ref() != Some(expected))
+                    }))
             {
                 return Err(EmbeddingError::ProviderUnavailable);
             }
@@ -457,6 +682,7 @@ impl SearchEngine {
                     context,
                     query,
                     filter.classes.clone(),
+                    source_classes,
                     query_project,
                     &requested,
                 )
@@ -481,13 +707,66 @@ impl SearchEngine {
         let pending = state
             .embeddings_pending
             .then_some(SearchDegradation::EmbeddingsPending);
+        let prepared = PreparedVector {
+            state,
+            vector,
+            embedder,
+            pending,
+            clock: clock.clone(),
+        };
+        let mut result = self
+            .search_prepared_vectors(&prepared, clock, snapshot, filter, excluded, limit)
+            .await?;
+        result.prepared = Some(prepared);
+        Ok(result)
+    }
+
+    async fn widen_prepared_vectors(
+        &self,
+        prepared: &PreparedVector,
+        request_clock: &Clock,
+        snapshot: Arc<dyn StructuralSnapshot>,
+        filter: Arc<Eligible>,
+        excluded: Arc<BTreeSet<NoteId>>,
+        limit: usize,
+    ) -> Result<VectorCandidates, PortError> {
+        // Share the initial vector interactive budget across initial and widened passes.
+        let clock = prepared.clock.clone();
+        if clock.remaining().is_err() {
+            request_clock.remaining()?;
+            return Ok(VectorCandidates::degraded(
+                SearchDegradation::BudgetExceeded,
+            ));
+        }
+        let work =
+            self.search_prepared_vectors(prepared, &clock, snapshot, filter, excluded, limit);
+        match clock.within(work).await {
+            Err(PortError::DeadlineExceeded(_)) => {
+                request_clock.remaining()?;
+                Ok(VectorCandidates::degraded(
+                    SearchDegradation::BudgetExceeded,
+                ))
+            }
+            result => result,
+        }
+    }
+
+    async fn search_prepared_vectors(
+        &self,
+        prepared: &PreparedVector,
+        clock: &Clock,
+        snapshot: Arc<dyn StructuralSnapshot>,
+        filter: Arc<Eligible>,
+        excluded: Arc<BTreeSet<NoteId>>,
+        limit: usize,
+    ) -> Result<VectorCandidates, PortError> {
         let vectors = loop {
             clock.remaining()?;
             let snapshot_attempt = snapshot.clone();
             let filter_attempt = filter.clone();
             let excluded_attempt = excluded.clone();
-            let state_attempt = state.clone();
-            let vector_attempt = vector.clone();
+            let state_attempt = prepared.state.clone();
+            let vector_attempt = prepared.vector.clone();
             let result = blocking_search(clock, "vector_search_worker", move |budget| {
                 let index = state_attempt
                     .vectors
@@ -517,8 +796,9 @@ impl SearchEngine {
         match vectors {
             Ok(vectors) => Ok(VectorCandidates {
                 hits: vectors.hits,
-                embedder: Some(embedder),
-                degraded: pending,
+                embedder: Some(prepared.embedder.clone()),
+                degraded: prepared.pending,
+                prepared: None,
             }),
             Err(crate::vector::VectorError::Cancelled) => {
                 clock.remaining()?;
@@ -600,6 +880,16 @@ struct VectorRequest<'a> {
     excluded: Arc<BTreeSet<NoteId>>,
     limit: usize,
     browse: bool,
+    source_classes: Option<BTreeSet<DocClass>>,
+    source_project: Option<Option<FolderRef>>,
+}
+
+struct PreparedVector {
+    state: Arc<Published>,
+    vector: crate::vector::QuantizedVector,
+    embedder: Arc<Embedder>,
+    pending: Option<SearchDegradation>,
+    clock: Clock,
 }
 
 #[derive(Default)]
@@ -607,6 +897,7 @@ struct VectorCandidates {
     hits: Vec<VectorHit>,
     embedder: Option<Arc<Embedder>>,
     degraded: Option<SearchDegradation>,
+    prepared: Option<PreparedVector>,
 }
 
 impl VectorCandidates {
@@ -622,6 +913,7 @@ struct Eligible {
     cut: SnapshotCut,
     classes: BTreeSet<DocClass>,
     project_root: Option<FolderId>,
+    grant_root: Option<FolderId>,
     folders: Option<BTreeSet<FolderId>>,
     ordinals: Option<Arc<Bitmap>>,
     chat_folders: Option<Arc<Bitmap>>,
@@ -643,12 +935,17 @@ impl Eligible {
             .spaces()
             .get(&cut.scope.space_id)
             .ok_or(DomainError::ResourceNotFound)?;
+        let keeper_without_skills = matches!(
+            ctx.auth().kind(),
+            notarium_core::auth::PrincipalKind::Keeper(_)
+        ) && ctx.auth().readonly_abilities().is_empty();
         let classes: BTreeSet<_> = grant
             .read_classes
             .iter()
             .copied()
             .filter(|class| {
                 *class != DocClass::EncryptedNote
+                    && (!keeper_without_skills || *class != DocClass::Skill)
                     && (query.classes.is_empty() || query.classes.contains(class))
             })
             .collect();
@@ -724,20 +1021,16 @@ impl Eligible {
             cut,
             classes,
             project_root: note_root.cloned(),
+            grant_root: root.cloned(),
             folders,
             ordinals,
             chat_folders,
             chat_viewer: chat_space
                 .filter(|space| {
                     ctx.auth()
-                        .can_view_chat_thread(
-                            space,
-                            notarium_core::ports::ChatThreadKind::Personal,
-                            ctx.auth().principal(),
-                            root,
-                            false,
-                        )
+                        .can_view_own_personal_chat(space, root, false)
                         .is_ok()
+                        || ctx.auth().keeper_log().is_some()
                 })
                 .map(|_| ctx.auth().principal().clone()),
             nodes,
@@ -745,7 +1038,9 @@ impl Eligible {
     }
 
     /// Resolve provider scope only for a remote target, within the vector deadline.
-    /// Pinned reads outside the Keeper's root do not widen provider consent.
+    /// Broad searches that include pinned reads outside the Keeper's root return
+    /// `None` so project-only remote embedders fail closed, and folder-narrowed
+    /// Keeper searches never borrow a different project's consent.
     async fn query_project(
         &self,
         snapshot: &dyn StructuralSnapshot,
@@ -753,13 +1048,19 @@ impl Eligible {
     ) -> Result<Option<FolderRef>, EmbeddingError> {
         let project = match (&self.project_root, folder) {
             (Some(root), _) => Some(root.clone()),
-            (None, Some(folder)) => snapshot.enclosing_project(folder).await.map_err(|error| {
-                if matches!(error, PortError::DeadlineExceeded(_)) {
-                    EmbeddingError::BudgetExceeded
-                } else {
-                    EmbeddingError::ProviderUnavailable
+            (None, Some(folder)) => {
+                let enclosing = snapshot.enclosing_project(folder).await.map_err(|error| {
+                    if matches!(error, PortError::DeadlineExceeded(_)) {
+                        EmbeddingError::BudgetExceeded
+                    } else {
+                        EmbeddingError::ProviderUnavailable
+                    }
+                })?;
+                match (&self.grant_root, enclosing) {
+                    (Some(bound), Some(found)) if found != *bound => None,
+                    (_, found) => found,
                 }
-            })?,
+            }
             (None, None) => None,
         };
         Ok(project.map(|folder_id| FolderRef {
@@ -879,16 +1180,16 @@ async fn lexical_candidates(
     excluded: Arc<BTreeSet<NoteId>>,
     text: String,
     candidate_k: usize,
-    top_k: usize,
+    fallback_window: usize,
     filtered: bool,
-    overlay: OverlayHits,
-) -> Result<Vec<LexicalHit>, PortError> {
+    overlay: Arc<OverlayHits>,
+) -> Result<RankedLexical, PortError> {
     let Some(state) = state else {
         return Ok(overlay.merge(
             Vec::new(),
             Vec::new(),
             candidate_k,
-            top_k.min(crate::lexical::MAX_FALLBACK_FLOOR),
+            fallback_window,
             text.trim().is_empty(),
         ));
     };
@@ -908,7 +1209,7 @@ async fn lexical_candidates(
             &text,
             &notes_filter,
             candidate_k,
-            top_k,
+            fallback_window,
             filtered,
             &overlay,
         )

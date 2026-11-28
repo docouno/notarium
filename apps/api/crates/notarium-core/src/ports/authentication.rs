@@ -148,21 +148,25 @@ pub enum BearerScope {
     Read,
     Write,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct CreatePat {
     pub name: String,
     pub scope: BearerScope,
+    #[serde(default)]
+    pub ability_write: bool,
     /// None means all current memberships; Some(empty) means no Spaces.
     pub selected_spaces: Option<Vec<SpaceId>>,
     pub expires_at_ms: Option<i64>,
     pub expected: ControlRevision,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct PatInfo {
     pub id: CredentialTokenId,
     pub account: PrincipalId,
     pub name: String,
     pub scope: BearerScope,
+    #[serde(default)]
+    pub ability_write: bool,
     pub selected_spaces: Option<Vec<SpaceId>>,
     pub expires_at_ms: Option<i64>,
     pub last_used_at_ms: Option<i64>,

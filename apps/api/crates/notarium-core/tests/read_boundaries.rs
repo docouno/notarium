@@ -93,6 +93,7 @@ fn metadata_only_cards_preserve_class_lifecycle_and_authority_fences() {
                             kind: SpaceKind::Personal,
                         },
                         class,
+                        project: None,
                         ancestor_folders: vec![],
                         folder_write_locked: false,
                         ability_package: None,

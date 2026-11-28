@@ -18,6 +18,33 @@ fn model(kind: ProviderModelKind) -> ProviderModelSpec {
         tools: true,
     }
 }
+fn completion_selection(model: &ProviderModelSpec) -> ProviderSelection {
+    ProviderSelection {
+        project: None,
+        project_only: None,
+        provider: ProviderResourceId::from_bytes([1; 16]),
+        model: model.id.clone(),
+        completion: Some(CompletionModelLimits {
+            max_input_tokens: model.max_input_tokens,
+            max_output_tokens: model.max_output_tokens,
+            supports_tools: model.tools,
+        }),
+        revocation_scope: ProviderRevocationScope {
+            owner: PrincipalId::from_bytes([1; 16]),
+            credential: None,
+        },
+        runtime_epochs: ProviderRuntimeEpochs {
+            resource: std::num::NonZeroU64::MIN,
+            credential: None,
+        },
+        policy: ProviderPolicy {
+            provider: ProviderResourceId::from_bytes([1; 16]),
+            audience: ProviderAudience::Personal { consented: true },
+            allowed_classes: DocClass::all(),
+        },
+    }
+}
+
 fn decoder(wire: ProviderWireKind) -> CompletionDecoder {
     CompletionDecoder::new(
         wire,
@@ -295,20 +322,8 @@ fn encoded_requests_keep_base_paths_roles_tools_and_conservative_limits() {
     let model = model(ProviderModelKind::Completion);
     let mut request = CompletionRequest {
         intent: CommandKey::from_bytes([1; 16]),
-        selection: ProviderSelection {
-            project: None,
-            provider: ProviderResourceId::from_bytes([1; 16]),
-            model: model.id.clone(),
-            runtime_epochs: ProviderRuntimeEpochs {
-                resource: std::num::NonZeroU64::MIN,
-                credential: None,
-            },
-            policy: ProviderPolicy {
-                provider: ProviderResourceId::from_bytes([1; 16]),
-                audience: ProviderAudience::Personal { consented: true },
-                allowed_classes: DocClass::all(),
-            },
-        },
+        selection: completion_selection(&model),
+        secondary_projects: vec![],
         messages: vec![CompletionMessage {
             role: CompletionRole::System,
             instruction: Some(
@@ -440,20 +455,8 @@ fn token_estimates_use_shared_conservative_weights_and_preserve_message_framing(
     let model = model(ProviderModelKind::Completion);
     let completion_req = CompletionRequest {
         intent: CommandKey::from_bytes([2; 16]),
-        selection: ProviderSelection {
-            project: None,
-            provider: ProviderResourceId::from_bytes([1; 16]),
-            model: model.id.clone(),
-            runtime_epochs: ProviderRuntimeEpochs {
-                resource: std::num::NonZeroU64::MIN,
-                credential: None,
-            },
-            policy: ProviderPolicy {
-                provider: ProviderResourceId::from_bytes([1; 16]),
-                audience: ProviderAudience::Personal { consented: true },
-                allowed_classes: DocClass::all(),
-            },
-        },
+        selection: completion_selection(&model),
+        secondary_projects: vec![],
         messages: vec![CompletionMessage {
             role: CompletionRole::User,
             instruction: Some(ProviderInstruction::from_orchestrator("привет".into()).unwrap()),
@@ -473,4 +476,168 @@ fn token_estimates_use_shared_conservative_weights_and_preserve_message_framing(
         estimate_completion_input_tokens(&completion_req).unwrap(),
         10
     );
+}
+
+#[test]
+fn provider_tool_schema_encodes_integer_bounds_and_const_bool() {
+    let model = model(ProviderModelKind::Completion);
+    let mut request = CompletionRequest {
+        intent: CommandKey::from_bytes([3; 16]),
+        selection: completion_selection(&model),
+        secondary_projects: vec![],
+        messages: vec![CompletionMessage {
+            role: CompletionRole::User,
+            instruction: Some(ProviderInstruction::from_orchestrator("List notes".into()).unwrap()),
+            parts: vec![],
+            tool_calls: vec![],
+            result_for: None,
+        }],
+        tools: vec![ProviderToolDefinition {
+            name: "list_notes".into(),
+            description: "List notes".into(),
+            parameters: ProviderToolSchema::Object {
+                properties: BTreeMap::from([
+                    (
+                        "limit".into(),
+                        ProviderToolSchema::Integer {
+                            minimum: Some(1),
+                            maximum: Some(100),
+                        },
+                    ),
+                    ("folderPage".into(), ProviderToolSchema::ConstBool(true)),
+                ]),
+                required: BTreeSet::new(),
+            },
+        }],
+        budget: CompletionBudget {
+            max_input_tokens: model.max_input_tokens,
+            max_output_tokens: 16,
+            max_tool_calls: 4,
+        },
+    };
+    let encoded: Value = serde_json::from_slice(
+        &completion(ProviderWireKind::OpenaiCompatible, &model, &request).unwrap(),
+    )
+    .unwrap();
+    let props = &encoded["tools"][0]["function"]["parameters"]["properties"];
+    assert_eq!(
+        props["limit"],
+        json!({"type": "integer", "minimum": 1, "maximum": 100})
+    );
+    assert_eq!(
+        props["folderPage"],
+        json!({"type": "boolean", "const": true})
+    );
+
+    request.tools[0].parameters = ProviderToolSchema::Object {
+        properties: BTreeMap::from([(
+            "limit".into(),
+            ProviderToolSchema::Integer {
+                minimum: Some(10),
+                maximum: Some(5),
+            },
+        )]),
+        required: BTreeSet::new(),
+    };
+    assert!(
+        completion(ProviderWireKind::OpenaiCompatible, &model, &request).is_err(),
+        "inverted integer bounds must be rejected"
+    );
+}
+
+#[test]
+fn openai_decoder_handles_truncated_tool_json_content_filter_and_refusal() {
+    let allowed = BTreeSet::from(["whoami".to_owned()]);
+    let decode_sse = |payload: &str| {
+        let mut decoder = CompletionDecoder::new(
+            ProviderWireKind::OpenaiCompatible,
+            "gpt-test".into(),
+            CommandKey::from_bytes([4; 16]),
+            allowed.clone(),
+            4,
+        )
+        .unwrap();
+        let mut events = decoder.feed(payload.as_bytes())?;
+        events.extend(decoder.eof()?);
+        Ok::<_, PortError>(events)
+    };
+
+    // 1. finish=length cutting off mid-JSON arguments preserves emitted text and drops tool calls.
+    let truncated_json = concat!(
+        "data: {\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Partial before cut\"}}]}\n\n",
+        "data: {\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"whoami\",\"arguments\":\"{\\\"unterminated\"}}]}}]}\n\n",
+        "data: {\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let events = decode_sse(truncated_json).expect("truncated tool JSON on length must succeed");
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, CompletionEvent::Text(t) if t == "Partial before cut"))
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, CompletionEvent::ToolCall(_))),
+        "incomplete tool calls must be dropped on finish=length"
+    );
+    assert!(matches!(
+        events.last(),
+        Some(CompletionEvent::Finished(CompletionFinish::Length))
+    ));
+
+    // 2. finish=content_filter after starting a tool call preserves emitted text and drops tool calls.
+    let filtered_after_tool = concat!(
+        "data: {\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Partial before filter\"}}]}\n\n",
+        "data: {\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_2\",\"type\":\"function\",\"function\":{\"name\":\"whoami\",\"arguments\":\"{\\\"x\"}}]}}]}\n\n",
+        "data: {\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"content_filter\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let events =
+        decode_sse(filtered_after_tool).expect("content_filter after partial tool must succeed");
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, CompletionEvent::Text(t) if t == "Partial before filter"))
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, CompletionEvent::ToolCall(_)))
+    );
+    assert!(matches!(
+        events.last(),
+        Some(CompletionEvent::Finished(CompletionFinish::ContentFilter))
+    ));
+
+    // 3. delta.refusal + finish_reason=stop emits refusal text and maps to ContentFilter (never Stop).
+    let refusal_stream = concat!(
+        "data: {\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"refusal\":\"I cannot comply.\"}}]}\n\n",
+        "data: {\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let events = decode_sse(refusal_stream).expect("refusal stream must decode");
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, CompletionEvent::Text(t) if t == "I cannot comply."))
+    );
+    assert!(matches!(
+        events.last(),
+        Some(CompletionEvent::Finished(CompletionFinish::ContentFilter))
+    ));
+
+    // 4. Post-finish refusal and refusal + tool_calls remain protocol errors.
+    let post_finish_refusal = concat!(
+        "data: {\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: {\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"delta\":{\"refusal\":\"late\"}}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    assert!(decode_sse(post_finish_refusal).is_err());
+
+    let refusal_with_tools = concat!(
+        "data: {\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"refusal\":\"nope\",\"tool_calls\":[{\"index\":0,\"id\":\"call_3\",\"type\":\"function\",\"function\":{\"name\":\"whoami\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    assert!(decode_sse(refusal_with_tools).is_err());
 }

@@ -1,0 +1,703 @@
+use super::{
+    super::{
+        EgressTarget, ToolCallContext, command_actor, corpus, decode, invalid, note_tools, session,
+    },
+    cursor::NoteContinuation,
+    predicates::Filters,
+    scope::{ReadTarget, targets},
+};
+use notarium_core::{
+    DomainError,
+    auth::ResourceFacts,
+    classes::DocClass,
+    error::{PortError, ValidationReason},
+    ids::{ContentDigest, EpisodeId},
+    model::{Lifecycle, LifecycleMask},
+    ports::{FolderSnapshot, GetNote, NoteQuery, PageLimit, SpaceContext},
+    query::{ReadRequest, SortSpec},
+    receipt::CausalBasis,
+};
+use notarium_syntax::unicode::lookup_key;
+use serde::Deserialize;
+use serde_json::{Value, json};
+use std::collections::BTreeMap;
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Args {
+    project: Option<String>,
+    path: Option<String>,
+    tag: Option<String>,
+    cursor: Option<String>,
+    limit: Option<u16>,
+    session: Option<EpisodeId>,
+    #[serde(flatten)]
+    fields: Filters,
+}
+
+pub(super) async fn list(call: &mut ToolCallContext<'_>, args: Value) -> Result<Value, PortError> {
+    let args: Args = decode(args)?;
+    let external = matches!(call.target, EgressTarget::ExternalMcp);
+    // Validate pure input syntax before resolving any target Space so invalid
+    // limits, paths, or cursors cannot become zero-taint project-slug oracles.
+    let limit = PageLimit::new(args.limit.unwrap_or(50))?;
+    let cleaned_path = note_tools::clean_path(args.path.as_deref().unwrap_or_default())?;
+    let previous = args
+        .cursor
+        .as_deref()
+        .map(|raw| call.registry.note_cursors.open(call.auth.principal(), raw))
+        .transpose()?;
+    let resolved = targets(call, args.project.as_deref(), args.session.as_ref(), false).await?;
+    let targeted_project = resolved.targeted_project;
+    let Some(target) = resolved.targets.into_iter().next() else {
+        if previous.is_some() {
+            return Err(invalid(ValidationReason::CursorStale));
+        }
+        return Ok(empty(external));
+    };
+    if previous
+        .as_ref()
+        .is_some_and(|prev| prev.scope.space_id != target.scope.space_id)
+    {
+        return Err(DomainError::ResourceNotFound.into());
+    }
+    let mut scope = call.space(target.scope.clone())?;
+    let foreign_space = !external
+        && scope
+            .auth()
+            .pinned_write_space()
+            .is_some_and(|pin| pin != &scope.scope().space_id);
+    let mut allow_user_doc = true;
+    if !external {
+        let selection_project = target.project.clone().or_else(|| match &call.target {
+            EgressTarget::InAppProvider {
+                primary_project, ..
+            } => primary_project
+                .as_ref()
+                .filter(|project| project.space_id == target.scope.space_id)
+                .cloned(),
+            EgressTarget::ExternalMcp => None,
+        });
+        let selection = match call.provider_selection(&scope, selection_project).await {
+            Ok(selection) => selection,
+            Err(error) if corpus::hidden(&error) => {
+                if previous.is_some() {
+                    if foreign_space && targeted_project {
+                        call.commit_external_read();
+                    }
+                    return Err(invalid(ValidationReason::CursorStale));
+                }
+                return Ok(empty(external));
+            }
+            Err(error) => return Err(error),
+        };
+        if let Some(sel) = selection {
+            allow_user_doc = sel.policy.allowed_classes.contains(&DocClass::UserDoc);
+            if let Some(required) = &sel.project_only {
+                if target
+                    .project
+                    .as_ref()
+                    .is_some_and(|existing| existing != required)
+                {
+                    if previous.is_some() {
+                        if foreign_space && targeted_project {
+                            call.commit_external_read();
+                        }
+                        return Err(invalid(ValidationReason::CursorStale));
+                    }
+                    return Ok(empty(external));
+                }
+                scope = match scope.restrict_to_project(required) {
+                    Ok(narrowed) => narrowed,
+                    Err(_) => {
+                        if previous.is_some() {
+                            if foreign_space && targeted_project {
+                                call.commit_external_read();
+                            }
+                            return Err(invalid(ValidationReason::CursorStale));
+                        }
+                        return Ok(empty(external));
+                    }
+                };
+            }
+        }
+    }
+    let alias_base_scope = scope.clone();
+    if let Some(project) = &target.project {
+        scope = match scope.restrict_to_project(project) {
+            Ok(narrowed) => narrowed,
+            Err(_) => {
+                if previous.is_some() {
+                    if foreign_space && targeted_project {
+                        call.commit_external_read();
+                    }
+                    return Err(invalid(ValidationReason::CursorStale));
+                }
+                return Ok(empty(external));
+            }
+        };
+    }
+    let preflight_scope = if external {
+        scope.clone()
+    } else {
+        scope.with_preflight_taint()
+    };
+    let alias_preflight_scope = if external {
+        alias_base_scope
+    } else {
+        alias_base_scope.with_preflight_taint()
+    };
+    if let Some(previous) = &previous
+        && let Err(error) = scope.scope().check(&previous.scope)
+    {
+        if foreign_space && targeted_project && !matches!(error, DomainError::ResourceNotFound) {
+            call.commit_external_read();
+        }
+        return Err(error.into());
+    }
+    if foreign_space && targeted_project {
+        // Targeting a consented foreign project (explicitly or via episode
+        // project_hint) observes that Space even when the resulting listing is empty.
+        call.auth.taint().mark_external_read();
+    }
+    let has_previous = previous.is_some();
+    let folder = match directory(
+        call,
+        &target,
+        &preflight_scope,
+        &alias_preflight_scope,
+        &cleaned_path,
+    )
+    .await
+    {
+        Ok(Some(folder)) => folder,
+        Ok(None) => {
+            if foreign_space && (args.path.is_some() || (targeted_project && has_previous)) {
+                call.commit_external_read();
+            }
+            if has_previous {
+                return Err(invalid(ValidationReason::CursorStale));
+            }
+            return Ok(empty(external));
+        }
+        Err(error) => {
+            commit_post_target_err(call, foreign_space, targeted_project, has_previous, &error);
+            return Err(error);
+        }
+    };
+    let folder_project = folder
+        .project
+        .clone()
+        .map(|folder_id| notarium_core::model::FolderRef {
+            space_id: scope.scope().space_id.clone(),
+            folder_id,
+        });
+    if let Err(error) = corpus::admit_folder_boundary(
+        call,
+        &scope,
+        &folder.reference,
+        folder_project,
+        &folder.ancestor_folders,
+        None,
+    )
+    .await
+    {
+        if corpus::hidden(&error) {
+            if has_previous {
+                if foreign_space && targeted_project {
+                    call.commit_external_read();
+                }
+                return Err(invalid(ValidationReason::CursorStale));
+            }
+            return Ok(empty(external));
+        }
+        commit_post_target_err(call, foreign_space, targeted_project, has_previous, &error);
+        return Err(error);
+    }
+    if foreign_space && (!args.fields.is_empty() || args.path.is_some()) {
+        call.commit_external_read();
+    }
+    let filter = if args.fields.is_empty() || (!external && !allow_user_doc) {
+        args.fields.compile(&BTreeMap::new())?
+    } else {
+        let schema = call
+            .registry
+            .engine
+            .space_schema(preflight_scope.clone())
+            .await?;
+        args.fields.compile(&schema)?
+    };
+    let tag = args.tag.map(|tag| lookup_key(&tag));
+    let auth = scope.auth();
+    let grant = auth
+        .spaces()
+        .get(&folder.reference.space_id)
+        .ok_or(DomainError::ResourceNotFound)?;
+    let receiver = match &call.target {
+        EgressTarget::ExternalMcp => None,
+        EgressTarget::InAppProvider {
+            provider,
+            model,
+            primary_project,
+        } => Some((provider, model, primary_project)),
+    };
+    let encoded = serde_json::to_vec(&(
+        auth.principal(),
+        command_actor(auth),
+        auth.bearer_scope(),
+        receiver,
+        grant.role,
+        &grant.read_classes,
+        &grant.project_root,
+        &target.project,
+        &folder.reference,
+        &filter,
+        &tag,
+        limit.get(),
+    ))
+    .map_err(|_| invalid(ValidationReason::InvalidState))?;
+    let fingerprint = ContentDigest::from_bytes(*blake3::hash(&encoded).as_bytes());
+    if let Some(previous) = &previous {
+        if let Err(error) = scope.scope().check(&previous.scope) {
+            if foreign_space && targeted_project && !matches!(error, DomainError::ResourceNotFound)
+            {
+                call.commit_external_read();
+            }
+            return Err(error.into());
+        }
+        if previous.folder != folder.reference || previous.fingerprint != fingerprint {
+            if foreign_space && targeted_project {
+                call.commit_external_read();
+            }
+            return Err(invalid(ValidationReason::CursorScopeMismatch));
+        }
+    }
+    let folder_info = match corpus::folder_metadata(call, &scope, &folder).await {
+        Ok(info) => info,
+        Err(error) if corpus::hidden(&error) => {
+            if args.cursor.is_some() {
+                if foreign_space && targeted_project {
+                    call.commit_external_read();
+                }
+                return Err(invalid(ValidationReason::CursorStale));
+            }
+            return Ok(empty(external));
+        }
+        Err(error) => {
+            commit_post_target_err(call, foreign_space, targeted_project, has_previous, &error);
+            return Err(error);
+        }
+    };
+
+    let request = if let Some(previous) = &previous {
+        previous
+            .notes
+            .clone()
+            .map(|cursor| ReadRequest::Continue { cursor })
+    } else {
+        Some(ReadRequest::Open {
+            query: NoteQuery {
+                folder: Some(folder.reference.folder_id.clone()),
+                recursive: false,
+                classes: [DocClass::UserDoc].into(),
+                lifecycle: LifecycleMask::Active,
+                filter,
+                tag,
+                sort: SortSpec::default(),
+                limit,
+            },
+            causal: target.causal(),
+        })
+    };
+    let mut items = Vec::new();
+    let mut next_notes = None;
+    let mut incomplete = false;
+    let mut total = if external {
+        previous.as_ref().and_then(|cursor| cursor.total)
+    } else {
+        None
+    };
+    if allow_user_doc && let Some(request) = request {
+        let page = match call
+            .registry
+            .engine
+            .list_notes(preflight_scope.clone(), request)
+            .await
+        {
+            Ok(page) => page,
+            Err(error) => {
+                commit_post_target_err(call, foreign_space, targeted_project, has_previous, &error);
+                return Err(error);
+            }
+        };
+        if let Err(error) = scope.scope().check(&page.children.scope) {
+            let error: PortError = error.into();
+            commit_post_target_err(call, foreign_space, targeted_project, has_previous, &error);
+            return Err(error);
+        }
+        if page.folder != folder.reference || page.children.items.len() > usize::from(limit.get()) {
+            let error = invalid(ValidationReason::InvalidState);
+            commit_post_target_err(call, foreign_space, targeted_project, has_previous, &error);
+            return Err(error);
+        }
+        if external {
+            total = Some(page.total);
+        }
+        incomplete = page.children.incomplete;
+        next_notes = page.children.next;
+        for card in page.children.items {
+            let metadata = card.document.provenance();
+            if metadata.class() != DocClass::UserDoc
+                || folder.cover_note.as_ref() == Some(&metadata.reference().note_id)
+            {
+                continue;
+            }
+            match corpus::note_metadata(call, &scope, metadata).await {
+                Ok(()) => items.push(json!({
+                    "noteId": metadata.reference().note_id,
+                    "versionToken": metadata.revision(),
+                    "title": card.title,
+                    "path": card.path,
+                    "tags": card.tags,
+                    "viewType": card.view_type,
+                })),
+                Err(error) if corpus::hidden(&error) => (),
+                Err(error) => {
+                    commit_post_target_err(
+                        call,
+                        foreign_space,
+                        targeted_project,
+                        has_previous,
+                        &error,
+                    );
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    let mut folders = Vec::new();
+    let mut next_folders = None;
+    let mut folders_cut = None;
+    if previous
+        .as_ref()
+        .is_none_or(|cursor| cursor.folders.is_some())
+    {
+        let (after, at_seq) = match previous {
+            Some(cursor) => (cursor.folders, cursor.folders_cut),
+            None => (None, None),
+        };
+        let page = match call
+            .registry
+            .engine
+            .list_child_folders(
+                preflight_scope.clone(),
+                Some(folder.reference.folder_id.clone()),
+                after.clone(),
+                at_seq,
+                limit,
+            )
+            .await
+        {
+            Ok(page) => page,
+            Err(error) => {
+                commit_post_target_err(call, foreign_space, targeted_project, has_previous, &error);
+                return Err(error);
+            }
+        };
+        if page.items.len() > usize::from(limit.get())
+            || page
+                .next
+                .as_ref()
+                .is_some_and(|next| after.as_ref().is_some_and(|after| next <= after))
+        {
+            let error = invalid(ValidationReason::InvalidState);
+            commit_post_target_err(call, foreign_space, targeted_project, has_previous, &error);
+            return Err(error);
+        }
+        next_folders = page.next;
+        folders_cut = next_folders.as_ref().map(|_| page.cut_seq);
+        for child in &page.items {
+            if child.history != folder.history
+                || child.parent.as_ref() != Some(&folder.reference.folder_id)
+            {
+                let error = invalid(ValidationReason::InvalidState);
+                commit_post_target_err(call, foreign_space, targeted_project, has_previous, &error);
+                return Err(error);
+            }
+        }
+        folders = match corpus::folder_metadata_batch(call, &scope, &page.items).await {
+            Ok(folders) => folders,
+            Err(error) => {
+                commit_post_target_err(call, foreign_space, targeted_project, has_previous, &error);
+                return Err(error);
+            }
+        };
+    }
+    let mut output = json!({ "items": items, "folders": folders });
+    if incomplete {
+        output["incomplete"] = json!(true);
+    }
+    if let Some(total) = total {
+        output["total"] = json!(total);
+    }
+    if next_notes.is_some() || next_folders.is_some() {
+        let token = match call.registry.note_cursors.insert(
+            call.auth.principal().clone(),
+            NoteContinuation {
+                folder: folder.reference.clone(),
+                scope: folder.history.clone(),
+                fingerprint,
+                notes: next_notes,
+                folders: next_folders,
+                folders_cut,
+                total,
+            },
+        ) {
+            Ok(token) => token,
+            Err(error) => {
+                commit_post_target_err(call, foreign_space, targeted_project, has_previous, &error);
+                return Err(error);
+            }
+        };
+        output["nextCursor"] = json!(token);
+    }
+    let handle = if let Some(handle) = args.project {
+        Some(handle)
+    } else if external && folder.cover_note.is_none() {
+        if let Some(project) = &target.project {
+            let source = match session::project_for_folder(call, project).await {
+                Ok(source) => source,
+                Err(error) => {
+                    commit_post_target_err(
+                        call,
+                        foreign_space,
+                        targeted_project,
+                        has_previous,
+                        &error,
+                    );
+                    return Err(error);
+                }
+            };
+            Some(format!("{}/{}", target.slug, source.project_slug))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let page = match folder_page(
+        call,
+        &scope,
+        &preflight_scope,
+        allow_user_doc,
+        &folder,
+        &folder_info,
+        handle.as_deref(),
+    )
+    .await
+    {
+        Ok(page) => page,
+        Err(error) => {
+            commit_post_target_err(call, foreign_space, targeted_project, has_previous, &error);
+            return Err(error);
+        }
+    };
+    if let Some(page) = page {
+        output["folderPage"] = page;
+    }
+    Ok(output)
+}
+
+fn commit_post_target_err(
+    call: &ToolCallContext<'_>,
+    foreign_space: bool,
+    targeted_project: bool,
+    has_previous: bool,
+    error: &PortError,
+) {
+    if foreign_space
+        && targeted_project
+        && !matches!(error, PortError::Domain(DomainError::ResourceNotFound))
+        && !(has_previous
+            && matches!(
+                error,
+                PortError::Domain(DomainError::ValidationFailed { diagnostic })
+                    if diagnostic.reason == ValidationReason::CursorStale
+            ))
+    {
+        call.commit_external_read();
+    }
+}
+
+async fn directory(
+    call: &ToolCallContext<'_>,
+    target: &ReadTarget,
+    scope: &SpaceContext,
+    alias_scope: &SpaceContext,
+    path: &str,
+) -> Result<Option<FolderSnapshot>, PortError> {
+    let engine = &call.registry.engine;
+    let Some(project) = &target.project else {
+        return engine
+            .resolve_folder_path(scope.clone(), None, path.to_owned())
+            .await;
+    };
+    let base = Some(project.folder_id.clone());
+    let Some(home) = engine
+        .resolve_folder_path(scope.clone(), base.clone(), String::new())
+        .await?
+    else {
+        return Ok(None);
+    };
+    scope.scope().check(&home.history)?;
+    if home.reference != *project {
+        return Err(invalid(ValidationReason::SourceMismatch));
+    }
+    if path.is_empty() {
+        return Ok(Some(home));
+    }
+    if let Some(relative) = corpus::strip_folder_prefix(path, &home.path)
+        && let Some(folder) = engine
+            .resolve_folder_path(scope.clone(), base.clone(), relative)
+            .await?
+    {
+        return Ok(Some(folder));
+    }
+
+    // Resolve project-relative paths first so live subfolders inside the
+    // selected project are never shadowed by an older Space-relative alias.
+    if let Some(folder) = engine
+        .resolve_folder_path(scope.clone(), base, path.to_owned())
+        .await?
+    {
+        return Ok(Some(folder));
+    }
+
+    // A whole-Space credential can fall back to an older Space-relative alias
+    // (e.g. a renamed project's former slug), provided the resolved folder
+    // belongs to the selected project and all subsequent reads stay narrowed.
+    if alias_scope
+        .auth()
+        .spaces()
+        .get(&project.space_id)
+        .is_some_and(|grant| grant.project_root.is_none())
+        && let Some(folder) = engine
+            .resolve_folder_path(alias_scope.clone(), None, path.to_owned())
+            .await?
+        && folder.project.as_ref() == Some(&project.folder_id)
+    {
+        return Ok(Some(folder));
+    }
+    Ok(None)
+}
+
+async fn folder_page(
+    call: &mut ToolCallContext<'_>,
+    scope: &SpaceContext,
+    preflight_scope: &SpaceContext,
+    allow_user_doc: bool,
+    folder: &FolderSnapshot,
+    folder_info: &Value,
+    handle: Option<&str>,
+) -> Result<Option<Value>, PortError> {
+    if !allow_user_doc {
+        return Ok(None);
+    }
+    let marker = |status: &str| {
+        json!({
+            "status": status,
+            "folderId": folder.reference.folder_id,
+            "folderPath": folder_info["path"],
+        })
+    };
+    if let Some(id) = &folder.cover_note {
+        let note = call
+            .registry
+            .engine
+            .get_note_metadata(
+                preflight_scope.clone(),
+                GetNote {
+                    note: id.clone(),
+                    revision: None,
+                    causal: CausalBasis::Await(Default::default()),
+                },
+            )
+            .await;
+        match note {
+            Ok(note) => {
+                let metadata = &note.metadata;
+                if metadata.class() == DocClass::UserDoc {
+                    if metadata.reference().note_id != *id
+                        || (note.parent.as_ref() != Some(&folder.reference.folder_id)
+                            && (note.parent.is_some() || folder.parent.is_some()))
+                    {
+                        return Err(invalid(ValidationReason::InvalidState));
+                    }
+                    match corpus::note_metadata(call, scope, metadata).await {
+                        Ok(()) => {
+                            let mut page = marker("present");
+                            page["noteId"] = json!(id);
+                            page["versionToken"] = json!(metadata.revision());
+                            page["title"] =
+                                json!(note.provenance.as_ref().map(|facts| &facts.title));
+                            return Ok(Some(page));
+                        }
+                        Err(error) if corpus::hidden(&error) => (),
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
+            Err(error) if corpus::hidden(&error) => (),
+            Err(error) => return Err(error),
+        }
+    }
+    let mut page = marker("missing");
+    if let Some(handle) = handle {
+        let facts = match call
+            .registry
+            .catalog
+            .folder(
+                call.account().with_preflight_taint(),
+                folder.reference.clone(),
+            )
+            .await
+        {
+            Ok(facts)
+                if facts.reference == folder.reference
+                    && facts.lifecycle == Lifecycle::Active
+                    && facts.space.id == folder.reference.space_id =>
+            {
+                facts
+            }
+            Ok(_) => return Err(invalid(ValidationReason::SourceMismatch)),
+            Err(error) if corpus::hidden(&error) => return Ok(Some(page)),
+            Err(error) => return Err(error),
+        };
+        let resource = ResourceFacts {
+            space: facts.space,
+            class: DocClass::UserDoc,
+            project: None,
+            ancestor_folders: facts.ancestor_folders,
+            folder_write_locked: facts.write_locked,
+            ability_package: None,
+        };
+        if scope
+            .auth()
+            .authorize_direct_write(&resource, &resource)
+            .is_ok()
+        {
+            page["createWith"] =
+                json!({ "project": handle, "path": folder_info["path"], "folderPage": true });
+        }
+    }
+    Ok(Some(page))
+}
+
+fn empty(external: bool) -> Value {
+    if external {
+        json!({ "items": [], "folders": [], "total": 0 })
+    } else {
+        json!({ "items": [], "folders": [] })
+    }
+}

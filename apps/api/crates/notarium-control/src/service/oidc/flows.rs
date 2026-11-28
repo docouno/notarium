@@ -215,7 +215,7 @@ impl OidcService {
             let record=TargetRecord::from(OidcTransactionsRow {transaction_id:flow.transaction.to_string(),state_hash:token::digest(state.expose().as_bytes()).to_vec(),nonce_hash:token::digest(flow.nonce.as_bytes()).to_vec(),flow_context_hash:token::digest(sealed.encrypted.as_bytes()).to_vec(),key_id:sealed.witness.key.to_string(),issuer:flow.issuer.clone(),client_id:flow.client.clone(),redirect_uri:flow.redirect.clone(),purpose:if flow.bound.is_some() {"link"} else {"login"}.into(),bound_user:flow.bound.as_ref().map(|b|b.user.to_string()),browser_binding_hash:browser.to_vec(),expires_at:flow.expires,consumed_at:None,created_at:flow.created});
             record.validate()?;record.insert(tx.inner_mut()).await
         },CommitEffect::NotCommitted).await?;
-        budget.run(tx.commit(), CommitEffect::Unknown).await?;
+        budget.commit_tx(tx).await?;
         Ok(OidcAuthorization {
             authorization_url: SecretString::new(url.to_string()),
             flow: ProtectedOidcFlow {
@@ -311,7 +311,7 @@ impl OidcService {
         },CommitEffect::NotCommitted).await?;
         // Claim is durable before the only token exchange. A lost response or
         // cancelled caller must start a new flow; there is no exchange retry.
-        budget.run(tx.commit(), CommitEffect::Unknown).await?;
+        budget.commit_tx(tx).await?;
         let client = CoreClient::from_provider_metadata(
             metadata,
             ClientId::new(flow.client.clone()),

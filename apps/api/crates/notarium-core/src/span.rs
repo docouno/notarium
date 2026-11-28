@@ -87,13 +87,13 @@ impl Utf16Span {
         }
     }
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CarrierByteSpan(pub ByteSpan);
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CarrierUtf16Span(pub Utf16Span);
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BodyByteSpan(pub ByteSpan);
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BodyUtf16Span(pub Utf16Span);
 pub fn decode_utf8(bytes: &[u8]) -> DomainResult<&str> {
     std::str::from_utf8(bytes).map_err(|_| DomainError::validation(ValidationReason::InvalidUtf8))

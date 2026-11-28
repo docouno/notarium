@@ -2,7 +2,10 @@
 use crate::{
     CanonicalStore, ProjectionRedactedEntry,
     changes::list_thread_keys_at_or_below_cutoff_tx,
-    codec::{RevisionMetadataEnvelope, RevisionMetadataPayload, internal_not_committed},
+    codec::{
+        RevisionMetadataEnvelope, RevisionMetadataPayload, ThreadRevisionMetadata,
+        internal_not_committed,
+    },
     projection_read::ProjectionPage,
     runtime::{
         is_note_purge_fenced_tx, pg_read_error, purge_fenced_note_ids_tx,
@@ -79,6 +82,31 @@ macro_rules! chat_fetch_scalar {
 pub struct ProjectionChatHead {
     pub thread: ChatThread,
     pub title: String,
+}
+
+impl ProjectionChatHead {
+    fn at_revision(
+        scope: &HistoryScope,
+        revision: RevisionId,
+        meta: ThreadRevisionMetadata,
+    ) -> Self {
+        Self {
+            title: meta.title.clone(),
+            thread: ChatThread {
+                id: meta.thread_id,
+                space: scope.space_id.clone(),
+                kind: meta.kind,
+                owner: meta.owner_id,
+                project_folder: meta.project_folder_id,
+                title: meta.title,
+                // Historical revisions contain no transient run claim.
+                active_run: None,
+                head: meta.head_leaf_seq,
+                revision,
+                tainted: meta.tainted,
+            },
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -755,19 +783,7 @@ pub(crate) async fn read_heads_batch(
         };
         out.insert(
             entity_key,
-            ProjectionChatHead {
-                thread: ChatThread {
-                    id: meta.thread_id,
-                    space: scope.space_id.clone(),
-                    kind: meta.kind,
-                    owner: meta.owner_id,
-                    project_folder: meta.project_folder_id,
-                    head: meta.head_leaf_seq,
-                    revision: RevisionId::parse(&rev_id)?,
-                    tainted: meta.tainted,
-                },
-                title: meta.title,
-            },
+            ProjectionChatHead::at_revision(scope, RevisionId::parse(&rev_id)?, meta),
         );
     }
     Ok(out)
@@ -785,19 +801,11 @@ pub(crate) async fn read_head(
     let RevisionMetadataPayload::Thread(meta) = revision.metadata.payload else {
         return Err(corrupt("non-thread payload in a thread revision"));
     };
-    Ok(Some(ProjectionChatHead {
-        thread: ChatThread {
-            id: meta.thread_id,
-            space: scope.space_id.clone(),
-            kind: meta.kind,
-            owner: meta.owner_id,
-            project_folder: meta.project_folder_id,
-            head: meta.head_leaf_seq,
-            revision: revision.revision_id,
-            tainted: meta.tainted,
-        },
-        title: meta.title,
-    }))
+    Ok(Some(ProjectionChatHead::at_revision(
+        scope,
+        revision.revision_id,
+        meta,
+    )))
 }
 
 struct EntryHead {

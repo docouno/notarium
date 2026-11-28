@@ -1,0 +1,857 @@
+use std::sync::LazyLock;
+
+use notarium_core::{
+    ids::EpisodeId,
+    ports::{
+        AgentOperation, ConfirmedEffectKind, ProviderToolDefinition, ProviderToolSchema,
+        RecallQuery,
+    },
+};
+use serde::Serialize;
+use serde_json::{Map, Value, json};
+
+use super::invalid;
+use notarium_core::error::{PortError, ValidationReason};
+
+const MAX_YAML_VALUE_DEPTH: usize = 8;
+
+struct CachedTool {
+    input: Input,
+    descriptor: ToolDescriptor,
+    provider_definition: ProviderToolDefinition,
+}
+
+static TOOL_CACHE: LazyLock<[CachedTool; 28]> = LazyLock::new(|| {
+    std::array::from_fn(|index| {
+        let tool = ToolName::ALL[index];
+        let input = tool.build_input();
+        let mut input_schema = input.json_schema();
+        input_schema["$schema"] = json!("https://json-schema.org/draft/2020-12/schema");
+        let descriptor = ToolDescriptor {
+            name: tool.name(),
+            description: tool.description(),
+            input_schema,
+            annotations: ToolAnnotations {
+                open_world_hint: false,
+                read_only_hint: tool.read_only_hint(),
+            },
+        };
+        let provider_definition = ProviderToolDefinition {
+            name: tool.name().into(),
+            description: tool.description().into(),
+            parameters: input.provider_schema(),
+        };
+        CachedTool {
+            input,
+            descriptor,
+            provider_definition,
+        }
+    })
+});
+
+macro_rules! tools {
+    ($($variant:ident ($name:literal, $description:literal, $operation:ident, $write:expr)),+ $(,)?) => {
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        pub(super) enum ToolName { $($variant),+ }
+
+        impl ToolName {
+            pub(super) const ALL: &'static [Self] = &[$(Self::$variant),+];
+
+            pub(super) fn parse(name: &str) -> Option<Self> {
+                match name {
+                    $($name => Some(Self::$variant),)+
+                    _ => None,
+                }
+            }
+            pub(super) const fn name(self) -> &'static str {
+                match self { $(Self::$variant => $name),+ }
+            }
+            const fn description(self) -> &'static str {
+                match self { $(Self::$variant => $description),+ }
+            }
+            pub(super) const fn operation(self) -> AgentOperation {
+                match self { $(Self::$variant => AgentOperation::$operation),+ }
+            }
+            pub(super) const fn writes(self) -> bool {
+                match self { $(Self::$variant => $write),+ }
+            }
+            pub(super) const fn read_only_hint(self) -> bool {
+                !self.writes() && !matches!(self, Self::StartSession | Self::UseRole)
+            }
+        }
+    };
+}
+
+tools! {
+    StartSession("start_session", "Start or resume an episode and read its workspace delta.", Context, false),
+    ListAbilities("list_abilities", "List visible roles and skills.", Ability, false),
+    UseRole("use_role", "Activate a role and load its instructions and skills.", Ability, false),
+    UseSkill("use_skill", "Load instructions from an effective skill.", Ability, false),
+    Whoami("whoami", "Inspect your current workspace access.", Context, false),
+    GetMyProjects("get_my_projects", "List the projects you can access.", List, false),
+    ListNotes("list_notes", "List notes and folders at a workspace path.", List, false),
+    RecentActivity("recent_activity", "Read recent visible changes.", List, false),
+    Search("search", "Search visible notes.", Search, false),
+    GetNote("get_note", "Read a note and its current revision.", Read, false),
+    Recall("recall", "Collect related note context within a token budget.", Search, false),
+    GetAbility("get_ability", "Read a visible role or skill package.", Ability, false),
+    CreateAbility("create_ability", "Publish a new role or skill.", Ability, true),
+    EditAbility("edit_ability", "Update an owned role or skill.", Ability, true),
+    DeleteAbility("delete_ability", "Trash an owned role or skill.", Ability, true),
+    CreateNote("create_note", "Create one Markdown note.", Mutation, true),
+    CreateNotes("create_notes", "Create a batch of Markdown notes and resolve links between them.", Mutation, true),
+    EditNote("edit_note", "Edit a note or one of its views.", Mutation, true),
+    RememberAboutUser("remember_about_user", "Append an observation to your personal memory.", Memory, true),
+    RememberAboutProject("remember_about_project", "Append an observation to project memory.", Memory, true),
+    Link("link", "Add one typed note link.", Mutation, true),
+    LinkMany("link_many", "Add a batch of typed note links.", Mutation, true),
+    DeleteNote("delete_note", "Move a note to the trash.", Mutation, true),
+    MoveNote("move_note", "Move a note to another folder in its Space.", Mutation, true),
+    RenameNote("rename_note", "Change the title of a note.", Mutation, true),
+    MoveFolder("move_folder", "Move a folder within its Space.", Mutation, true),
+    RenameFolder("rename_folder", "Rename a workspace folder.", Mutation, true),
+    RenameProject("rename_project", "Rename a project and update its handle.", Mutation, true),
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolDescriptor {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub input_schema: Value,
+    pub annotations: ToolAnnotations,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolAnnotations {
+    pub open_world_hint: bool,
+    pub read_only_hint: bool,
+}
+
+impl ToolName {
+    fn cached(self) -> &'static CachedTool {
+        &TOOL_CACHE[self as usize]
+    }
+
+    pub(super) fn descriptor(self) -> ToolDescriptor {
+        self.cached().descriptor.clone()
+    }
+
+    pub(super) fn provider_definition(self) -> ProviderToolDefinition {
+        self.cached().provider_definition.clone()
+    }
+
+    pub(super) fn validate(self, args: &mut Value) -> Result<(), PortError> {
+        if self.cached().input.validate(args) {
+            Ok(())
+        } else {
+            Err(invalid(ValidationReason::InvalidQuery))
+        }
+    }
+
+    pub(super) const fn ability_write(self) -> bool {
+        matches!(
+            self,
+            Self::CreateAbility | Self::EditAbility | Self::DeleteAbility
+        )
+    }
+
+    pub(super) const fn confirmed_effect_kind(self) -> Option<ConfirmedEffectKind> {
+        match self {
+            Self::CreateNote | Self::CreateNotes => Some(ConfirmedEffectKind::CreateNote),
+            Self::EditNote => Some(ConfirmedEffectKind::EditNote),
+            Self::DeleteNote => Some(ConfirmedEffectKind::TrashNote),
+            Self::MoveNote => Some(ConfirmedEffectKind::MoveNote),
+            Self::RenameNote => Some(ConfirmedEffectKind::RenameNote),
+            Self::Link | Self::LinkMany => Some(ConfirmedEffectKind::Link),
+            Self::RememberAboutUser | Self::RememberAboutProject => {
+                Some(ConfirmedEffectKind::AppendMemory)
+            }
+            _ => None,
+        }
+    }
+
+    fn build_input(self) -> Input {
+        use ToolName::*;
+
+        let fields = match self {
+            Whoami | GetMyProjects => vec![],
+            StartSession => {
+                return object(vec![
+                    opt("project", key()),
+                    opt("role", key()),
+                    opt("task", string(0, 4096)),
+                    opt(
+                        "session",
+                        one_of(vec![
+                            object(vec![req("id", Input::Episode)]),
+                            object(vec![req("name", string(1, 128))]),
+                        ]),
+                    ),
+                    opt("continuation", cursor()),
+                    opt("deliveryReceipt", cursor()),
+                    opt("acknowledge", Input::Boolean),
+                    opt("responseFormat", response_format()),
+                ]);
+            }
+            ListAbilities => vec![
+                req("view", choice(&["runtime", "authoring"])),
+                opt("kind", ability_kind()),
+                opt("source", choice(&["system", "owned"])),
+                opt("project", key()),
+                opt("q", string(1, 256)),
+                opt("cursor", cursor()),
+                opt("limit", integer(1, 50)),
+            ],
+            UseRole | UseSkill => vec![
+                opt(if self == UseRole { "role" } else { "skill" }, key()),
+                opt("name", key()),
+                opt("project", key()),
+                opt("budgetTokens", integer(100, 16000)),
+            ],
+            GetAbility | DeleteAbility | DeleteNote => vec![req("ref", key())],
+            CreateAbility => vec![
+                req("kind", ability_kind()),
+                req("name", string(1, 128)),
+                req("description", string(1, 4096)),
+                req("instructions", string(1, 262_144)),
+                req(
+                    "placement",
+                    any_of(vec![
+                        object(vec![req("home", choice(&["personal"]))]),
+                        object(vec![req("home", choice(&["space"])), req("space", key())]),
+                        object(vec![
+                            req("home", choice(&["project"])),
+                            req("project", key()),
+                        ]),
+                    ]),
+                ),
+                opt("attachments", attachments()),
+                opt("availability", availability()),
+                opt("idempotencyKey", key()),
+            ],
+            EditAbility => vec![
+                req("ref", key()),
+                opt("versionToken", cursor()),
+                opt("description", string(1, 4096)),
+                opt("instructions", string(1, 262_144)),
+                opt("attachments", attachments()),
+                opt("availability", availability()),
+                opt("enabled", Input::Boolean),
+                opt("home", object(vec![req("home", choice(&["space"]))])),
+            ],
+            ListNotes => vec![
+                opt("project", key()),
+                opt("path", path()),
+                opt("tag", key()),
+                opt("field", array(key(), 0, 64)),
+                opt("fieldDay", array(key(), 0, 64)),
+                opt("fieldAny", array(key(), 0, 64)),
+                opt("fieldBad", array(key(), 0, 64)),
+                opt("cursor", cursor()),
+                opt("limit", integer(1, 100)),
+            ],
+            GetNote => vec![req("ref", key()), opt("responseFormat", response_format())],
+            RecentActivity => vec![opt("project", key()), opt("limit", integer(1, 100))],
+            Search => vec![
+                req("query", byte_string(1, 4096)),
+                opt("project", key()),
+                opt("class", key()),
+                opt("responseFormat", response_format()),
+                opt("limit", integer(1, 100)),
+            ],
+            Recall => vec![
+                req("query", byte_string(1, 4096)),
+                opt("project", key()),
+                opt("budgetTokens", integer(200, 32000)),
+                opt("depth", integer(0, i64::from(RecallQuery::MAX_GRAPH_DEPTH))),
+                opt("maxPerSource", integer(1, 32000)),
+            ],
+            CreateNote => {
+                let mut fields = note_input();
+                fields.extend([
+                    req("project", key()),
+                    opt("folderPage", Input::True),
+                    opt("versionToken", cursor()),
+                ]);
+                fields
+            }
+            CreateNotes => vec![
+                req("project", key()),
+                req("notes", array(object(note_input()), 1, 50)),
+            ],
+            EditNote => vec![
+                req("ref", key()),
+                opt(
+                    "operation",
+                    choice(&[
+                        "append",
+                        "prepend",
+                        "replace",
+                        "replaceSection",
+                        "findReplace",
+                    ]),
+                ),
+                opt("content", content()),
+                opt("section", key()),
+                opt("find", string(1, 65_536)),
+                opt(
+                    "fields",
+                    map(any_of(vec![
+                        content(),
+                        array(content(), 0, 256),
+                        Input::Null,
+                    ])),
+                ),
+                opt(
+                    "view",
+                    object(vec![
+                        req("viewRef", key()),
+                        opt("source", view_patch()),
+                        opt("common", view_patch()),
+                        opt("options", view_patch()),
+                    ]),
+                ),
+                opt("versionToken", cursor()),
+                opt("idempotencyKey", key()),
+            ],
+            RememberAboutUser | RememberAboutProject => {
+                let mut fields = vec![
+                    req("observation", string(1, 262_144)),
+                    opt("category", string(1, 64)),
+                    opt("summary", string(0, 262_144)),
+                    opt("versionToken", cursor()),
+                    opt("idempotencyKey", key()),
+                ];
+                if self == RememberAboutProject {
+                    fields.push(req("project", key()));
+                }
+                fields
+            }
+            MoveNote => vec![req("ref", key()), req("toFolder", path())],
+            RenameNote => vec![req("ref", key()), req("title", key())],
+            MoveFolder => vec![
+                req("folder", byte_string(1, 4096)),
+                req("toFolder", path()),
+                opt("project", key()),
+            ],
+            RenameFolder => vec![
+                req("folder", byte_string(1, 4096)),
+                req("name", key()),
+                opt("project", key()),
+            ],
+            RenameProject => vec![
+                req("project", key()),
+                req("slug", key()),
+                opt("displayName", key()),
+            ],
+            Link => link_tool_fields(),
+            LinkMany => vec![req("links", array(object(link_tool_fields()), 1, 100))],
+        };
+        let mut fields = fields;
+        fields.push(opt("session", Input::Episode));
+        object(fields)
+    }
+}
+
+enum Input {
+    Text {
+        min: usize,
+        max: usize,
+        max_bytes: Option<usize>,
+    },
+    Episode,
+    Choice(&'static [&'static str]),
+    Integer {
+        min: i64,
+        max: i64,
+    },
+    Boolean,
+    True,
+    Null,
+    Array {
+        item: Box<Input>,
+        min: usize,
+        max: usize,
+    },
+    Object(Vec<Field>),
+    Map(Box<Input>),
+    AnyOf(Vec<Input>),
+    OneOf(Vec<Input>),
+    YamlValue {
+        max_depth: usize,
+    },
+}
+
+struct Field {
+    name: &'static str,
+    input: Input,
+    required: bool,
+}
+
+fn valid_yaml_value(value: &Value, depth: usize) -> bool {
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) => true,
+        Value::String(text) => {
+            text.len() <= 524_288_usize.saturating_mul(4) && text.chars().count() <= 524_288
+        }
+        Value::Array(items) => {
+            depth > 0
+                && items.len() <= 256
+                && items.iter().all(|item| valid_yaml_value(item, depth - 1))
+        }
+        Value::Object(map) => {
+            depth > 0
+                && map.len() <= 128
+                && map.values().all(|item| valid_yaml_value(item, depth - 1))
+        }
+    }
+}
+
+impl Input {
+    fn matches(&self, value: &Value) -> bool {
+        match self {
+            Self::Text {
+                min,
+                max,
+                max_bytes,
+            } => value.as_str().is_some_and(|text| {
+                text.len() <= max_bytes.unwrap_or_else(|| max.saturating_mul(4))
+                    && (*min..=*max).contains(&text.chars().count())
+            }),
+            Self::Episode => value
+                .as_str()
+                .is_some_and(|id| EpisodeId::parse(id).is_ok()),
+            Self::Choice(choices) => value.as_str().is_some_and(|text| choices.contains(&text)),
+            Self::Integer { min, max } => value
+                .as_i64()
+                .or_else(|| {
+                    value.as_f64().and_then(|n| {
+                        (n.fract() == 0.0 && n >= *min as f64 && n <= *max as f64)
+                            .then_some(n as i64)
+                    })
+                })
+                .is_some_and(|number| (*min..=*max).contains(&number)),
+            Self::Boolean => value.is_boolean(),
+            Self::True => value.as_bool() == Some(true),
+            Self::Null => value.is_null(),
+            Self::Array { item, min, max } => value.as_array().is_some_and(|items| {
+                (*min..=*max).contains(&items.len()) && items.iter().all(|v| item.matches(v))
+            }),
+            Self::Object(fields) => value.as_object().is_some_and(|object| {
+                if object.len() > fields.len()
+                    || !object
+                        .keys()
+                        .all(|name| fields.iter().any(|field| field.name == name))
+                {
+                    return false;
+                }
+                fields.iter().all(|field| match object.get(field.name) {
+                    Some(value) => field.input.matches(value),
+                    None => !field.required,
+                })
+            }),
+            Self::Map(rule) => value.as_object().is_some_and(|object| {
+                object.len() <= 128 && object.values().all(|value| rule.matches(value))
+            }),
+            Self::AnyOf(choices) => choices.iter().any(|input| input.matches(value)),
+            Self::OneOf(choices) => {
+                choices.iter().filter(|input| input.matches(value)).count() == 1
+            }
+            Self::YamlValue { max_depth } => valid_yaml_value(value, *max_depth),
+        }
+    }
+
+    fn validate(&self, value: &mut Value) -> bool {
+        match self {
+            Self::Text {
+                min,
+                max,
+                max_bytes,
+            } => value.as_str().is_some_and(|text| {
+                // Bound UTF-8 accounting before scanning multibyte strings.
+                text.len() <= max_bytes.unwrap_or_else(|| max.saturating_mul(4))
+                    && (*min..=*max).contains(&text.chars().count())
+            }),
+            Self::Episode => value
+                .as_str()
+                .is_some_and(|id| EpisodeId::parse(id).is_ok()),
+            Self::Choice(choices) => value.as_str().is_some_and(|text| choices.contains(&text)),
+            Self::Integer { min, max } => {
+                let Some(number) = value.as_i64().or_else(|| {
+                    value.as_f64().and_then(|n| {
+                        (n.fract() == 0.0 && n >= *min as f64 && n <= *max as f64)
+                            .then_some(n as i64)
+                    })
+                }) else {
+                    return false;
+                };
+                if !(*min..=*max).contains(&number) {
+                    return false;
+                }
+                *value = Value::from(number);
+                true
+            }
+            Self::Boolean => value.is_boolean(),
+            Self::True => value.as_bool() == Some(true),
+            Self::Null => value.is_null(),
+            Self::Array { item, min, max } => value.as_array_mut().is_some_and(|items| {
+                (*min..=*max).contains(&items.len())
+                    && items.iter_mut().all(|value| item.validate(value))
+            }),
+            Self::Object(fields) => value.as_object_mut().is_some_and(|object| {
+                if object.len() > fields.len()
+                    || !object
+                        .keys()
+                        .all(|name| fields.iter().any(|field| field.name == name))
+                {
+                    return false;
+                }
+                fields.iter().all(|field| match object.get_mut(field.name) {
+                    Some(value) => field.input.validate(value),
+                    None => !field.required,
+                })
+            }),
+            Self::Map(rule) => value.as_object_mut().is_some_and(|object| {
+                object.len() <= 128 && object.values_mut().all(|value| rule.validate(value))
+            }),
+            Self::AnyOf(choices) => choices
+                .iter()
+                .find(|input| input.matches(value))
+                .is_some_and(|input| input.validate(value)),
+            Self::OneOf(choices) => {
+                let mut matched = choices.iter().filter(|input| input.matches(value));
+                let first = matched.next();
+                if matched.next().is_some() {
+                    return false;
+                }
+                first.is_some_and(|input| input.validate(value))
+            }
+            Self::YamlValue { max_depth } => valid_yaml_value(value, *max_depth),
+        }
+    }
+
+    fn json_schema(&self) -> Value {
+        match self {
+            Self::Text {
+                min,
+                max,
+                max_bytes: Some(bytes),
+            } => {
+                // JSON Schema `maxLength` counts Unicode scalar values rather than
+                // UTF-8 bytes, so publish the tightest sound code-point ceiling
+                // without rejecting valid mixed-script strings; runtime validation
+                // enforces the exact UTF-8 byte bound.
+                let codepoint_max = (*max).min(*bytes);
+                json!({
+                    "type": "string",
+                    "minLength": min,
+                    "maxLength": codepoint_max,
+                })
+            }
+            Self::Text {
+                min,
+                max,
+                max_bytes: None,
+            } => {
+                json!({"type":"string","minLength":min,"maxLength":max})
+            }
+            Self::Episode => json!({
+                "type":"string",
+                "pattern":"^(ses_[0-9a-f]{32}|ses_[A-Za-z0-9_-]{12}|[A-Za-z0-9_-]{12}|[0-9a-fA-F]{16})$"
+            }),
+            Self::Choice(values) => json!({"type":"string","enum":values}),
+            Self::Integer { min, max } => json!({"type":"integer","minimum":min,"maximum":max}),
+            Self::Boolean => json!({"type":"boolean"}),
+            Self::True => json!({"type":"boolean","const":true}),
+            Self::Null => json!({"type":"null"}),
+            Self::Array { item, min, max } => {
+                json!({"type":"array","items":item.json_schema(),"minItems":min,"maxItems":max})
+            }
+            Self::Object(fields) => {
+                let properties: Map<_, _> = fields
+                    .iter()
+                    .map(|field| (field.name.to_owned(), field.input.json_schema()))
+                    .collect();
+                let required: Vec<_> = fields
+                    .iter()
+                    .filter(|field| field.required)
+                    .map(|field| field.name)
+                    .collect();
+                json!({"type":"object","properties":properties,"required":required,"additionalProperties":false})
+            }
+            Self::Map(rule) => {
+                json!({"type":"object","additionalProperties":rule.json_schema(),"maxProperties":128})
+            }
+            Self::AnyOf(choices) => {
+                json!({"anyOf":choices.iter().map(Self::json_schema).collect::<Vec<_>>()})
+            }
+            Self::OneOf(choices) => {
+                json!({"oneOf":choices.iter().map(Self::json_schema).collect::<Vec<_>>()})
+            }
+            Self::YamlValue { .. } => {
+                json!({"type":["string","number","boolean","null","array","object"]})
+            }
+        }
+    }
+
+    fn provider_schema(&self) -> ProviderToolSchema {
+        match self {
+            Self::Text { .. } | Self::Episode => ProviderToolSchema::String { choices: vec![] },
+            Self::Choice(values) => ProviderToolSchema::String {
+                choices: values.iter().map(|value| (*value).to_owned()).collect(),
+            },
+            Self::Integer { min, max } => ProviderToolSchema::Integer {
+                minimum: Some(*min),
+                maximum: Some(*max),
+            },
+            Self::Boolean => ProviderToolSchema::Boolean,
+            Self::True => ProviderToolSchema::ConstBool(true),
+            Self::Null => ProviderToolSchema::Null,
+            Self::Array { item, min, max } => ProviderToolSchema::Array {
+                items: Box::new(item.provider_schema()),
+                minimum: (*min > 0).then_some(*min as u32),
+                maximum: *max as u32,
+            },
+            Self::Object(fields) => ProviderToolSchema::Object {
+                properties: fields
+                    .iter()
+                    .map(|field| (field.name.to_owned(), field.input.provider_schema()))
+                    .collect(),
+                required: fields
+                    .iter()
+                    .filter(|field| field.required)
+                    .map(|field| field.name.to_owned())
+                    .collect(),
+            },
+            Self::Map(rule) => ProviderToolSchema::Map {
+                values: Box::new(rule.provider_schema()),
+            },
+            Self::AnyOf(choices) | Self::OneOf(choices) => {
+                ProviderToolSchema::AnyOf(choices.iter().map(Self::provider_schema).collect())
+            }
+            Self::YamlValue { .. } => ProviderToolSchema::JsonValue,
+        }
+    }
+}
+
+fn req(name: &'static str, input: Input) -> Field {
+    Field {
+        name,
+        input,
+        required: true,
+    }
+}
+fn opt(name: &'static str, input: Input) -> Field {
+    Field {
+        name,
+        input,
+        required: false,
+    }
+}
+fn object(fields: Vec<Field>) -> Input {
+    Input::Object(fields)
+}
+fn map(rule: Input) -> Input {
+    Input::Map(Box::new(rule))
+}
+fn any_of(choices: Vec<Input>) -> Input {
+    Input::AnyOf(choices)
+}
+fn one_of(choices: Vec<Input>) -> Input {
+    Input::OneOf(choices)
+}
+fn array(item: Input, min: usize, max: usize) -> Input {
+    Input::Array {
+        item: Box::new(item),
+        min,
+        max,
+    }
+}
+fn choice(values: &'static [&'static str]) -> Input {
+    Input::Choice(values)
+}
+fn string(min: usize, max: usize) -> Input {
+    Input::Text {
+        min,
+        max,
+        max_bytes: None,
+    }
+}
+fn byte_string(min: usize, max: usize) -> Input {
+    Input::Text {
+        min,
+        max,
+        max_bytes: Some(max),
+    }
+}
+fn integer(min: i64, max: i64) -> Input {
+    Input::Integer { min, max }
+}
+fn key() -> Input {
+    string(1, 1024)
+}
+fn path() -> Input {
+    byte_string(0, 4096)
+}
+fn cursor() -> Input {
+    string(1, 4096)
+}
+fn content() -> Input {
+    string(0, 524_288)
+}
+fn ability_kind() -> Input {
+    choice(&["role", "skill"])
+}
+fn response_format() -> Input {
+    choice(&["concise", "detailed"])
+}
+fn attachments() -> Input {
+    array(object(vec![req("ref", key()), opt("label", key())]), 0, 16)
+}
+fn availability() -> Input {
+    any_of(vec![
+        object(vec![req("mode", choice(&["all-projects"]))]),
+        object(vec![
+            req("mode", choice(&["selected-projects"])),
+            req("projects", array(key(), 1, 128)),
+        ]),
+    ])
+}
+fn link_fields() -> Vec<Field> {
+    vec![
+        req("relation", key()),
+        opt("to", key()),
+        opt("toTitle", key()),
+    ]
+}
+fn link_tool_fields() -> Vec<Field> {
+    let mut fields = link_fields();
+    fields.push(req("from", key()));
+    fields
+}
+fn note_input() -> Vec<Field> {
+    vec![
+        req("body", content()),
+        opt("title", key()),
+        opt("path", path()),
+        opt("type", key()),
+        opt("tags", array(key(), 0, 128)),
+        opt("links", array(object(link_fields()), 0, 100)),
+        opt("createdAt", any_of(vec![string(1, 128), Input::Null])),
+        opt("fileName", key()),
+        opt("idempotencyKey", key()),
+    ]
+}
+fn view_patch() -> Input {
+    object(vec![
+        opt(
+            "set",
+            map(Input::YamlValue {
+                max_depth: MAX_YAML_VALUE_DEPTH,
+            }),
+        ),
+        opt("remove", array(key(), 0, 128)),
+    ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registry_carries_exact_closed_world_descriptors() {
+        let names: std::collections::BTreeSet<_> =
+            ToolName::ALL.iter().map(|tool| tool.name()).collect();
+        assert_eq!(names.len(), 28);
+        assert_eq!(
+            ToolName::ALL.iter().filter(|tool| !tool.writes()).count(),
+            12
+        );
+        for &tool in ToolName::ALL {
+            assert_eq!(ToolName::parse(tool.name()), Some(tool));
+            let descriptor = tool.descriptor();
+            assert!(!descriptor.annotations.open_world_hint);
+            assert_eq!(descriptor.input_schema["additionalProperties"], false);
+        }
+    }
+
+    #[test]
+    fn names_and_structures_keep_legacy_identity_and_reject_other_fields() {
+        let mut args = json!({"ref":"ABCDEF012345", "title":"New", "session":"ses_A0b1C2d3E4_-"});
+        ToolName::RenameNote.validate(&mut args).unwrap();
+        args["fileName"] = json!("new");
+        assert!(ToolName::RenameNote.validate(&mut args).is_err());
+        assert!(
+            ToolName::GetAbility
+                .validate(&mut json!({"ref":"ab12","session":"ses_A0b1C2d3E4_+"}))
+                .is_err()
+        );
+        assert!(
+            ToolName::CreateNote
+                .validate(&mut json!({"project":"a/b","body":"","folderPage":false}))
+                .is_err()
+        );
+        ToolName::EditNote
+            .validate(&mut json!({
+                "ref":"abc", "fields":{"tag":["a", "b"], "owner":null},
+                "view":{"viewRef":"v_old","options":{"set":{"enabled":true}}}
+            }))
+            .unwrap();
+
+        // start_session.session schema uses oneOf and rejects empty or dual-key locators.
+        let ss_schema = ToolName::StartSession.descriptor().input_schema;
+        assert!(ss_schema["properties"]["session"]["oneOf"].is_array());
+        assert!(
+            ToolName::StartSession
+                .validate(&mut json!({"session":{}}))
+                .is_err()
+        );
+        assert!(
+            ToolName::StartSession
+                .validate(&mut json!({"session":{"id":"ses_A0b1C2d3E4_-","name":"alpha"}}))
+                .is_err()
+        );
+        ToolName::StartSession
+            .validate(&mut json!({"session":{"id":"ses_A0b1C2d3E4_-"}}))
+            .unwrap();
+        ToolName::StartSession
+            .validate(&mut json!({"session":{"name":"alpha"}}))
+            .unwrap();
+
+        // search/recall byte_string enforces exact 4096 UTF-8 byte ceiling at runtime
+        // while publishing a sound maxLength bound that admits mixed-script UTF-8.
+        let search_schema = ToolName::Search.descriptor().input_schema;
+        assert_eq!(search_schema["properties"]["query"]["maxLength"], 4096);
+        assert!(search_schema["properties"]["query"].get("anyOf").is_none());
+        let two_byte_over = "\u{044F}".repeat(2049);
+        assert!(
+            ToolName::Search
+                .validate(&mut json!({"query": two_byte_over}))
+                .is_err()
+        );
+        let two_byte_exact = "\u{044F}".repeat(2048);
+        ToolName::Search
+            .validate(&mut json!({"query": two_byte_exact}))
+            .unwrap();
+        let mixed_script = format!("{}\u{044F}", "a".repeat(2048));
+        ToolName::Search
+            .validate(&mut json!({"query": mixed_script}))
+            .unwrap();
+        let mixed_exact_4096 = format!("{}\u{044F}", "a".repeat(4094));
+        ToolName::Search
+            .validate(&mut json!({"query": mixed_exact_4096}))
+            .unwrap();
+        let mixed_over_4096 = format!("{}\u{044F}", "a".repeat(4095));
+        assert!(
+            ToolName::Search
+                .validate(&mut json!({"query": mixed_over_4096}))
+                .is_err()
+        );
+        let ascii_exact = "a".repeat(4096);
+        ToolName::Search
+            .validate(&mut json!({"query": ascii_exact}))
+            .unwrap();
+    }
+}

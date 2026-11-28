@@ -7,10 +7,11 @@ and `notarium-syntax` within the workspace.
 
 ## Runtime profiles and ownership boundary
 
-Two runtime storage profiles execute the same typed domain logic and pass the
-same behavioral parity suites:
+Two closed runtime storage profiles execute the same typed domain logic and pass
+the same behavioral parity suites (`CanonicalRuntime::open` rejects hybrid
+combinations such as PostgreSQL with local CAS or SQLite with S3):
 
-- **Local profile:** `SQLite` (`journal_mode = WAL`, `synchronous = FULL`,
+- **Local profile (`LocalSqlite`):** `SQLite` (`journal_mode = WAL`, `synchronous = FULL`,
   `secure_delete = ON`, `wal_autocheckpoint = 0`, `foreign_keys = ON`,
   `journal_size_limit = 64 MiB` at idle, zero `ATTACH DATABASE` statements and
   zero FTS/virtual shadow tables) paired with `LocalZstdV1` content-addressed
@@ -19,7 +20,7 @@ same behavioral parity suites:
   `fullfsync=ON`. On macOS this requests `F_FULLFSYNC` from the filesystem
   for both WAL commits and checkpoints. SQLite falls back to `fsync` if the
   filesystem does not support that request.
-- **Cloud profile:** `PostgreSQL 16` (`synchronous_commit = on`, `fsync = on`,
+- **Cloud profile (`CloudPostgresS3`):** `PostgreSQL 16` (`synchronous_commit = on`, `fsync = on`,
   `LC_COLLATE = C` / UTF-8 bytewise collation parity, `fillfactor = 70` on
   `spaces` and `fillfactor = 80` on `note_heads` to preserve PostgreSQL HOT
   updates without indexing `last_seq` or `updated_seq`) paired with
@@ -31,15 +32,22 @@ same behavioral parity suites:
   roots and match its identity to the configured host, including loopback.
   Set the TCP transport's `root_cert` field to a PEM CA file to trust a private
   issuer. Local PostgreSQL fixtures connect through a Unix socket.
+  When a PostgreSQL writer batch or guarded auxiliary commit returns an
+  ambiguous outcome while revocation leases are held, the store closes the
+  ambiguous connection and waits (including across runtime shutdown drain) for a
+  short `FOR SHARE` barrier on the touched `spaces` rows before releasing those
+  revocation leases so concurrent revocation cannot settle ahead of a late
+  server-side commit.
 
 `CanonicalRuntime::open` acquires lifetime `DataRootOwnerLock` guards where
 local storage is used, verifies or bootstraps the schema transactionally and
 reconciles interrupted collaboration room fences. SQLite resumes pending blob
-retirements on open. If the installation has used projections, a purge that
-still requires derived cleanup stays pending until its handler is available.
-While the exclusive SQLite opener waits for that handler, it can still reclaim
-unbound S3 uploads left by the previous process, including uploads from the
-current lease epoch. Online recovery protects uploads owned by a live writer.
+retirements on open. Shutdown performs a non-blocking local orphan sweep so
+external retained staging tickets cannot deadlock shutdown. If the installation
+has used projections, a purge that still requires derived cleanup stays pending
+until its handler is available. In the Cloud profile, lease takeover reclaims
+unbound S3 uploads left by a previous process. Online recovery protects uploads
+owned by a live writer.
 If recovery fails, opening cancels its workers and releases local ownership
 before returning the error. Dropping an opening future schedules the same
 shutdown on its Tokio runtime. The DataRoot stays locked until the workers and
@@ -62,11 +70,28 @@ to enable the `test-support` Cargo feature for raw diagnostics and fault injecti
 The store implements
 `NoteWritePort`, `ChatPort`, `ContentJobPort`,
 `ChangeBroadcast` and `BackupParticipantPort`, alongside canonical point reads
-(`get_note`, `hydrate_cards`, `read_ability_resource`, `read_changes`,
-`recent_activity`), `move_board_card`, `rollback_agent_run`,
+(`get_note`, `get_note_metadata`, `hydrate_cards`, `read_ability_resource`, `read_changes`,
+`recent_activity`, `resolve_note_target`, `resolve_folder_path`,
+`list_child_folders`, `space_schema`), `move_board_card`,
+`rollback_agent_run_by_id`,
 `accept_external_observation`, and peer session/job persistence. Full query
 planning (`NoteReadPort::list_notes`), `ViewGraphPort` and `SearchPort` remain
 owned by downstream projection and search crates.
+
+Path creation admits an authorized parent and commits missing components
+together. Replaying a creation command returns its folder within the original
+base subject to current visibility. Reads resolve exact active paths before
+historical aliases and retain the current project boundary.
+
+The filename stem `index` is reserved for explicit folder pages. Creating,
+moving, trashing, restoring, purging or rolling back a folder page updates
+both the covering note and the relevant folder revisions at the same command
+boundary. Renaming its title keeps the reserved stem. Visible note snapshots
+and recent activity carry the title, path, project, actor and timestamp from
+the admitted revision and folder placement. Schema updates preserve a folder
+page at its current folder and reserved stem. Activity omits erased note
+metadata and can still report other changes in the same window. Delta
+consumers crossing an erased command payload must resync.
 
 Search uses read-only carriers for paged seeds, complete-command increments,
 exact receipt revisions, and current authorized hydration. Chat search reads
@@ -105,7 +130,7 @@ recovers writes under its exclusive DataRoot owner lock.
 ## Dual-dialect schema and history model
 
 Both SQL dialects materialize the same ordinary B-tree tables in schema
-version `8` and verify live database catalogs (`sqlite_master` / `pg_catalog`)
+version `10` and verify live database catalogs (`sqlite_master` / `pg_catalog`)
 against a shared typed manifest checksum (`schema_meta`) on every startup.
 Unknown newer schema versions, mismatched manifest checksums or unfinished
 migration states fail closed.
@@ -152,6 +177,21 @@ The caller can replay a pending control operation after losing the canonical
 response. Reusing the key with a different payload is rejected. Rebinding a
 Space's history invalidates receipts issued for its earlier incarnation.
 
+Version 10 raises the inline chat payload check constraint on `chat_entries` and
+`chat_pending_inputs` to 32 KiB, retires any legacy `staged_chat` blob
+references left by predecessor schemas, and fails closed if any remaining
+reachable blob exceeds the `64 MiB` decode cap. Version 9 extends the linear schema
+sequence from version 8 with chat runtime columns and updated ability-package
+and lookup indexes. Startup selects the upgrade by version and exact manifest
+checksum. Schema version 9 allows multiple canonical packages to share a folded
+name. Control binding policy selects the visible package and serializes live
+authoring operations. Canonical package identity and version remain exact.
+
+The same upgrade stores the active chat run's writer generation, distinguishes
+human turns from derived turns after redaction, and records the source proof of
+derived turns. A legacy redaction with unknown origin counts as a peer
+intervention when its author differs from the queued sender.
+
 Schema version 6 orders the existing retirement index by status and then Space.
 Both the installation-wide and per-Space pending checks can seek directly to
 pending work as completed retirements accumulate. Startup rebuilds this index
@@ -183,11 +223,20 @@ run within the startup transaction and preserve the trailing snapshot BLOB.
 Catalog reads use current grants and canonical folder ancestry. Keyset cursors
 bind the catalog revision and filters. Account and project memory categories
 identify stable AgentMemory notes in the personal root or project folder.
+Inspecting a memory category returns its current revision or observed absence.
+Appending an observation can create the category and set its optional summary
+in the same canonical command. An append that omits the summary preserves it.
+After rollback undoes the creation of a category, the next observation starts
+a fresh carrier at its stable note ID. Manually trashed categories require
+an explicit restore.
+The writer checks explicit revision or absence predicates and replays its
+receipt only while the memory slot remains authorized.
 Published ability manifests expose up to 256 auxiliary names of at most 1024
 UTF-8 bytes each. Access to an exact package revision requires visibility at
-publication and at its current location. Resource reads check both locations
-again after fetching the content. Catalog lookups return metadata and keep
-branch taint unchanged.
+publication and at its current location, and preserves `promoted_from` origin
+for project-only consent checks after Space republishing. Resource reads check
+both locations again after fetching the content. Catalog lookups return
+metadata and keep branch taint unchanged.
 
 Upgrading the recognized version 1 manifest adds the receipt ledger and queued
 chat-input provenance in one transaction. Existing pending private inputs are
@@ -397,8 +446,7 @@ same example against an isolated prefix.
   `IdempotencyKeyReused`. An older receipt may supply an omitted revision from
   immutable command history. A supplied room lease or lineage needs a matching
   stored fingerprint. Old ambiguous rename titles require the recorded operation.
-  An old rollback receipt also requires a unique typed interpretation of the
-  entity and board IDs in each record. See the mutation preconditions in
+  See the mutation preconditions in
   [Core contracts](core-contracts.md#mutation-preconditions).
   A batch note edit uses its requested base digest and the head visible at its
   savepoint. Link appends derive their base from the current source. `link_many`
@@ -448,31 +496,29 @@ same example against an isolated prefix.
   pause and `reset_gate_overruns` counts closures over budget.
 - **Hierarchy, boards and semantic rollback:** `MoveFolder` updates only the
   moved folder row (`0` descendant row writes) under cycle checks and per-Space
-  serialization. Same-depth and upward moves check the two ancestor paths.
-  Moving deeper also probes indexed children until the first path that would
-  exceed 256 levels. `move_board_card` maintains `<= 16`-byte `sort_rank_lexo` keys
-  via windowed Packed Memory Array (PMA) rebalancing that updates physical
+  serialization. Authorization inspects the moved subtree for folder write
+  locks and descendant document classes before validating depth. Same-depth and
+  upward moves check the two ancestor paths; moving deeper also probes indexed
+  children until the first path that would exceed 256 levels. `move_board_card`
+  is restricted to non-agent callers (humans and bearer tokens) and maintains
+  `<= 16`-byte `sort_rank_lexo`
+  keys via windowed Packed Memory Array (PMA) rebalancing that updates physical
   `rank_rev_id` without overwriting semantic `placement_revision` provenance.
-  Rollback spends one caller budget across room reservations, Board planning,
-  retries and writer admission. The direct PostgreSQL path includes the writer
-  safe point, connection checkout and SQL in that budget. Planning reads also
-  respect the configured read timeout. Cancellation before writer admission
+  Agent runs move cards across columns by editing note frontmatter directly, so
+  shared manual board ordering stays human-owned.
+  `rollback_agent_run_by_id` spends one caller budget across optional room
+  reservations (when live collaboration rooms or fences are present in the
+  Space), retries and writer admission. Cancellation before writer admission
   leaves the command uncommitted. A queued command can finish after its caller
-  stops waiting. An ambiguous acknowledgement returns `Unknown`. Retrying with
-  the same command identity recovers the durable outcome. On the direct
-  PostgreSQL path the writer gate and room fences cover the outstanding COMMIT.
-  Pools with at least three connections can retain one idle rollback session
-  across Spaces to reuse database plans. A successful rollback returns that
-  session to the cache after COMMIT acknowledgement. Shutdown drains the cache.
-  `rollback_agent_run` freezes eligible targets and closed-room reservations
-  before planning, simulates inverse board moves in reverse command order over
-  recorded semantic before-anchors, and applies `Trash`-first slug deconfliction
-  atomically. Restoring a note to a different folder requires write access to
-  both its current and restored placement and document class. For user
-  documents directly under the root, PostgreSQL reads each current head
-  alongside its pre-run revision and candidate blob publication. The commit
-  locks the Space and rechecks the writer epoch, run revision, expected
-  heads, root permissions and live publications.
+  stops waiting. An ambiguous acknowledgement returns `Unknown`; retrying with
+  the same command identity recovers the durable outcome. Inside a single writer
+  transaction, `rollback_agent_run_by_id` verifies live authorization on touched
+  notes and their pre-run destinations, skips notes with later manual edits or
+  active rooms, locks closed-room fences, applies `Trash`-first slug
+  deconfliction atomically, removes rank overlays for retired notes/views,
+  synchronizes folder covers and ability entrypoints, and restores pre-run
+  content and timestamps. Restoring a note to a different folder requires write
+  access to both its current and restored placement and document class.
 - **Collaboration room ownership.** A PostgreSQL writer takeover fences active
   rooms in the same transaction that advances the Space writer epoch. The
   successor recovers the stored snapshot and durable updates under the room
@@ -495,17 +541,14 @@ same example against an isolated prefix.
 - **Job pagination.** `list_jobs` binds each cursor to the original Space cut.
   Continuation returns `CursorStale` if the cut advances or a heartbeat changes
   progress visible to the query. Consumers can open a new read at the current cut.
-- **Chat DAG and pending queue:** `chat_entries` stores `<= 512`-byte UTF-8
-  messages inline and `> 512`-byte payloads in verified CAS. Each
-  `stage_chat_blob` call records a per-author lease with its provenance, including
-  when several calls stage the same digest. Append consumes the specific lease.
-  When a caller leaves during COMMIT, storage releases its undelivered lease and
-  retires the content if the last owner has gone. Shutdown or a process crash can interrupt
-  this handoff. The original grant can call `next_staged_chat_blob` with its
-  request ID, content digest and matching provenance to recover each outstanding
-  lease, then append it or release it with `discard_staged_chat_blob`. A repeated
-  release is safe. Existing leases remain consumable with their original tokens.
-  Legacy leases with unknown provenance count as externally tainted. A leaf window follows at most one parent per returned entry and issues
+- **Chat DAG and pending queue:** `chat_entries` enforces a `256 KiB` UTF-8
+  per-entry payload cap, stores `<= 32 KiB` messages inline, and transparently
+  stages `> 32 KiB` payloads into verified CAS inside `append_chat` and
+  `queue_chat_input` without a separate client staging protocol. Verified CAS
+  enforces a `64 MiB` hard raw-size ceiling on write, during S3 manifest
+  pre-checks and before Zstd decompression, and chat hydration checks per-read
+  byte budgets before decompressing each blob.
+  A leaf window follows at most one parent per returned entry and issues
   zero writes. For a distant `before` cursor, ancestry validation first walks
   fixed jumps of 256 levels, then 16 levels, then individual parents. For a
   depth difference `d`, this takes up to `d / 256` full jumps plus at most 30
@@ -518,6 +561,12 @@ same example against an isolated prefix.
   uploads even when a caller closes its executor. A lease takeover adopts
   older private uploads. Retrying the same lease leaves that generation's
   active uploads with their owners.
+  Tool proposals and model calls are stored as typed chat bodies. Proposal
+  application rechecks the matching model/tool records in the target writer
+  transaction. A queued input keeps its original author. If a peer intervened
+  on the selected branch, the transaction records that fact along with the
+  consumed entry. Log and seed listings apply live and historical thread
+  visibility, including owner and Keeper log checks.
   `redact_chat_entry` applies the same thread and taint checks on first execution
   and replay. It erases target entry content, preserves DAG ancestry and
   clears the stored bodies and CAS references of dependent `Compaction` entries.
@@ -528,7 +577,9 @@ same example against an isolated prefix.
   The committed receipt remains available within the caller's remaining budget.
   Retries share the same retirement worker for a given history, lease epoch and
   retirement ID. The store recovers outstanding work after restart or takeover.
-  Taint is monotonic.
+  The thread's audit mask records whether any branch has ever been tainted.
+  Reads and effects on a selected branch use that leaf's accumulated taint.
+  An explicit fork from a clean ancestor can start a fresh run.
 - **Paired backup (`BackupParticipantPort`).** Prepare both participants and acquire
   their holds before pausing control, then canonical. PostgreSQL uses a dedicated
   connection to fence writers across runtimes sharing the canonical schema. Pin
@@ -548,13 +599,39 @@ same example against an isolated prefix.
   volume, where lookup checks file size and BLAKE3 before returning the path.
   Startup reconciles abandoned holds and pending local artifacts.
   The offline `notarium_canonical::backup::decode_postgres_spool_v1_bounded`
-  API verifies the trailer and recognizes the exact manifests for schemas 1 through 8.
+  API verifies the trailer and recognizes the exact linear manifests for schemas 1 through 10.
+  Schema version 9 adds `chat_threads.{active_run_epoch, active_run_generation, redaction_epoch}`
+  for run fencing and O(1) folded-proof invalidation,
+  `chat_entries.{human_origin, body_format, provenance_json}` (with typed `effect_kind`
+  inside the structured proposal JSON body), replaces `uq_ability_packages_active_slug`
+  with non-unique `idx_ability_packages_active_slug`, and adds secondary indexes for
+  personal Space lookup (`idx_spaces_personal_owner`), receipt sequence scans
+  (`idx_command_receipts_seq`), active project roots
+  (`idx_folder_heads_active_projects_id`), incremental folder-change scans
+  (`idx_folder_heads_space_updated`), active chat-run lookup
+  (`idx_chat_threads_active_run`), tainted chat entry scans
+  (`idx_chat_entries_tainted`), consumed pending chat inputs
+  (`idx_chat_pending_inputs_consumed`), folder-alias parent scans
+  (`idx_folder_aliases_parent_seq`), bounded active-note title lookups
+  (`idx_note_heads_space_title_fold`), purge-fence sequence lookups
+  (`idx_revision_purge_fences_seq`), ability-kind filtering
+  (`idx_ability_packages_space_kind`), mint-and-purge successor scrubbing
+  (`idx_pending_purges_successor`), and `COLLATE "C"`-aligned keyset paging
+  (`idx_note_heads_keyset`, `idx_ability_packages_keyset`, `idx_chat_threads_keyset`,
+  plus `COLLATE "C"` on `idx_folder_heads_parent_lifecycle`).
   It returns typed rows in the original table and column order within the
   caller's byte budget. To materialize a historical spool, create an empty
-  target with `schema::POSTGRES_BASELINE_DDL`. For version 7, apply
-  `tests/fixtures/schema-v7-chat-refs.sql` to restore the original six-column
-  occurrence table and its target index. For versions 1 through 6, apply
-  `tests/fixtures/schema-v6-remove-projection.sql` from the canonical crate.
+  target with `schema::POSTGRES_BASELINE_DDL`. Match the version and manifest
+  checksum in the spool header to its source layout. The following SQL
+  fixtures live in the canonical crate's `tests/fixtures/` directory.
+
+  | Historical layout (manifest checksum prefix) | Apply to the empty version 10 target in order |
+  | --- | --- |
+  | Schema v9 (`a906f0cf`) | None (identical table and column layout) |
+  | Schema v8 (`085e724d`) | `schema-v8-remove-agents.sql` |
+  | Schema v7 (`1a3cfcfe`) | `schema-v8-remove-agents.sql`, then `schema-v7-chat-refs.sql` |
+  | Common v1–v6 | `schema-v8-remove-agents.sql`, then `schema-v6-remove-projection.sql`, followed by the version-specific steps below |
+
   For versions 1 through 5, drop `idx_blob_retirements_status` and recreate it
   on `(space_id, status)`.
   For versions 1 and 2, drop
@@ -571,8 +648,10 @@ same example against an isolated prefix.
   temporary table, then inserts the full set in one statement so foreign keys
   can resolve parents that appear later in the archive.
   Opening the target with the original installation ID applies the remaining
-  migrations through version 8. The canonical L4 backup suite exercises this
-  procedure with archives from all seven predecessor versions.
+  migrations through version 10. The PostgreSQL restore suite imports archives
+  for predecessor manifests (v1–v8) and checks chat authorship and normalized
+  references after startup, while the schema-history suite exercises v8 and v9
+  upgrades through version 10.
   Before serving the restored database, call `restore_cursors` with each
   original cutoff and a fresh history incarnation. The same transaction
   rotates the writer epoch and fences active rooms, retaining their snapshots,
@@ -621,7 +700,8 @@ For full-note storage interaction timings, run
 sh docker/storage-fixtures/with-storage-fixtures.sh benchmark --interactions
 ```
 
-Each series uses SQLite or local PostgreSQL 16 with a local blob store. One
+Each series uses SQLite with local CAS or local PostgreSQL 16 with S3
+(`S3ChunkedV1` over local UDS). One
 unpaced worker or eight workers with independent 4 KiB Markdown notes and a
 100 ms think time open the latest note, edit with its revision precondition,
 and verify the complete carrier with the new receipt. The save includes patch
@@ -668,7 +748,7 @@ Compare the same `environment.git_tree`, `rollback_tier` and three distinct
 `environment.fixture_run_id` values. All three full reports must pass to
 qualify the complete suite. For rollback acceptance inspect each of the three
 reports individually, including its completed sample counts, room restorations,
-cutoff read deadlines and the strict p95 limits for both local CAS profiles.
+cutoff read deadlines and the strict p95 limit for the local SQLite CAS profile.
 The full report records the selected rollback, writer, chat and confirmed-pause
 thresholds in `applied_limits`. Every profile contributes to the full suite status.
 A launcher failure before the final report leaves the attempt incomplete.
@@ -700,7 +780,7 @@ phase and retains up to eight detailed examples per operation type.
 | Workload | Release profile and target |
 | --- | --- |
 | SQLite writer | 50 writers with either 0 or 200 readers, unique 4 KiB edits, 10 s warmup + 30 s measurement, 3 runs each. Every run must exceed 1,600 confirmed mutations/s on Medium or 2,000/s on High and default, with zero reader, writer or busy errors. Each mixed run also requires completed reads. The report samples the active batch writer's synchronous setting and journal size limit and records reader gate dwell. |
-| Rollback | Fresh run, history and revisions for every sample. The Space also has an unrelated folder. Seed 18 edited notes, 2 creations, 1 deletion with a slug collision and 1 subsequent manual edit through the public ports before starting the timer. Open and cleanly close a room on each of the 17 edited notes eligible for restoration. After timing, verify that every room retains its lease, advances exactly one lineage and points at its returned restore revision. Require a new rollback receipt above the pre-call Space sequence. At that receipt, verify that each revision references its original revision and content digest, then read and hash the original carrier through the note API. The `verified_closed_room_restores` counter includes successful checks for measured samples and excludes the warmup. Across 1,000 samples the default requires p95 below 5 ms for SQLite and PostgreSQL with local CAS. High requires <4 ms for SQLite and <5 ms for PostgreSQL, Medium <10 ms and <15 ms respectively. Each profile records its exact `p95_limit_us`. The compatibility field `enforce_5ms_budget` is true for limits of 5 ms or tighter. The test-only lookup of the expected run revision uses the fixture's 30 s call budget while waiting for admission before the timer starts. Its active SQL snapshot keeps the ordinary deadline. The separate 200-sample PostgreSQL/S3 profile reports local UDS latency and has a null limit. |
+| Rollback | Fresh run, history and revisions for every sample. The Space also has an unrelated folder. Seed 18 edited notes, 2 creations, 1 deletion with a slug collision and 1 subsequent manual edit through the public ports before starting the timer. Open and cleanly close a room on each of the 17 edited notes eligible for restoration. After timing, verify that every room retains its lease, advances exactly one lineage and points at its returned restore revision. Require a new rollback receipt above the pre-call Space sequence. At that receipt, verify that each revision references its original revision and content digest, then read and hash the original carrier through the note API. The `verified_closed_room_restores` counter includes successful checks for measured samples and excludes the warmup. Across 1,000 samples the default requires p95 below 5 ms for SQLite with local CAS (High requires <4 ms, Medium <10 ms). Each profile records its exact `p95_limit_us`. The compatibility field `enforce_5ms_budget` is true for limits of 5 ms or tighter. The separate 200-sample PostgreSQL/S3 profile reports local UDS latency and has a null limit. |
 | Chat window | 10,000 reads of 50 entries on each 10,000-turn thread, p95 below 0.5 ms on High or 1 ms on Medium and default. After 50 shared turns, the branched thread appends 16 turns at a time to each of nine branches in rotation. All nine measured windows cross at least two parent gaps containing 128 or more off-branch turns. A PostgreSQL read from a nonzero leaf with no pagination cursor follows parent keys and returns the authorized thread header and bounded window from one statement snapshot. Every timed read compares its full ordered sequence of 50 entries against append receipts. The smoke run uses the same topology with 512 turns and 200 reads per profile. Row triggers count writes across the canonical tables. |
 | Board and folder | 10,000 first-slot board moves with ranks at most 16 bytes. After each move, compare its receipt result to the first ranked overlay and check every rank length. Each move over 100,000 seeded descendants alternates between two parents. After timing, verify the receipt sequence, durable parent and revision chain, every historical alias at its original parent and sequence, and zero descendant row writes. Only verified moves enter the latency distribution. A no-op update to one descendant verifies the write counter. |
 | Paired backup | The control and canonical participants share an installation. Test 1 and 64 canonical Spaces separately on SQLite and PostgreSQL. For each profile, prepare both participants, acquire both holds, pause control then canonical, pin both snapshots, and resume both writers. Report prepare/holds, safe-point acquisition, confirmed pause after control acknowledges its safe point, and the inclusive interval from the first pause call through the last resume. The confirmed pause from the first safe point through both resume acknowledgements must reach p95 below 2.5 ms for PostgreSQL on Medium and below 1 ms for every other backend/tier combination, across 1,000 captures per profile. |

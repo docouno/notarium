@@ -37,36 +37,69 @@ impl ControlService {
         ctx: &AccountContext,
         episode: Option<&EpisodeId>,
     ) -> Result<Vec<(SpaceId, Vec<u8>, i64)>, PortError> {
-        let mut rows_out = Vec::new();
-        for (space, grant) in ctx.auth().spaces() {
-            if grant.read_classes.is_empty() {
-                continue;
-            }
-            let row = match episode {
-                Some(id) => {
-                    rows!(tx,CursorRow,fetch_optional,"SELECT history_incarnation,acked_space_seq FROM mcp_delta_session_cursors WHERE episode_id=$1 AND space_id=$2","SELECT history_incarnation,acked_space_seq FROM v1_control.mcp_delta_session_cursors WHERE episode_id=$1 AND space_id=$2";id.as_str(),space.as_str())?
-                }
-                None => {
-                    rows!(tx,CursorRow,fetch_optional,"SELECT history_incarnation,acked_space_seq FROM mcp_delta_owner_cursors WHERE owner_id=$1 AND space_id=$2","SELECT history_incarnation,acked_space_seq FROM v1_control.mcp_delta_owner_cursors WHERE owner_id=$1 AND space_id=$2";ctx.auth().principal().as_str(),space.as_str())?
-                }
-            };
-            if let Some(row) = row {
-                rows_out.push((space.clone(), row.history_incarnation, row.acked_space_seq));
+        #[derive(sqlx::FromRow)]
+        struct ScopedCursorRow {
+            space_id: String,
+            history_incarnation: Vec<u8>,
+            acked_space_seq: i64,
+        }
+        let fetched = match episode {
+            Some(id) => rows!(
+                tx,
+                ScopedCursorRow,
+                fetch_all,
+                "SELECT space_id, history_incarnation, acked_space_seq FROM mcp_delta_session_cursors WHERE episode_id=$1 ORDER BY space_id",
+                "SELECT space_id, history_incarnation, acked_space_seq FROM v1_control.mcp_delta_session_cursors WHERE episode_id=$1 ORDER BY space_id";
+                id.as_str()
+            )?,
+            None => rows!(
+                tx,
+                ScopedCursorRow,
+                fetch_all,
+                "SELECT space_id, history_incarnation, acked_space_seq FROM mcp_delta_owner_cursors WHERE owner_id=$1 ORDER BY space_id",
+                "SELECT space_id, history_incarnation, acked_space_seq FROM v1_control.mcp_delta_owner_cursors WHERE owner_id=$1 ORDER BY space_id";
+                ctx.auth().principal().as_str()
+            )?,
+        };
+        let mut rows_out = Vec::with_capacity(fetched.len());
+        for row in fetched {
+            let space = SpaceId::parse(&row.space_id)?;
+            if ctx
+                .auth()
+                .spaces()
+                .get(&space)
+                .is_some_and(|grant| !grant.read_classes.is_empty())
+            {
+                rows_out.push((space, row.history_incarnation, row.acked_space_seq));
             }
         }
         Ok(rows_out)
     }
-    pub(in super::super) async fn resolve_acknowledgements(
+    pub(in super::super) async fn resolve_acknowledgements_cached(
         &self,
         ctx: &AccountContext,
         rows_in: Vec<(SpaceId, Vec<u8>, i64)>,
+        space_cache: &mut BTreeMap<SpaceId, Option<CatalogSpace>>,
     ) -> Result<BTreeMap<SpaceId, AcknowledgedCursor>, PortError> {
         let mut result = BTreeMap::new();
         for (space, history_incarnation, acked_space_seq) in rows_in {
-            let current = match self.catalog_space(ctx, &space).await {
-                Ok(value) => value,
-                Err(error) if hidden(&error) => continue,
-                Err(error) => return Err(error),
+            let current = if let Some(cached) = space_cache.get(&space) {
+                let Some(value) = cached else {
+                    continue;
+                };
+                value.clone()
+            } else {
+                match self.catalog_space(ctx, &space).await {
+                    Ok(value) => {
+                        space_cache.insert(space.clone(), Some(value.clone()));
+                        value
+                    }
+                    Err(error) if hidden(&error) => {
+                        space_cache.insert(space.clone(), None);
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
             };
             let scope = HistoryScope {
                 space_id: space.clone(),
@@ -101,38 +134,110 @@ impl ControlService {
             ),
         )?;
         command.require(ctx.auth().principal(), ctx.auth().principal())?;
+        if matches!(
+            ctx.auth().kind(),
+            PrincipalKind::Keeper(_) | PrincipalKind::AgentRun(_)
+        ) {
+            return Err(DomainError::AccessDenied.into());
+        }
+        if ctx.auth().taint().is_tainted() {
+            return Err(DomainError::CrossSpaceTainted.into());
+        }
+        if matches!(request.input.owner, AckOwner::Account)
+            && ctx.auth().bearer_scope() == Some(BearerScope::Read)
+        {
+            return Err(DomainError::SpaceReadOnly.into());
+        }
         let budget = OperationBudget::new(ctx.budget.clone());
         let delivered = &request.input.delivered;
         let current_pre = self.current_account(&ctx, &budget).await?;
+        if matches!(
+            current_pre.auth().kind(),
+            PrincipalKind::Keeper(_) | PrincipalKind::AgentRun(_)
+        ) {
+            return Err(DomainError::AccessDenied.into());
+        }
+        if current_pre.auth().taint().is_tainted() {
+            return Err(DomainError::CrossSpaceTainted.into());
+        }
+        if matches!(request.input.owner, AckOwner::Account)
+            && current_pre.auth().bearer_scope() == Some(BearerScope::Read)
+        {
+            return Err(DomainError::SpaceReadOnly.into());
+        }
         if current_pre
             .auth()
             .spaces()
             .get(&delivered.scope.space_id)
-            .is_none_or(|g| g.read_classes.is_empty())
+            .is_none_or(|g| {
+                g.project_root.is_some()
+                    || g.read_classes != notarium_core::classes::DocClass::all()
+            })
         {
             return Err(DomainError::ResourceNotFound.into());
         }
-        let catalog = budget
-            .run(
-                self.catalog_space(&current_pre, &delivered.scope.space_id),
-                CommitEffect::NotCommitted,
-            )
-            .await?;
-        catalog.history.check(&delivered.scope)?;
-        if delivered.after > catalog.last_seq {
-            return Err(invalid(ValidationReason::InvalidQuery));
+        let catalog_precheck: Result<(), PortError> = async {
+            let catalog = budget
+                .run(
+                    self.catalog_space(&current_pre, &delivered.scope.space_id),
+                    CommitEffect::NotCommitted,
+                )
+                .await?;
+            catalog.history.check(&delivered.scope)?;
+            if delivered.after > catalog.last_seq {
+                return Err(invalid(ValidationReason::InvalidQuery));
+            }
+            Ok(())
         }
+        .await;
         let keeper = self
             .precheck_keeper_catalog(ctx.auth(), &budget, &ctx.budget.request)
             .await?;
         let mut tx = self.store.write(budget.clone()).await?;
         let (revision, saved) = budget.run(async {
             let auth = self.revalidate_with_keeper(tx.inner_mut(), ctx.auth(), keeper.as_ref()).await?;
-            if auth.spaces().get(&delivered.scope.space_id).is_none_or(|g| g.read_classes.is_empty()) {
+            if matches!(auth.kind(), PrincipalKind::Keeper(_) | PrincipalKind::AgentRun(_)) {
+                return Err(DomainError::AccessDenied.into());
+            }
+            if auth.taint().is_tainted() {
+                return Err(DomainError::CrossSpaceTainted.into());
+            }
+            if matches!(request.input.owner, AckOwner::Account)
+                && auth.bearer_scope() == Some(BearerScope::Read)
+            {
+                return Err(DomainError::SpaceReadOnly.into());
+            }
+            if auth
+                .spaces()
+                .get(&delivered.scope.space_id)
+                .is_none_or(|g| {
+                    g.project_root.is_some()
+                        || g.read_classes != notarium_core::classes::DocClass::all()
+                })
+            {
                 return Err(DomainError::ResourceNotFound.into());
             }
-            if let AckOwner::Episode(id) = &request.input.owner { episode(tx.inner_mut(), auth.principal(), id).await?; }
+            let episode_row = if let AckOwner::Episode(id) = &request.input.owner {
+                let owner_row = user_read(tx.inner_mut(), auth.principal().as_str()).await?;
+                let row = episode(tx.inner_mut(), auth.principal(), id).await?;
+                if !super::episode_visible_to_narrowed(
+                    &auth,
+                    owner_row.personal_space_id.as_deref(),
+                    super::stored_project_ref(&row)?.as_ref(),
+                    row.name.as_deref(),
+                    None,
+                ) {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+                Some(row)
+            } else {
+                None
+            };
             if let Some(replay) = command.replay::<SavedAck>(tx.inner_mut()).await? { return Ok(replay); }
+            catalog_precheck?;
+            if episode_row.as_ref().is_some_and(|row| row.lifecycle == "closed") {
+                return Err(invalid(ValidationReason::InvalidState));
+            }
             let owner = user(tx.inner_mut(), auth.principal().as_str()).await?;
             let space = delivered.scope.space_id.as_str();
             let existing = match &request.input.owner {
@@ -168,7 +273,7 @@ impl ControlService {
             command.save(tx.inner_mut(), revision, &saved, now).await?;
             Ok((revision, saved))
         }, CommitEffect::NotCommitted).await?;
-        budget.run(tx.commit(), CommitEffect::Unknown).await?;
+        budget.commit_tx(tx).await?;
         Ok(ControlCommit {
             revision,
             value: AcknowledgedCursor {
@@ -190,6 +295,9 @@ impl ControlService {
         let hit = budget
             .run(
                 async {
+                    if !dedup_actor_allowed(&auth, &key.actor) {
+                        return Err(DomainError::AccessDenied.into());
+                    }
                     if auth.principal().as_str().len() + key.actor.len() + key.request_key.as_str().len()
                         > 2048
                     {
@@ -238,8 +346,11 @@ impl ControlService {
         &self,
         ctx: AccountContext,
         record: McpDedupRecord,
-    ) -> Result<(), PortError> {
+    ) -> Result<McpDedupHit, PortError> {
         validate_dedup_key(&record.key)?;
+        if ctx.auth().taint().is_tainted() {
+            return Err(DomainError::CrossSpaceTainted.into());
+        }
         if record.safe_result.len() > 65536
             || record.safe_result.contains('\0')
             || record.ttl_ms == 0
@@ -258,12 +369,23 @@ impl ControlService {
             .precheck_keeper_catalog(ctx.auth(), &budget, &ctx.budget.request)
             .await?;
         let mut tx = self.store.write(budget.clone()).await?;
-        budget
+        let hit = budget
             .run(
                 async {
                     let auth = self
                         .revalidate_with_keeper(tx.inner_mut(), ctx.auth(), keeper.as_ref())
                         .await?;
+                    if auth.taint().is_tainted() {
+                        return Err(DomainError::CrossSpaceTainted.into());
+                    }
+                    if !dedup_actor_allowed(&auth, &record.key.actor) {
+                        return Err(DomainError::AccessDenied.into());
+                    }
+                    if auth.bearer_scope() == Some(BearerScope::Read)
+                        && record.effect == AgentEffect::Write
+                    {
+                        return Err(DomainError::SpaceReadOnly.into());
+                    }
                     let owner = auth.principal().as_str();
                     if owner.len() + record.key.actor.len() + record.key.request_key.as_str().len()
                         > 2048
@@ -291,7 +413,15 @@ impl ControlService {
                             {
                                 return Err(DomainError::IdempotencyKeyReused.into());
                             }
-                            return Ok(());
+                            let effect: AgentEffect = serde_json::from_value(
+                                serde_json::Value::String(existing.effect),
+                            )
+                            .map_err(|_| invalid(ValidationReason::InvalidState))?;
+                            return Ok(McpDedupHit {
+                                operation: existing.operation,
+                                safe_result: existing.safe_result,
+                                effect,
+                            });
                         }
                         execute!(
                             tx.inner_mut(),
@@ -343,14 +473,41 @@ impl ControlService {
                         {
                             return Err(DomainError::IdempotencyKeyReused.into());
                         }
+                        let effect: AgentEffect =
+                            serde_json::from_value(serde_json::Value::String(raced.effect))
+                                .map_err(|_| invalid(ValidationReason::InvalidState))?;
+                        return Ok(McpDedupHit {
+                            operation: raced.operation,
+                            safe_result: raced.safe_result,
+                            effect,
+                        });
                     }
-                    Ok(())
+                    Ok(McpDedupHit {
+                        operation: raw_row.operation,
+                        safe_result: raw_row.safe_result,
+                        effect: record.effect,
+                    })
                 },
                 CommitEffect::NotCommitted,
             )
             .await?;
-        budget.run(tx.commit(), CommitEffect::Unknown).await
+        budget.commit_tx(tx).await?;
+        Ok(hit)
     }
+}
+
+fn expected_dedup_actor(auth: &notarium_core::auth::EngineAuthContext) -> &str {
+    match auth.kind() {
+        PrincipalKind::AgentRun(run) | PrincipalKind::Keeper(run) => run.as_str(),
+        _ => auth.grant().as_str(),
+    }
+}
+
+fn dedup_actor_allowed(auth: &notarium_core::auth::EngineAuthContext, actor: &str) -> bool {
+    actor == expected_dedup_actor(auth)
+        || (matches!(auth.kind(), PrincipalKind::DirectHuman)
+            && auth.authorize_human_management().is_ok()
+            && actor == auth.principal().as_str())
 }
 
 fn validate_dedup_key(key: &McpDedupKey) -> Result<(), PortError> {

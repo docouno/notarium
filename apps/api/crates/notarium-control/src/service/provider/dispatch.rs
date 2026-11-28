@@ -9,20 +9,20 @@ use super::{
 use crate::{
     error::{invalid, unavailable},
     outbound::{OutboundRequest, OutboundResponse},
-    store::{lease::OperationBudget, target::ProviderCallLogRow},
+    store::{lease::OperationBudget, statements::rows, target::ProviderCallLogRow},
+};
+use http::{
+    Method,
+    header::{ACCEPT, CONTENT_TYPE, HeaderValue},
 };
 use notarium_core::{
     DomainError,
     auth::{AuthenticatedCredential, PrincipalKind},
-    classes::DocClass,
+    classes::{DocClass, ProviderOrigin},
     error::{BudgetKind, CommitEffect, PortError, ValidationReason},
     ids::*,
     model::{FolderRef, Lifecycle},
     ports::{control::*, *},
-};
-use reqwest::{
-    Method,
-    header::{ACCEPT, CONTENT_TYPE, HeaderValue},
 };
 use std::{
     collections::BTreeSet,
@@ -51,6 +51,39 @@ struct Leases {
     canonical: Option<Box<dyn ProviderEgressLease>>,
     registration: Option<Box<dyn RevocationLease>>,
 }
+fn is_unknown_effect(error: &PortError) -> bool {
+    match error {
+        PortError::Cancelled(failure)
+        | PortError::DeadlineExceeded(failure)
+        | PortError::Unavailable(failure)
+        | PortError::Internal(failure) => failure.effect() == CommitEffect::Unknown,
+        PortError::Domain(_) => false,
+    }
+}
+
+fn unknown_failure(label: &str) -> notarium_core::error::OperationalFailure {
+    notarium_core::error::OperationalFailure::new(
+        ContentDigest::from_bytes(*blake3::hash(label.as_bytes()).as_bytes()),
+        CommitEffect::Unknown,
+        notarium_core::error::RetryAdvice::Never,
+        false,
+    )
+    .expect("non-retryable failure")
+}
+
+fn unknown_lease_error(error: PortError) -> PortError {
+    match error {
+        PortError::Cancelled(_) => {
+            PortError::Cancelled(unknown_failure("provider lease cancelled"))
+        }
+        PortError::DeadlineExceeded(_) => {
+            PortError::DeadlineExceeded(unknown_failure("provider lease expired"))
+        }
+        PortError::Unavailable(_) => unavailable("provider lease revoked", CommitEffect::Unknown),
+        _ => PortError::Cancelled(unknown_failure("provider lease revoked")),
+    }
+}
+
 impl Leases {
     fn check(&mut self) -> Result<(), PortError> {
         if let Some(lease) = &self.canonical {
@@ -66,15 +99,23 @@ impl Leases {
         runtime: &Runtime,
         operation: impl Future<Output = Result<T, PortError>>,
     ) -> Result<T, PortError> {
-        self.check()?;
+        if let Err(error) = self.check() {
+            return Err(unknown_lease_error(error));
+        }
         let result = runtime.run(operation, CommitEffect::Unknown).await;
-        self.check()?;
+        if let Err(error) = self.check() {
+            return Err(match result {
+                Err(existing) if is_unknown_effect(&existing) => existing,
+                _ => unknown_lease_error(error),
+            });
+        }
         result
     }
 }
 struct Progress {
     call: RequestId,
     reserved: bool,
+    pending_commit: Option<tokio::task::JoinHandle<Result<(), PortError>>>,
     submitted: bool,
     mismatch: bool,
     usage: ProviderUsage,
@@ -98,7 +139,12 @@ impl PortStream<CompletionEvent> for CompletionStream {
             if let Some(event) = self.receiver.recv().await {
                 return Ok(Some(event));
             }
-            if let Some(error) = self.error.lock().expect("provider stream result").take() {
+            if let Some(error) = self
+                .error
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+            {
                 return Err(error);
             }
             Ok(None)
@@ -149,7 +195,9 @@ impl ProviderService {
             }
             .await;
             if let Err(error) = result {
-                *terminal.lock().expect("provider stream result") = Some(error);
+                *terminal
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error);
             }
         });
         Ok(Box::new(CompletionStream {
@@ -177,6 +225,14 @@ impl ProviderService {
         ctx: SpaceContext,
         request: EmbeddingRequest,
     ) -> Result<EmbeddingResult, PortError> {
+        if request
+            .inputs
+            .iter()
+            .any(|input| matches!(input, EmbeddingInput::Query(_)))
+        {
+            ctx.auth()
+                .authorize_remote_embedding_query(&ctx.scope().space_id)?;
+        }
         match self.unary(Job::embedding(ctx, request)).await? {
             Output::Embedding(result) => Ok(result),
             _ => Err(protocol()),
@@ -201,6 +257,7 @@ impl ProviderService {
         let mut progress = Progress {
             call: RequestId::from_bytes(crate::auth::token::random()?),
             reserved: false,
+            pending_commit: None,
             submitted: false,
             mismatch: false,
             usage: ProviderUsage::Unknown,
@@ -208,14 +265,54 @@ impl ProviderService {
             response: None,
         };
         let mut result = self.perform(runtime, job, sender, &mut progress).await;
-        // Cancellation/drop only signals the transport. Keep every authority
-        // lease until its owned producer acknowledges actual network shutdown.
+        // Cancellation/drop only signals the transport. Keep any un-released
+        // source snapshot and live credential/consent registration active until
+        // actual network shutdown completes.
         if let Some(response) = progress.response.take()
             && let Err(error) = response.close().await
         {
             result = Err(error);
         }
+        if let Some(lease) = &mut progress.leases.canonical {
+            let _ = lease.close().await;
+        }
         drop(progress.leases);
+        let mut deferred_late_reserve: Option<tokio::task::JoinHandle<Result<(), PortError>>> =
+            None;
+        if let Some(mut handle) = progress.pending_commit.take() {
+            // Wait (bounded) for any spawned reserve/sending COMMIT task to
+            // finish before `finalize` runs so PostgreSQL does not race ahead
+            // of the in-flight COMMIT and miss the inserted row.
+            tokio::select! {
+                _ = &mut handle => {}
+                _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                    deferred_late_reserve = Some(handle);
+                }
+            }
+        }
+        if let Some(handle) = deferred_late_reserve
+            && progress.reserved
+            && !progress.submitted
+        {
+            // A slow reserve COMMIT exceeded the inline wait before any remote
+            // call was sent: settle it asynchronously as NotSent once COMMIT
+            // resolves so quota is not stranded as Unknown.
+            let svc = self.clone();
+            let call_id = progress.call.clone();
+            tokio::spawn(async move {
+                let _ = handle.await;
+                let _ = svc
+                    .finalize(
+                        &call_id,
+                        Some(&svc.dispatcher),
+                        ProviderUsage::Unknown,
+                        ProviderOutcome::NotSent,
+                        None,
+                    )
+                    .await;
+            });
+            progress.reserved = false;
+        }
         if progress.reserved {
             let outcome = match &result {
                 Ok(_) => ProviderOutcome::Completed,
@@ -234,14 +331,40 @@ impl ProviderService {
                 Ok(_) if progress.mismatch => Some(ProviderErrorCode::BudgetMismatch),
                 _ => None,
             };
-            self.finalize(
-                &progress.call,
-                Some(&self.dispatcher),
-                progress.usage,
-                outcome,
-                diagnostic,
-            )
-            .await?;
+            if let Err(finalize_err) = self
+                .finalize(
+                    &progress.call,
+                    Some(&self.dispatcher),
+                    progress.usage,
+                    outcome,
+                    diagnostic,
+                )
+                .await
+                && result.is_ok()
+            {
+                result = Err(if progress.submitted {
+                    match finalize_err {
+                        PortError::Unavailable(failure) | PortError::Internal(failure)
+                            if failure.effect() == CommitEffect::NotCommitted =>
+                        {
+                            unavailable("provider settlement", CommitEffect::Unknown)
+                        }
+                        PortError::DeadlineExceeded(failure)
+                            if failure.effect() == CommitEffect::NotCommitted =>
+                        {
+                            PortError::DeadlineExceeded(unknown_failure("provider settlement"))
+                        }
+                        PortError::Cancelled(failure)
+                            if failure.effect() == CommitEffect::NotCommitted =>
+                        {
+                            PortError::Cancelled(unknown_failure("provider settlement"))
+                        }
+                        other => other,
+                    }
+                } else {
+                    finalize_err
+                });
+            }
         }
         result
     }
@@ -308,6 +431,23 @@ impl ProviderService {
         runtime
             .run(
                 async {
+                    if job.scope.is_none() {
+                        auth.authorize_human_management()?;
+                        super::super::authority::require_unpinned_human(&auth)?;
+                        let owner = rows!(
+                            tx.inner_mut(),
+                            (String,),
+                            fetch_optional,
+                            "SELECT owner_id FROM provider_resources WHERE id=$1",
+                            "SELECT owner_id FROM v1_control.provider_resources WHERE id=$1";
+                            job.resource().as_str()
+                        )?;
+                        if owner.as_ref().map(|(id,)| id.as_str())
+                            != Some(auth.principal().as_str())
+                        {
+                            return Err(DomainError::ResourceNotFound.into());
+                        }
+                    }
                     accounting::existing_read(
                         tx.inner_mut(),
                         auth.principal().as_str(),
@@ -348,9 +488,47 @@ impl ProviderService {
         } else {
             None
         };
+        // Run Keeper catalog prechecks before acquiring the pinned canonical
+        // egress lease so a single-connection canonical pool cannot deadlock
+        // trying to borrow a second connection while holding the lease.
+        let keeper = runtime
+            .run(
+                self.control.precheck_keeper_catalog(
+                    job.ctx.auth(),
+                    &runtime.budget,
+                    &job.ctx.budget.request,
+                ),
+                CommitEffect::NotCommitted,
+            )
+            .await?;
         let parts = job.parts();
+        let mut secondary_projects = Vec::new();
         let current = if primary.is_some() {
-            let egress = job.egress(&parts)?;
+            if parts.len() > MAX_PROVIDER_ORIGINS {
+                return Err(invalid(ValidationReason::InvalidLimit));
+            }
+            let chat_origins = parts
+                .iter()
+                .filter_map(|part| {
+                    let origin = part.origin();
+                    matches!(origin, ProviderOrigin::Chat { .. }).then_some(origin)
+                })
+                .collect::<Vec<_>>();
+            let dependencies = if chat_origins.is_empty() {
+                ProviderEgressDependencies::default()
+            } else {
+                runtime
+                    .run(
+                        self.egress.chat_dependencies(
+                            AccountContext::new(job.ctx.auth().clone(), runtime.context()),
+                            chat_origins,
+                        ),
+                        CommitEffect::NotCommitted,
+                    )
+                    .await?
+            };
+            let egress = job.egress(&parts, dependencies)?;
+            secondary_projects.clone_from(&egress.secondary_projects);
             let project_folders = egress.project_folders.clone();
             let lease = runtime
                 .run(
@@ -362,28 +540,30 @@ impl ProviderService {
                     CommitEffect::NotCommitted,
                 )
                 .await?;
+            progress.leases.canonical = Some(lease);
+            let lease = progress
+                .leases
+                .canonical
+                .as_ref()
+                .expect("stored canonical lease");
             lease.check()?;
             if lease.project() != job.project()
                 || lease.project_folders() != &project_folders
-                || lease.current().len() > 4096
+                || lease.secondary_projects() != secondary_projects
+                || lease.current().len() > MAX_PROVIDER_ORIGINS
             {
                 return Err(invalid(ValidationReason::SourceMismatch));
             }
-            let current = lease.current().to_vec();
-            progress.leases.canonical = Some(lease);
-            current
+            lease.current().to_vec()
         } else {
             Vec::new()
         };
-        let keeper = self
-            .control
-            .precheck_keeper_catalog(job.ctx.auth(), &runtime.budget, &job.ctx.budget.request)
-            .await?;
         let authority = || DispatchAuthority {
             snapshot: &snapshot,
             ctx: &job.ctx,
             primary: primary.as_ref(),
             project: job.project(),
+            secondary_projects: &secondary_projects,
             parts: &parts,
             embedding_inputs: job.embedding_inputs(),
             selection: match &job.request {
@@ -410,13 +590,25 @@ impl ProviderService {
                         call_id: progress.call.to_string(),
                         owner_id: snapshot.resource.owner_id.clone(),
                         principal: validated.auth.principal().to_string(),
-                        run_id: None,
+                        run_id: if validated.disclosed_classes.is_empty() {
+                            None
+                        } else {
+                            match validated.auth.kind() {
+                                PrincipalKind::AgentRun(run) | PrincipalKind::Keeper(run) => {
+                                    Some(run.to_string())
+                                }
+                                _ => None,
+                            }
+                        },
                         scope_id: scope_key,
                         intent_key: job.intent().to_string(),
                         request_hash: hash.to_vec(),
                         resource_id: snapshot.resource.id.clone(),
                         credential_id: snapshot.resource.credential_id.clone(),
-                        policy_epochs: snapshot.epochs()?,
+                        policy_epochs: snapshot.epochs(
+                            &validated.disclosed_classes,
+                            validated.disclosed_project_only.as_ref(),
+                        )?,
                         participating_spaces: json(&validated.spaces)?,
                         model_id: job.model().map(ToString::to_string),
                         reserved_tokens: job.reservation(&snapshot)?,
@@ -438,13 +630,24 @@ impl ProviderService {
                         self.control.clock.now_ms()?,
                     )
                     .await?;
-                    progress.reserved = true;
                     Ok(())
                 },
                 CommitEffect::NotCommitted,
             )
             .await?;
-        runtime.run(tx.commit(), CommitEffect::Unknown).await?;
+        runtime.check(CommitEffect::NotCommitted)?;
+        progress.reserved = true;
+        progress.pending_commit = Some(tx.spawn_commit());
+        let reserve_commit = runtime
+            .await_commit_handle(&mut progress.pending_commit)
+            .await;
+        if let Err(ref err) = reserve_commit
+            && progress.pending_commit.is_none()
+            && !is_unknown_effect(err)
+        {
+            progress.reserved = false;
+        }
+        reserve_commit?;
         let mut material = runtime
             .run(
                 self.headers(&runtime.budget, &progress.call, &snapshot),
@@ -488,7 +691,11 @@ impl ProviderService {
                 CommitEffect::NotCommitted,
             )
             .await?;
-        runtime.run(tx.commit(), CommitEffect::Unknown).await?;
+        runtime.check(CommitEffect::NotCommitted)?;
+        progress.pending_commit = Some(tx.spawn_commit());
+        runtime
+            .await_commit_handle(&mut progress.pending_commit)
+            .await?;
         progress.leases.check()?;
         let kind = wire(&snapshot.resource.wire)?;
         material
@@ -550,7 +757,19 @@ impl ProviderService {
             check_query_taint,
         )?);
         progress.submitted = true;
+        // Local SQLite keeps its in-memory Space disclosure pin across DNS/TCP/TLS,
+        // preflight(), and request-body upload before releasing in `mark_dispatched()`
+        // prior to upstream TTFB. Cloud PostgreSQL verifies sources atomically under a
+        // short read-only snapshot at `acquire_egress` and relies on `RevocationHub`
+        // cancellation during upload so network I/O never holds PG connections or locks.
         let response = progress.response.as_mut().expect("started transport");
+        let uploaded = progress
+            .leases
+            .run(runtime, response.wait_uploaded())
+            .await?;
+        if uploaded && let Some(lease) = &mut progress.leases.canonical {
+            let _ = lease.mark_dispatched().await;
+        }
         if let Err(error) = progress.leases.run(runtime, response.receive_head()).await {
             if matches!(&error,PortError::Unavailable(failure) if failure.effect()==CommitEffect::NotCommitted)
                 || matches!(&error, PortError::Domain(DomainError::CrossSpaceTainted))
@@ -579,9 +798,8 @@ impl EmbeddingProviderPort for ProviderService {
         folder: Option<FolderId>,
     ) -> PortFuture<'_, BTreeSet<DocClass>> {
         Box::pin(async move {
-            if ctx.auth().taint().is_tainted() {
-                return Err(DomainError::CrossSpaceTainted.into());
-            }
+            ctx.auth()
+                .authorize_remote_embedding_query(&ctx.scope().space_id)?;
             if let (Some(project), Some(folder_id)) = (&project, folder) {
                 let budget = OperationBudget::new(ctx.budget.clone());
                 let reference = FolderRef {
@@ -612,15 +830,51 @@ impl EmbeddingProviderPort for ProviderService {
                 .unwrap_or_default();
             let selected = self
                 .select_provider(
-                    ctx,
+                    ctx.clone(),
                     SelectProvider {
                         kind: PreferenceModelKind::Embedding,
                         resource: Some(provider),
                         model: Some(model),
-                        project,
+                        project: project.clone(),
                     },
                 )
                 .await?;
+            if matches!(
+                ctx.auth().kind(),
+                PrincipalKind::AgentRun(_) | PrincipalKind::Keeper(_)
+            ) {
+                let budget = OperationBudget::new(ctx.budget.clone());
+                let space = self.selection_catalog(&ctx, project.as_ref()).await?;
+                let (mut tx, auth) = self
+                    .control
+                    .open_revalidated_read(&budget, &ctx.budget.request, ctx.auth())
+                    .await?;
+                let required = budget
+                    .run(
+                        async {
+                            let grant = auth
+                                .spaces()
+                                .get(&space.space.id)
+                                .ok_or_else(selection::unavailable)?;
+                            super::admission::required_query_source_disclosure(
+                                tx.inner_mut(),
+                                &auth,
+                                grant,
+                            )
+                            .await
+                        },
+                        CommitEffect::NotCommitted,
+                    )
+                    .await;
+                budget.run(tx.finish(), CommitEffect::NotCommitted).await?;
+                let required = required?;
+                if !required.allows_embedder(
+                    &selected.policy.allowed_classes,
+                    selected.project_only.as_ref(),
+                ) {
+                    return Ok(BTreeSet::new());
+                }
+            }
             Ok(selected
                 .policy
                 .allowed_classes

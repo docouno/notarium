@@ -27,6 +27,8 @@ pub(crate) struct ListCardRow {
     pub content_digest: Option<ContentDigest>,
     pub title: String,
     pub slug: String,
+    pub tags: Vec<String>,
+    pub view_type: Option<String>,
 }
 
 #[derive(Clone)]
@@ -171,8 +173,7 @@ impl DerivedStore {
             .await
     }
 
-    /// Narrow hydration for `list_notes`: avoids reading preview and all six
-    /// MessagePack blobs (`tags`, `views`, `raw`, `evaluated`, `diagnostics`).
+    /// Hydrate directory metadata from the same projection cut as its keyset.
     pub(crate) async fn hydrate_list_rows(
         &self,
         scope: &HistoryScope,
@@ -200,6 +201,9 @@ impl DerivedStore {
             Kind::Bytes,
             Kind::Text,
             Kind::Text,
+            Kind::Bytes,
+            Kind::Bytes,
+            Kind::Bytes,
         ];
         self.database
             .read(move |mut tx| {
@@ -212,7 +216,8 @@ impl DerivedStore {
                         let pg_ids = req_ids.iter().map(|&id| i64::from(id)).collect();
                         tx.select(
                             "SELECT dense_id, note_id, rev_id, parent_folder_id, ability_id,
-                                    doc_class, lifecycle, content_digest, title, slug
+                                    doc_class, lifecycle, content_digest, title, slug,
+                                    tags_msgpack, raw_fields_msgpack, view_blocks_msgpack
                              FROM projected_notes
                              WHERE space_id = ? AND dense_id = ANY(?)",
                             vec![value(&scope.space_id), SqlValue::IntArray(pg_ids)],
@@ -223,7 +228,8 @@ impl DerivedStore {
                         let padded = pad_sqlite_in(&req_ids);
                         let sql = format!(
                             "SELECT dense_id, note_id, rev_id, parent_folder_id, ability_id,
-                                    doc_class, lifecycle, content_digest, title, slug
+                                    doc_class, lifecycle, content_digest, title, slug,
+                                    tags_msgpack, raw_fields_msgpack, view_blocks_msgpack
                              FROM projected_notes
                              WHERE space_id = ? AND dense_id IN ({})",
                             placeholders(padded.len()),
@@ -250,6 +256,17 @@ impl DerivedStore {
                                 content_digest: take(&mut cols)?,
                                 title: take(&mut cols)?,
                                 slug: take(&mut cols)?,
+                                tags: {
+                                    let inline: Vec<String> =
+                                        super::decode_payload(&take::<Vec<u8>>(&mut cols)?)?;
+                                    let raw = super::decode_payload::<Option<_>>(
+                                        &take::<Vec<u8>>(&mut cols)?,
+                                    )?;
+                                    crate::runtime::records::effective_tags(&inline, raw.as_ref())
+                                },
+                                view_type: crate::nota::first_view_type(&take::<Vec<u8>>(
+                                    &mut cols,
+                                )?)?,
                             },
                         );
                     }

@@ -445,11 +445,12 @@ impl ProjectionEngine {
                 .await?;
             let visible_heads: BTreeMap<ChatThreadId, _> = heads
                 .into_iter()
-                .filter(|(_, head)| {
+                .filter(|(thread_id, head)| {
                     let thread = &head.thread;
                     ctx.auth()
                         .can_view_chat_thread(
                             source.permit.space(),
+                            thread_id,
                             thread.kind,
                             &thread.owner,
                             thread.project_folder.as_ref(),

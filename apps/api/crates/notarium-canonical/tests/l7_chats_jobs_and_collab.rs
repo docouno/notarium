@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+#[path = "l7_chats_jobs_and_collab/agent_turns.rs"]
+mod agent_turns;
 #[path = "l7_chats_jobs_and_collab/authority.rs"]
 mod authority;
 #[path = "l7_chats_jobs_and_collab/pg_read_cancellation.rs"]
@@ -32,23 +34,25 @@ use notarium_canonical::{
 };
 use notarium_core::{
     DomainError,
-    auth::{EngineAuthContext, SpaceGrant, SpaceKind, SpaceRole, VerifiedHuman},
+    auth::{ChatAudience, EngineAuthContext, SpaceGrant, SpaceKind, SpaceRole, VerifiedHuman},
     classes::DocClass,
     error::{PortError, ValidationReason},
     ids::{
-        ArtifactId, ChatThreadId, CommandKey, ContentDigest, GrantId, JobId, LeaseEpoch, NoteId,
-        PendingInputId, PrincipalId, RequestId, SpaceSeq, ThreadEntrySeq,
+        AgentRunId, ArtifactId, ChatThreadId, CommandKey, ContentDigest, GrantId, JobId,
+        LeaseEpoch, NoteId, PendingInputId, PrincipalId, RequestId, SpaceSeq, ThreadEntrySeq,
     },
     model::{HistoryScope, NoteRef},
     patch::CarrierEditOrigin,
     ports::{
         AppendChat, CallBudget, CancelJob, Cancellation, ChangeKind, ChangeRead, ChangeReadResult,
-        ChatBody, ChatEntryKind, ChatInputBody, ChatPort, ChatRead, ChatThreadKind, ConsumePending,
-        ConsumedPending, ContentJobKind, ContentJobPort, CreateChat, CreateNote, DeleteDisposition,
-        DeleteNote, EditNote, EntityId, FilenamePin, ForkChat, GetNote, InterceptedMutation,
-        InterceptionResult, JobQuery, JobState, LiveCollabInterceptor, Mutation, NoteWritePort,
-        PageLimit, PendingChatInput, PortFuture, Preconditions, QueueInputOutcome, RedactChatEntry,
-        RollbackReservation, ServiceAuthority, ServicePurpose, SpaceContext, StagedChatBlob,
+        ChatBody, ChatEntryKind, ChatInputBody, ChatPort, ChatRead, ChatRunRequest, ChatThreadKind,
+        ClaimChatRun, ClaimChatRunOutcome, ConsumePending, ConsumedPending, ContentJobKind,
+        ContentJobPort, CreateChat, CreateNote, DeleteDisposition, DeleteNote, DismissPending,
+        EditNote, EntityId, FilenamePin, FinishChatRunOutcome, ForkChat, GetNote,
+        InterceptedMutation, InterceptionResult, JobQuery, JobState, LiveCollabInterceptor,
+        Mutation, NoteWritePort, PageLimit, PendingChatInput, PortFuture, Preconditions,
+        QueueInputOutcome, RedactChatEntry, RollbackReservation, ServiceAuthority, ServicePurpose,
+        SpaceContext,
     },
     query::ReadRequest,
     receipt::{CausalBasis, ChangeCursor, CommandIdentity, ReceiptSet},
@@ -89,6 +93,42 @@ fn owner_ctx(scope: &HistoryScope, principal: PrincipalId) -> SpaceContext {
         make_budget(),
     )
     .expect("owner SpaceContext")
+}
+
+async fn claim_run(
+    store: &CanonicalStore,
+    ctx: SpaceContext,
+    audience: ChatAudience,
+    thread: &ChatThreadId,
+    run: &AgentRunId,
+    leaf: ThreadEntrySeq,
+) -> SpaceContext {
+    let agent = ctx
+        .auth()
+        .for_agent_run(
+            run.clone(),
+            ctx.scope().space_id.clone(),
+            audience,
+            ctx.auth().spaces().clone(),
+        )
+        .unwrap();
+    let agent_ctx = SpaceContext::new(agent, ctx.scope().clone(), make_budget()).unwrap();
+    assert_eq!(
+        store
+            .claim_active_run(
+                agent_ctx.clone(),
+                ClaimChatRun {
+                    thread: thread.clone(),
+                    run: run.clone(),
+                    expected_leaf: leaf,
+                    previous_run: None,
+                }
+            )
+            .await
+            .unwrap(),
+        ClaimChatRunOutcome::Claimed,
+    );
+    agent_ctx
 }
 
 fn next_mutation<T>(scope: &HistoryScope, actor: &PrincipalId, input: T) -> Mutation<T> {
@@ -344,7 +384,6 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
         incarnation: sample_incarnation(0x71),
     };
     let owner = sample_principal_id(0x11);
-    let other_user = sample_principal_id(0x22);
     let root_folder = sample_folder_id(0x01);
 
     store
@@ -371,6 +410,7 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
                 &scope,
                 &owner,
                 CreateNote {
+                    folder_page: false,
                     note: ref_note.clone(),
                     parent: None,
                     slug: "chat-ref".to_owned(),
@@ -399,7 +439,7 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
         .await
         .expect("create project");
 
-    // 1. Create Personal chat thread and test 512B vs 513B multi-byte UTF-8 inline/CAS boundary.
+    // 1. Create Personal chat thread and test 32 KiB vs 32 KiB + 1B multi-byte UTF-8 inline/CAS boundary.
     let thread = sample_thread_id(0x31);
     let created = store
         .create_chat(
@@ -422,9 +462,12 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
     assert_eq!(created.head, ThreadEntrySeq::ZERO);
     assert!(!created.tainted);
 
-    // Exact 512 UTF-8 bytes ending with 4-byte emoji '🦀' (508 ASCII + 4B emoji = 512B) -> Inline!
-    let exact_512 = format!("{}🦀", "a".repeat(508));
-    assert_eq!(exact_512.len(), 512);
+    // Exact 32 KiB UTF-8 bytes ending with 4-byte emoji '🦀' (32764 ASCII + 4B emoji = 32768B) -> Inline!
+    let exact_32k = format!(
+        "{}🦀",
+        "a".repeat(ChatInputBody::INLINE_MAX_BYTES as usize - 4)
+    );
+    assert_eq!(exact_32k.len(), ChatInputBody::INLINE_MAX_BYTES as usize);
     let e1 = store
         .append_chat(
             owner_ctx(&scope, owner.clone()),
@@ -432,179 +475,68 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
                 &scope,
                 &owner,
                 AppendChat {
+                    tool_calls: Vec::new(),
+                    provenance: None,
+                    interruption: None,
+                    proposed_diff: None,
+                    proposed_effect: None,
                     thread: thread.clone(),
                     parent: ThreadEntrySeq::ZERO,
                     kind: ChatEntryKind::Human,
-                    body: ChatInputBody::Text(exact_512.clone()),
+                    body: ChatInputBody::Text(exact_32k.clone()),
                     referenced_notes: Vec::new(),
                     tainted: false,
                 },
             ),
         )
         .await
-        .expect("512B UTF-8 inline append")
+        .expect("32KiB UTF-8 inline append")
         .value;
-    assert_eq!(e1.body, ChatBody::Inline(exact_512.clone()));
+    assert_eq!(e1.body, ChatBody::Inline(exact_32k.clone()));
     assert_eq!(e1.depth, 0);
     assert!(e1.is_chain_node);
     assert!(e1.ancestors.is_empty());
 
-    // 513 UTF-8 bytes with `ChatInputBody::Text` must fail closed (`InvalidRange`)!
-    let body_513 = format!("{}🦀b", "a".repeat(508));
-    assert_eq!(body_513.len(), 513);
-    let too_big_inline = store
+    // Payloads > 256 KiB (`ChatInputBody::MAX_ENTRY_BYTES`) must fail closed (`InvalidRange`)!
+    let too_big_body = "x".repeat(ChatInputBody::MAX_ENTRY_BYTES + 1);
+    let too_big_res = store
         .append_chat(
             owner_ctx(&scope, owner.clone()),
             next_mutation(
                 &scope,
                 &owner,
                 AppendChat {
+                    tool_calls: Vec::new(),
+                    provenance: None,
+                    interruption: None,
+                    proposed_diff: None,
+                    proposed_effect: None,
                     thread: thread.clone(),
                     parent: e1.seq,
                     kind: ChatEntryKind::Model,
-                    body: ChatInputBody::Text(body_513.clone()),
+                    body: ChatInputBody::Text(too_big_body),
                     referenced_notes: Vec::new(),
                     tainted: false,
                 },
             ),
         )
         .await;
-    assert_validation_err(&too_big_inline, ValidationReason::InvalidRange);
+    assert_validation_err(&too_big_res, ValidationReason::InvalidRange);
 
-    // `stage_chat_blob` rejects <= 512B!
-    let bad_stage = store
-        .stage_chat_blob(owner_ctx(&scope, owner.clone()), &exact_512)
-        .await;
-    assert_validation_err(&bad_stage, ValidationReason::InvalidRange);
-
-    // Unowned / forged `StagedChatBlob::attest_canonical` rejected!
-    let unowned_staged = StagedChatBlob::attest_canonical(
-        scope.space_id.clone(),
-        owner.clone(),
-        ContentDigest::from_bytes([0xEE; 32]),
-        600,
-    )
-    .unwrap();
-    let unowned_res = store
-        .append_chat(
-            owner_ctx(&scope, owner.clone()),
-            next_mutation(
-                &scope,
-                &owner,
-                AppendChat {
-                    thread: thread.clone(),
-                    parent: e1.seq,
-                    kind: ChatEntryKind::Model,
-                    body: ChatInputBody::Staged(unowned_staged),
-                    referenced_notes: Vec::new(),
-                    tainted: false,
-                },
-            ),
-        )
-        .await;
-    assert!(unowned_res.is_err(), "unowned digest must be rejected");
-
-    // Wrong-author `StagedChatBlob` rejected (`InvalidAuthority`)!
-    let wrong_owner_staged = StagedChatBlob::attest_canonical(
-        scope.space_id.clone(),
-        other_user.clone(),
-        ContentDigest::from_bytes([0xDD; 32]),
-        600,
-    )
-    .unwrap();
-    let wrong_owner_res = store
-        .append_chat(
-            owner_ctx(&scope, owner.clone()),
-            next_mutation(
-                &scope,
-                &owner,
-                AppendChat {
-                    thread: thread.clone(),
-                    parent: e1.seq,
-                    kind: ChatEntryKind::Model,
-                    body: ChatInputBody::Staged(wrong_owner_staged),
-                    referenced_notes: Vec::new(),
-                    tainted: false,
-                },
-            ),
-        )
-        .await;
-    assert_validation_err(&wrong_owner_res, ValidationReason::InvalidAuthority);
-
-    // Legitimate `stage_chat_blob` (>512B) + `append_chat` succeeds and stores `ChatBody::Blob(digest)`!
-    let stage_ctx = owner_ctx(&scope, owner.clone());
-    let source_request = stage_ctx.budget.request.clone();
-    let staged_513 = store
-        .stage_chat_blob(stage_ctx.clone(), &body_513)
-        .await
-        .expect("stage 513B chat blob");
-    let duplicate = store
-        .stage_chat_blob(stage_ctx.clone(), &body_513)
-        .await
-        .unwrap();
-    let other_request = owner_ctx(&scope, owner.clone()).budget.request;
-    let digest = staged_513.digest();
-    let first = store
-        .next_staged_chat_blob(stage_ctx.clone(), source_request.clone(), digest, None)
-        .await
-        .unwrap()
-        .unwrap();
-    let second = store
-        .next_staged_chat_blob(
-            stage_ctx.clone(),
-            source_request.clone(),
-            digest,
-            first.lease(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-    assert_ne!(first, second);
-    assert!([first.clone(), second.clone()].contains(&staged_513));
-    assert!([first, second.clone()].contains(&duplicate));
-    assert!(
-        store
-            .next_staged_chat_blob(
-                stage_ctx.clone(),
-                source_request.clone(),
-                digest,
-                second.lease()
-            )
-            .await
-            .unwrap()
-            .is_none()
+    // Payloads > 32 KiB (`ChatInputBody::INLINE_MAX_BYTES`) and <= 256 KiB transparently
+    // stage a CAS blob inside `append_chat` and store `ChatBody::Blob(digest)`!
+    let body_over_32k = format!(
+        "{}🦀b",
+        "a".repeat(ChatInputBody::INLINE_MAX_BYTES as usize - 4)
     );
-    assert!(
-        store
-            .next_staged_chat_blob(stage_ctx.clone(), other_request, digest, None)
-            .await
-            .unwrap()
-            .is_none()
-    );
-    let tainted_ctx = owner_ctx(&scope, owner.clone());
-    tainted_ctx.auth().taint().mark_external_read();
-    assert!(
-        store
-            .next_staged_chat_blob(tainted_ctx, source_request.clone(), digest, None)
-            .await
-            .unwrap()
-            .is_none()
-    );
-    store
-        .discard_staged_chat_blob(stage_ctx.clone(), duplicate.clone())
-        .await
-        .unwrap();
-    store
-        .discard_staged_chat_blob(stage_ctx.clone(), duplicate)
-        .await
-        .unwrap();
     assert_eq!(
-        store
-            .next_staged_chat_blob(stage_ctx, source_request, digest, None)
-            .await
-            .unwrap(),
-        Some(staged_513.clone())
+        body_over_32k.len(),
+        ChatInputBody::INLINE_MAX_BYTES as usize + 1
     );
+    let expected_blob_digest = store
+        .prepare_blob(body_over_32k.as_bytes())
+        .unwrap()
+        .digest();
     let e2 = store
         .append_chat(
             owner_ctx(&scope, owner.clone()),
@@ -612,10 +544,15 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
                 &scope,
                 &owner,
                 AppendChat {
+                    tool_calls: Vec::new(),
+                    provenance: None,
+                    interruption: None,
+                    proposed_diff: None,
+                    proposed_effect: None,
                     thread: thread.clone(),
                     parent: e1.seq,
                     kind: ChatEntryKind::Model,
-                    body: ChatInputBody::Staged(staged_513.clone()),
+                    body: ChatInputBody::Text(body_over_32k),
                     referenced_notes: vec![NoteRef {
                         space_id: scope.space_id.clone(),
                         note_id: ref_note.clone(),
@@ -625,9 +562,9 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
             ),
         )
         .await
-        .expect("append staged 513B chat")
+        .expect("append transparent >32KiB chat blob")
         .value;
-    assert_eq!(e2.body, ChatBody::Blob(staged_513.digest()));
+    assert_eq!(e2.body, ChatBody::Blob(expected_blob_digest));
     assert_eq!(e2.depth, 1);
     assert_eq!(e2.parent, Some(e1.seq));
     assert!(e2.ancestors.is_empty());
@@ -658,6 +595,11 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
                     &scope,
                     &owner,
                     AppendChat {
+                        tool_calls: Vec::new(),
+                        provenance: None,
+                        interruption: None,
+                        proposed_diff: None,
+                        proposed_effect: None,
                         thread: thread.clone(),
                         parent: branch_b_tip,
                         kind: ChatEntryKind::Human,
@@ -687,6 +629,11 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
                         &scope,
                         &owner,
                         AppendChat {
+                            tool_calls: Vec::new(),
+                            provenance: None,
+                            interruption: None,
+                            proposed_diff: None,
+                            proposed_effect: None,
                             thread: thread.clone(),
                             parent: branch_b_tip,
                             kind: ChatEntryKind::Model,
@@ -709,6 +656,11 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
                     &scope,
                     &owner,
                     AppendChat {
+                        tool_calls: Vec::new(),
+                        provenance: None,
+                        interruption: None,
+                        proposed_diff: None,
+                        proposed_effect: None,
                         thread: thread.clone(),
                         parent: cur_a,
                         kind: if target_depth % 2 == 0 {
@@ -878,8 +830,99 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
 
     // 3. Bounded 16-item pending input queue (`17` concurrent `queue_chat_input` -> `16` Queued + `1` Full, zero leaked CAS refs).
     let run_id = sample_run_id(0x55);
+    let queue_agent = claim_run(
+        store,
+        owner_ctx(&scope, owner.clone()),
+        ChatAudience::Personal,
+        &thread,
+        &run_id,
+        cur_a,
+    )
+    .await;
+    // Historical queue APIs can retain a base on a sibling branch. The current
+    // run cannot implicitly switch to it through append, or consume its input.
+    let sibling_input = PendingInputId::from_bytes([0x78; 16]);
+    let sibling_post = next_mutation(
+        &scope,
+        &owner,
+        AppendChat {
+            thread: thread.clone(),
+            parent: branch_b_tip,
+            kind: ChatEntryKind::Human,
+            body: ChatInputBody::Text("A post on a sibling branch".into()),
+            tool_calls: Vec::new(),
+            provenance: None,
+            interruption: None,
+            proposed_diff: None,
+            proposed_effect: None,
+            referenced_notes: Vec::new(),
+            tainted: false,
+        },
+    );
+    assert!(matches!(
+        store
+            .append_chat(owner_ctx(&scope, owner.clone()), sibling_post)
+            .await,
+        Err(PortError::Domain(DomainError::RevisionConflict { .. }))
+    ));
+    let sibling = next_mutation(
+        &scope,
+        &owner,
+        PendingChatInput {
+            id: sibling_input.clone(),
+            thread: thread.clone(),
+            sender: owner.clone(),
+            body: "Queued before the branch change".into(),
+            queued_base_leaf: branch_b_tip,
+            in_flight_run: run_id.clone(),
+            mentions_agent: false,
+        },
+    );
+    assert!(matches!(
+        store
+            .queue_chat_input(owner_ctx(&scope, owner.clone()), sibling)
+            .await
+            .unwrap(),
+        QueueInputOutcome::Queued(_)
+    ));
+    let unchanged = store
+        .consume_chat_input(
+            owner_ctx(&scope, owner.clone()),
+            next_mutation(
+                &scope,
+                &owner,
+                ConsumePending {
+                    thread: thread.clone(),
+                    input: sibling_input.clone(),
+                    expected_active_run: run_id.clone(),
+                    expected_run: run_id.clone(),
+                    current_leaf: cur_a,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        unchanged.value,
+        ConsumedPending::BranchChanged { queued, current }
+            if queued == branch_b_tip && current == cur_a
+    ));
+    assert!(
+        store
+            .dismiss_chat_input(
+                queue_agent.clone(),
+                DismissPending {
+                    thread: thread.clone(),
+                    input: sibling_input
+                },
+            )
+            .await
+            .unwrap()
+    );
+
     let mut large_candidates = BTreeSet::new();
     let mut handles = Vec::new();
+    let mut queued_ids = Vec::new();
     for idx in 0..17u8 {
         let st = store.clone();
         let sc = scope.clone();
@@ -890,10 +933,10 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
         if idx % 2 == 0 {
             large_candidates.insert(input_id.clone());
         }
-        handles.push(tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let body = if idx % 2 == 0 {
-                // >512B body exercises CAS staging and cleanup on queue overflow!
-                format!("large-pending-{idx}-{}", "x".repeat(600))
+                // >32 KiB body exercises CAS staging and cleanup on queue overflow!
+                format!("large-pending-{idx}-{}", "x".repeat(33_000))
             } else {
                 format!("inline-pending-{idx}")
             };
@@ -917,12 +960,19 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
             )
             .await
             .expect("queue_chat_input call")
-        }));
+        });
+        if idx == 0 {
+            let QueueInputOutcome::Queued(first) = handle.await.unwrap() else {
+                panic!("the first input must occupy the first FIFO slot");
+            };
+            queued_ids.push(first.value.input);
+        } else {
+            handles.push(handle);
+        }
     }
 
-    let mut queued_ids = Vec::new();
     let mut full_count = 0usize;
-    for (idx, h) in handles.into_iter().enumerate() {
+    for (idx, h) in (1..).zip(handles) {
         match h.await.unwrap() {
             QueueInputOutcome::Queued(c) => {
                 assert!((1..=16).contains(&c.value.position));
@@ -936,12 +986,13 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
                         .assert_discarded(
                             store,
                             &scope,
-                            &format!("large-pending-{idx}-{}", "x".repeat(600)),
+                            &format!("large-pending-{idx}-{}", "x".repeat(33_000)),
                             false,
                         )
                         .await;
                 }
             }
+            QueueInputOutcome::Changed => panic!("run claim changed before queue settled"),
         }
     }
     assert_eq!(queued_ids.len(), 16);
@@ -968,18 +1019,18 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
         "17th Full queue_chat_input must leak zero CAS blob_refs"
     );
 
-    // Pick a >512B queued item to verify CAS ref transfer on consume!
+    // Pick a >32 KiB queued item to verify CAS ref transfer on consume!
     let target_pending = queued_ids
         .iter()
         .find(|id| large_candidates.contains(*id))
         .cloned()
-        .expect("at least one >512B pending item queued");
+        .expect("at least one >32 KiB pending item queued");
 
     let shared_idx = (0..17u8)
         .find(|idx| PendingInputId::from_bytes([0x80 + *idx; 16]) == target_pending)
         .unwrap();
-    let shared = format!("large-pending-{shared_idx}-{}", "x".repeat(600));
-    let never_staged = "always-full".repeat(75);
+    let shared = format!("large-pending-{shared_idx}-{}", "x".repeat(33_000));
+    let never_staged = "always-full".repeat(3100);
     let fresh_input = |body: String, id| {
         next_mutation(
             &scope,
@@ -1028,7 +1079,7 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
             .unwrap(),
         shared.as_bytes()
     );
-    let denied_body = "missing-thread".repeat(80);
+    let denied_body = "missing-thread".repeat(2500);
     let mut missing = fresh_input(denied_body.clone(), 0xef);
     missing.input.thread = sample_thread_id(0xde);
     assert!(matches!(
@@ -1041,31 +1092,7 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
         .assert_discarded(store, &scope, &denied_body, true)
         .await;
 
-    // `BranchChanged` when `current_leaf != queued_base_leaf` preserves `'pending'` status!
-    let branch_changed = store
-        .consume_chat_input(
-            owner_ctx(&scope, owner.clone()),
-            next_mutation(
-                &scope,
-                &owner,
-                ConsumePending {
-                    thread: thread.clone(),
-                    input: target_pending.clone(),
-                    expected_run: run_id.clone(),
-                    current_leaf: branch_b_tip,
-                },
-            ),
-        )
-        .await
-        .expect("consume BranchChanged")
-        .value;
-    assert!(matches!(
-        branch_changed,
-        ConsumedPending::BranchChanged { queued, current }
-            if queued == cur_a && current == branch_b_tip
-    ));
-
-    // `Appended` when `current_leaf == cur_a` transfers CAS ref `ChatPendingInput -> ChatEntry`!
+    // Consuming the FIFO head transfers its CAS reference to the new entry.
     let consumer = owner_ctx(&scope, owner.clone());
     assert!(!consumer.auth().taint().is_tainted());
     let consumed_ok = store
@@ -1077,6 +1104,7 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
                 ConsumePending {
                     thread: thread.clone(),
                     input: target_pending.clone(),
+                    expected_active_run: run_id.clone(),
                     expected_run: run_id.clone(),
                     current_leaf: cur_a,
                 },
@@ -1086,7 +1114,7 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
         .expect("consume Appended")
         .value;
     let appended_from_queue = match consumed_ok {
-        ConsumedPending::Appended(entry) => entry,
+        ConsumedPending::Appended { entry, .. } => entry,
         other => panic!("expected Appended, got {other:?}"),
     };
     assert!(matches!(appended_from_queue.body, ChatBody::Blob(_)));
@@ -1098,7 +1126,7 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
     assert_eq!(retained, 0);
     // Both requests may pass preflight for the last slot. The enabled-bucket
     // fixture holds their data PUTs until both private publications are registered.
-    let race_body = "concurrent final queue slot".repeat(40);
+    let race_body = "concurrent final queue slot".repeat(1300);
     let prepared = store.prepare_blob(race_body.as_bytes()).unwrap();
     if let QueuePhysical::S3(audit) = &physical {
         let hash = blake3::hash(&prepared.s3_parts()[0].compressed);
@@ -1181,6 +1209,7 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
                 ConsumePending {
                     thread: thread.clone(),
                     input: target_pending,
+                    expected_active_run: run_id.clone(),
                     expected_run: run_id.clone(),
                     current_leaf: cur_a,
                 },
@@ -1195,13 +1224,35 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
         .iter()
         .find(|id| !large_candidates.contains(*id))
         .unwrap();
+    for queued in store
+        .list_pending_chat_inputs(queue_agent.clone(), thread.clone())
+        .await
+        .unwrap()
+    {
+        if queued.id == *inline_pending {
+            break;
+        }
+        assert!(
+            store
+                .dismiss_chat_input(
+                    queue_agent.clone(),
+                    DismissPending {
+                        thread: thread.clone(),
+                        input: queued.id,
+                    }
+                )
+                .await
+                .unwrap()
+        );
+    }
     let inline_request = next_mutation(
         &scope,
         &owner,
         ConsumePending {
             thread: thread.clone(),
             input: inline_pending.clone(),
-            expected_run: run_id,
+            expected_active_run: run_id.clone(),
+            expected_run: run_id.clone(),
             current_leaf: cur_a,
         },
     );
@@ -1209,7 +1260,11 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
         .consume_chat_input(owner_ctx(&scope, owner.clone()), inline_request.clone())
         .await
         .unwrap();
-    let ConsumedPending::Appended(inline_entry) = added.value else {
+    let ConsumedPending::Appended {
+        entry: inline_entry,
+        ..
+    } = added.value
+    else {
         panic!("expected inline entry");
     };
     assert!(matches!(inline_entry.body, ChatBody::Inline(_)));
@@ -1234,7 +1289,7 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
         .await
         .expect("hydrate the top-ranked live chat entry");
     assert_eq!(hits.len(), 1);
-    assert_eq!(hits[0].text, exact_512);
+    assert_eq!(hits[0].text, exact_32k);
     assert!(truncated);
     // Parity with `read_chat`: a tainted thread head (`ext_space_tainted_mask != 0`)
     // taints the caller even when the matched entry itself was untainted.
@@ -1267,6 +1322,11 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
                 &scope,
                 &owner,
                 AppendChat {
+                    tool_calls: Vec::new(),
+                    provenance: None,
+                    interruption: None,
+                    proposed_diff: None,
+                    proposed_effect: None,
                     thread: clean_thread.clone(),
                     parent: ThreadEntrySeq::ZERO,
                     kind: ChatEntryKind::Human,
@@ -1320,6 +1380,11 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
                 &scope,
                 &owner,
                 AppendChat {
+                    tool_calls: Vec::new(),
+                    provenance: None,
+                    interruption: None,
+                    proposed_diff: None,
+                    proposed_effect: None,
                     thread: thread.clone(),
                     parent: cur_a,
                     kind: ChatEntryKind::Human,
@@ -1370,24 +1435,57 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
     ).await.unwrap();
     assert_eq!(retained, 0);
 
+    // Close the active run before setting up the sibling redaction cases.
+    for queued in store
+        .list_pending_chat_inputs(queue_agent.clone(), thread.clone())
+        .await
+        .unwrap()
+    {
+        assert!(
+            store
+                .dismiss_chat_input(
+                    queue_agent.clone(),
+                    DismissPending {
+                        thread: thread.clone(),
+                        input: queued.id,
+                    },
+                )
+                .await
+                .unwrap()
+        );
+    }
+    assert_eq!(
+        store
+            .finish_run_if_queue_empty(
+                queue_agent,
+                ChatRunRequest {
+                    thread: thread.clone(),
+                    expected_run: run_id,
+                },
+            )
+            .await
+            .unwrap(),
+        FinishChatRunOutcome::Cleared,
+    );
+
     // 4. Redaction (`redact_chat_entry`):
     // Append a Compaction entry on branch A (descendant of `e2`) AND a Compaction entry on sibling
     // branch B (NOT a descendant of `e2`, and having HIGHER `entry_seq` than `e2`!).
-    let blob = store
-        .stage_chat_blob(
-            owner_ctx(&scope, owner.clone()),
-            &"branch A compaction summary".repeat(24),
-        )
-        .await
-        .unwrap();
+    let comp_a_body = "branch A compaction summary ".repeat(1200);
+    let comp_a_digest = store.prepare_blob(comp_a_body.as_bytes()).unwrap().digest();
     let summary = next_mutation(
         &scope,
         &owner,
         AppendChat {
+            tool_calls: Vec::new(),
+            provenance: None,
+            interruption: None,
+            proposed_diff: None,
+            proposed_effect: None,
             thread: thread.clone(),
             parent: cur_a,
             kind: ChatEntryKind::Compaction,
-            body: ChatInputBody::Staged(blob.clone()),
+            body: ChatInputBody::Text(comp_a_body),
             referenced_notes: vec![NoteRef {
                 space_id: scope.space_id.clone(),
                 note_id: ref_note.clone(),
@@ -1438,6 +1536,11 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
                 &scope,
                 &owner,
                 AppendChat {
+                    tool_calls: Vec::new(),
+                    provenance: None,
+                    interruption: None,
+                    proposed_diff: None,
+                    proposed_effect: None,
                     thread: thread.clone(),
                     parent: comp_a.seq,
                     kind: ChatEntryKind::Model,
@@ -1460,6 +1563,11 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
                 &scope,
                 &owner,
                 AppendChat {
+                    tool_calls: Vec::new(),
+                    provenance: None,
+                    interruption: None,
+                    proposed_diff: None,
+                    proposed_effect: None,
                     thread: thread.clone(),
                     parent: branch_b_tip,
                     kind: ChatEntryKind::Compaction,
@@ -1474,8 +1582,7 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
         .value;
     branch_b_tip = comp_b.seq;
 
-    // Release staging lease on `staged_513` first? Wait: let's check how `stage_chat_blob` + `append_chat`
-    // manages `StagedChat` vs `ChatEntry` ref_count, and redact `e2`!
+    // Redact `e2` and verify descendant compaction invalidation and blob retirement.
     let latest_thread = store
         .read_chat(
             owner_ctx(&scope, owner.clone()),
@@ -1560,7 +1667,7 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
         invalidated: comp_a.seq,
         child,
         valid: comp_b.seq,
-        digest: blob.digest(),
+        digest: comp_a_digest,
     };
     stale.check(store).await;
 
@@ -1680,6 +1787,11 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
                 &scope,
                 &owner,
                 AppendChat {
+                    tool_calls: Vec::new(),
+                    provenance: None,
+                    interruption: None,
+                    proposed_diff: None,
+                    proposed_effect: None,
                     thread: thread.clone(),
                     parent: cur_a,
                     kind: ChatEntryKind::Model,
@@ -1701,6 +1813,11 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
                 &scope,
                 &owner,
                 AppendChat {
+                    tool_calls: Vec::new(),
+                    provenance: None,
+                    interruption: None,
+                    proposed_diff: None,
+                    proposed_effect: None,
                     thread: thread.clone(),
                     parent: tainted_append.seq,
                     kind: ChatEntryKind::Human,
@@ -1812,6 +1929,11 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
                 &shared_scope,
                 &owner,
                 AppendChat {
+                    tool_calls: Vec::new(),
+                    provenance: None,
+                    interruption: None,
+                    proposed_diff: None,
+                    proposed_effect: None,
                     thread: group_thread.clone(),
                     parent: ThreadEntrySeq::ZERO,
                     kind: ChatEntryKind::Model,
@@ -1861,6 +1983,11 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
                     chat_scope,
                     &owner,
                     AppendChat {
+                        tool_calls: Vec::new(),
+                        provenance: None,
+                        interruption: None,
+                        proposed_diff: None,
+                        proposed_effect: None,
                         thread: redact_thread.clone(),
                         parent: ThreadEntrySeq::ZERO,
                         kind: ChatEntryKind::Human,
@@ -2031,6 +2158,11 @@ async fn run_ten_thousand_entry_chat_dag_read_suite(store: &CanonicalStore) {
                 &scope,
                 &owner,
                 AppendChat {
+                    tool_calls: Vec::new(),
+                    provenance: None,
+                    interruption: None,
+                    proposed_diff: None,
+                    proposed_effect: None,
                     thread: thread.clone(),
                     parent: ThreadEntrySeq::ZERO,
                     kind: ChatEntryKind::Human,
@@ -2062,6 +2194,11 @@ async fn run_ten_thousand_entry_chat_dag_read_suite(store: &CanonicalStore) {
                             &sc,
                             &own,
                             AppendChat {
+                                tool_calls: Vec::new(),
+                                provenance: None,
+                                interruption: None,
+                                proposed_diff: None,
+                                proposed_effect: None,
                                 thread: th.clone(),
                                 parent: tip,
                                 kind: if step % 2 == 0 {
@@ -2100,6 +2237,11 @@ async fn run_ten_thousand_entry_chat_dag_read_suite(store: &CanonicalStore) {
                     &scope,
                     &owner,
                     AppendChat {
+                        tool_calls: Vec::new(),
+                        provenance: None,
+                        interruption: None,
+                        proposed_diff: None,
+                        proposed_effect: None,
                         thread: thread.clone(),
                         parent: tip,
                         kind: ChatEntryKind::Human,
@@ -2430,6 +2572,7 @@ async fn run_jobs_and_collab_lifecycle_suite(store: &CanonicalStore, sqlite: boo
                 &scope,
                 &owner,
                 CreateNote {
+                    folder_page: false,
                     note: secret_note.clone(),
                     parent: None,
                     slug: "export-secret".to_owned(),
@@ -2748,6 +2891,7 @@ async fn run_jobs_and_collab_lifecycle_suite(store: &CanonicalStore, sqlite: boo
                 &scope,
                 &owner,
                 CreateNote {
+                    folder_page: false,
                     note: collab_note.clone(),
                     parent: None,
                     slug: "collab-doc".to_owned(),
@@ -3243,7 +3387,6 @@ async fn l7_sqlite_chats_jobs_collab_and_crash_fenced_recovery() {
     let config = CanonicalConfig::local_default(sample_installation_id(0x70), temp.data_root());
 
     let staging_thread = sample_thread_id(0xd4);
-    let staged_pair;
     let stale;
     {
         let (store, runtime) = CanonicalRuntime::open(config.clone())
@@ -3287,6 +3430,7 @@ async fn l7_sqlite_chats_jobs_collab_and_crash_fenced_recovery() {
                     &crash_scope,
                     &owner,
                     CreateNote {
+                        folder_page: false,
                         note: crash_note.clone(),
                         parent: None,
                         slug: "crash-doc".to_owned(),
@@ -3333,20 +3477,6 @@ async fn l7_sqlite_chats_jobs_collab_and_crash_fenced_recovery() {
             )
             .await
             .unwrap();
-        let content = "same staged body".repeat(70);
-        let tainted_writer = owner_ctx(&crash_scope, owner.clone());
-        tainted_writer.auth().taint().mark_external_read();
-        let tainted = store
-            .stage_chat_blob(tainted_writer, &content)
-            .await
-            .unwrap();
-        let clean = store
-            .stage_chat_blob(owner_ctx(&crash_scope, owner.clone()), &content)
-            .await
-            .unwrap();
-        assert_eq!(clean.digest(), tainted.digest());
-        staged_pair = [(clean, false), (tainted, true)];
-
         runtime.shutdown().await.expect("shutdown SQLite runtime");
     }
 
@@ -3362,26 +3492,36 @@ async fn l7_sqlite_chats_jobs_collab_and_crash_fenced_recovery() {
     let owner = sample_principal_id(0x19);
     let crash_note = sample_note_id(0xD9);
 
-    for (staged, expected_taint) in staged_pair {
-        let reader = owner_ctx(&crash_scope, owner.clone());
+    let large_body = "same large chat body ".repeat(1700);
+    for expected_taint in [false, true] {
+        let writer = owner_ctx(&crash_scope, owner.clone());
+        if expected_taint {
+            writer.auth().taint().mark_external_read();
+        }
         let request = next_mutation(
             &crash_scope,
             &owner,
             AppendChat {
+                tool_calls: Vec::new(),
+                provenance: None,
+                interruption: None,
+                proposed_diff: None,
+                proposed_effect: None,
                 thread: staging_thread.clone(),
                 parent: ThreadEntrySeq::ZERO,
                 kind: ChatEntryKind::Human,
-                body: ChatInputBody::Staged(staged),
+                body: ChatInputBody::Text(large_body.clone()),
                 referenced_notes: Vec::new(),
                 tainted: false,
             },
         );
         let result = store2
-            .append_chat(reader.clone(), request.clone())
+            .append_chat(writer.clone(), request.clone())
             .await
             .unwrap();
+        assert!(matches!(result.value.body, ChatBody::Blob(_)));
         assert_eq!(result.value.tainted, expected_taint);
-        assert_eq!(reader.auth().taint().is_tainted(), expected_taint);
+        assert_eq!(writer.auth().taint().is_tainted(), expected_taint);
         let fresh = owner_ctx(&crash_scope, owner.clone());
         let replay = store2.append_chat(fresh.clone(), request).await.unwrap();
         assert_eq!(replay.receipt, result.receipt);
@@ -3707,7 +3847,18 @@ async fn exercise_interrupted_queue_upload(
     )
     .await
     .unwrap();
-    let body = "payload spanning queue takeover".repeat(24);
+    let old_run = sample_run_id(0xad);
+    let new_run = sample_run_id(0xae);
+    claim_run(
+        &old,
+        owner_ctx(&scope, actor.clone()),
+        ChatAudience::Personal,
+        &thread,
+        &old_run,
+        ThreadEntrySeq::ZERO,
+    )
+    .await;
+    let body = "payload spanning queue takeover".repeat(1100);
     let prepared = old.prepare_blob(body.as_bytes()).unwrap();
     let (reached, until_put) = tokio::sync::oneshot::channel();
     let (release, resume) = tokio::sync::oneshot::channel();
@@ -3727,7 +3878,11 @@ async fn exercise_interrupted_queue_upload(
                 sender: actor.clone(),
                 body: body.clone(),
                 queued_base_leaf: ThreadEntrySeq::ZERO,
-                in_flight_run: sample_run_id(0xad),
+                in_flight_run: if id == 0xe1 || cancel {
+                    old_run.clone()
+                } else {
+                    new_run.clone()
+                },
                 mentions_agent: false,
             },
         )
@@ -3774,6 +3929,28 @@ async fn exercise_interrupted_queue_upload(
             )
             .await
             .unwrap();
+        assert_eq!(
+            current
+                .recover_active_run(
+                    owner_ctx(&scope, actor.clone()),
+                    ChatRunRequest {
+                        thread: thread.clone(),
+                        expected_run: old_run.clone(),
+                    }
+                )
+                .await
+                .unwrap(),
+            FinishChatRunOutcome::Cleared,
+        );
+        claim_run(
+            &current,
+            owner_ctx(&scope, actor.clone()),
+            ChatAudience::Personal,
+            &thread,
+            &new_run,
+            ThreadEntrySeq::ZERO,
+        )
+        .await;
         (current, Some(rt))
     };
     let accepted = current
@@ -3897,7 +4074,7 @@ async fn chat_receipts_preserve_body_and_reference_boundaries() {
         let root = TempDataRoot::new("chat-reference-identity");
         let installation = sample_installation_id(0x64);
         let cfg = if postgres {
-            fixtures.pg_local_config(installation, &schema, root.data_root())
+            fixtures.open_pg_s3_config(installation, &schema).await
         } else {
             CanonicalConfig::local_default(installation, root.data_root())
         };
@@ -3930,6 +4107,7 @@ async fn chat_receipts_preserve_body_and_reference_boundaries() {
                     &scope,
                     &owner,
                     CreateNote {
+                        folder_page: false,
                         note: note.clone(),
                         parent: None,
                         slug: "report".into(),
@@ -3962,6 +4140,11 @@ async fn chat_receipts_preserve_body_and_reference_boundaries() {
             &scope,
             &owner,
             AppendChat {
+                tool_calls: Vec::new(),
+                provenance: None,
+                interruption: None,
+                proposed_diff: None,
+                proposed_effect: None,
                 thread: thread.clone(),
                 parent: ThreadEntrySeq::ZERO,
                 kind: ChatEntryKind::Human,
@@ -4037,7 +4220,7 @@ async fn batched_chat_search_hydration_handles_multi_thread_deep_chains_and_bran
         let root = TempDataRoot::new("chat-search-batched-hydration");
         let installation = sample_installation_id(0x65);
         let cfg = if postgres {
-            fixtures.pg_local_config(installation, &schema, root.data_root())
+            fixtures.open_pg_s3_config(installation, &schema).await
         } else {
             CanonicalConfig::local_default(installation, root.data_root())
         };
@@ -4103,6 +4286,11 @@ async fn batched_chat_search_hydration_handles_multi_thread_deep_chains_and_bran
                         &scope,
                         &owner,
                         AppendChat {
+                            tool_calls: Vec::new(),
+                            provenance: None,
+                            interruption: None,
+                            proposed_diff: None,
+                            proposed_effect: None,
                             thread: t1.clone(),
                             parent,
                             kind: ChatEntryKind::Human,
@@ -4130,6 +4318,11 @@ async fn batched_chat_search_hydration_handles_multi_thread_deep_chains_and_bran
                     &scope,
                     &owner,
                     AppendChat {
+                        tool_calls: Vec::new(),
+                        provenance: None,
+                        interruption: None,
+                        proposed_diff: None,
+                        proposed_effect: None,
                         thread: t1.clone(),
                         parent: t1_e3,
                         kind: ChatEntryKind::Model,
@@ -4152,6 +4345,11 @@ async fn batched_chat_search_hydration_handles_multi_thread_deep_chains_and_bran
                         &scope,
                         &owner,
                         AppendChat {
+                            tool_calls: Vec::new(),
+                            provenance: None,
+                            interruption: None,
+                            proposed_diff: None,
+                            proposed_effect: None,
                             thread: t1.clone(),
                             parent,
                             kind: ChatEntryKind::Human,
@@ -4179,6 +4377,11 @@ async fn batched_chat_search_hydration_handles_multi_thread_deep_chains_and_bran
                         &scope,
                         &owner,
                         AppendChat {
+                            tool_calls: Vec::new(),
+                            provenance: None,
+                            interruption: None,
+                            proposed_diff: None,
+                            proposed_effect: None,
                             thread: t2.clone(),
                             parent: t2_parent,
                             kind: ChatEntryKind::Human,
@@ -4239,6 +4442,11 @@ async fn batched_chat_search_hydration_handles_multi_thread_deep_chains_and_bran
                         &scope,
                         &owner,
                         AppendChat {
+                            tool_calls: Vec::new(),
+                            provenance: None,
+                            interruption: None,
+                            proposed_diff: None,
+                            proposed_effect: None,
                             thread: t3.clone(),
                             parent: t3_parent,
                             kind: ChatEntryKind::Model,
@@ -4316,4 +4524,98 @@ async fn batched_chat_search_hydration_handles_multi_thread_deep_chains_and_bran
         runtime.shutdown().await.unwrap();
     }
     fixtures.drop_pg_schema(&schema).await;
+}
+
+#[tokio::test]
+async fn chat_hydration_rejects_oversized_blob_before_decompression() {
+    let temp = TempDataRoot::new("chat-hydration-budget-cap");
+    let cfg = CanonicalConfig::local_default(sample_installation_id(0x66), temp.data_root());
+    let (store, runtime) = CanonicalRuntime::open(cfg).await.unwrap();
+    let scope = HistoryScope {
+        space_id: sample_space_id(0x66),
+        incarnation: sample_incarnation(0x66),
+    };
+    let owner = sample_principal_id(0x66);
+    store
+        .create_space(CreateSpaceSpec {
+            space_id: scope.space_id.clone(),
+            incarnation: scope.incarnation,
+            root_folder_id: sample_folder_id(0x66),
+            slug: "hydrate-cap".into(),
+            kind: SpaceKind::Personal,
+            owner: owner.clone(),
+            active_epoch: LeaseEpoch::new(1).unwrap(),
+            initial_last_seq: SpaceSeq::ZERO,
+            created_at: None,
+        })
+        .await
+        .unwrap();
+    let ctx = owner_ctx(&scope, owner.clone());
+    let thread = sample_thread_id(0x66);
+    store
+        .create_chat(
+            ctx.clone(),
+            next_mutation(
+                &scope,
+                &owner,
+                CreateChat {
+                    thread: thread.clone(),
+                    kind: ChatThreadKind::Personal,
+                    owner: owner.clone(),
+                    project_folder: None,
+                    title: "Hydration cap".into(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let body = "b".repeat(ChatInputBody::INLINE_MAX_BYTES as usize + 128);
+    let entry = store
+        .append_chat(
+            ctx.clone(),
+            next_mutation(
+                &scope,
+                &owner,
+                AppendChat {
+                    tool_calls: Vec::new(),
+                    provenance: None,
+                    interruption: None,
+                    proposed_diff: None,
+                    proposed_effect: None,
+                    thread: thread.clone(),
+                    parent: ThreadEntrySeq::ZERO,
+                    kind: ChatEntryKind::Human,
+                    body: ChatInputBody::Text(body),
+                    referenced_notes: Vec::new(),
+                    tainted: false,
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .value;
+    assert!(matches!(entry.body, ChatBody::Blob(_)));
+
+    // Inflate `blob_catalog.raw_size` past the 16 MiB per-read chat hydration budget:
+    // `read_chat_contents` must reject with `BudgetExceeded` before decompressing.
+    let updated = store
+        .execute_diagnostic_write_sql_for_test(
+            "UPDATE blob_catalog SET raw_size = 20971520 WHERE space_id = (SELECT space_id FROM spaces LIMIT 1)",
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated, 1);
+
+    let res = store
+        .read_chat_contents(
+            ctx,
+            notarium_core::ports::ChatContentRead {
+                thread,
+                leaf: entry.seq,
+                entries: vec![entry.seq],
+            },
+        )
+        .await;
+    assert_validation_err(&res, ValidationReason::BudgetExceeded);
+    runtime.shutdown().await.unwrap();
 }

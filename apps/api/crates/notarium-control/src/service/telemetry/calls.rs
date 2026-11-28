@@ -19,7 +19,26 @@ impl ControlService {
             if let Some(existing)=existing {
                 if existing.owner_id!=auth.principal().as_str() || existing.fingerprint!=fingerprint.as_bytes(){return Err(DomainError::IdempotencyKeyReused.into());}return Ok(());
             }
-            if let Some(id)=&request.episode {super::super::episodes::episode(tx.inner_mut(),auth.principal(),id).await?;}
+            let episode = match &request.episode {
+                Some(id) => {
+                    let owner_row = user_read(tx.inner_mut(), auth.principal().as_str()).await?;
+                    let row =
+                        super::super::episodes::episode(tx.inner_mut(), auth.principal(), id)
+                            .await?;
+                    let project = super::super::episodes::stored_project_ref(&row)?;
+                    if !super::super::episodes::episode_visible_to_narrowed(
+                        &auth,
+                        owner_row.personal_space_id.as_deref(),
+                        project.as_ref(),
+                        row.name.as_deref(),
+                        Some(id),
+                    ) {
+                        return Err(DomainError::ResourceNotFound.into());
+                    }
+                    Some(row)
+                }
+                None => None,
+            };
             let agent=match auth.kind(){PrincipalKind::AgentRun(run)|PrincipalKind::Keeper(run)=>Some(run.to_string()),_=>None};
             let raw_row = AgentCallsRow {
                 call_id: request.call.to_string(),
@@ -90,10 +109,21 @@ impl ControlService {
                 {
                     return Err(DomainError::IdempotencyKeyReused.into());
                 }
+            } else if let Some(episode) = episode
+                && matches!(request.transport, AgentTransport::Mcp)
+                && auth.bearer_scope() != Some(BearerScope::Read)
+                && !auth.taint().is_tainted()
+                && !matches!(
+                    auth.kind(),
+                    PrincipalKind::Keeper(_) | PrincipalKind::AgentRun(_)
+                )
+            {
+                super::super::episodes::touch_active(tx.inner_mut(), &episode, raw_row.started_at)
+                    .await?;
             }
             Ok(())
         },CommitEffect::NotCommitted).await?;
-        budget.run(tx.commit(), CommitEffect::Unknown).await
+        budget.commit_tx(tx).await
     }
     pub async fn finish_agent_call(
         &self,
@@ -125,7 +155,7 @@ impl ControlService {
                 let record=TargetRecord::from(AgentCallDetailsRow{call_id:request.call.to_string(),payload,created_at:raw_now,expires_at:expires});record.validate()?;record.insert(tx.inner_mut()).await?;
             }Ok(())
         },CommitEffect::NotCommitted).await?;
-        budget.run(tx.commit(), CommitEffect::Unknown).await
+        budget.commit_tx(tx).await
     }
     pub async fn record_agent_retrieval(
         &self,
@@ -204,6 +234,6 @@ impl ControlService {
             }
             Ok(())
         },CommitEffect::NotCommitted).await?;
-        budget.run(tx.commit(), CommitEffect::Unknown).await
+        budget.commit_tx(tx).await
     }
 }

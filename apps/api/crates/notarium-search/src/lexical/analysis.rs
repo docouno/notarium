@@ -10,7 +10,7 @@ use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
 
 pub const PROSE: &str = "notarium_prose_v1";
 pub const EXACT: &str = "notarium_exact_v1";
-pub const TOKENIZER_VERSION: u32 = 2;
+pub const TOKENIZER_VERSION: u32 = 3;
 const MAX_TERM_BYTES: usize = 255;
 // NFC and case folding cannot shrink valid UTF-8 by more than 4x.
 const MAX_RAW_TERM_BYTES: usize = MAX_TERM_BYTES * 4;

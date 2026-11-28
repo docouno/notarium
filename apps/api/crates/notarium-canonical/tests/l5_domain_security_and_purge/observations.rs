@@ -28,7 +28,7 @@ async fn observed_digest_matches_content_on_no_change_and_replay() {
         let root = TempDataRoot::new("observation-digest");
         let installation = sample_installation_id(93);
         let cfg = if postgres {
-            fixtures.pg_local_config(installation, &schema, root.data_root())
+            fixtures.open_pg_s3_config(installation, &schema).await
         } else {
             CanonicalConfig::local_default(installation, root.data_root())
         };
@@ -50,6 +50,7 @@ async fn observed_digest_matches_content_on_no_change_and_replay() {
                     &scope,
                     &owner,
                     CreateNote {
+                        folder_page: false,
                         note: note.clone(),
                         parent: None,
                         slug: "observed".into(),
@@ -203,20 +204,13 @@ async fn historical_observation_replay_bounds_paused_cas_read() {
 
     let fixtures = StorageTestFixtures::load_required();
     let schema = fixtures.fresh_pg_schema();
-    for postgres in [false, true] {
-        let root = TempDataRoot::new("observation-replay-deadline");
+    {
         let installation = sample_installation_id(94);
         let bucket = fixtures.fresh_s3_bucket("observation-replay");
         let s3 = fixtures.s3_config(&bucket, S3BucketModePolicy::DetectFromBucket);
         admin_ensure_bucket(&s3, None).await.unwrap();
         let gate = Arc::new(PausedObjectRead::new(&s3));
-        let cfg = if postgres {
-            fixtures.pg_s3_config(installation, &schema, s3)
-        } else {
-            let mut cfg = CanonicalConfig::local_default(installation, root.data_root());
-            cfg.blobs = notarium_canonical::BlobBackendConfig::S3(Box::new(s3));
-            cfg
-        };
+        let cfg = fixtures.pg_s3_config(installation, &schema, s3);
         let (store, runtime) = CanonicalRuntime::open_with_s3_transport(cfg, Some(gate.clone()))
             .await
             .unwrap();
@@ -234,6 +228,7 @@ async fn historical_observation_replay_bounds_paused_cas_read() {
             &scope,
             &owner,
             CreateNote {
+                folder_page: false,
                 note: note.clone(),
                 parent: None,
                 slug: "observed".into(),

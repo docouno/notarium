@@ -274,6 +274,7 @@ async fn run_projection_reads(store: &CanonicalStore) {
                 identity: identity(2),
                 preconditions: Preconditions::default(),
                 input: CreateNote {
+                    folder_page: false,
                     note: skill.clone(),
                     parent: None,
                     slug: "skill".into(),
@@ -292,6 +293,9 @@ async fn run_projection_reads(store: &CanonicalStore) {
                 identity: identity(3),
                 preconditions: Preconditions::default(),
                 input: PublishAbilityPackage {
+                    attached_skills: Vec::new(),
+                    expected_entrypoint_revision: Some(skill_create.value.revision.clone()),
+                    requires_explicit_binding: false,
                     ability: ability.clone(),
                     kind: AbilityKind::Skill,
                     entrypoint: skill.clone(),
@@ -426,6 +430,7 @@ async fn run_projection_reads(store: &CanonicalStore) {
                 identity: identity(4),
                 preconditions: Preconditions::default(),
                 input: CreateNote {
+                    folder_page: false,
                     note: sample_note_id(13),
                     parent: None,
                     slug: "later".into(),
@@ -495,6 +500,7 @@ async fn run_projection_reads(store: &CanonicalStore) {
                 identity: identity(6),
                 preconditions: Preconditions::default(),
                 input: CreateNote {
+                    folder_page: false,
                     note: sample_note_id(15),
                     parent: None,
                     slug: "after-schema".into(),
@@ -717,6 +723,7 @@ async fn run_projection_reads(store: &CanonicalStore) {
                 identity: identity(100),
                 preconditions: Preconditions::default(),
                 input: CreateNote {
+                    folder_page: false,
                     note: nested_note.clone(),
                     parent: Some(movable_folder.clone()),
                     slug: "nested-note".into(),
@@ -923,8 +930,9 @@ async fn sqlite_projection_reads() {
 async fn postgres_projection_reads() {
     let fixtures = StorageTestFixtures::load_required();
     let schema = fixtures.fresh_pg_schema();
-    let path = TempDataRoot::new("projection-reads-postgres");
-    let config = fixtures.pg_local_config(sample_installation_id(2), &schema, path.data_root());
+    let config = fixtures
+        .open_pg_s3_config(sample_installation_id(2), &schema)
+        .await;
     let (store, runtime) = CanonicalRuntime::open(config).await.unwrap();
     run_projection_reads(&store).await;
     runtime.shutdown().await.unwrap();

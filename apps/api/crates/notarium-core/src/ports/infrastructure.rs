@@ -2,20 +2,15 @@ use super::{PortFuture, PortStream, context::*, provider::ProviderRuntimeEpochs,
 use crate::{
     DomainError, DomainResult,
     classes::{DocClass, ProviderPart},
-    error::{Diagnostic, ValidationReason},
+    error::ValidationReason,
     ids::*,
     model::*,
     patch::*,
     query::FieldFilterAstV1,
     receipt::*,
-    value::YamlValue,
 };
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 pub trait StructuralSnapshot: Send + Sync {
     fn cut(&self) -> &SnapshotCut;
@@ -62,6 +57,17 @@ pub trait StructuralReadPort: Send + Sync {
         ctx: SpaceContext,
         causal: CausalBasis,
     ) -> PortFuture<'_, Box<dyn StructuralSnapshot>>;
+    /// Untainted snapshot acquisition used for search preflight prior to
+    /// live-visibility filtering and packing so rejected or packed-out hits do
+    /// not flip cross-space `BranchTaint`. Surviving hits commit taint on
+    /// final admission.
+    fn acquire_snapshot_preflight(
+        &self,
+        ctx: SpaceContext,
+        causal: CausalBasis,
+    ) -> PortFuture<'_, Box<dyn StructuralSnapshot>> {
+        self.acquire_snapshot(ctx, causal)
+    }
     /// Current canonical fence, including class changes; never the pinned snapshot bit.
     fn is_live_visible<'a>(
         &'a self,
@@ -82,6 +88,16 @@ pub trait StructuralReadPort: Send + Sync {
             }
             Ok(results)
         })
+    }
+    /// Untainted visibility prefilter used for search preflight prior to
+    /// packing so rejected or packed-out hits do not flip cross-space
+    /// `BranchTaint`. Surviving hits commit taint on final admission.
+    fn filter_live_visible_preflight<'a>(
+        &'a self,
+        ctx: &'a SpaceContext,
+        notes: &'a [NoteId],
+    ) -> PortFuture<'a, Vec<bool>> {
+        self.filter_live_visible(ctx, notes)
     }
     /// Preserve request ordering, including absent/hidden rows.
     fn hydrate(
@@ -471,80 +487,6 @@ impl BoardMoveFacts {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct PlannedNoteRestoration {
-    pub note: NoteId,
-    pub current_revision: RevisionId,
-    pub restored_from_revision: Option<RevisionId>,
-    pub planned_lifecycle: Lifecycle,
-    /// Exact placement prepared by the canonical rollback command.
-    pub planned_parent_folder: FolderId,
-    pub planned_class: DocClass,
-    pub planned_ability: Option<AbilityId>,
-    pub planned_header_diagnostic: Option<Diagnostic>,
-    pub planned_carrier: Option<String>,
-    pub planned_fields: BTreeMap<String, Option<YamlValue>>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BoardViewRollbackFacts {
-    pub view: ViewRef,
-    pub view_revision: RevisionId,
-    pub schema_revision: Option<RevisionId>,
-    pub descriptor_fingerprint: ContentDigest,
-    pub group_field: String,
-    pub group_field_kind: BoardGroupFieldKind,
-    pub groups: Vec<EvaluatedBoardGroup>,
-    /// Post-restoration group membership for each eligible target (`None` = outside view).
-    pub post_restore_membership: BTreeMap<NoteId, Option<GroupKey>>,
-}
-
-#[derive(Clone, Debug)]
-pub struct RollbackBoardFacts {
-    authority: BoardPlannerAuthority,
-    scope: HistoryScope,
-    cutoff: SpaceSeq,
-    views: BTreeMap<ViewRef, BoardViewRollbackFacts>,
-}
-impl RollbackBoardFacts {
-    pub fn attest(
-        authority: &BoardPlannerAuthority,
-        scope: HistoryScope,
-        cutoff: SpaceSeq,
-        views: BTreeMap<ViewRef, BoardViewRollbackFacts>,
-    ) -> Self {
-        Self {
-            authority: authority.clone(),
-            scope,
-            cutoff,
-            views,
-        }
-    }
-    pub fn verify_authority(&self, expected: &BoardPlannerAuthority) -> DomainResult<()> {
-        if self.authority.matches(expected) {
-            Ok(())
-        } else {
-            Err(DomainError::validation(ValidationReason::InvalidAuthority))
-        }
-    }
-    pub fn scope(&self) -> &HistoryScope {
-        &self.scope
-    }
-    pub fn cutoff(&self) -> SpaceSeq {
-        self.cutoff
-    }
-    pub fn views(&self) -> &BTreeMap<ViewRef, BoardViewRollbackFacts> {
-        &self.views
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct RollbackBoardFactsRequest {
-    pub cutoff: Option<SpaceSeq>,
-    pub views: Vec<ViewRef>,
-    pub eligible_notes: Vec<PlannedNoteRestoration>,
-}
-
 pub trait BoardMutationFactsProvider: Send + Sync {
     fn evaluate_move<'a>(
         &'a self,
@@ -553,13 +495,6 @@ pub trait BoardMutationFactsProvider: Send + Sync {
         cutoff: Option<SpaceSeq>,
         intent: MoveBoardCard,
     ) -> PortFuture<'a, BoardMoveFacts>;
-
-    fn evaluate_rollback<'a>(
-        &'a self,
-        authority: &'a BoardPlannerAuthority,
-        ctx: SpaceContext,
-        request: RollbackBoardFactsRequest,
-    ) -> PortFuture<'a, RollbackBoardFacts>;
 }
 
 #[derive(Clone, Debug)]
@@ -676,7 +611,7 @@ pub struct CommitPermit {
     pub epoch: LeaseEpoch,
 }
 /// Pure transition kernel; storage applies consume and commit under one fence lock.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct RoomFenceState {
     note: NoteId,
     scope: HistoryScope,
@@ -775,7 +710,7 @@ pub trait EventBusPort: Send + Sync {
         after: ChangeCursor,
     ) -> PortFuture<'_, Box<dyn PortStream<SpaceEvent>>>;
 }
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", content = "target", rename_all = "snake_case")]
 pub enum RevocationSelector {
     Principal(PrincipalId),
@@ -786,6 +721,10 @@ pub enum RevocationSelector {
     ProviderCall(RequestId),
     Schedule(ScheduleId),
     ScheduledRun(AgentRunId),
+    AgentRun {
+        space: SpaceId,
+        run: AgentRunId,
+    },
     Grant(GrantId),
     OAuthGrant(OAuthGrantId),
     OAuthFamily(OAuthFamilyId),
@@ -817,11 +756,19 @@ pub trait SessionRevocationPort: Send + Sync {
         selectors: Vec<RevocationSelector>,
         cancellation: Cancellation,
     ) -> PortFuture<'_, Box<dyn RevocationLease>>;
-    /// Close matching admissions, cancel active calls, and wait for their leases
-    /// to drop. The caller already holds database authority locks and retains
-    /// this fence through COMMIT/ROLLBACK, including cancellation of its waiter.
+    /// Register before a short read-only credential check. Revocation cancels
+    /// queued effects without waiting for them to acquire Canonical locks.
+    fn register_canonical_effect(
+        &self,
+        ctx: MaintenanceContext,
+        selectors: Vec<RevocationSelector>,
+        cancellation: Cancellation,
+    ) -> PortFuture<'_, Arc<dyn CanonicalEffectRegistration>>;
+    /// Close matching admissions, cancel provider calls and canonical effects,
+    /// and drain active effects and sockets. The caller holds Control authority
+    /// locks and retains this fence through COMMIT/ROLLBACK.
     /// Selector batches are acquired atomically; implementations must not wait
-    /// for database settlement while draining registrations.
+    /// for Control database settlement while draining registrations.
     fn fence_provider(
         &self,
         ctx: MaintenanceContext,
@@ -845,6 +792,22 @@ pub trait SessionRevocationPort: Send + Sync {
         selector: RevocationSelector,
         reason: RevocationReason,
     ) -> PortFuture<'_, ()>;
+}
+
+/// A cancellable registration prepared before the Control authority snapshot.
+/// Each SQL execution or receipt read enters after acquiring its storage locks.
+pub trait CanonicalEffectRegistration: Send + Sync {
+    /// Narrow this registration to the credential lifetime observed after registration.
+    /// Both queued and active leases enforce the earlier of this and the call deadline.
+    fn restrict_until(&self, deadline: std::time::Instant) -> Result<(), crate::error::PortError>;
+
+    fn check(&self) -> Result<(), crate::error::PortError>;
+
+    /// Enter atomically against a revocation fence. A canceled registration or
+    /// a matching fence denies entry without waiting for the fence to drop.
+    /// Hold the returned lease through SQL settlement. No Control mutation or
+    /// model call may run while holding this lease.
+    fn begin(self: Arc<Self>) -> PortFuture<'static, Box<dyn RevocationLease>>;
 }
 
 /// Loss of distributed registry authority invalidates a lease and cancels every

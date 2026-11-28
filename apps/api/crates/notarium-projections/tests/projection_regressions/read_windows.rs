@@ -68,6 +68,7 @@ async fn listings_hydrate_both_deepest_supported_folder_levels() {
                 owner.clone(),
                 ReadRequest::Open {
                     query: NoteQuery {
+                        tag: None,
                         folder: Some(folder),
                         recursive: false,
                         classes: BTreeSet::from([DocClass::UserDoc]),

@@ -3,6 +3,7 @@ mod abilities;
 mod accounts;
 mod auth_port;
 mod authority;
+mod canonical_effects;
 mod commands;
 mod context_state;
 mod control_port;
@@ -19,6 +20,10 @@ mod pats;
 pub mod provider;
 mod provisioning;
 mod schedules;
+pub use schedules::compute_next_slot;
+pub(crate) use schedules::validate_stored_calendar;
+#[cfg(test)]
+mod plan_tests;
 mod sessions;
 mod spaces;
 mod telemetry;
@@ -66,6 +71,7 @@ pub struct ControlService {
     store: ControlStore,
     catalog: Arc<dyn ControlCatalogPort>,
     revoker: Arc<dyn SessionRevocationPort>,
+    revocation_tracker: Arc<outbox::RevocationDeliveryTracker>,
     clock: Arc<dyn ControlClock>,
     config: ControlConfig,
     installation: InstallationId,
@@ -109,6 +115,7 @@ impl ControlService {
             store,
             catalog,
             revoker,
+            revocation_tracker: Arc::new(outbox::RevocationDeliveryTracker::default()),
             clock,
             config,
             installation,

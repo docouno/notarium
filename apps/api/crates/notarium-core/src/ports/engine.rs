@@ -1,7 +1,63 @@
 use super::{PortFuture, SpaceContext, types::*};
-use crate::{ids::*, model::*, query::*, receipt::CausalBasis};
+use crate::{DomainError, ids::*, model::*, query::*, receipt::CausalBasis};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SpaceSchemaSnapshot {
+    pub revision: Option<RevisionId>,
+    pub fields: BTreeMap<String, FieldSchema>,
+}
 
 pub trait NoteReadPort: Send + Sync {
+    fn resolve_folder_path(
+        &self,
+        ctx: SpaceContext,
+        base: Option<FolderId>,
+        path: String,
+    ) -> PortFuture<'_, Option<FolderSnapshot>>;
+    fn list_child_folders(
+        &self,
+        ctx: SpaceContext,
+        base: Option<FolderId>,
+        after: Option<FolderId>,
+        at_seq: Option<SpaceSeq>,
+        limit: PageLimit,
+    ) -> PortFuture<'_, ChildFolders>;
+    fn resolve_note_target(
+        &self,
+        ctx: SpaceContext,
+        parent: Option<FolderId>,
+        slug_title_or_id: String,
+    ) -> PortFuture<'_, Option<NoteRef>>;
+    fn space_schema(&self, ctx: SpaceContext) -> PortFuture<'_, BTreeMap<String, FieldSchema>>;
+    /// Read either the current field schema (`revision == None`) or an exact
+    /// historical schema revision (`revision == Some(rev)`), returning its
+    /// revision identity alongside the fields so retries can replay against the
+    /// original schema without journaling user content.
+    fn space_schema_snapshot(
+        &self,
+        ctx: SpaceContext,
+        revision: Option<RevisionId>,
+    ) -> PortFuture<'_, SpaceSchemaSnapshot> {
+        if revision.is_some() {
+            return Box::pin(async { Err(DomainError::ResourceNotFound.into()) });
+        }
+        Box::pin(async move {
+            Ok(SpaceSchemaSnapshot {
+                revision: None,
+                fields: self.space_schema(ctx).await?,
+            })
+        })
+    }
+    /// Aggregate only visible notes from the exact project and requested history.
+    /// Counts and the source cut use the caller's live class and project grants.
+    fn project_note_counts(
+        &self,
+        ctx: SpaceContext,
+        project: FolderRef,
+        causal: crate::receipt::CausalBasis,
+    ) -> PortFuture<'_, ProjectNoteCounts>;
     /// Read exactly one committed protected package resource. The canonical owner
     /// checks Space/history, live package visibility and authorization before
     /// returning bytes; a missing revision/resource never falls back to latest.
@@ -11,6 +67,11 @@ pub trait NoteReadPort: Send + Sync {
         request: ReadAbilityResource,
     ) -> PortFuture<'_, crate::classes::ClassifiedAbilityResource>;
     fn get_note(&self, ctx: SpaceContext, request: GetNote) -> PortFuture<'_, NoteSnapshot>;
+    fn get_note_metadata(
+        &self,
+        ctx: SpaceContext,
+        request: GetNote,
+    ) -> PortFuture<'_, NoteMetadataSnapshot>;
     fn list_notes(
         &self,
         ctx: SpaceContext,
@@ -28,6 +89,11 @@ pub trait NoteReadPort: Send + Sync {
     ) -> PortFuture<'_, ChangeReadResult>;
 }
 pub trait NoteWritePort: Send + Sync {
+    fn ensure_folder_path(
+        &self,
+        ctx: SpaceContext,
+        request: Mutation<EnsureFolderPath>,
+    ) -> PortFuture<'_, EnsuredFolder>;
     fn create_note(
         &self,
         ctx: SpaceContext,
@@ -82,7 +148,7 @@ pub trait NoteWritePort: Send + Sync {
         &self,
         ctx: SpaceContext,
         request: Mutation<AppendMemory>,
-    ) -> PortFuture<'_, Committed<NoteRevision>>;
+    ) -> PortFuture<'_, Committed<MemoryAppendResult>>;
     fn link(&self, ctx: SpaceContext, request: Mutation<Link>) -> PortFuture<'_, Committed<Link>>;
     fn link_many(&self, ctx: SpaceContext, request: LinkBatch)
     -> PortFuture<'_, BatchResult<Link>>;
@@ -91,10 +157,17 @@ pub trait NoteWritePort: Send + Sync {
         ctx: SpaceContext,
         request: Mutation<PublishAbilityPackage>,
     ) -> PortFuture<'_, Committed<AbilityPackageRevision>>;
-    fn rollback_agent_run(
+    fn trash_ability_package(
         &self,
         ctx: SpaceContext,
-        request: Mutation<RollbackAgentRun>,
+        request: Mutation<TrashAbilityPackage>,
+    ) -> PortFuture<'_, Committed<NoteRevision>>;
+    /// Resolve the current rollback plan internally. The durable command is
+    /// identified by the run, even after a successful rollback changes the plan.
+    fn rollback_agent_run_by_id(
+        &self,
+        ctx: SpaceContext,
+        request: Mutation<AgentRunId>,
     ) -> PortFuture<'_, Committed<RollbackResult>>;
     fn accept_external_observation(
         &self,
@@ -104,6 +177,28 @@ pub trait NoteWritePort: Send + Sync {
 }
 pub trait ChatPort: Send + Sync {
     fn read_chat(&self, ctx: SpaceContext, request: ChatRead) -> PortFuture<'_, ChatBranch>;
+    /// A bounded prompt window. A live prefix checkpoint is presented before
+    /// its retained original suffix, with its durable sequence unchanged.
+    /// Prompt windows omit historical empty human entries, which remain available
+    /// through the audit reader.
+    fn read_chat_context(&self, ctx: SpaceContext, request: ChatRead)
+    -> PortFuture<'_, ChatBranch>;
+    /// Read the oldest logical window when the suffix extends beyond a single page.
+    fn read_chat_compaction_prefix(
+        &self,
+        ctx: SpaceContext,
+        request: ChatRead,
+    ) -> PortFuture<'_, ChatCompactionPrefix>;
+    fn read_chat_contents(
+        &self,
+        ctx: SpaceContext,
+        request: ChatContentRead,
+    ) -> PortFuture<'_, Vec<HydratedChatEntry>>;
+    fn read_chat_proposal(
+        &self,
+        ctx: SpaceContext,
+        request: ChatProposalRead,
+    ) -> PortFuture<'_, CanonicalChatProposal>;
     fn create_chat(
         &self,
         ctx: SpaceContext,
@@ -119,6 +214,16 @@ pub trait ChatPort: Send + Sync {
         ctx: SpaceContext,
         request: Mutation<AppendChat>,
     ) -> PortFuture<'_, Committed<ChatEntry>>;
+    fn submit_user_chat_input(
+        &self,
+        ctx: SpaceContext,
+        request: SubmitUserChatInput,
+    ) -> PortFuture<'_, SubmitUserChatOutcome>;
+    fn lookup_user_chat_input(
+        &self,
+        ctx: SpaceContext,
+        request: &SubmitUserChatInput,
+    ) -> PortFuture<'_, Option<SubmitUserChatOutcome>>;
     fn queue_chat_input(
         &self,
         ctx: SpaceContext,
@@ -129,6 +234,31 @@ pub trait ChatPort: Send + Sync {
         ctx: SpaceContext,
         request: Mutation<ConsumePending>,
     ) -> PortFuture<'_, Committed<ConsumedPending>>;
+    fn list_pending_chat_inputs(
+        &self,
+        ctx: SpaceContext,
+        thread: ChatThreadId,
+    ) -> PortFuture<'_, Vec<QueuedChatInput>>;
+    fn dismiss_chat_input(
+        &self,
+        ctx: SpaceContext,
+        request: DismissPending,
+    ) -> PortFuture<'_, bool>;
+    fn claim_active_run(
+        &self,
+        ctx: SpaceContext,
+        request: ClaimChatRun,
+    ) -> PortFuture<'_, ClaimChatRunOutcome>;
+    fn finish_run_if_queue_empty(
+        &self,
+        ctx: SpaceContext,
+        request: ChatRunRequest,
+    ) -> PortFuture<'_, FinishChatRunOutcome>;
+    fn recover_active_run(
+        &self,
+        ctx: SpaceContext,
+        request: ChatRunRequest,
+    ) -> PortFuture<'_, FinishChatRunOutcome>;
     fn redact_chat_entry(
         &self,
         ctx: SpaceContext,
@@ -172,9 +302,54 @@ pub trait LinkReadPort: Send + Sync {
         limit: PageLimit,
     ) -> PortFuture<'_, ChatBacklinkPage>;
 }
+/// Admit ranked note metadata before counting a result or loading its chunks.
+/// The final consumer still validates the exact source when disclosing its content.
+pub trait SearchRecipient: Send + Sync {
+    /// A recipient that supplies only recall framing can skip metadata preflight.
+    fn filters_notes(&self) -> bool {
+        true
+    }
+    fn admit<'a>(&'a self, card: &'a crate::classes::ClassifiedMetadata) -> PortFuture<'a, bool>;
+    /// Additional context tokens charged by recall for a delivered chunk.
+    fn framing_tokens(&self, _note: &NoteId, _first_chunk: bool) -> u32 {
+        0
+    }
+    /// Context tokens charged by recall for a title-only note with no chunks.
+    fn title_only_framing_tokens(&self, note: &NoteId) -> u32 {
+        self.framing_tokens(note, true)
+    }
+    /// Non-encrypted document classes the calling model may have observed when
+    /// authoring this query. Remote query embedding must cover every class here.
+    fn query_source_classes(&self) -> Option<std::collections::BTreeSet<crate::classes::DocClass>> {
+        None
+    }
+    /// Project confinement of the calling model's provider policy when authoring
+    /// this query: `Some(Some(project))` when confined to `project`, `Some(None)`
+    /// when Space-wide/unconfined, or `None` when not an in-app provider call.
+    fn query_source_project(&self) -> Option<Option<FolderRef>> {
+        None
+    }
+}
+
 pub trait SearchPort: Send + Sync {
-    fn search(&self, ctx: SpaceContext, request: SearchQuery) -> PortFuture<'_, SearchResult>;
-    fn recall(&self, ctx: SpaceContext, request: RecallQuery) -> PortFuture<'_, SearchResult>;
+    fn search(&self, ctx: SpaceContext, request: SearchQuery) -> PortFuture<'_, SearchResult> {
+        self.search_for(ctx, request, None)
+    }
+    fn search_for<'a>(
+        &'a self,
+        ctx: SpaceContext,
+        request: SearchQuery,
+        recipient: Option<&'a dyn SearchRecipient>,
+    ) -> PortFuture<'a, SearchResult>;
+    fn recall(&self, ctx: SpaceContext, request: RecallQuery) -> PortFuture<'_, SearchResult> {
+        self.recall_for(ctx, request, None)
+    }
+    fn recall_for<'a>(
+        &'a self,
+        ctx: SpaceContext,
+        request: RecallQuery,
+        recipient: Option<&'a dyn SearchRecipient>,
+    ) -> PortFuture<'a, SearchResult>;
 }
 pub trait ContentJobPort: Send + Sync {
     fn create_job(

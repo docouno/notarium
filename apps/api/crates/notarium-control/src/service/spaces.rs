@@ -24,6 +24,8 @@ use notarium_core::{
 };
 use serde::{Deserialize, Serialize};
 
+pub(crate) const WHOAMI_PROVIDER_SQLITE_SQL: &str = "SELECT CAST(1 AS BIGINT) FROM provider_attachments a INDEXED BY attachment_target CROSS JOIN provider_resources r CROSS JOIN provider_models m WHERE r.id=a.resource_id AND m.resource_id=r.id AND a.target_kind='personal' AND a.target_owner=$1 AND a.target_space=$2 AND a.state='approved' AND a.resource_epoch=r.consent_epoch AND (a.expires_at IS NULL OR a.expires_at>$3) AND r.disabled_at IS NULL AND m.kind='completion' LIMIT 1";
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SpaceCursor {
@@ -85,6 +87,45 @@ pub(super) async fn admission(
     };
     row.ok_or(DomainError::ResourceNotFound.into())
 }
+pub(super) async fn admission_revisions(
+    tx: &mut Transaction,
+    spaces: &[&SpaceId],
+) -> Result<Vec<(SpaceId, i64)>, PortError> {
+    if spaces.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids: Vec<String> = spaces.iter().map(|space| space.to_string()).collect();
+    let fetched: Vec<(String, i64)> = match tx {
+        Transaction::Sqlite(tx) => {
+            let encoded =
+                serde_json::to_string(&ids).map_err(|_| invalid(ValidationReason::InvalidState))?;
+            sqlx::query_as(
+                "SELECT space_id, revision FROM space_admission WHERE space_id IN (SELECT value FROM json_each($1))",
+            )
+            .bind(encoded)
+            .fetch_all(&mut **tx)
+            .await
+            .map_err(crate::error::database_not_committed)?
+        }
+        Transaction::Postgres(tx) => sqlx::query_as(
+            "SELECT space_id, revision FROM v1_control.space_admission WHERE space_id = ANY($1)",
+        )
+        .bind(&ids)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(crate::error::database_not_committed)?,
+    };
+    let map: std::collections::BTreeMap<String, i64> = fetched.into_iter().collect();
+    let mut out = Vec::with_capacity(spaces.len());
+    for space in spaces {
+        let rev = map
+            .get(space.as_str())
+            .copied()
+            .ok_or(DomainError::ResourceNotFound)?;
+        out.push(((*space).clone(), rev));
+    }
+    Ok(out)
+}
 pub(super) async fn require_owner_read(
     tx: &mut Transaction,
     auth: &EngineAuthContext,
@@ -94,7 +135,7 @@ pub(super) async fn require_owner_read(
         || auth
             .spaces()
             .get(space)
-            .is_none_or(|grant| grant.role != SpaceRole::Owner)
+            .is_none_or(|grant| grant.role != SpaceRole::Owner || grant.project_root.is_some())
     {
         return Err(access_denied());
     }
@@ -119,6 +160,9 @@ impl ControlService {
         scope: notarium_core::model::HistoryScope,
     ) -> Result<SpaceContext, PortError> {
         ctx.auth().authorize_human_management()?;
+        if ctx.auth().taint().is_tainted() {
+            return Err(DomainError::CrossSpaceTainted.into());
+        }
         let budget = OperationBudget::new(ctx.budget.clone());
         let mut rtx = self.store.read(budget.clone()).await?;
         let auth = budget
@@ -128,9 +172,23 @@ impl ControlService {
                         user_read(rtx.inner_mut(), ctx.auth().principal().as_str()).await?;
                     self.live_human(rtx.inner_mut(), ctx.auth(), &current)
                         .await?;
-                    let space = admission(rtx.inner_mut(), &scope.space_id, false).await?;
-                    if !matches!(space.state.as_str(), "active" | "closing" | "archived") {
-                        return Err(access_denied());
+                    if ctx.auth().is_space_narrowed()
+                        || ctx
+                            .auth()
+                            .spaces()
+                            .values()
+                            .any(|grant| grant.project_root.is_some())
+                    {
+                        let allowed =
+                            ctx.auth()
+                                .spaces()
+                                .get(&scope.space_id)
+                                .is_some_and(|grant| {
+                                    grant.role == SpaceRole::Owner && grant.project_root.is_none()
+                                });
+                        if !allowed {
+                            return Err(access_denied());
+                        }
                     }
                     let member = rows!(
                         rtx.inner_mut(),
@@ -141,23 +199,47 @@ impl ControlService {
                         scope.space_id.as_str(),
                         &current.user_id
                     )?
-                    .ok_or_else(access_denied)?;
+                    .ok_or(DomainError::ResourceNotFound)?;
                     if member.role != "owner" || member.admission != "active" {
+                        return Err(DomainError::ResourceNotFound.into());
+                    }
+                    let space = admission(rtx.inner_mut(), &scope.space_id, false).await?;
+                    if !matches!(space.state.as_str(), "active" | "closing" | "archived") {
                         return Err(access_denied());
                     }
+                    let (read_classes, write_classes) = if space.state == "active" {
+                        let existing = ctx
+                            .auth()
+                            .spaces()
+                            .get(&scope.space_id)
+                            .ok_or_else(access_denied)?;
+                        if existing.role != SpaceRole::Owner || existing.project_root.is_some() {
+                            return Err(access_denied());
+                        }
+                        (
+                            existing.read_classes.clone(),
+                            existing.write_classes.clone(),
+                        )
+                    } else {
+                        if ctx.auth().is_space_narrowed()
+                            || ctx
+                                .auth()
+                                .spaces()
+                                .values()
+                                .any(|grant| grant.project_root.is_some())
+                        {
+                            return Err(access_denied());
+                        }
+                        (Default::default(), Default::default())
+                    };
                     let credential = ctx.auth().credential().cloned().ok_or_else(denied)?;
                     let mut spaces = std::collections::BTreeMap::new();
-                    let classes = if space.state == "active" {
-                        notarium_core::classes::DocClass::all()
-                    } else {
-                        Default::default()
-                    };
                     spaces.insert(
                         scope.space_id.clone(),
                         SpaceGrant {
                             role: SpaceRole::Owner,
-                            read_classes: classes.clone(),
-                            write_classes: classes,
+                            read_classes,
+                            write_classes,
                             project_root: None,
                         },
                     );
@@ -170,7 +252,8 @@ impl ControlService {
                         )
                         .with_human_management(ctx.auth().human_management())
                         .with_credential(credential),
-                    ))
+                    )
+                    .mark_spaces_narrowed())
                 },
                 CommitEffect::NotCommitted,
             )
@@ -190,14 +273,38 @@ impl ControlService {
     }
     pub async fn whoami(&self, ctx: AccountContext) -> Result<PrincipalInfo, PortError> {
         let budget = OperationBudget::new(ctx.budget.clone());
-        let (rtx, auth) = self
+        let (mut rtx, auth) = self
             .open_revalidated_read(&budget, &ctx.budget.request, ctx.auth())
             .await?;
+        let metadata = budget.run(async {
+            let account = account_info(&user_read(rtx.inner_mut(), auth.principal().as_str()).await?)?;
+            let personal_space = account.personal_space.filter(|space| {
+                auth.spaces().get(space).is_some_and(|grant| {
+                    grant.project_root.is_none() && !grant.read_classes.is_empty()
+                })
+            });
+            // A configuration hint for the caller's visible Personal Space.
+            // Model selection still performs disclosure and live admission checks.
+            let has_completion_provider = if let Some(space) = &personal_space {
+                let now = self.clock.now_ms()?;
+                rows!(rtx.inner_mut(),(i64,),fetch_optional,
+                    WHOAMI_PROVIDER_SQLITE_SQL,
+                    "SELECT CAST(1 AS BIGINT) FROM v1_control.provider_attachments a JOIN v1_control.provider_resources r ON r.id=a.resource_id JOIN v1_control.provider_models m ON m.resource_id=r.id WHERE a.target_kind='personal' AND a.target_owner=$1 AND a.target_space=$2 AND a.state='approved' AND a.resource_epoch=r.consent_epoch AND (a.expires_at IS NULL OR a.expires_at>$3) AND r.disabled_at IS NULL AND m.kind='completion' LIMIT 1";
+                    auth.principal().as_str(),space.as_str(),now)?.is_some()
+            } else {
+                false
+            };
+            Ok((account.revision, personal_space, has_completion_provider))
+        }, CommitEffect::NotCommitted).await;
         budget.run(rtx.finish(), CommitEffect::NotCommitted).await?;
+        let (account_revision, personal_space, has_completion_provider) = metadata?;
         Ok(PrincipalInfo {
             principal: auth.principal().clone(),
             kind: auth.kind().clone(),
             grant: auth.grant().clone(),
+            account_revision,
+            personal_space,
+            has_completion_provider,
         })
     }
     pub async fn list_spaces(
@@ -270,8 +377,10 @@ impl ControlService {
             if current.space.lifecycle == SpaceLifecycle::Active {
                 items.push(AccessibleSpace {
                     space: current.space,
+                    slug: current.slug,
                     role: grant.role,
                     history: current.history,
+                    last_seq: current.last_seq,
                 });
             }
         }
@@ -314,7 +423,7 @@ impl ControlService {
             command.save(tx.inner_mut(),revision,&saved,now).await?;
             Ok((revision,saved))
         },CommitEffect::NotCommitted).await?;
-        budget.run(tx.commit(), CommitEffect::Unknown).await?;
+        budget.commit_tx(tx).await?;
         let current = self
             .finish_space_operation(&budget, &saved.value.operation)
             .await?;
@@ -328,8 +437,10 @@ impl ControlService {
             revision,
             value: AccessibleSpace {
                 space: current.space,
+                slug: current.slug,
                 role: SpaceRole::Owner,
                 history: current.history,
+                last_seq: current.last_seq,
             },
         })
     }
@@ -339,9 +450,8 @@ impl ControlService {
         scope: HistoryScope,
         request: MembershipChange,
     ) -> Result<ControlCommit<MembershipResult>, PortError> {
-        if ctx.auth().kind() != &PrincipalKind::DirectHuman {
-            return Err(access_denied());
-        }
+        ctx.auth().authorize_human_management()?;
+        require_unpinned_human(ctx.auth())?;
         let command = membership_command(ctx.auth(), &scope, &request)?;
         let budget = OperationBudget::new(ctx.budget.clone());
         let mut rtx = self.store.read(budget.clone()).await?;
@@ -387,6 +497,7 @@ impl ControlService {
         request: MembershipChange,
     ) -> Result<ControlCommit<MembershipResult>, PortError> {
         ctx.auth().authorize_human_management()?;
+        require_unpinned_project(ctx.auth())?;
         let command = membership_command(ctx.auth(), ctx.scope(), &request)?;
         let budget = OperationBudget::new(ctx.budget.clone());
         let space = &ctx.scope().space_id;
@@ -421,13 +532,13 @@ impl ControlService {
             return Err(invalid(ValidationReason::InvalidState));
         }
         let mut tx = self.store.write(budget.clone()).await?;
-        let (revision,saved)=budget.run(async {
+        let (revision,saved,enqueued)=budget.run(async {
             let accounts=rows!(tx.inner_mut(),UsersRow,fetch_all,
                 "SELECT * FROM users WHERE user_id IN ($1,$2) ORDER BY user_id",
                 "SELECT * FROM v1_control.users WHERE user_id IN ($1,$2) ORDER BY user_id FOR UPDATE";ctx.auth().principal().as_str(),request.member.as_str())?;
             let actor=accounts.iter().find(|user|user.user_id==ctx.auth().principal().as_str()).ok_or_else(denied)?;
             self.live_human(tx.inner_mut(),ctx.auth(),actor).await?;
-            if let Some(replay)=command.replay::<MembershipResult>(tx.inner_mut()).await? {return Ok(replay);}
+            if let Some((revision,saved))=command.replay::<MembershipResult>(tx.inner_mut()).await? {return Ok((revision,saved,Vec::new()));}
             let target=accounts.iter().find(|user|user.user_id==request.member.as_str()).ok_or(DomainError::ResourceNotFound)?;
             if request.role.is_some() && target.disabled_at.is_some() {return Err(access_denied());}
             let current=admission(tx.inner_mut(),space,true).await?;
@@ -455,11 +566,12 @@ impl ControlService {
             execute!(tx.inner_mut(),"UPDATE space_admission SET revision=$1,admission_epoch=$2 WHERE space_id=$3","UPDATE v1_control.space_admission SET revision=$1,admission_epoch=$2 WHERE space_id=$3";revision,epoch,space.as_str())?;
             let event=super::outbox::enqueue(tx.inner_mut(),RevocationSelector::Membership{space:space.clone(),principal:request.member.clone()},RevocationReason::PermissionChanged,epoch,now).await?;
             let revision=ControlRevision::new(revision as u64)?;
+            let enqueued = vec![event.clone()];
             let saved=SavedResult{value:MembershipResult{space:space.clone(),member:request.member,role:request.role},events:vec![event]};
             command.save(tx.inner_mut(),revision,&saved,now).await?;
-            Ok((revision,saved))
+            Ok((revision,saved,enqueued))
         },CommitEffect::NotCommitted).await?;
-        self.commit_revocations(tx, &budget, &saved.events).await?;
+        self.commit_revocations(tx, &budget, &enqueued).await?;
         for event in &saved.events {
             self.flush_event(&budget, event).await?;
         }

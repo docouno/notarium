@@ -5,11 +5,11 @@ use crate::{
     document::{ChunkDescriptor, render_chunk},
     error::ValidationReason,
     ids::{
-        ChatThreadId, ContentDigest, FolderId, ModelProfileId, ProviderResourceId, RevisionId,
-        SpaceId, ThreadEntrySeq,
+        AbilityId, ChatThreadId, ContentDigest, FolderId, ModelProfileId, PrincipalId,
+        ProviderResourceId, RevisionId, SpaceId, ThreadEntrySeq,
     },
-    model::{AbilityResourceRef, Lifecycle, NoteRef},
-    ports::{ServiceAuthority, ServicePurpose},
+    model::{AbilityResourceRef, FolderRef, HistoryScope, Lifecycle, NoteRef},
+    ports::{AbilityPlacement, ChatProvenance, ServiceAuthority, ServicePurpose},
     span::ByteSpan,
 };
 use serde::{Deserialize, Serialize};
@@ -42,7 +42,7 @@ pub enum AbilityKind {
     Skill,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Eq, PartialEq)]
 struct DocumentFacts {
     recorded: ResourceFacts,
     current: Option<Box<(ResourceFacts, Lifecycle)>>,
@@ -57,6 +57,30 @@ impl DocumentFacts {
 
     fn iter(&self) -> impl Iterator<Item = &ResourceFacts> {
         std::iter::once(&self.recorded).chain(self.current.as_deref().map(|(facts, _)| facts))
+    }
+
+    fn current(&self) -> &ResourceFacts {
+        self.current
+            .as_deref()
+            .map_or(&self.recorded, |(facts, _)| facts)
+    }
+
+    fn note_origin(
+        &self,
+        reference: &NoteRef,
+        revision: &RevisionId,
+        digest: ContentDigest,
+    ) -> ProviderOrigin {
+        let current = self.current();
+        ProviderOrigin::Note {
+            reference: reference.clone(),
+            revision: revision.clone(),
+            digest,
+            placement: Some(NoteDisclosurePlacement {
+                class: current.class,
+                project: current.project.clone(),
+            }),
+        }
     }
 
     fn bind_current(
@@ -88,6 +112,21 @@ impl DocumentFacts {
         auth.authorize_read(&self.recorded)
     }
 
+    fn can_view(&self, auth: &EngineAuthContext) -> DomainResult<()> {
+        if let Some((current, _)) = self.current.as_deref() {
+            auth.can_view_resource(current)?;
+        }
+        auth.can_view_resource(&self.recorded)
+    }
+
+    fn is_purged(&self, lifecycle: Lifecycle) -> bool {
+        lifecycle == Lifecycle::Purged
+            || self
+                .current
+                .as_deref()
+                .is_some_and(|(_, now)| *now == Lifecycle::Purged)
+    }
+
     fn check_egress(&self, lifecycle: Lifecycle) -> DomainResult<()> {
         if self
             .iter()
@@ -111,6 +150,15 @@ impl DocumentFacts {
     fn allow_egress(&self, lifecycle: Lifecycle, auth: &EngineAuthContext) -> DomainResult<()> {
         self.check_egress(lifecycle)?;
         self.authorize(auth)
+    }
+
+    fn allow_egress_preflight(
+        &self,
+        lifecycle: Lifecycle,
+        auth: &EngineAuthContext,
+    ) -> DomainResult<()> {
+        self.check_egress(lifecycle)?;
+        self.can_view(auth)
     }
 
     fn allow_provider(&self, policy: &ProviderPolicy) -> DomainResult<()> {
@@ -180,17 +228,46 @@ impl ClassifiedMetadata {
     pub fn digest(&self) -> ContentDigest {
         self.digest
     }
+    pub fn origin(&self) -> ProviderOrigin {
+        self.facts
+            .note_origin(&self.reference, &self.revision, self.digest)
+    }
+    pub fn current_class(&self) -> DocClass {
+        self.facts.current().class
+    }
+    pub fn current_lifecycle(&self) -> Lifecycle {
+        self.facts
+            .current
+            .as_deref()
+            .map_or(self.lifecycle, |(_, lc)| *lc)
+    }
+    /// The nearest project in the current facts bound by the canonical reader.
+    pub fn current_project(&self) -> Option<FolderRef> {
+        self.facts
+            .current()
+            .project
+            .clone()
+            .map(|folder_id| FolderRef {
+                space_id: self.reference.space_id.clone(),
+                folder_id,
+            })
+    }
+    pub fn in_project(&self, project: &FolderRef) -> bool {
+        self.facts.in_project(project)
+    }
     pub fn listing(&self, auth: &EngineAuthContext) -> DomainResult<ListedDocument> {
-        self.facts.authorize(auth)?;
-        if self.lifecycle == Lifecycle::Purged {
+        if self.facts.is_purged(self.lifecycle) {
             return Err(DomainError::ResourceNotFound);
         }
-        Ok(ListedDocument {
-            reference: self.reference.clone(),
-            revision: self.revision.clone(),
-            class: self.class(),
-            lifecycle: self.lifecycle,
-        })
+        self.facts.authorize(auth)?;
+        Ok(ListedDocument(self.clone()))
+    }
+    pub fn authorize_current_write(&self, auth: &EngineAuthContext) -> DomainResult<()> {
+        let current = self.facts.current();
+        auth.authorize_direct_write(current, current)
+    }
+    pub fn current_has_ability_package(&self) -> bool {
+        self.facts.current().ability_package.is_some()
     }
 }
 
@@ -267,6 +344,9 @@ impl ClassifiedDocument {
     pub fn lifecycle(&self) -> Lifecycle {
         self.lifecycle
     }
+    pub fn content_bytes(&self) -> usize {
+        self.content.len()
+    }
     pub fn listing(&self, auth: &EngineAuthContext) -> DomainResult<ListedDocument> {
         self.metadata().listing(auth)
     }
@@ -282,34 +362,39 @@ impl ClassifiedDocument {
     pub fn digest(&self) -> ContentDigest {
         self.digest
     }
+    pub fn origin(&self) -> ProviderOrigin {
+        self.facts
+            .note_origin(&self.reference, &self.revision, self.digest)
+    }
+    pub fn in_project(&self, project: &FolderRef) -> bool {
+        self.facts.in_project(project)
+    }
     pub fn explicit_read<'a>(&'a self, auth: &EngineAuthContext) -> DomainResult<&'a str> {
-        self.facts.authorize(auth)?;
-        if self.lifecycle == Lifecycle::Purged {
+        if self.facts.is_purged(self.lifecycle) {
             return Err(DomainError::ResourceNotFound);
         }
+        self.facts.authorize(auth)?;
         Ok(&self.content)
     }
 }
 
 #[derive(Clone, Debug)]
-pub struct ListedDocument {
-    reference: NoteRef,
-    revision: RevisionId,
-    class: DocClass,
-    lifecycle: Lifecycle,
-}
+pub struct ListedDocument(ClassifiedMetadata);
 impl ListedDocument {
     pub fn reference(&self) -> &NoteRef {
-        &self.reference
+        self.0.reference()
     }
     pub fn revision(&self) -> &RevisionId {
-        &self.revision
+        self.0.revision()
     }
     pub fn class(&self) -> DocClass {
-        self.class
+        self.0.class()
     }
     pub fn lifecycle(&self) -> Lifecycle {
-        self.lifecycle
+        self.0.lifecycle()
+    }
+    pub fn provenance(&self) -> &ClassifiedMetadata {
+        &self.0
     }
 }
 
@@ -317,7 +402,7 @@ impl ListedDocument {
 #[derive(Clone)]
 pub struct ClassifiedAbilityResource {
     reference: AbilityResourceRef,
-    facts: ResourceFacts,
+    provenance: AbilityResourceProvenance,
     lifecycle: Lifecycle,
     content: String,
     digest: ContentDigest,
@@ -325,20 +410,15 @@ pub struct ClassifiedAbilityResource {
 impl ClassifiedAbilityResource {
     pub fn from_canonical(
         reference: AbilityResourceRef,
-        facts: ResourceFacts,
+        provenance: AbilityResourceProvenance,
         lifecycle: Lifecycle,
         content: String,
         digest: ContentDigest,
     ) -> DomainResult<Self> {
-        if reference.space != facts.space.id
-            || facts.class != DocClass::Skill
-            || facts.ability_package.as_ref() != Some(&reference.ability)
-        {
-            return Err(DomainError::validation(ValidationReason::ScopeMismatch));
-        }
+        provenance.validate(&reference)?;
         Ok(Self {
             reference,
-            facts,
+            provenance,
             lifecycle,
             content,
             digest,
@@ -347,18 +427,113 @@ impl ClassifiedAbilityResource {
     pub fn reference(&self) -> &AbilityResourceRef {
         &self.reference
     }
+    pub fn placement(&self) -> &AbilityPlacement {
+        &self.provenance.current.placement
+    }
+    pub fn in_project(&self, project: &FolderRef) -> bool {
+        self.provenance.in_project(project)
+    }
     pub fn digest(&self) -> ContentDigest {
         self.digest
+    }
+    pub fn origin(&self) -> ProviderOrigin {
+        ProviderOrigin::Ability {
+            reference: self.reference.clone(),
+            placement: self.placement().clone(),
+            digest: self.digest,
+        }
     }
     pub fn lifecycle(&self) -> Lifecycle {
         self.lifecycle
     }
+    pub fn content_bytes(&self) -> usize {
+        self.content.len()
+    }
     pub fn explicit_read<'a>(&'a self, auth: &EngineAuthContext) -> DomainResult<&'a str> {
-        auth.authorize_read(&self.facts)?;
         if self.lifecycle == Lifecycle::Purged {
             return Err(DomainError::ResourceNotFound);
         }
+        self.provenance.authorize(auth)?;
         Ok(&self.content)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct AbilityResourceLocation {
+    pub placement: AbilityPlacement,
+    pub facts: ResourceFacts,
+}
+
+/// An immutable package may have been published at a different location from
+/// its current entrypoint, or promoted from an earlier project-scoped home.
+/// Reading or disclosing it requires rights across all of those locations.
+#[derive(Clone, Debug)]
+pub struct AbilityResourceProvenance {
+    pub current: AbilityResourceLocation,
+    pub published: AbilityResourceLocation,
+    pub promoted_from: Option<crate::ports::AbilityRef>,
+}
+
+impl AbilityResourceProvenance {
+    fn locations(&self) -> [&AbilityResourceLocation; 2] {
+        [&self.current, &self.published]
+    }
+
+    fn validate(&self, reference: &AbilityResourceRef) -> DomainResult<()> {
+        if self.locations().into_iter().all(|location| {
+            let facts = &location.facts;
+            facts.space.id == reference.space
+                && facts.class == DocClass::Skill
+                && facts.ability_package.as_ref() == Some(&reference.ability)
+                && ability_placement_matches(&location.placement, facts)
+        }) && self
+            .promoted_from
+            .as_ref()
+            .is_none_or(|prev| prev.id == reference.ability)
+        {
+            Ok(())
+        } else {
+            Err(DomainError::validation(ValidationReason::ScopeMismatch))
+        }
+    }
+
+    fn can_view(&self, auth: &EngineAuthContext) -> DomainResult<()> {
+        if self.locations().into_iter().any(|location| {
+            matches!(&location.placement, AbilityPlacement::OwnedPersonal(owner) if owner != auth.principal())
+        }) {
+            return Err(DomainError::ResourceNotFound);
+        }
+        auth.can_view_resource(&self.current.facts)?;
+        auth.can_view_resource(&self.published.facts)
+    }
+
+    fn authorize(&self, auth: &EngineAuthContext) -> DomainResult<()> {
+        self.can_view(auth)?;
+        auth.authorize_read(&self.published.facts)
+    }
+
+    fn in_project(&self, project: &FolderRef) -> bool {
+        self.locations()
+            .into_iter()
+            .all(|location| location.placement.in_project(project))
+            && self
+                .promoted_from
+                .as_ref()
+                .is_none_or(|prev| prev.placement.in_project(project))
+    }
+}
+
+fn ability_placement_matches(placement: &AbilityPlacement, facts: &ResourceFacts) -> bool {
+    match placement {
+        AbilityPlacement::OwnedProject(project) => {
+            project.space_id == facts.space.id
+                && facts.ancestor_folders.contains(&project.folder_id)
+        }
+        AbilityPlacement::OwnedSpace(space) => {
+            *space == facts.space.id && facts.space.kind == SpaceKind::Shared
+        }
+        AbilityPlacement::OwnedPersonal(_) => facts.space.kind == SpaceKind::Personal,
+        AbilityPlacement::System => false,
     }
 }
 impl fmt::Debug for ClassifiedAbilityResource {
@@ -426,7 +601,7 @@ impl SearchContent {
 /// source ranges are checked here and cannot introduce foreign content.
 #[derive(Clone)]
 pub struct ContentPart {
-    document: Arc<ClassifiedDocument>,
+    document: Arc<ClassifiedMetadata>,
     chunk: ChunkDescriptor,
 }
 impl ContentPart {
@@ -434,7 +609,21 @@ impl ContentPart {
         document: Arc<ClassifiedDocument>,
         chunk: ChunkDescriptor,
     ) -> DomainResult<Self> {
-        if chunk.source != document.digest
+        let metadata = Arc::new(document.metadata());
+        Self::from_chunk_shared(&document, metadata, chunk)
+    }
+
+    pub fn from_chunk_shared(
+        document: &ClassifiedDocument,
+        metadata: Arc<ClassifiedMetadata>,
+        chunk: ChunkDescriptor,
+    ) -> DomainResult<Self> {
+        if metadata.reference() != document.reference()
+            || metadata.revision() != document.revision()
+            || metadata.digest() != document.digest()
+            || metadata.facts != document.facts
+            || metadata.lifecycle != document.lifecycle
+            || chunk.source != document.digest
             || chunk.spans.is_empty()
             || render_chunk(&document.content, &chunk.context, &chunk.spans)? != chunk.text
         {
@@ -445,9 +634,12 @@ impl ContentPart {
                 ValidationReason::TokenBudgetExceeded,
             ));
         }
-        Ok(Self { document, chunk })
+        Ok(Self {
+            document: metadata,
+            chunk,
+        })
     }
-    pub fn provenance(&self) -> &ClassifiedDocument {
+    pub fn provenance(&self) -> &ClassifiedMetadata {
         &self.document
     }
     pub fn model(&self) -> &ModelProfileId {
@@ -485,8 +677,11 @@ impl SearchPart {
     pub fn part(&self) -> &ContentPart {
         &self.0
     }
-    pub fn provenance(&self) -> &ClassifiedDocument {
+    pub fn provenance(&self) -> &ClassifiedMetadata {
         self.0.provenance()
+    }
+    pub fn in_project(&self, project: &FolderRef) -> bool {
+        self.provenance().in_project(project)
     }
 }
 #[derive(Clone, Debug)]
@@ -501,7 +696,7 @@ impl ProviderPart {
     pub fn part(&self) -> &ContentPart {
         &self.part
     }
-    pub fn provenance(&self) -> &ClassifiedDocument {
+    pub fn provenance(&self) -> &ClassifiedMetadata {
         self.part.provenance()
     }
     pub fn provider(&self) -> &ProviderResourceId {
@@ -537,6 +732,8 @@ pub struct CanonicalChatContent {
     text: String,
     digest: ContentDigest,
     project: Option<crate::ids::FolderId>,
+    provenance: Option<ChatProvenance>,
+    group_author: Option<PrincipalId>,
 }
 impl CanonicalChatContent {
     pub fn from_canonical(
@@ -556,7 +753,33 @@ impl CanonicalChatContent {
             text,
             digest,
             project,
+            provenance: None,
+            group_author: None,
         }
+    }
+    pub fn with_provenance(mut self, provenance: Option<ChatProvenance>) -> Self {
+        self.provenance = provenance;
+        self
+    }
+    /// The canonical reader adds this only to a human message in a group chat.
+    pub fn with_group_author(mut self, author: PrincipalId) -> Self {
+        self.group_author = Some(author);
+        self
+    }
+    pub fn digest(&self) -> ContentDigest {
+        self.digest
+    }
+    pub fn origin(&self) -> ProviderOrigin {
+        ProviderOrigin::Chat {
+            space: self.space.id.clone(),
+            thread: self.thread.clone(),
+            entry: self.entry,
+            digest: self.digest,
+            project: self.project.clone(),
+        }
+    }
+    pub fn provenance(&self) -> Option<&ChatProvenance> {
+        self.provenance.as_ref()
     }
 }
 impl fmt::Debug for CanonicalChatContent {
@@ -572,10 +795,13 @@ impl fmt::Debug for CanonicalChatContent {
 pub struct ProviderChatContent {
     entry: CanonicalChatContent,
     provider: ProviderResourceId,
+    rendered_group_message: Option<String>,
 }
 impl ProviderChatContent {
     pub fn text(&self) -> &str {
-        &self.entry.text
+        self.rendered_group_message
+            .as_deref()
+            .unwrap_or(&self.entry.text)
     }
     pub fn provenance(&self) -> &CanonicalChatContent {
         &self.entry
@@ -589,8 +815,17 @@ pub enum ProviderMessage {
     Document(ProviderContent),
     Part(ProviderPart),
     Chat(ProviderChatContent),
-    Ability(ProviderAbilityContent),
+    Ability(Box<ProviderAbilityContent>),
+    SystemAbility(ProviderSystemAbilityContent),
+    Metadata(ProviderMetadataContent),
 }
+/// The class and nearest project at the time a note was read for disclosure.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NoteDisclosurePlacement {
+    pub class: DocClass,
+    pub project: Option<FolderId>,
+}
+
 /// A metadata-only identity for acquiring current canonical egress authority.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ProviderOrigin {
@@ -598,9 +833,14 @@ pub enum ProviderOrigin {
         reference: NoteRef,
         revision: RevisionId,
         digest: ContentDigest,
+        /// Old stored origins can still be read, but cannot match a fresh
+        /// canonical disclosure witness without this placement.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        placement: Option<NoteDisclosurePlacement>,
     },
     Ability {
         reference: AbilityResourceRef,
+        placement: AbilityPlacement,
         digest: ContentDigest,
     },
     Chat {
@@ -610,6 +850,48 @@ pub enum ProviderOrigin {
         digest: ContentDigest,
         project: Option<crate::ids::FolderId>,
     },
+    SystemAbility {
+        ability: AbilityId,
+        revision: RevisionId,
+        digest: ContentDigest,
+    },
+    Folder {
+        history: HistoryScope,
+        reference: FolderRef,
+        revision: RevisionId,
+        digest: ContentDigest,
+    },
+    Space {
+        history: HistoryScope,
+        digest: ContentDigest,
+    },
+    SpaceProjects {
+        history: HistoryScope,
+        digest: ContentDigest,
+    },
+}
+impl ProviderOrigin {
+    pub fn owning_project(&self) -> Option<&FolderRef> {
+        match self {
+            Self::Ability {
+                placement: AbilityPlacement::OwnedProject(project),
+                ..
+            } => Some(project),
+            _ => None,
+        }
+    }
+
+    pub fn space_id(&self) -> Option<&SpaceId> {
+        match self {
+            Self::Note { reference, .. } => Some(&reference.space_id),
+            Self::Ability { reference, .. } => Some(&reference.space),
+            Self::Chat { space, .. } => Some(space),
+            Self::Folder { history, .. }
+            | Self::Space { history, .. }
+            | Self::SpaceProjects { history, .. } => Some(&history.space_id),
+            Self::SystemAbility { .. } => None,
+        }
+    }
 }
 #[derive(Clone, Debug)]
 pub enum ProviderCurrentContent {
@@ -617,8 +899,10 @@ pub enum ProviderCurrentContent {
     Ability {
         reference: AbilityResourceRef,
         digest: ContentDigest,
-        facts: ResourceFacts,
+        provenance: Box<AbilityResourceProvenance>,
         lifecycle: Lifecycle,
+        promoted_from: Option<crate::ports::AbilityRef>,
+        requires_explicit_binding: bool,
     },
     Chat {
         space: Space,
@@ -628,20 +912,48 @@ pub enum ProviderCurrentContent {
         project: Option<crate::ids::FolderId>,
         lifecycle: Lifecycle,
         tainted: bool,
+        provenance: Option<ChatProvenance>,
+        group_author: Option<PrincipalId>,
+    },
+    SystemAbility {
+        ability: AbilityId,
+        revision: RevisionId,
+        digest: ContentDigest,
+    },
+    Folder {
+        history: HistoryScope,
+        reference: FolderRef,
+        revision: RevisionId,
+        digest: ContentDigest,
+        space: Space,
+        lifecycle: Lifecycle,
+        ancestor_folders: Vec<FolderId>,
+    },
+    Space {
+        history: HistoryScope,
+        digest: ContentDigest,
+        space: Space,
+        root: FolderId,
+    },
+    SpaceProjects {
+        history: HistoryScope,
+        digest: ContentDigest,
+        space: Space,
+        root: FolderId,
     },
 }
 impl ProviderCurrentContent {
     pub fn origin(&self) -> ProviderOrigin {
         match self {
-            Self::Note(value) => ProviderOrigin::Note {
-                reference: value.reference.clone(),
-                revision: value.revision.clone(),
-                digest: value.digest,
-            },
+            Self::Note(value) => value.origin(),
             Self::Ability {
-                reference, digest, ..
+                reference,
+                provenance,
+                digest,
+                ..
             } => ProviderOrigin::Ability {
                 reference: reference.clone(),
+                placement: provenance.current.placement.clone(),
                 digest: *digest,
             },
             Self::Chat {
@@ -658,26 +970,87 @@ impl ProviderCurrentContent {
                 digest: *digest,
                 project: project.clone(),
             },
+            Self::SystemAbility {
+                ability,
+                revision,
+                digest,
+            } => ProviderOrigin::SystemAbility {
+                ability: ability.clone(),
+                revision: revision.clone(),
+                digest: *digest,
+            },
+            Self::Folder {
+                history,
+                reference,
+                revision,
+                digest,
+                ..
+            } => ProviderOrigin::Folder {
+                history: history.clone(),
+                reference: reference.clone(),
+                revision: revision.clone(),
+                digest: *digest,
+            },
+            Self::Space {
+                history, digest, ..
+            } => ProviderOrigin::Space {
+                history: history.clone(),
+                digest: *digest,
+            },
+            Self::SpaceProjects {
+                history, digest, ..
+            } => ProviderOrigin::SpaceProjects {
+                history: history.clone(),
+                digest: *digest,
+            },
         }
     }
-    pub fn space(&self) -> &Space {
+    pub fn space(&self) -> Option<&Space> {
         match self {
-            Self::Note(value) => &value.facts.recorded.space,
-            Self::Ability { facts, .. } => &facts.space,
-            Self::Chat { space, .. } => space,
+            Self::Note(value) => Some(&value.facts.recorded.space),
+            Self::Ability { provenance, .. } => Some(&provenance.current.facts.space),
+            Self::Chat { space, .. }
+            | Self::Folder { space, .. }
+            | Self::Space { space, .. }
+            | Self::SpaceProjects { space, .. } => Some(space),
+            Self::SystemAbility { .. } => None,
         }
     }
     /// Project-only consent is usable only with current canonical placement.
     pub fn in_project(&self, project: &crate::model::FolderRef) -> bool {
-        if self.space().id != project.space_id {
-            return false;
-        }
         match self {
-            Self::Note(value) => value.facts.in_project(project),
-            Self::Ability { facts, .. } => facts.ancestor_folders.contains(&project.folder_id),
+            Self::Note(value) => value.in_project(project),
+            Self::Ability {
+                provenance,
+                promoted_from,
+                ..
+            } => {
+                provenance.in_project(project)
+                    && promoted_from
+                        .as_ref()
+                        .is_none_or(|prev| prev.placement.in_project(project))
+            }
             Self::Chat {
-                project: current, ..
-            } => current.as_ref() == Some(&project.folder_id),
+                space,
+                project: current,
+                ..
+            } => space.id == project.space_id && current.as_ref() == Some(&project.folder_id),
+            Self::Folder {
+                reference,
+                ancestor_folders,
+                ..
+            } => {
+                reference.space_id == project.space_id
+                    && (reference == project || ancestor_folders.contains(&project.folder_id))
+            }
+            Self::SystemAbility { .. } => true,
+            Self::Space { .. } | Self::SpaceProjects { .. } => false,
+        }
+    }
+    pub fn provenance(&self) -> Option<&ChatProvenance> {
+        match self {
+            Self::Chat { provenance, .. } => provenance.as_ref(),
+            _ => None,
         }
     }
 }
@@ -685,39 +1058,26 @@ impl ProviderMessage {
     /// Scope of the content as admitted, retained until dispatch even if a note moves.
     pub fn in_project(&self, project: &crate::model::FolderRef) -> bool {
         match self {
-            Self::Document(value) => value.provenance().facts.in_project(project),
-            Self::Part(value) => value.provenance().facts.in_project(project),
-            Self::Ability(value) => {
-                let facts = &value.resource.facts;
-                facts.space.id == project.space_id
-                    && facts.ancestor_folders.contains(&project.folder_id)
-            }
+            Self::Document(value) => value.provenance().in_project(project),
+            Self::Part(value) => value.provenance().in_project(project),
+            Self::Ability(value) => value.resource.in_project(project),
             Self::Chat(value) => {
                 value.entry.space.id == project.space_id
                     && value.entry.project.as_ref() == Some(&project.folder_id)
             }
+            Self::SystemAbility(_) => true,
+            Self::Metadata(value) => value.content.current.in_project(project),
         }
     }
 
     pub fn origin(&self) -> ProviderOrigin {
         match self {
-            Self::Document(value) => {
-                ProviderCurrentContent::Note(value.provenance().metadata()).origin()
-            }
-            Self::Part(value) => {
-                ProviderCurrentContent::Note(value.part().provenance().metadata()).origin()
-            }
-            Self::Ability(value) => ProviderOrigin::Ability {
-                reference: value.resource.reference.clone(),
-                digest: value.resource.digest,
-            },
-            Self::Chat(value) => ProviderOrigin::Chat {
-                space: value.entry.space.id.clone(),
-                thread: value.entry.thread.clone(),
-                entry: value.entry.entry,
-                digest: value.entry.digest,
-                project: value.entry.project.clone(),
-            },
+            Self::Document(value) => value.provenance().origin(),
+            Self::Part(value) => value.provenance().origin(),
+            Self::Ability(value) => value.resource.origin(),
+            Self::Chat(value) => value.entry.origin(),
+            Self::SystemAbility(value) => value.content.origin(),
+            Self::Metadata(value) => value.content.current.origin(),
         }
     }
     pub fn text(&self) -> &str {
@@ -726,6 +1086,8 @@ impl ProviderMessage {
             Self::Part(value) => value.text(),
             Self::Chat(value) => value.text(),
             Self::Ability(value) => value.text(),
+            Self::SystemAbility(value) => value.text(),
+            Self::Metadata(value) => &value.content.text,
         }
     }
     pub fn provider(&self) -> &ProviderResourceId {
@@ -734,6 +1096,14 @@ impl ProviderMessage {
             Self::Part(value) => value.provider(),
             Self::Chat(value) => value.provider(),
             Self::Ability(value) => value.provider(),
+            Self::SystemAbility(value) => value.provider(),
+            Self::Metadata(value) => &value.provider,
+        }
+    }
+    pub fn provenance(&self) -> Option<&ChatProvenance> {
+        match self {
+            Self::Chat(value) => value.entry.provenance(),
+            _ => None,
         }
     }
 }
@@ -753,7 +1123,327 @@ impl ProviderAbilityContent {
         &self.provider
     }
 }
+
+/// An immutable package shipped with the application. The catalog verifies
+/// the revision and digest against the shipped inventory again at dispatch.
+#[derive(Clone)]
+pub struct SystemAbilityContent {
+    ability: AbilityId,
+    revision: RevisionId,
+    digest: ContentDigest,
+    text: &'static str,
+}
+
+impl SystemAbilityContent {
+    pub fn new(
+        ability: AbilityId,
+        revision: RevisionId,
+        digest: ContentDigest,
+        text: &'static str,
+    ) -> DomainResult<Self> {
+        if text.len() > 256 * 1024 || text.contains('\0') {
+            return Err(DomainError::validation(ValidationReason::InvalidLimit));
+        }
+        Ok(Self {
+            ability,
+            revision,
+            digest,
+            text,
+        })
+    }
+
+    pub fn text(&self) -> &'static str {
+        self.text
+    }
+
+    pub fn origin(&self) -> ProviderOrigin {
+        ProviderOrigin::SystemAbility {
+            ability: self.ability.clone(),
+            revision: self.revision.clone(),
+            digest: self.digest,
+        }
+    }
+}
+
+impl fmt::Debug for SystemAbilityContent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SystemAbilityContent")
+            .field("ability", &self.ability)
+            .field("revision", &self.revision)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ProviderSystemAbilityContent {
+    content: SystemAbilityContent,
+    provider: ProviderResourceId,
+}
+
+impl ProviderSystemAbilityContent {
+    pub fn text(&self) -> &str {
+        self.content.text()
+    }
+    pub fn provider(&self) -> &ProviderResourceId {
+        &self.provider
+    }
+}
+
+/// Folder and space metadata owned by the canonical catalog.
+#[derive(Clone)]
+pub struct CanonicalMetadataContent {
+    current: ProviderCurrentContent,
+    text: String,
+}
+
+impl CanonicalMetadataContent {
+    pub fn from_canonical(current: ProviderCurrentContent, text: String) -> DomainResult<Self> {
+        match current {
+            ProviderCurrentContent::Folder { .. }
+            | ProviderCurrentContent::Space { .. }
+            | ProviderCurrentContent::SpaceProjects { .. } => Ok(Self { current, text }),
+            _ => Err(DomainError::validation(ValidationReason::SourceMismatch)),
+        }
+    }
+
+    pub fn current(&self) -> &ProviderCurrentContent {
+        &self.current
+    }
+}
+
+impl fmt::Debug for CanonicalMetadataContent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CanonicalMetadataContent")
+            .field("origin", &self.current.origin())
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ProviderMetadataContent {
+    content: CanonicalMetadataContent,
+    provider: ProviderResourceId,
+}
+
 impl ClassEgressFence {
+    pub fn mcp_note<'a>(
+        document: &'a ClassifiedDocument,
+        auth: &EngineAuthContext,
+    ) -> DomainResult<&'a str> {
+        Self::check(document, auth)?;
+        Ok(&document.content)
+    }
+
+    pub fn provider_note_metadata(
+        metadata: &ClassifiedMetadata,
+        auth: &EngineAuthContext,
+        policy: &ProviderPolicy,
+    ) -> DomainResult<ProviderOrigin> {
+        metadata
+            .facts
+            .allow_egress_preflight(metadata.lifecycle, auth)?;
+        metadata.facts.allow_provider(policy)?;
+        metadata.facts.allow_egress(metadata.lifecycle, auth)?;
+        Ok(metadata.origin())
+    }
+
+    /// Untainted policy and visibility preflight for search candidate admission;
+    /// final delivery still marks cross-space taint via `provider_note_metadata`
+    /// or `provider_part`.
+    pub fn provider_note_metadata_preflight(
+        metadata: &ClassifiedMetadata,
+        auth: &EngineAuthContext,
+        policy: &ProviderPolicy,
+    ) -> DomainResult<ProviderOrigin> {
+        metadata
+            .facts
+            .allow_egress_preflight(metadata.lifecycle, auth)?;
+        metadata.facts.allow_provider(policy)?;
+        Ok(metadata.origin())
+    }
+
+    pub fn mcp_note_metadata(
+        metadata: &ClassifiedMetadata,
+        auth: &EngineAuthContext,
+    ) -> DomainResult<ProviderOrigin> {
+        metadata.facts.allow_egress(metadata.lifecycle, auth)?;
+        Ok(metadata.origin())
+    }
+
+    pub fn mcp_ability<'a>(
+        resource: &'a ClassifiedAbilityResource,
+        auth: &EngineAuthContext,
+    ) -> DomainResult<&'a str> {
+        Self::check_ability_resource(resource, auth)?;
+        Ok(&resource.content)
+    }
+
+    pub fn chat_transcript<'a>(
+        entry: &'a CanonicalChatContent,
+        auth: &EngineAuthContext,
+    ) -> DomainResult<&'a str> {
+        auth.authorize_chat_read(&entry.space, entry.project.as_ref(), entry.tainted)?;
+        Ok(&entry.text)
+    }
+
+    pub fn system_ability(
+        content: SystemAbilityContent,
+        policy: &ProviderPolicy,
+    ) -> DomainResult<ProviderSystemAbilityContent> {
+        Self::check_system_policy(policy)?;
+        Ok(ProviderSystemAbilityContent {
+            content,
+            provider: policy.provider.clone(),
+        })
+    }
+
+    pub fn mcp_metadata<'a>(
+        content: &'a CanonicalMetadataContent,
+        auth: &EngineAuthContext,
+    ) -> DomainResult<&'a str> {
+        Self::authorize_metadata(&content.current, auth)?;
+        Ok(&content.text)
+    }
+
+    pub fn provider_metadata(
+        content: CanonicalMetadataContent,
+        auth: &EngineAuthContext,
+        policy: &ProviderPolicy,
+    ) -> DomainResult<ProviderMetadataContent> {
+        Self::revalidate_origin(auth, policy, &content.current)?;
+        Ok(ProviderMetadataContent {
+            content,
+            provider: policy.provider.clone(),
+        })
+    }
+
+    fn check_system_policy(policy: &ProviderPolicy) -> DomainResult<()> {
+        if !policy.allowed_classes.contains(&DocClass::Skill) {
+            return Err(DomainError::validation(
+                ValidationReason::ClassEgressForbidden,
+            ));
+        }
+        Self::authorize_audience(None, &policy.audience)
+    }
+
+    fn can_view_metadata(
+        current: &ProviderCurrentContent,
+        auth: &EngineAuthContext,
+    ) -> DomainResult<()> {
+        match current {
+            ProviderCurrentContent::Folder {
+                history,
+                reference,
+                space,
+                lifecycle,
+                ancestor_folders,
+                ..
+            } if history.space_id == reference.space_id
+                && reference.space_id == space.id
+                && *lifecycle == Lifecycle::Active =>
+            {
+                auth.can_view_folder(space, &reference.folder_id, ancestor_folders)
+            }
+            ProviderCurrentContent::Space {
+                history,
+                space,
+                root,
+                ..
+            }
+            | ProviderCurrentContent::SpaceProjects {
+                history,
+                space,
+                root,
+                ..
+            } if history.space_id == space.id => auth.can_view_folder(space, root, &[]),
+            _ => Err(DomainError::ResourceNotFound),
+        }
+    }
+
+    fn authorize_metadata(
+        current: &ProviderCurrentContent,
+        auth: &EngineAuthContext,
+    ) -> DomainResult<()> {
+        match current {
+            ProviderCurrentContent::Folder {
+                history,
+                reference,
+                space,
+                lifecycle,
+                ancestor_folders,
+                ..
+            } if history.space_id == reference.space_id
+                && reference.space_id == space.id
+                && *lifecycle == Lifecycle::Active =>
+            {
+                auth.authorize_folder_read(space, &reference.folder_id, ancestor_folders)
+            }
+            ProviderCurrentContent::Space {
+                history,
+                space,
+                root,
+                ..
+            }
+            | ProviderCurrentContent::SpaceProjects {
+                history,
+                space,
+                root,
+                ..
+            } if history.space_id == space.id => auth.authorize_folder_read(space, root, &[]),
+            _ => Err(DomainError::ResourceNotFound),
+        }
+    }
+
+    /// Recheck an origin used by a persisted derivative, including when no
+    /// original bytes from this source occur verbatim in the next prompt.
+    pub fn revalidate_origin(
+        auth: &EngineAuthContext,
+        policy: &ProviderPolicy,
+        current: &ProviderCurrentContent,
+    ) -> DomainResult<()> {
+        match current {
+            ProviderCurrentContent::Note(value) => {
+                value.facts.allow_egress_preflight(value.lifecycle, auth)?;
+                value.facts.allow_provider(policy)?;
+                value.facts.allow_egress(value.lifecycle, auth)
+            }
+            ProviderCurrentContent::Ability {
+                reference,
+                provenance,
+                lifecycle,
+                ..
+            } => {
+                if *lifecycle != Lifecycle::Active {
+                    return Err(DomainError::ResourceNotFound);
+                }
+                provenance.validate(reference)?;
+                provenance.can_view(auth)?;
+                Self::ability_provider_policy(provenance, policy)?;
+                provenance.authorize(auth)
+            }
+            ProviderCurrentContent::Chat {
+                space,
+                project,
+                lifecycle,
+                tainted,
+                ..
+            } => {
+                if *lifecycle != Lifecycle::Active {
+                    return Err(DomainError::ResourceNotFound);
+                }
+                Self::check_chat(space, project.as_ref(), *tainted, auth, policy)
+            }
+            ProviderCurrentContent::SystemAbility { .. } => Self::check_system_policy(policy),
+            ProviderCurrentContent::Folder { space, .. }
+            | ProviderCurrentContent::Space { space, .. }
+            | ProviderCurrentContent::SpaceProjects { space, .. } => {
+                Self::can_view_metadata(current, auth)?;
+                Self::authorize_audience(Some(space), &policy.audience)?;
+                Self::authorize_metadata(current, auth)
+            }
+        }
+    }
+
     /// The caller holds a canonical egress lease and dispatch registration,
     /// and supplies freshly verified control authority and disclosure consent.
     pub fn revalidate(
@@ -770,25 +1460,7 @@ impl ClassEgressFence {
                 Self::revalidate_note(original.provenance(), value, auth, policy)
             }
             (ProviderMessage::Part(original), ProviderCurrentContent::Note(value)) => {
-                Self::revalidate_note(original.provenance(), value, auth, policy)
-            }
-            (
-                ProviderMessage::Ability(_),
-                ProviderCurrentContent::Ability {
-                    reference,
-                    facts,
-                    lifecycle,
-                    ..
-                },
-            ) => {
-                Self::check_metadata(facts, *lifecycle, auth)?;
-                if facts.class != DocClass::Skill
-                    || facts.ability_package.as_ref() != Some(&reference.ability)
-                    || facts.space.id != reference.space
-                {
-                    return Err(DomainError::validation(ValidationReason::ClassMismatch));
-                }
-                Self::provider_policy(&facts.space, facts.class, policy)
+                Self::revalidate_note_metadata(original.provenance(), value, auth, policy)
             }
             (
                 ProviderMessage::Chat(value),
@@ -797,11 +1469,18 @@ impl ClassEgressFence {
                     project,
                     lifecycle,
                     tainted,
+                    group_author,
+                    provenance,
                     ..
                 },
             ) => {
                 if *lifecycle != Lifecycle::Active {
                     return Err(DomainError::ResourceNotFound);
+                }
+                if &value.entry.group_author != group_author
+                    || &value.entry.provenance != provenance
+                {
+                    return Err(DomainError::validation(ValidationReason::SourceMismatch));
                 }
                 Self::check_chat(
                     space,
@@ -811,6 +1490,14 @@ impl ClassEgressFence {
                     policy,
                 )
             }
+            (ProviderMessage::Ability(_), ProviderCurrentContent::Ability { .. })
+            | (ProviderMessage::SystemAbility(_), ProviderCurrentContent::SystemAbility { .. })
+            | (
+                ProviderMessage::Metadata(_),
+                ProviderCurrentContent::Folder { .. }
+                | ProviderCurrentContent::Space { .. }
+                | ProviderCurrentContent::SpaceProjects { .. },
+            ) => Self::revalidate_origin(auth, policy, current),
             _ => Err(DomainError::validation(ValidationReason::SourceMismatch)),
         }
     }
@@ -820,14 +1507,39 @@ impl ClassEgressFence {
         auth: &EngineAuthContext,
         policy: &ProviderPolicy,
     ) -> DomainResult<()> {
-        Self::check(original, auth)?;
+        original
+            .facts
+            .allow_egress_preflight(original.lifecycle, auth)?;
         original.facts.allow_provider(policy)?;
-        current.facts.allow_egress(current.lifecycle, auth)?;
-        current.facts.allow_provider(policy)
+        current
+            .facts
+            .allow_egress_preflight(current.lifecycle, auth)?;
+        current.facts.allow_provider(policy)?;
+        Self::check(original, auth)?;
+        current.facts.allow_egress(current.lifecycle, auth)
+    }
+    fn revalidate_note_metadata(
+        original: &ClassifiedMetadata,
+        current: &ClassifiedMetadata,
+        auth: &EngineAuthContext,
+        policy: &ProviderPolicy,
+    ) -> DomainResult<()> {
+        original
+            .facts
+            .allow_egress_preflight(original.lifecycle, auth)?;
+        original.facts.allow_provider(policy)?;
+        current
+            .facts
+            .allow_egress_preflight(current.lifecycle, auth)?;
+        current.facts.allow_provider(policy)?;
+        original.facts.allow_egress(original.lifecycle, auth)?;
+        current.facts.allow_egress(current.lifecycle, auth)
     }
 
     pub fn search_part(part: ContentPart, auth: &EngineAuthContext) -> DomainResult<SearchPart> {
-        Self::check(part.provenance(), auth)?;
+        part.document
+            .facts
+            .allow_egress(part.document.lifecycle, auth)?;
         Ok(SearchPart(part))
     }
     pub fn provider_part(
@@ -835,8 +1547,13 @@ impl ClassEgressFence {
         auth: &EngineAuthContext,
         policy: &ProviderPolicy,
     ) -> DomainResult<ProviderPart> {
-        Self::check(part.provenance(), auth)?;
+        part.document
+            .facts
+            .allow_egress_preflight(part.document.lifecycle, auth)?;
         part.document.facts.allow_provider(policy)?;
+        part.document
+            .facts
+            .allow_egress(part.document.lifecycle, auth)?;
         Ok(ProviderPart {
             part,
             provider: policy.provider.clone(),
@@ -850,11 +1567,29 @@ impl ClassEgressFence {
         if resource.lifecycle != Lifecycle::Active {
             return Err(DomainError::ResourceNotFound);
         }
-        auth.authorize_read(&resource.facts)?;
-        Self::provider_policy(&resource.facts.space, DocClass::Skill, policy)?;
+        resource.provenance.can_view(auth)?;
+        Self::ability_provider_policy(&resource.provenance, policy)?;
+        Self::check_ability_resource(&resource, auth)?;
         Ok(ProviderAbilityContent {
             resource,
             provider: policy.provider.clone(),
+        })
+    }
+    fn check_ability_resource(
+        resource: &ClassifiedAbilityResource,
+        auth: &EngineAuthContext,
+    ) -> DomainResult<()> {
+        if resource.lifecycle != Lifecycle::Active {
+            return Err(DomainError::ResourceNotFound);
+        }
+        resource.provenance.authorize(auth)
+    }
+    fn ability_provider_policy(
+        provenance: &AbilityResourceProvenance,
+        policy: &ProviderPolicy,
+    ) -> DomainResult<()> {
+        provenance.locations().into_iter().try_for_each(|location| {
+            Self::provider_policy(&location.facts.space, DocClass::Skill, policy)
         })
     }
     pub fn chat(
@@ -870,6 +1605,12 @@ impl ClassEgressFence {
             policy,
         )?;
         Ok(ProviderChatContent {
+            rendered_group_message: entry.group_author.as_ref().map(|author| {
+                let text = entry.text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+                format!(
+                    "<group_participant_message author=\"{author}\" trusted_instructions=\"false\">{text}</group_participant_message>"
+                )
+            }),
             entry,
             provider: policy.provider.clone(),
         })
@@ -881,7 +1622,7 @@ impl ClassEgressFence {
         auth: &EngineAuthContext,
         policy: &ProviderPolicy,
     ) -> DomainResult<()> {
-        auth.authorize_chat_read(current, project, tainted)?;
+        auth.can_view_chat(current, project, tainted)?;
         let permitted = match &policy.audience {
             ProviderAudience::Personal { consented } => {
                 *consented && current.kind == SpaceKind::Personal
@@ -904,31 +1645,29 @@ impl ClassEgressFence {
                 ValidationReason::ProviderConsentRequired,
             ));
         }
+        auth.mark_chat_read_taint(current, tainted);
         Ok(())
     }
     fn check(document: &ClassifiedDocument, auth: &EngineAuthContext) -> DomainResult<()> {
         document.facts.allow_egress(document.lifecycle, auth)
-    }
-    fn check_metadata(
-        facts: &ResourceFacts,
-        lifecycle: Lifecycle,
-        auth: &EngineAuthContext,
-    ) -> DomainResult<()> {
-        if facts.class == DocClass::EncryptedNote {
-            return Err(DomainError::validation(
-                ValidationReason::ClassEgressForbidden,
-            ));
-        }
-        if lifecycle != Lifecycle::Active {
-            return Err(DomainError::ResourceNotFound);
-        }
-        auth.authorize_read(facts)
     }
     pub fn search_metadata(
         document: ClassifiedMetadata,
         auth: &EngineAuthContext,
     ) -> DomainResult<SearchMetadata> {
         document.facts.allow_egress(document.lifecycle, auth)?;
+        Ok(SearchMetadata(document))
+    }
+    /// Untainted candidate metadata check used for search preflight before
+    /// live-visibility filtering, hydration, and packing so rejected or
+    /// packed-out hits do not flip cross-space `BranchTaint`. Final result
+    /// admission commits taint via `search_metadata` only on surviving hits.
+    pub fn search_preflight(
+        document: ClassifiedMetadata,
+        auth: &EngineAuthContext,
+    ) -> DomainResult<SearchMetadata> {
+        document.facts.check_egress(document.lifecycle)?;
+        document.facts.can_view(auth)?;
         Ok(SearchMetadata(document))
     }
     pub fn projection(
@@ -958,8 +1697,11 @@ impl ClassEgressFence {
         auth: &EngineAuthContext,
         policy: &ProviderPolicy,
     ) -> DomainResult<ProviderContent> {
-        Self::check(&document, auth)?;
+        document
+            .facts
+            .allow_egress_preflight(document.lifecycle, auth)?;
         document.facts.allow_provider(policy)?;
+        Self::check(&document, auth)?;
         Ok(ProviderContent {
             document,
             provider: policy.provider.clone(),
@@ -975,9 +1717,18 @@ impl ClassEgressFence {
                 ValidationReason::ClassEgressForbidden,
             ));
         }
-        let permitted = match &policy.audience {
+        if class == DocClass::Profile && matches!(policy.audience, ProviderAudience::Shared { .. })
+        {
+            return Err(DomainError::validation(
+                ValidationReason::ProviderConsentRequired,
+            ));
+        }
+        Self::authorize_audience(Some(space), &policy.audience)
+    }
+    fn authorize_audience(space: Option<&Space>, audience: &ProviderAudience) -> DomainResult<()> {
+        let permitted = match audience {
             ProviderAudience::Personal { consented } => {
-                *consented && space.kind == SpaceKind::Personal
+                *consented && space.is_none_or(|value| value.kind == SpaceKind::Personal)
             }
             ProviderAudience::Shared {
                 space: attached_space,
@@ -988,8 +1739,7 @@ impl ClassEgressFence {
                 *attached
                     && *space_consented
                     && *sender_consented
-                    && attached_space == &space.id
-                    && class != DocClass::Profile
+                    && space.is_none_or(|value| attached_space == &value.id)
             }
         };
         if !permitted {
@@ -1011,4 +1761,151 @@ pub fn authorize_field_key(key: &str) -> DomainResult<()> {
     } else {
         Ok(())
     }
+}
+
+#[cfg(test)]
+#[test]
+fn content_part_releases_full_document_arc_immediately() {
+    let space = Space {
+        id: SpaceId::from_bytes([1; 16]),
+        kind: SpaceKind::Personal,
+        lifecycle: crate::auth::SpaceLifecycle::Active,
+    };
+    let reference = NoteRef {
+        space_id: space.id.clone(),
+        note_id: crate::ids::NoteId::from_bytes([2; 16]),
+    };
+    let text = format!("# Title\n\n{}\n", "a".repeat(65_536));
+    let digest = ContentDigest::from_bytes([7; 32]);
+    let doc = Arc::new(
+        ClassifiedDocument::from_canonical(
+            reference.clone(),
+            RevisionId::from_bytes([3; 16]),
+            ResourceFacts {
+                space,
+                class: DocClass::UserDoc,
+                project: None,
+                ancestor_folders: vec![FolderId::from_bytes([4; 16])],
+                folder_write_locked: false,
+                ability_package: None,
+            },
+            Lifecycle::Active,
+            text,
+            digest,
+        )
+        .unwrap(),
+    );
+    let span = ByteSpan::new(0, 7).unwrap();
+    let chunk = ChunkDescriptor {
+        key: ContentDigest::from_bytes([5; 32]),
+        source: digest,
+        model: ModelProfileId::from_bytes([6; 16]),
+        tokens: 2,
+        context: Vec::new(),
+        spans: vec![span],
+        text: "# Title".to_owned(),
+    };
+    let part = ContentPart::from_chunk(Arc::clone(&doc), chunk).unwrap();
+    assert_eq!(
+        Arc::strong_count(&doc),
+        1,
+        "ContentPart must drop the full ClassifiedDocument Arc immediately after verification"
+    );
+    assert_eq!(part.provenance().reference(), &reference);
+}
+
+#[cfg(test)]
+#[test]
+fn content_part_from_chunk_shared_rejects_metadata_facts_or_lifecycle_mismatch() {
+    let space = Space {
+        id: SpaceId::from_bytes([1; 16]),
+        kind: SpaceKind::Personal,
+        lifecycle: crate::auth::SpaceLifecycle::Active,
+    };
+    let reference = NoteRef {
+        space_id: space.id.clone(),
+        note_id: crate::ids::NoteId::from_bytes([2; 16]),
+    };
+    let revision = RevisionId::from_bytes([3; 16]);
+    let digest = ContentDigest::from_bytes([7; 32]);
+    let recorded = ResourceFacts {
+        space: space.clone(),
+        class: DocClass::UserDoc,
+        project: None,
+        ancestor_folders: vec![FolderId::from_bytes([4; 16])],
+        folder_write_locked: false,
+        ability_package: None,
+    };
+    let doc = ClassifiedDocument::from_canonical(
+        reference.clone(),
+        revision.clone(),
+        recorded.clone(),
+        Lifecycle::Active,
+        "# Title\n".to_owned(),
+        digest,
+    )
+    .unwrap();
+    let chunk = ChunkDescriptor {
+        key: ContentDigest::from_bytes([5; 32]),
+        source: digest,
+        model: ModelProfileId::from_bytes([6; 16]),
+        tokens: 2,
+        context: Vec::new(),
+        spans: vec![ByteSpan::new(0, 7).unwrap()],
+        text: "# Title".to_owned(),
+    };
+
+    // Lifecycle mismatch must be rejected.
+    let trashed_meta = Arc::new(
+        ClassifiedDocument::from_canonical(
+            reference.clone(),
+            revision.clone(),
+            recorded.clone(),
+            Lifecycle::Trashed,
+            "# Title\n".to_owned(),
+            digest,
+        )
+        .unwrap()
+        .metadata(),
+    );
+    assert!(matches!(
+        ContentPart::from_chunk_shared(&doc, trashed_meta, chunk.clone()),
+        Err(DomainError::ValidationFailed { diagnostic })
+            if diagnostic.reason == ValidationReason::SourceMismatch
+    ));
+
+    // Recorded ResourceFacts mismatch must be rejected.
+    let mut locked_facts = recorded.clone();
+    locked_facts.folder_write_locked = true;
+    let locked_meta = Arc::new(
+        ClassifiedDocument::from_canonical(
+            reference.clone(),
+            revision.clone(),
+            locked_facts,
+            Lifecycle::Active,
+            "# Title\n".to_owned(),
+            digest,
+        )
+        .unwrap()
+        .metadata(),
+    );
+    assert!(matches!(
+        ContentPart::from_chunk_shared(&doc, locked_meta, chunk.clone()),
+        Err(DomainError::ValidationFailed { diagnostic })
+            if diagnostic.reason == ValidationReason::SourceMismatch
+    ));
+
+    // Bound current-placement mismatch must be rejected.
+    let mut moved_facts = recorded;
+    moved_facts.class = DocClass::Skill;
+    let mut bound_doc = doc.clone();
+    bound_doc
+        .bind_current(moved_facts, Lifecycle::Active)
+        .unwrap();
+    let unbound_meta = Arc::new(doc.metadata());
+    assert!(matches!(
+        ContentPart::from_chunk_shared(&bound_doc, unbound_meta, chunk),
+        Err(DomainError::ValidationFailed { diagnostic })
+            if diagnostic.reason == ValidationReason::SourceMismatch
+    ));
 }

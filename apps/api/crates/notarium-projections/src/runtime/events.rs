@@ -1039,7 +1039,11 @@ fn admitted_seq(engine: &ProjectionEngine, scope: &HistoryScope) -> Option<Space
 }
 
 fn has_full_space_access(ctx: &SpaceContext) -> bool {
-    ctx.auth()
+    !matches!(
+        ctx.auth().kind(),
+        notarium_core::auth::PrincipalKind::Keeper(_)
+    ) && ctx
+        .auth()
         .spaces()
         .get(&ctx.scope().space_id)
         .is_some_and(|grant| grant.project_root.is_none() && grant.read_classes == DocClass::all())

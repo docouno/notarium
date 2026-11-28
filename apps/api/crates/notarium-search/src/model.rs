@@ -220,12 +220,14 @@ impl Embedder {
         self.tokenizer.as_ref()
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn query(
         &self,
         services: &Arc<Services>,
         mut ctx: SpaceContext,
         query: &SearchQuery,
         classes: BTreeSet<DocClass>,
+        source_classes: Option<BTreeSet<DocClass>>,
         project_scope: Option<FolderRef>,
         requested: &ResolvedEmbeddingTarget,
     ) -> Result<QuantizedVector, EmbeddingError> {
@@ -269,7 +271,7 @@ impl Embedder {
                             ctx.budget.remaining =
                                 ctx.budget.remaining.saturating_sub(started.elapsed());
                             backend
-                                .query(
+                                .query_with_sources(
                                     ctx,
                                     EmbeddingQueryInput {
                                         text,
@@ -278,6 +280,7 @@ impl Embedder {
                                         project_scope,
                                         folder,
                                     },
+                                    source_classes,
                                     implicit,
                                 )
                                 .await

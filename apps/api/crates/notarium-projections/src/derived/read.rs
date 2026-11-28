@@ -109,7 +109,22 @@ impl DerivedStore {
         folder: &FolderId,
         path: &str,
     ) -> Result<Vec<FolderId>, PortError> {
+        self.active_descendants_of_kind(scope, cut, folder, path, false)
+            .await
+    }
+
+    pub(crate) async fn active_descendants_of_kind(
+        &self,
+        scope: &HistoryScope,
+        cut: SpaceSeq,
+        folder: &FolderId,
+        path: &str,
+        projects_only: bool,
+    ) -> Result<Vec<FolderId>, PortError> {
         let mut filter = "norm_path_prefix IS NOT NULL AND folder_id <> ?".to_owned();
+        if projects_only {
+            filter.push_str(" AND is_project = 1");
+        }
         let mut args = vec![value(folder)];
         if !path.is_empty() {
             let lower = format!("{path}/");

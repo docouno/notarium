@@ -33,6 +33,10 @@ CREATE TABLE IF NOT EXISTS spaces (
 CREATE UNIQUE INDEX IF NOT EXISTS uq_spaces_slug_fold
     ON spaces (slug_fold);
 
+CREATE INDEX IF NOT EXISTS idx_spaces_personal_owner
+    ON spaces (owner_id)
+    WHERE space_kind = 'personal' AND lifecycle_state = 'active';
+
 CREATE TABLE IF NOT EXISTS folder_heads (
     space_id TEXT NOT NULL,
     folder_id TEXT NOT NULL,
@@ -86,6 +90,13 @@ CREATE INDEX IF NOT EXISTS idx_folder_heads_cover
     ON folder_heads (space_id, cover_note_id)
     WHERE cover_note_id IS NOT NULL;
 
+CREATE INDEX IF NOT EXISTS idx_folder_heads_active_projects_id
+    ON folder_heads (space_id, folder_id)
+    WHERE lifecycle_state = 'active' AND is_project = 1;
+
+CREATE INDEX IF NOT EXISTS idx_folder_heads_space_updated
+    ON folder_heads (space_id, updated_seq);
+
 CREATE TABLE IF NOT EXISTS folder_aliases (
     space_id TEXT NOT NULL,
     old_parent_folder_id TEXT NOT NULL,
@@ -102,6 +113,9 @@ CREATE INDEX IF NOT EXISTS idx_folder_aliases_lookup
 
 CREATE INDEX IF NOT EXISTS idx_folder_aliases_projection_seq
     ON folder_aliases (space_id, created_seq);
+
+CREATE INDEX IF NOT EXISTS idx_folder_aliases_parent_seq
+    ON folder_aliases (space_id, old_parent_folder_id, created_seq);
 
 CREATE TABLE IF NOT EXISTS note_heads (
     space_id TEXT NOT NULL,
@@ -144,6 +158,13 @@ CREATE INDEX IF NOT EXISTS idx_note_heads_parent_lifecycle
 
 CREATE INDEX IF NOT EXISTS idx_note_heads_created_seq
     ON note_heads (space_id, created_seq, note_id);
+
+CREATE INDEX IF NOT EXISTS idx_note_heads_keyset
+    ON note_heads (space_id, note_id, created_seq);
+
+CREATE INDEX IF NOT EXISTS idx_note_heads_space_title_fold
+    ON note_heads (space_id, parent_folder_id, substr(title_fold, 1, 256), note_id)
+    WHERE lifecycle_state = 'active';
 
 CREATE TABLE IF NOT EXISTS note_aliases (
     space_id TEXT NOT NULL,
@@ -252,6 +273,9 @@ CREATE TABLE IF NOT EXISTS revision_purge_fences (
     FOREIGN KEY (space_id) REFERENCES spaces (space_id)
 );
 
+CREATE INDEX IF NOT EXISTS idx_revision_purge_fences_seq
+    ON revision_purge_fences (space_id, history_incarnation, purge_seq);
+
 CREATE TABLE IF NOT EXISTS ability_packages (
     space_id TEXT NOT NULL,
     ability_id TEXT NOT NULL,
@@ -267,12 +291,20 @@ CREATE TABLE IF NOT EXISTS ability_packages (
     FOREIGN KEY (space_id, entrypoint_note_id) REFERENCES note_heads (space_id, note_id)
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS uq_ability_packages_active_slug
-    ON ability_packages (space_id, slug_fold)
+CREATE INDEX IF NOT EXISTS idx_ability_packages_active_slug
+    ON ability_packages (space_id, slug_fold, ability_id)
     WHERE lifecycle_state = 'active';
 
 CREATE INDEX IF NOT EXISTS idx_ability_packages_entrypoint
     ON ability_packages (space_id, entrypoint_note_id);
+
+CREATE INDEX IF NOT EXISTS idx_ability_packages_keyset
+    ON ability_packages (space_id, ability_id)
+    WHERE lifecycle_state = 'active';
+
+CREATE INDEX IF NOT EXISTS idx_ability_packages_space_kind
+    ON ability_packages (space_id, kind, ability_id)
+    WHERE lifecycle_state = 'active';
 
 CREATE TABLE IF NOT EXISTS view_rank_overlays (
     space_id TEXT NOT NULL,
@@ -489,6 +521,9 @@ CREATE TABLE IF NOT EXISTS command_receipts (
 CREATE INDEX IF NOT EXISTS idx_command_receipts_expires
     ON command_receipts (space_id, expires_at_ms);
 
+CREATE INDEX IF NOT EXISTS idx_command_receipts_seq
+    ON command_receipts (space_id, history_incarnation, canonical_seq);
+
 CREATE INDEX IF NOT EXISTS idx_receipt_exception_pointer ON command_receipts (space_id, response_payload_id) WHERE response_payload_id IS NOT NULL AND
             (response_payload_id <> 'rcpt_pay:' || actor_id || ':' || idempotency_key
              OR actor_id LIKE '%:%');
@@ -616,6 +651,9 @@ CREATE TABLE IF NOT EXISTS chat_threads (
     created_at_nsec INTEGER NOT NULL CHECK (created_at_nsec >= 0 AND created_at_nsec < 1000000000),
     updated_at_sec INTEGER NOT NULL,
     updated_at_nsec INTEGER NOT NULL CHECK (updated_at_nsec >= 0 AND updated_at_nsec < 1000000000),
+    active_run_epoch INTEGER CHECK (active_run_epoch IS NULL OR active_run_epoch >= 0),
+    active_run_generation TEXT,
+    redaction_epoch INTEGER NOT NULL DEFAULT 0 CHECK (redaction_epoch >= 0),
     PRIMARY KEY (space_id, thread_id),
     FOREIGN KEY (space_id) REFERENCES spaces (space_id),
     FOREIGN KEY (space_id, project_folder_id) REFERENCES folder_heads (space_id, folder_id)
@@ -623,6 +661,13 @@ CREATE TABLE IF NOT EXISTS chat_threads (
 
 CREATE INDEX IF NOT EXISTS idx_chat_threads_created_seq
     ON chat_threads (space_id, created_seq, thread_id);
+
+CREATE INDEX IF NOT EXISTS idx_chat_threads_keyset
+    ON chat_threads (space_id, thread_id, created_seq);
+
+CREATE INDEX IF NOT EXISTS idx_chat_threads_active_run
+    ON chat_threads (space_id, active_run_id)
+    WHERE active_run_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS chat_entries (
     space_id TEXT NOT NULL,
@@ -645,6 +690,9 @@ CREATE TABLE IF NOT EXISTS chat_entries (
     created_space_seq INTEGER NOT NULL CHECK (created_space_seq >= 1),
     redacted_at_seq INTEGER,
     checkpoint_stale INTEGER NOT NULL DEFAULT 0 CHECK (checkpoint_stale IN (0, 1)),
+    human_origin INTEGER CHECK (human_origin IN (0, 1)),
+    body_format INTEGER NOT NULL DEFAULT 0 CHECK (body_format IN (0, 1, 2)),
+    provenance_json TEXT,
     PRIMARY KEY (space_id, thread_id, entry_seq),
     CHECK (
         (kind = 'redacted' AND inline_text IS NULL AND payload_blake3 IS NULL AND redacted_at_seq IS NOT NULL)
@@ -652,7 +700,7 @@ CREATE TABLE IF NOT EXISTS chat_entries (
             kind <> 'redacted'
             AND redacted_at_seq IS NULL
             AND (
-                (inline_text IS NOT NULL AND length(CAST(inline_text AS BLOB)) <= 512 AND payload_blake3 IS NULL)
+                (inline_text IS NOT NULL AND length(CAST(inline_text AS BLOB)) <= 32768 AND payload_blake3 IS NULL)
                 OR (inline_text IS NULL AND payload_blake3 IS NOT NULL)
             )
         )
@@ -670,6 +718,10 @@ CREATE INDEX IF NOT EXISTS idx_chat_entries_parent
 CREATE INDEX IF NOT EXISTS idx_chat_entries_compaction
     ON chat_entries (space_id, thread_id, entry_seq)
     WHERE kind = 'compaction';
+
+CREATE INDEX IF NOT EXISTS idx_chat_entries_tainted
+    ON chat_entries (space_id, thread_id, entry_seq)
+    WHERE ext_space_tainted <> 0;
 
 CREATE INDEX IF NOT EXISTS idx_chat_entries_projection
     ON chat_entries (space_id, thread_id, entry_seq, revision_id, created_space_seq,
@@ -718,7 +770,7 @@ CREATE TABLE IF NOT EXISTS chat_pending_inputs (
     ext_space_tainted INTEGER NOT NULL DEFAULT 0 CHECK (ext_space_tainted IN (0, 1)),
     PRIMARY KEY (space_id, thread_id, input_id),
     CHECK (
-        (inline_text IS NOT NULL AND length(CAST(inline_text AS BLOB)) <= 512 AND payload_blake3 IS NULL)
+        (inline_text IS NOT NULL AND length(CAST(inline_text AS BLOB)) <= 32768 AND payload_blake3 IS NULL)
         OR (inline_text IS NULL AND payload_blake3 IS NOT NULL)
     ),
     FOREIGN KEY (space_id, thread_id) REFERENCES chat_threads (space_id, thread_id)
@@ -730,6 +782,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_chat_pending_inputs_ordinal
 CREATE INDEX IF NOT EXISTS idx_chat_pending_inputs_active
     ON chat_pending_inputs (space_id, thread_id, ordinal)
     WHERE status = 'pending';
+
+CREATE INDEX IF NOT EXISTS idx_chat_pending_inputs_consumed
+    ON chat_pending_inputs (space_id, thread_id, consumed_entry_seq)
+    WHERE status = 'consumed';
 
 CREATE TABLE IF NOT EXISTS collab_sessions (
     space_id TEXT NOT NULL,
@@ -820,6 +876,10 @@ CREATE TABLE IF NOT EXISTS pending_purges (
 
 CREATE INDEX IF NOT EXISTS idx_pending_purges_phase
     ON pending_purges (space_id, phase);
+
+CREATE INDEX IF NOT EXISTS idx_pending_purges_successor
+    ON pending_purges (space_id, new_note_id)
+    WHERE new_note_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS account_catalog_receipts (
     owner_id TEXT NOT NULL,

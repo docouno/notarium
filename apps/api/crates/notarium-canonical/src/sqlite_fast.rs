@@ -20,7 +20,7 @@ use notarium_core::{
     model::{HistoryScope, Lifecycle, NoteRef, PathTarget},
     ports::{
         CallBudget, ClosedRoomReservation, CommandSeqRange, CreateNote, GetNote, NoteRevision,
-        NoteSnapshot, Preconditions, RollbackAgentRun, SpaceContext,
+        NoteSnapshot, Preconditions, RevocationLease, SpaceContext,
     },
     query::{FieldObservation, FieldSchema, FieldValue},
     receipt::{CausalBasis, CommandIdentity, MutationReceiptToken},
@@ -35,18 +35,14 @@ use crate::{
         BlobCodecTag, BlobOwnerKind, BlobReferenceClaim, FastLocalBlobReadPlan, PendingDirSyncs,
         StagedBlobTicket, local::DeferredLocalStaging,
     },
-    changes::{
-        BroadcastSignal, ChangedNoteSummaryV1, EffectBodyV1, StoredAwaitReasonV1,
-        build_effect_payload_draft,
-    },
+    changes::{BroadcastSignal, ChangedNoteSummaryV1, EffectBodyV1, build_effect_payload_draft},
     codec::{
         AgentRunRevisionMetadata, MAX_MSGPACK_DECODE_BYTES, NoteRevisionMetadata,
         RevisionMetadataEnvelope, RevisionMetadataPayload, cancelled_not_committed,
         deadline_not_committed, decode_msgpack_bounded, decode_timestamp_parts, doc_class_from_db,
-        doc_class_to_db, encode_msgpack, encode_timestamp_parts, evaluate_fields_with_schema,
-        i64_to_space_seq, internal_not_committed, lifecycle_from_db, lifecycle_to_db,
-        new_prefixed_hex_id, new_revision_id, normalize_title_key, now_unix_ms, now_utc_timestamp,
-        ordered_ids_batch, unavailable_retryable,
+        doc_class_to_db, encode_timestamp_parts, evaluate_fields_with_schema, i64_to_space_seq,
+        internal_not_committed, lifecycle_from_db, lifecycle_to_db, new_prefixed_hex_id,
+        new_revision_id, now_unix_ms, now_utc_timestamp, unavailable_retryable,
     },
     config::WriterConfig,
     dialect::sqlite::{open_rusqlite_readonly_connection, open_rusqlite_writer_connection},
@@ -55,22 +51,18 @@ use crate::{
         common::{
             CommandDeadline, CurrentSpaceSchema, FolderAncestryFacts, MAX_FOLDER_DEPTH,
             NoteHeadRow, NoteRoomDirectWriteState, StoredCommittedNoteRevV1,
-            StoredCommittedRollbackV1, extract_agent_run_from_auth, note_rank_version_digest,
+            extract_agent_run_from_auth, note_rank_version_digest,
         },
         notes::{
-            EvaluatedFields, PreparedCarrierInfo, build_carrier_replacement_intent,
-            build_create_note_intent, changed_note_fields, revision_fields,
-        },
-        rollback::{
-            CandidateAction, RollbackRevision, build_rollback_direct_single_tx_exec,
-            decode_rollback_note, encode_rollback_note, rank_removal,
-            rollback_fallback_board_present_err,
+            CarrierReplacement, EvaluatedFields, PreparedCarrierInfo,
+            build_carrier_replacement_intent, build_create_note_intent, changed_note_fields,
+            revision_fields,
         },
     },
     runtime::{FolderHeadRow, SqlDriverState},
     wal::{SqliteWalCoordinator, read_cancelled},
     writer::{
-        BatchEventDraft, BatchExecOutcome, ChangePayloadDraft, CommandIdentitySpec,
+        BatchEventDraft, BatchExecOutcome, ChangePayloadDraft, CommandIdentitySpec, CommitAction,
         ItemCommitArtifacts, ItemExecCtx, ItemExecuteFn, ItemOutcomeSlot, PreparedWriteIntent,
         SemanticCutMismatchKind, SpaceBatchEntry, StoredReceiptRow, WriterFaultState,
     },
@@ -703,6 +695,7 @@ pub(crate) async fn get_note_sqlite_local_fast(
         byte_size,
         fields,
         diagnostics,
+        provenance,
         eager_raw_bytes,
         deferred_plan,
     ) = fast_read_pool
@@ -783,7 +776,7 @@ pub(crate) async fn get_note_sqlite_local_fast(
                 return Err(DomainError::ResourceNotFound.into());
             }
 
-            let (live_facts, _) = build_resource_facts_rusqlite(
+            let (live_facts, ancestry) = build_resource_facts_rusqlite(
                 conn,
                 &space_rec.space,
                 &live_head.parent_folder_id,
@@ -791,6 +784,13 @@ pub(crate) async fn get_note_sqlite_local_fast(
                 live_head.ability_id.clone(),
                 false,
             )?;
+            let live_effective_lc = crate::domain::common::combine_lifecycle(
+                live_head.lifecycle,
+                ancestry.folder_lifecycle,
+            );
+            if live_effective_lc == Lifecycle::Purged {
+                return Err(DomainError::ResourceNotFound.into());
+            }
             auth.authorize_read(&live_facts)?;
 
             let target_rev_id = req_rev_opt.unwrap_or_else(|| live_head.head_rev_id.clone());
@@ -831,9 +831,12 @@ pub(crate) async fn get_note_sqlite_local_fast(
             let digest = nm.content_digest.ok_or_else(|| {
                 internal_not_committed("note_rev_missing_digest", "note revision lacks digest")
             })?;
+            let provenance = ancestry.note_provenance(
+                &req_note, &nm.slug, nm.title, live_head.last_actor_id, live_head.updated_at,
+            );
             let parent_opt = (nm.parent_folder_id != space_rec.root_folder_id).then_some(nm.parent_folder_id);
             let effective_lc = if target_rev_id == live_head.head_rev_id {
-                live_head.lifecycle
+                live_effective_lc
             } else {
                 nm.lifecycle
             };
@@ -886,6 +889,7 @@ pub(crate) async fn get_note_sqlite_local_fast(
                     nm.byte_size,
                     fields,
                     nm.diagnostics,
+                    provenance,
                     fast_local_read,
                 ))
             },
@@ -898,6 +902,7 @@ pub(crate) async fn get_note_sqlite_local_fast(
                 byte_size,
                 fields,
                 diagnostics,
+                provenance,
                 fast_local_read,
             )| {
                 let (eager_raw, deferred) = match fast_local_read {
@@ -913,6 +918,7 @@ pub(crate) async fn get_note_sqlite_local_fast(
                     byte_size,
                     fields,
                     diagnostics,
+                    provenance,
                     eager_raw,
                     deferred,
                 ))
@@ -943,7 +949,7 @@ pub(crate) async fn get_note_sqlite_local_fast(
     ctx.budget.remaining = caller_deadline.saturating_duration_since(tokio::time::Instant::now());
     let (live_facts, live_lifecycle) =
         crate::domain::notes::recheck_note_read(store, &ctx, &request.note, false).await?;
-    if live_facts.class != initial_facts.class {
+    if live_facts.class != initial_facts.class || live_facts.project != initial_facts.project {
         return Err(DomainError::ResourceNotFound.into());
     }
 
@@ -979,6 +985,7 @@ pub(crate) async fn get_note_sqlite_local_fast(
         byte_size,
         fields,
         diagnostics,
+        provenance: Some(provenance),
     })
 }
 
@@ -1524,6 +1531,10 @@ impl DeferredAppendRows {
 pub(crate) trait SqliteSyncItemPlan: Send {
     fn take_deferred_local_staging(&self) -> Option<DeferredLocalStaging>;
 
+    fn supports_canonical_effect(&self) -> bool {
+        false
+    }
+
     fn phase1_receipt_checked_at_gen(&self) -> Option<u64> {
         None
     }
@@ -1567,6 +1578,7 @@ struct FastBatchPendingWaves {
     batch_dir_syncs: PendingDirSyncs,
     batch_retained_tickets: Vec<StagedBlobTicket>,
     batch_retained_guards: Vec<Box<dyn Send>>,
+    after_commit: Vec<CommitAction>,
     batch_committed: Arc<AtomicBool>,
     slots: Vec<ItemOutcomeSlot>,
 }
@@ -1577,6 +1589,10 @@ enum FastSqlStageResult {
         space_states: BTreeMap<SpaceId, SpaceBatchEntry>,
         slots: Vec<ItemOutcomeSlot>,
         wal_frames: Option<u64>,
+    },
+    RolledBackAllFailed {
+        space_states: BTreeMap<SpaceId, SpaceBatchEntry>,
+        slots: Vec<ItemOutcomeSlot>,
     },
     UnknownDirectCommit {
         slots: Vec<ItemOutcomeSlot>,
@@ -1594,6 +1610,10 @@ enum EarlyWaveApproval {
 enum LocalCasWaveOutcome {
     Completed {
         synced_dirs: PendingDirSyncs,
+        newly_published: Vec<(SpaceId, ContentDigest)>,
+    },
+    Failed {
+        err: PortError,
         newly_published: Vec<(SpaceId, ContentDigest)>,
     },
     Aborted,
@@ -1651,6 +1671,7 @@ pub(crate) async fn execute_sqlite_fast_batch(
 
     let stage1_fut = tokio::task::spawn_blocking(move || {
         let mut approval_tx_opt = Some(wave_approval_tx);
+        let mut active_effect = None;
         let stage = run_sqlite_fast_sql_stage(
             &rconn,
             fast_items,
@@ -1660,6 +1681,7 @@ pub(crate) async fn execute_sqlite_fast_batch(
             has_external_stagings,
             current_writer_gen,
             &mut approval_tx_opt,
+            &mut active_effect,
         );
         if let Some(tx) = approval_tx_opt.take() {
             match &stage {
@@ -1678,7 +1700,7 @@ pub(crate) async fn execute_sqlite_fast_batch(
                 }
             }
         }
-        (rconn, stage)
+        (rconn, stage, active_effect)
     });
 
     let local_cas_fut = async {
@@ -1708,19 +1730,29 @@ pub(crate) async fn execute_sqlite_fast_batch(
         };
 
         let mut newly_published = Vec::new();
-        for entry in &synced_entries {
-            if entry.temp_file.is_some()
-                && keys_to_publish.contains(&(entry.space_id_str.clone(), entry.digest))
-            {
-                newly_published.push((entry.space_id.clone(), entry.digest));
+        let synced_dirs = match store
+            .rename_synced_local_entries_async(
+                synced_entries,
+                &keys_to_publish,
+                &mut newly_published,
+            )
+            .await
+        {
+            Ok(dirs) => dirs,
+            Err(err) => {
+                return Ok(LocalCasWaveOutcome::Failed {
+                    err,
+                    newly_published,
+                });
             }
+        };
+
+        if let Err(sync_err) = store.flush_pending_local_dirs_async(&synced_dirs).await {
+            return Ok(LocalCasWaveOutcome::Failed {
+                err: sync_err,
+                newly_published,
+            });
         }
-
-        let synced_dirs = store
-            .rename_synced_local_entries_async(synced_entries, &keys_to_publish)
-            .await?;
-
-        store.flush_pending_local_dirs_async(&synced_dirs).await?;
 
         Ok(LocalCasWaveOutcome::Completed {
             synced_dirs,
@@ -1735,20 +1767,22 @@ pub(crate) async fn execute_sqlite_fast_batch(
             match cas_res {
                 Ok(LocalCasWaveOutcome::Completed {
                     newly_published, ..
+                })
+                | Ok(LocalCasWaveOutcome::Failed {
+                    newly_published, ..
                 }) => newly_published,
                 _ => Vec::new(),
             }
         };
 
-    let (mut rconn, stage1_res) = match stage1_join {
+    // Keep any active effect until the SQL acknowledgement or connection cleanup.
+    let (mut rconn, stage1_res, _active_effect) = match stage1_join {
         Ok(pair_out) => pair_out,
         Err(join_err) => {
-            store
-                .cleanup_unretained_local_files_async(cleanup_all_published(local_cas_res))
-                .await;
             if let Ok(reopened) = open_rusqlite_writer_connection(&pair.db_path) {
                 pair.rusqlite_conn = Some(reopened);
             }
+            store.schedule_unretained_local_files_cleanup(cleanup_all_published(local_cas_res));
             return BatchExecOutcome::AbortedBeforeCommit(internal_not_committed(
                 "sqlite_fast_stage1_join",
                 join_err.to_string(),
@@ -1758,33 +1792,43 @@ pub(crate) async fn execute_sqlite_fast_batch(
 
     match stage1_res {
         FastSqlStageResult::AbortedBeforeCommit(err) => {
-            store
-                .cleanup_unretained_local_files_async(cleanup_all_published(local_cas_res))
-                .await;
             restore_writer_rconn(pair, rconn);
+            store.schedule_unretained_local_files_cleanup(cleanup_all_published(local_cas_res));
             BatchExecOutcome::AbortedBeforeCommit(err)
         }
         FastSqlStageResult::UnknownDirectCommit { slots, diag_reason } => {
-            store
-                .cleanup_unretained_local_files_async(cleanup_all_published(local_cas_res))
-                .await;
             restore_writer_rconn(pair, rconn);
-            BatchExecOutcome::UnknownCommit { slots, diag_reason }
+            store.schedule_unretained_local_files_cleanup(cleanup_all_published(local_cas_res));
+            BatchExecOutcome::UnknownCommit {
+                slots,
+                diag_reason,
+                pg_barrier: None,
+            }
         }
         FastSqlStageResult::CommittedDirectly {
             space_states,
             slots,
             wal_frames,
         } => {
-            drop(local_cas_res);
+            let orphaned = cleanup_all_published(local_cas_res);
             if let Some(w) = wal_opt.as_deref() {
                 w.note_writer_commit_with_frames(wal_frames);
             }
             restore_writer_rconn(pair, rconn);
+            store.schedule_unretained_local_files_cleanup(orphaned);
+            finalize_committed_batch(store, &space_states, slots, faults)
+        }
+        FastSqlStageResult::RolledBackAllFailed {
+            space_states,
+            slots,
+        } => {
+            restore_writer_rconn(pair, rconn);
+            store.schedule_unretained_local_files_cleanup(cleanup_all_published(local_cas_res));
             finalize_committed_batch(store, &space_states, slots, faults)
         }
         FastSqlStageResult::NeedsLocalWaves(pending) => {
             let mut published_for_abort_cleanup = Vec::new();
+            let mut unretained_for_post_tx_cleanup = Vec::new();
             let wave_res: Result<(), PortError> = async {
                 match local_cas_res? {
                     LocalCasWaveOutcome::Completed {
@@ -1799,25 +1843,28 @@ pub(crate) async fn execute_sqlite_fast_batch(
                                     retained_keys.insert(key.clone());
                                 }
                             }
-                            let mut unretained = Vec::new();
                             let mut kept = Vec::with_capacity(newly_published.len());
                             for (sp, dig) in newly_published {
                                 if retained_keys.contains(&(sp.as_str().to_owned(), dig)) {
                                     kept.push((sp, dig));
                                 } else {
-                                    unretained.push((sp, dig));
+                                    unretained_for_post_tx_cleanup.push((sp, dig));
                                 }
                             }
                             published_for_abort_cleanup = kept;
-                            if !unretained.is_empty() {
-                                store.cleanup_unretained_local_files_async(unretained).await;
-                            }
                         }
                         let unsynced = pending.batch_dir_syncs.without(&synced_dirs);
                         if !unsynced.is_empty() {
                             store.flush_pending_local_dirs_async(&unsynced).await?;
                         }
                         Ok(())
+                    }
+                    LocalCasWaveOutcome::Failed {
+                        err,
+                        newly_published,
+                    } => {
+                        published_for_abort_cleanup = newly_published;
+                        Err(err)
                     }
                     LocalCasWaveOutcome::Aborted => Err(internal_not_committed(
                         "sqlite_fast_local_waves_aborted",
@@ -1829,9 +1876,6 @@ pub(crate) async fn execute_sqlite_fast_batch(
 
             match wave_res {
                 Err(io_err) => {
-                    store
-                        .cleanup_unretained_local_files_async(published_for_abort_cleanup)
-                        .await;
                     let rollback_join = tokio::task::spawn_blocking(move || {
                         let _ = rconn.execute_batch("ROLLBACK");
                         rconn
@@ -1852,6 +1896,8 @@ pub(crate) async fn execute_sqlite_fast_batch(
                         .fetch_add(2, Ordering::Release);
                     drop(pending.batch_retained_tickets);
                     drop(pending.batch_retained_guards);
+                    published_for_abort_cleanup.extend(unretained_for_post_tx_cleanup);
+                    store.schedule_unretained_local_files_cleanup(published_for_abort_cleanup);
                     BatchExecOutcome::AbortedBeforeCommit(io_err)
                 }
                 Ok(()) => {
@@ -1906,8 +1952,16 @@ pub(crate) async fn execute_sqlite_fast_batch(
                     drop(pending.batch_retained_tickets);
                     drop(pending.batch_retained_guards);
 
+                    for action in pending.after_commit {
+                        action.settle(commit_res.is_ok());
+                    }
                     match commit_res {
                         Ok(()) => {
+                            if !unretained_for_post_tx_cleanup.is_empty() {
+                                store.schedule_unretained_local_files_cleanup(
+                                    unretained_for_post_tx_cleanup,
+                                );
+                            }
                             if let Some(w) = wal_opt.as_deref() {
                                 w.note_writer_commit_with_frames(wal_frames);
                             }
@@ -1918,10 +1972,17 @@ pub(crate) async fn execute_sqlite_fast_batch(
                                 faults,
                             )
                         }
-                        Err(diag_reason) => BatchExecOutcome::UnknownCommit {
-                            slots: pending.slots,
-                            diag_reason,
-                        },
+                        Err(diag_reason) => {
+                            published_for_abort_cleanup.extend(unretained_for_post_tx_cleanup);
+                            store.schedule_unretained_local_files_cleanup(
+                                published_for_abort_cleanup,
+                            );
+                            BatchExecOutcome::UnknownCommit {
+                                slots: pending.slots,
+                                diag_reason,
+                                pg_barrier: None,
+                            }
+                        }
                     }
                 }
             }
@@ -1988,12 +2049,14 @@ fn finalize_committed_batch(
         return BatchExecOutcome::UnknownCommit {
             slots,
             diag_reason: "fault_injected_commit_response_loss".to_owned(),
+            pg_barrier: None,
         };
     }
 
     BatchExecOutcome::Committed {
         slots,
         space_effective_cuts,
+        conn_clean: true,
         visibility_windows: crate::writer::visibility_windows(store, space_states),
     }
 }
@@ -2008,8 +2071,21 @@ fn run_sqlite_fast_sql_stage(
     has_external_stagings: bool,
     current_writer_gen: u64,
     approval_tx_opt: &mut Option<tokio::sync::oneshot::Sender<EarlyWaveApproval>>,
+    active_effect: &mut Option<Box<dyn RevocationLease>>,
 ) -> FastSqlStageResult {
-    if items.iter().any(|(_, p)| p.requires_savepoint_isolation()) {
+    let guarded = items.iter().any(|(meta, _)| {
+        meta.idempotency
+            .as_ref()
+            .and_then(CommandIdentitySpec::canonical_effect)
+            .is_some()
+    });
+    if guarded && !(items.len() == 1 && items[0].1.supports_canonical_effect()) {
+        return FastSqlStageResult::AbortedBeforeCommit(internal_not_committed(
+            "sqlite_fast_guarded_plan",
+            "guarded rollback requires its own SQLite transaction",
+        ));
+    }
+    if guarded || items.iter().any(|(_, p)| p.requires_savepoint_isolation()) {
         return run_savepoint_fallback_sql_stage(
             conn,
             &items,
@@ -2018,6 +2094,7 @@ fn run_sqlite_fast_sql_stage(
             inner,
             has_external_stagings,
             current_writer_gen,
+            active_effect,
         );
     }
     match try_run_optimistic_fast_sql_stage(
@@ -2042,6 +2119,7 @@ fn run_sqlite_fast_sql_stage(
                 inner,
                 has_external_stagings,
                 current_writer_gen,
+                active_effect,
             )
         }
     }
@@ -2108,6 +2186,7 @@ fn try_run_optimistic_fast_sql_stage(
     let mut batch_dir_syncs = PendingDirSyncs::default();
     let mut batch_retained_tickets: Vec<StagedBlobTicket> = Vec::with_capacity(items.len());
     let mut batch_retained_guards: Vec<Box<dyn Send>> = Vec::new();
+    let mut after_commit = Vec::new();
     let mut slots: Vec<ItemOutcomeSlot> = Vec::with_capacity(items.len());
     let mut cache = FastBatchSqlCache {
         current_writer_gen,
@@ -2178,6 +2257,7 @@ fn try_run_optimistic_fast_sql_stage(
                 dir_syncs,
                 retained_tickets,
                 retained_guards,
+                commit_action,
                 written_receipt: _,
             }) => {
                 if let Some(SpaceBatchEntry::Loaded {
@@ -2198,6 +2278,7 @@ fn try_run_optimistic_fast_sql_stage(
                 batch_dir_syncs.merge(&dir_syncs);
                 batch_retained_tickets.extend(retained_tickets);
                 batch_retained_guards.extend(retained_guards);
+                after_commit.extend(commit_action);
                 slots.push(ItemOutcomeSlot::Succeeded {
                     response_bytes,
                     has_idempotency: has_idemp,
@@ -2227,15 +2308,21 @@ fn try_run_optimistic_fast_sql_stage(
         batch_dir_syncs,
         batch_retained_tickets,
         batch_retained_guards,
+        after_commit,
         cache.batch_committed,
         slots,
         wal,
         inner,
         has_external_stagings,
+        None,
         wal_only,
     ))
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "uses the same writer context and transaction fences as the optimistic stage"
+)]
 fn run_savepoint_fallback_sql_stage(
     conn: &rusqlite::Connection,
     items: &[(FastIntentMeta, Box<dyn SqliteSyncItemPlan>)],
@@ -2244,6 +2331,7 @@ fn run_savepoint_fallback_sql_stage(
     inner: &crate::runtime::CanonicalInner,
     has_external_stagings: bool,
     current_writer_gen: u64,
+    active_effect: &mut Option<Box<dyn RevocationLease>>,
 ) -> FastSqlStageResult {
     if let Err(err) = conn.execute_batch("BEGIN IMMEDIATE") {
         if let Some(w) = wal {
@@ -2253,6 +2341,22 @@ fn run_savepoint_fallback_sql_stage(
             "sqlite_begin_immediate",
             err.to_string(),
         ));
+    }
+
+    if let [(meta, _)] = items
+        && let Some(effect) = meta
+            .idempotency
+            .as_ref()
+            .and_then(CommandIdentitySpec::canonical_effect)
+    {
+        // This is a blocking worker with the SQLite write transaction open.
+        match tokio::runtime::Handle::current().block_on(effect.begin()) {
+            Ok(lease) => *active_effect = Some(lease),
+            Err(error) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                return FastSqlStageResult::AbortedBeforeCommit(error);
+            }
+        }
     }
 
     let committed_at_ms = match now_unix_ms() {
@@ -2276,12 +2380,16 @@ fn run_savepoint_fallback_sql_stage(
     let mut batch_dir_syncs = PendingDirSyncs::default();
     let mut batch_retained_tickets: Vec<StagedBlobTicket> = Vec::new();
     let mut batch_retained_guards: Vec<Box<dyn Send>> = Vec::new();
+    let mut after_commit = Vec::new();
     let mut slots: Vec<ItemOutcomeSlot> = Vec::with_capacity(items.len());
     let mut cache = FastBatchSqlCache {
         current_writer_gen,
         ..FastBatchSqlCache::default()
     };
 
+    // A guarded singleton aborts the entire transaction on error. It can use
+    // the same batched revision and event inserts as an optimistic native write.
+    let mut deferred = active_effect.is_some().then(DeferredAppendRows::default);
     let use_savepoint = items.len() > 1;
     for (meta, plan) in items {
         let space_id = meta.scope.space_id.clone();
@@ -2334,7 +2442,7 @@ fn run_savepoint_fallback_sql_stage(
             committed_at_ms,
             expires_at_ms,
             current_writer_gen,
-            None,
+            deferred.as_mut(),
         );
 
         match item_res {
@@ -2347,6 +2455,7 @@ fn run_savepoint_fallback_sql_stage(
                 dir_syncs,
                 retained_tickets,
                 retained_guards,
+                commit_action,
                 written_receipt,
             }) => {
                 if use_savepoint && let Err(err) = conn.execute_batch("RELEASE SAVEPOINT sp_item") {
@@ -2380,6 +2489,7 @@ fn run_savepoint_fallback_sql_stage(
                 batch_dir_syncs.merge(&dir_syncs);
                 batch_retained_tickets.extend(retained_tickets);
                 batch_retained_guards.extend(retained_guards);
+                after_commit.extend(commit_action);
                 slots.push(ItemOutcomeSlot::Succeeded {
                     response_bytes,
                     has_idempotency: has_idemp,
@@ -2403,16 +2513,21 @@ fn run_savepoint_fallback_sql_stage(
                 } else {
                     let _ = conn.execute_batch("ROLLBACK");
                     slots.push(ItemOutcomeSlot::Failed(item_err));
-                    return FastSqlStageResult::CommittedDirectly {
+                    return FastSqlStageResult::RolledBackAllFailed {
                         space_states,
                         slots,
-                        wal_frames: Some(0),
                     };
                 }
             }
         }
     }
 
+    if let Some(rows) = deferred
+        && let Err(error) = rows.flush(conn)
+    {
+        let _ = conn.execute_batch("ROLLBACK");
+        return FastSqlStageResult::AbortedBeforeCommit(error);
+    }
     let wal_only = items.iter().all(|(_, p)| p.is_unsequenced_room_wal());
     finish_fast_sql_stage(
         conn,
@@ -2420,11 +2535,13 @@ fn run_savepoint_fallback_sql_stage(
         batch_dir_syncs,
         batch_retained_tickets,
         batch_retained_guards,
+        after_commit,
         cache.batch_committed,
         slots,
         wal,
         inner,
         has_external_stagings,
+        active_effect.as_deref(),
         wal_only,
     )
 }
@@ -2436,11 +2553,13 @@ fn finish_fast_sql_stage(
     batch_dir_syncs: PendingDirSyncs,
     batch_retained_tickets: Vec<StagedBlobTicket>,
     batch_retained_guards: Vec<Box<dyn Send>>,
+    after_commit: Vec<CommitAction>,
     batch_committed: Arc<AtomicBool>,
     slots: Vec<ItemOutcomeSlot>,
     wal: Option<&SqliteWalCoordinator>,
     inner: &crate::runtime::CanonicalInner,
     has_external_stagings: bool,
+    active_effect: Option<&dyn RevocationLease>,
     wal_only: bool,
 ) -> FastSqlStageResult {
     for entry in space_states.values() {
@@ -2475,6 +2594,12 @@ fn finish_fast_sql_stage(
 
     if !has_external_stagings && !has_deferred_publish && !has_dir_syncs {
         let _ = crate::wal::take_last_wal_commit_frames();
+        if let Some(effect) = active_effect
+            && let Err(error) = effect.check()
+        {
+            let _ = conn.execute_batch("ROLLBACK");
+            return FastSqlStageResult::AbortedBeforeCommit(error);
+        }
         // Bracket SQLite COMMIT with the seqlock generation (even->odd before
         // COMMIT, odd->even immediately after COMMIT and strictly BEFORE
         // dropping fence guards or waking readers). Pure unsequenced room WAL
@@ -2490,6 +2615,9 @@ fn finish_fast_sql_stage(
         commit_seq.finish();
         match commit_res {
             Ok(()) => {
+                for action in after_commit {
+                    action.settle(true);
+                }
                 let wal_frames = crate::wal::take_last_wal_commit_frames();
                 batch_committed.store(true, Ordering::Release);
                 drop(batch_retained_tickets);
@@ -2501,6 +2629,11 @@ fn finish_fast_sql_stage(
                 }
             }
             Err(commit_err) => {
+                if conn.is_autocommit() {
+                    for action in after_commit {
+                        action.settle(false);
+                    }
+                }
                 if let Some(w) = wal {
                     record_rusqlite_busy(w, &commit_err);
                 }
@@ -2512,12 +2645,21 @@ fn finish_fast_sql_stage(
                 }
             }
         }
+    } else if active_effect.is_some() {
+        // Native rollback only rebinds existing blobs. A plan that stages new
+        // content needs the ordinary writer's admission across its CAS waves.
+        let _ = conn.execute_batch("ROLLBACK");
+        FastSqlStageResult::AbortedBeforeCommit(internal_not_committed(
+            "guarded_sqlite_rollback_staging",
+            "guarded rollback unexpectedly staged content",
+        ))
     } else {
         FastSqlStageResult::NeedsLocalWaves(FastBatchPendingWaves {
             space_states,
             batch_dir_syncs,
             batch_retained_tickets,
             batch_retained_guards,
+            after_commit,
             batch_committed,
             slots,
         })
@@ -2533,6 +2675,7 @@ struct FastSingleItemSuccess {
     dir_syncs: PendingDirSyncs,
     retained_tickets: Vec<StagedBlobTicket>,
     retained_guards: Vec<Box<dyn Send>>,
+    commit_action: Option<CommitAction>,
     written_receipt: Option<(
         (SpaceId, HistoryIncarnation, PrincipalId, CommandKey),
         StoredReceiptRow,
@@ -2586,11 +2729,12 @@ fn execute_single_fast_item(
         let existing_opt = if let Some(in_batch) = cache.in_batch_receipts.get(&rcpt_key) {
             authorize_replay_rusqlite(conn, &meta.scope, idemp)
                 .map_err(FastItemExecError::PreWrite)?;
-            Some(StoredReceiptRow {
+            let receipt = StoredReceiptRow {
                 command_hash: in_batch.command_hash,
                 status: in_batch.status.clone(),
                 response_blob: in_batch.response_blob.clone(),
-            })
+            };
+            Some(receipt)
         } else if plan.phase1_receipt_checked_at_gen() == Some(current_writer_gen) {
             None
         } else {
@@ -2612,6 +2756,7 @@ fn execute_single_fast_item(
                     dir_syncs: PendingDirSyncs::default(),
                     retained_tickets: Vec::new(),
                     retained_guards: Vec::new(),
+                    commit_action: None,
                     item_changes: crate::projection_fence::VisibilityChanges::default(),
                     written_receipt: None,
                 }),
@@ -2659,6 +2804,7 @@ fn execute_single_fast_item(
         defer_append.as_deref_mut(),
     )?;
 
+    let commit_action = item_ctx.take_after_commit();
     let allocated_count = item_ctx.allocated_count();
     if plan.is_unsequenced_room_wal() {
         if allocated_count != 0
@@ -2678,6 +2824,7 @@ fn execute_single_fast_item(
             item_purge_seq: None,
             committed_events: Vec::new(),
             item_changes: Default::default(),
+            commit_action,
             dir_syncs,
             retained_tickets,
             retained_guards,
@@ -2861,6 +3008,7 @@ fn execute_single_fast_item(
             dir_syncs,
             retained_tickets,
             retained_guards,
+            commit_action,
             written_receipt: None,
         });
     }
@@ -2938,6 +3086,7 @@ fn execute_single_fast_item(
         dir_syncs,
         retained_tickets,
         retained_guards,
+        commit_action,
         written_receipt,
     })
 }
@@ -3138,6 +3287,7 @@ impl SqliteSyncItemPlan for CreateNoteFastPlan {
         let run_opt = extract_agent_run_from_auth(auth);
         let meta =
             RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Note(NoteRevisionMetadata {
+                folder_page: false,
                 note_id: input.note.clone(),
                 parent_folder_id: parent_id.clone(),
                 is_root_child: anc.is_root_child,
@@ -3154,6 +3304,7 @@ impl SqliteSyncItemPlan for CreateNoteFastPlan {
                 raw_fields: info.raw_fields.clone(),
                 evaluated_fields: eval_fields,
                 diagnostics: info.diagnostics.clone(),
+                logical_updated_at: None,
             }))
             .encode()
             .map_err(FastItemExecError::PreWrite)?;
@@ -3405,6 +3556,7 @@ pub(crate) fn build_carrier_replacement_fast_intent(
             evaluate_fields_with_schema(info.raw_fields.as_ref(), info.diagnostics.first(), None)
         };
         RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Note(NoteRevisionMetadata {
+            folder_page: cached_anc.cover_note.as_ref() == Some(&note_id),
             note_id: note_id.clone(),
             parent_folder_id: cached_head.parent_folder_id.clone(),
             is_root_child: cached_anc.is_root_child,
@@ -3421,6 +3573,7 @@ pub(crate) fn build_carrier_replacement_fast_intent(
             raw_fields: info.raw_fields.clone(),
             evaluated_fields: eval_fields.clone(),
             diagnostics: info.diagnostics.clone(),
+            logical_updated_at: None,
         }))
         .encode()
         .ok()
@@ -3502,7 +3655,10 @@ impl SqliteSyncItemPlan for CarrierReplacementFastPlan {
             me.preconditions,
             me.note_id,
             me.expected_base_rev,
-            me.explicit_slug_override,
+            match me.explicit_slug_override {
+                Some((slug, folded)) => CarrierReplacement::Rename(slug, folded),
+                None => CarrierReplacement::Edit,
+            },
             me.info,
             me.ticket,
             room,
@@ -3666,6 +3822,7 @@ impl SqliteSyncItemPlan for CarrierReplacementFastPlan {
                 &final_slug,
                 (head.parent_folder_id != item_ctx.root_folder_id)
                     .then_some(head.parent_folder_id.clone()),
+                anc.project.as_ref(),
             )
             .map_err(FastItemExecError::PreWrite)?;
             Some(ab_id.clone())
@@ -3715,6 +3872,7 @@ impl SqliteSyncItemPlan for CarrierReplacementFastPlan {
             };
             let bytes =
                 RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Note(NoteRevisionMetadata {
+                    folder_page: anc.cover_note.as_ref() == Some(note_id),
                     note_id: note_id.clone(),
                     parent_folder_id: head.parent_folder_id,
                     is_root_child: anc.is_root_child,
@@ -3731,6 +3889,7 @@ impl SqliteSyncItemPlan for CarrierReplacementFastPlan {
                     raw_fields: info.raw_fields.clone(),
                     evaluated_fields: eval_fields.clone(),
                     diagnostics: info.diagnostics.clone(),
+                    logical_updated_at: None,
                 }))
                 .encode()
                 .map_err(FastItemExecError::PreWrite)?;
@@ -4129,8 +4288,10 @@ fn authorize_replay_rusqlite(
     scope: &HistoryScope,
     idemp: &CommandIdentitySpec,
 ) -> Result<(), PortError> {
-    use crate::writer::replay::{ReplayPolicy, ReplayResource, authorize_head, destination};
-    let Some((auth, policy)) = idemp.authority.as_deref() else {
+    use crate::writer::replay::ReplayPolicy;
+    let Some(crate::writer::replay::ReplayAuthority { auth, policy, .. }) =
+        idemp.authority.as_deref()
+    else {
         return Ok(());
     };
     let srec = load_space_record_rusqlite(conn, &scope.space_id)?;
@@ -4142,67 +4303,133 @@ fn authorize_replay_rusqlite(
         ));
     };
     auth.authorize_space_write(&srec.space)?;
+    authorize_replay_targets_rusqlite(conn, &srec, auth, targets)
+}
+
+fn authorize_replay_targets_rusqlite(
+    conn: &rusqlite::Connection,
+    srec: &SpaceRecord,
+    auth: &EngineAuthContext,
+    targets: &[crate::writer::replay::ReplayResource],
+) -> Result<(), PortError> {
+    use crate::writer::replay::{ReplayResource, authorize_head, destination};
     for target in targets {
         let note = match target {
             ReplayResource::WriteFolder(folder) => {
                 let folder = folder.as_ref().unwrap_or(&srec.root_folder_id);
-                let (facts, _) = build_resource_facts_rusqlite(
+                let (facts, ancestry) = build_resource_facts_rusqlite(
                     conn,
                     &srec.space,
                     folder,
                     crate::domain::folders::folder_mutation_class(auth, &srec.space.id)?,
                     None,
-                    true,
+                    false,
                 )?;
+                for anc in &ancestry.ancestors {
+                    let row = load_folder_head_row_rusqlite(conn, &srec.space.id, anc)?;
+                    if row.lifecycle == notarium_core::model::Lifecycle::Purged {
+                        return Err(DomainError::ResourceNotFound.into());
+                    }
+                }
+                auth.can_view_folder(&srec.space, folder, &ancestry.ancestors)?;
                 auth.authorize_direct_write(&facts, &facts)?;
+                continue;
+            }
+            ReplayResource::WriteFolderSubtree(folder) => {
+                let (facts, ancestry) = build_resource_facts_rusqlite(
+                    conn,
+                    &srec.space,
+                    folder,
+                    crate::domain::folders::folder_mutation_class(auth, &srec.space.id)?,
+                    None,
+                    false,
+                )?;
+                for anc in &ancestry.ancestors {
+                    let row = load_folder_head_row_rusqlite(conn, &srec.space.id, anc)?;
+                    if row.lifecycle == notarium_core::model::Lifecycle::Purged {
+                        return Err(DomainError::ResourceNotFound.into());
+                    }
+                }
+                auth.can_view_folder(&srec.space, folder, &ancestry.ancestors)?;
+                auth.authorize_direct_write(&facts, &facts)?;
+                let mut stmt = conn
+                    .prepare_cached(crate::domain::folders::FOLDER_SUBTREE_AUTH_SQL_WITH_ROOT)
+                    .map_err(|err| {
+                        internal_not_committed("sqlite_replay_folder_subtree_auth", err.to_string())
+                    })?;
+                let mask: i64 = stmt
+                    .query_row(params![srec.space.id.as_str(), folder.as_str()], |row| {
+                        row.get(0)
+                    })
+                    .map_err(|err| {
+                        map_interrupt_or_internal(err, "sqlite_replay_folder_subtree_auth")
+                    })?;
+                crate::domain::folders::authorize_folder_subtree_mask(&srec.space.id, auth, mask)?;
                 continue;
             }
             ReplayResource::ReadLinkFolder(folder, source) => {
                 let head = load_note_head_row_rusqlite(conn, &srec.space.id, source)?;
-                let (facts, _) = build_resource_facts_rusqlite(
+                let (facts, ancestry) = build_resource_facts_rusqlite(
                     conn,
                     &srec.space,
                     folder,
                     head.doc_class,
                     None,
-                    true,
+                    false,
                 )?;
+                if ancestry.folder_lifecycle == notarium_core::model::Lifecycle::Purged {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
                 auth.authorize_read(&facts)?;
                 continue;
             }
             ReplayResource::Write(note)
+            | ReplayResource::WriteUnpurged(note)
             | ReplayResource::Read(note)
             | ReplayResource::View(note)
             | ReplayResource::Create(note, ..)
             | ReplayResource::Move(note, ..) => note,
         };
-        if matches!(target, ReplayResource::View(_))
-            && is_note_purge_fenced_rusqlite(conn, &srec.space.id, note.as_str())?
+        if matches!(
+            target,
+            ReplayResource::Read(_) | ReplayResource::View(_) | ReplayResource::WriteUnpurged(_)
+        ) && is_note_purge_fenced_rusqlite(conn, &srec.space.id, note.as_str())?
         {
             return Err(DomainError::ResourceNotFound.into());
         }
-        let head = load_note_head_row_opt_rusqlite(conn, &scope.space_id, note)?;
+        let head = load_note_head_row_opt_rusqlite(conn, &srec.space.id, note)?;
         if let Some((parent, class)) = destination(target, head.as_ref().map(|h| h.doc_class)) {
-            let (facts, _) = build_resource_facts_rusqlite(
+            let (facts, ancestry) = build_resource_facts_rusqlite(
                 conn,
                 &srec.space,
                 parent.unwrap_or(&srec.root_folder_id),
                 class,
                 None,
-                true,
+                false,
             )?;
+            if ancestry.folder_lifecycle == notarium_core::model::Lifecycle::Purged {
+                return Err(DomainError::ResourceNotFound.into());
+            }
             auth.authorize_direct_write(&facts, &facts)?;
         }
         if let Some(head) = head {
-            let (facts, _) = build_resource_facts_rusqlite(
+            let (facts, ancestry) = build_resource_facts_rusqlite(
                 conn,
                 &srec.space,
                 &head.parent_folder_id,
                 head.doc_class,
                 head.ability_id,
-                true,
+                false,
             )?;
-            authorize_head(auth, target, &facts, head.lifecycle)?;
+            if ancestry.folder_lifecycle == notarium_core::model::Lifecycle::Purged {
+                return Err(DomainError::ResourceNotFound.into());
+            }
+            authorize_head(
+                auth,
+                target,
+                &facts,
+                crate::domain::common::combine_lifecycle(head.lifecycle, ancestry.folder_lifecycle),
+            )?;
         } else if !matches!(target, ReplayResource::Create(..)) {
             return Err(DomainError::ResourceNotFound.into());
         }
@@ -4276,14 +4503,15 @@ fn lookup_command_receipt_rusqlite(
         sanitized_blob
     };
 
-    Ok(Some(StoredReceiptRow {
+    let receipt = StoredReceiptRow {
         command_hash: ContentDigest::from_bytes(arr),
         status,
         response_blob: effective_blob,
-    }))
+    };
+    Ok(Some(receipt))
 }
 
-fn is_note_purge_fenced_rusqlite(
+pub(crate) fn is_note_purge_fenced_rusqlite(
     conn: &rusqlite::Connection,
     space_id: &SpaceId,
     note_id: &str,
@@ -4330,7 +4558,7 @@ fn is_note_purge_fenced_cached(
     is_note_purge_fenced_rusqlite(conn, space_id, note_id)
 }
 
-fn load_note_head_row_opt_rusqlite(
+pub(crate) fn load_note_head_row_opt_rusqlite(
     conn: &rusqlite::Connection,
     space_id: &SpaceId,
     note_id: &NoteId,
@@ -4552,6 +4780,7 @@ fn load_folder_head_row_rusqlite(
         write_locked: write_lock_json.is_some(),
         lifecycle,
         head_rev_id,
+        updated_seq: None,
     })
 }
 
@@ -4562,10 +4791,14 @@ fn load_folder_ancestry_rusqlite(
     require_all_active: bool,
 ) -> Result<FolderAncestryFacts, PortError> {
     let mut ancestors = Vec::new();
+    let mut ancestor_revisions = Vec::new();
     let mut segments_rev = Vec::new();
     let mut visited = BTreeSet::new();
     let mut write_locked = false;
     let mut current = folder_id.clone();
+    let mut project = None;
+    let mut cover_note = None;
+    let mut folder_lifecycle = Lifecycle::Active;
 
     for _depth in 0..=MAX_FOLDER_DEPTH {
         if !visited.insert(current.clone()) {
@@ -4578,10 +4811,19 @@ fn load_folder_ancestry_rusqlite(
         if require_all_active && row.lifecycle != Lifecycle::Active {
             return Err(DomainError::ResourceNotFound.into());
         }
+        folder_lifecycle =
+            crate::domain::common::combine_lifecycle(folder_lifecycle, row.lifecycle);
         if row.write_locked {
             write_locked = true;
         }
+        if ancestors.is_empty() {
+            cover_note = row.cover_note_id;
+        }
+        if row.is_project && project.is_none() {
+            project = Some(row.folder_id.clone());
+        }
         ancestors.push(row.folder_id.clone());
+        ancestor_revisions.push(row.head_rev_id.clone());
         if row.is_root {
             segments_rev.reverse();
             let folder_path = if segments_rev.is_empty() {
@@ -4592,9 +4834,13 @@ fn load_folder_ancestry_rusqlite(
             let is_root_child = ancestors.len() == 1;
             return Ok(FolderAncestryFacts {
                 ancestors,
+                ancestor_revisions,
                 write_locked,
                 is_root_child,
                 folder_path,
+                project,
+                cover_note,
+                folder_lifecycle,
             });
         }
         segments_rev.push(row.slug);
@@ -4625,6 +4871,7 @@ pub(crate) fn build_resource_facts_rusqlite(
     let facts = ResourceFacts {
         space: space.clone(),
         class,
+        project: anc.project.clone(),
         ancestor_folders: anc.ancestors.clone(),
         folder_write_locked: anc.write_locked,
         ability_package,
@@ -4661,6 +4908,7 @@ pub(crate) fn build_resource_facts_cached(
     let facts = ResourceFacts {
         space: space.clone(),
         class,
+        project: anc.project.clone(),
         ancestor_folders: anc.ancestors.clone(),
         folder_write_locked: anc.write_locked,
         ability_package,
@@ -4831,17 +5079,19 @@ fn check_ability_package_slug_conflict_rusqlite(
     new_slug_fold: &str,
     new_slug: &str,
     report_parent: Option<FolderId>,
+    project: Option<&FolderId>,
 ) -> Result<(), PortError> {
     let mut stmt = conn
-        .prepare_cached(
-            "SELECT 1 FROM ability_packages
-             WHERE space_id = ?1 AND slug_fold = ?2 AND lifecycle_state = 'active' AND ability_id <> ?3
-             LIMIT 1",
-        )
+        .prepare_cached(include_str!("domain/ability_slot_check.sql"))
         .map_err(|err| internal_not_committed("sqlite_ability_rename_check", err.to_string()))?;
     let conflict: Option<i64> = stmt
         .query_row(
-            params![space_id.as_str(), new_slug_fold, ability_id.as_str()],
+            params![
+                space_id.as_str(),
+                new_slug_fold,
+                ability_id.as_str(),
+                project.map_or("", FolderId::as_str)
+            ],
             |r| r.get(0),
         )
         .optional()
@@ -5829,1276 +6079,6 @@ fn bump_space_seq_exact_rusqlite(
     Ok(new_last)
 }
 
-// ============================================================================
-// Note-Only `rollback_agent_run` Single-Pass Synchronous `rusqlite` Fast Path
-// ============================================================================
-
-struct RollbackDirectSqliteFastPlan {
-    scope: HistoryScope,
-    auth: EngineAuthContext,
-    request_identity: CommandIdentity,
-    input: RollbackAgentRun,
-    room_fences: Arc<RoomFenceTable>,
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn build_rollback_direct_sqlite_fast_intent(
-    scope: &HistoryScope,
-    active_epoch: LeaseEpoch,
-    idemp: CommandIdentitySpec,
-    auth: EngineAuthContext,
-    request_identity: CommandIdentity,
-    input: RollbackAgentRun,
-    room_fences: Arc<RoomFenceTable>,
-) -> (PreparedWriteIntent, Box<dyn SqliteSyncItemPlan>) {
-    let intent = PreparedWriteIntent {
-        scope: scope.clone(),
-        active_epoch,
-        idempotency: Some(idemp),
-        source_note_ids: Vec::new(),
-        staged_bytes: 0,
-        required_semantic_cut: None,
-        execute: Box::new(|_tx, _ctx| {
-            Box::pin(async {
-                Err(internal_not_committed(
-                    "fast_intent_placeholder_invoked",
-                    "RollbackDirectSqliteFastPlan was not materialized before async fallback",
-                ))
-            })
-        }),
-    };
-    let plan = Box::new(RollbackDirectSqliteFastPlan {
-        scope: scope.clone(),
-        auth,
-        request_identity,
-        input,
-        room_fences,
-    });
-    (intent, plan)
-}
-
-impl SqliteSyncItemPlan for RollbackDirectSqliteFastPlan {
-    fn take_deferred_local_staging(&self) -> Option<DeferredLocalStaging> {
-        None
-    }
-
-    fn requires_savepoint_isolation(&self) -> bool {
-        true
-    }
-
-    fn into_async_exec(self: Box<Self>) -> ItemExecuteFn {
-        let me = *self;
-        build_rollback_direct_single_tx_exec(
-            me.scope,
-            me.auth,
-            me.request_identity,
-            me.input,
-            me.room_fences,
-        )
-    }
-
-    fn execute_sqlite_sync(
-        &self,
-        conn: &rusqlite::Connection,
-        item_ctx: &mut ItemExecCtx,
-        cache: &mut FastBatchSqlCache,
-        batch_now_ts: Timestamp,
-        batch_now_ms: i64,
-        defer_append: Option<&mut DeferredAppendRows>,
-    ) -> Result<ItemCommitArtifacts, FastItemExecError> {
-        let scope_cl = &self.scope;
-        let auth = &self.auth;
-        let input = &self.input;
-
-        // --- 1. Read-only preconditions & pure validation (zero SQL mutations) ---
-        if has_any_board_moves_in_space_rusqlite(conn, &scope_cl.space_id)
-            .map_err(FastItemExecError::PreWrite)?
-        {
-            return Err(FastItemExecError::PreWrite(
-                rollback_fallback_board_present_err(),
-            ));
-        }
-
-        let mut heads_map = verify_run_and_entity_preconditions_note_only_rusqlite(
-            conn,
-            cache,
-            scope_cl,
-            &item_ctx.space,
-            auth,
-            input,
-        )
-        .map_err(FastItemExecError::PreWrite)?;
-
-        let mut closed_room_has_stored_state = HashMap::new();
-        let mut skipped_manual_edits = Vec::new();
-        let mut skipped_room_active = Vec::new();
-        let mut candidates = BTreeMap::new();
-        let mut original_metadata = HashMap::with_capacity(heads_map.len());
-        // Command ends are monotonic. Within each command space_seq orders its events.
-        let mut history = conn.prepare_cached(
-            "WITH touched AS (
-                 SELECT entity_key, MIN(space_seq) AS first_run_seq
-                 FROM revisions
-                 WHERE space_id = ?1 AND entity_type = 'note' AND agent_run_id = ?2
-                 GROUP BY entity_key
-             )
-             SELECT t.entity_key, EXISTS (
-                        SELECT 1 FROM revisions r
-                        WHERE r.space_id = ?1 AND r.entity_type = 'note' AND r.entity_key = t.entity_key
-                          AND r.visibility_seq > t.first_run_seq AND r.space_seq > t.first_run_seq
-                          AND r.agent_run_id IS NOT ?2
-                    ), pre.rev_id, pre.metadata_msgpack,
-                    CASE WHEN s.note_id IS NOT NULL THEN
-                        s.room_state <> 'closed' OR COALESCE(c.carrier_dirty, 0) <> 0 OR EXISTS (
-                            SELECT 1 FROM collab_update_log u
-                            WHERE u.space_id = s.space_id AND u.note_id = s.note_id)
-                    END,
-                    CASE WHEN s.note_id IS NOT NULL THEN
-                        c.note_id IS NOT NULL OR s.yrs_snapshot_blob IS NOT NULL
-                        OR s.yrs_snapshot_blake3 IS NOT NULL OR EXISTS (
-                            SELECT 1 FROM blob_references b WHERE b.space_id = s.space_id
-                              AND b.owner_kind <> 'note_revision' AND b.owner_kind = 'collab_snapshot'
-                              AND b.owner_id = s.note_id)
-                    END,
-                    CASE WHEN pre.rev_id IS NULL THEN (
-                        SELECT r.metadata_msgpack
-                        FROM note_heads h JOIN revisions r ON r.space_id = h.space_id AND r.rev_id = h.head_rev_id
-                        WHERE h.space_id = ?1 AND h.note_id = t.entity_key
-                          AND r.entity_type = 'note' AND r.entity_key = t.entity_key
-                    ) END
-             FROM touched t
-             LEFT JOIN collab_sessions s ON s.space_id = ?1 AND s.note_id = t.entity_key
-             LEFT JOIN collab_checkpoints c USING (space_id, note_id)
-             LEFT JOIN revisions pre ON pre.rowid = (
-                 SELECT r.rowid FROM revisions r
-                 WHERE r.space_id = ?1 AND r.entity_type = 'note' AND r.entity_key = t.entity_key
-                   AND r.space_seq < t.first_run_seq
-                 ORDER BY r.visibility_seq DESC, r.space_seq DESC LIMIT 1
-             )
-             ORDER BY t.entity_key"
-        ).map_err(|err| FastItemExecError::PreWrite(internal_not_committed("sqlite_rollback_history", err.to_string())))?;
-        let map_history_error = |err| {
-            FastItemExecError::PreWrite(map_interrupt_or_internal(err, "sqlite_rollback_history"))
-        };
-        let mut rows = history
-            .query(params![scope_cl.space_id.as_str(), input.run.as_str()])
-            .map_err(map_history_error)?;
-        while let Some(row) = rows.next().map_err(map_history_error)? {
-            let key: &str = row
-                .get_ref(0)
-                .map_err(map_history_error)?
-                .as_str()
-                .map_err(|err| {
-                    FastItemExecError::PreWrite(internal_not_committed(
-                        "sqlite_rollback_note_id",
-                        err.to_string(),
-                    ))
-                })?;
-            let nid = NoteId::parse(key).map_err(|e| FastItemExecError::PreWrite(e.into()))?;
-            let head = heads_map.remove(&nid).ok_or_else(|| {
-                FastItemExecError::PreWrite(
-                    DomainError::validation(ValidationReason::SourceMismatch).into(),
-                )
-            })?;
-            if row.get::<_, bool>(1).map_err(map_history_error)? {
-                skipped_manual_edits.push(nid);
-                continue;
-            }
-            if let Some(blocked) = row.get::<_, Option<bool>>(4).map_err(map_history_error)? {
-                if blocked {
-                    skipped_room_active.push(nid);
-                    continue;
-                }
-                let has_stored_state: bool = row.get(5).map_err(map_history_error)?;
-                closed_room_has_stored_state.insert(nid.clone(), has_stored_state);
-            }
-            let pre_raw: Option<String> = row.get(2).map_err(map_history_error)?;
-            let Some(pre_raw) = pre_raw else {
-                let bytes: Vec<u8> = row.get(6).map_err(map_history_error)?;
-                let metadata =
-                    decode_rollback_note(&bytes, &nid).map_err(FastItemExecError::PreWrite)?;
-                candidates.insert(
-                    nid,
-                    CandidateAction::TrashCreated {
-                        metadata: Box::new(metadata),
-                        current_rev: head.head_rev_id,
-                        current_lifecycle: head.lifecycle,
-                        doc_class: head.doc_class,
-                        parent_folder_id: head.parent_folder_id,
-                        slug: head.slug,
-                        slug_fold: head.slug_fold,
-                        title: head.title,
-                        ability_id: head.ability_id,
-                        visibility_mask: head.visibility_mask,
-                        byte_size: head.byte_size,
-                        content_digest: head.content_digest,
-                    },
-                );
-                continue;
-            };
-            let pre_rev_id =
-                RevisionId::parse(&pre_raw).map_err(|e| FastItemExecError::PreWrite(e.into()))?;
-            let bytes: Vec<u8> = row.get(3).map_err(map_history_error)?;
-            let pre_meta =
-                decode_rollback_note(&bytes, &nid).map_err(FastItemExecError::PreWrite)?;
-            let head_unchanged_placement = head.lifecycle == pre_meta.lifecycle
-                && head.parent_folder_id == pre_meta.parent_folder_id
-                && head.slug == pre_meta.slug
-                && head.slug_fold == pre_meta.slug_fold;
-            let needs_note_mutation = head.head_rev_id != pre_rev_id || !head_unchanged_placement;
-            original_metadata.insert(nid.clone(), bytes);
-            candidates.insert(
-                nid,
-                CandidateAction::RestorePreExisting {
-                    current_rev: head.head_rev_id,
-                    pre_rev_id,
-                    pre_meta: Box::new(pre_meta),
-                    pre_carrier: None,
-                    needs_note_mutation,
-                    head_unchanged_placement,
-                },
-            );
-        }
-        drop(rows);
-        drop(history);
-
-        // Lock per-note fences in ascending NoteId order before collision checks so no room can open/close
-        // concurrently and any PreWrite error drops the guards without bumping fence epochs.
-        let mut eligible_notes: BTreeMap<NoteId, CandidateAction> = BTreeMap::new();
-        let mut locked_fences = Vec::with_capacity(candidates.len());
-        for (nid, action) in candidates {
-            match self
-                .room_fences
-                .try_lock_closed_for_rollback_blocking(scope_cl, &nid, &self.request_identity)
-                .map_err(FastItemExecError::PreWrite)?
-            {
-                Some((guard, res)) => {
-                    locked_fences.push((guard, res));
-                    eligible_notes.insert(nid, action);
-                }
-                None => {
-                    skipped_room_active.push(nid);
-                }
-            }
-        }
-        skipped_room_active.sort();
-
-        let eligible_all_ids: BTreeSet<NoteId> = eligible_notes.keys().cloned().collect();
-        let mut planned_active_slots: HashMap<(FolderId, String), NoteId> = HashMap::new();
-        let mut restored_ancestries: HashMap<NoteId, bool> = HashMap::new();
-
-        for (nid, action) in &eligible_notes {
-            if let CandidateAction::RestorePreExisting {
-                pre_meta,
-                head_unchanged_placement,
-                ..
-            } = action
-            {
-                let require_active_folder = pre_meta.lifecycle == Lifecycle::Active;
-                let (after, anc) = build_resource_facts_cached(
-                    conn,
-                    cache,
-                    &item_ctx.space,
-                    &pre_meta.parent_folder_id,
-                    pre_meta.doc_class,
-                    pre_meta.ability_id.clone(),
-                    require_active_folder,
-                )
-                .map_err(FastItemExecError::PreWrite)?;
-                auth.authorize_direct_write(&after, &after)
-                    .map_err(|err| FastItemExecError::PreWrite(err.into()))?;
-                restored_ancestries.insert(nid.clone(), anc.is_root_child);
-
-                if pre_meta.lifecycle == Lifecycle::Active {
-                    let slot_key = (
-                        pre_meta.parent_folder_id.clone(),
-                        pre_meta.slug_fold.clone(),
-                    );
-                    if planned_active_slots.insert(slot_key, nid.clone()).is_some() {
-                        return Err(FastItemExecError::PreWrite(
-                            DomainError::PathConflict {
-                                target: PathTarget {
-                                    space_id: scope_cl.space_id.clone(),
-                                    parent: if anc.is_root_child {
-                                        None
-                                    } else {
-                                        Some(pre_meta.parent_folder_id.clone())
-                                    },
-                                    component: pre_meta.slug.clone(),
-                                },
-                            }
-                            .into(),
-                        ));
-                    }
-                    if !*head_unchanged_placement
-                        && let Some(occ_nid) = active_occupant_note_id_rusqlite(
-                            conn,
-                            &scope_cl.space_id,
-                            &pre_meta.parent_folder_id,
-                            &pre_meta.slug_fold,
-                        )
-                        .map_err(FastItemExecError::PreWrite)?
-                        && !eligible_all_ids.contains(&occ_nid)
-                    {
-                        return Err(FastItemExecError::PreWrite(
-                            DomainError::PathConflict {
-                                target: PathTarget {
-                                    space_id: scope_cl.space_id.clone(),
-                                    parent: if anc.is_root_child {
-                                        None
-                                    } else {
-                                        Some(pre_meta.parent_folder_id.clone())
-                                    },
-                                    component: pre_meta.slug.clone(),
-                                },
-                            }
-                            .into(),
-                        ));
-                    }
-                }
-            }
-        }
-
-        // Pre-verify all existing active blobs that will be bound to new trash/restore revisions.
-        let mut unique_digests: Vec<ContentDigest> = Vec::with_capacity(eligible_notes.len());
-        for action in eligible_notes.values() {
-            match action {
-                CandidateAction::TrashCreated {
-                    current_lifecycle,
-                    content_digest: Some(d),
-                    ..
-                } if *current_lifecycle != Lifecycle::Trashed => {
-                    unique_digests.push(*d);
-                }
-                CandidateAction::RestorePreExisting {
-                    needs_note_mutation: true,
-                    pre_meta,
-                    ..
-                } => {
-                    if let Some(d) = pre_meta.content_digest {
-                        unique_digests.push(d);
-                    }
-                }
-                _ => {}
-            }
-        }
-        unique_digests.sort_unstable();
-        unique_digests.dedup();
-
-        let mut pub_by_digest: HashMap<ContentDigest, (Option<usize>, String)> =
-            HashMap::with_capacity(unique_digests.len());
-        if !unique_digests.is_empty() {
-            let mut cat_stmt = conn
-                .prepare_cached(
-                    "SELECT admission_state, blob_state, current_publication_id
-                     FROM blob_catalog WHERE space_id = ?1 AND content_blake3 = ?2",
-                )
-                .map_err(|err| {
-                    FastItemExecError::PreWrite(internal_not_committed(
-                        "sqlite_rebind_cat_prep",
-                        err.to_string(),
-                    ))
-                })?;
-            for d in &unique_digests {
-                if let Some((idx, pub_id)) = cache
-                    .in_batch_new_blobs
-                    .get(&(scope_cl.space_id.clone(), *d))
-                {
-                    pub_by_digest.insert(*d, (Some(*idx), pub_id.clone()));
-                    continue;
-                }
-                let row_opt: Option<(String, String, Option<String>)> = cat_stmt
-                    .query_row(
-                        params![scope_cl.space_id.as_str(), d.as_bytes().as_slice()],
-                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-                    )
-                    .optional()
-                    .map_err(|err| {
-                        FastItemExecError::PreWrite(internal_not_committed(
-                            "sqlite_rebind_cat_row",
-                            err.to_string(),
-                        ))
-                    })?;
-                let Some((admission, blob_state, Some(pub_id))) = row_opt else {
-                    return Err(FastItemExecError::PreWrite(unavailable_retryable(
-                        "blob_missing_for_rebind",
-                        "existing blob publication missing during metadata revision bind",
-                        Duration::from_millis(25),
-                    )));
-                };
-                if admission != "open" || blob_state != "active" {
-                    return Err(FastItemExecError::PreWrite(unavailable_retryable(
-                        "blob_retiring_on_rebind",
-                        "existing blob entered retirement before metadata revision commit",
-                        Duration::from_millis(25),
-                    )));
-                }
-                pub_by_digest.insert(*d, (None, pub_id));
-            }
-        }
-
-        let current_schema = load_current_space_schema_cached(conn, cache, &scope_cl.space_id)
-            .map_err(FastItemExecError::PreWrite)?;
-        let space_has_overlays = has_any_overlays_in_space_rusqlite(conn, &scope_cl.space_id)
-            .map_err(FastItemExecError::PreWrite)?;
-
-        let mut trash_ancestries: HashMap<NoteId, bool> = HashMap::new();
-        for (nid, action) in &eligible_notes {
-            if let CandidateAction::TrashCreated {
-                current_lifecycle,
-                parent_folder_id,
-                doc_class,
-                ability_id,
-                ..
-            } = action
-                && *current_lifecycle != Lifecycle::Trashed
-            {
-                let (_, anc) = build_resource_facts_cached(
-                    conn,
-                    cache,
-                    &item_ctx.space,
-                    parent_folder_id,
-                    *doc_class,
-                    ability_id.clone(),
-                    false,
-                )
-                .map_err(FastItemExecError::PreWrite)?;
-                trash_ancestries.insert(nid.clone(), anc.is_root_child);
-            }
-        }
-
-        let trash_note_count = eligible_notes
-            .values()
-            .filter(|act| {
-                matches!(
-                    act,
-                    CandidateAction::TrashCreated {
-                        current_lifecycle,
-                        ..
-                    } if *current_lifecycle != Lifecycle::Trashed
-                )
-            })
-            .count() as u64;
-        let restore_note_count = eligible_notes
-            .values()
-            .filter(|act| {
-                matches!(
-                    act,
-                    CandidateAction::RestorePreExisting {
-                        needs_note_mutation: true,
-                        ..
-                    }
-                )
-            })
-            .count() as u64;
-        let rank_removals = if space_has_overlays {
-            rank_removal::plan_rusqlite(conn, &scope_cl.space_id, &eligible_notes)
-                .map_err(FastItemExecError::PreWrite)?
-        } else {
-            Vec::new()
-        };
-        let total_seqs =
-            (trash_note_count + restore_note_count + rank_removals.len() as u64).max(1);
-        let (first_seq, visibility_seq) = item_ctx
-            .preview_seq_range(total_seqs)
-            .map_err(FastItemExecError::PreWrite)?;
-
-        // Consume all closed-room reservations in ascending NoteId order after all PreWrite checks pass.
-        for (mut guard, res) in locked_fences {
-            guard
-                .consume(res, &self.request_identity)
-                .map_err(|e| FastItemExecError::PreWrite(e.into()))?;
-            item_ctx.retain_until_batch_commit(guard);
-        }
-
-        // --- 2. Authoritative SQL writes ---
-        let vis_i64 = visibility_seq.get() as i64;
-        let (sec, nsec) = encode_timestamp_parts(batch_now_ts);
-        let actor_str = auth.principal().as_str();
-        let mut id_pool = ordered_ids_batch((total_seqs as usize) + 3)
-            .map_err(FastItemExecError::PreWrite)?
-            .into_iter();
-        let mut next_fast_rev_id = || -> Result<RevisionId, FastItemExecError> {
-            let suffix = hex::encode(id_pool.next().expect("id_pool pre-sized"));
-            RevisionId::parse(&format!("rev_{suffix}"))
-                .map_err(|e| FastItemExecError::PostWrite(e.into()))
-        };
-
-        let mut events = Vec::with_capacity(total_seqs as usize);
-        let mut trashed_out = Vec::with_capacity(trash_note_count as usize);
-        let mut restored_out = Vec::with_capacity(restore_note_count as usize);
-        let mut owner_notes_for_receipt: BTreeSet<NoteId> = BTreeSet::new();
-        let mut pending_blob_rebinds: Vec<(NoteId, RevisionId, ContentDigest, SpaceSeq)> =
-            Vec::with_capacity(eligible_notes.len());
-        struct PendingFastRev {
-            rev_id: RevisionId,
-            entity_key: String,
-            space_seq: SpaceSeq,
-            parent_rev_id: RevisionId,
-            restored_from_rev_id: Option<RevisionId>,
-            content_blake3: Option<ContentDigest>,
-            metadata_msgpack: Vec<u8>,
-        }
-        let mut empty_rooms = Vec::new();
-        let mut sync_room = |note: &NoteId, revision: &RevisionId| -> Result<(), PortError> {
-            match closed_room_has_stored_state.get(note) {
-                Some(true) => sync_closed_collab_session_on_direct_write_rusqlite(
-                    conn,
-                    &scope_cl.space_id,
-                    note,
-                    revision,
-                    visibility_seq,
-                ),
-                Some(false) => {
-                    empty_rooms.push(note.as_str().to_owned());
-                    Ok(())
-                }
-                None => Ok(()),
-            }
-        };
-        let mut pending_rev_rows: Vec<PendingFastRev> = Vec::with_capacity(eligible_notes.len());
-
-        // 2a. Trash run-created eligible notes FIRST so colliding sibling slots are freed before restore.
-        {
-            let mut trash_stmt = conn
-                .prepare_cached(
-                    "UPDATE note_heads
-                     SET head_rev_id = ?1, lifecycle_state = 'trashed', updated_seq = ?2,
-                         updated_at_sec = ?3, updated_at_nsec = ?4, last_actor_id = ?5
-                     WHERE space_id = ?6 AND note_id = ?7",
-                )
-                .map_err(|err| {
-                    FastItemExecError::PostWrite(internal_not_committed(
-                        "sqlite_rb_trash_prep",
-                        err.to_string(),
-                    ))
-                })?;
-
-            for (nid, action) in &eligible_notes {
-                let CandidateAction::TrashCreated {
-                    metadata,
-                    current_rev,
-                    current_lifecycle,
-                    doc_class,
-                    content_digest,
-                    ..
-                } = action
-                else {
-                    continue;
-                };
-
-                owner_notes_for_receipt.insert(nid.clone());
-
-                if *current_lifecycle == Lifecycle::Trashed {
-                    trashed_out.push(NoteRevision {
-                        note: nid.clone(),
-                        revision: current_rev.clone(),
-                    });
-                    continue;
-                }
-
-                let tseq = item_ctx
-                    .alloc_next_seq()
-                    .map_err(FastItemExecError::PostWrite)?;
-                let trev = next_fast_rev_id()?;
-                let is_root_child = trash_ancestries.get(nid).copied().unwrap_or(false);
-
-                trash_stmt
-                    .execute(params![
-                        trev.as_str(),
-                        vis_i64,
-                        sec,
-                        nsec,
-                        actor_str,
-                        scope_cl.space_id.as_str(),
-                        nid.as_str(),
-                    ])
-                    .map_err(|err| {
-                        FastItemExecError::PostWrite(internal_not_committed(
-                            "sqlite_rb_trash_exec",
-                            err.to_string(),
-                        ))
-                    })?;
-
-                cache
-                    .in_batch_modified_notes
-                    .insert((scope_cl.space_id.clone(), nid.clone()));
-
-                sync_room(nid, &trev).map_err(FastItemExecError::PostWrite)?;
-
-                if let Some(digest) = *content_digest {
-                    pending_blob_rebinds.push((nid.clone(), trev.clone(), digest, tseq));
-                }
-
-                let meta =
-                    encode_rollback_note(metadata, None, is_root_child, RollbackRevision::Trash)
-                        .map_err(FastItemExecError::PostWrite)?;
-
-                pending_rev_rows.push(PendingFastRev {
-                    rev_id: trev.clone(),
-                    entity_key: nid.as_str().to_owned(),
-                    space_seq: tseq,
-                    parent_rev_id: current_rev.clone(),
-                    restored_from_rev_id: None,
-                    content_blake3: *content_digest,
-                    metadata_msgpack: meta,
-                });
-
-                events.push(BatchEventDraft {
-                    space_seq: tseq,
-                    entity_type: "note".to_owned(),
-                    entity_id: nid.as_str().to_owned(),
-                    op_kind: "trash".to_owned(),
-                    rev_id: trev.clone(),
-                    lifecycle: Lifecycle::Trashed,
-                    doc_class: Some(*doc_class),
-                });
-                trashed_out.push(NoteRevision {
-                    note: nid.clone(),
-                    revision: trev,
-                });
-            }
-        }
-
-        // 2b. Restore pre-existing eligible notes (`restored_from_rev_id = Some(pre_rev_id)`).
-        {
-            let mut restore_full_stmt = conn
-                .prepare_cached(
-                    "UPDATE note_heads
-                     SET parent_folder_id = ?1, slug = ?2, slug_fold = ?3, title = ?4, title_fold = ?5,
-                         doc_class = ?6, ability_id = ?7, head_rev_id = ?8, content_blake3 = ?9,
-                         byte_size = ?10, lifecycle_state = ?11, visibility_mask = ?12,
-                         updated_seq = ?13, updated_at_sec = ?14, updated_at_nsec = ?15, last_actor_id = ?16
-                     WHERE space_id = ?17 AND note_id = ?18",
-                )
-                .map_err(|err| {
-                    FastItemExecError::PostWrite(internal_not_committed(
-                        "sqlite_rb_restore_prep",
-                        err.to_string(),
-                    ))
-                })?;
-            let mut restore_inplace_stmt = conn
-                .prepare_cached(
-                    "UPDATE note_heads
-                     SET title = ?1, title_fold = ?2, doc_class = ?3, ability_id = ?4,
-                         head_rev_id = ?5, content_blake3 = ?6, byte_size = ?7, visibility_mask = ?8,
-                         updated_seq = ?9, updated_at_sec = ?10, updated_at_nsec = ?11, last_actor_id = ?12
-                     WHERE space_id = ?13 AND note_id = ?14",
-                )
-                .map_err(|err| {
-                    FastItemExecError::PostWrite(internal_not_committed(
-                        "sqlite_rb_restore_inplace_prep",
-                        err.to_string(),
-                    ))
-                })?;
-
-            for (nid, action) in &eligible_notes {
-                let CandidateAction::RestorePreExisting {
-                    current_rev,
-                    pre_rev_id,
-                    pre_meta,
-                    needs_note_mutation,
-                    head_unchanged_placement,
-                    ..
-                } = action
-                else {
-                    continue;
-                };
-                owner_notes_for_receipt.insert(nid.clone());
-
-                if !*needs_note_mutation {
-                    continue;
-                }
-
-                let rseq = item_ctx
-                    .alloc_next_seq()
-                    .map_err(FastItemExecError::PostWrite)?;
-                let rrev = next_fast_rev_id()?;
-                let is_root_child = restored_ancestries.get(nid).copied().unwrap_or(false);
-
-                if let Some(digest) = pre_meta.content_digest {
-                    pending_blob_rebinds.push((nid.clone(), rrev.clone(), digest, rseq));
-                }
-
-                let title_fold = if pre_meta.doc_class == DocClass::EncryptedNote {
-                    normalize_title_key(&pre_meta.slug)
-                } else {
-                    normalize_title_key(&pre_meta.title)
-                };
-                let digest_slice = pre_meta
-                    .content_digest
-                    .as_ref()
-                    .map(|d| d.as_bytes().as_slice());
-
-                if *head_unchanged_placement {
-                    restore_inplace_stmt
-                        .execute(params![
-                            &pre_meta.title,
-                            title_fold,
-                            doc_class_to_db(pre_meta.doc_class),
-                            pre_meta.ability_id.as_ref().map(|a| a.as_str()),
-                            rrev.as_str(),
-                            digest_slice,
-                            pre_meta.byte_size as i64,
-                            i64::from(pre_meta.visibility_mask),
-                            vis_i64,
-                            sec,
-                            nsec,
-                            actor_str,
-                            scope_cl.space_id.as_str(),
-                            nid.as_str(),
-                        ])
-                        .map_err(|err| {
-                            FastItemExecError::PostWrite(internal_not_committed(
-                                "sqlite_rb_restore_inplace_exec",
-                                err.to_string(),
-                            ))
-                        })?;
-                } else {
-                    restore_full_stmt
-                        .execute(params![
-                            pre_meta.parent_folder_id.as_str(),
-                            &pre_meta.slug,
-                            &pre_meta.slug_fold,
-                            &pre_meta.title,
-                            title_fold,
-                            doc_class_to_db(pre_meta.doc_class),
-                            pre_meta.ability_id.as_ref().map(|a| a.as_str()),
-                            rrev.as_str(),
-                            digest_slice,
-                            pre_meta.byte_size as i64,
-                            lifecycle_to_db(pre_meta.lifecycle),
-                            i64::from(pre_meta.visibility_mask),
-                            vis_i64,
-                            sec,
-                            nsec,
-                            actor_str,
-                            scope_cl.space_id.as_str(),
-                            nid.as_str(),
-                        ])
-                        .map_err(|err| {
-                            FastItemExecError::PostWrite(internal_not_committed(
-                                "sqlite_rb_restore_exec",
-                                err.to_string(),
-                            ))
-                        })?;
-                }
-
-                cache
-                    .in_batch_modified_notes
-                    .insert((scope_cl.space_id.clone(), nid.clone()));
-
-                sync_room(nid, &rrev).map_err(FastItemExecError::PostWrite)?;
-
-                let meta = encode_rollback_note(
-                    pre_meta,
-                    original_metadata.remove(nid).map(Into::into),
-                    is_root_child,
-                    RollbackRevision::Restore(current_schema.as_deref()),
-                )
-                .map_err(FastItemExecError::PostWrite)?;
-
-                pending_rev_rows.push(PendingFastRev {
-                    rev_id: rrev.clone(),
-                    entity_key: nid.as_str().to_owned(),
-                    space_seq: rseq,
-                    parent_rev_id: current_rev.clone(),
-                    restored_from_rev_id: Some(pre_rev_id.clone()),
-                    content_blake3: pre_meta.content_digest,
-                    metadata_msgpack: meta,
-                });
-
-                events.push(BatchEventDraft {
-                    space_seq: rseq,
-                    entity_type: "note".to_owned(),
-                    entity_id: nid.as_str().to_owned(),
-                    op_kind: "restore".to_owned(),
-                    rev_id: rrev.clone(),
-                    lifecycle: pre_meta.lifecycle,
-                    doc_class: Some(pre_meta.doc_class),
-                });
-                restored_out.push(NoteRevision {
-                    note: nid.clone(),
-                    revision: rrev,
-                });
-            }
-        }
-
-        if !empty_rooms.is_empty() {
-            // The writer transaction owns the changed heads and their room rows. Only
-            // rooms proven to have no checkpoint, updates, snapshot or references reach here.
-            let room_error = |err: rusqlite::Error| {
-                FastItemExecError::PostWrite(internal_not_committed(
-                    "sqlite_rollback_rooms",
-                    err.to_string(),
-                ))
-            };
-            let ids = serde_json::to_string(&empty_rooms).map_err(|err| {
-                FastItemExecError::PostWrite(internal_not_committed(
-                    "sqlite_rollback_rooms",
-                    err.to_string(),
-                ))
-            })?;
-            let mut update = conn
-                .prepare_cached(
-                    "UPDATE collab_sessions AS s
-                 SET lineage_epoch = lineage_epoch + 1, updated_seq = ?1,
-                     carrier_rev_id = (SELECT h.head_rev_id FROM note_heads h
-                                       WHERE h.space_id = s.space_id AND h.note_id = s.note_id)
-                 WHERE s.space_id = ?2 AND s.room_state = 'closed'
-                   AND s.note_id IN (SELECT value FROM json_each(?3))",
-                )
-                .map_err(room_error)?;
-            let affected = update
-                .execute(params![vis_i64, scope_cl.space_id.as_str(), ids])
-                .map_err(room_error)?;
-            if affected != empty_rooms.len() {
-                return Err(FastItemExecError::PostWrite(internal_not_committed(
-                    "sqlite_rollback_rooms",
-                    "closed rollback room was not updated",
-                )));
-            }
-        }
-
-        for removal in rank_removals {
-            let seq = item_ctx
-                .alloc_next_seq()
-                .map_err(FastItemExecError::PostWrite)?;
-            let revision = next_fast_rev_id()?;
-            removal
-                .delete_rusqlite(conn, &scope_cl.space_id)
-                .map_err(FastItemExecError::PostWrite)?;
-            let metadata = removal
-                .revision_metadata()
-                .map_err(FastItemExecError::PostWrite)?;
-            insert_revision_row_rusqlite(
-                conn,
-                scope_cl,
-                &revision,
-                "rank",
-                &removal.entity_key(),
-                seq,
-                visibility_seq,
-                Some(&removal.previous),
-                None,
-                None,
-                &metadata,
-                auth.principal(),
-                None,
-                batch_now_ts,
-            )
-            .map_err(FastItemExecError::PostWrite)?;
-            owner_notes_for_receipt.extend(removal.owners().into_iter().cloned());
-            events.push(removal.event(seq, revision));
-        }
-
-        // 2c. Rebind existing active CAS blobs + append revision rows + bump `agent_run_heads`.
-        if let Some(buf) = defer_append {
-            let mut delta_persisted: HashMap<ContentDigest, i64> =
-                HashMap::with_capacity(pub_by_digest.len());
-            for (nid, rev_id, digest, cseq) in &pending_blob_rebinds {
-                let (in_batch_idx, pub_id) =
-                    pub_by_digest.get(digest).expect("verified digest present");
-                if let Some(idx) = in_batch_idx {
-                    buf.blob_catalog[*idx].ref_count += 1;
-                } else {
-                    *delta_persisted.entry(*digest).or_insert(0) += 1;
-                }
-                buf.blob_references.push(DeferredBlobRefRow {
-                    space_id: scope_cl.space_id.as_str().to_owned(),
-                    owner_kind: BlobOwnerKind::NoteRevision.as_db_str(),
-                    owner_id: nid.as_str().to_owned(),
-                    owner_rev_id: rev_id.as_str().to_owned(),
-                    resource_key: "carrier".to_owned(),
-                    content_blake3: SqlBlob32(*digest.as_bytes()),
-                    publication_id: pub_id.clone(),
-                    created_seq: cseq.get() as i64,
-                });
-            }
-
-            if !delta_persisted.is_empty() {
-                let mut upd_cat = conn
-                    .prepare_cached(
-                        "UPDATE blob_catalog
-                         SET ref_count = ref_count + ?1, touched_at_ms = ?2
-                         WHERE space_id = ?3 AND content_blake3 = ?4",
-                    )
-                    .map_err(|err| {
-                        FastItemExecError::PostWrite(internal_not_committed(
-                            "sqlite_rebind_upd_cat_prep",
-                            err.to_string(),
-                        ))
-                    })?;
-                for (digest, delta) in delta_persisted {
-                    upd_cat
-                        .execute(params![
-                            delta,
-                            batch_now_ms,
-                            scope_cl.space_id.as_str(),
-                            digest.as_bytes().as_slice(),
-                        ])
-                        .map_err(|err| {
-                            FastItemExecError::PostWrite(internal_not_committed(
-                                "sqlite_rebind_upd_cat_exec",
-                                err.to_string(),
-                            ))
-                        })?;
-                }
-            }
-
-            for r in pending_rev_rows {
-                buf.revisions.push(DeferredRevisionRow {
-                    space_id: scope_cl.space_id.as_str().to_owned(),
-                    incarnation: SqlBlob16(*scope_cl.incarnation.as_bytes()),
-                    rev_id: r.rev_id.as_str().to_owned(),
-                    entity_type: "note",
-                    entity_key: r.entity_key,
-                    space_seq: r.space_seq.get() as i64,
-                    visibility_seq: vis_i64,
-                    parent_rev_id: Some(r.parent_rev_id.as_str().to_owned()),
-                    restored_from_rev_id: r.restored_from_rev_id.map(|id| id.as_str().to_owned()),
-                    content_blake3: r.content_blake3.map(|d| SqlBlob32(*d.as_bytes())),
-                    metadata_msgpack: r.metadata_msgpack,
-                    actor_id: actor_str.to_owned(),
-                    agent_run_id: None,
-                    sec,
-                    nsec,
-                });
-            }
-
-            let new_run_rev = upsert_agent_run_head_rusqlite_deferred(
-                conn,
-                scope_cl,
-                &input.run,
-                auth.principal(),
-                visibility_seq,
-                visibility_seq,
-                batch_now_ts,
-                buf,
-            )
-            .map_err(FastItemExecError::PostWrite)?;
-
-            if events.is_empty() {
-                let noop_seq = item_ctx
-                    .alloc_next_seq()
-                    .map_err(FastItemExecError::PostWrite)?;
-                events.push(BatchEventDraft {
-                    space_seq: noop_seq,
-                    entity_type: "folder".to_owned(),
-                    entity_id: item_ctx.root_folder_id.as_str().to_owned(),
-                    op_kind: "edit".to_owned(),
-                    rev_id: new_run_rev,
-                    lifecycle: Lifecycle::Active,
-                    doc_class: None,
-                });
-            }
-        } else {
-            pending_blob_rebinds.sort_unstable_by(|a, b| {
-                (a.1.as_str(), a.0.as_str()).cmp(&(b.1.as_str(), b.0.as_str()))
-            });
-            pending_rev_rows.sort_unstable_by(|a, b| a.rev_id.as_str().cmp(b.rev_id.as_str()));
-
-            let mut delta_persisted: BTreeMap<[u8; 32], i64> = BTreeMap::new();
-            {
-                let mut ins_ref = conn
-                    .prepare_cached(
-                        "INSERT OR IGNORE INTO blob_references (
-                            space_id, owner_kind, owner_id, owner_rev_id, resource_key,
-                            content_blake3, publication_id, created_seq
-                        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                    )
-                    .map_err(|err| {
-                        FastItemExecError::PostWrite(internal_not_committed(
-                            "sqlite_rebind_ins_ref_prep",
-                            err.to_string(),
-                        ))
-                    })?;
-                let owner_kind_str = BlobOwnerKind::NoteRevision.as_db_str();
-                for (nid, rev_id, digest, cseq) in &pending_blob_rebinds {
-                    let (_, pub_id) = pub_by_digest.get(digest).expect("verified digest present");
-                    let inserted = ins_ref
-                        .execute(params![
-                            scope_cl.space_id.as_str(),
-                            owner_kind_str,
-                            nid.as_str(),
-                            rev_id.as_str(),
-                            "carrier",
-                            digest.as_bytes().as_slice(),
-                            pub_id,
-                            cseq.get() as i64,
-                        ])
-                        .map_err(|err| {
-                            FastItemExecError::PostWrite(internal_not_committed(
-                                "sqlite_rebind_ins_ref_exec",
-                                err.to_string(),
-                            ))
-                        })?;
-                    if inserted > 0 {
-                        *delta_persisted.entry(*digest.as_bytes()).or_insert(0) += inserted as i64;
-                    }
-                }
-            }
-            if !delta_persisted.is_empty() {
-                let mut upd_cat = conn
-                    .prepare_cached(
-                        "UPDATE blob_catalog
-                         SET ref_count = ref_count + ?1, touched_at_ms = ?2
-                         WHERE space_id = ?3 AND content_blake3 = ?4",
-                    )
-                    .map_err(|err| {
-                        FastItemExecError::PostWrite(internal_not_committed(
-                            "sqlite_rebind_upd_cat_prep",
-                            err.to_string(),
-                        ))
-                    })?;
-                for (digest_arr, delta) in delta_persisted {
-                    upd_cat
-                        .execute(params![
-                            delta,
-                            batch_now_ms,
-                            scope_cl.space_id.as_str(),
-                            digest_arr.as_slice(),
-                        ])
-                        .map_err(|err| {
-                            FastItemExecError::PostWrite(internal_not_committed(
-                                "sqlite_rebind_upd_cat_exec",
-                                err.to_string(),
-                            ))
-                        })?;
-                }
-            }
-
-            {
-                let mut rev_stmt = conn
-                    .prepare_cached(
-                        "INSERT INTO revisions (
-                            space_id, history_incarnation, rev_id, entity_type, entity_key,
-                            space_seq, visibility_seq, parent_rev_id, their_rev_id, restored_from_rev_id,
-                            content_blake3, metadata_msgpack, patch_meta_json, actor_id, session_id,
-                            agent_run_id, quarantine_reason, created_at_sec, created_at_nsec
-                        ) VALUES (
-                            ?1, ?2, ?3, 'note', ?4,
-                            ?5, ?6, ?7, NULL, ?8,
-                            ?9, ?10, NULL, ?11, NULL,
-                            NULL, NULL, ?12, ?13
-                        )",
-                    )
-                    .map_err(|err| {
-                        FastItemExecError::PostWrite(internal_not_committed(
-                            "sqlite_rb_ins_rev_prep",
-                            err.to_string(),
-                        ))
-                    })?;
-                let inc_slice = scope_cl.incarnation.as_bytes().as_slice();
-                for r in &pending_rev_rows {
-                    let restored_str = r.restored_from_rev_id.as_ref().map(RevisionId::as_str);
-                    let digest_slice = r.content_blake3.as_ref().map(|d| d.as_bytes().as_slice());
-                    rev_stmt
-                        .execute(params![
-                            scope_cl.space_id.as_str(),
-                            inc_slice,
-                            r.rev_id.as_str(),
-                            &r.entity_key,
-                            r.space_seq.get() as i64,
-                            vis_i64,
-                            r.parent_rev_id.as_str(),
-                            restored_str,
-                            digest_slice,
-                            &r.metadata_msgpack,
-                            actor_str,
-                            sec,
-                            nsec,
-                        ])
-                        .map_err(|err| {
-                            FastItemExecError::PostWrite(internal_not_committed(
-                                "sqlite_rb_ins_rev_exec",
-                                err.to_string(),
-                            ))
-                        })?;
-                }
-            }
-
-            let new_run_rev = upsert_agent_run_head_rusqlite(
-                conn,
-                scope_cl,
-                &input.run,
-                auth.principal(),
-                visibility_seq,
-                visibility_seq,
-                batch_now_ts,
-            )
-            .map_err(FastItemExecError::PostWrite)?;
-
-            if events.is_empty() {
-                let noop_seq = item_ctx
-                    .alloc_next_seq()
-                    .map_err(FastItemExecError::PostWrite)?;
-                events.push(BatchEventDraft {
-                    space_seq: noop_seq,
-                    entity_type: "folder".to_owned(),
-                    entity_id: item_ctx.root_folder_id.as_str().to_owned(),
-                    op_kind: "edit".to_owned(),
-                    rev_id: new_run_rev,
-                    lifecycle: Lifecycle::Active,
-                    doc_class: None,
-                });
-            }
-        }
-
-        let owner_vec: Vec<NoteId> = owner_notes_for_receipt.into_iter().collect();
-        let cmd_range = CommandSeqRange::new(first_seq, visibility_seq)
-            .map_err(|e| FastItemExecError::PostWrite(e.into()))?;
-        let effect_draft = build_effect_payload_draft(
-            format!(
-                "pay_{}",
-                hex::encode(id_pool.next().expect("id_pool pre-sized"))
-            ),
-            scope_cl.clone(),
-            cmd_range,
-            "rollback_agent_run",
-            EffectBodyV1::AwaitProjection {
-                reason: StoredAwaitReasonV1::Bulk,
-            },
-            owner_vec.clone(),
-        )
-        .map_err(FastItemExecError::PostWrite)?;
-
-        let receipt_token = MutationReceiptToken::new(scope_cl.clone(), visibility_seq)
-            .map_err(|e| FastItemExecError::PostWrite(e.into()))?;
-        let wire = StoredCommittedRollbackV1 {
-            restored: restored_out,
-            trashed: trashed_out,
-            restored_ranks: Vec::new(),
-            skipped_manual_edits: skipped_manual_edits.clone(),
-            skipped_room_active: skipped_room_active.clone(),
-            receipt: receipt_token.clone(),
-        };
-        let resp_bytes = encode_msgpack(&wire).map_err(FastItemExecError::PostWrite)?;
-        let sanitized = encode_msgpack(&StoredCommittedRollbackV1 {
-            restored: Vec::new(),
-            trashed: Vec::new(),
-            restored_ranks: Vec::new(),
-            skipped_manual_edits,
-            skipped_room_active,
-            receipt: receipt_token,
-        })
-        .map_err(FastItemExecError::PostWrite)?;
-
-        Ok(ItemCommitArtifacts {
-            command_id: format!(
-                "cmd_{}",
-                hex::encode(id_pool.next().expect("id_pool pre-sized"))
-            ),
-            command_kind: "rollback_agent_run".to_owned(),
-            events,
-            change_payload: Some(effect_draft),
-            receipt_detail_blob: Some(resp_bytes.clone()),
-            receipt_sanitized_blob: sanitized,
-            receipt_owner_note_ids: owner_vec,
-            response_bytes: resp_bytes,
-        })
-    }
-}
-
-fn verify_run_and_entity_preconditions_note_only_rusqlite(
-    conn: &rusqlite::Connection,
-    cache: &mut FastBatchSqlCache,
-    scope: &HistoryScope,
-    space: &Space,
-    auth: &EngineAuthContext,
-    input: &RollbackAgentRun,
-) -> Result<BTreeMap<NoteId, NoteHeadRow>, PortError> {
-    auth.authorize_space_write(space)?;
-    let run_row: Option<(Vec<u8>, String)> = {
-        let mut stmt = conn
-            .prepare_cached(
-                "SELECT history_incarnation, run_revision FROM agent_run_heads
-                 WHERE space_id = ?1 AND run_id = ?2",
-            )
-            .map_err(|err| internal_not_committed("sqlite_load_run_head", err.to_string()))?;
-        stmt.query_row(params![scope.space_id.as_str(), input.run.as_str()], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })
-        .optional()
-        .map_err(|err| map_interrupt_or_internal(err, "sqlite_load_run_head"))?
-    };
-
-    let Some((inc_bytes, run_rev_raw)) = run_row else {
-        return Err(DomainError::ResourceNotFound.into());
-    };
-    let inc_arr: [u8; 16] = inc_bytes
-        .try_into()
-        .map_err(|_| internal_not_committed("corrupt_run_inc", "incarnation != 16B"))?;
-    let run_scope = HistoryScope {
-        space_id: scope.space_id.clone(),
-        incarnation: HistoryIncarnation::from_bytes(inc_arr),
-    };
-    scope.check(&run_scope)?;
-
-    let actual_run_rev = RevisionId::parse(&run_rev_raw)
-        .map_err(|_| internal_not_committed("corrupt_run_rev", "invalid run_revision"))?;
-
-    let mut caller_notes: BTreeMap<NoteId, RevisionId> = BTreeMap::new();
-    for exp in &input.expected_entities {
-        if is_note_purge_fenced_cached(conn, cache, &scope.space_id, exp.note.as_str())? {
-            return Err(DomainError::ResourceNotFound.into());
-        }
-        if caller_notes
-            .insert(exp.note.clone(), exp.revision.clone())
-            .is_some()
-        {
-            return Err(DomainError::validation(ValidationReason::InvalidState).into());
-        }
-    }
-
-    let mut touched_set: BTreeSet<NoteId> = BTreeSet::new();
-    {
-        let mut stmt = conn
-            .prepare_cached(
-                "SELECT DISTINCT entity_key FROM revisions
-                 WHERE space_id = ?1 AND agent_run_id = ?2 AND agent_run_id IS NOT NULL AND entity_type = 'note'",
-            )
-            .map_err(|err| internal_not_committed("sqlite_run_touched_notes", err.to_string()))?;
-        let rows = stmt
-            .query_map(params![scope.space_id.as_str(), input.run.as_str()], |r| {
-                r.get::<_, String>(0)
-            })
-            .map_err(|err| map_interrupt_or_internal(err, "sqlite_run_touched_notes"))?;
-        for item in rows {
-            let raw =
-                item.map_err(|err| map_interrupt_or_internal(err, "sqlite_run_touched_notes"))?;
-            let nid = NoteId::parse(&raw)
-                .map_err(|_| internal_not_committed("corrupt_touched_note_id", "invalid NoteId"))?;
-            touched_set.insert(nid);
-        }
-    }
-    let caller_set: BTreeSet<NoteId> = caller_notes.keys().cloned().collect();
-    if caller_set != touched_set {
-        return Err(DomainError::validation(ValidationReason::SourceMismatch).into());
-    }
-
-    let mut heads_map = BTreeMap::new();
-    for nid in caller_notes.keys() {
-        let head = load_note_head_row_rusqlite(conn, &scope.space_id, nid)?;
-        let (rfacts, _) = build_resource_facts_cached(
-            conn,
-            cache,
-            space,
-            &head.parent_folder_id,
-            head.doc_class,
-            head.ability_id.clone(),
-            false,
-        )?;
-        auth.authorize_direct_write(&rfacts, &rfacts)?;
-        heads_map.insert(nid.clone(), head);
-    }
-
-    crate::domain::rollback::verify_authorized_rollback_revisions(actual_run_rev, input, |nid| {
-        heads_map.get(nid).map(|head| &head.head_rev_id)
-    })?;
-    Ok(heads_map)
-}
-
 fn load_revision_meta_bytes_rusqlite(
     conn: &rusqlite::Connection,
     space_id: &SpaceId,
@@ -7113,63 +6093,6 @@ fn load_revision_meta_bytes_rusqlite(
         r.get::<_, Vec<u8>>(0)
     })
     .map_err(|err| map_interrupt_or_internal(err, "sqlite_load_rev_meta_fast"))
-}
-
-fn has_any_board_moves_in_space_rusqlite(
-    conn: &rusqlite::Connection,
-    space_id: &SpaceId,
-) -> Result<bool, PortError> {
-    let mut stmt = conn
-        .prepare_cached("SELECT 1 FROM board_move_history WHERE space_id = ?1 LIMIT 1")
-        .map_err(|err| internal_not_committed("sqlite_has_bmh", err.to_string()))?;
-    let found: Option<i64> = stmt
-        .query_row(params![space_id.as_str()], |r| r.get(0))
-        .optional()
-        .map_err(|err| map_interrupt_or_internal(err, "sqlite_has_bmh"))?;
-    Ok(found.is_some())
-}
-
-fn has_any_overlays_in_space_rusqlite(
-    conn: &rusqlite::Connection,
-    space_id: &SpaceId,
-) -> Result<bool, PortError> {
-    let mut stmt = conn
-        .prepare_cached("SELECT 1 FROM view_rank_overlays WHERE space_id = ?1 LIMIT 1")
-        .map_err(|err| internal_not_committed("sqlite_has_overlays", err.to_string()))?;
-    let found: Option<i64> = stmt
-        .query_row(params![space_id.as_str()], |r| r.get(0))
-        .optional()
-        .map_err(|err| map_interrupt_or_internal(err, "sqlite_has_overlays"))?;
-    Ok(found.is_some())
-}
-
-fn active_occupant_note_id_rusqlite(
-    conn: &rusqlite::Connection,
-    space_id: &SpaceId,
-    parent_folder_id: &FolderId,
-    slug_fold: &str,
-) -> Result<Option<NoteId>, PortError> {
-    let mut stmt = conn
-        .prepare_cached(
-            "SELECT note_id FROM note_heads
-             WHERE space_id = ?1 AND parent_folder_id = ?2 AND slug_fold = ?3
-               AND lifecycle_state = 'active'
-             LIMIT 1",
-        )
-        .map_err(|err| internal_not_committed("sqlite_rb_slug_occ", err.to_string()))?;
-    let raw_opt: Option<String> = stmt
-        .query_row(
-            params![space_id.as_str(), parent_folder_id.as_str(), slug_fold],
-            |r| r.get(0),
-        )
-        .optional()
-        .map_err(|err| map_interrupt_or_internal(err, "sqlite_rb_slug_occ"))?;
-    match raw_opt {
-        Some(raw) => Ok(Some(NoteId::parse(&raw).map_err(|_| {
-            internal_not_committed("corrupt_occ_nid", "invalid NoteId")
-        })?)),
-        None => Ok(None),
-    }
 }
 
 #[cfg(test)]
@@ -7339,6 +6262,7 @@ mod savepoint_idempotency_tests {
             &store.inner,
             false,
             current_writer_gen,
+            &mut None,
         );
         let FastSqlStageResult::CommittedDirectly { slots, .. } = stage else {
             panic!("expected CommittedDirectly from savepoint fallback stage");

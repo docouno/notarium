@@ -494,14 +494,11 @@ async fn l3_sqlite_writer_batch_savepoints_idempotency_and_clean_drain() {
 async fn l3_postgres_and_s3_writer_cross_space_independence_and_epoch_takeover() {
     let fixtures = StorageTestFixtures::load_required();
 
-    // 1. PostgreSQL + Local CAS: full L3 suite + cross-Space independence + mid-batch epoch takeover!
+    // 1. PostgreSQL + S3 CAS: full L3 suite + cross-Space independence + mid-batch epoch takeover!
     let pg_schema = fixtures.fresh_pg_schema();
-    let blob_root = TempDataRoot::new("l3-pg-local");
-    let pg_cfg = fixtures.pg_local_config(
-        sample_installation_id(70),
-        &pg_schema,
-        blob_root.data_root(),
-    );
+    let pg_cfg = fixtures
+        .open_pg_s3_config(sample_installation_id(70), &pg_schema)
+        .await;
     let (pg_store, pg_rt) = CanonicalRuntime::open(pg_cfg).await.unwrap();
 
     run_core_writer_batch_suite(&pg_store, 70).await;
@@ -645,12 +642,9 @@ async fn l3_postgres_and_s3_writer_cross_space_independence_and_epoch_takeover()
 
     // A different runtime must obtain its own grant. Reading spaces.active_epoch does
     // not authorize the original process to continue using NoteWritePort after takeover.
-    let other_root = TempDataRoot::new("l3-pg-takeover");
-    let mut successor_cfg = fixtures.pg_local_config(
-        sample_installation_id(70),
-        &pg_schema,
-        other_root.data_root(),
-    );
+    let mut successor_cfg = fixtures
+        .open_pg_s3_config(sample_installation_id(70), &pg_schema)
+        .await;
     let notarium_canonical::SqlBackendConfig::Postgres { pool_size, .. } = &mut successor_cfg.sql
     else {
         unreachable!()
@@ -689,6 +683,7 @@ async fn l3_postgres_and_s3_writer_cross_space_independence_and_epoch_takeover()
             hash: ContentDigest::from_bytes([201; 32]),
         },
         input: CreateNote {
+            folder_page: false,
             note: NoteId::from_bytes([201; 16]),
             parent: None,
             slug: "successor".into(),
@@ -750,4 +745,98 @@ async fn l3_postgres_and_s3_writer_cross_space_independence_and_epoch_takeover()
     drop(s3_store);
     s3_rt.shutdown().await.unwrap();
     fixtures.drop_pg_schema(&pg_s3_schema).await;
+}
+
+#[tokio::test]
+async fn pg_unknown_commit_barrier_waits_for_active_space_row_lock() {
+    use sqlx::Connection;
+
+    let fixtures = StorageTestFixtures::load_required();
+    let schema = fixtures.fresh_pg_schema();
+    let cfg = fixtures
+        .open_pg_s3_config(sample_installation_id(79), &schema)
+        .await;
+    let (store, runtime) = CanonicalRuntime::open(cfg).await.unwrap();
+    let space_id = sample_space_id(79);
+    store
+        .create_space(CreateSpaceSpec {
+            space_id: space_id.clone(),
+            incarnation: sample_incarnation(79),
+            root_folder_id: sample_folder_id(79),
+            slug: "pg-barrier".to_owned(),
+            kind: SpaceKind::Personal,
+            owner: sample_principal_id(79),
+            active_epoch: LeaseEpoch::new(1).unwrap(),
+            initial_last_seq: SpaceSeq::ZERO,
+            created_at: None,
+        })
+        .await
+        .unwrap();
+
+    // Hold a FOR NO KEY UPDATE lock on the Space row (the exact lock mode acquired
+    // by canonical writers, simulating an in-flight server-side COMMIT whose client
+    // connection was lost).
+    let mut raw = fixtures.open_raw_pg().await;
+    let mut tx = raw.begin().await.unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SELECT 1 FROM \"{schema}\".spaces WHERE space_id = $1 FOR NO KEY UPDATE"
+    )))
+    .bind(space_id.as_str())
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+
+    let mut barrier =
+        Box::pin(store.await_pg_unknown_commit_barrier_for_test(std::slice::from_ref(&space_id)));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(80), &mut barrier)
+            .await
+            .is_err(),
+        "unknown-commit barrier must wait while a Space FOR NO KEY UPDATE transaction is active"
+    );
+
+    tx.rollback().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), barrier)
+        .await
+        .expect("unknown-commit barrier must complete once the Space row lock releases");
+
+    // Starting runtime.shutdown() while a Space row lock is still held must NOT cancel
+    // or bypass the barrier prematurely before PG settles the ambiguous transaction.
+    let mut tx2 = raw.begin().await.unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SELECT 1 FROM \"{schema}\".spaces WHERE space_id = $1 FOR NO KEY UPDATE"
+    )))
+    .bind(space_id.as_str())
+    .fetch_one(&mut *tx2)
+    .await
+    .unwrap();
+    let store_for_barrier = store.clone();
+    let space_for_barrier = space_id.clone();
+    let mut barrier_during_shutdown = tokio::spawn(async move {
+        store_for_barrier
+            .await_pg_unknown_commit_barrier_for_test(std::slice::from_ref(&space_for_barrier))
+            .await;
+    });
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    let shutdown_task = tokio::spawn(async move { runtime.shutdown().await });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(120), &mut barrier_during_shutdown)
+            .await
+            .is_err(),
+        "runtime.shutdown() must not bypass an active PG unknown-commit barrier"
+    );
+
+    tx2.rollback().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), barrier_during_shutdown)
+        .await
+        .expect("barrier must finish once the Space lock releases")
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), shutdown_task)
+        .await
+        .expect("shutdown must finish cleanly after barrier releases")
+        .unwrap()
+        .unwrap();
+
+    let _ = raw.close().await;
+    fixtures.drop_pg_schema(&schema).await;
 }

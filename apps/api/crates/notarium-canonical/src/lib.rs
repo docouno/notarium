@@ -37,11 +37,15 @@ pub use backup::{
     decode_postgres_spool_v1,
 };
 
+#[cfg(feature = "test-support")]
+pub use catalog::{LIST_PACKAGES_SLUG_SQLITE, MEMORY_UNDONE_SLOT_SQL};
 pub use changes::{
     BroadcastSignal as SpaceSignal, ChangedNoteSummaryV1, CommittedTargets, EFFECT_CODEC_V1,
     EffectBodyV1, EffectEnvelopeV1, ProjectionCatalogSubscription, StoredAwaitReasonV1,
     build_effect_payload_draft,
 };
+#[cfg(feature = "test-support")]
+pub use chats::{OTHER_HUMAN_ON_BRANCH_SQL, THREAD_TAINTED_RANGE_SQL};
 pub use config::{
     BlobBackendConfig, CanonicalConfig, PgConnectConfig, PgTransport, S3AddressingStyle,
     S3BucketMode, S3BucketModePolicy, S3Config, S3Credentials, SqlBackendConfig, WriterConfig,
@@ -50,6 +54,8 @@ pub use config::{
 #[cfg(feature = "test-support")]
 pub use dialect::postgres::build_pg_connect_options;
 pub use dialect::{DataRootOwnerLock, sqlite::observe_sqlite_canonical_witness};
+#[cfg(feature = "test-support")]
+pub use domain::rollback::ROLLBACK_ACTIVE_COLLISION_CHECK_SQLITE_SQL;
 pub use domain::{RoomCommandSettlement, RoomFenceTable, SpaceSchemaRevision, UpdateSpaceSchema};
 #[cfg(any(test, feature = "test-support"))]
 pub use peers::AppendCollabUpdate;

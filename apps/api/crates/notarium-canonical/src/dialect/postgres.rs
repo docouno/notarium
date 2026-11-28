@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use notarium_core::{epoch::DatabaseWitness, error::PortError, ids::InstallationId};
 use sqlx::{
@@ -42,15 +42,68 @@ pub fn build_pg_connect_options(cfg: &PgConnectConfig) -> PgConnectOptions {
 /// called from short-lived runtimes and keep the connection for later requests.
 pub(crate) struct StorePgPool {
     pool: PgPool,
+    writer: Mutex<WriterSlot>,
     executor: tokio::runtime::Handle,
 }
 
+#[derive(Default)]
+struct WriterSlot {
+    connection: Option<StorePgConnection>,
+    waiters: usize,
+}
+
+pub(crate) struct WriterSlotWait<'a>(&'a Mutex<WriterSlot>);
+
+impl Drop for WriterSlotWait<'_> {
+    fn drop(&mut self) {
+        self.0.lock().expect("PG writer slot").waiters -= 1;
+    }
+}
+
 impl StorePgPool {
+    pub(crate) fn take_idle_writer(&self) -> Option<StorePgConnection> {
+        self.writer
+            .lock()
+            .expect("PG writer slot")
+            .connection
+            .take()
+    }
+
+    pub(crate) fn park_writer(&self, connection: StorePgConnection) {
+        if self.pool.options().get_max_connections() > 2 {
+            let mut slot = self.writer.lock().expect("PG writer slot");
+            if slot.waiters == 0 && slot.connection.is_none() {
+                slot.connection = Some(connection);
+            }
+        }
+    }
+
+    // Once a checkout queues, give the connection back to SQLx and prevent a
+    // hot writer from repeatedly taking it ahead of the FIFO checkout queue.
+    pub(crate) fn yield_writer(&self) -> WriterSlotWait<'_> {
+        let connection = {
+            let mut slot = self.writer.lock().expect("PG writer slot");
+            slot.waiters += 1;
+            slot.connection.take()
+        };
+        drop(connection);
+        WriterSlotWait(&self.writer)
+    }
+
     pub(crate) fn acquire_timeout(&self) -> std::time::Duration {
         self.pool.options().get_acquire_timeout()
     }
 
     pub(crate) async fn acquire(&self) -> Result<StorePgConnection, sqlx::Error> {
+        let mut checkout = std::pin::pin!(self.acquire_from_pool());
+        if let std::task::Poll::Ready(result) = futures_util::poll!(checkout.as_mut()) {
+            return result;
+        }
+        let _waiting = self.yield_writer();
+        checkout.await
+    }
+
+    async fn acquire_from_pool(&self) -> Result<StorePgConnection, sqlx::Error> {
         if tokio::runtime::Handle::current().id() == self.executor.id() {
             return Ok(StorePgConnection {
                 connection: Some(self.pool.acquire().await?),
@@ -199,6 +252,7 @@ pub(crate) async fn open_and_bootstrap_postgres(
 
     let pool = StorePgPool {
         pool,
+        writer: Mutex::default(),
         executor: tokio::runtime::Handle::current(),
     };
     Ok((pool, witness, validated_schema))

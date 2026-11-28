@@ -24,19 +24,23 @@ pub(crate) const V4_HASH: &str = "23fda6322e7820fdb9b60bd67192098e3d472c074f655a
 
 pub(crate) const V5_HASH: &str = "e32b31f85aeb41b99c19c355bad2f9103eac552a0fe4b9c1ebb149892a7d9774";
 pub(crate) const V6_HASH: &str = "f91526e264d8000bf5d72a4efcb4e9701b350636c37da24d2b34bb19f50a8772";
-
 pub(crate) const V7_HASH: &str = "1a3cfcfe1c2d78948310fb1dafb04dba99e243ea821626e2de4d7009c3aa22b9";
+pub(crate) const V8_HASH: &str = "085e724d4cf969a85265d36b616fe04bc78a51c3beadf86dee7f1664bee2dcd7";
+pub(crate) const V9_HASH: &str = "a906f0cf2dc6d4948cd01b180491c1cbe796160ef88e18a706a96e7f36c8fd84";
 
-pub(crate) fn recognized_predecessor(version: i64, hash: &[u8]) -> bool {
-    match version {
-        1 => hex::encode(hash) == V1_HASH,
-        2 => hex::encode(hash) == V2_HASH,
-        3 => hex::encode(hash) == V3_HASH,
-        4 => hex::encode(hash) == V4_HASH,
-        5 => hex::encode(hash) == V5_HASH,
-        6 => hex::encode(hash) == V6_HASH,
-        7 => hex::encode(hash) == V7_HASH,
-        _ => false,
+pub(crate) fn predecessor(version: i64, hash: &[u8]) -> Option<i64> {
+    let hash = hex::encode(hash);
+    match (version, hash.as_str()) {
+        (1, V1_HASH)
+        | (2, V2_HASH)
+        | (3, V3_HASH)
+        | (4, V4_HASH)
+        | (5, V5_HASH)
+        | (6, V6_HASH)
+        | (7, V7_HASH)
+        | (8, V8_HASH)
+        | (9, V9_HASH) => Some(version),
+        _ => None,
     }
 }
 
@@ -60,6 +64,14 @@ const MIGRATE_PENDING_INPUTS: [&str; 3] = [
 
 const ADD_HOLD_GENERATION: &str =
     "ALTER TABLE backup_holds ADD COLUMN owner_generation TEXT NOT NULL DEFAULT ''";
+const MIGRATE_CHAT_HISTORY: [&str; 5] = [
+    "ALTER TABLE chat_threads ADD COLUMN active_run_generation TEXT",
+    "ALTER TABLE chat_entries ADD COLUMN human_origin INTEGER CHECK (human_origin IN (0, 1))",
+    "ALTER TABLE chat_entries ADD COLUMN body_format INTEGER NOT NULL DEFAULT 0 CHECK (body_format IN (0, 1, 2))",
+    "ALTER TABLE chat_entries ADD COLUMN provenance_json TEXT",
+    "UPDATE chat_entries SET human_origin = CASE WHEN kind = 'human' THEN 1 ELSE 0 END WHERE kind <> 'redacted'",
+];
+
 // A legacy snapshot covered an unknown prefix. Keep every delta and require a
 // newer lease to establish coverage. A room with only deltas has no snapshot.
 const BACKFILL_CHECKPOINTS: &str = "INSERT INTO collab_checkpoints
@@ -195,6 +207,243 @@ async fn upgrade_owners_v5(conn: &mut crate::sql_exec::BackendConn<'_>) -> Resul
     Ok(())
 }
 
+const PG_UPGRADE_CHAT_INLINE_LIMIT_V10: &str = "DO $migration$
+    DECLARE
+        cname TEXT;
+    BEGIN
+        FOR cname IN
+            SELECT conname FROM pg_constraint
+            WHERE conrelid = 'chat_entries'::regclass AND contype = 'c'
+              AND (conname = 'chat_entries_body_check' OR pg_get_constraintdef(oid) LIKE '%inline_text IS NOT NULL%')
+        LOOP
+            EXECUTE format('ALTER TABLE chat_entries DROP CONSTRAINT %I', cname);
+        END LOOP;
+        ALTER TABLE chat_entries ADD CONSTRAINT chat_entries_body_check CHECK (
+            (kind = 'redacted' AND inline_text IS NULL AND payload_blake3 IS NULL AND redacted_at_seq IS NOT NULL)
+            OR (
+                kind <> 'redacted'
+                AND redacted_at_seq IS NULL
+                AND (
+                    (inline_text IS NOT NULL AND octet_length(inline_text) <= 32768 AND payload_blake3 IS NULL)
+                    OR (inline_text IS NULL AND payload_blake3 IS NOT NULL)
+                )
+            )
+        );
+        FOR cname IN
+            SELECT conname FROM pg_constraint
+            WHERE conrelid = 'chat_pending_inputs'::regclass AND contype = 'c'
+              AND (conname = 'chat_pending_inputs_body_check' OR pg_get_constraintdef(oid) LIKE '%inline_text IS NOT NULL%')
+        LOOP
+            EXECUTE format('ALTER TABLE chat_pending_inputs DROP CONSTRAINT %I', cname);
+        END LOOP;
+        ALTER TABLE chat_pending_inputs ADD CONSTRAINT chat_pending_inputs_body_check CHECK (
+            (inline_text IS NOT NULL AND octet_length(inline_text) <= 32768 AND payload_blake3 IS NULL)
+            OR (inline_text IS NULL AND payload_blake3 IS NOT NULL)
+        );
+    END $migration$";
+
+async fn retire_legacy_staged_chat_refs(
+    conn: &mut crate::sql_exec::BackendConn<'_>,
+) -> Result<(), PortError> {
+    use crate::blobs::{RetirementReason, initiate_digest_retirement_tx};
+    use crate::sql_exec::BackendConn;
+    use notarium_core::{
+        ids::{HistoryIncarnation, LeaseEpoch, SpaceId},
+        model::HistoryScope,
+    };
+
+    let fail = |e: sqlx::Error| internal_not_committed("migration_v10_staged_chat", e.to_string());
+    let exec = async |tx: &mut BackendConn<'_>, sql: &'static str| -> Result<(), PortError> {
+        match tx {
+            BackendConn::Sqlite(c) => sqlx::query(sql).execute(&mut **c).await.map(|_| ()),
+            BackendConn::Postgres(c) => sqlx::query(sql).execute(&mut **c).await.map(|_| ()),
+        }
+        .map_err(fail)
+    };
+
+    for sql in [
+        "CREATE TEMP TABLE migrating_staged_digests AS
+         SELECT DISTINCT space_id, content_blake3
+         FROM blob_references
+         WHERE owner_kind = 'staged_chat'",
+        "CREATE UNIQUE INDEX migrating_staged_digest_key
+         ON migrating_staged_digests (space_id, content_blake3)",
+        "DELETE FROM blob_references WHERE owner_kind = 'staged_chat'",
+        "UPDATE blob_catalog
+         SET ref_count = (
+             SELECT COUNT(*) FROM blob_references b
+             WHERE b.space_id = blob_catalog.space_id
+               AND b.content_blake3 = blob_catalog.content_blake3
+         )
+         WHERE (space_id, content_blake3) IN (
+             SELECT space_id, content_blake3 FROM migrating_staged_digests
+         )",
+    ] {
+        exec(conn, sql).await?;
+    }
+
+    const PAGE: &str = "SELECT d.space_id, d.content_blake3, s.history_incarnation, s.active_epoch
+        FROM migrating_staged_digests d
+        JOIN spaces s ON s.space_id = d.space_id
+        JOIN blob_catalog b ON b.space_id = d.space_id AND b.content_blake3 = d.content_blake3
+        WHERE b.ref_count = 0 AND b.blob_state = 'active' AND (d.space_id, d.content_blake3) > ($1, $2)
+        ORDER BY d.space_id, d.content_blake3 LIMIT 128";
+    let mut after = (String::new(), Vec::<u8>::new());
+    loop {
+        let rows: Vec<(String, Vec<u8>, Vec<u8>, i64)> = match conn {
+            BackendConn::Sqlite(c) => {
+                sqlx::query_as(PAGE)
+                    .bind(&after.0)
+                    .bind(&after.1)
+                    .fetch_all(&mut **c)
+                    .await
+            }
+            BackendConn::Postgres(c) => {
+                sqlx::query_as(PAGE)
+                    .bind(&after.0)
+                    .bind(&after.1)
+                    .fetch_all(&mut **c)
+                    .await
+            }
+        }
+        .map_err(fail)?;
+        if rows.is_empty() {
+            break;
+        }
+        for (space, bytes, incarnation, epoch) in rows {
+            let scope = HistoryScope {
+                space_id: SpaceId::parse(&space)?,
+                incarnation: HistoryIncarnation::from_bytes(incarnation.try_into().map_err(
+                    |_| {
+                        internal_not_committed(
+                            "migrate_staged_history",
+                            "invalid history incarnation",
+                        )
+                    },
+                )?),
+            };
+            let digest = ContentDigest::from_bytes(bytes.as_slice().try_into().map_err(|_| {
+                internal_not_committed("migrate_staged_digest", "invalid content digest")
+            })?);
+            let epoch = LeaseEpoch::new(u64::try_from(epoch).map_err(|_| {
+                internal_not_committed("migrate_staged_epoch", "negative active epoch")
+            })?)?;
+            let _ = initiate_digest_retirement_tx(
+                conn,
+                &scope,
+                epoch,
+                digest,
+                RetirementReason::Gc,
+                None,
+                None,
+            )
+            .await?;
+            after = (space, bytes);
+        }
+    }
+    exec(conn, "DROP TABLE migrating_staged_digests").await
+}
+
+async fn upgrade_chat_inline_limit_v10(
+    conn: &mut crate::sql_exec::BackendConn<'_>,
+) -> Result<(), PortError> {
+    use crate::sql_exec::BackendConn;
+    let fail =
+        |e: sqlx::Error| internal_not_committed("migration_v10_chat_inline_limit", e.to_string());
+    match conn {
+        BackendConn::Sqlite(c) => {
+            let create_entries = create_new_table(SQLITE_BASELINE_DDL, "chat_entries")?;
+            let create_pending = create_new_table(SQLITE_BASELINE_DDL, "chat_pending_inputs")?;
+            for statement in [
+                "ALTER TABLE chat_entries RENAME TO chat_entries_v9",
+                &create_entries,
+                "INSERT INTO chat_entries(
+                    space_id, thread_id, entry_seq, parent_seq, revision_id, kind, tool_call_id,
+                    author_id, agent_run_id, inline_text, payload_blake3, referenced_notes_json,
+                    ext_space_tainted, is_chain_node, branch_depth, anc_16_seq, anc_256_seq,
+                    created_space_seq, redacted_at_seq, checkpoint_stale, human_origin,
+                    body_format, provenance_json
+                 )
+                 SELECT space_id, thread_id, entry_seq, parent_seq, revision_id, kind, tool_call_id,
+                    author_id, agent_run_id, inline_text, payload_blake3, referenced_notes_json,
+                    ext_space_tainted, is_chain_node, branch_depth, anc_16_seq, anc_256_seq,
+                    created_space_seq, redacted_at_seq, checkpoint_stale, human_origin,
+                    body_format, provenance_json
+                 FROM chat_entries_v9",
+                "DROP TABLE chat_entries_v9",
+                "ALTER TABLE chat_pending_inputs RENAME TO chat_pending_inputs_v9",
+                &create_pending,
+                "INSERT INTO chat_pending_inputs(
+                    space_id, thread_id, input_id, ordinal, author_id, inline_text, payload_blake3,
+                    queued_base_leaf_seq, in_flight_run_id, mentions_agent, status, enqueued_seq,
+                    consumed_entry_seq, ext_space_tainted
+                 )
+                 SELECT space_id, thread_id, input_id, ordinal, author_id, inline_text, payload_blake3,
+                    queued_base_leaf_seq, in_flight_run_id, mentions_agent, status, enqueued_seq,
+                    consumed_entry_seq, ext_space_tainted
+                 FROM chat_pending_inputs_v9",
+                "DROP TABLE chat_pending_inputs_v9",
+            ] {
+                sqlx::query(sqlx::AssertSqlSafe(statement))
+                    .execute(&mut **c)
+                    .await
+                    .map_err(fail)?;
+            }
+            for prefix in [
+                "CREATE INDEX IF NOT EXISTS idx_chat_entries_parent",
+                "CREATE INDEX IF NOT EXISTS idx_chat_entries_compaction",
+                "CREATE INDEX IF NOT EXISTS idx_chat_entries_tainted",
+                "CREATE INDEX IF NOT EXISTS idx_chat_entries_projection",
+                "CREATE INDEX IF NOT EXISTS idx_chat_entries_created_change",
+                "CREATE INDEX IF NOT EXISTS idx_chat_entries_redacted_change",
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_chat_pending_inputs_ordinal",
+                "CREATE INDEX IF NOT EXISTS idx_chat_pending_inputs_active",
+                "CREATE INDEX IF NOT EXISTS idx_chat_pending_inputs_consumed",
+            ] {
+                let sql = baseline_statement(SQLITE_BASELINE_DDL, prefix)?;
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .execute(&mut **c)
+                    .await
+                    .map_err(fail)?;
+            }
+        }
+        BackendConn::Postgres(c) => {
+            sqlx::raw_sql(PG_UPGRADE_CHAT_INLINE_LIMIT_V10)
+                .execute(&mut **c)
+                .await
+                .map_err(fail)?;
+        }
+    }
+    retire_legacy_staged_chat_refs(conn).await?;
+
+    // Fail closed before stamping schema version 10 if any reachable blob exceeds
+    // the 64 MiB decode ceiling so operators can export or purge oversized carriers
+    // on the predecessor version instead of silently losing read access after upgrade.
+    let oversized_exists: Option<i64> = match conn {
+        BackendConn::Sqlite(c) => sqlx::query_scalar(
+            "SELECT 1 FROM blob_catalog WHERE ref_count > 0 AND raw_size > ? LIMIT 1",
+        )
+        .bind(crate::blobs::MAX_BLOB_DECODE_BYTES as i64)
+        .fetch_optional(&mut **c)
+        .await
+        .map_err(fail)?,
+        BackendConn::Postgres(c) => sqlx::query_scalar(
+            "SELECT 1::BIGINT FROM blob_catalog WHERE ref_count > 0 AND raw_size > $1 LIMIT 1",
+        )
+        .bind(crate::blobs::MAX_BLOB_DECODE_BYTES as i64)
+        .fetch_optional(&mut **c)
+        .await
+        .map_err(fail)?,
+    };
+    if oversized_exists.is_some() {
+        return Err(internal_not_committed(
+            "migration_v10_blob_exceeds_64mib",
+            "reachable blob exceeds 64 MiB decode cap; export or purge oversized carriers before upgrading",
+        ));
+    }
+    Ok(())
+}
+
 macro_rules! upgrade {
     ($name:ident, $connection:ty, $variant:ident, $ddl:ident, $pg_v2:expr $(, $catalog:ident)?) => {
         pub(super) async fn $name(
@@ -211,9 +460,9 @@ macro_rules! upgrade {
             let Some((version, hash)) = previous else {
                 return Ok(());
             };
-            if !recognized_predecessor(version, &hash) {
+            let Some(version) = predecessor(version, &hash) else {
                 return Ok(());
-            }
+            };
             if version == 1 {
                 sqlx::query(sqlx::AssertSqlSafe(create_new_table(
                     $ddl,
@@ -266,12 +515,12 @@ macro_rules! upgrade {
             }
             if version < 6 {
                 // Both global and per-Space pending checks can seek by status.
-            let index = baseline_statement($ddl, "CREATE INDEX IF NOT EXISTS idx_blob_retirements_status")?;
-            sqlx::query("DROP INDEX idx_blob_retirements_status")
-                .execute(&mut *conn).await
-                .map_err(|e| internal_not_committed("migration_v6_drop_retirement_index", e.to_string()))?;
-            sqlx::query(sqlx::AssertSqlSafe(index)).execute(&mut *conn).await
-                .map_err(|e| internal_not_committed("migration_v6_retirement_index", e.to_string()))?;
+                let index = baseline_statement($ddl, "CREATE INDEX IF NOT EXISTS idx_blob_retirements_status")?;
+                sqlx::query("DROP INDEX idx_blob_retirements_status")
+                    .execute(&mut *conn).await
+                    .map_err(|e| internal_not_committed("migration_v6_drop_retirement_index", e.to_string()))?;
+                sqlx::query(sqlx::AssertSqlSafe(index)).execute(&mut *conn).await
+                    .map_err(|e| internal_not_committed("migration_v6_retirement_index", e.to_string()))?;
             }
             if version < 7 {
                 let rank_error = |e: sqlx::Error| {
@@ -294,7 +543,87 @@ macro_rules! upgrade {
                     ));
                 }
             }
-            chat_refs::$name(&mut *conn, version).await?;
+            if version < 8 {
+                chat_refs::$name(&mut *conn, version).await?;
+            }
+            if version < 9 {
+                let (add_epoch, add_redaction_epoch) = if stringify!($variant) == "Sqlite" {
+                    (
+                        "ALTER TABLE chat_threads ADD COLUMN active_run_epoch INTEGER CHECK (active_run_epoch IS NULL OR active_run_epoch >= 0)",
+                        "ALTER TABLE chat_threads ADD COLUMN redaction_epoch INTEGER NOT NULL DEFAULT 0 CHECK (redaction_epoch >= 0)",
+                    )
+                } else {
+                    (
+                        "ALTER TABLE chat_threads ADD COLUMN active_run_epoch BIGINT CHECK (active_run_epoch IS NULL OR active_run_epoch >= 0)",
+                        "ALTER TABLE chat_threads ADD COLUMN redaction_epoch BIGINT NOT NULL DEFAULT 0 CHECK (redaction_epoch >= 0)",
+                    )
+                };
+                for sql in [add_epoch]
+                    .into_iter()
+                    .chain(MIGRATE_CHAT_HISTORY)
+                    .chain([add_redaction_epoch])
+                {
+                    sqlx::query(sql).execute(&mut *conn).await.map_err(|e| {
+                        internal_not_committed("migration_v9_chat_history", e.to_string())
+                    })?;
+                }
+                sqlx::query("DROP INDEX IF EXISTS uq_ability_packages_active_slug")
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(|e| internal_not_committed("migration_v9_ability_slot_drop", e.to_string()))?;
+                if stringify!($variant) == "Postgres" {
+                    sqlx::query("DROP INDEX IF EXISTS idx_folder_heads_parent_lifecycle")
+                        .execute(&mut *conn)
+                        .await
+                        .map_err(|e| {
+                            internal_not_committed(
+                                "migration_v9_folder_parent_index_drop",
+                                e.to_string(),
+                            )
+                        })?;
+                    sqlx::query(sqlx::AssertSqlSafe(baseline_statement(
+                        $ddl,
+                        "CREATE INDEX IF NOT EXISTS idx_folder_heads_parent_lifecycle",
+                    )?))
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(|e| {
+                        internal_not_committed(
+                            "migration_v9_folder_parent_index_create",
+                            e.to_string(),
+                        )
+                    })?;
+                }
+                for prefix in [
+                    "CREATE INDEX IF NOT EXISTS idx_chat_entries_tainted",
+                    "CREATE INDEX IF NOT EXISTS idx_chat_pending_inputs_consumed",
+                    "CREATE INDEX IF NOT EXISTS idx_chat_threads_active_run",
+                    "CREATE INDEX IF NOT EXISTS idx_chat_threads_keyset",
+                    "CREATE INDEX IF NOT EXISTS idx_ability_packages_active_slug",
+                    "CREATE INDEX IF NOT EXISTS idx_ability_packages_keyset",
+                    "CREATE INDEX IF NOT EXISTS idx_note_heads_keyset",
+                    "CREATE INDEX IF NOT EXISTS idx_spaces_personal_owner",
+                    "CREATE INDEX IF NOT EXISTS idx_folder_heads_active_projects_id",
+                    "CREATE INDEX IF NOT EXISTS idx_folder_heads_space_updated",
+                    "CREATE INDEX IF NOT EXISTS idx_command_receipts_seq",
+                    "CREATE INDEX IF NOT EXISTS idx_folder_aliases_parent_seq",
+                    "CREATE INDEX IF NOT EXISTS idx_note_heads_space_title_fold",
+                    "CREATE INDEX IF NOT EXISTS idx_revision_purge_fences_seq",
+                    "CREATE INDEX IF NOT EXISTS idx_ability_packages_space_kind",
+                    "CREATE INDEX IF NOT EXISTS idx_pending_purges_successor",
+                ] {
+                    sqlx::query(sqlx::AssertSqlSafe(baseline_statement($ddl, prefix)?))
+                        .execute(&mut *conn)
+                        .await
+                        .map_err(|e| {
+                            internal_not_committed("migration_v9_indexes", e.to_string())
+                        })?;
+                }
+            }
+            if version < 10 {
+                upgrade_chat_inline_limit_v10(&mut crate::sql_exec::BackendConn::$variant(conn))
+                    .await?;
+            }
             let (sec, nsec) =
                 crate::codec::encode_timestamp_parts(crate::codec::now_utc_timestamp()?);
             sqlx::query(WRITE_WITNESS)
@@ -331,6 +660,124 @@ mod tests {
     use crate::schema::bootstrap_sqlite_schema;
     use sqlx::{Connection, Row};
 
+    async fn restore_schema_v6(db: &mut SqliteConnection) {
+        sqlx::raw_sql(concat!(
+            include_str!("../../tests/fixtures/schema-v6-remove-projection.sql"),
+            include_str!("../../tests/fixtures/schema-v8-remove-agents.sql")
+        ))
+        .execute(db)
+        .await
+        .unwrap();
+    }
+
+    mod fixture {
+        include!("../../tests/fixtures/schema-history.rs");
+    }
+
+    #[tokio::test]
+    async fn linear_v7_and_v8_upgrade_using_the_manifest_witness() {
+        for (version, hash) in [(7, V7_HASH), (8, V8_HASH), (9, V9_HASH)] {
+            let mut db = SqliteConnection::connect(":memory:").await.unwrap();
+            let installation = InstallationId::from_bytes([7; 16]);
+            bootstrap_sqlite_schema(&mut db, &installation)
+                .await
+                .unwrap();
+            for ddl in fixture::remove_later_features(version, hash) {
+                sqlx::raw_sql(*ddl).execute(&mut db).await.unwrap();
+            }
+            sqlx::query("UPDATE schema_meta SET schema_version=$1, manifest_checksum=$2")
+                .bind(i64::from(version))
+                .bind(hex::decode(hash).unwrap())
+                .execute(&mut db)
+                .await
+                .unwrap();
+            bootstrap_sqlite_schema(&mut db, &installation)
+                .await
+                .unwrap();
+            let witness: (i64, Vec<u8>) =
+                sqlx::query_as("SELECT schema_version, manifest_checksum FROM schema_meta")
+                    .fetch_one(&mut db)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                witness,
+                (
+                    i64::from(CANONICAL_SCHEMA_VERSION),
+                    crate::manifest_checksum().as_bytes().to_vec()
+                )
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn v6_upgrade_backfills_live_authorship_without_guessing_tombstones() {
+        let mut db = SqliteConnection::connect(":memory:").await.unwrap();
+        let installation = InstallationId::from_bytes([6; 16]);
+        bootstrap_sqlite_schema(&mut db, &installation)
+            .await
+            .unwrap();
+        restore_schema_v6(&mut db).await;
+        sqlx::query("UPDATE schema_meta SET schema_version=6, manifest_checksum=$1")
+            .bind(hex::decode(V6_HASH).unwrap())
+            .execute(&mut db)
+            .await
+            .unwrap();
+        sqlx::raw_sql(
+            "INSERT INTO spaces VALUES('space',zeroblob(16),'root','home','home','personal','owner','active',1,4,'{}',0,0);
+             INSERT INTO chat_threads VALUES('space',zeroblob(16),'thread','personal','owner',NULL,'Chat',3,'rev',4,NULL,0,1,4,0,0,0,0);
+             INSERT INTO chat_entries(
+                 space_id, thread_id, entry_seq, parent_seq, revision_id, kind, author_id,
+                 inline_text, referenced_notes_json, ext_space_tainted, is_chain_node,
+                 branch_depth, created_space_seq, redacted_at_seq
+             ) VALUES
+                 ('space','thread',1,NULL,'a','human','owner','hello','[]',0,1,0,1,NULL),
+                 ('space','thread',2,1,'b','model','owner','answer','[]',0,1,1,2,NULL),
+                 ('space','thread',3,2,'c','redacted','owner',NULL,'[]',0,1,2,3,4);",
+        ).execute(&mut db).await.unwrap();
+        bootstrap_sqlite_schema(&mut db, &installation)
+            .await
+            .unwrap();
+        let entries: Vec<(String, Option<i32>, i32, Option<String>)> = sqlx::query_as(
+            "SELECT kind, human_origin, body_format, provenance_json FROM chat_entries ORDER BY entry_seq",
+        ).fetch_all(&mut db).await.unwrap();
+        assert_eq!(
+            entries,
+            [
+                ("human".into(), Some(1), 0, None),
+                ("model".into(), Some(0), 0, None),
+                ("redacted".into(), None, 0, None),
+            ]
+        );
+        // Verify upgraded v10 table enforces the 32 KiB inline threshold (not the old 512B cap).
+        let ten_kib = "x".repeat(10 * 1024);
+        sqlx::query(
+            "INSERT INTO chat_entries(
+                space_id, thread_id, entry_seq, parent_seq, revision_id, kind, author_id,
+                inline_text, referenced_notes_json, ext_space_tainted, is_chain_node,
+                branch_depth, created_space_seq, human_origin, body_format
+             ) VALUES ('space','thread',4,2,'d','model','owner',$1,'[]',0,1,2,5,0,0)",
+        )
+        .bind(&ten_kib)
+        .execute(&mut db)
+        .await
+        .expect("upgraded v10 chat_entries must accept 10 KiB inline body");
+        let over_32k = "y".repeat(32 * 1024 + 1);
+        assert!(
+            sqlx::query(
+                "INSERT INTO chat_entries(
+                    space_id, thread_id, entry_seq, parent_seq, revision_id, kind, author_id,
+                    inline_text, referenced_notes_json, ext_space_tainted, is_chain_node,
+                    branch_depth, created_space_seq, human_origin, body_format
+                 ) VALUES ('space','thread',5,4,'e','model','owner',$1,'[]',0,1,3,6,0,0)",
+            )
+            .bind(&over_32k)
+            .execute(&mut db)
+            .await
+            .is_err(),
+            "upgraded v10 chat_entries must reject > 32 KiB inline body"
+        );
+    }
+
     #[tokio::test]
     async fn v5_retirement_upgrade_preserves_rows_and_indexes_global_pending_work() {
         let mut db = SqliteConnection::connect(":memory:").await.unwrap();
@@ -338,6 +785,7 @@ mod tests {
         bootstrap_sqlite_schema(&mut db, &installation)
             .await
             .unwrap();
+        restore_schema_v6(&mut db).await;
         sqlx::raw_sql(
             "DROP INDEX idx_blob_retirements_status;
              CREATE INDEX idx_blob_retirements_status ON blob_retirements(space_id, status);
@@ -408,6 +856,7 @@ mod tests {
                 .await
                 .unwrap();
         }
+        restore_schema_v6(&mut db).await;
         sqlx::query("INSERT INTO schema_meta VALUES(1,4,1,$1,'ready',$2,0,0,0,0)")
             .bind(installation.as_str())
             .bind(hex::decode(V4_HASH).unwrap())
@@ -465,6 +914,7 @@ mod tests {
                 .await
                 .unwrap();
         }
+        restore_schema_v6(&mut db).await;
         sqlx::raw_sql(include_str!(
             "../../tests/fixtures/schema-v3-reference-index.sql"
         ))
@@ -577,6 +1027,7 @@ mod tests {
                 .await
                 .unwrap();
         }
+        restore_schema_v6(&mut db).await;
         let install = InstallationId::from_bytes([4; 16]);
         sqlx::query("INSERT INTO schema_meta VALUES(1,1,1,$1,'ready',$2,0,0,0,0)")
             .bind(install.as_str())
@@ -652,5 +1103,284 @@ mod tests {
         );
 
         bootstrap_sqlite_schema(&mut db, &install).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn v8_and_v9_512b_upgrade_lifts_inline_limit_preserves_refs_and_retires_staged_chat() {
+        for (version, hash) in [(8u32, V8_HASH), (9u32, V9_HASH)] {
+            let mut db = SqliteConnection::connect(":memory:").await.unwrap();
+            let installation = InstallationId::from_bytes([version as u8; 16]);
+            sqlx::query("PRAGMA foreign_keys = ON")
+                .execute(&mut db)
+                .await
+                .unwrap();
+            for sql in split_sql_statements(SQLITE_BASELINE_DDL) {
+                let downgraded = if sql.starts_with("CREATE TABLE IF NOT EXISTS chat_entries (")
+                    || sql.starts_with("CREATE TABLE IF NOT EXISTS chat_pending_inputs (")
+                {
+                    sql.replace("<= 32768", "<= 512")
+                } else {
+                    sql
+                };
+                sqlx::query(sqlx::AssertSqlSafe(downgraded))
+                    .execute(&mut db)
+                    .await
+                    .unwrap();
+            }
+            for ddl in fixture::remove_later_features(version, hash) {
+                sqlx::raw_sql(*ddl).execute(&mut db).await.unwrap();
+            }
+            sqlx::query("INSERT INTO schema_meta VALUES(1,$1,1,$2,'ready',$3,0,0,0,0)")
+                .bind(i64::from(version))
+                .bind(installation.as_str())
+                .bind(hex::decode(hash).unwrap())
+                .execute(&mut db)
+                .await
+                .unwrap();
+            let space_id = notarium_core::ids::SpaceId::from_bytes([0x11; 16]);
+            let sid = space_id.as_str();
+            sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                "INSERT INTO spaces VALUES('{sid}',zeroblob(16),'root','home','home','personal','owner','active',1,10,'{{}}',0,0);
+                 INSERT INTO chat_threads(
+                     space_id, history_incarnation, thread_id, kind, owner_id, project_folder_id,
+                     title, head_leaf_seq, head_rev_id, next_entry_seq, active_run_id,
+                     ext_space_tainted_mask, created_seq, updated_seq, created_at_sec,
+                     created_at_nsec, updated_at_sec, updated_at_nsec
+                 ) VALUES ('{sid}',zeroblob(16),'thread','personal','owner',NULL,'Chat',1,'r1',2,NULL,0,1,2,0,0,0,0);
+                 INSERT INTO chat_entries(
+                     space_id, thread_id, entry_seq, parent_seq, revision_id, kind, author_id,
+                     inline_text, referenced_notes_json, ext_space_tainted, is_chain_node,
+                     branch_depth, created_space_seq, redacted_at_seq
+                 ) VALUES ('{sid}','thread',1,NULL,'r1','human','owner','hello','[]',0,1,0,1,NULL);
+                 INSERT INTO chat_entry_note_refs(
+                     space_id, thread_id, entry_seq, ref_ordinal, target_space_id,
+                     target_note_id, created_space_seq
+                 ) VALUES ('{sid}','thread',1,0,'{sid}','note1',1);
+                 INSERT INTO chat_pending_inputs(
+                     space_id, thread_id, input_id, ordinal, author_id, inline_text,
+                     queued_base_leaf_seq, in_flight_run_id, mentions_agent, status,
+                     enqueued_seq, ext_space_tainted
+                 ) VALUES ('{sid}','thread','in1',1,'owner','pending',1,'run1',0,'pending',2,0);
+                 INSERT INTO blob_catalog VALUES('{sid}',zeroblob(32),600,120,1,'pub_staged','open','active',1);
+                 INSERT INTO blob_publications VALUES('{sid}','pub_staged',zeroblob(32),1,'local_zstd_v1','active',1,1,600,120,1,1);
+                 INSERT INTO blob_references VALUES('{sid}','staged_chat','lease1','r0','body',zeroblob(32),'pub_staged',1);"
+            )))
+            .execute(&mut db)
+            .await
+            .unwrap();
+
+            // Pre-upgrade 513B inline insert must fail under the old <= 512 CHECK.
+            let body_513 = "a".repeat(513);
+            assert!(
+                sqlx::query(
+                    "INSERT INTO chat_entries(
+                        space_id, thread_id, entry_seq, parent_seq, revision_id, kind, author_id,
+                        inline_text, referenced_notes_json, ext_space_tainted, is_chain_node,
+                        branch_depth, created_space_seq
+                     ) VALUES ($1,'thread',2,1,'r2','model','owner',$2,'[]',0,1,1,3)",
+                )
+                .bind(sid)
+                .bind(&body_513)
+                .execute(&mut db)
+                .await
+                .is_err(),
+                "v{version} fixture must enforce old <= 512 CHECK before upgrade"
+            );
+
+            bootstrap_sqlite_schema(&mut db, &installation)
+                .await
+                .unwrap();
+
+            // Pragmas must be restored cleanly after upgrade.
+            let fk_on: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+                .fetch_one(&mut db)
+                .await
+                .unwrap();
+            let legacy_alter: i64 = sqlx::query_scalar("PRAGMA legacy_alter_table")
+                .fetch_one(&mut db)
+                .await
+                .unwrap();
+            assert_eq!((fk_on, legacy_alter), (1, 0));
+
+            // 513B and 32768B inline inserts must now succeed; 32769B must fail on both tables.
+            let body_32k = "b".repeat(32 * 1024);
+            let body_32k_plus_1 = "c".repeat(32 * 1024 + 1);
+            sqlx::query(
+                "INSERT INTO chat_entries(
+                    space_id, thread_id, entry_seq, parent_seq, revision_id, kind, author_id,
+                    inline_text, referenced_notes_json, ext_space_tainted, is_chain_node,
+                    branch_depth, created_space_seq, human_origin, body_format
+                 ) VALUES ($1,'thread',2,1,'r2','model','owner',$2,'[]',0,1,1,3,0,0)",
+            )
+            .bind(sid)
+            .bind(&body_32k)
+            .execute(&mut db)
+            .await
+            .expect("upgraded chat_entries must accept 32 KiB inline body");
+            assert!(
+                sqlx::query(
+                    "INSERT INTO chat_entries(
+                        space_id, thread_id, entry_seq, parent_seq, revision_id, kind, author_id,
+                        inline_text, referenced_notes_json, ext_space_tainted, is_chain_node,
+                        branch_depth, created_space_seq, human_origin, body_format
+                     ) VALUES ($1,'thread',3,2,'r3','model','owner',$2,'[]',0,1,2,4,0,0)",
+                )
+                .bind(sid)
+                .bind(&body_32k_plus_1)
+                .execute(&mut db)
+                .await
+                .is_err()
+            );
+            sqlx::query(
+                "INSERT INTO chat_pending_inputs(
+                    space_id, thread_id, input_id, ordinal, author_id, inline_text,
+                    queued_base_leaf_seq, in_flight_run_id, mentions_agent, status,
+                    enqueued_seq, ext_space_tainted
+                 ) VALUES ($1,'thread','in2',2,'owner',$2,2,'run1',0,'pending',4,0)",
+            )
+            .bind(sid)
+            .bind(&body_32k)
+            .execute(&mut db)
+            .await
+            .expect("upgraded chat_pending_inputs must accept 32 KiB inline body");
+            assert!(
+                sqlx::query(
+                    "INSERT INTO chat_pending_inputs(
+                        space_id, thread_id, input_id, ordinal, author_id, inline_text,
+                        queued_base_leaf_seq, in_flight_run_id, mentions_agent, status,
+                        enqueued_seq, ext_space_tainted
+                     ) VALUES ($1,'thread','in3',3,'owner',$2,2,'run1',0,'pending',5,0)",
+                )
+                .bind(sid)
+                .bind(&body_32k_plus_1)
+                .execute(&mut db)
+                .await
+                .is_err()
+            );
+
+            // Populated chat_entry_note_refs must survive rebuild and still CASCADE delete.
+            let ref_count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM chat_entry_note_refs WHERE space_id=$1 AND entry_seq=1",
+            )
+            .bind(sid)
+            .fetch_one(&mut db)
+            .await
+            .unwrap();
+            assert_eq!(ref_count, 1);
+            // Child entry_seq=2 references parent entry_seq=1, so delete child first.
+            sqlx::query("DELETE FROM chat_entries WHERE space_id=$1 AND entry_seq=2")
+                .bind(sid)
+                .execute(&mut db)
+                .await
+                .unwrap();
+            sqlx::query("DELETE FROM chat_entries WHERE space_id=$1 AND entry_seq=1")
+                .bind(sid)
+                .execute(&mut db)
+                .await
+                .unwrap();
+            let after_cascade: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM chat_entry_note_refs WHERE space_id=$1 AND entry_seq=1",
+            )
+            .bind(sid)
+            .fetch_one(&mut db)
+            .await
+            .unwrap();
+            assert_eq!(after_cascade, 0);
+
+            // Legacy staged_chat ref must be removed, ref_count decremented to 0, and retirement queued.
+            let remaining_staged: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM blob_references WHERE owner_kind='staged_chat'",
+            )
+            .fetch_one(&mut db)
+            .await
+            .unwrap();
+            let catalog_refs: i64 = sqlx::query_scalar(
+                "SELECT ref_count FROM blob_catalog WHERE space_id=$1 AND content_blake3=zeroblob(32)",
+            )
+            .bind(sid)
+            .fetch_one(&mut db)
+            .await
+            .unwrap();
+            let pending_rets: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM blob_retirements WHERE space_id=$1 AND reason='gc' AND status='pending'",
+            )
+            .bind(sid)
+            .fetch_one(&mut db)
+            .await
+            .unwrap();
+            assert_eq!((remaining_staged, catalog_refs, pending_rets), (0, 0, 1));
+        }
+
+        // Reachable >64 MiB note_revision blob must fail-closed and roll back v9->v10 cleanly
+        // (preserving schema_version=9 and restoring SQLite pragmas), whereas an oversized blob
+        // referenced ONLY by obsolete staged_chat retires first and does not block upgrade.
+        let mut db = SqliteConnection::connect(":memory:").await.unwrap();
+        let installation = InstallationId::from_bytes([0x99; 16]);
+        let space_id = notarium_core::ids::SpaceId::from_bytes([0x99; 16]);
+        let sid = space_id.as_str();
+        sqlx::query("PRAGMA foreign_keys = ON")
+            .execute(&mut db)
+            .await
+            .unwrap();
+        for sql in split_sql_statements(SQLITE_BASELINE_DDL) {
+            sqlx::query(sqlx::AssertSqlSafe(sql))
+                .execute(&mut db)
+                .await
+                .unwrap();
+        }
+        sqlx::query("INSERT INTO schema_meta VALUES(1,9,1,$1,'ready',$2,0,0,0,0)")
+            .bind(installation.as_str())
+            .bind(hex::decode(V9_HASH).unwrap())
+            .execute(&mut db)
+            .await
+            .unwrap();
+        let over_64m = crate::blobs::MAX_BLOB_DECODE_BYTES as i64 + 1;
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO spaces VALUES('{sid}',zeroblob(16),'root','home','home','personal','owner','active',1,10,'{{}}',0,0);
+             INSERT INTO blob_catalog VALUES('{sid}',zeroblob(32),{over_64m},120,1,'pub_big','open','active',1);
+             INSERT INTO blob_publications VALUES('{sid}','pub_big',zeroblob(32),1,'local_zstd_v1','active',1,1,{over_64m},120,1,1);
+             INSERT INTO blob_references VALUES('{sid}','note_revision','note1','r1','body',zeroblob(32),'pub_big',1);"
+        )))
+        .execute(&mut db)
+        .await
+        .unwrap();
+        assert!(
+            bootstrap_sqlite_schema(&mut db, &installation)
+                .await
+                .is_err(),
+            "v10 upgrade must fail closed when a reachable blob exceeds 64 MiB"
+        );
+        let ver_after_abort: i64 =
+            sqlx::query_scalar("SELECT schema_version FROM schema_meta WHERE singleton_id=1")
+                .fetch_one(&mut db)
+                .await
+                .unwrap();
+        let fk_after_abort: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+            .fetch_one(&mut db)
+            .await
+            .unwrap();
+        let legacy_after_abort: i64 = sqlx::query_scalar("PRAGMA legacy_alter_table")
+            .fetch_one(&mut db)
+            .await
+            .unwrap();
+        assert_eq!(
+            (ver_after_abort, fk_after_abort, legacy_after_abort),
+            (9, 1, 0)
+        );
+
+        // Convert the oversized reference to obsolete staged_chat: v10 must retire it and succeed.
+        sqlx::query("UPDATE blob_references SET owner_kind='staged_chat'")
+            .execute(&mut db)
+            .await
+            .unwrap();
+        bootstrap_sqlite_schema(&mut db, &installation)
+            .await
+            .expect("staged_chat-only >64 MiB blob must retire before the reachability check");
+        let ver_after_ok: i64 =
+            sqlx::query_scalar("SELECT schema_version FROM schema_meta WHERE singleton_id=1")
+                .fetch_one(&mut db)
+                .await
+                .unwrap();
+        assert_eq!(ver_after_ok, i64::from(CANONICAL_SCHEMA_VERSION));
     }
 }

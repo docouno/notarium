@@ -247,6 +247,7 @@ async fn canonical_room_command_settlement(store: &CanonicalStore) -> Observatio
             command(
                 &ctx,
                 CreateNote {
+                    folder_page: false,
                     note: note.clone(),
                     parent: None,
                     slug: "draft".into(),

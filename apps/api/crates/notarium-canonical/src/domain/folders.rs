@@ -21,10 +21,10 @@ use crate::{
         normalize_slug_key, normalize_title_key, now_utc_timestamp,
     },
     domain::common::{
-        MAX_FOLDER_DEPTH, StoredCommittedFolderRefV1, active_note_sibling_exists_tx,
-        build_resource_facts_tx, derive_command_identity_spec, extract_agent_run_from_auth,
-        insert_folder_alias_tx, load_folder_ancestry_tx, load_note_head_row_opt_tx,
-        upsert_agent_run_head_tx, validate_mutation_identity,
+        FolderAncestryCache, MAX_FOLDER_DEPTH, StoredCommittedFolderRefV1,
+        active_note_sibling_exists_tx, build_resource_facts_tx, derive_command_identity_spec,
+        extract_agent_run_from_auth, insert_folder_alias_tx, load_folder_ancestry_tx,
+        load_note_head_row_opt_tx, upsert_agent_run_head_tx, validate_mutation_identity,
     },
     runtime::{
         active_folder_sibling_exists, active_project_slug_exists, insert_revision_row,
@@ -60,7 +60,7 @@ pub(crate) async fn move_folder_impl(
             .map(FolderId::as_str)
             .unwrap_or("<root>")
     );
-    let idemp = derive_command_identity_spec(&request.identity, "move_folder", fp.as_bytes())
+    let idemp = derive_command_identity_spec(&ctx, &request.identity, "move_folder", fp.as_bytes())
         .with_preconditions(
             &request.preconditions,
             "folder",
@@ -69,9 +69,9 @@ pub(crate) async fn move_folder_impl(
         .with_policy(
             ctx.auth(),
             crate::writer::replay::ReplayPolicy::Documents(vec![
-                crate::writer::replay::ReplayResource::WriteFolder(Some(
+                crate::writer::replay::ReplayResource::WriteFolderSubtree(
                     request.input.folder.clone(),
-                )),
+                ),
                 crate::writer::replay::ReplayResource::WriteFolder(
                     request.input.new_parent.clone(),
                 ),
@@ -105,6 +105,11 @@ pub(crate) async fn move_folder_impl(
                     load_folder_ancestry_tx(tx, &scope.space_id, &input.folder, true).await?;
                 let dest_anc =
                     load_folder_ancestry_tx(tx, &scope.space_id, &dest_parent, true).await?;
+                auth.can_view_folder(&live_space.space, &input.folder, &before_anc.ancestors)?;
+                auth.can_view_folder(&live_space.space, &dest_parent, &dest_anc.ancestors)?;
+                let crosses_ability_scope =
+                    !folder_row.is_project && before_anc.project != dest_anc.project;
+                let destination_project = dest_anc.project.clone();
 
                 let would_cycle = dest_anc.ancestors.contains(&input.folder);
                 let old_depth = before_anc.ancestors.len() - 1;
@@ -112,21 +117,26 @@ pub(crate) async fn move_folder_impl(
                 let before_facts = notarium_core::auth::ResourceFacts {
                     space: live_space.space.clone(),
                     class: target_write_class,
+                    project: before_anc.project,
                     ancestor_folders: before_anc.ancestors,
                     folder_write_locked: before_anc.write_locked,
                     ability_package: None,
                 };
-                let mut after_ancestors = Vec::with_capacity(dest_anc.ancestors.len() + 1);
-                after_ancestors.push(input.folder.clone());
-                after_ancestors.extend(dest_anc.ancestors);
                 let after_facts = notarium_core::auth::ResourceFacts {
                     space: live_space.space.clone(),
                     class: target_write_class,
-                    ancestor_folders: after_ancestors,
+                    project: if folder_row.is_project {
+                        Some(input.folder.clone())
+                    } else {
+                        destination_project.clone()
+                    },
+                    ancestor_folders: dest_anc.ancestors,
                     folder_write_locked: folder_row.write_locked || dest_anc.write_locked,
                     ability_package: None,
                 };
                 auth.authorize_direct_write(&before_facts, &after_facts)?;
+                authorize_folder_subtree_tx(tx, &scope.space_id, &input.folder, &auth, true)
+                    .await?;
 
                 if folder_row.is_root {
                     return Err(DomainError::validation(ValidationReason::InvalidState).into());
@@ -239,6 +249,45 @@ pub(crate) async fn move_folder_impl(
                     }
                 }
 
+                if crosses_ability_scope {
+                    let sql = include_str!("moved_ability_slots.sql");
+                    let project = destination_project.as_ref().map_or("", FolderId::as_str);
+                    let state: i64 = match tx {
+                        BackendConn::Sqlite(conn) => {
+                            sqlx::query_scalar(sql)
+                                .bind(scope.space_id.as_str())
+                                .bind(input.folder.as_str())
+                                .bind(project)
+                                .fetch_one(&mut **conn)
+                                .await
+                        }
+                        BackendConn::Postgres(conn) => {
+                            sqlx::query_scalar(sql)
+                                .bind(scope.space_id.as_str())
+                                .bind(input.folder.as_str())
+                                .bind(project)
+                                .fetch_one(&mut **conn)
+                                .await
+                        }
+                    }
+                    .map_err(|err| {
+                        internal_not_committed("moved_ability_slots", err.to_string())
+                    })?;
+                    if state != 0 {
+                        auth.authorize_ability_mutation()?;
+                    }
+                    if state == 2 {
+                        return Err(DomainError::PathConflict {
+                            target: PathTarget {
+                                space_id: scope.space_id.clone(),
+                                parent: input.new_parent.clone(),
+                                component: folder_row.slug.clone(),
+                            },
+                        }
+                        .into());
+                    }
+                }
+
                 if dest_parent != old_parent {
                     insert_folder_alias_tx(
                         tx,
@@ -254,6 +303,7 @@ pub(crate) async fn move_folder_impl(
                 let run_opt = extract_agent_run_from_auth(&auth);
                 let meta = RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Folder(
                     FolderRevisionMetadata {
+                        confirmation: None,
                         folder_id: input.folder.clone(),
                         parent_folder_id: Some(dest_parent),
                         is_root: false,
@@ -373,20 +423,21 @@ pub(crate) async fn rename_folder_impl(
         request.input.folder.as_str(),
         request.input.name
     );
-    let idemp = derive_command_identity_spec(&request.identity, "rename_folder", fp.as_bytes())
-        .with_preconditions(
-            &request.preconditions,
-            "folder",
-            request.input.folder.as_str(),
-        )
-        .with_policy(
-            ctx.auth(),
-            crate::writer::replay::ReplayPolicy::Documents(vec![
-                crate::writer::replay::ReplayResource::WriteFolder(Some(
-                    request.input.folder.clone(),
-                )),
-            ]),
-        );
+    let idemp =
+        derive_command_identity_spec(&ctx, &request.identity, "rename_folder", fp.as_bytes())
+            .with_preconditions(
+                &request.preconditions,
+                "folder",
+                request.input.folder.as_str(),
+            )
+            .with_policy(
+                ctx.auth(),
+                crate::writer::replay::ReplayPolicy::Documents(vec![
+                    crate::writer::replay::ReplayResource::WriteFolderSubtree(
+                        request.input.folder.clone(),
+                    ),
+                ]),
+            );
 
     let auth = ctx.auth().clone();
     let preconditions = request.preconditions.clone();
@@ -408,16 +459,20 @@ pub(crate) async fn rename_folder_impl(
                     return Err(DomainError::ResourceNotFound.into());
                 }
                 let anc = load_folder_ancestry_tx(tx, &scope.space_id, &input.folder, true).await?;
+                auth.can_view_folder(&live_space.space, &input.folder, &anc.ancestors)?;
                 let facts = notarium_core::auth::ResourceFacts {
                     space: live_space.space.clone(),
                     class: target_write_class,
+                    project: anc.project,
                     ancestor_folders: anc.ancestors,
                     folder_write_locked: anc.write_locked,
                     ability_package: None,
                 };
                 auth.authorize_direct_write(&facts, &facts)?;
+                authorize_folder_subtree_tx(tx, &scope.space_id, &input.folder, &auth, true)
+                    .await?;
 
-                if folder_row.is_root {
+                if folder_row.is_root || folder_row.is_project {
                     return Err(DomainError::validation(ValidationReason::InvalidState).into());
                 }
                 if let Some(expected_rev) = &preconditions.revision
@@ -505,7 +560,23 @@ pub(crate) async fn rename_folder_impl(
                     }
                 }
 
-                if new_slug_fold != folder_row.slug_fold {
+                if let Some(old_project_slug_fold) = folder_row.project_slug_fold.as_deref()
+                    && new_slug_fold != old_project_slug_fold
+                {
+                    insert_folder_alias_tx(
+                        tx,
+                        &scope.space_id,
+                        &parent_id,
+                        old_project_slug_fold,
+                        &input.folder,
+                        seq,
+                    )
+                    .await?;
+                }
+                if new_slug_fold != folder_row.slug_fold
+                    && folder_row.project_slug_fold.as_deref()
+                        != Some(folder_row.slug_fold.as_str())
+                {
                     insert_folder_alias_tx(
                         tx,
                         &scope.space_id,
@@ -520,6 +591,7 @@ pub(crate) async fn rename_folder_impl(
                 let run_opt = extract_agent_run_from_auth(&auth);
                 let meta = RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Folder(
                     FolderRevisionMetadata {
+                        confirmation: None,
                         folder_id: input.folder.clone(),
                         parent_folder_id: Some(parent_id),
                         is_root: false,
@@ -626,7 +698,9 @@ pub(crate) async fn rename_project_impl(
     validate_mutation_identity(&ctx, &request.identity)?;
     crate::domain::common::require_revision_only(&request.preconditions)?;
     let new_slug_fold = normalize_slug_key(&request.input.name)?;
-    if request.input.display_name.trim().is_empty() {
+    if let Some(display_name) = &request.input.display_name
+        && (display_name.trim().is_empty() || display_name.chars().any(char::is_control))
+    {
         return Err(DomainError::validation(ValidationReason::InvalidPathComponent).into());
     }
     let target_write_class = folder_mutation_class(ctx.auth(), &ctx.scope().space_id)?;
@@ -637,26 +711,33 @@ pub(crate) async fn rename_project_impl(
         .await?;
     space_rec.scope.check(ctx.scope())?;
 
-    let fp = format!(
-        "folder={}\0name={}\0display={}",
-        request.input.folder.as_str(),
-        request.input.name,
-        request.input.display_name
-    );
-    let idemp = derive_command_identity_spec(&request.identity, "rename_project", fp.as_bytes())
-        .with_preconditions(
-            &request.preconditions,
-            "folder",
+    let fp = match &request.input.display_name {
+        Some(display_name) => format!(
+            "folder={}\0name={}\0display={display_name}",
             request.input.folder.as_str(),
-        )
-        .with_policy(
-            ctx.auth(),
-            crate::writer::replay::ReplayPolicy::Documents(vec![
-                crate::writer::replay::ReplayResource::WriteFolder(Some(
-                    request.input.folder.clone(),
-                )),
-            ]),
-        );
+            request.input.name,
+        ),
+        None => format!(
+            "folder={}\0name={}\0display_keep=1",
+            request.input.folder.as_str(),
+            request.input.name,
+        ),
+    };
+    let idemp =
+        derive_command_identity_spec(&ctx, &request.identity, "rename_project", fp.as_bytes())
+            .with_preconditions(
+                &request.preconditions,
+                "folder",
+                request.input.folder.as_str(),
+            )
+            .with_policy(
+                ctx.auth(),
+                crate::writer::replay::ReplayPolicy::Documents(vec![
+                    crate::writer::replay::ReplayResource::WriteFolderSubtree(
+                        request.input.folder.clone(),
+                    ),
+                ]),
+            );
 
     let auth = ctx.auth().clone();
     let preconditions = request.preconditions.clone();
@@ -678,14 +759,18 @@ pub(crate) async fn rename_project_impl(
                     return Err(DomainError::ResourceNotFound.into());
                 }
                 let anc = load_folder_ancestry_tx(tx, &scope.space_id, &input.folder, true).await?;
+                auth.can_view_folder(&live_space.space, &input.folder, &anc.ancestors)?;
                 let facts = notarium_core::auth::ResourceFacts {
                     space: live_space.space.clone(),
                     class: target_write_class,
+                    project: anc.project,
                     ancestor_folders: anc.ancestors,
                     folder_write_locked: anc.write_locked,
                     ability_package: None,
                 };
                 auth.authorize_direct_write(&facts, &facts)?;
+                authorize_folder_subtree_tx(tx, &scope.space_id, &input.folder, &auth, true)
+                    .await?;
 
                 if folder_row.is_root || !folder_row.is_project {
                     return Err(DomainError::validation(ValidationReason::InvalidState).into());
@@ -737,6 +822,20 @@ pub(crate) async fn rename_project_impl(
                     .into());
                 }
 
+                let effective_display_name = match &input.display_name {
+                    Some(name) => name.clone(),
+                    None => {
+                        if folder_row.display_name.trim().is_empty()
+                            || folder_row.display_name.chars().any(char::is_control)
+                        {
+                            return Err(DomainError::validation(
+                                ValidationReason::InvalidPathComponent,
+                            )
+                            .into());
+                        }
+                        folder_row.display_name.clone()
+                    }
+                };
                 let seq = item_ctx.alloc_next_seq()?;
                 let new_rev = new_revision_id()?;
                 let now_ts = now_utc_timestamp()?;
@@ -755,7 +854,7 @@ pub(crate) async fn rename_project_impl(
                         )
                         .bind(&input.name)
                         .bind(&new_slug_fold)
-                        .bind(&input.display_name)
+                        .bind(&effective_display_name)
                         .bind(&input.name)
                         .bind(&new_slug_fold)
                         .bind(new_rev.as_str())
@@ -781,7 +880,7 @@ pub(crate) async fn rename_project_impl(
                         )
                         .bind(&input.name)
                         .bind(&new_slug_fold)
-                        .bind(&input.display_name)
+                        .bind(&effective_display_name)
                         .bind(&input.name)
                         .bind(&new_slug_fold)
                         .bind(new_rev.as_str())
@@ -798,7 +897,23 @@ pub(crate) async fn rename_project_impl(
                     }
                 }
 
-                if new_slug_fold != folder_row.slug_fold {
+                if let Some(old_project_slug_fold) = folder_row.project_slug_fold.as_deref()
+                    && new_slug_fold != old_project_slug_fold
+                {
+                    insert_folder_alias_tx(
+                        tx,
+                        &scope.space_id,
+                        &parent_id,
+                        old_project_slug_fold,
+                        &input.folder,
+                        seq,
+                    )
+                    .await?;
+                }
+                if new_slug_fold != folder_row.slug_fold
+                    && folder_row.project_slug_fold.as_deref()
+                        != Some(folder_row.slug_fold.as_str())
+                {
                     insert_folder_alias_tx(
                         tx,
                         &scope.space_id,
@@ -813,12 +928,13 @@ pub(crate) async fn rename_project_impl(
                 let run_opt = extract_agent_run_from_auth(&auth);
                 let meta = RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Folder(
                     FolderRevisionMetadata {
+                        confirmation: None,
                         folder_id: input.folder.clone(),
                         parent_folder_id: Some(parent_id),
                         is_root: false,
                         slug: input.name.clone(),
                         slug_fold: new_slug_fold,
-                        display_name: input.display_name,
+                        display_name: effective_display_name,
                         is_project: true,
                         project_slug: Some(input.name),
                         description: folder_row.description,
@@ -930,115 +1046,129 @@ pub(crate) async fn resolve_folder_alias_impl(
                 }
 
                 let parent_id = parent.unwrap_or_else(|| space_rec.root_folder_id.clone());
+                let mut cache = FolderAncestryCache::default();
 
-                // 1. Exact active sibling takes priority over any historical alias!
-                let active_sibling: Option<String> = match tx {
-                    BackendConn::Sqlite(conn) => sqlx::query_scalar(
-                        "SELECT folder_id FROM folder_heads
-                         WHERE space_id = ? AND parent_folder_id = ? AND slug_fold = ?
-                           AND lifecycle_state = 'active' AND is_root = 0
-                         LIMIT 1",
-                    )
-                    .bind(scope.space_id.as_str())
-                    .bind(parent_id.as_str())
-                    .bind(&slug_fold)
-                    .fetch_optional(&mut **conn)
-                    .await
-                    .map_err(|err| {
-                        internal_not_committed("sqlite_resolve_folder_exact", err.to_string())
-                    })?,
-                    BackendConn::Postgres(conn) => sqlx::query_scalar(
-                        "SELECT folder_id FROM folder_heads
-                         WHERE space_id = $1 AND parent_folder_id = $2 AND slug_fold = $3
-                           AND lifecycle_state = 'active' AND is_root = 0
-                         LIMIT 1",
-                    )
-                    .bind(scope.space_id.as_str())
-                    .bind(parent_id.as_str())
-                    .bind(&slug_fold)
-                    .fetch_optional(&mut **conn)
-                    .await
-                    .map_err(|err| {
-                        crate::runtime::pg_read_error("pg_resolve_folder_exact", err)
-                    })?,
-                };
-
-                if let Some(fid_raw) = active_sibling {
-                    let fid = FolderId::parse(&fid_raw).map_err(|_| {
-                        internal_not_committed("corrupt_folder_id", "invalid folder_id")
-                    })?;
-                    if is_folder_readable_tx(tx, &space_rec.space, &auth, &fid).await? {
-                        return Ok(Some(FolderRef {
-                            space_id: scope.space_id,
-                            folder_id: fid,
-                        }));
-                    }
-                    return Ok(None);
-                }
-
-                // 2. Newest valid active alias target (with cycle/depth guard via ancestry check).
-                let candidates: Vec<String> = match tx {
-                    BackendConn::Sqlite(conn) => {
-                        let rows = sqlx::query(
-                            "SELECT target_folder_id FROM folder_aliases
-                             WHERE space_id = ? AND old_parent_folder_id = ? AND old_slug_fold = ?
-                             ORDER BY created_seq DESC
-                             LIMIT ?",
-                        )
-                        .bind(scope.space_id.as_str())
-                        .bind(parent_id.as_str())
-                        .bind(&slug_fold)
-                        .bind(MAX_FOLDER_DEPTH as i64)
-                        .fetch_all(&mut **conn)
-                        .await
-                        .map_err(|err| {
-                            internal_not_committed("sqlite_resolve_folder_alias", err.to_string())
-                        })?;
-                        rows.into_iter()
-                            .map(|r| r.get("target_folder_id"))
-                            .collect()
-                    }
-                    BackendConn::Postgres(conn) => {
-                        let rows = sqlx::query(
-                            "SELECT target_folder_id FROM folder_aliases
-                             WHERE space_id = $1 AND old_parent_folder_id = $2 AND old_slug_fold = $3
-                             ORDER BY created_seq DESC
-                             LIMIT $4",
-                        )
-                        .bind(scope.space_id.as_str())
-                        .bind(parent_id.as_str())
-                        .bind(&slug_fold)
-                        .bind(MAX_FOLDER_DEPTH as i64)
-                        .fetch_all(&mut **conn)
-                        .await
-                        .map_err(|err| {
-                            crate::runtime::pg_read_error("pg_resolve_folder_alias", err)
-                        })?;
-                        rows.into_iter()
-                            .map(|r| r.get("target_folder_id"))
-                            .collect()
-                    }
-                };
-
-                let mut seen = BTreeSet::new();
-                for cand_raw in candidates {
-                    if !seen.insert(cand_raw.clone()) {
-                        continue;
-                    }
-                    let fid = FolderId::parse(&cand_raw).map_err(|_| {
-                        internal_not_committed("corrupt_alias_folder_id", "invalid target_folder_id")
-                    })?;
-                    if is_folder_readable_tx(tx, &space_rec.space, &auth, &fid).await? {
-                        return Ok(Some(FolderRef {
-                            space_id: scope.space_id,
-                            folder_id: fid,
-                        }));
-                    }
-                }
-                Ok(None)
+                resolve_folder_component_tx(
+                    tx, &space_rec, &auth, &parent_id, &slug_fold, true, &mut cache,
+                )
+                .await
             })
         })
         .await
+}
+
+pub(super) async fn resolve_folder_component_tx(
+    tx: &mut BackendConn<'_>,
+    space_rec: &crate::SpaceRecord,
+    auth: &notarium_core::auth::EngineAuthContext,
+    parent_id: &FolderId,
+    slug_fold: &str,
+    aliases: bool,
+    cache: &mut FolderAncestryCache,
+) -> Result<Option<FolderRef>, PortError> {
+    let scope = &space_rec.scope;
+    // 1. Exact active sibling takes priority over any historical alias!
+    let active_sibling: Option<String> = match tx {
+        BackendConn::Sqlite(conn) => sqlx::query_scalar(
+            "SELECT folder_id FROM folder_heads
+             WHERE space_id = ? AND parent_folder_id = ? AND slug_fold = ?
+               AND lifecycle_state = 'active' AND is_root = 0
+             LIMIT 1",
+        )
+        .bind(scope.space_id.as_str())
+        .bind(parent_id.as_str())
+        .bind(slug_fold)
+        .fetch_optional(&mut **conn)
+        .await
+        .map_err(|err| internal_not_committed("sqlite_resolve_folder_exact", err.to_string()))?,
+        BackendConn::Postgres(conn) => sqlx::query_scalar(
+            "SELECT folder_id FROM folder_heads
+             WHERE space_id = $1 AND parent_folder_id = $2 AND slug_fold = $3
+               AND lifecycle_state = 'active' AND is_root = 0
+             LIMIT 1",
+        )
+        .bind(scope.space_id.as_str())
+        .bind(parent_id.as_str())
+        .bind(slug_fold)
+        .fetch_optional(&mut **conn)
+        .await
+        .map_err(|err| crate::runtime::pg_read_error("pg_resolve_folder_exact", err))?,
+    };
+
+    if let Some(fid_raw) = active_sibling {
+        let fid = FolderId::parse(&fid_raw)
+            .map_err(|_| internal_not_committed("corrupt_folder_id", "invalid folder_id"))?;
+        if is_folder_readable_tx(tx, &space_rec.space, auth, &fid, cache).await? {
+            return Ok(Some(FolderRef {
+                space_id: scope.space_id.clone(),
+                folder_id: fid,
+            }));
+        }
+        return Ok(None);
+    }
+
+    if !aliases {
+        return Ok(None);
+    }
+
+    // 2. Newest valid active alias target (with cycle/depth guard via ancestry check).
+    let candidates: Vec<String> = match tx {
+        BackendConn::Sqlite(conn) => {
+            let rows = sqlx::query(
+                "SELECT target_folder_id FROM folder_aliases
+                 WHERE space_id = ? AND old_parent_folder_id = ? AND old_slug_fold = ?
+                 ORDER BY created_seq DESC
+                 LIMIT ?",
+            )
+            .bind(scope.space_id.as_str())
+            .bind(parent_id.as_str())
+            .bind(slug_fold)
+            .bind(MAX_FOLDER_DEPTH as i64)
+            .fetch_all(&mut **conn)
+            .await
+            .map_err(|err| {
+                internal_not_committed("sqlite_resolve_folder_alias", err.to_string())
+            })?;
+            rows.into_iter()
+                .map(|r| r.get("target_folder_id"))
+                .collect()
+        }
+        BackendConn::Postgres(conn) => {
+            let rows = sqlx::query(
+                "SELECT target_folder_id FROM folder_aliases
+                 WHERE space_id = $1 AND old_parent_folder_id = $2 AND old_slug_fold = $3
+                 ORDER BY created_seq DESC
+                 LIMIT $4",
+            )
+            .bind(scope.space_id.as_str())
+            .bind(parent_id.as_str())
+            .bind(slug_fold)
+            .bind(MAX_FOLDER_DEPTH as i64)
+            .fetch_all(&mut **conn)
+            .await
+            .map_err(|err| crate::runtime::pg_read_error("pg_resolve_folder_alias", err))?;
+            rows.into_iter()
+                .map(|r| r.get("target_folder_id"))
+                .collect()
+        }
+    };
+
+    let mut seen = BTreeSet::new();
+    for cand_raw in candidates {
+        if !seen.insert(cand_raw.clone()) {
+            continue;
+        }
+        let fid = FolderId::parse(&cand_raw).map_err(|_| {
+            internal_not_committed("corrupt_alias_folder_id", "invalid target_folder_id")
+        })?;
+        if is_folder_readable_tx(tx, &space_rec.space, auth, &fid, cache).await? {
+            return Ok(Some(FolderRef {
+                space_id: scope.space_id.clone(),
+                folder_id: fid,
+            }));
+        }
+    }
+    Ok(None)
 }
 
 pub(crate) async fn resolve_note_alias_impl(
@@ -1118,13 +1248,16 @@ pub(crate) async fn resolve_note_alias_impl(
                         BackendConn::Sqlite(conn) => {
                             let rows = sqlx::query(
                                 "SELECT note_id FROM note_heads
-                                 WHERE space_id = ? AND parent_folder_id = ? AND title_fold = ?
+                                 WHERE space_id = ? AND parent_folder_id = ?
+                                   AND substr(title_fold, 1, 256) = substr(?, 1, 256)
+                                   AND title_fold = ?
                                    AND lifecycle_state = 'active'
                                  ORDER BY updated_seq DESC, note_id ASC
                                  LIMIT 16",
                             )
                             .bind(scope.space_id.as_str())
                             .bind(parent_id.as_str())
+                            .bind(&title_norm)
                             .bind(&title_norm)
                             .fetch_all(&mut **conn)
                             .await
@@ -1136,9 +1269,11 @@ pub(crate) async fn resolve_note_alias_impl(
                         BackendConn::Postgres(conn) => {
                             let rows = sqlx::query(
                                 "SELECT note_id FROM note_heads
-                                 WHERE space_id = $1 AND parent_folder_id = $2 AND title_fold = $3
+                                 WHERE space_id = $1 AND parent_folder_id = $2
+                                   AND (substr(title_fold, 1, 256) COLLATE \"C\") = (substr($3, 1, 256) COLLATE \"C\")
+                                   AND title_fold = $3
                                    AND lifecycle_state = 'active'
-                                 ORDER BY updated_seq DESC, note_id ASC
+                                 ORDER BY updated_seq DESC, note_id COLLATE \"C\" ASC
                                  LIMIT 16",
                             )
                             .bind(scope.space_id.as_str())
@@ -1279,6 +1414,9 @@ pub(crate) async fn set_folder_write_lock_impl(
     folder: FolderId,
     locked: bool,
 ) -> Result<FolderRef, PortError> {
+    if ctx.confirmed_chat_step().is_some() {
+        return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
+    }
     let deadline =
         crate::domain::common::CommandDeadline::start(&ctx.budget, "set_folder_write_lock");
     let target_write_class = folder_mutation_class(ctx.auth(), &ctx.scope().space_id)?;
@@ -1308,15 +1446,33 @@ pub(crate) async fn set_folder_write_lock_impl(
                     return Err(DomainError::ResourceNotFound.into());
                 }
                 let anc = load_folder_ancestry_tx(tx, &scope.space_id, &folder_cl, true).await?;
-                // Unlocking checks write permission without failing on the folder's own existing lock!
+                auth.can_view_folder(&live_space.space, &folder_cl, &anc.ancestors)?;
+                let strict_ancestor_locked = if let Some(parent_id) = &folder_row.parent_folder_id {
+                    load_folder_ancestry_tx(tx, &scope.space_id, parent_id, true)
+                        .await?
+                        .write_locked
+                } else {
+                    false
+                };
+                // Unlocking checks write permission against strict ancestors and strict descendants
+                // without failing on the folder's own existing lock.
                 let check_facts = notarium_core::auth::ResourceFacts {
                     space: live_space.space.clone(),
                     class: target_write_class,
+                    project: anc.project,
                     ancestor_folders: anc.ancestors,
-                    folder_write_locked: false,
+                    folder_write_locked: strict_ancestor_locked,
                     ability_package: None,
                 };
                 auth.authorize_direct_write(&check_facts, &check_facts)?;
+                if matches!(
+                    auth.kind(),
+                    notarium_core::auth::PrincipalKind::AgentRun(_)
+                        | notarium_core::auth::PrincipalKind::Keeper(_)
+                ) {
+                    return Err(DomainError::SpaceReadOnly.into());
+                }
+                authorize_folder_subtree_tx(tx, &scope.space_id, &folder_cl, &auth, false).await?;
 
                 let lock_json: Option<&str> = if locked {
                     Some("{\"locked\":true}")
@@ -1372,6 +1528,7 @@ pub(crate) async fn set_folder_write_lock_impl(
 
                 let meta = RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Folder(
                     FolderRevisionMetadata {
+                        confirmation: None,
                         folder_id: folder_cl.clone(),
                         parent_folder_id: folder_row.parent_folder_id,
                         is_root: folder_row.is_root,
@@ -1435,7 +1592,9 @@ pub(crate) async fn set_folder_write_lock_impl(
     };
 
     let _ = active_note_sibling_exists_tx;
-    deadline.submit(store, &ctx.budget, intent).await
+    deadline
+        .submit_with_effect(store, &ctx.budget, intent, ctx.canonical_effect().cloned())
+        .await
 }
 
 /// Memory and ability grants apply to those documents only. Neither grants authority
@@ -1448,15 +1607,25 @@ pub(crate) fn folder_mutation_class(
         .spaces()
         .get(space)
         .ok_or(DomainError::ResourceNotFound)?;
-    if grant.write_classes.contains(&DocClass::UserDoc) {
+    if grant.write_classes.contains(&DocClass::UserDoc)
+        && grant.read_classes.contains(&DocClass::UserDoc)
+    {
         return Ok(DocClass::UserDoc);
     }
-    grant
+    if let Some(class) = grant.write_classes.iter().copied().find(|class| {
+        !matches!(class, DocClass::AgentMemory | DocClass::Skill)
+            && grant.read_classes.contains(class)
+    }) {
+        return Ok(class);
+    }
+    if grant
         .write_classes
         .iter()
-        .copied()
-        .find(|class| !matches!(class, DocClass::AgentMemory | DocClass::Skill))
-        .ok_or(DomainError::SpaceReadOnly)
+        .any(|class| !matches!(class, DocClass::AgentMemory | DocClass::Skill))
+    {
+        return Err(DomainError::ResourceNotFound);
+    }
+    Err(DomainError::SpaceReadOnly)
 }
 
 async fn is_folder_readable_tx(
@@ -1464,27 +1633,16 @@ async fn is_folder_readable_tx(
     space: &notarium_core::auth::Space,
     auth: &notarium_core::auth::EngineAuthContext,
     folder_id: &FolderId,
+    cache: &mut FolderAncestryCache,
 ) -> Result<bool, PortError> {
-    let Some(anc) = super::common::optional_read(
-        load_folder_ancestry_tx(tx, &space.id, folder_id, true).await,
-    )?
+    let Some(anc) =
+        super::common::optional_read(cache.load_ancestry_tx(tx, &space.id, folder_id, true).await)?
     else {
         return Ok(false);
     };
-    let Some(grant) = auth.spaces().get(&space.id) else {
-        return Ok(false);
-    };
-    let Some(readable_class) = grant.read_classes.iter().copied().next() else {
-        return Ok(false);
-    };
-    let facts = notarium_core::auth::ResourceFacts {
-        space: space.clone(),
-        class: readable_class,
-        ancestor_folders: anc.ancestors,
-        folder_write_locked: anc.write_locked,
-        ability_package: None,
-    };
-    Ok(auth.authorize_read(&facts).is_ok())
+    Ok(auth
+        .authorize_folder_read(space, folder_id, &anc.ancestors)
+        .is_ok())
 }
 
 pub(crate) async fn is_note_live_readable_tx(
@@ -1519,6 +1677,207 @@ pub(crate) async fn is_note_live_readable_tx(
     Ok(auth.authorize_read(&facts).is_ok())
 }
 
+pub(crate) const FOLDER_SUBTREE_AUTH_SQL_WITH_ROOT: &str = FOLDER_SUBTREE_AUTH_SQLITE_WITH_ROOT;
+
+const FOLDER_SUBTREE_AUTH_SQLITE_WITH_ROOT: &str = "WITH RECURSIVE subtree(folder_id, locked) AS (
+        SELECT folder_id,
+               CASE WHEN lifecycle_state != 'purged' AND write_lock_json IS NOT NULL THEN 1 ELSE 0 END
+        FROM folder_heads
+        WHERE space_id = $1 AND folder_id = $2
+        UNION
+        SELECT child.folder_id,
+               CASE WHEN child.lifecycle_state != 'purged' AND child.write_lock_json IS NOT NULL THEN 1 ELSE 0 END
+        FROM subtree AS parent
+        CROSS JOIN folder_heads AS child
+        WHERE child.space_id = $1
+          AND child.parent_folder_id = parent.folder_id
+          AND child.lifecycle_state != 'purged'
+    )
+    SELECT CAST(
+        COALESCE((SELECT MAX(locked) FROM subtree), 0)
+        + COALESCE((
+            SELECT
+                MAX(CASE WHEN nh.doc_class = 'skill' OR nh.ability_id IS NOT NULL THEN 2 ELSE 0 END)
+                + MAX(CASE WHEN nh.doc_class = 'user-doc' THEN 4 ELSE 0 END)
+                + MAX(CASE WHEN nh.doc_class = 'agent-memory' THEN 8 ELSE 0 END)
+                + MAX(CASE WHEN nh.doc_class = 'skill' THEN 16 ELSE 0 END)
+                + MAX(CASE WHEN nh.doc_class = 'encrypted-note' THEN 32 ELSE 0 END)
+                + MAX(CASE WHEN nh.doc_class = 'profile' THEN 64 ELSE 0 END)
+                + MAX(CASE WHEN nh.doc_class NOT IN ('user-doc', 'agent-memory', 'skill', 'encrypted-note', 'profile') THEN 128 ELSE 0 END)
+            FROM subtree AS s
+            CROSS JOIN note_heads AS nh INDEXED BY idx_note_heads_parent_lifecycle
+            WHERE nh.space_id = $1
+              AND nh.parent_folder_id = s.folder_id
+              AND nh.lifecycle_state != 'purged'
+        ), 0)
+    AS BIGINT)";
+
+const FOLDER_SUBTREE_AUTH_SQLITE_WITHOUT_ROOT: &str = "WITH RECURSIVE subtree(folder_id, locked) AS (
+        SELECT folder_id, 0
+        FROM folder_heads
+        WHERE space_id = $1 AND folder_id = $2
+        UNION
+        SELECT child.folder_id,
+               CASE WHEN child.lifecycle_state != 'purged' AND child.write_lock_json IS NOT NULL THEN 1 ELSE 0 END
+        FROM subtree AS parent
+        CROSS JOIN folder_heads AS child
+        WHERE child.space_id = $1
+          AND child.parent_folder_id = parent.folder_id
+          AND child.lifecycle_state != 'purged'
+    )
+    SELECT CAST(
+        COALESCE((SELECT MAX(locked) FROM subtree), 0)
+        + COALESCE((
+            SELECT
+                MAX(CASE WHEN nh.doc_class = 'skill' OR nh.ability_id IS NOT NULL THEN 2 ELSE 0 END)
+                + MAX(CASE WHEN nh.doc_class = 'user-doc' THEN 4 ELSE 0 END)
+                + MAX(CASE WHEN nh.doc_class = 'agent-memory' THEN 8 ELSE 0 END)
+                + MAX(CASE WHEN nh.doc_class = 'skill' THEN 16 ELSE 0 END)
+                + MAX(CASE WHEN nh.doc_class = 'encrypted-note' THEN 32 ELSE 0 END)
+                + MAX(CASE WHEN nh.doc_class = 'profile' THEN 64 ELSE 0 END)
+                + MAX(CASE WHEN nh.doc_class NOT IN ('user-doc', 'agent-memory', 'skill', 'encrypted-note', 'profile') THEN 128 ELSE 0 END)
+            FROM subtree AS s
+            CROSS JOIN note_heads AS nh INDEXED BY idx_note_heads_parent_lifecycle
+            WHERE nh.space_id = $1
+              AND nh.parent_folder_id = s.folder_id
+              AND nh.lifecycle_state != 'purged'
+        ), 0)
+    AS BIGINT)";
+
+const FOLDER_SUBTREE_AUTH_PG_WITH_ROOT: &str = "WITH RECURSIVE subtree(folder_id, locked) AS (
+        SELECT folder_id,
+               CASE WHEN lifecycle_state != 'purged' AND write_lock_json IS NOT NULL THEN 1 ELSE 0 END
+        FROM folder_heads
+        WHERE space_id = $1 AND folder_id = $2
+        UNION
+        SELECT child.folder_id,
+               CASE WHEN child.lifecycle_state != 'purged' AND child.write_lock_json IS NOT NULL THEN 1 ELSE 0 END
+        FROM subtree AS parent
+        CROSS JOIN folder_heads AS child
+        WHERE child.space_id = $1
+          AND child.parent_folder_id = parent.folder_id
+          AND child.lifecycle_state != 'purged'
+    )
+    SELECT CAST(
+        COALESCE((SELECT MAX(locked) FROM subtree), 0)
+        + COALESCE((
+            SELECT
+                MAX(CASE WHEN nh.doc_class = 'skill' OR nh.ability_id IS NOT NULL THEN 2 ELSE 0 END)
+                + MAX(CASE WHEN nh.doc_class = 'user-doc' THEN 4 ELSE 0 END)
+                + MAX(CASE WHEN nh.doc_class = 'agent-memory' THEN 8 ELSE 0 END)
+                + MAX(CASE WHEN nh.doc_class = 'skill' THEN 16 ELSE 0 END)
+                + MAX(CASE WHEN nh.doc_class = 'encrypted-note' THEN 32 ELSE 0 END)
+                + MAX(CASE WHEN nh.doc_class = 'profile' THEN 64 ELSE 0 END)
+                + MAX(CASE WHEN nh.doc_class NOT IN ('user-doc', 'agent-memory', 'skill', 'encrypted-note', 'profile') THEN 128 ELSE 0 END)
+            FROM subtree AS s
+            CROSS JOIN note_heads AS nh
+            WHERE nh.space_id = $1
+              AND nh.parent_folder_id = s.folder_id
+              AND nh.lifecycle_state != 'purged'
+        ), 0)
+    AS BIGINT)";
+
+const FOLDER_SUBTREE_AUTH_PG_WITHOUT_ROOT: &str = "WITH RECURSIVE subtree(folder_id, locked) AS (
+        SELECT folder_id, 0
+        FROM folder_heads
+        WHERE space_id = $1 AND folder_id = $2
+        UNION
+        SELECT child.folder_id,
+               CASE WHEN child.lifecycle_state != 'purged' AND child.write_lock_json IS NOT NULL THEN 1 ELSE 0 END
+        FROM subtree AS parent
+        CROSS JOIN folder_heads AS child
+        WHERE child.space_id = $1
+          AND child.parent_folder_id = parent.folder_id
+          AND child.lifecycle_state != 'purged'
+    )
+    SELECT CAST(
+        COALESCE((SELECT MAX(locked) FROM subtree), 0)
+        + COALESCE((
+            SELECT
+                MAX(CASE WHEN nh.doc_class = 'skill' OR nh.ability_id IS NOT NULL THEN 2 ELSE 0 END)
+                + MAX(CASE WHEN nh.doc_class = 'user-doc' THEN 4 ELSE 0 END)
+                + MAX(CASE WHEN nh.doc_class = 'agent-memory' THEN 8 ELSE 0 END)
+                + MAX(CASE WHEN nh.doc_class = 'skill' THEN 16 ELSE 0 END)
+                + MAX(CASE WHEN nh.doc_class = 'encrypted-note' THEN 32 ELSE 0 END)
+                + MAX(CASE WHEN nh.doc_class = 'profile' THEN 64 ELSE 0 END)
+                + MAX(CASE WHEN nh.doc_class NOT IN ('user-doc', 'agent-memory', 'skill', 'encrypted-note', 'profile') THEN 128 ELSE 0 END)
+            FROM subtree AS s
+            CROSS JOIN note_heads AS nh
+            WHERE nh.space_id = $1
+              AND nh.parent_folder_id = s.folder_id
+              AND nh.lifecycle_state != 'purged'
+        ), 0)
+    AS BIGINT)";
+
+pub(crate) fn authorize_folder_subtree_mask(
+    space_id: &notarium_core::ids::SpaceId,
+    auth: &notarium_core::auth::EngineAuthContext,
+    mask: i64,
+) -> Result<(), PortError> {
+    if (mask & 1) != 0 || (mask & 128) != 0 {
+        return Err(DomainError::SpaceReadOnly.into());
+    }
+    let grant = auth
+        .spaces()
+        .get(space_id)
+        .ok_or(DomainError::ResourceNotFound)?;
+    for (bit, class) in [
+        (4_i64, DocClass::UserDoc),
+        (8_i64, DocClass::AgentMemory),
+        (16_i64, DocClass::Skill),
+        (32_i64, DocClass::EncryptedNote),
+        (64_i64, DocClass::Profile),
+    ] {
+        if (mask & bit) != 0 && !grant.write_classes.contains(&class) {
+            return Err(DomainError::SpaceReadOnly.into());
+        }
+    }
+    if (mask & 2) != 0 {
+        auth.authorize_ability_mutation()?;
+    }
+    Ok(())
+}
+
+pub(crate) async fn authorize_folder_subtree_tx(
+    tx: &mut BackendConn<'_>,
+    space_id: &notarium_core::ids::SpaceId,
+    root_folder: &FolderId,
+    auth: &notarium_core::auth::EngineAuthContext,
+    include_root_lock: bool,
+) -> Result<(), PortError> {
+    let mask: i64 = match tx {
+        BackendConn::Sqlite(conn) => {
+            let sql = if include_root_lock {
+                FOLDER_SUBTREE_AUTH_SQLITE_WITH_ROOT
+            } else {
+                FOLDER_SUBTREE_AUTH_SQLITE_WITHOUT_ROOT
+            };
+            sqlx::query_scalar(sql)
+                .bind(space_id.as_str())
+                .bind(root_folder.as_str())
+                .fetch_one(&mut **conn)
+                .await
+                .map_err(|err| {
+                    internal_not_committed("sqlite_folder_subtree_auth", err.to_string())
+                })?
+        }
+        BackendConn::Postgres(conn) => {
+            let sql = if include_root_lock {
+                FOLDER_SUBTREE_AUTH_PG_WITH_ROOT
+            } else {
+                FOLDER_SUBTREE_AUTH_PG_WITHOUT_ROOT
+            };
+            sqlx::query_scalar(sql)
+                .bind(space_id.as_str())
+                .bind(root_folder.as_str())
+                .fetch_one(&mut **conn)
+                .await
+                .map_err(|err| crate::runtime::pg_read_error("pg_folder_subtree_auth", err))?
+        }
+    };
+    authorize_folder_subtree_mask(space_id, auth, mask)
+}
+
 async fn subtree_reaches_depth_tx(
     tx: &mut BackendConn<'_>,
     space_id: &notarium_core::ids::SpaceId,
@@ -1541,7 +1900,7 @@ async fn subtree_reaches_depth_tx(
                 .bind(depth)
                 .fetch_one(&mut **conn)
                 .await
-                .map_err(|err| internal_not_committed("pg_subtree_depth", err.to_string()))
+                .map_err(|err| crate::runtime::pg_read_error("pg_subtree_depth", err))
         }
     }
 }

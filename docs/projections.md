@@ -283,7 +283,8 @@ down the connection pool) and advises `POSIX_FADV_DONTNEED` on the derived
 SQLite database and WAL files. For PostgreSQL cold board queries, the local
 mmap checkpoint is evicted from RAM and OS page cache while PostgreSQL
 `shared_buffers` remains warm across samples in the same fixture instance. The
-PostgreSQL profile uses a local Unix socket and local CAS. Its results describe
+PostgreSQL profile uses a local Unix socket and S3 (`S3ChunkedV1` over local
+UDS). Its results describe
 the storage and projection workload under that setup. Both drivers also measure
 the warm and cold 50-row read after a canonical drag materializes the
 destination column. Every sample checks column counts, note order and the

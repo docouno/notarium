@@ -121,7 +121,7 @@ impl CanonicalStore {
         self.inner.check_writer_epoch(&scope.space_id, epoch)?;
         let current = scope.clone();
         let (through, has_purges) = self
-            .with_write_tx(|tx| {
+            .with_write_tx_for_space(Some(scope.space_id.clone()), |tx| {
                 Box::pin(async move {
                     let space = crate::blobs::lock_and_check_space_tx(tx, &current, epoch).await?;
                     crate::blobs::plan_unowned_active_blobs_tx(tx, &current, epoch).await?;
@@ -351,7 +351,7 @@ async fn purge_note_inner(
     space_rec.scope.check(ctx.scope())?;
 
     let fp = format!("purge_note={}", request.input.note.as_str());
-    let idemp = derive_command_identity_spec(&request.identity, "purge_note", fp.as_bytes())
+    let idemp = derive_command_identity_spec(&ctx, &request.identity, "purge_note", fp.as_bytes())
         .with_preconditions(&request.preconditions, "note", request.input.note.as_str())
         .for_note(ctx.auth(), &request.input.note);
 
@@ -418,6 +418,20 @@ async fn purge_note_inner(
                     ));
                 }
 
+                let cover_folders =
+                    super::folder_cover::find_cover_folders(tx, &scope.space_id, &old_note).await?;
+                for cover_folder in &cover_folders {
+                    super::folder_cover::authorize_cover_folder_mutation_tx(
+                        tx,
+                        &live_space.space,
+                        &auth,
+                        cover_folder,
+                        false,
+                    )
+                    .await?;
+                }
+                let (_first_seq, visibility_seq) =
+                    item_ctx.preview_seq_range(1 + cover_folders.len() as u64)?;
                 let purge_seq = item_ctx.alloc_next_seq()?;
                 let tombstone_rev = new_revision_id()?;
                 let purge_id = new_prefixed_hex_id("prg_")?;
@@ -440,6 +454,17 @@ async fn purge_note_inner(
                 .await?;
 
                 let run_opt = extract_agent_run_from_auth(&auth);
+                let cover_events = super::folder_cover::clear_folders(
+                    tx,
+                    item_ctx,
+                    &scope,
+                    &cover_folders,
+                    visibility_seq,
+                    auth.principal(),
+                    run_opt.as_ref(),
+                    now_ts,
+                )
+                .await?;
                 if let Some(run_id) = &run_opt {
                     upsert_agent_run_head_tx(
                         tx,
@@ -447,13 +472,13 @@ async fn purge_note_inner(
                         run_id,
                         auth.principal(),
                         purge_seq,
-                        purge_seq,
+                        visibility_seq,
                         now_ts,
                     )
                     .await?;
                 }
 
-                let receipt = MutationReceiptToken::new(scope.clone(), purge_seq)?;
+                let receipt = MutationReceiptToken::new(scope.clone(), visibility_seq)?;
                 let stored_resp = StoredCommittedNoteRevV1 {
                     value: NoteRevision {
                         note: old_note.clone(),
@@ -471,7 +496,7 @@ async fn purge_note_inner(
                     &old_note,
                     None,
                     None,
-                    purge_seq,
+                    visibility_seq,
                     &retirement_ids,
                     &sanitized_bytes,
                     now_ms,
@@ -487,23 +512,27 @@ async fn purge_note_inner(
                         actor_id: idemp_cl.actor.as_str().to_owned(),
                         idempotency_key: idemp_cl.command_key.as_str().to_owned(),
                         old_note_id: old_note.clone(),
-                        canonical_seq: purge_seq,
+                        canonical_seq: visibility_seq,
                         retirement_ids,
                     });
+
+                let mut events = Vec::with_capacity(1 + cover_events.len());
+                events.push(BatchEventDraft {
+                    space_seq: purge_seq,
+                    entity_type: "note".to_owned(),
+                    entity_id: old_note.as_str().to_owned(),
+                    op_kind: "purge".to_owned(),
+                    rev_id: tombstone_rev,
+                    lifecycle: Lifecycle::Purged,
+                    doc_class: Some(old_head.doc_class),
+                });
+                events.extend(cover_events);
 
                 let cmd_id = new_prefixed_hex_id("cmd_")?;
                 Ok(ItemCommitArtifacts {
                     command_id: cmd_id,
                     command_kind: "purge_note".to_owned(),
-                    events: vec![BatchEventDraft {
-                        space_seq: purge_seq,
-                        entity_type: "note".to_owned(),
-                        entity_id: old_note.as_str().to_owned(),
-                        op_kind: "purge".to_owned(),
-                        rev_id: tombstone_rev,
-                        lifecycle: Lifecycle::Purged,
-                        doc_class: Some(old_head.doc_class),
-                    }],
+                    events,
                     change_payload: None,
                     receipt_detail_blob: None,
                     receipt_sanitized_blob: sanitized_bytes.clone(),
@@ -553,6 +582,27 @@ async fn purge_note_inner(
                     })?;
                 return Ok(stored.into_committed());
             }
+            if let Some(receipt) = deadline
+                .prepare(&ctx.budget, || {
+                    load_completed_receipt_for_idempotency(store, &space_rec.scope, &idemp)
+                })
+                .await?
+            {
+                let stored: StoredCommittedNoteRevV1 =
+                    rmp_serde::from_slice(&receipt.response_blob).map_err(|err| {
+                        unknown_commit_outcome("decode_completed_purge_resp", err.to_string())
+                    })?;
+                let committed = stored.into_committed();
+                finish_replayed_projection_cleanup(
+                    store,
+                    &committed.receipt,
+                    &committed.value.note,
+                    &ctx.budget,
+                    &deadline,
+                )
+                .await?;
+                return Ok(committed);
+            }
             Err(unavailable_retryable(
                 "purge_submit_unavailable",
                 "purge temporarily unavailable; retry same command",
@@ -588,6 +638,19 @@ async fn authorize_mint_placement_tx(
     )
     .await?;
     auth.authorize_direct_write(&old_facts, &new_facts)?;
+    let cover_folders =
+        super::folder_cover::find_cover_folders(tx, &space.scope.space_id, &old_head.note_id)
+            .await?;
+    for cover_folder in &cover_folders {
+        super::folder_cover::authorize_cover_folder_mutation_tx(
+            tx,
+            &space.space,
+            auth,
+            cover_folder,
+            false,
+        )
+        .await?;
+    }
 
     Ok(new_anc)
 }
@@ -635,6 +698,7 @@ pub(crate) async fn mint_and_purge_impl(
     fp_hasher.update(&[0]);
     fp_hasher.update(encrypted_digest.as_bytes());
     let idemp = derive_command_identity_spec(
+        &ctx,
         &request.identity,
         "mint_and_purge",
         fp_hasher.finalize().as_bytes(),
@@ -649,7 +713,7 @@ pub(crate) async fn mint_and_purge_impl(
         ctx.auth(),
         crate::writer::replay::ReplayPolicy::Documents(vec![
             crate::writer::replay::ReplayResource::Write(request.input.old_note.clone()),
-            crate::writer::replay::ReplayResource::Write(request.input.new_note.clone()),
+            crate::writer::replay::ReplayResource::WriteUnpurged(request.input.new_note.clone()),
         ]),
     );
 
@@ -675,12 +739,12 @@ pub(crate) async fn mint_and_purge_impl(
                     return Ok(Some(receipt));
                 }
                 let head = load_note_head_row_tx(tx, &space.scope.space_id, &old_note).await?;
-                authorize_mint_placement_tx(tx, &space, &head, preflight.auth()).await?;
                 if head.lifecycle == Lifecycle::Purged
                     || is_note_purge_fenced_tx(tx, &space.scope.space_id, old_note.as_str()).await?
                 {
                     return Err(DomainError::ResourceNotFound.into());
                 }
+                authorize_mint_placement_tx(tx, &space, &head, preflight.auth()).await?;
                 let collision = super::common::authorized_collision_revision_tx(
                     tx,
                     &space.space,
@@ -708,9 +772,9 @@ pub(crate) async fn mint_and_purge_impl(
         })
     };
     let existing = deadline.prepare(&ctx.budget, read_existing).await?;
-    if let Some(receipt) = existing {
+    if let Some(mut receipt) = existing {
         if receipt.status != "completed" {
-            let (pending, _) = deadline
+            if let Some((pending, _)) = deadline
                 .prepare(&ctx.budget, || {
                     load_pending_purge_for_idempotency(store, &space_rec.scope, &idemp)
                 })
@@ -718,13 +782,24 @@ pub(crate) async fn mint_and_purge_impl(
                 .map_err(|err| {
                     unknown_commit_outcome("lookup_pending_mint_purge", err.to_string())
                 })?
-                .ok_or_else(|| {
-                    unknown_commit_outcome(
-                        "missing_pending_purge",
-                        "unfinished receipt missing purge state",
-                    )
-                })?;
-            finish_committed_purge(store, &pending, &ctx.budget, &deadline, true).await?;
+            {
+                finish_committed_purge(store, &pending, &ctx.budget, &deadline, true).await?;
+            } else if let Some(completed) = deadline
+                .prepare(&ctx.budget, || {
+                    load_completed_receipt_for_idempotency(store, &space_rec.scope, &idemp)
+                })
+                .await
+                .map_err(|err| {
+                    unknown_commit_outcome("lookup_completed_mint_purge", err.to_string())
+                })?
+            {
+                receipt = completed;
+            } else {
+                return Err(unknown_commit_outcome(
+                    "missing_pending_purge",
+                    "unfinished receipt missing purge state",
+                ));
+            }
         }
         let stored: StoredCommittedMintAndPurgeV1 = rmp_serde::from_slice(&receipt.response_blob)
             .map_err(|err| {
@@ -835,6 +910,11 @@ pub(crate) async fn mint_and_purge_impl(
                     .clone()
                     .unwrap_or_else(|| old_head.slug.clone());
                 let succ_slug_fold = normalize_slug_key(&succ_slug)?;
+                if succ_slug_fold == super::folder_cover::SLUG {
+                    return Err(
+                        DomainError::validation(ValidationReason::InvalidPathComponent).into(),
+                    );
+                }
 
                 // Exclude `old_note` since it transitions to `'purged'` in this exact atomic transaction!
                 if active_note_sibling_exists_tx(
@@ -858,8 +938,12 @@ pub(crate) async fn mint_and_purge_impl(
                     .into());
                 }
 
-                // Preview 2 contiguous SpaceSeq allocations (`purge_seq`, `create_seq`).
-                let _ = item_ctx.preview_seq_range(2)?;
+                let cover_folders =
+                    super::folder_cover::find_cover_folders(tx, &scope.space_id, &input.old_note)
+                        .await?;
+                // Preview contiguous SpaceSeq allocations (`purge_seq`, `create_seq`, and cleared folder covers).
+                let (_first_seq, visibility_seq) =
+                    item_ctx.preview_seq_range(2 + cover_folders.len() as u64)?;
                 let purge_seq = item_ctx.alloc_next_seq()?;
                 let create_seq = item_ctx.alloc_next_seq()?;
                 let tombstone_rev = new_revision_id()?;
@@ -906,6 +990,7 @@ pub(crate) async fn mint_and_purge_impl(
                 let succ_title = succ_slug.clone();
                 let succ_title_fold = normalize_title_key(&succ_title);
                 let create_i64 = create_seq.get() as i64;
+                let vis_i64 = visibility_seq.get() as i64;
                 let enc_class_str = doc_class_to_db(DocClass::EncryptedNote);
 
                 match tx {
@@ -931,7 +1016,7 @@ pub(crate) async fn mint_and_purge_impl(
                         .bind(encrypted_digest.as_bytes().as_slice())
                         .bind(encrypted_byte_size as i64)
                         .bind(create_i64)
-                        .bind(create_i64)
+                        .bind(vis_i64)
                         .bind(sec)
                         .bind(nsec)
                         .bind(sec)
@@ -951,7 +1036,7 @@ pub(crate) async fn mint_and_purge_impl(
                                 content_blake3, byte_size, lifecycle_state, visibility_mask,
                                 settlement_successor_id, created_seq, updated_seq,
                                 created_at_sec, created_at_nsec, updated_at_sec, updated_at_nsec, last_actor_id
-                             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, $9, $10, $11, 'active', 0, NULL, $12, $12, $13, $14, $13, $14, $15)",
+                             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, $9, $10, $11, 'active', 0, NULL, $12, $13, $14, $15, $14, $15, $16)",
                         )
                         .bind(scope.space_id.as_str())
                         .bind(input.new_note.as_str())
@@ -965,6 +1050,7 @@ pub(crate) async fn mint_and_purge_impl(
                         .bind(encrypted_digest.as_bytes().as_slice())
                         .bind(encrypted_byte_size as i64)
                         .bind(create_i64)
+                        .bind(vis_i64)
                         .bind(sec)
                         .bind(nsec)
                         .bind(auth.principal().as_str())
@@ -980,6 +1066,7 @@ pub(crate) async fn mint_and_purge_impl(
                 let run_opt = extract_agent_run_from_auth(&auth);
                 let new_meta = RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Note(
                     NoteRevisionMetadata {
+                        folder_page: false,
                         note_id: input.new_note.clone(),
                         parent_folder_id: old_head.parent_folder_id.clone(),
                         is_root_child: new_anc.is_root_child,
@@ -996,6 +1083,7 @@ pub(crate) async fn mint_and_purge_impl(
                         raw_fields: None,
                         evaluated_fields: Default::default(),
                         diagnostics: Vec::new(),
+                        logical_updated_at: None,
                     },
                 ))
                 .encode()?;
@@ -1007,7 +1095,7 @@ pub(crate) async fn mint_and_purge_impl(
                     "note",
                     input.new_note.as_str(),
                     create_seq,
-                    create_seq,
+                    visibility_seq,
                     None,
                     None,
                     Some(encrypted_digest),
@@ -1018,14 +1106,25 @@ pub(crate) async fn mint_and_purge_impl(
                 )
                 .await?;
 
+                let cover_events = super::folder_cover::clear_folders(
+                    tx,
+                    item_ctx,
+                    &scope,
+                    &cover_folders,
+                    visibility_seq,
+                    auth.principal(),
+                    run_opt.as_ref(),
+                    now_ts,
+                )
+                .await?;
                 if let Some(run_id) = &run_opt {
                     upsert_agent_run_head_tx(
                         tx,
                         &scope,
                         run_id,
                         auth.principal(),
-                        create_seq,
-                        create_seq,
+                        purge_seq,
+                        visibility_seq,
                         now_ts,
                     )
                     .await?;
@@ -1033,7 +1132,7 @@ pub(crate) async fn mint_and_purge_impl(
 
                 let cmd_id = new_prefixed_hex_id("cmd_")?;
                 let payload_id = format!("eff:{cmd_id}");
-                let range = notarium_core::ports::CommandSeqRange::new(purge_seq, create_seq)?;
+                let range = notarium_core::ports::CommandSeqRange::new(purge_seq, visibility_seq)?;
                 // Effect payload references ONLY `new_note`, never `old_note`!
                 let cp = build_effect_payload_draft(
                     payload_id,
@@ -1053,16 +1152,25 @@ pub(crate) async fn mint_and_purge_impl(
                     vec![input.new_note.clone()],
                 )?;
 
-                let receipt = MutationReceiptToken::new(scope.clone(), create_seq)?;
+                let receipt = MutationReceiptToken::new(scope.clone(), visibility_seq)?;
                 let stored_resp = StoredCommittedMintAndPurgeV1 {
                     old_note: input.old_note.clone(),
                     new_note: NoteRevision {
                         note: input.new_note.clone(),
                         revision: new_note_rev.clone(),
                     },
+                    receipt: receipt.clone(),
+                };
+                let detail_bytes = CanonicalStore::encode_command_outcome(&stored_resp)?;
+                let scrubbed_resp = StoredCommittedMintAndPurgeV1 {
+                    old_note: input.old_note.clone(),
+                    new_note: NoteRevision {
+                        note: input.new_note.clone(),
+                        revision: RevisionId::from_bytes([0u8; 16]),
+                    },
                     receipt,
                 };
-                let sanitized_bytes = CanonicalStore::encode_command_outcome(&stored_resp)?;
+                let sanitized_bytes = CanonicalStore::encode_command_outcome(&scrubbed_resp)?;
 
                 insert_pending_purge_row_tx(
                     tx,
@@ -1072,9 +1180,9 @@ pub(crate) async fn mint_and_purge_impl(
                     &input.old_note,
                     Some(&input.new_note),
                     Some(&new_note_rev),
-                    create_seq,
+                    visibility_seq,
                     &retirement_ids,
-                    &sanitized_bytes,
+                    &detail_bytes,
                     now_ms,
                 )
                 .await?;
@@ -1088,38 +1196,40 @@ pub(crate) async fn mint_and_purge_impl(
                         actor_id: idemp_cl.actor.as_str().to_owned(),
                         idempotency_key: idemp_cl.command_key.as_str().to_owned(),
                         old_note_id: input.old_note.clone(),
-                        canonical_seq: create_seq,
+                        canonical_seq: visibility_seq,
                         retirement_ids,
                     });
+
+                let mut events = Vec::with_capacity(2 + cover_events.len());
+                events.push(BatchEventDraft {
+                    space_seq: purge_seq,
+                    entity_type: "note".to_owned(),
+                    entity_id: input.old_note.as_str().to_owned(),
+                    op_kind: "purge".to_owned(),
+                    rev_id: tombstone_rev,
+                    lifecycle: Lifecycle::Purged,
+                    doc_class: Some(old_head.doc_class),
+                });
+                events.push(BatchEventDraft {
+                    space_seq: create_seq,
+                    entity_type: "note".to_owned(),
+                    entity_id: input.new_note.as_str().to_owned(),
+                    op_kind: "create".to_owned(),
+                    rev_id: new_note_rev,
+                    lifecycle: Lifecycle::Active,
+                    doc_class: Some(DocClass::EncryptedNote),
+                });
+                events.extend(cover_events);
 
                 Ok(ItemCommitArtifacts {
                     command_id: cmd_id,
                     command_kind: "mint_and_purge".to_owned(),
-                    events: vec![
-                        BatchEventDraft {
-                            space_seq: purge_seq,
-                            entity_type: "note".to_owned(),
-                            entity_id: input.old_note.as_str().to_owned(),
-                            op_kind: "purge".to_owned(),
-                            rev_id: tombstone_rev,
-                            lifecycle: Lifecycle::Purged,
-                            doc_class: Some(old_head.doc_class),
-                        },
-                        BatchEventDraft {
-                            space_seq: create_seq,
-                            entity_type: "note".to_owned(),
-                            entity_id: input.new_note.as_str().to_owned(),
-                            op_kind: "create".to_owned(),
-                            rev_id: new_note_rev,
-                            lifecycle: Lifecycle::Active,
-                            doc_class: Some(DocClass::EncryptedNote),
-                        },
-                    ],
+                    events,
                     change_payload: Some(cp),
-                    receipt_detail_blob: None,
-                    receipt_sanitized_blob: sanitized_bytes.clone(),
+                    receipt_detail_blob: Some(detail_bytes.clone()),
+                    receipt_sanitized_blob: sanitized_bytes,
                     receipt_owner_note_ids: vec![input.new_note],
-                    response_bytes: sanitized_bytes,
+                    response_bytes: detail_bytes,
                 })
             })
         }),
@@ -1161,6 +1271,27 @@ pub(crate) async fn mint_and_purge_impl(
                         unknown_commit_outcome("decode_resumed_mint_purge_resp", err.to_string())
                     })?;
                 return Ok(stored.into_committed());
+            }
+            if let Some(receipt) = deadline
+                .prepare(&ctx.budget, || {
+                    load_completed_receipt_for_idempotency(store, &space_rec.scope, &idemp)
+                })
+                .await?
+            {
+                let stored: StoredCommittedMintAndPurgeV1 =
+                    rmp_serde::from_slice(&receipt.response_blob).map_err(|err| {
+                        unknown_commit_outcome("decode_completed_mint_purge_resp", err.to_string())
+                    })?;
+                let committed = stored.into_committed();
+                finish_replayed_projection_cleanup(
+                    store,
+                    &committed.receipt,
+                    &committed.value.old_note,
+                    &ctx.budget,
+                    &deadline,
+                )
+                .await?;
+                return Ok(committed);
             }
             Err(unavailable_retryable(
                 "mint_and_purge_unavailable",
@@ -1336,7 +1467,7 @@ async fn execute_sql_erasure_for_old_note_tx(
         }
     }
 
-    // 2. Clear cover_note_id, overlays, rank revisions, note aliases, observations, collab sessions/logs, and note revisions!
+    // 2. Clear overlays, rank revisions, note aliases, observations, collab sessions/logs, and note revisions!
     let rank_prefix = format!("{old_id_str}:");
     let rank_suffix = format!(":{old_id_str}");
     const DELETE_ANCHORED_RANKS: [&str; 2] = [
@@ -1345,15 +1476,6 @@ async fn execute_sql_erasure_for_old_note_tx(
     ];
     match tx {
         BackendConn::Sqlite(conn) => {
-            sqlx::query(
-                "UPDATE folder_heads SET cover_note_id = NULL WHERE space_id = ? AND cover_note_id = ?",
-            )
-            .bind(scope.space_id.as_str())
-            .bind(old_id_str)
-            .execute(&mut **conn)
-            .await
-            .map_err(|err| internal_not_committed("sqlite_purge_clear_cover", err.to_string()))?;
-
             sqlx::query(
                 "DELETE FROM view_rank_overlays WHERE space_id = ? AND (target_note_id = ? OR view_note_id = ?)",
             )
@@ -1430,15 +1552,6 @@ async fn execute_sql_erasure_for_old_note_tx(
             .map_err(|err| internal_not_committed("sqlite_purge_del_revs", err.to_string()))?;
         }
         BackendConn::Postgres(conn) => {
-            sqlx::query(
-                "UPDATE folder_heads SET cover_note_id = NULL WHERE space_id = $1 AND cover_note_id = $2",
-            )
-            .bind(scope.space_id.as_str())
-            .bind(old_id_str)
-            .execute(&mut **conn)
-            .await
-            .map_err(|err| internal_not_committed("pg_purge_clear_cover", err.to_string()))?;
-
             sqlx::query(
                 "DELETE FROM view_rank_overlays WHERE space_id = $1 AND (target_note_id = $2 OR view_note_id = $2)",
             )
@@ -1734,6 +1847,8 @@ async fn execute_sql_erasure_for_old_note_tx(
     }
 
     receipt_pointers::clear(tx, scope, &erased_detail_ids).await?;
+    scrub_legacy_mint_and_purge_receipts_tx(tx, scope, &old_head.note_id, &erased_detail_ids)
+        .await?;
 
     // Erase all board_move_history rows and payload_owners referencing `old_note`!
     match tx {
@@ -1823,6 +1938,41 @@ async fn execute_sql_erasure_for_old_note_tx(
             .execute(&mut **conn)
             .await
             .map_err(|err| internal_not_committed("pg_tombstone_note_head", err.to_string()))?;
+        }
+    }
+
+    // 5c. Scrub any prior MintAndPurge pending_purges rows where this purged note was
+    //     recorded as the encrypted successor so neither its RevisionId nor un-scrubbed
+    //     receipt detail survives hard purge or leaks into subsequent backups.
+    scrub_pending_purge_successor_receipts_tx(tx, scope, &old_head.note_id).await?;
+    match tx {
+        BackendConn::Sqlite(conn) => {
+            sqlx::query(
+                "UPDATE pending_purges
+                 SET new_note_rev_id = NULL, sanitized_response_msgpack = X''
+                 WHERE space_id = ? AND new_note_id IS NOT NULL AND new_note_id = ?",
+            )
+            .bind(scope.space_id.as_str())
+            .bind(old_id_str)
+            .execute(&mut **conn)
+            .await
+            .map_err(|err| {
+                internal_not_committed("sqlite_scrub_successor_pending_purges", err.to_string())
+            })?;
+        }
+        BackendConn::Postgres(conn) => {
+            sqlx::query(
+                "UPDATE pending_purges
+                 SET new_note_rev_id = NULL, sanitized_response_msgpack = ''::BYTEA
+                 WHERE space_id = $1 AND new_note_id IS NOT NULL AND new_note_id COLLATE \"C\" = $2",
+            )
+            .bind(scope.space_id.as_str())
+            .bind(old_id_str)
+            .execute(&mut **conn)
+            .await
+            .map_err(|err| {
+                internal_not_committed("pg_scrub_successor_pending_purges", err.to_string())
+            })?;
         }
     }
 
@@ -1990,6 +2140,7 @@ async fn load_pending_purge_for_idempotency(
                             "SELECT purge_id, command_hash, old_note_id, retirement_ids_json, sanitized_response_msgpack, canonical_seq
                              FROM pending_purges
                              WHERE space_id = ? AND history_incarnation = ? AND actor_id = ? AND idempotency_key = ?
+                               AND phase IN ('sql_erased', 'cas_retired')
                              ORDER BY created_at_ms DESC
                              LIMIT 1",
                         )
@@ -2018,6 +2169,7 @@ async fn load_pending_purge_for_idempotency(
                             "SELECT purge_id, command_hash, old_note_id, retirement_ids_json, sanitized_response_msgpack, canonical_seq
                              FROM pending_purges
                              WHERE space_id = $1 AND history_incarnation = $2 AND actor_id = $3 AND idempotency_key = $4
+                               AND phase IN ('sql_erased', 'cas_retired')
                              ORDER BY created_at_ms DESC
                              LIMIT 1",
                         )
@@ -2073,6 +2225,298 @@ async fn load_pending_purge_for_idempotency(
         .await
 }
 
+async fn load_completed_receipt_for_idempotency(
+    store: &CanonicalStore,
+    scope: &HistoryScope,
+    idemp: &CommandIdentitySpec,
+) -> Result<Option<crate::writer::StoredReceiptRow>, PortError> {
+    let scope_cl = scope.clone();
+    let idemp_cl = idemp.clone();
+    let space_rec = store.read_space(&scope.space_id).await?;
+    space_rec.scope.check(scope)?;
+    store
+        .with_read_tx(|tx| {
+            Box::pin(async move {
+                let Some(receipt) =
+                    crate::writer::lookup_command_receipt_tx(tx, &scope_cl, &idemp_cl).await?
+                else {
+                    return Ok(None);
+                };
+                if receipt.status == "completed" {
+                    Ok(Some(receipt))
+                } else {
+                    Ok(None)
+                }
+            })
+        })
+        .await
+}
+
+async fn scrub_command_receipt_envelope_for_note_tx(
+    tx: &mut BackendConn<'_>,
+    space_id: &SpaceId,
+    incarnation: Option<&[u8]>,
+    actor_id: &str,
+    idempotency_key: &str,
+    purged_note: &NoteId,
+) -> Result<(), PortError> {
+    let zero_rev = RevisionId::from_bytes([0u8; 16]);
+    let rows: Vec<(Vec<u8>, Vec<u8>)> = match (&mut *tx, incarnation) {
+        (BackendConn::Sqlite(conn), Some(inc)) => {
+            let found = sqlx::query(
+                "SELECT history_incarnation, sanitized_envelope_msgpack FROM command_receipts
+                 WHERE space_id = ? AND history_incarnation = ? AND actor_id = ? AND idempotency_key = ?",
+            )
+            .bind(space_id.as_str())
+            .bind(inc)
+            .bind(actor_id)
+            .bind(idempotency_key)
+            .fetch_all(&mut **conn)
+            .await
+            .map_err(|err| internal_not_committed("sqlite_load_legacy_rcpt", err.to_string()))?;
+            found
+                .into_iter()
+                .map(|r| {
+                    (
+                        r.get("history_incarnation"),
+                        r.get("sanitized_envelope_msgpack"),
+                    )
+                })
+                .collect()
+        }
+        (BackendConn::Sqlite(conn), None) => {
+            let found = sqlx::query(
+                "SELECT history_incarnation, sanitized_envelope_msgpack FROM command_receipts
+                 WHERE space_id = ? AND actor_id = ? AND idempotency_key = ?",
+            )
+            .bind(space_id.as_str())
+            .bind(actor_id)
+            .bind(idempotency_key)
+            .fetch_all(&mut **conn)
+            .await
+            .map_err(|err| internal_not_committed("sqlite_load_legacy_rcpt", err.to_string()))?;
+            found
+                .into_iter()
+                .map(|r| {
+                    (
+                        r.get("history_incarnation"),
+                        r.get("sanitized_envelope_msgpack"),
+                    )
+                })
+                .collect()
+        }
+        (BackendConn::Postgres(conn), Some(inc)) => {
+            let found = sqlx::query(
+                "SELECT history_incarnation, sanitized_envelope_msgpack FROM command_receipts
+                 WHERE space_id = $1 AND history_incarnation = $2 AND actor_id = $3 AND idempotency_key = $4",
+            )
+            .bind(space_id.as_str())
+            .bind(inc)
+            .bind(actor_id)
+            .bind(idempotency_key)
+            .fetch_all(&mut **conn)
+            .await
+            .map_err(|err| internal_not_committed("pg_load_legacy_rcpt", err.to_string()))?;
+            found
+                .into_iter()
+                .map(|r| {
+                    (
+                        r.get("history_incarnation"),
+                        r.get("sanitized_envelope_msgpack"),
+                    )
+                })
+                .collect()
+        }
+        (BackendConn::Postgres(conn), None) => {
+            let found = sqlx::query(
+                "SELECT history_incarnation, sanitized_envelope_msgpack FROM command_receipts
+                 WHERE space_id = $1 AND actor_id = $2 AND idempotency_key = $3",
+            )
+            .bind(space_id.as_str())
+            .bind(actor_id)
+            .bind(idempotency_key)
+            .fetch_all(&mut **conn)
+            .await
+            .map_err(|err| internal_not_committed("pg_load_legacy_rcpt", err.to_string()))?;
+            found
+                .into_iter()
+                .map(|r| {
+                    (
+                        r.get("history_incarnation"),
+                        r.get("sanitized_envelope_msgpack"),
+                    )
+                })
+                .collect()
+        }
+    };
+    for (inc_bytes, raw_blob) in rows {
+        let Ok(mut stored) = rmp_serde::from_slice::<StoredCommittedMintAndPurgeV1>(&raw_blob)
+        else {
+            continue;
+        };
+        if &stored.new_note.note != purged_note || stored.new_note.revision == zero_rev {
+            continue;
+        }
+        stored.new_note.revision = zero_rev.clone();
+        let scrubbed = CanonicalStore::encode_command_outcome(&stored)?;
+        match tx {
+            BackendConn::Sqlite(conn) => {
+                sqlx::query(
+                    "UPDATE command_receipts SET sanitized_envelope_msgpack = ?
+                     WHERE space_id = ? AND history_incarnation = ? AND actor_id = ? AND idempotency_key = ?",
+                )
+                .bind(scrubbed.as_slice())
+                .bind(space_id.as_str())
+                .bind(inc_bytes.as_slice())
+                .bind(actor_id)
+                .bind(idempotency_key)
+                .execute(&mut **conn)
+                .await
+                .map_err(|err| {
+                    internal_not_committed("sqlite_scrub_legacy_rcpt", err.to_string())
+                })?;
+            }
+            BackendConn::Postgres(conn) => {
+                sqlx::query(
+                    "UPDATE command_receipts SET sanitized_envelope_msgpack = $1
+                     WHERE space_id = $2 AND history_incarnation = $3 AND actor_id = $4 AND idempotency_key = $5",
+                )
+                .bind(scrubbed.as_slice())
+                .bind(space_id.as_str())
+                .bind(inc_bytes.as_slice())
+                .bind(actor_id)
+                .bind(idempotency_key)
+                .execute(&mut **conn)
+                .await
+                .map_err(|err| internal_not_committed("pg_scrub_legacy_rcpt", err.to_string()))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn distinct_receipt_incarnations_tx(
+    tx: &mut BackendConn<'_>,
+    space_id: &SpaceId,
+) -> Result<Vec<Vec<u8>>, PortError> {
+    const SQL: &str = "WITH RECURSIVE histories(h) AS (
+            SELECT (SELECT history_incarnation FROM command_receipts WHERE space_id=$1 ORDER BY history_incarnation LIMIT 1)
+            UNION ALL
+            SELECT (SELECT r.history_incarnation FROM command_receipts r
+                    WHERE r.space_id=$1 AND r.history_incarnation > histories.h
+                    ORDER BY r.history_incarnation LIMIT 1)
+            FROM histories WHERE h IS NOT NULL
+        )
+        SELECT h FROM histories WHERE h IS NOT NULL";
+    match tx {
+        BackendConn::Sqlite(conn) => sqlx::query_scalar(SQL)
+            .bind(space_id.as_str())
+            .fetch_all(&mut **conn)
+            .await
+            .map_err(|err| internal_not_committed("sqlite_receipt_incarnations", err.to_string())),
+        BackendConn::Postgres(conn) => sqlx::query_scalar(SQL)
+            .bind(space_id.as_str())
+            .fetch_all(&mut **conn)
+            .await
+            .map_err(|err| internal_not_committed("pg_receipt_incarnations", err.to_string())),
+    }
+}
+
+async fn scrub_legacy_mint_and_purge_receipts_tx(
+    tx: &mut BackendConn<'_>,
+    scope: &HistoryScope,
+    purged_note: &NoteId,
+    erased_detail_ids: &[String],
+) -> Result<(), PortError> {
+    let pairs: Vec<(&str, &str)> = erased_detail_ids
+        .iter()
+        .filter_map(|detail| detail.strip_prefix("rcpt_pay:")?.split_once(':'))
+        .collect();
+    if pairs.is_empty() {
+        return Ok(());
+    }
+    let incarnations = distinct_receipt_incarnations_tx(tx, &scope.space_id).await?;
+    for (actor, key) in pairs {
+        for inc in &incarnations {
+            scrub_command_receipt_envelope_for_note_tx(
+                tx,
+                &scope.space_id,
+                Some(inc.as_slice()),
+                actor,
+                key,
+                purged_note,
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn scrub_pending_purge_successor_receipts_tx(
+    tx: &mut BackendConn<'_>,
+    scope: &HistoryScope,
+    purged_note: &NoteId,
+) -> Result<(), PortError> {
+    let keys: Vec<(Vec<u8>, String, String)> = match tx {
+        BackendConn::Sqlite(conn) => {
+            let rows = sqlx::query(
+                "SELECT history_incarnation, actor_id, idempotency_key
+                 FROM pending_purges WHERE space_id = ? AND new_note_id IS NOT NULL AND new_note_id = ?",
+            )
+            .bind(scope.space_id.as_str())
+            .bind(purged_note.as_str())
+            .fetch_all(&mut **conn)
+            .await
+            .map_err(|err| {
+                internal_not_committed("sqlite_load_successor_pending_purges", err.to_string())
+            })?;
+            rows.into_iter()
+                .map(|r| {
+                    (
+                        r.get("history_incarnation"),
+                        r.get("actor_id"),
+                        r.get("idempotency_key"),
+                    )
+                })
+                .collect()
+        }
+        BackendConn::Postgres(conn) => {
+            let rows = sqlx::query(
+                "SELECT history_incarnation, actor_id, idempotency_key
+                 FROM pending_purges WHERE space_id = $1 AND new_note_id IS NOT NULL AND new_note_id COLLATE \"C\" = $2",
+            )
+            .bind(scope.space_id.as_str())
+            .bind(purged_note.as_str())
+            .fetch_all(&mut **conn)
+            .await
+            .map_err(|err| {
+                internal_not_committed("pg_load_successor_pending_purges", err.to_string())
+            })?;
+            rows.into_iter()
+                .map(|r| {
+                    (
+                        r.get("history_incarnation"),
+                        r.get("actor_id"),
+                        r.get("idempotency_key"),
+                    )
+                })
+                .collect()
+        }
+    };
+    for (inc, actor, key) in keys {
+        scrub_command_receipt_envelope_for_note_tx(
+            tx,
+            &scope.space_id,
+            Some(&inc),
+            &actor,
+            &key,
+            purged_note,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 async fn mark_pending_purge_cas_retired(
     store: &CanonicalStore,
     scope: &HistoryScope,
@@ -2083,7 +2527,7 @@ async fn mark_pending_purge_cas_retired(
     let purge_cl = purge_id.to_owned();
     let now_ms = now_unix_ms()?;
     store
-        .with_write_tx(|tx| {
+        .with_write_tx_for_space(Some(scope.space_id.clone()), |tx| {
             Box::pin(async move {
                 crate::blobs::lock_and_check_space_tx(tx, &scope_cl, epoch).await?;
                 match tx {
@@ -2139,14 +2583,16 @@ async fn mark_pending_purge_completed_tx(
     let now_ms = now_unix_ms()?;
 
     store
-        .with_write_tx(|tx| {
+        .with_write_tx_for_space(Some(scope.space_id.clone()), |tx| {
             Box::pin(async move {
                 crate::blobs::lock_and_check_space_tx(tx, &scope_cl, epoch).await?;
                 match tx {
                     BackendConn::Sqlite(conn) => {
                         sqlx::query(
                             "UPDATE pending_purges
-                             SET phase = 'completed', last_safe_error = NULL, updated_at_ms = ?
+                             SET phase = 'completed', last_safe_error = NULL,
+                                 new_note_rev_id = NULL, sanitized_response_msgpack = X'',
+                                 updated_at_ms = ?
                              WHERE space_id = ? AND purge_id = ?",
                         )
                         .bind(now_ms)
@@ -2176,7 +2622,9 @@ async fn mark_pending_purge_completed_tx(
                     BackendConn::Postgres(conn) => {
                         sqlx::query(
                             "UPDATE pending_purges
-                             SET phase = 'completed', last_safe_error = NULL, updated_at_ms = $1
+                             SET phase = 'completed', last_safe_error = NULL,
+                                 new_note_rev_id = NULL, sanitized_response_msgpack = ''::BYTEA,
+                                 updated_at_ms = $1
                              WHERE space_id = $2 AND purge_id = $3",
                         )
                         .bind(now_ms)
@@ -2223,7 +2671,7 @@ async fn record_pending_purge_safe_error(
     let now_ms = now_unix_ms()?;
 
     store
-        .with_write_tx(|tx| {
+        .with_write_tx_for_space(Some(scope.space_id.clone()), |tx| {
             Box::pin(async move {
                 crate::blobs::lock_and_check_space_tx(tx, &scope_cl, epoch).await?;
                 match tx {

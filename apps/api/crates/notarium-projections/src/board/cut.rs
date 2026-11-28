@@ -727,11 +727,10 @@ impl BoardCut {
             .authorize_folder_read(&self.space, entry, &ancestry.ids)?)
     }
 
-    pub(super) fn authorize_board_source(
+    pub(super) fn authorize_board_source_static(
         &self,
         ctx: &SpaceContext,
         source: &ViewSource,
-        source_folder: Option<&FolderId>,
     ) -> Result<(), PortError> {
         let grant = ctx
             .auth()
@@ -742,9 +741,34 @@ impl BoardCut {
             .classes
             .iter()
             .all(|class| grant.read_classes.contains(class))
+            || (matches!(
+                ctx.auth().kind(),
+                notarium_core::auth::PrincipalKind::Keeper(_)
+            ) && source.classes.contains(&DocClass::Skill))
         {
             return Err(DomainError::ResourceNotFound.into());
         }
+        if grant.project_root.is_some()
+            && source.scope == SourceScope::Space
+            && source.folder.is_none()
+        {
+            return Err(DomainError::ResourceNotFound.into());
+        }
+        Ok(())
+    }
+
+    pub(super) fn authorize_board_source(
+        &self,
+        ctx: &SpaceContext,
+        source: &ViewSource,
+        source_folder: Option<&FolderId>,
+    ) -> Result<(), PortError> {
+        self.authorize_board_source_static(ctx, source)?;
+        let grant = ctx
+            .auth()
+            .spaces()
+            .get(&self.scope.space_id)
+            .ok_or(DomainError::ResourceNotFound)?;
         if let Some(project_root) = grant.project_root.as_ref() {
             let Some(folder) = source_folder else {
                 return Err(DomainError::ResourceNotFound.into());
@@ -772,6 +796,15 @@ impl BoardCut {
             .authorize_read(&ResourceFacts {
                 space: self.space.clone(),
                 class,
+                project: ancestry
+                    .ids
+                    .iter()
+                    .find(|id| {
+                        self.folders
+                            .get(*id)
+                            .is_some_and(|folder| folder.is_project)
+                    })
+                    .cloned(),
                 ancestor_folders: ancestry.ids,
                 folder_write_locked: ancestry.locked,
                 ability_package: ability,
@@ -812,7 +845,6 @@ impl BoardCut {
         views: impl IntoIterator<Item = (&'a ViewRef, &'a [notarium_core::ports::EvaluatedBoardGroup])>,
         additional: impl IntoIterator<Item = &'a NoteId>,
         auth_folders: impl IntoIterator<Item = &'a FolderId>,
-        restorations: impl IntoIterator<Item = &'a notarium_core::ports::PlannedNoteRestoration>,
         deadline: &PlannerDeadline,
     ) -> Result<LiveReadPermit, PortError> {
         deadline.check()?;
@@ -859,22 +891,6 @@ impl BoardCut {
         }
         for id in additional {
             check_note(id)?;
-        }
-        for restoration in restorations {
-            deadline.check()?;
-            if restoration.planned_lifecycle == Lifecycle::Active {
-                check_folder(&restoration.planned_parent_folder)?;
-            }
-            match permit.classify(ctx, &restoration.note, false)? {
-                LiveNoteStatus::ActiveVisible(facts)
-                | LiveNoteStatus::TrashedVisible(facts)
-                | LiveNoteStatus::EncryptedVisible { facts, .. } => {
-                    ctx.auth().authorize_read(&facts)?;
-                }
-                LiveNoteStatus::HiddenByAuth { .. } | LiveNoteStatus::PurgedOrAbsent => {
-                    return Err(DomainError::ResourceNotFound.into());
-                }
-            }
         }
         Ok(permit)
     }
@@ -1063,13 +1079,13 @@ impl PlannerDeadline {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::board::{evaluate_move, evaluate_rollback};
+    use crate::board::evaluate_move;
     use notarium_core::{
         auth::{EngineAuthContext, SpaceGrant, SpaceKind, SpaceRole, VerifiedHuman},
         ids::{GrantId, HistoryIncarnation, PrincipalId, RequestId, SpaceId, ViewKey},
         ports::{
-            BoardGroupFieldKind, CallBudget, GroupKey, MoveBoardCard, PlannedNoteRestoration,
-            RankExpectation, RollbackBoardFactsRequest, SemanticPlacement,
+            BoardGroupFieldKind, CallBudget, GroupKey, MoveBoardCard, RankExpectation,
+            SemanticPlacement,
         },
         value::ScalarValue,
     };
@@ -1310,74 +1326,6 @@ mod tests {
     }
 
     #[test]
-    fn rollback_uses_the_restored_parent_and_respects_trashed_ancestors() {
-        let (mut cut, ctx, view) = fixture("source: {scope: folder, folder: recovered}\n");
-        let restored_parent = FolderId::from_bytes([9; 16]);
-        cut.folders.insert(
-            restored_parent.clone(),
-            BoardFolder {
-                parent: Some(cut.root.clone()),
-                slug_fold: "recovered".to_owned(),
-                lifecycle: Lifecycle::Active,
-                locked: false,
-                is_project: false,
-            },
-        );
-        let (target, note) = note(10, &cut.root, DocClass::UserDoc, Some("done"), "");
-        let request = RollbackBoardFactsRequest {
-            cutoff: None,
-            views: vec![view.clone()],
-            eligible_notes: vec![PlannedNoteRestoration {
-                note: target.clone(),
-                current_revision: note.revision.clone(),
-                restored_from_revision: Some(RevisionId::from_bytes([4; 16])),
-                planned_lifecycle: Lifecycle::Active,
-                planned_parent_folder: restored_parent.clone(),
-                planned_class: DocClass::UserDoc,
-                planned_ability: None,
-                planned_header_diagnostic: None,
-                planned_carrier: None,
-                planned_fields: BTreeMap::from([(
-                    "status".to_owned(),
-                    Some(YamlValue::String("todo".to_owned())),
-                )]),
-            }],
-        };
-        cut.notes.insert(target.clone(), note);
-        let deadline = PlannerDeadline::start(&ctx);
-        let (facts, _) = evaluate_rollback(&cut, &ctx, &request, &deadline).unwrap();
-        assert_eq!(
-            facts[&view].post_restore_membership[&target],
-            Some(group("todo"))
-        );
-        assert!(
-            facts[&view]
-                .groups
-                .iter()
-                .all(|column| column.rows.is_empty())
-        );
-
-        // The board's folder itself must stay active. Trash a descendant that
-        // was the earlier placement of the restored card.
-        let child = FolderId::from_bytes([11; 16]);
-        cut.folders.insert(
-            child.clone(),
-            BoardFolder {
-                parent: Some(restored_parent.clone()),
-                slug_fold: "child".to_owned(),
-                lifecycle: Lifecycle::Trashed,
-                locked: false,
-                is_project: false,
-            },
-        );
-        let mut request = request;
-        request.eligible_notes[0].planned_parent_folder = child;
-        let (facts, auth_folders) = evaluate_rollback(&cut, &ctx, &request, &deadline).unwrap();
-        assert_eq!(facts[&view].post_restore_membership[&target], None);
-        assert!(auth_folders.contains(&restored_parent));
-    }
-
-    #[test]
     fn static_source_auth_rejects_oracle_even_when_filter_matches_no_notes() {
         // Class oracle: source includes profile, caller only has UserDoc, and
         // filter matches ZERO notes — must still reject statically before filter evaluation.
@@ -1579,6 +1527,7 @@ mod tests {
                     identity: make_cmd(20),
                     preconditions: Preconditions::default(),
                     input: CreateNote {
+                        folder_page: false,
                         note: board_id.clone(),
                         parent: Some(project_a.clone()),
                         slug: "board".into(),
@@ -1591,13 +1540,14 @@ mod tests {
             )
             .await
             .unwrap();
-        let moved_created = store
+        let _moved_created = store
             .create_note(
                 owner.clone(),
                 Mutation {
                     identity: make_cmd(21),
                     preconditions: Preconditions::default(),
                     input: CreateNote {
+                        folder_page: false,
                         note: moved_id.clone(),
                         parent: Some(project_a.clone()),
                         slug: "moved".into(),
@@ -1615,6 +1565,7 @@ mod tests {
                     identity: make_cmd(22),
                     preconditions: Preconditions::default(),
                     input: CreateNote {
+                        folder_page: false,
                         note: purged_id.clone(),
                         parent: Some(project_a.clone()),
                         slug: "purged".into(),
@@ -1668,34 +1619,21 @@ mod tests {
         )
         .await
         .unwrap();
-        let hidden_restoration = PlannedNoteRestoration {
-            note: moved_id,
-            current_revision: moved_created.value.revision,
-            restored_from_revision: None,
-            planned_lifecycle: Lifecycle::Active,
-            planned_parent_folder: project_a.clone(),
-            planned_class: DocClass::UserDoc,
-            planned_ability: None,
-            planned_fields: BTreeMap::new(),
-            planned_header_diagnostic: None,
-            planned_carrier: None,
-        };
         assert!(matches!(
             cut.check_live(
                 &engine,
                 &scoped,
                 Some(past_cutoff),
                 std::iter::empty(),
+                std::iter::once(&moved_id),
                 std::iter::empty(),
-                std::iter::empty(),
-                std::iter::once(&hidden_restoration),
                 &deadline,
             ),
             Err(PortError::Domain(DomainError::ResourceNotFound))
         ));
 
         // 2. Now purge purged_id concurrently after BoardCut::load and prove check_live
-        //    rejects the PurgedOrAbsent restoration instead of silently skipping it.
+        //    rejects the PurgedOrAbsent note instead of silently skipping it.
         let purged_receipt = store
             .delete_note(
                 owner.clone(),
@@ -1714,27 +1652,14 @@ mod tests {
             .wait_for_projected(&scope, purged_receipt.receipt.seq(), &budget)
             .await
             .unwrap();
-        let purged_restoration = PlannedNoteRestoration {
-            note: purged_id,
-            current_revision: purged_created.value.revision,
-            restored_from_revision: None,
-            planned_lifecycle: Lifecycle::Active,
-            planned_parent_folder: project_a,
-            planned_class: DocClass::UserDoc,
-            planned_ability: None,
-            planned_fields: BTreeMap::new(),
-            planned_header_diagnostic: None,
-            planned_carrier: None,
-        };
         assert!(matches!(
             cut.check_live(
                 &engine,
                 &scoped,
                 Some(past_cutoff),
                 std::iter::empty(),
+                std::iter::once(&purged_id),
                 std::iter::empty(),
-                std::iter::empty(),
-                std::iter::once(&purged_restoration),
                 &deadline,
             ),
             Err(PortError::Domain(DomainError::ResourceNotFound))
@@ -1748,7 +1673,6 @@ mod tests {
                 &engine,
                 &owner,
                 Some(past_cutoff),
-                std::iter::empty(),
                 std::iter::empty(),
                 std::iter::empty(),
                 std::iter::empty(),

@@ -1,180 +1,514 @@
 use super::*;
 
+enum ClaimedApproval {
+    SpaceUnavailable,
+    RoleChanged,
+    Ready(Box<dyn ScheduleAbilityLease>),
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "state", content = "outcome", rename_all = "snake_case")]
+enum SavedScheduleRunStatus {
+    Claimed,
+    Running,
+    Terminal(ScheduleOutcome),
+}
+
+impl From<ScheduleRunStatus> for SavedScheduleRunStatus {
+    fn from(value: ScheduleRunStatus) -> Self {
+        match value {
+            ScheduleRunStatus::Claimed => Self::Claimed,
+            ScheduleRunStatus::Running => Self::Running,
+            ScheduleRunStatus::Terminal(outcome) => Self::Terminal(outcome),
+        }
+    }
+}
+
+impl From<SavedScheduleRunStatus> for ScheduleRunStatus {
+    fn from(value: SavedScheduleRunStatus) -> Self {
+        match value {
+            SavedScheduleRunStatus::Claimed => Self::Claimed,
+            SavedScheduleRunStatus::Running => Self::Running,
+            SavedScheduleRunStatus::Terminal(outcome) => Self::Terminal(outcome),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum SavedScheduleSkip {
+    Duplicate {
+        schedule: ScheduleId,
+        run: AgentRunId,
+        lease: LeaseEpoch,
+        slot: Timestamp,
+        reserved_next_slot: Option<Timestamp>,
+        keeper_log: Option<ChatThreadId>,
+        claimed_revision: ControlRevision,
+        status: SavedScheduleRunStatus,
+    },
+    UnverifiedFold,
+}
+
+const SCHEDULE_SKIP_ACTOR: &str = "scheduler";
+const SCHEDULE_SKIP_TARGET: &str = "claim_schedule_skip";
+
+fn schedule_skip_key(schedule: &ScheduleId, expected: ControlRevision) -> String {
+    format!("schedule-skip:{}:{}", schedule.as_str(), expected.get())
+}
+
+async fn lookup_schedule_skip(
+    tx: &mut Transaction,
+    owner_id: &str,
+    command_key: &str,
+    fingerprint: &[u8],
+    expected: ControlRevision,
+) -> Result<Option<ScheduleClaim>, PortError> {
+    let saved = rows!(tx,crate::store::target::ControlCommandsRow,fetch_optional,
+        "SELECT * FROM control_commands WHERE owner=$1 AND actor=$2 AND command_key=$3",
+        "SELECT * FROM v1_control.control_commands WHERE owner=$1 AND actor=$2 AND command_key=$3";
+        owner_id, SCHEDULE_SKIP_ACTOR, command_key)?;
+    let Some(saved) = saved else {
+        return Ok(None);
+    };
+    if saved.request_hash != fingerprint
+        || saved.target != SCHEDULE_SKIP_TARGET
+        || saved.expected != expected.get() as i64
+    {
+        return Err(DomainError::IdempotencyKeyReused.into());
+    }
+    let decoded: SavedScheduleSkip = serde_json::from_str(
+        saved
+            .safe_result
+            .as_deref()
+            .ok_or_else(|| invalid(ValidationReason::InvalidState))?,
+    )
+    .map_err(|_| invalid(ValidationReason::InvalidState))?;
+    let outcome = match decoded {
+        SavedScheduleSkip::UnverifiedFold => ScheduleClaim::SkippedUnverifiedFold,
+        SavedScheduleSkip::Duplicate {
+            schedule,
+            run,
+            lease,
+            slot,
+            reserved_next_slot,
+            keeper_log,
+            claimed_revision,
+            status,
+        } => {
+            let live_slot_ms = ms(slot)?;
+            let restored = match slot_receipt(tx, &schedule, live_slot_ms).await? {
+                Some(live) => receipt(&live)?,
+                None => ScheduleRunReceipt {
+                    schedule,
+                    run,
+                    lease,
+                    slot,
+                    reserved_next_slot,
+                    keeper_log,
+                    claimed_revision,
+                    status: status.into(),
+                },
+            };
+            ScheduleClaim::SkippedDuplicate(restored)
+        }
+    };
+    Ok(Some(outcome))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn save_schedule_skip(
+    tx: &mut Transaction,
+    owner_id: &str,
+    command_key: &str,
+    fingerprint: &[u8],
+    expected: i64,
+    result_revision: ControlRevision,
+    outcome: &ScheduleClaim,
+    now: i64,
+) -> Result<(), PortError> {
+    let saved = match outcome {
+        ScheduleClaim::SkippedUnverifiedFold => SavedScheduleSkip::UnverifiedFold,
+        ScheduleClaim::SkippedDuplicate(r) => SavedScheduleSkip::Duplicate {
+            schedule: r.schedule.clone(),
+            run: r.run.clone(),
+            lease: r.lease,
+            slot: r.slot,
+            reserved_next_slot: r.reserved_next_slot,
+            keeper_log: r.keeper_log.clone(),
+            claimed_revision: r.claimed_revision,
+            status: r.status.into(),
+        },
+        _ => return Err(invalid(ValidationReason::InvalidState)),
+    };
+    let safe_result =
+        serde_json::to_string(&saved).map_err(|_| invalid(ValidationReason::InvalidState))?;
+    let record = TargetRecord::from(crate::store::target::ControlCommandsRow {
+        owner: owner_id.to_owned(),
+        actor: SCHEDULE_SKIP_ACTOR.to_owned(),
+        command_key: command_key.to_owned(),
+        request_hash: fingerprint.to_vec(),
+        target: SCHEDULE_SKIP_TARGET.to_owned(),
+        expected,
+        result_revision: Some(result_revision.get() as i64),
+        state: "committed".to_owned(),
+        safe_result: Some(safe_result),
+        expires_at: now
+            .checked_add(30 * 24 * 60 * 60 * 1000)
+            .ok_or_else(|| invalid(ValidationReason::InvalidTimestamp))?,
+    });
+    record.validate()?;
+    record.insert(tx).await
+}
+
 impl ControlService {
+    async fn precheck_schedule_claim(
+        &self,
+        ctx: &MaintenanceContext,
+        budget: &OperationBudget,
+        observed: &AgentSchedulesRow,
+    ) -> Result<Option<ClaimedApproval>, PortError> {
+        let info = schedule_info(observed)?;
+        let scope = ScheduleScope::from(&info.definition);
+        let probe_run = AgentRunId::from_bytes([0; 16]);
+        let mut rtx = self.store.read(budget.clone()).await?;
+        let source = budget
+            .run(
+                async {
+                    let owner = user_read(rtx.inner_mut(), &observed.owner_id).await?;
+                    self.schedule_source(
+                        rtx.inner_mut(),
+                        &owner,
+                        scope.space,
+                        AuthenticatedCredential::ScheduledRun {
+                            schedule: info.id.clone(),
+                            run: probe_run.clone(),
+                            lease: LeaseEpoch::new(1)?,
+                        },
+                        grant("scheduled-run-probe", info.id.as_str()),
+                        false,
+                    )
+                    .await
+                },
+                CommitEffect::NotCommitted,
+            )
+            .await;
+        budget.run(rtx.finish(), CommitEffect::NotCommitted).await?;
+        let Some((auth, _)) = source? else {
+            return Ok(None);
+        };
+        let keeper = scope.keeper(
+            &auth,
+            probe_run,
+            package_ids(&info.definition.approved_role, &info.approved_skills),
+            system_package_ids(&info.definition.approved_role, &info.approved_skills),
+        )?;
+        let current = AccountContext::new(keeper, budget.context(ctx.budget.request.clone()));
+        budget
+            .run(
+                async {
+                    let history = match self.schedule_history(&current, scope).await {
+                        Ok(history) => history,
+                        Err(error) if hidden(&error) => {
+                            return Ok(Some(ClaimedApproval::SpaceUnavailable));
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    match self
+                        .pin_schedule_approval(
+                            current,
+                            scope,
+                            &info.definition.approved_role,
+                            &info.approved_skills,
+                        )
+                        .await?
+                    {
+                        None => Ok(Some(ClaimedApproval::RoleChanged)),
+                        Some(mut pin) => {
+                            if let Err(error) = history.check(pin.history()) {
+                                let _ = pin.close().await;
+                                return Err(error.into());
+                            }
+                            Ok(Some(ClaimedApproval::Ready(pin)))
+                        }
+                    }
+                },
+                CommitEffect::NotCommitted,
+            )
+            .await
+    }
+
     pub async fn claim_schedule(
         &self,
         ctx: MaintenanceContext,
         request: ClaimSchedule,
     ) -> Result<ScheduleClaim, PortError> {
         Box::pin(async move {
-        ctx.authority.require(ServicePurpose::Scheduler)?;
-        let slot = ms(request.slot)?;
-        let next_slot = ms(request.next_slot)?;
-        let now = self.clock.now_ms()?;
-        if next_slot <= slot || slot > now {
-            return Err(invalid(ValidationReason::InvalidTimestamp));
-        }
-        let fingerprint = blake3::hash(json(&(1, &request))?.as_bytes())
-            .as_bytes()
-            .to_vec();
-        let budget = OperationBudget::new(ctx.budget.clone());
-        let observed = self.observe_schedule(&budget, &request.schedule).await?;
-        let prechecked_catalog = if observed.deleted_at.is_none() && observed.paused_reason.is_none() {
-            let observed_info = schedule_info(&observed)?;
-            let space = SpaceId::parse(&observed.space_id)?;
-            let mut rtx = self.store.read(budget.clone()).await?;
-            let probe_source = budget
-                .run(
-                    async {
-                        let owner = user_read(rtx.inner_mut(), &observed.owner_id).await?;
-                        self.schedule_source(
-                            rtx.inner_mut(),
-                            &owner,
-                            &space,
-                            AuthenticatedCredential::ScheduledRun {
-                                schedule: request.schedule.clone(),
-                                run: AgentRunId::from_bytes([0; 16]),
-                                lease: LeaseEpoch::new(1)?,
-                            },
-                            grant("scheduled-run-probe", request.schedule.as_str()),
-                            false,
-                        )
-                        .await
-                    },
-                    CommitEffect::NotCommitted,
-                )
-                .await?;
-            budget
-                .run(rtx.finish(), CommitEffect::NotCommitted)
-                .await?;
-            if let Some((probe_auth, _)) = probe_source {
-                let keeper = probe_auth.for_keeper(
-                    AgentRunId::from_bytes([0; 16]),
-                    space.clone(),
-                    observed_info
-                        .definition
-                        .project
-                        .as_ref()
-                        .map(|p| p.folder_id.clone()),
-                    BTreeSet::from([observed_info.definition.approved_role.id.clone()]),
-                )?;
-                let current = AccountContext::new(keeper, budget.context(ctx.budget.request.clone()));
-                Some(
-                    budget
-                        .run(
-                            async {
-                                let facts = self.catalog_space(&current, &space).await?;
-                                if let Some(project) = &observed_info.definition.project {
-                                    self.catalog_project(&current, project).await?;
-                                }
-                                let raw = match self
-                                    .raw_ability(
-                                        &current,
-                                        observed_info.definition.approved_role.identity(),
-                                    )
-                                    .await
-                                {
-                                    Ok(raw) => Some(raw),
-                                    Err(error) if hidden(&error) => None,
-                                    Err(error) => return Err(error),
-                                };
-                                Ok::<_, PortError>((observed.config_revision, facts.history, raw))
-                            },
-                            CommitEffect::NotCommitted,
-                        )
-                        .await,
-                )
+            ctx.authority.require(ServicePurpose::Scheduler)?;
+            let slot = ms(request.slot)?;
+            let observed_at = self.clock.now_ms()?;
+            if slot > observed_at {
+                return Err(invalid(ValidationReason::InvalidTimestamp));
+            }
+            let fingerprint = blake3::hash(json(&(1, &request))?.as_bytes()).as_bytes().to_vec();
+            let budget = OperationBudget::new(ctx.budget.clone());
+            let observed = self.observe_schedule(&budget, &request.schedule).await?;
+            let prechecked = if observed.deleted_at.is_none()
+                && observed.paused_reason.is_none()
+                && observed.next_slot_utc_ms == Some(slot)
+            {
+                self.precheck_schedule_claim(&ctx, &budget, &observed).await
             } else {
-                None
+                Ok(None)
+            };
+
+            let (prechecked_claim, mut schedule_pin) = match prechecked {
+                Ok(Some(ClaimedApproval::Ready(pin))) => {
+                    let snapshot = (pin.abilities().to_vec(), pin.history().clone());
+                    (Ok(Some(Ok(snapshot))), Some(pin))
+                }
+                Ok(Some(ClaimedApproval::SpaceUnavailable)) => {
+                    (Ok(Some(Err(SchedulePauseReason::SpaceUnavailable))), None)
+                }
+                Ok(Some(ClaimedApproval::RoleChanged)) => {
+                    (Ok(Some(Err(SchedulePauseReason::RoleChanged))), None)
+                }
+                Ok(None) => (Ok(None), None),
+                Err(error) => (Err(error), None),
+            };
+            let mut tx = match self.store.write(budget.clone()).await {
+                Ok(tx) => tx,
+                Err(error) => {
+                    if let Some(mut pin) = schedule_pin.take() {
+                        let _ = pin.close().await;
+                    }
+                    return Err(error);
+                }
+            };
+            if let Some(pin) = schedule_pin.take() {
+                tx.hold_schedule_pin(pin);
             }
-        } else {
-            None
-        };
-        let mut tx = self.store.write(budget.clone()).await?;
-        let (result,events)=budget.run(async {
-            let owner=user(tx.inner_mut(),&observed.owner_id).await?;
-            let run=AgentRunId::from_bytes(crate::auth::token::random()?);
-            let lease=LeaseEpoch::new(1)?;
-            let space=SpaceId::parse(&observed.space_id)?;
-            let credential=AuthenticatedCredential::ScheduledRun{schedule:request.schedule.clone(),run:run.clone(),lease};
-            let source=self.schedule_source(tx.inner_mut(),&owner,&space,credential,grant("scheduled-run",run.as_str()),true).await?;
-            let row=schedule(tx.inner_mut(),&request.schedule,true).await?;
-            let previous=rows!(tx.inner_mut(),AgentScheduleRunsRow,fetch_optional,"SELECT * FROM agent_schedule_runs WHERE schedule_id=$1 AND slot_utc_ms=$2","SELECT * FROM v1_control.agent_schedule_runs WHERE schedule_id=$1 AND slot_utc_ms=$2";request.schedule.as_str(),slot)?;
-            if let Some(previous)=previous {
-                if previous.claim_request_hash!=fingerprint {return Err(DomainError::IdempotencyKeyReused.into());}
-                return Ok((ScheduleClaim::AlreadyClaimed(receipt(&previous)?),Vec::new()));
-            }
-            if row.deleted_at.is_some() {return Err(DomainError::ResourceNotFound.into());}
-            let mut info=schedule_info(&row)?;
-            if let Some(reason)=info.paused_reason {return Ok((ScheduleClaim::Paused(reason),Vec::new()));}
-            expect(&row,request.expected)?;
-            if row.next_slot_utc_ms!=slot || request.current_role!=info.definition.approved_role {return Err(invalid(ValidationReason::ScopeMismatch));}
-            validate(&info.definition,request.next_slot,RunLimits::HARD_CEILING)?;
-            let mut reason=None;
-            let mut admitted=None;
-            if !info.definition.limits.fits(self.config.schedule_limits) {reason=Some(SchedulePauseReason::BudgetExceeded);}
-            else if let Some((source,admission))=source {
-                let keeper=source.for_keeper(run.clone(),space.clone(),info.definition.project.as_ref().map(|p|p.folder_id.clone()),BTreeSet::from([info.definition.approved_role.id.clone()]))?;
-                let current=AccountContext::new(keeper.clone(),budget.context(ctx.budget.request.clone()));
-                match prechecked_catalog {
-                    None => return Err(DomainError::ControlRevisionConflict{current:ControlRevision::new(row.revision as u64)?}.into()),
-                    Some(Err(error)) if hidden(&error)=>reason=Some(SchedulePauseReason::SpaceUnavailable),
-                    Some(Err(error))=>return Err(error),
-                    Some(Ok((observed_cfg,history,raw_opt)))=>{
-                        if observed_cfg != row.config_revision {
-                            return Err(DomainError::ControlRevisionConflict{current:ControlRevision::new(row.revision as u64)?}.into());
-                        }
-                        if let Some(raw) = raw_opt
-                            && raw.reference == info.definition.approved_role
-                            && self
-                                .current_role_db_only(
-                                    tx.inner_mut(),
-                                    &current,
-                                    raw,
-                                    info.definition.project.as_ref(),
-                                )
-                                .await?
-                        {
-                            admitted = Some((keeper, admission, history));
-                        } else {
-                            reason = Some(SchedulePauseReason::RoleChanged);
-                        }
+            let (mut result, events, claimed_at) = budget.run(async {
+                let owner = user(tx.inner_mut(), &observed.owner_id).await?;
+                let run = AgentRunId::from_bytes(crate::auth::token::random()?);
+                let lease = LeaseEpoch::new(1)?;
+                let space = SpaceId::parse(&observed.space_id)?;
+                let credential = AuthenticatedCredential::ScheduledRun {
+                    schedule: request.schedule.clone(),
+                    run: run.clone(),
+                    lease,
+                };
+                let source = self.schedule_source(
+                    tx.inner_mut(), &owner, &space, credential,
+                    grant("scheduled-run", run.as_str()), true,
+                ).await?;
+                let row = schedule(tx.inner_mut(), &request.schedule, true).await?;
+                let locked_now = self.clock.now_ms()?;
+                if slot > locked_now {
+                    return Err(invalid(ValidationReason::InvalidTimestamp));
+                }
+                let previous = slot_receipt(tx.inner_mut(), &request.schedule, slot).await?;
+                if let Some(previous) = &previous
+                    && previous.claim_request_hash == fingerprint
+                {
+                    return Ok((ScheduleClaim::AlreadyClaimed(receipt(previous)?), Vec::new(), None));
+                }
+                let skip_key = schedule_skip_key(&request.schedule, request.expected);
+                if let Some(replayed) = lookup_schedule_skip(
+                    tx.inner_mut(),
+                    &row.owner_id,
+                    &skip_key,
+                    &fingerprint,
+                    request.expected,
+                )
+                .await?
+                {
+                    return Ok((replayed, Vec::new(), None));
+                }
+                if let Some(previous) = &previous {
+                    // Older configurations could rewind the current due to an already
+                    // issued slot. Only its live revision may advance past that receipt.
+                    let expected = request.expected.get();
+                    let current = row.revision as u64;
+                    let repairing = row.next_slot_utc_ms == Some(slot) && current == expected;
+                    if previous.claimed_schedule_revision as u64 >= expected || !repairing {
+                        return Err(DomainError::IdempotencyKeyReused.into());
                     }
                 }
-            } else {
-                let admission=super::super::spaces::admission(tx.inner_mut(),&space,false).await?;
-                reason=Some(if admission.state!="active" {SchedulePauseReason::SpaceUnavailable} else {SchedulePauseReason::OwnerRevoked});
+                if row.deleted_at.is_some() {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+                let mut info = schedule_info(&row)?;
+                if let Some(reason) = info.paused_reason {
+                    return Ok((ScheduleClaim::Paused(reason), Vec::new(), None));
+                }
+                if request.current_role != info.definition.approved_role {
+                    return Err(invalid(ValidationReason::ScopeMismatch));
+                }
+
+                let calendar = Calendar::parse(&info.definition.cron, &info.definition.timezone)?;
+                let civil_slot = calendar.civil_slot_ms(slot)?;
+                let skipped = if let Some(previous) = previous {
+                    Some(ScheduleClaim::SkippedDuplicate(receipt(&previous)?))
+                } else if civil_slot != slot {
+                    match slot_receipt(tx.inner_mut(), &request.schedule, civil_slot).await? {
+                        Some(early) => Some(ScheduleClaim::SkippedDuplicate(receipt(&early)?)),
+                        None if locked_now.saturating_sub(civil_slot.max(row.created_at))
+                            >= super::super::telemetry::MIN_COMPACT_MS &&
+                            missing_cursor_history(tx.inner_mut(), &row, request.expected).await? =>
+                            Some(ScheduleClaim::SkippedUnverifiedFold),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                expect(&row, request.expected)?;
+                if row.next_slot_utc_ms != Some(slot) {
+                    return Err(invalid(ValidationReason::ScopeMismatch));
+                }
+                // Control authoritatively computes the next due slot under the writer lock
+                // from its own clock, eliminating cross-clock retries on the scheduler.
+                let trusted_instant = Timestamp::from_unix_parts(locked_now.div_euclid(1000), 0)?;
+                let next_slot = calendar.next_ms(request.slot.max(trusted_instant))?;
+                if next_slot.is_some_and(|next| next <= slot) {
+                    return Err(invalid(ValidationReason::InvalidTimestamp));
+                }
+                let next_slot_ts = next_slot
+                    .map(|value| {
+                        let secs = value.div_euclid(1000);
+                        let nanos = u32::try_from(value.rem_euclid(1000))
+                            .map_err(|_| invalid(ValidationReason::InvalidTimestamp))?
+                            .saturating_mul(1_000_000);
+                        Timestamp::from_unix_parts(secs, nanos).map_err(PortError::from)
+                    })
+                    .transpose()?;
+                if let Some(outcome) = skipped {
+                    let new_rev =
+                        advance(tx.inner_mut(), &request.schedule, next_slot, &row, locked_now)
+                            .await?;
+                    save_schedule_skip(
+                        tx.inner_mut(),
+                        &row.owner_id,
+                        &skip_key,
+                        &fingerprint,
+                        row.revision,
+                        new_rev,
+                        &outcome,
+                        locked_now,
+                    )
+                    .await?;
+                    return Ok((outcome, Vec::new(), None));
+                }
+                validate(&info.definition, next_slot_ts, RunLimits::HARD_CEILING, false)?;
+
+                let scope = ScheduleScope::from(&info.definition);
+                let log_id = schedule_log_id(
+                    &request.schedule,
+                    &row.owner_id,
+                    &space,
+                    scope.project.map(|p| &p.folder_id),
+                );
+                let (reason, admitted) = if !info.definition.limits.fits(self.config.schedule_limits) {
+                    (Some(SchedulePauseReason::BudgetExceeded), None)
+                } else if let Some((auth, admission)) = source {
+                    if observed.config_revision != row.config_revision {
+                        return Err(DomainError::ControlRevisionConflict { current: info.revision }.into());
+                    }
+                    match prechecked_claim.as_ref().map_err(|error| error.clone())? {
+                        None => return Err(DomainError::ControlRevisionConflict { current: info.revision }.into()),
+                        Some(Err(reason)) => (Some(*reason), None),
+                        Some(Ok((abilities, history))) => {
+                            let keeper = scope.keeper(
+                                &auth, run.clone(),
+                                package_ids(&info.definition.approved_role, &info.approved_skills),
+                                system_package_ids(&info.definition.approved_role, &info.approved_skills),
+                            )?.with_verified_keeper_log(log_id.clone())?;
+                            let current = AccountContext::new(keeper.clone(), budget.context(ctx.budget.request.clone()));
+                            if self.verify_schedule_approval_db(tx.inner_mut(), &current, scope, abilities).await? {
+                                (None, Some((keeper, admission, history.clone())))
+                            } else {
+                                (Some(SchedulePauseReason::RoleChanged), None)
+                            }
+                        }
+                    }
+                } else {
+                    let admission = super::super::spaces::admission(tx.inner_mut(), &space, false).await?;
+                    let reason = if admission.state == "active" {
+                        SchedulePauseReason::OwnerRevoked
+                    } else {
+                        SchedulePauseReason::SpaceUnavailable
+                    };
+                    (Some(reason), None)
+                };
+                let now = locked_now;
+                let claimed_at = std::time::Instant::now();
+                if let Some(reason) = reason {
+                    let label: String = parse(&json(&reason)?)?;
+                    let revision = next(row.revision)?;
+                    execute!(tx.inner_mut(),
+                        "UPDATE agent_schedules SET paused_reason=$1,revision=$2,config_revision=$3,updated_at=$4 WHERE schedule_id=$5",
+                        "UPDATE v1_control.agent_schedules SET paused_reason=$1,revision=$2,config_revision=$3,updated_at=$4 WHERE schedule_id=$5";
+                        label,revision,next(row.config_revision)?,now,request.schedule.as_str()
+                    )?;
+                    let event = super::super::outbox::enqueue(
+                        tx.inner_mut(), RevocationSelector::Schedule(request.schedule.clone()),
+                        RevocationReason::PermissionChanged, revision, now,
+                    ).await?;
+                    return Ok((ScheduleClaim::Paused(reason), vec![event], None));
+                }
+                let (keeper, admission, history) = admitted.ok_or_else(|| invalid(ValidationReason::InvalidState))?;
+                let expires_at = now.checked_add(info.definition.limits.timeout_ms as i64)
+                    .ok_or_else(|| invalid(ValidationReason::InvalidTimestamp))?;
+                let record = TargetRecord::from(AgentScheduleRunsRow {
+                    run_id: run.to_string(),
+                    schedule_id: request.schedule.to_string(),
+                    slot_utc_ms: slot,
+                    lease_epoch: 1,
+                    claim_request_hash: fingerprint,
+                    claimed_schedule_revision: row.revision,
+                    reserved_next_slot: next_slot,
+                    approved_skills: row.approved_skills.clone(),
+                    keeper_log_id: Some(log_id.to_string()),
+                    keeper_project_folder_id: scope.project.map(|project| project.folder_id.to_string()),
+                    status: "claimed".into(),
+                    started_at: now,
+                    finished_at: None,
+                    safe_result: None,
+                    owner_auth_version: owner.auth_version,
+                    config_revision: row.config_revision,
+                    admission_epoch: admission.admission_epoch,
+                    history_scope: json(&history)?,
+                    expires_at,
+                });
+                record.validate()?;
+                record.insert(tx.inner_mut()).await?;
+                info.revision = advance(tx.inner_mut(), &request.schedule, next_slot, &row, now).await?;
+                info.next_slot = next_slot_ts;
+                let context = SpaceContext::new(keeper, history, CallBudget {
+                    request: ctx.budget.request.clone(),
+                    cancellation: Cancellation::default(),
+                    remaining: Duration::from_millis(info.definition.limits.timeout_ms),
+                })?;
+                Ok((ScheduleClaim::Claimed {
+                    run, lease, schedule: Box::new(info), context: Box::new(context),
+                }, Vec::new(), Some(claimed_at)))
+            }, CommitEffect::NotCommitted).await?;
+            self.commit_revocations(tx, &budget, &events).await?;
+            for event in &events {
+                self.flush_event(&budget, event).await?;
             }
-            let now=self.clock.now_ms()?;
-            if let Some(reason)=reason {
-                let label:String=parse(&json(&reason)?)?;
-                let revision=next(row.revision)?;
-                execute!(tx.inner_mut(),"UPDATE agent_schedules SET paused_reason=$1,revision=$2,config_revision=$3,updated_at=$4 WHERE schedule_id=$5","UPDATE v1_control.agent_schedules SET paused_reason=$1,revision=$2,config_revision=$3,updated_at=$4 WHERE schedule_id=$5";label,revision,next(row.config_revision)?,now,request.schedule.as_str())?;
-                let event=super::super::outbox::enqueue(tx.inner_mut(),RevocationSelector::Schedule(request.schedule.clone()),RevocationReason::PermissionChanged,revision,now).await?;
-                return Ok((ScheduleClaim::Paused(reason),vec![event]));
+            if let (ScheduleClaim::Claimed { context, .. }, Some(claimed_at)) =
+                (&mut result, claimed_at)
+            {
+                context.budget.remaining = context
+                    .budget
+                    .remaining
+                    .saturating_sub(claimed_at.elapsed());
             }
-            let (keeper,admission,history)=admitted.ok_or_else(||invalid(ValidationReason::InvalidState))?;
-            let expires_at=now.checked_add(info.definition.limits.timeout_ms as i64).ok_or_else(||invalid(ValidationReason::InvalidTimestamp))?;
-            let record=TargetRecord::from(AgentScheduleRunsRow{
-                run_id:run.to_string(),schedule_id:request.schedule.to_string(),slot_utc_ms:slot,lease_epoch:1,
-                claim_request_hash:fingerprint,claimed_schedule_revision:row.revision,reserved_next_slot:next_slot,status:"claimed".into(),
-                started_at:now,finished_at:None,safe_result:None,owner_auth_version:owner.auth_version,config_revision:row.config_revision,
-                admission_epoch:admission.admission_epoch,history_scope:json(&history)?,expires_at,
-            }); record.validate()?;record.insert(tx.inner_mut()).await?;
-            let revision=next(row.revision)?;
-            execute!(tx.inner_mut(),"UPDATE agent_schedules SET next_slot_utc_ms=$1,revision=$2,updated_at=$3 WHERE schedule_id=$4","UPDATE v1_control.agent_schedules SET next_slot_utc_ms=$1,revision=$2,updated_at=$3 WHERE schedule_id=$4";next_slot,revision,now,request.schedule.as_str())?;
-            info.next_slot=request.next_slot;info.revision=ControlRevision::new(revision as u64)?;
-            let context=SpaceContext::new(keeper,history,CallBudget{request:ctx.budget.request.clone(),cancellation:Cancellation::default(),remaining:Duration::from_millis(info.definition.limits.timeout_ms)})?;
-            Ok((ScheduleClaim::Claimed{run,lease,schedule:Box::new(info),context:Box::new(context)},Vec::new()))
-        },CommitEffect::NotCommitted).await?;
-        self.commit_revocations(tx, &budget, &events).await?;
-        for event in &events {
-            self.flush_event(&budget, event).await?;
-        }
-        Ok(result)
-        })
-        .await
+            Ok(result)
+        }).await
     }
+
     pub async fn record_schedule_result(
         &self,
         ctx: MaintenanceContext,
@@ -184,7 +518,7 @@ impl ControlService {
         let budget = OperationBudget::new(ctx.budget);
         let observed = self.observe_schedule(&budget, &result.schedule).await?;
         let mut tx = self.store.write(budget.clone()).await?;
-        let (receipt,events)=budget.run(async {
+        let (receipt,events,enqueued)=budget.run(async {
             // Terminal audit is independent of the old credential's expiration
             // or deletion, but uses the same owner -> schedule -> run lock order.
             user(tx.inner_mut(),&observed.owner_id).await?;
@@ -195,18 +529,65 @@ impl ControlService {
             if !matches!(row.status.as_str(),"claimed"|"running") {
                 if row.status!=status {return Err(invalid(ValidationReason::InvalidState));}
                 let events=super::super::outbox::pending(tx.inner_mut(),RevocationSelector::ScheduledRun(result.run.clone())).await?;
-                return Ok((receipt(&row)?,events));
+                return Ok((receipt(&row)?,events,Vec::new()));
             }
             let now=self.clock.now_ms()?;
             execute!(tx.inner_mut(),"UPDATE agent_schedule_runs SET status=$1,finished_at=$2 WHERE run_id=$3","UPDATE v1_control.agent_schedule_runs SET status=$1,finished_at=$2 WHERE run_id=$3";&status,now,result.run.as_str())?;
             row.status=status;row.finished_at=Some(now);
             let event=super::super::outbox::enqueue(tx.inner_mut(),RevocationSelector::ScheduledRun(result.run.clone()),RevocationReason::Expired,row.lease_epoch,now).await?;
-            Ok((receipt(&row)?,vec![event]))
+            Ok((receipt(&row)?,vec![event.clone()],vec![event]))
         },CommitEffect::NotCommitted).await?;
-        self.commit_revocations(tx, &budget, &events).await?;
+        self.commit_revocations(tx, &budget, &enqueued).await?;
         for event in &events {
             self.flush_event(&budget, event).await?;
         }
         Ok(receipt)
     }
+}
+
+/// Configuration edits bump both counters; claims and duplicate skips only
+/// bump the schedule revision. If receipts explain all prior cursor advances,
+/// the absence of an early-fold receipt still proves it was never issued.
+async fn missing_cursor_history(
+    tx: &mut Transaction,
+    row: &AgentSchedulesRow,
+    expected: ControlRevision,
+) -> Result<bool, PortError> {
+    let advances = expected.get().saturating_sub(row.config_revision as u64);
+    if advances == 0 {
+        return Ok(false);
+    }
+    let retained = rows!(tx, (i64,), fetch_one,
+        "SELECT COUNT(*) FROM agent_schedule_runs WHERE schedule_id=$1",
+        "SELECT COUNT(*) FROM v1_control.agent_schedule_runs WHERE schedule_id=$1";
+        &row.schedule_id)?
+    .0;
+    Ok((retained as u64) < advances)
+}
+
+pub(super) async fn slot_receipt(
+    tx: &mut Transaction,
+    schedule: &ScheduleId,
+    slot: i64,
+) -> Result<Option<AgentScheduleRunsRow>, PortError> {
+    rows!(tx,AgentScheduleRunsRow,fetch_optional,
+        "SELECT * FROM agent_schedule_runs WHERE schedule_id=$1 AND slot_utc_ms=$2",
+        "SELECT * FROM v1_control.agent_schedule_runs WHERE schedule_id=$1 AND slot_utc_ms=$2";
+        schedule.as_str(),slot)
+}
+
+async fn advance(
+    tx: &mut Transaction,
+    schedule: &ScheduleId,
+    next_slot: Option<i64>,
+    row: &AgentSchedulesRow,
+    now: i64,
+) -> Result<ControlRevision, PortError> {
+    let revision = next(row.revision)?;
+    execute!(tx,
+        "UPDATE agent_schedules SET next_slot_utc_ms=$1,revision=$2,updated_at=$3 WHERE schedule_id=$4",
+        "UPDATE v1_control.agent_schedules SET next_slot_utc_ms=$1,revision=$2,updated_at=$3 WHERE schedule_id=$4";
+        next_slot,revision,now,schedule.as_str()
+    )?;
+    Ok(ControlRevision::new(revision as u64)?)
 }

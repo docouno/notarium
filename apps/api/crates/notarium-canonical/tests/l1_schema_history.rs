@@ -124,9 +124,10 @@ async fn postgres_open_rejects_fsync_off_before_creating_the_schema() {
             .unwrap();
     assert_eq!((sync.as_str(), fsync.as_str()), ("on", "off"));
 
-    let temp = TempDataRoot::new("pg-durability");
     let schema = fixtures.fresh_pg_schema();
-    let cfg = fixtures.pg_local_config(sample_installation_id(53), &schema, temp.data_root());
+    let cfg = fixtures
+        .open_pg_s3_config(sample_installation_id(53), &schema)
+        .await;
     let Err(failure) = CanonicalRuntime::open(cfg).await else {
         panic!("fsync-off startup must fail");
     };
@@ -203,6 +204,13 @@ async fn l1_sqlite_bootstrap_witness_owner_lock_and_fail_closed_guards() {
 
     {
         let mut raw = temp.open_raw_sqlite().await;
+        sqlx::raw_sql(concat!(
+            include_str!("fixtures/schema-v6-remove-projection.sql"),
+            include_str!("fixtures/schema-v8-remove-agents.sql")
+        ))
+        .execute(&mut raw)
+        .await
+        .unwrap();
         sqlx::raw_sql("DROP TABLE collab_checkpoints;
             ALTER TABLE backup_holds DROP COLUMN owner_generation;
             UPDATE schema_meta SET schema_version=2,
@@ -309,10 +317,9 @@ async fn l1_sqlite_bootstrap_witness_owner_lock_and_fail_closed_guards() {
 async fn l1_postgres_bootstrap_idempotence_and_fail_closed_guards() {
     let fixtures = StorageTestFixtures::load_required();
     let schema = fixtures.fresh_pg_schema();
-    let blob_temp = TempDataRoot::new("l1-pg-blobs");
     let install = sample_installation_id(3);
 
-    let cfg = fixtures.pg_local_config(install.clone(), &schema, blob_temp.data_root());
+    let cfg = fixtures.open_pg_s3_config(install.clone(), &schema).await;
     let (_store, runtime) = CanonicalRuntime::open(cfg.clone())
         .await
         .expect("initial PostgreSQL 16 canonical open");
@@ -338,6 +345,13 @@ async fn l1_postgres_bootstrap_idempotence_and_fail_closed_guards() {
             .fetch_all(&mut raw)
             .await
             .unwrap();
+        sqlx::raw_sql(concat!(
+            include_str!("fixtures/schema-v6-remove-projection.sql"),
+            include_str!("fixtures/schema-v8-remove-agents.sql")
+        ))
+        .execute(&mut raw)
+        .await
+        .unwrap();
         sqlx::raw_sql(
             "DROP TABLE collab_checkpoints; ALTER TABLE backup_holds DROP COLUMN owner_generation",
         )
@@ -357,8 +371,7 @@ async fn l1_postgres_bootstrap_idempotence_and_fail_closed_guards() {
     }
 
     // Reopen same schema idempotently.
-    let blob_temp2 = TempDataRoot::new("l1-pg-blobs-2");
-    let cfg2 = fixtures.pg_local_config(install.clone(), &schema, blob_temp2.data_root());
+    let cfg2 = fixtures.open_pg_s3_config(install.clone(), &schema).await;
     let (_store2, runtime2) = CanonicalRuntime::open(cfg2.clone())
         .await
         .expect("idempotent PG reopen");
@@ -369,6 +382,13 @@ async fn l1_postgres_bootstrap_idempotence_and_fail_closed_guards() {
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "SET search_path TO \"{schema}\""
     )))
+    .execute(&mut raw)
+    .await
+    .unwrap();
+    sqlx::raw_sql(concat!(
+        include_str!("fixtures/schema-v6-remove-projection.sql"),
+        include_str!("fixtures/schema-v8-remove-agents.sql")
+    ))
     .execute(&mut raw)
     .await
     .unwrap();
@@ -445,9 +465,9 @@ async fn l1_postgres_bootstrap_idempotence_and_fail_closed_guards() {
     raw.close().await.unwrap();
 
     // Wrong installation fails closed.
-    let blob_temp3 = TempDataRoot::new("l1-pg-blobs-3");
-    let wrong_cfg =
-        fixtures.pg_local_config(sample_installation_id(4), &schema, blob_temp3.data_root());
+    let wrong_cfg = fixtures
+        .open_pg_s3_config(sample_installation_id(4), &schema)
+        .await;
     assert!(CanonicalRuntime::open(wrong_cfg).await.is_err());
 
     // Newer schema_version fails closed on PG.
@@ -462,15 +482,10 @@ async fn l1_postgres_bootstrap_idempotence_and_fail_closed_guards() {
             .expect("bump PG schema_version");
         let _ = raw.close().await;
     }
-    let blob_temp4 = TempDataRoot::new("l1-pg-blobs-4");
     assert!(
-        CanonicalRuntime::open(fixtures.pg_local_config(
-            install.clone(),
-            &schema,
-            blob_temp4.data_root()
-        ))
-        .await
-        .is_err()
+        CanonicalRuntime::open(fixtures.open_pg_s3_config(install.clone(), &schema).await)
+            .await
+            .is_err()
     );
 
     // Restore schema_version, test migration_state = 'migrating' fails closed on PG.
@@ -486,9 +501,8 @@ async fn l1_postgres_bootstrap_idempotence_and_fail_closed_guards() {
             .expect("set PG migrating");
         let _ = raw.close().await;
     }
-    let blob_temp5 = TempDataRoot::new("l1-pg-blobs-5");
     assert!(
-        CanonicalRuntime::open(fixtures.pg_local_config(install, &schema, blob_temp5.data_root()))
+        CanonicalRuntime::open(fixtures.open_pg_s3_config(install, &schema).await)
             .await
             .is_err()
     );
@@ -514,9 +528,9 @@ async fn l1_semantic_parity_sqlite_and_postgres() {
     {
         let fixtures = StorageTestFixtures::load_required();
         let schema = fixtures.fresh_pg_schema();
-        let blob_temp = TempDataRoot::new("l1-sem-pg-blobs");
-        let cfg =
-            fixtures.pg_local_config(sample_installation_id(11), &schema, blob_temp.data_root());
+        let cfg = fixtures
+            .open_pg_s3_config(sample_installation_id(11), &schema)
+            .await;
         let (store, runtime) = CanonicalRuntime::open(cfg)
             .await
             .expect("open PostgreSQL 16 for semantic L1");
@@ -1086,4 +1100,430 @@ async fn verify_postgres_mid_command_and_purge_fence(
         fenced_read,
         Err(PortError::Domain(DomainError::ResourceNotFound))
     ));
+}
+
+#[tokio::test]
+async fn l1_long_incompressible_title_fold_succeeds_in_sqlite_and_postgres_v9_index() {
+    use notarium_core::ids::{CommandKey, ContentDigest, GrantId, RequestId};
+    use notarium_core::ports::{CreateNote, Mutation, NoteWritePort, Preconditions, SpaceContext};
+    use notarium_core::receipt::CommandIdentity;
+
+    // 8192 incompressible hex characters (128 distinct blake3 chunks): exceeds PG16's 8 KiB
+    // B-tree item limit if indexed verbatim, but fits cleanly in the bounded 256-char prefix index.
+    let mut long_title = String::with_capacity(8192);
+    for i in 0u16..128 {
+        let digest = blake3::hash(&i.to_be_bytes());
+        long_title.push_str(&digest.to_hex());
+    }
+    assert_eq!(long_title.len(), 8192);
+    let body = format!("# {long_title}\n\nbody\n");
+
+    let run_case = |store: CanonicalStore| {
+        let body = body.clone();
+        async move {
+            let owner = sample_principal_id(41);
+            let space_id = sample_space_id(41);
+            let inc = sample_incarnation(41);
+            let root = sample_folder_id(41);
+            let scope = HistoryScope {
+                space_id: space_id.clone(),
+                incarnation: inc,
+            };
+            store
+                .create_space(CreateSpaceSpec {
+                    space_id: space_id.clone(),
+                    incarnation: inc,
+                    root_folder_id: root.clone(),
+                    slug: "long-title-space".to_owned(),
+                    kind: SpaceKind::Personal,
+                    owner: owner.clone(),
+                    active_epoch: LeaseEpoch::new(1).unwrap(),
+                    initial_last_seq: SpaceSeq::ZERO,
+                    created_at: None,
+                })
+                .await
+                .expect("create space");
+            let auth = notarium_core::auth::EngineAuthContext::for_human(
+                notarium_core::auth::VerifiedHuman::attest(
+                    owner.clone(),
+                    GrantId::from_bytes([41; 16]),
+                    std::collections::BTreeMap::from([(
+                        space_id.clone(),
+                        notarium_core::auth::SpaceGrant {
+                            role: notarium_core::auth::SpaceRole::Owner,
+                            read_classes: std::collections::BTreeSet::from([
+                                notarium_core::classes::DocClass::UserDoc,
+                            ]),
+                            write_classes: std::collections::BTreeSet::from([
+                                notarium_core::classes::DocClass::UserDoc,
+                            ]),
+                            project_root: None,
+                        },
+                    )]),
+                    false,
+                ),
+            );
+            let ctx = SpaceContext::new(
+                auth,
+                scope.clone(),
+                notarium_core::ports::CallBudget {
+                    request: RequestId::from_bytes([41; 16]),
+                    cancellation: notarium_core::ports::Cancellation::default(),
+                    remaining: std::time::Duration::from_secs(10),
+                },
+            )
+            .unwrap();
+            store
+                .create_note(
+                    ctx,
+                    Mutation {
+                        identity: CommandIdentity {
+                            scope,
+                            actor: owner,
+                            key: CommandKey::from_bytes([41; 16]),
+                            hash: ContentDigest::from_bytes(
+                                *blake3::hash(body.as_bytes()).as_bytes(),
+                            ),
+                        },
+                        preconditions: Preconditions::default(),
+                        input: CreateNote {
+                            note: sample_note_id(41),
+                            parent: None,
+                            slug: "long-h1".to_owned(),
+                            class: notarium_core::classes::DocClass::UserDoc,
+                            carrier: body,
+                            folder_page: false,
+                        },
+                    },
+                )
+                .await
+                .expect("active note with 8 KiB incompressible H1 must fit v9 title_fold index");
+        }
+    };
+
+    {
+        let temp = TempDataRoot::new("l1-long-title-sqlite");
+        let cfg = CanonicalConfig::local_default(sample_installation_id(41), temp.data_root());
+        let (store, runtime) = CanonicalRuntime::open(cfg).await.expect("open SQLite");
+        run_case(store).await;
+        runtime.shutdown().await.expect("shutdown SQLite");
+    }
+    {
+        let fixtures = StorageTestFixtures::load_required();
+        let schema = fixtures.fresh_pg_schema();
+        let cfg = fixtures
+            .open_pg_s3_config(sample_installation_id(42), &schema)
+            .await;
+        let (store, runtime) = CanonicalRuntime::open(cfg).await.expect("open PG16");
+        run_case(store).await;
+        runtime.shutdown().await.expect("shutdown PG16");
+        fixtures.drop_pg_schema(&schema).await;
+    }
+}
+
+#[tokio::test]
+async fn canonical_open_rejects_hybrid_storage_profiles() {
+    use notarium_canonical::{
+        BlobBackendConfig, S3BucketModePolicy, SqlBackendConfig, WriterConfig,
+        config::{default_backup_budget, default_postgres_backup_budget},
+    };
+    use notarium_core::error::ValidationReason;
+    use std::time::Duration;
+
+    let fixtures = StorageTestFixtures::load_required();
+    let temp = TempDataRoot::new("hybrid-profiles");
+    let schema = fixtures.fresh_pg_schema();
+
+    // Hybrid 1: PostgreSQL + Local CAS must be rejected before opening sockets or locks.
+    let pg_local = CanonicalConfig {
+        installation_id: sample_installation_id(91),
+        sql: SqlBackendConfig::postgres_default(fixtures.pg_connect_config(), &schema),
+        blobs: BlobBackendConfig::Local {
+            data_root: temp.data_root(),
+        },
+        writer: WriterConfig::default(),
+        snapshot_retention: Duration::from_secs(60),
+        default_backup_budget: default_postgres_backup_budget(),
+    };
+    assert_validation_err(
+        &CanonicalRuntime::open(pg_local).await,
+        ValidationReason::InvalidState,
+    );
+
+    // Hybrid 2: SQLite + S3 CAS must be rejected before opening sockets or locks.
+    let s3_cfg = fixtures.s3_config(
+        "notarium-hybrid-unused",
+        S3BucketModePolicy::DetectFromBucket,
+    );
+    let sqlite_s3 = CanonicalConfig {
+        installation_id: sample_installation_id(92),
+        sql: SqlBackendConfig::sqlite_default(temp.data_root()),
+        blobs: BlobBackendConfig::S3(Box::new(s3_cfg)),
+        writer: WriterConfig::default(),
+        snapshot_retention: Duration::from_secs(60),
+        default_backup_budget: default_backup_budget(),
+    };
+    assert_validation_err(
+        &CanonicalRuntime::open(sqlite_s3).await,
+        ValidationReason::InvalidState,
+    );
+}
+
+#[tokio::test]
+async fn pg_v8_and_v9_512b_upgrade_lifts_inline_limit_and_retires_staged_chat() {
+    use sqlx::Connection;
+
+    let fixtures = StorageTestFixtures::load_required();
+    let v8_hash = "085e724d4cf969a85265d36b616fe04bc78a51c3beadf86dee7f1664bee2dcd7";
+    let v9_hash = "a906f0cf2dc6d4948cd01b180491c1cbe796160ef88e18a706a96e7f36c8fd84";
+
+    for (version, hash) in [(8i32, v8_hash), (9i32, v9_hash)] {
+        let schema = fixtures.fresh_pg_schema();
+        let install = sample_installation_id(80 + version as u8);
+        let mut raw = fixtures.open_raw_pg().await;
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "CREATE SCHEMA \"{schema}\"; SET search_path TO \"{schema}\""
+        )))
+        .execute(&mut raw)
+        .await
+        .unwrap();
+
+        let downgraded_ddl = include_str!("../src/schema/postgres_ddl.sql")
+            .replace("CONSTRAINT chat_entries_body_check CHECK", "CHECK")
+            .replace("CONSTRAINT chat_pending_inputs_body_check CHECK", "CHECK")
+            .replace("<= 32768", "<= 512");
+        sqlx::raw_sql(sqlx::AssertSqlSafe(downgraded_ddl))
+            .execute(&mut raw)
+            .await
+            .unwrap();
+        if version == 8 {
+            sqlx::raw_sql(include_str!("fixtures/schema-v8-remove-agents.sql"))
+                .execute(&mut raw)
+                .await
+                .unwrap();
+        }
+        sqlx::query("INSERT INTO schema_meta VALUES(1,$1,1,$2,'ready',$3,0,0,0,0)")
+            .bind(version)
+            .bind(install.as_str())
+            .bind(hex::decode(hash).unwrap())
+            .execute(&mut raw)
+            .await
+            .unwrap();
+        let space_id = sample_space_id(80 + version as u8);
+        let sid = space_id.as_str();
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO spaces VALUES('{sid}',decode('00000000000000000000000000000000','hex'),'root','home','home','personal','owner','active',1,10,'{{}}',0,0);
+             INSERT INTO chat_threads(
+                 space_id, history_incarnation, thread_id, kind, owner_id, project_folder_id,
+                 title, head_leaf_seq, head_rev_id, next_entry_seq, active_run_id,
+                 ext_space_tainted_mask, created_seq, updated_seq, created_at_sec,
+                 created_at_nsec, updated_at_sec, updated_at_nsec
+             ) VALUES ('{sid}',decode('00000000000000000000000000000000','hex'),'thread','personal','owner',NULL,'Chat',1,'r1',2,NULL,0,1,2,0,0,0,0);
+             INSERT INTO chat_entries(
+                 space_id, thread_id, entry_seq, parent_seq, revision_id, kind, author_id,
+                 inline_text, referenced_notes_json, ext_space_tainted, is_chain_node,
+                 branch_depth, created_space_seq, redacted_at_seq
+             ) VALUES ('{sid}','thread',1,NULL,'r1','human','owner','hello','[]',0,1,0,1,NULL);
+             INSERT INTO chat_entry_note_refs(
+                 space_id, thread_id, entry_seq, ref_ordinal, target_space_id,
+                 target_note_id, created_space_seq
+             ) VALUES ('{sid}','thread',1,0,'{sid}','note1',1);
+             INSERT INTO chat_pending_inputs(
+                 space_id, thread_id, input_id, ordinal, author_id, inline_text,
+                 queued_base_leaf_seq, in_flight_run_id, mentions_agent, status,
+                 enqueued_seq, ext_space_tainted
+             ) VALUES ('{sid}','thread','in1',1,'owner','pending',1,'run1',0,'pending',2,0);
+             INSERT INTO blob_catalog VALUES('{sid}',decode('0000000000000000000000000000000000000000000000000000000000000000','hex'),600,120,1,'pub_staged','open','active',1);
+             INSERT INTO blob_publications VALUES('{sid}','pub_staged',decode('0000000000000000000000000000000000000000000000000000000000000000','hex'),1,'s3_chunked_v1','active',1,1,600,120,1,1);
+             INSERT INTO blob_references VALUES('{sid}','staged_chat','lease1','r0','body',decode('0000000000000000000000000000000000000000000000000000000000000000','hex'),'pub_staged',1);"
+        )))
+        .execute(&mut raw)
+        .await
+        .unwrap();
+
+        // Pre-upgrade 513B insert must fail against the old anonymous <= 512 CHECK.
+        let body_513 = "a".repeat(513);
+        assert!(
+            sqlx::query(
+                "INSERT INTO chat_entries(
+                    space_id, thread_id, entry_seq, parent_seq, revision_id, kind, author_id,
+                    inline_text, referenced_notes_json, ext_space_tainted, is_chain_node,
+                    branch_depth, created_space_seq
+                 ) VALUES ($1,'thread',2,1,'r2','model','owner',$2,'[]',0,1,1,3)",
+            )
+            .bind(sid)
+            .bind(&body_513)
+            .execute(&mut raw)
+            .await
+            .is_err(),
+            "PG v{version} must reject 513B inline before upgrade"
+        );
+
+        notarium_canonical::schema::bootstrap_postgres_schema(&mut raw, &schema, &install)
+            .await
+            .expect("upgrade PG v8/v9 to v10");
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SET search_path TO \"{schema}\""
+        )))
+        .execute(&mut raw)
+        .await
+        .unwrap();
+
+        let body_32k = "b".repeat(32 * 1024);
+        let body_32k_plus_1 = "c".repeat(32 * 1024 + 1);
+        sqlx::query(
+            "INSERT INTO chat_entries(
+                space_id, thread_id, entry_seq, parent_seq, revision_id, kind, author_id,
+                inline_text, referenced_notes_json, ext_space_tainted, is_chain_node,
+                branch_depth, created_space_seq, human_origin, body_format
+             ) VALUES ($1,'thread',2,1,'r2','model','owner',$2,'[]',0,1,1,3,0,0)",
+        )
+        .bind(sid)
+        .bind(&body_32k)
+        .execute(&mut raw)
+        .await
+        .expect("upgraded PG chat_entries must accept 32 KiB inline");
+        assert!(
+            sqlx::query(
+                "INSERT INTO chat_entries(
+                    space_id, thread_id, entry_seq, parent_seq, revision_id, kind, author_id,
+                    inline_text, referenced_notes_json, ext_space_tainted, is_chain_node,
+                    branch_depth, created_space_seq, human_origin, body_format
+                 ) VALUES ($1,'thread',3,2,'r3','model','owner',$2,'[]',0,1,2,4,0,0)",
+            )
+            .bind(sid)
+            .bind(&body_32k_plus_1)
+            .execute(&mut raw)
+            .await
+            .is_err()
+        );
+        sqlx::query(
+            "INSERT INTO chat_pending_inputs(
+                space_id, thread_id, input_id, ordinal, author_id, inline_text,
+                queued_base_leaf_seq, in_flight_run_id, mentions_agent, status,
+                enqueued_seq, ext_space_tainted
+             ) VALUES ($1,'thread','in2',2,'owner',$2,2,'run1',0,'pending',4,0)",
+        )
+        .bind(sid)
+        .bind(&body_32k)
+        .execute(&mut raw)
+        .await
+        .expect("upgraded PG chat_pending_inputs must accept 32 KiB inline");
+        assert!(
+            sqlx::query(
+                "INSERT INTO chat_pending_inputs(
+                    space_id, thread_id, input_id, ordinal, author_id, inline_text,
+                    queued_base_leaf_seq, in_flight_run_id, mentions_agent, status,
+                    enqueued_seq, ext_space_tainted
+                 ) VALUES ($1,'thread','in3',3,'owner',$2,2,'run1',0,'pending',5,0)",
+            )
+            .bind(sid)
+            .bind(&body_32k_plus_1)
+            .execute(&mut raw)
+            .await
+            .is_err()
+        );
+
+        let remaining_staged: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM blob_references WHERE owner_kind='staged_chat'",
+        )
+        .fetch_one(&mut raw)
+        .await
+        .unwrap();
+        let catalog_refs: i64 =
+            sqlx::query_scalar("SELECT ref_count FROM blob_catalog WHERE space_id=$1")
+                .bind(sid)
+                .fetch_one(&mut raw)
+                .await
+                .unwrap();
+        let pending_rets: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM blob_retirements WHERE space_id=$1 AND reason='gc' AND status='pending'",
+        )
+        .bind(sid)
+        .fetch_one(&mut raw)
+        .await
+        .unwrap();
+        assert_eq!((remaining_staged, catalog_refs, pending_rets), (0, 0, 1));
+
+        let _ = raw.close().await;
+        fixtures.drop_pg_schema(&schema).await;
+    }
+
+    // PostgreSQL parity: reachable >64 MiB note_revision blob must fail closed and roll back
+    // v9->v10 cleanly; converting it to obsolete staged_chat retires it and allows upgrade.
+    let schema = fixtures.fresh_pg_schema();
+    let install = sample_installation_id(99);
+    let space_id = sample_space_id(99);
+    let sid = space_id.as_str();
+    let mut raw = fixtures.open_raw_pg().await;
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "CREATE SCHEMA \"{schema}\"; SET search_path TO \"{schema}\""
+    )))
+    .execute(&mut raw)
+    .await
+    .unwrap();
+    sqlx::raw_sql(include_str!("../src/schema/postgres_ddl.sql"))
+        .execute(&mut raw)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO schema_meta VALUES(1,9,1,$1,'ready',$2,0,0,0,0)")
+        .bind(install.as_str())
+        .bind(hex::decode(v9_hash).unwrap())
+        .execute(&mut raw)
+        .await
+        .unwrap();
+    let over_64m = notarium_canonical::blobs::MAX_BLOB_DECODE_BYTES as i64 + 1;
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "INSERT INTO spaces VALUES('{sid}',decode('00000000000000000000000000000000','hex'),'root','home','home','personal','owner','active',1,10,'{{}}',0,0);
+         INSERT INTO blob_catalog VALUES('{sid}',decode('0000000000000000000000000000000000000000000000000000000000000000','hex'),{over_64m},120,1,'pub_big','open','active',1);
+         INSERT INTO blob_publications VALUES('{sid}','pub_big',decode('0000000000000000000000000000000000000000000000000000000000000000','hex'),1,'s3_chunked_v1','active',1,1,{over_64m},120,1,1);
+         INSERT INTO blob_references VALUES('{sid}','note_revision','note1','r1','body',decode('0000000000000000000000000000000000000000000000000000000000000000','hex'),'pub_big',1);"
+    )))
+    .execute(&mut raw)
+    .await
+    .unwrap();
+    assert!(
+        notarium_canonical::schema::bootstrap_postgres_schema(&mut raw, &schema, &install)
+            .await
+            .is_err(),
+        "PG v10 upgrade must fail closed when a reachable blob exceeds 64 MiB"
+    );
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SET search_path TO \"{schema}\""
+    )))
+    .execute(&mut raw)
+    .await
+    .unwrap();
+    let ver_after_abort: i32 =
+        sqlx::query_scalar("SELECT schema_version FROM schema_meta WHERE singleton_id=1")
+            .fetch_one(&mut raw)
+            .await
+            .unwrap();
+    assert_eq!(ver_after_abort, 9);
+
+    sqlx::query("UPDATE blob_references SET owner_kind='staged_chat'")
+        .execute(&mut raw)
+        .await
+        .unwrap();
+    notarium_canonical::schema::bootstrap_postgres_schema(&mut raw, &schema, &install)
+        .await
+        .expect("PG staged_chat-only >64 MiB blob must retire before reachability check");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SET search_path TO \"{schema}\""
+    )))
+    .execute(&mut raw)
+    .await
+    .unwrap();
+    let ver_after_ok: i32 =
+        sqlx::query_scalar("SELECT schema_version FROM schema_meta WHERE singleton_id=1")
+            .fetch_one(&mut raw)
+            .await
+            .unwrap();
+    assert_eq!(
+        ver_after_ok,
+        notarium_canonical::CANONICAL_SCHEMA_VERSION as i32
+    );
+
+    let _ = raw.close().await;
+    fixtures.drop_pg_schema(&schema).await;
 }

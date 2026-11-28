@@ -1,5 +1,4 @@
 use super::CheckedEndpoint;
-use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use std::{
     io,
     net::{SocketAddr, ToSocketAddrs},
@@ -41,8 +40,8 @@ impl Drop for CancelOnDrop {
     }
 }
 
-/// A resolver bound to one checked origin. Pass it to ClientBuilder::dns_resolver
-/// so the connector uses these exact verified addresses without another lookup.
+/// A resolver bound to one checked origin. The outbound connector resolves the
+/// host once per fresh TCP connection and dials only these verified addresses.
 /// System jobs own one of four transport-scoped slots until they actually finish.
 pub(super) struct GuardedResolver {
     endpoint: CheckedEndpoint,
@@ -80,43 +79,44 @@ impl GuardedResolver {
     pub(super) fn available_permits(&self) -> usize {
         self.dns_admission.available_permits()
     }
-}
-impl Resolve for GuardedResolver {
-    fn resolve(&self, name: Name) -> Resolving {
+    pub(super) async fn resolve_addrs(&self, host: &str) -> io::Result<Vec<SocketAddr>> {
+        if self.endpoint.url().host_str() != Some(host) {
+            return Err(rejected());
+        }
+        let permit = match self.dns_admission.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                let _queue_slot = self
+                    .dns_queue
+                    .clone()
+                    .try_acquire_owned()
+                    .map_err(|_| rejected())?;
+                tokio::time::timeout(
+                    DNS_ADMISSION_WAIT,
+                    self.dns_admission.clone().acquire_owned(),
+                )
+                .await
+                .map_err(|_| rejected())?
+                .map_err(|_| rejected())?
+            }
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let _cancel = CancelOnDrop(cancelled.clone());
         let endpoint = self.endpoint.clone();
         let lookup = self.lookup.clone();
-        let dns_admission = self.dns_admission.clone();
-        let dns_queue = self.dns_queue.clone();
-        Box::pin(async move {
-            if endpoint.url().host_str() != Some(name.as_str()) {
-                return Err(rejected().into());
+        let host = host.to_owned();
+        let worker = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            if cancelled.load(Ordering::Acquire) {
+                return Err(rejected());
             }
-            let permit = match dns_admission.clone().try_acquire_owned() {
-                Ok(permit) => permit,
-                Err(_) => {
-                    let _queue_slot = dns_queue.try_acquire_owned().map_err(|_| rejected())?;
-                    tokio::time::timeout(DNS_ADMISSION_WAIT, dns_admission.acquire_owned())
-                        .await
-                        .map_err(|_| rejected())?
-                        .map_err(|_| rejected())?
-                }
-            };
-            let cancelled = Arc::new(AtomicBool::new(false));
-            let _cancel = CancelOnDrop(cancelled.clone());
-            let worker = tokio::task::spawn_blocking(move || {
-                let _permit = permit;
-                if cancelled.load(Ordering::Acquire) {
-                    return Err(rejected());
-                }
-                let values = lookup.addresses(name.as_str()).map_err(|_| rejected())?;
-                if cancelled.load(Ordering::Acquire) {
-                    return Err(rejected());
-                }
-                endpoint.addresses(values).map_err(|_| rejected())
-            });
-            let checked = worker.await.map_err(|_| rejected())??;
-            Ok(Box::new(checked.into_iter()) as Addrs)
-        })
+            let values = lookup.addresses(&host).map_err(|_| rejected())?;
+            if cancelled.load(Ordering::Acquire) {
+                return Err(rejected());
+            }
+            endpoint.addresses(values).map_err(|_| rejected())
+        });
+        worker.await.map_err(|_| rejected())?
     }
 }
 

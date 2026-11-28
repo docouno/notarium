@@ -106,14 +106,14 @@ macro_rules! room_facts_cte {
       ON c.space_id = s.space_id AND c.note_id = ", $p2, "
     WHERE s.space_id = ", $p1, "
   ),
-  anc(depth, folder_id, parent_folder_id, is_root, lifecycle_state, write_lock_json) AS (
-    SELECT 0, f.folder_id, f.parent_folder_id, f.is_root, f.lifecycle_state, f.write_lock_json
+  anc(depth, folder_id, parent_folder_id, is_root, lifecycle_state, write_lock_json, is_project) AS (
+    SELECT 0, f.folder_id, f.parent_folder_id, f.is_root, f.lifecycle_state, f.write_lock_json, f.is_project
     FROM base b
     JOIN folder_heads f
       ON f.space_id = ", $p1, " AND f.folder_id = b.parent_folder_id
     WHERE b.parent_folder_id IS NOT NULL
     UNION ALL
-    SELECT a.depth + 1, f.folder_id, f.parent_folder_id, f.is_root, f.lifecycle_state, f.write_lock_json
+    SELECT a.depth + 1, f.folder_id, f.parent_folder_id, f.is_root, f.lifecycle_state, f.write_lock_json, f.is_project
     FROM anc a
     JOIN folder_heads f
       ON f.space_id = ", $p1, " AND f.folder_id = a.parent_folder_id
@@ -138,7 +138,8 @@ SELECT
   a.folder_id,
   a.is_root,
   a.lifecycle_state AS folder_lifecycle,
-  a.write_lock_json
+  a.write_lock_json,
+  a.is_project
 FROM base b
 LEFT JOIN anc a ON 1 = 1
 ORDER BY a.depth ASC"
@@ -169,6 +170,7 @@ pub(super) struct RawRoomFactsRow {
     is_root: Option<i32>,
     folder_lifecycle: Option<String>,
     write_lock_json: Option<String>,
+    is_project: Option<i32>,
 }
 
 pub(super) struct ActiveRoomExpectation<'a> {
@@ -268,6 +270,7 @@ pub(super) fn decode_room_facts_rows(
     let mut ancestors = Vec::with_capacity(rows.len());
     let mut visited = BTreeSet::new();
     let mut write_locked = false;
+    let mut project = None;
     let mut reached_root = false;
     for row in &rows {
         let Some(folder_raw) = row.folder_id.as_deref() else {
@@ -296,6 +299,9 @@ pub(super) fn decode_room_facts_rows(
         }
         if row.write_lock_json.is_some() {
             write_locked = true;
+        }
+        if row.is_project == Some(1) && project.is_none() {
+            project = Some(folder_id.clone());
         }
         ancestors.push(folder_id);
         if row.is_root.unwrap_or(0) != 0 {
@@ -334,6 +340,7 @@ pub(super) fn decode_room_facts_rows(
         resource: ResourceFacts {
             space,
             class: doc_class,
+            project,
             ancestor_folders: ancestors,
             folder_write_locked: write_locked,
             ability_package,
@@ -418,6 +425,9 @@ fn query_room_facts_rusqlite(
             write_lock_json: r
                 .get(18)
                 .map_err(|e| internal_not_committed("sqlite_rf_18", e.to_string()))?,
+            is_project: r
+                .get(19)
+                .map_err(|e| internal_not_committed("sqlite_rf_19", e.to_string()))?,
         });
     }
     Ok(out)
@@ -492,6 +502,9 @@ pub(super) async fn query_room_facts_pg(
                 write_lock_json: r
                     .try_get("write_lock_json")
                     .map_err(|e| map_col("pg_rf_write_lock_json", e))?,
+                is_project: r
+                    .try_get("is_project")
+                    .map_err(|e| map_col("pg_rf_is_project", e))?,
             })
         })
         .collect()

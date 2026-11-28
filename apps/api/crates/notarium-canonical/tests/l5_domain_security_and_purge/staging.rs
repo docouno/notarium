@@ -24,6 +24,7 @@ pub(super) async fn verify_write_admission(
     let put_count = || gate.map_or(0, |gate| gate.data_puts.load(Ordering::SeqCst));
     let before = put_count();
     let create = |seed: u8| CreateNote {
+        folder_page: false,
         note: sample_note_id(seed),
         parent: None,
         slug: format!("admission-{seed}"),
@@ -36,11 +37,14 @@ pub(super) async fn verify_write_admission(
         digest: notarium_syntax::content_digest(name),
     };
     let package = || PublishAbilityPackage {
+        attached_skills: vec![],
         ability: ability.clone(),
         kind: AbilityKind::Skill,
         entrypoint: entry.clone(),
         files: vec![file("first-auxiliary"), file("second-auxiliary")],
         expected_package_revision: None,
+        expected_entrypoint_revision: None,
+        requires_explicit_binding: false,
     };
     let denied = store
         .create_note(

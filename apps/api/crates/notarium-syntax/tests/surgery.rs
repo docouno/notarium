@@ -188,6 +188,37 @@ fn body_coordinates_are_distinct_and_checked_against_live_identity() {
         .is_err()
     );
 }
+
+#[test]
+fn a_new_header_and_body_edit_share_the_headerless_boundary() {
+    let source = "\u{feff}Original body";
+    let body = Carrier::scan(source).unwrap().body;
+    let title = set_field(source, DocClass::UserDoc, "title", string("New title")).unwrap();
+    let mut edits: Vec<_> = title
+        .edits
+        .into_iter()
+        .map(|edit| (edit.origin, edit.bytes.0, edit.replacement))
+        .collect();
+    edits.push((CarrierEditOrigin::Body, body, "Replacement body".to_owned()));
+    let plan = patch::plan(source, body, edits).unwrap();
+    let output = patch::apply(source, &plan).unwrap();
+    let after = analyze(&output, DocClass::UserDoc).unwrap();
+    assert_eq!(after.fields.unwrap()["title"], string("New title"));
+    assert_eq!(
+        after.carrier.body.slice(&output).unwrap(),
+        "Replacement body"
+    );
+
+    let identity = BodyIdentity::from_bytes([1; 16]);
+    let body_plan = patch::body_plan(source, &plan, identity.clone()).unwrap();
+    assert_eq!(
+        patch::apply_body("Original body", &identity, &body_plan).unwrap(),
+        "Replacement body",
+    );
+    let mut reversed = plan;
+    reversed.edits.swap(0, 1);
+    assert!(patch::apply(source, &reversed).is_err());
+}
 #[test]
 fn portable_names_preserve_identity_and_apply_final_filename_budgets() {
     assert!(PortableFilename::note_slug(&"a".repeat(252)).is_ok());

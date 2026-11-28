@@ -28,12 +28,13 @@ incompatible and damaged states. Missing, invalid and unreadable observations
 remain different; an I/O error cannot authorize initialization. `DataRoot` only
 constructs the shared layout from a supplied path.
 
-Verified authority enters through trusted owners, not deserialization of an auth
-context. Delegation intersects role, class and project grants. Interactive
-`human_management` attestation is separate from `Cap::AbilityWrite`:
-`human_management` does not grant `Cap::AbilityWrite`, while `Cap::AbilityWrite`
-additionally requires `human_management`; Agent, Keeper, OAuth and PAT contexts
-can obtain neither. Both old and new resource facts
+Trusted owners attest verified authority in process. Delegation intersects role,
+class and project grants. Interactive ability authoring requires a separate
+attestation alongside `human_management`. The authentication owner builds a PAT
+or OAuth context from live credential and membership evidence. A bearer can carry
+`Cap::AbilityWrite` when its write scope, durable opt-in and live write grant
+agree. Account management requires interactive human authority. Agent and Keeper
+contexts carry zero ability-authoring and human-management authority. Both old and new resource facts
 are checked on direct writes, including auxiliary ability files. A run pins its
 write Space; non-tainting metadata visibility checks (`can_view_resource`,
 `can_view_folder`) filter listings and references without tainting the branch,
@@ -41,8 +42,15 @@ whereas content-bearing `authorize_read` / `authorize_folder_read` taint
 already-existing clones before external content returns. Shared chat limits reads
 to its Space (and to matching project-scoped threads when a Keeper is pinned to a
 `project_root`) and excludes the sender's profile.
-Nested Keeper runs can retain or drop approved package read exceptions; they
-cannot add exceptions outside their parent's project authority.
+A scheduled credential also binds its own Keeper log. Nested Keeper runs can
+retain or drop approved package read exceptions within their parent's project
+authority.
+
+Explicit proposal confirmation uses two independently revalidated interactive
+contexts with fresh taint latches. The proposal reader has read authority and
+cannot derive a run or perform management or document writes. The write context
+retains the original credential, project and membership ceilings. A typed
+confirmation witness binds each approved mutation step to its source chat entry.
 
 Canonical owners create classified documents. `ClassEgressFence` creates private
 projection/search/provider wrappers only after read, lifecycle and class checks.
@@ -56,13 +64,21 @@ These constructors are trusted in-process boundaries, not isolation from malicio
 Rust code that controls the canonical/admission owner. Adapters must recheck live
 visibility and revocation at use time.
 
-Provider dispatch uses `ProviderEgressCatalogPort` to pin current metadata for
-every origin and the selected active project. Its lease excludes changes to class,
-lifecycle, provenance and project ancestry until release, or cancels the call and
-waits for release. Chat origins include their canonical digest and optional project;
-current taint remains authoritative. `ClassEgressFence::revalidate` checks these
-fresh facts against the exact source and current provider disclosure. No document
-bodies or SQL handles cross the metadata port.
+Provider dispatch uses `ProviderEgressCatalogPort` to verify current metadata for
+every origin and the selected active project under a short read-only snapshot. On
+local SQLite, its in-memory disclosure pin excludes local canonical mutations to
+participating Spaces until `mark_dispatched` / release; on Cloud PostgreSQL, the
+read-only snapshot returns its connection immediately after verification so
+upstream network I/O never holds database locks or exhausts the pool, while
+Control authority, consent, membership, credential and run revocations cancel
+in-flight calls synchronously through `RevocationHub`. Chat origins include their
+canonical digest and optional project;
+current taint remains authoritative. Folder and Space metadata carry their
+own canonical revision or digest. A derived chat entry retains the transitive
+origins of each source used to produce it, including earlier tool results and
+summaries. `ClassEgressFence::revalidate` checks the exact source and current
+provider disclosure before dispatch. The metadata port carries identities,
+placement, lifecycle and proofs.
 
 Completion messages retain roles, classified parts and ordered tool-call/result
 associations. `ProviderInstruction` carries trusted orchestration text on `System`,
@@ -253,8 +269,18 @@ An unsupported field produces `InvalidState` after checking command identity
 and before using a receipt. It needs no knowledge of resource existence.
 Supported conditions are checked under current resource authority. A schema
 update that supplies a note revision requires an existing note. The expected
-package revision, queue base leaf, rollback run/entity/rank expectations and
-job cancellation lease belong to their typed inputs.
+package revision, queue base leaf and job cancellation lease belong to their
+typed inputs.
+
+`rollback_agent_run_by_id` is the sole canonical rollback command and resolves
+run provenance directly inside the canonical owner. Its command identity binds
+the run ID independently of note revisions, so a retry reaches the original
+receipt even after revisions advance. When a Space has no live collaboration
+rooms or fences, rollback executes directly in a single writer transaction on
+both SQLite and PostgreSQL; when live rooms or fences are present, it reserves
+closed rooms in deterministic `NoteId` order before submitting the same writer
+transaction. Before replay, Canonical checks current access to the run's
+sources and to every note named in the stored result.
 
 ## Complete mutation intent across live rooms
 
@@ -356,9 +382,10 @@ Owner management admission can target an archived Space without granting content
 read/write access. Revocation callbacks receive the durable event request ID for
 idempotent delivery; a committed mutation cannot return success before their ACK.
 
-Schedule claims carry the next slot computed by the scheduler. A committed claim
-advances that slot atomically; repeated claims return an inspection receipt,
-without permission to dispatch again. Terminal run results are typed and do not
+Control computes the next schedule slot authoritatively from the schedule
+calendar and Control clock inside the claim transaction. A committed claim
+advances the slot or records calendar exhaustion atomically. Repeated claims
+return an inspection receipt. A fresh winning claim authorizes dispatch. Terminal run results are typed and do not
 carry a next slot. Only a new winning claim returns a non-deserializable
 ScheduledRun/Keeper context. Scheduler maintenance authority owns claims and
 terminal audit; human schedule edits use account commands and configuration CAS.
@@ -390,7 +417,8 @@ canonical revisions for immediate search. Wait watermarks require an indexed cut
 Results carry a `SnapshotCut`, a truncation flag, and any embedding degradation.
 See [search and recall](search.md).
 
-The following 28 tool names are consumer coverage, not a tool registry in core:
+The [agent tool registry](agents.md#tool-registry) maps these 28 names to core
+ports.
 
 | Consumer tools | Typed operations |
 | --- | --- |
@@ -427,7 +455,9 @@ may select a cluster, intersecting its members with the existing project, tag
 and field filters. An unknown or unauthorized cluster returns
 `ResourceNotFound`, without widening the query to the whole Space.
 `GraphResult.hidden_count` counts active non-encrypted notes excluded by filters
-or node caps, never unauthorized notes. Clustering, identity matching and
+or node caps, never unauthorized notes. `GraphQuery` also accepts an optional
+`causal` basis so callers such as `get_note` can wait briefly for recent
+canonical edits before reading graph neighbors. Clustering, identity matching and
 membership lookup remain projection owner responsibilities. The existing
 500/2000 node caps and 1–2 hop bound remain. `Personal` chat thread reads,
 backlinks, and event delivery share one centralized authorization rule enforcing

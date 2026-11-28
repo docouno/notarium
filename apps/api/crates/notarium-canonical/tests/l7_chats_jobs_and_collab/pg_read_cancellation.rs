@@ -69,8 +69,9 @@ async fn seed_personal_chat(
 async fn fast_pg_chat_read_releases_slots_on_cancel_drop_and_shutdown() {
     let fixtures = StorageTestFixtures::load_required();
     let schema = fixtures.fresh_pg_schema();
-    let data = TempDataRoot::new("fast-pg-read-cancel");
-    let mut cfg = fixtures.pg_local_config(sample_installation_id(97), &schema, data.data_root());
+    let mut cfg = fixtures
+        .open_pg_s3_config(sample_installation_id(97), &schema)
+        .await;
     let SqlBackendConfig::Postgres { pool_size, .. } = &mut cfg.sql else {
         unreachable!()
     };
@@ -85,6 +86,11 @@ async fn fast_pg_chat_read_releases_slots_on_cancel_drop_and_shutdown() {
                 &scope,
                 &owner,
                 AppendChat {
+                    tool_calls: Vec::new(),
+                    provenance: None,
+                    interruption: None,
+                    proposed_diff: None,
+                    proposed_effect: None,
                     thread: thread.clone(),
                     parent: ThreadEntrySeq::ZERO,
                     kind: ChatEntryKind::Human,
@@ -209,8 +215,9 @@ async fn fast_pg_chat_read_releases_slots_on_cancel_drop_and_shutdown() {
 async fn pg_pool_returns_foreign_checkout_to_the_store_runtime() {
     let fixtures = StorageTestFixtures::load_required();
     let schema = fixtures.fresh_pg_schema();
-    let data = TempDataRoot::new("foreign-pg-checkout");
-    let mut cfg = fixtures.pg_local_config(sample_installation_id(98), &schema, data.data_root());
+    let mut cfg = fixtures
+        .open_pg_s3_config(sample_installation_id(98), &schema)
+        .await;
     let SqlBackendConfig::Postgres { pool_size, .. } = &mut cfg.sql else {
         unreachable!()
     };
@@ -332,8 +339,9 @@ async fn pg_pool_returns_foreign_checkout_to_the_store_runtime() {
 async fn pg_append_chat_rechecks_an_expired_read_before_writer_admission() {
     let fixtures = StorageTestFixtures::load_required();
     let schema = fixtures.fresh_pg_schema();
-    let data = TempDataRoot::new("pg-chat-read-deadline");
-    let config = fixtures.pg_local_config(sample_installation_id(89), &schema, data.data_root());
+    let config = fixtures
+        .open_pg_s3_config(sample_installation_id(89), &schema)
+        .await;
     let (store, runtime) = CanonicalRuntime::open(config).await.unwrap();
     let (scope, owner, thread) = seed_personal_chat(&store, 89).await;
     let ctx = || owner_ctx(&scope, owner.clone());
@@ -355,6 +363,11 @@ async fn pg_append_chat_rechecks_an_expired_read_before_writer_admission() {
             &scope,
             &owner,
             AppendChat {
+                tool_calls: Vec::new(),
+                provenance: None,
+                interruption: None,
+                proposed_diff: None,
+                proposed_effect: None,
                 thread: thread.clone(),
                 parent: ThreadEntrySeq::ZERO,
                 kind: ChatEntryKind::Human,

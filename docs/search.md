@@ -10,7 +10,7 @@ before shutting down canonical storage.
 ## Queries and recall
 
 - Lexical ranking uses Tantivy with title, body (shared across searchable note
-  classes, including agent memory) and chat fields (`TOKENIZER_VERSION = 2`).
+  classes, including agent memory) and chat fields (`TOKENIZER_VERSION = 3`).
   Filter metadata is stored in fast fields without stored note or chat text.
   English and Russian prose use case folding and stemming. Exact fields retain
   code identifiers and path terms. Quoted clauses match phrase positions.
@@ -36,12 +36,36 @@ before shutting down canonical storage.
   a consistent canonical head and applies the current taint of returned chats. A
   project-scoped Keeper can search its explicitly pinned skills outside the
   project when no folder is requested.
+- For provider-recipient search and recall, the output limit counts notes
+  admitted for that recipient. A single lexical and vector collection can
+  inspect up to 800 distinct ranked notes per branch before graph expansion.
+  Strict lexical matches take priority within that window. The single-clause
+  fallback counts recipient-admitted strict notes, then fills the remaining
+  slots up to `min(top_k, 10)` with admitted weaker matches before rank
+  fusion and graph expansion. Both tiers share the same 800-note limit.
+  When present, the existing structural mask plus the receipt overlay bounds
+  this collection without reducing its ordinary chunk depth. An additional
+  distinct strict or vector match marks the typed result truncated. An extra
+  weak match marks it truncated while the fallback floor is still unfilled.
+  Provider-facing tools omit this flag and hidden counts. The larger window reuses the same query embedding. Ordinary
+  search and recall retain their `max(100, 4 * top_k)` candidate limits.
 - The hybrid path fuses lexical and vector ranks with reciprocal rank fusion
   (`k = 60`). The vector branch ranks each note by its best matching chunk
   and also retains the leading chunks for recall. Recall can expand the
-  leading notes through up to two graph hops.
-  It serves the best eligible chunk per note first, then fills the remaining
-  token budget with ranked chunks. Lexical fallback ranks chunks by matching
+  top 16 notes through up to three graph hops. For a provider recipient,
+  only admitted notes with graph nodes count toward the 16 seeds. Each
+  visit reads up to 64 neighbors per direction. Up to 64 distinct admitted
+  neighbors determine the degree penalty and can receive a boost or become
+  the next frontier. All visits in a layer check their first 64 candidates
+  before requesting replacements. Each subsequent batch checks at most as
+  many candidates per visit as there are open slots. A full visit skips
+  the rest of its page.
+  Across all hops, the provider search checks up to 1,040 additional
+  distinct neighbors for admission. All seeds and hops share
+  1,040 node visits and the request deadline. Work beyond either cap marks
+  the typed result truncated. Recall serves the best
+  eligible chunk per note first, then fills the remaining token budget while
+  respecting the optional per-note token limit. Lexical fallback ranks chunks by matching
   phrases and normalized terms. Each chunk carries canonical source spans.
 - Wait watermarks require a caught-up search cut. A bounded set of exact
   receipts can score the named canonical revisions while the indexes catch up,
@@ -189,11 +213,25 @@ parts. Changing the default recipient drains in-flight implicit calls for the
 affected Space before the preference commits. Explicit calls retain their
 own provider admission. They require an untainted
 context, a matching project scope, and a nonempty intersection of search
-classes and provider disclosure. For project-scoped queries the canonical
-egress lease pins the requested folder inside that project through dispatch. Provider admission rechecks current access and
+classes and provider disclosure; for model-authored queries from chat runs and
+Keepers, the remote embedding provider must additionally cover every
+non-encrypted class disclosed to that run or allowed to its active completion
+provider, and project-only remote embedders also require prior non-query
+disclosures and the active completion provider to stay confined to that same
+project, degrading to lexical search with `ProviderUnavailable` otherwise. For
+project-scoped queries the canonical egress lease pins the requested folder
+inside that project through dispatch. Provider admission rechecks current access and
 token limits. Dispatch compares both resolved runtime generations and checks
-the shared taint. Remote indexing excludes descendants of trashed folders. Chat
-text stays in the lexical index.
+the shared taint. Chat runs and Keepers can disclose a query only in their
+pinned Space: `authorize_remote_embedding_query` blocks remote query embedding
+in any non-pinned Space locally so the lexical path serves cross-Space queries
+without disclosing query text, while `SearchEngine` defers cross-Space branch
+taint during snapshot, candidate, and recall-packing preflight until a
+surviving hit is delivered (direct `StructuralReadPort` opens still taint on
+open). A scheduled Keeper
+also needs a live lease and current approval of its role and skills. Query
+embedding sends the query text alone. Remote indexing excludes descendants of
+trashed folders. Chat transcript indexing stays lexical.
 
 Local CPU ONNX inference and remote provider calls run on separate bounded
 priority schedulers so remote network latency never starves local inference.
@@ -208,6 +246,10 @@ preparation and traversal. Local and lexical searches skip the provider project
 lookup. When this deadline expires, the query returns lexical results with
 `BudgetExceeded`.
 The same deadline bounds waits for projection access during traversal.
+Recipient-filtered provider queries start at the ordinary candidate depth and
+widen progressively to the full recipient probe budget only when recipient
+filtering rejects candidates and leaves too few hits, reusing prepared query
+vectors and overlay hits across passes.
 The durable pending state schedules bounded repair when embeddings are missing.
 Ready targeted batches alternate with full-sweep pages. Targeted repair resumes
 after the last attempted note ID and wraps at the end. A note-specific rate

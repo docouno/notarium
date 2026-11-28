@@ -118,8 +118,7 @@ impl HttpsFixture {
         OutboundTransport::fixture_https(
             self.origin.clone(),
             Arc::new(Loopback),
-            reqwest::Certificate::from_der(include_bytes!("../../tests/fixtures/identity/ca.der"))
-                .unwrap(),
+            include_bytes!("../../tests/fixtures/identity/ca.der").to_vec(),
         )
     }
 }

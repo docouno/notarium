@@ -176,6 +176,7 @@ async fn create_with_id(
                 identity: command_identity(ctx),
                 preconditions: Preconditions::default(),
                 input: CreateNote {
+                    folder_page: false,
                     note,
                     parent: None,
                     slug: slug.to_owned(),
@@ -337,6 +338,7 @@ async fn cluster_lens_survives_forced_compaction_and_generation_rotation() {
                             version: 1,
                             predicate: Predicate::All(Vec::new()),
                         },
+                        causal: None,
                     },
                 )
                 .await
@@ -848,7 +850,7 @@ fn storage_fixture<T: serde::de::DeserializeOwned>() -> T {
     .unwrap()
 }
 
-async fn postgres_fixture(root: &DataRoot) -> (CanonicalConfig, sqlx::PgPool, String, String) {
+async fn postgres_fixture(_root: &DataRoot) -> (CanonicalConfig, sqlx::PgPool, String, String) {
     let fixture: PgFixture = storage_fixture();
     let socket = format!(".s.PGSQL.{}", fixture.pg_port);
     let directory = [
@@ -886,9 +888,7 @@ async fn postgres_fixture(root: &DataRoot) -> (CanonicalConfig, sqlx::PgPool, St
             },
             &canonical_schema,
         ),
-        blobs: BlobBackendConfig::Local {
-            data_root: root.clone(),
-        },
+        blobs: postgres_erasure::s3_blob_backend_for_prefix(&canonical_schema).await,
         writer: WriterConfig::default(),
         snapshot_retention: Duration::from_secs(60),
         default_backup_budget: default_postgres_backup_budget(),

@@ -1,11 +1,13 @@
 use super::*;
 
-struct Candidate {
-    position: i64,
-    note_space: String,
-    note_id: String,
-    favorite: i64,
-}
+const MAX_BOOTSTRAP_SCOPE_ROWS: usize = 4096;
+const MAX_BOOTSTRAP_SCOPE_ITEMS: usize = 8192;
+
+pub(crate) const BOOTSTRAP_SCOPE_PINS_SQLITE_SQL: &str = "SELECT coalesce(o.rank,0) AS rank, p.note_space, p.note_id FROM context_scope_pins p INDEXED BY context_pin_target LEFT JOIN context_order o ON o.target_kind=p.target_kind AND o.target_id=p.target_id AND o.entry_kind='note' AND o.entry_ref=('{\"space_id\":\"' || p.note_space || '\",\"note_id\":\"' || p.note_id || '\"}') WHERE p.target_kind=$1 AND p.target_id=$2 LIMIT 4097";
+pub(crate) const BOOTSTRAP_SCOPE_SETS_SQLITE_SQL: &str = "SELECT coalesce(o.rank,0) AS rank, a.target_space, s.set_id, s.owner_id, s.home_space, s.name, s.note_refs, s.revision FROM context_set_attachments a INDEXED BY context_attachment_target CROSS JOIN context_sets s LEFT JOIN context_order o ON o.target_kind=a.target_kind AND o.target_id=a.target_id AND o.entry_kind='set' AND o.entry_ref=a.set_id WHERE s.set_id=a.set_id AND a.target_kind=$1 AND a.target_id=$2 LIMIT 4097";
+pub(crate) const BOOTSTRAP_FAVORITES_FIRST_SQLITE_SQL: &str = "SELECT rank, space_id, entity_id FROM favorites WHERE owner_id=$1 AND entity_kind='note' ORDER BY rank,space_id,entity_id LIMIT $2";
+pub(crate) const BOOTSTRAP_FAVORITES_AFTER_SQLITE_SQL: &str = "SELECT rank, space_id, entity_id FROM favorites WHERE owner_id=$1 AND entity_kind='note' AND (rank,space_id,entity_id)>($2,$3,$4) ORDER BY rank,space_id,entity_id LIMIT $5";
+
 #[derive(sqlx::FromRow)]
 struct PinCandidateRow {
     rank: i64,
@@ -15,8 +17,13 @@ struct PinCandidateRow {
 #[derive(sqlx::FromRow)]
 struct SetCandidateRow {
     rank: i64,
+    target_space: String,
     set_id: String,
+    owner_id: String,
+    home_space: String,
+    name: String,
     note_refs: String,
+    revision: i64,
 }
 #[derive(sqlx::FromRow)]
 struct FavoriteCandidateRow {
@@ -32,21 +39,16 @@ struct ScopeItem {
     item_index: usize,
     note_space: String,
     note_id: String,
+    set_home: Option<(String, String)>,
 }
-async fn load_bootstrap_candidates(
+async fn load_bootstrap_scope_items(
+    service: &ControlService,
     tx: &mut Transaction,
-    owner_id: &str,
+    current: &AccountContext,
     project: &str,
     space: &str,
     personal: &str,
-    after: i64,
-    page_limit: u16,
-) -> Result<Vec<Candidate>, PortError> {
-    let skip = usize::try_from(after).map_err(|_| invalid(ValidationReason::InvalidQuery))?;
-    let want = usize::from(page_limit) + 1;
-    let needed = skip
-        .checked_add(want)
-        .ok_or_else(|| invalid(ValidationReason::InvalidLimit))?;
+) -> Result<Vec<ScopeItem>, PortError> {
     let mut targets = Vec::with_capacity(3);
     if !project.is_empty() {
         targets.push((0_i64, "project", project));
@@ -63,12 +65,18 @@ async fn load_bootstrap_candidates(
             tx,
             PinCandidateRow,
             fetch_all,
-            "SELECT coalesce(o.rank,0) AS rank, p.note_space, p.note_id FROM context_scope_pins p LEFT JOIN context_order o ON o.target_kind=p.target_kind AND o.target_id=p.target_id AND o.entry_kind='note' AND o.entry_ref=('{\"space_id\":\"' || p.note_space || '\",\"note_id\":\"' || p.note_id || '\"}') WHERE p.target_kind=$1 AND p.target_id=$2",
-            "SELECT coalesce(o.rank,0) AS rank, p.note_space, p.note_id FROM v1_control.context_scope_pins p LEFT JOIN v1_control.context_order o ON o.target_kind=p.target_kind AND o.target_id=p.target_id AND o.entry_kind='note' AND o.entry_ref=('{\"space_id\":\"' || p.note_space || '\",\"note_id\":\"' || p.note_id || '\"}') WHERE p.target_kind=$1 AND p.target_id=$2";
+            BOOTSTRAP_SCOPE_PINS_SQLITE_SQL,
+            "SELECT coalesce(o.rank,0) AS rank, p.note_space, p.note_id FROM v1_control.context_scope_pins p LEFT JOIN v1_control.context_order o ON o.target_kind=p.target_kind AND o.target_id=p.target_id AND o.entry_kind='note' AND o.entry_ref=('{\"space_id\":\"' || p.note_space || '\",\"note_id\":\"' || p.note_id || '\"}') WHERE p.target_kind=$1 AND p.target_id=$2 LIMIT 4097";
             kind,
             target_id
         )?;
+        if pins.len() > MAX_BOOTSTRAP_SCOPE_ROWS {
+            return Err(invalid(ValidationReason::BudgetExceeded));
+        }
         for pin in pins {
+            if scope_items.len() >= MAX_BOOTSTRAP_SCOPE_ITEMS {
+                return Err(invalid(ValidationReason::BudgetExceeded));
+            }
             scope_items.push(ScopeItem {
                 level,
                 rank: pin.rank,
@@ -76,18 +84,58 @@ async fn load_bootstrap_candidates(
                 item_index: 0,
                 note_space: pin.note_space,
                 note_id: pin.note_id,
+                set_home: None,
             });
         }
         let sets = rows!(
             tx,
             SetCandidateRow,
             fetch_all,
-            "SELECT coalesce(o.rank,0) AS rank, a.set_id, s.note_refs FROM context_set_attachments a JOIN context_sets s ON s.set_id=a.set_id LEFT JOIN context_order o ON o.target_kind=a.target_kind AND o.target_id=a.target_id AND o.entry_kind='set' AND o.entry_ref=a.set_id WHERE a.target_kind=$1 AND a.target_id=$2",
-            "SELECT coalesce(o.rank,0) AS rank, a.set_id, s.note_refs FROM v1_control.context_set_attachments a JOIN v1_control.context_sets s ON s.set_id=a.set_id LEFT JOIN v1_control.context_order o ON o.target_kind=a.target_kind AND o.target_id=a.target_id AND o.entry_kind='set' AND o.entry_ref=a.set_id WHERE a.target_kind=$1 AND a.target_id=$2";
+            BOOTSTRAP_SCOPE_SETS_SQLITE_SQL,
+            "SELECT coalesce(o.rank,0) AS rank, a.target_space, s.set_id, s.owner_id, s.home_space, s.name, s.note_refs, s.revision FROM v1_control.context_set_attachments a JOIN v1_control.context_sets s ON s.set_id=a.set_id LEFT JOIN v1_control.context_order o ON o.target_kind=a.target_kind AND o.target_id=a.target_id AND o.entry_kind='set' AND o.entry_ref=a.set_id WHERE a.target_kind=$1 AND a.target_id=$2 LIMIT 4097";
             kind,
             target_id
         )?;
+        if sets.len() > MAX_BOOTSTRAP_SCOPE_ROWS {
+            return Err(invalid(ValidationReason::BudgetExceeded));
+        }
         for set in sets {
+            let home = SpaceId::parse(&set.home_space)?;
+            let Some(grant) = current.auth().spaces().get(&home) else {
+                continue;
+            };
+            if grant.read_classes.is_empty() {
+                continue;
+            }
+            if let Some(root) = &grant.project_root {
+                let expected_target = serde_json::to_string(&FolderRef {
+                    space_id: home.clone(),
+                    folder_id: root.clone(),
+                })
+                .map_err(|_| invalid(ValidationReason::InvalidState))?;
+                if !(kind == "project"
+                    && target_id == expected_target
+                    && set.target_space == home.as_str())
+                {
+                    let bundle_row = ContextSetsRow {
+                        set_id: set.set_id.clone(),
+                        owner_id: set.owner_id.clone(),
+                        home_space: set.home_space.clone(),
+                        name: set.name,
+                        note_refs: set.note_refs.clone(),
+                        revision: set.revision,
+                        created_at: 0,
+                    };
+                    match service
+                        .check_bundle_attachment_db(tx, current, &bundle_row)
+                        .await
+                    {
+                        Ok(()) => {}
+                        Err(error) if hidden(&error) => continue,
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
             if set.note_refs.len() > 65536 {
                 return Err(invalid(ValidationReason::InvalidState));
             }
@@ -97,7 +145,11 @@ async fn load_bootstrap_candidates(
                 return Err(invalid(ValidationReason::InvalidState));
             }
             let entry = format!("s:{}", set.set_id);
+            let set_home = Some((set.home_space, set.owner_id));
             for (idx, note) in notes.into_iter().enumerate() {
+                if scope_items.len() >= MAX_BOOTSTRAP_SCOPE_ITEMS {
+                    return Err(invalid(ValidationReason::BudgetExceeded));
+                }
                 scope_items.push(ScopeItem {
                     level,
                     rank: set.rank,
@@ -105,77 +157,20 @@ async fn load_bootstrap_candidates(
                     item_index: idx,
                     note_space: note.space_id.to_string(),
                     note_id: note.note_id.to_string(),
+                    set_home: set_home.clone(),
                 });
             }
         }
     }
     scope_items.sort();
-    let mut seen = std::collections::BTreeSet::new();
-    let mut deduped: Vec<(String, String, i64)> = Vec::new();
-    for item in scope_items {
-        if seen.insert((item.note_space.clone(), item.note_id.clone())) {
-            deduped.push((item.note_space, item.note_id, 0));
-        }
-    }
-    let mut fav_cursor: Option<(i64, String, String)> = None;
-    while deduped.len() < needed {
-        let batch_limit = ((needed - deduped.len())
-            .saturating_add(seen.len())
-            .clamp(32, 512)) as i64;
-        let favs = match &fav_cursor {
-            None => rows!(
-                tx,
-                FavoriteCandidateRow,
-                fetch_all,
-                "SELECT rank, space_id, entity_id FROM favorites WHERE owner_id=$1 AND entity_kind='note' ORDER BY rank,space_id,entity_id LIMIT $2",
-                "SELECT rank, space_id, entity_id FROM v1_control.favorites WHERE owner_id=$1 AND entity_kind='note' ORDER BY rank,space_id,entity_id LIMIT $2";
-                owner_id,
-                batch_limit
-            )?,
-            Some((rank, space_id, entity_id)) => rows!(
-                tx,
-                FavoriteCandidateRow,
-                fetch_all,
-                "SELECT rank, space_id, entity_id FROM favorites WHERE owner_id=$1 AND entity_kind='note' AND (rank,space_id,entity_id)>($2,$3,$4) ORDER BY rank,space_id,entity_id LIMIT $5",
-                "SELECT rank, space_id, entity_id FROM v1_control.favorites WHERE owner_id=$1 AND entity_kind='note' AND (rank,space_id,entity_id)>($2,$3,$4) ORDER BY rank,space_id,entity_id LIMIT $5";
-                owner_id,
-                *rank,
-                space_id,
-                entity_id,
-                batch_limit
-            )?,
-        };
-        if favs.is_empty() {
-            break;
-        }
-        let exhausted = (favs.len() as i64) < batch_limit;
-        if let Some(last) = favs.last() {
-            fav_cursor = Some((last.rank, last.space_id.clone(), last.entity_id.clone()));
-        }
-        for fav in favs {
-            if seen.insert((fav.space_id.clone(), fav.entity_id.clone())) {
-                deduped.push((fav.space_id, fav.entity_id, 1));
-                if deduped.len() >= needed {
-                    break;
-                }
-            }
-        }
-        if exhausted {
-            break;
-        }
-    }
-    Ok(deduped
-        .into_iter()
-        .enumerate()
-        .skip(skip)
-        .take(want)
-        .map(|(idx, (note_space, note_id, favorite))| Candidate {
-            position: (idx + 1) as i64,
-            note_space,
-            note_id,
-            favorite,
-        })
-        .collect())
+    Ok(scope_items)
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BootstrapFavCursor {
+    rank: i64,
+    space: SpaceId,
+    note: NoteId,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -183,8 +178,20 @@ struct BootstrapCursor {
     version: u8,
     scope: ContentDigest,
     after: i64,
+    #[serde(default)]
+    fav_after: Option<BootstrapFavCursor>,
 }
-#[derive(sqlx::FromRow, Serialize, Deserialize)]
+#[derive(sqlx::FromRow)]
+struct EntryQueryRow {
+    kind: String,
+    space: String,
+    entity: String,
+    rank: i64,
+    target_space: String,
+    set_owner: String,
+    set_home: String,
+}
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EntryRow {
     kind: String,
@@ -202,6 +209,16 @@ struct EntryCursor {
 
 impl ControlService {
     pub async fn bootstrap_context(
+        &self,
+        ctx: AccountContext,
+        id: EpisodeId,
+        space: Option<SpaceId>,
+        page: ControlPageRequest,
+    ) -> Result<BootstrapContext, PortError> {
+        Box::pin(self.bootstrap_context_inner(ctx, id, space, page)).await
+    }
+
+    async fn bootstrap_context_inner(
         &self,
         ctx: AccountContext,
         id: EpisodeId,
@@ -230,21 +247,34 @@ impl ControlService {
         budget.run(rtx.finish(), CommitEffect::NotCommitted).await?;
         let (owner, loaded_ep, owner_ack_rows) = first_db?;
         let had_project = loaded_ep.row.project_space.is_some();
-        let (mut episode, role_to_overlay, selected, personal, owner_acknowledgements) = budget
+        let (
+            mut episode,
+            role_to_overlay,
+            selected,
+            personal,
+            owner_acknowledgements,
+            mut space_cache,
+        ) = budget
             .run(
                 async {
-                    let (episode, role_to_overlay) =
-                        self.resolve_episode_catalog(&current, loaded_ep).await?;
+                    let mut space_cache = std::collections::BTreeMap::new();
+                    let (episode, role_to_overlay) = self
+                        .resolve_episode_catalog_cached(&current, loaded_ep, &mut space_cache)
+                        .await?;
                     let selected = if let Some(space) = space {
-                        if current
-                            .auth()
-                            .spaces()
-                            .get(&space)
-                            .is_none_or(|grant| grant.read_classes.is_empty())
-                        {
+                        let Some(grant) = current.auth().spaces().get(&space) else {
+                            return Err(DomainError::ResourceNotFound.into());
+                        };
+                        if grant.read_classes.is_empty() {
                             return Err(DomainError::ResourceNotFound.into());
                         }
-                        self.catalog_space(&current, &space).await?;
+                        if grant.project_root.is_some() && episode.project_hint.is_none() {
+                            return Err(DomainError::ResourceNotFound.into());
+                        }
+                        if !matches!(space_cache.get(&space), Some(Some(_))) {
+                            let info = self.catalog_space(&current, &space).await?;
+                            space_cache.insert(space.clone(), Some(info));
+                        }
                         if episode
                             .project_hint
                             .as_ref()
@@ -262,30 +292,38 @@ impl ControlService {
                             .map(SpaceId::parse)
                             .transpose()?
                             .filter(|space| {
-                                current
-                                    .auth()
-                                    .spaces()
-                                    .get(space)
-                                    .is_some_and(|grant| !grant.read_classes.is_empty())
+                                current.auth().spaces().get(space).is_some_and(|grant| {
+                                    !grant.read_classes.is_empty() && grant.project_root.is_none()
+                                })
                             })
                     } else {
                         None
                     };
-                    if let Some(space) = &selected {
-                        self.catalog_space(&current, space).await?;
+                    if let Some(space) = &selected
+                        && !matches!(space_cache.get(space), Some(Some(_)))
+                    {
+                        let info = self.catalog_space(&current, space).await?;
+                        space_cache.insert(space.clone(), Some(info));
                     }
                     let personal = if let Some(value) = &owner.personal_space_id {
                         let space = SpaceId::parse(value)?;
-                        if current
-                            .auth()
-                            .spaces()
-                            .get(&space)
-                            .is_some_and(|grant| !grant.read_classes.is_empty())
-                        {
-                            match self.catalog_space(&current, &space).await {
-                                Ok(_) => owner.user_id.clone(),
-                                Err(error) if hidden(&error) => String::new(),
-                                Err(error) => return Err(error),
+                        if current.auth().spaces().get(&space).is_some_and(|grant| {
+                            !grant.read_classes.is_empty() && grant.project_root.is_none()
+                        }) {
+                            match space_cache.get(&space) {
+                                Some(Some(_)) => owner.user_id.clone(),
+                                Some(None) => String::new(),
+                                None => match self.catalog_space(&current, &space).await {
+                                    Ok(info) => {
+                                        space_cache.insert(space, Some(info));
+                                        owner.user_id.clone()
+                                    }
+                                    Err(error) if hidden(&error) => {
+                                        space_cache.insert(space, None);
+                                        String::new()
+                                    }
+                                    Err(error) => return Err(error),
+                                },
                             }
                         } else {
                             String::new()
@@ -294,7 +332,7 @@ impl ControlService {
                         String::new()
                     };
                     let owner_acknowledgements = self
-                        .resolve_acknowledgements(&current, owner_ack_rows)
+                        .resolve_acknowledgements_cached(&current, owner_ack_rows, &mut space_cache)
                         .await?;
                     Ok::<_, PortError>((
                         episode,
@@ -302,6 +340,7 @@ impl ControlService {
                         selected,
                         personal,
                         owner_acknowledgements,
+                        space_cache,
                     ))
                 },
                 CommitEffect::NotCommitted,
@@ -330,6 +369,13 @@ impl ControlService {
                     } else {
                         None
                     };
+                    let space_scope = selected.as_ref().filter(|space| {
+                        current
+                            .auth()
+                            .spaces()
+                            .get(*space)
+                            .is_some_and(|grant| grant.project_root.is_none())
+                    });
                     let scope = self
                         .context_digest(
                             rtx.inner_mut(),
@@ -339,6 +385,7 @@ impl ControlService {
                                 &id,
                                 episode.revision,
                                 &selected,
+                                &space_scope,
                                 &episode.project_hint,
                                 &personal,
                             ),
@@ -363,92 +410,300 @@ impl ControlService {
                         .transpose()
                         .map_err(|_| invalid(ValidationReason::InvalidState))?
                         .unwrap_or_default();
-                    let space_str = selected.as_ref().map_or("", SpaceId::as_str);
-                    let after = cursor.as_ref().map_or(0, |cursor| cursor.after);
-                    let mut candidates = load_bootstrap_candidates(
+                    let space_str = space_scope.map_or("", SpaceId::as_str);
+                    let raw_scope_items = load_bootstrap_scope_items(
+                        self,
                         rtx.inner_mut(),
-                        &owner.user_id,
+                        &current,
                         &project,
                         space_str,
                         &personal,
-                        after,
-                        page.limit(),
                     )
                     .await?;
-                    let continuation = if candidates.len() > usize::from(page.limit()) {
-                        candidates.pop();
-                        Some(
-                            serde_json::to_string(&BootstrapCursor {
-                                version: 1,
-                                scope,
-                                after: candidates.last().expect("positive page limit").position,
-                            })
-                            .map_err(|_| invalid(ValidationReason::InvalidState))?,
-                        )
-                    } else {
-                        None
-                    };
-                    Ok::<_, PortError>((role_enabled, after, candidates, continuation))
+                    Ok::<_, PortError>((role_enabled, scope, cursor, raw_scope_items))
                 },
                 CommitEffect::NotCommitted,
             )
             .await;
         budget.run(rtx.finish(), CommitEffect::NotCommitted).await?;
-        let (role_enabled, after, candidates, continuation) = second_db?;
+        let (role_enabled, scope, cursor, raw_scope_items) = second_db?;
         if let Some(reference) = role_enabled {
             episode.active_role = Some(reference);
         } else if had_overlay_candidate {
             episode.diagnostics.push(EpisodeDiagnostic::RoleUnavailable);
         }
-        budget
+        let (scope_notes, seen_scope) = budget
             .run(
                 async {
-                    let mut pinned = Vec::new();
-                    let mut favorites = Vec::new();
-                    let mut unavailable = 0;
-                    for candidate in candidates {
-                        if candidate.position <= after || !matches!(candidate.favorite, 0 | 1) {
-                            return Err(invalid(ValidationReason::InvalidState));
+                    let mut seen = std::collections::BTreeSet::new();
+                    let mut scope_notes = Vec::new();
+                    for item in raw_scope_items {
+                        if let Some((home_str, set_owner)) = &item.set_home {
+                            let home_space = SpaceId::parse(home_str)?;
+                            let home_kind = match space_cache.get(&home_space) {
+                                Some(Some(info)) => Some(info.space.kind),
+                                Some(None) => None,
+                                None => match self.catalog_space(&current, &home_space).await {
+                                    Ok(info) => {
+                                        let kind = info.space.kind;
+                                        space_cache.insert(home_space, Some(info));
+                                        Some(kind)
+                                    }
+                                    Err(error) if hidden(&error) => {
+                                        space_cache.insert(home_space, None);
+                                        None
+                                    }
+                                    Err(error) => return Err(error),
+                                },
+                            };
+                            let Some(kind) = home_kind else {
+                                continue;
+                            };
+                            if kind == SpaceKind::Personal
+                                && set_owner != current.auth().principal().as_str()
+                            {
+                                continue;
+                            }
                         }
                         let note = NoteRef {
-                            space_id: SpaceId::parse(&candidate.note_space)?,
-                            note_id: NoteId::parse(&candidate.note_id)?,
+                            space_id: SpaceId::parse(&item.note_space)?,
+                            note_id: NoteId::parse(&item.note_id)?,
                         };
-                        match self.catalog_note(&current, &note).await {
-                            Ok(_) => {
-                                if candidate.favorite == 1 {
-                                    favorites.push(note);
-                                } else {
-                                    pinned.push(note);
-                                }
-                            }
-                            Err(error) if hidden(&error) => unavailable += 1,
-                            Err(error) => return Err(error),
+                        if seen.insert((note.space_id.clone(), note.note_id.clone())) {
+                            scope_notes.push(note);
                         }
                     }
-                    let readable_spaces = current
-                        .auth()
-                        .spaces()
-                        .iter()
-                        .filter(|(_, grant)| !grant.read_classes.is_empty())
-                        .map(|(space, _)| space.clone())
-                        .collect();
-                    Ok(BootstrapContext {
-                        episode,
-                        selection: ContextSelection {
-                            space: selected,
-                            pinned,
-                            favorites,
-                            readable_spaces,
-                            unavailable,
-                        },
-                        owner_acknowledgements,
-                        continuation,
-                    })
+                    Ok::<_, PortError>((scope_notes, seen))
                 },
                 CommitEffect::NotCommitted,
             )
-            .await
+            .await?;
+        let scope_skip = cursor
+            .as_ref()
+            .map(|c| usize::try_from(c.after).map_err(|_| invalid(ValidationReason::CursorStale)))
+            .transpose()?
+            .unwrap_or(0);
+        let fav_start = cursor.as_ref().and_then(|c| c.fav_after.clone());
+        if scope_skip > scope_notes.len()
+            || (fav_start.is_some() && scope_skip != scope_notes.len())
+        {
+            return Err(invalid(ValidationReason::CursorStale));
+        }
+
+        let target = usize::from(page.limit());
+        let mut emitted = 0usize;
+        let mut pinned = Vec::new();
+        let mut favorites = Vec::new();
+        let mut unavailable = 0u32;
+        let mut has_more = false;
+        let mut next_scope_after = scope_skip;
+        let mut last_fav_cursor = fav_start.clone();
+
+        budget
+            .run(
+                async {
+                    for note in scope_notes.iter().skip(scope_skip) {
+                        if emitted == target {
+                            has_more = true;
+                            break;
+                        }
+                        match self.catalog_note(&current, note).await {
+                            Ok(_) => pinned.push(note.clone()),
+                            Err(error) if hidden(&error) => unavailable += 1,
+                            Err(error) => return Err(error),
+                        }
+                        emitted += 1;
+                        next_scope_after += 1;
+                    }
+                    Ok::<_, PortError>(())
+                },
+                CommitEffect::NotCommitted,
+            )
+            .await?;
+
+        if !has_more {
+            let (fav_items, fav_unavail, fav_more, fav_last) =
+                Box::pin(self.bootstrap_favorites_page(
+                    &budget,
+                    &current,
+                    &owner.user_id,
+                    &seen_scope,
+                    fav_start,
+                    target.saturating_sub(emitted),
+                    page.limit(),
+                ))
+                .await?;
+            favorites.extend(fav_items);
+            unavailable = unavailable.saturating_add(fav_unavail);
+            has_more = fav_more;
+            last_fav_cursor = fav_last;
+        }
+
+        let continuation = if has_more {
+            Some(
+                serde_json::to_string(&BootstrapCursor {
+                    version: 1,
+                    scope,
+                    after: next_scope_after as i64,
+                    fav_after: last_fav_cursor,
+                })
+                .map_err(|_| invalid(ValidationReason::InvalidState))?,
+            )
+        } else {
+            None
+        };
+        let readable_spaces = current
+            .auth()
+            .spaces()
+            .iter()
+            .filter(|(_, grant)| !grant.read_classes.is_empty())
+            .map(|(space, _)| space.clone())
+            .collect();
+        Ok(BootstrapContext {
+            episode,
+            selection: ContextSelection {
+                space: selected,
+                pinned,
+                favorites,
+                readable_spaces,
+                unavailable,
+            },
+            owner_acknowledgements,
+            continuation,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn bootstrap_favorites_page(
+        &self,
+        budget: &OperationBudget,
+        current: &AccountContext,
+        owner_id: &str,
+        seen_scope: &std::collections::BTreeSet<(SpaceId, NoteId)>,
+        fav_start: Option<BootstrapFavCursor>,
+        remaining_slots: usize,
+        page_limit: u16,
+    ) -> Result<(Vec<NoteRef>, u32, bool, Option<BootstrapFavCursor>), PortError> {
+        const MAX_SCAN: usize = 4096;
+        let batch_limit = i64::from(page_limit).saturating_add(1).max(16);
+        let mut scan_cursor = fav_start.clone();
+        let mut last_fav_cursor = fav_start;
+        let mut favorites = Vec::new();
+        let mut unavailable = 0u32;
+        let mut emitted = 0usize;
+        let mut has_more = false;
+        let mut scanned = 0usize;
+        loop {
+            let fetch_limit = batch_limit.min(
+                i64::try_from((MAX_SCAN + 1).saturating_sub(scanned))
+                    .unwrap_or(1)
+                    .max(1),
+            );
+            let mut ftx = self.store.read(budget.clone()).await?;
+            let batch_res = budget
+                .run(
+                    async {
+                        let favs = match &scan_cursor {
+                            None => rows!(
+                                ftx.inner_mut(),
+                                FavoriteCandidateRow,
+                                fetch_all,
+                                BOOTSTRAP_FAVORITES_FIRST_SQLITE_SQL,
+                                "SELECT rank, space_id, entity_id FROM v1_control.favorites WHERE owner_id=$1 AND entity_kind='note' ORDER BY rank,space_id,entity_id LIMIT $2";
+                                owner_id,
+                                fetch_limit
+                            )?,
+                            Some(prev) => rows!(
+                                ftx.inner_mut(),
+                                FavoriteCandidateRow,
+                                fetch_all,
+                                BOOTSTRAP_FAVORITES_AFTER_SQLITE_SQL,
+                                "SELECT rank, space_id, entity_id FROM v1_control.favorites WHERE owner_id=$1 AND entity_kind='note' AND (rank,space_id,entity_id)>($2,$3,$4) ORDER BY rank,space_id,entity_id LIMIT $5";
+                                owner_id,
+                                prev.rank,
+                                prev.space.as_str(),
+                                prev.note.as_str(),
+                                fetch_limit
+                            )?,
+                        };
+                        Ok::<_, PortError>(favs)
+                    },
+                    CommitEffect::NotCommitted,
+                )
+                .await;
+            budget.run(ftx.finish(), CommitEffect::NotCommitted).await?;
+            let favs = batch_res?;
+            let batch_len = favs.len();
+            budget
+                .run(
+                    async {
+                        for fav in favs {
+                            scanned = scanned.saturating_add(1);
+                            if scanned > MAX_SCAN {
+                                return Err(invalid(ValidationReason::BudgetExceeded));
+                            }
+                            let fav_space = SpaceId::parse(&fav.space_id)?;
+                            let fav_note = NoteId::parse(&fav.entity_id)?;
+                            let fav_key = BootstrapFavCursor {
+                                rank: fav.rank,
+                                space: fav_space.clone(),
+                                note: fav_note.clone(),
+                            };
+                            scan_cursor = Some(fav_key.clone());
+                            if current
+                                .auth()
+                                .spaces()
+                                .get(&fav_space)
+                                .is_none_or(|grant| grant.read_classes.is_empty())
+                            {
+                                continue;
+                            }
+                            if seen_scope.contains(&(fav_space.clone(), fav_note.clone())) {
+                                continue;
+                            }
+                            let note = NoteRef {
+                                space_id: fav_space,
+                                note_id: fav_note,
+                            };
+                            match self.catalog_note(current, &note).await {
+                                Ok(_) => {
+                                    if emitted == remaining_slots {
+                                        has_more = true;
+                                        break;
+                                    }
+                                    favorites.push(note);
+                                    emitted += 1;
+                                    last_fav_cursor = Some(fav_key);
+                                }
+                                Err(error) if hidden(&error) => {
+                                    let out_of_project_fav = current
+                                        .auth()
+                                        .spaces()
+                                        .get(&note.space_id)
+                                        .is_some_and(|grant| grant.project_root.is_some());
+                                    if !out_of_project_fav {
+                                        if emitted == remaining_slots {
+                                            has_more = true;
+                                            break;
+                                        }
+                                        unavailable += 1;
+                                        emitted += 1;
+                                        last_fav_cursor = Some(fav_key);
+                                    }
+                                }
+                                Err(error) => return Err(error),
+                            }
+                        }
+                        Ok::<_, PortError>(())
+                    },
+                    CommitEffect::NotCommitted,
+                )
+                .await?;
+            if has_more || batch_len < usize::try_from(fetch_limit).unwrap_or(usize::MAX) {
+                break;
+            }
+        }
+        Ok((favorites, unavailable, has_more, last_fav_cursor))
     }
     pub async fn list_context_entries(
         &self,
@@ -456,17 +711,28 @@ impl ControlService {
         scope: ContextScope,
         page: ControlPageRequest,
     ) -> Result<ControlPage<ContextEntryInfo>, PortError> {
+        Box::pin(self.list_context_entries_inner(ctx, scope, page)).await
+    }
+
+    async fn list_context_entries_inner(
+        &self,
+        ctx: AccountContext,
+        scope: ContextScope,
+        page: ControlPageRequest,
+    ) -> Result<ControlPage<ContextEntryInfo>, PortError> {
+        const MAX_SCAN: usize = 4096;
         let budget = OperationBudget::new(ctx.budget.clone());
         let (mut tx, auth) = self
             .open_revalidated_read(&budget, &ctx.budget.request, ctx.auth())
             .await?;
         let current = AccountContext::new(auth, budget.context(ctx.budget.request.clone()));
-        let db_result = budget
+        let init_result = budget
             .run(
                 async {
                     let owner =
                         user_read(tx.inner_mut(), current.auth().principal().as_str()).await?;
                     let key = scope_key(&owner, &scope)?;
+                    Self::context_scope_grant_ok(current.auth(), &scope, &key)?;
                     let digest = self
                         .context_digest(tx.inner_mut(), &current, ("context-entries", &key))
                         .await?;
@@ -493,54 +759,7 @@ impl ControlService {
                         },
                         |cursor| cursor.last,
                     );
-                    let limit = i64::from(page.limit()) + 1;
-                    let mut rows: Vec<EntryRow> = match tx.inner_mut() {
-                        Transaction::Sqlite(tx) => {
-                            sqlx::query_as(include_str!("entries.sqlite.sql"))
-                                .bind(&key.kind)
-                                .bind(&key.id)
-                                .bind(after.rank)
-                                .bind(&after.kind)
-                                .bind(&after.space)
-                                .bind(&after.entity)
-                                .bind(limit)
-                                .fetch_all(&mut **tx)
-                                .await
-                                .map_err(crate::error::database)?
-                        }
-                        Transaction::Postgres(tx) => {
-                            sqlx::query_as(include_str!("entries.postgres.sql"))
-                                .bind(&key.kind)
-                                .bind(&key.id)
-                                .bind(after.rank)
-                                .bind(&after.kind)
-                                .bind(&after.space)
-                                .bind(&after.entity)
-                                .bind(limit)
-                                .fetch_all(&mut **tx)
-                                .await
-                                .map_err(crate::error::database)?
-                        }
-                    };
-                    let continuation = if rows.len() > usize::from(page.limit()) {
-                        rows.pop();
-                        Some(
-                            serde_json::to_string(&EntryCursor {
-                                version: 1,
-                                scope: digest,
-                                last: EntryRow {
-                                    kind: rows.last().unwrap().kind.clone(),
-                                    space: rows.last().unwrap().space.clone(),
-                                    entity: rows.last().unwrap().entity.clone(),
-                                    rank: rows.last().unwrap().rank,
-                                },
-                            })
-                            .map_err(|_| invalid(ValidationReason::InvalidState))?,
-                        )
-                    } else {
-                        None
-                    };
-                    Ok::<_, PortError>((key, rows, continuation))
+                    Ok::<_, PortError>((key, digest, after))
                 },
                 CommitEffect::NotCommitted,
             )
@@ -548,42 +767,274 @@ impl ControlService {
         budget
             .run(tx.rollback(), CommitEffect::NotCommitted)
             .await?;
-        let (key, rows, continuation) = db_result?;
+        let (key, digest, mut after) = init_result?;
         budget
             .run(
-                async {
-                    self.context_scope_read(&current, &scope, &key).await?;
-                    let mut items = Vec::with_capacity(rows.len());
-                    for row in rows {
-                        let entry = match row.kind.as_str() {
-                            "set" => ContextEntry::Set(ContextSetId::parse(&row.entity)?),
-                            "note" => {
-                                let note = NoteRef {
-                                    space_id: SpaceId::parse(&row.space)?,
-                                    note_id: NoteId::parse(&row.entity)?,
-                                };
-                                match self.catalog_note(&current, &note).await {
-                                    Ok(_) => (),
-                                    Err(error) if hidden(&error) => continue,
-                                    Err(error) => return Err(error),
-                                };
-                                ContextEntry::Note(note)
-                            }
-                            _ => return Err(invalid(ValidationReason::InvalidState)),
-                        };
-                        items.push(ContextEntryInfo {
-                            entry,
-                            rank: row.rank,
-                        });
-                    }
-                    Ok(ControlPage {
-                        items,
-                        continuation,
-                    })
-                },
+                self.context_scope_read(&current, &scope, &key),
                 CommitEffect::NotCommitted,
             )
-            .await
+            .await?;
+        let target = usize::from(page.limit());
+        let mut batch_limit = i64::from(page.limit()).saturating_add(1).max(16);
+        let allowed_spaces: Vec<String> = current
+            .auth()
+            .spaces()
+            .keys()
+            .map(|id| id.as_str().to_owned())
+            .collect();
+        let allowed_spaces_pipe = if allowed_spaces.is_empty() {
+            String::new()
+        } else {
+            format!("|{}|", allowed_spaces.join("|"))
+        };
+        let mut items = Vec::with_capacity(target);
+        let mut last_visible: Option<EntryRow> = None;
+        let mut has_more = false;
+        let mut scanned = 0usize;
+        let mut set_space_cache: BTreeMap<SpaceId, Option<SpaceKind>> = BTreeMap::new();
+        loop {
+            let fetch_limit = batch_limit.min(
+                i64::try_from((MAX_SCAN + 1).saturating_sub(scanned))
+                    .unwrap_or(1)
+                    .max(1),
+            );
+            let mut tx = self.store.read(budget.clone()).await?;
+            let batch_result = budget
+                .run(
+                    async {
+                        let batch: Vec<EntryQueryRow> = match tx.inner_mut() {
+                            Transaction::Sqlite(tx) => {
+                                sqlx::query_as(include_str!("entries.sqlite.sql"))
+                                    .bind(&key.kind)
+                                    .bind(&key.id)
+                                    .bind(after.rank)
+                                    .bind(&after.kind)
+                                    .bind(&after.space)
+                                    .bind(&after.entity)
+                                    .bind(fetch_limit)
+                                    .bind(&allowed_spaces_pipe)
+                                    .fetch_all(&mut **tx)
+                                    .await
+                                    .map_err(crate::error::database_not_committed)?
+                            }
+                            Transaction::Postgres(tx) => {
+                                sqlx::query_as(include_str!("entries.postgres.sql"))
+                                    .bind(&key.kind)
+                                    .bind(&key.id)
+                                    .bind(after.rank)
+                                    .bind(&after.kind)
+                                    .bind(&after.space)
+                                    .bind(&after.entity)
+                                    .bind(fetch_limit)
+                                    .bind(&allowed_spaces)
+                                    .fetch_all(&mut **tx)
+                                    .await
+                                    .map_err(crate::error::database_not_committed)?
+                            }
+                        };
+                        let batch_len = batch.len();
+                        let mut next_after = EntryRow {
+                            kind: after.kind.clone(),
+                            space: after.space.clone(),
+                            entity: after.entity.clone(),
+                            rank: after.rank,
+                        };
+                        let mut candidates = Vec::with_capacity(batch_len);
+                        let mut skipped_since_last = 0usize;
+                        for qrow in batch {
+                            let row = EntryRow {
+                                kind: qrow.kind,
+                                space: qrow.space,
+                                entity: qrow.entity,
+                                rank: qrow.rank,
+                            };
+                            next_after = EntryRow {
+                                kind: row.kind.clone(),
+                                space: row.space.clone(),
+                                entity: row.entity.clone(),
+                                rank: row.rank,
+                            };
+                            match row.kind.as_str() {
+                                "set" => {
+                                    let _set_id = ContextSetId::parse(&row.entity)?;
+                                    let home = SpaceId::parse(&qrow.set_home)?;
+                                    let Some(grant) = current.auth().spaces().get(&home) else {
+                                        skipped_since_last += 1;
+                                        continue;
+                                    };
+                                    if grant.read_classes.is_empty() {
+                                        skipped_since_last += 1;
+                                        continue;
+                                    }
+                                    if let Some(root) = &grant.project_root {
+                                        let expected_target = serde_json::to_string(&FolderRef {
+                                            space_id: home.clone(),
+                                            folder_id: root.clone(),
+                                        })
+                                        .map_err(|_| invalid(ValidationReason::InvalidState))?;
+                                        if !(key.kind == "project"
+                                            && key.id == expected_target
+                                            && qrow.target_space == home.as_str())
+                                        {
+                                            let bundle_row = ContextSetsRow {
+                                                set_id: row.entity.clone(),
+                                                owner_id: qrow.set_owner.clone(),
+                                                home_space: qrow.set_home.clone(),
+                                                name: String::new(),
+                                                note_refs: String::new(),
+                                                revision: 0,
+                                                created_at: 0,
+                                            };
+                                            match self
+                                                .check_bundle_attachment_db(
+                                                    tx.inner_mut(),
+                                                    &current,
+                                                    &bundle_row,
+                                                )
+                                                .await
+                                            {
+                                                Ok(()) => {}
+                                                Err(error) if hidden(&error) => {
+                                                    skipped_since_last += 1;
+                                                    continue;
+                                                }
+                                                Err(error) => return Err(error),
+                                            }
+                                        }
+                                    }
+                                    candidates.push((
+                                        skipped_since_last,
+                                        row,
+                                        Some((home, qrow.set_owner)),
+                                    ));
+                                    skipped_since_last = 0;
+                                }
+                                "note" => {
+                                    let space_id = SpaceId::parse(&row.space)?;
+                                    if current
+                                        .auth()
+                                        .spaces()
+                                        .get(&space_id)
+                                        .is_some_and(|grant| !grant.read_classes.is_empty())
+                                    {
+                                        candidates.push((skipped_since_last, row, None));
+                                        skipped_since_last = 0;
+                                    } else {
+                                        skipped_since_last += 1;
+                                    }
+                                }
+                                _ => return Err(invalid(ValidationReason::InvalidState)),
+                            }
+                        }
+                        Ok::<_, PortError>((batch_len, next_after, candidates, skipped_since_last))
+                    },
+                    CommitEffect::NotCommitted,
+                )
+                .await;
+            budget
+                .run(tx.rollback(), CommitEffect::NotCommitted)
+                .await?;
+            let (batch_len, next_after, candidates, trailing_skipped) = batch_result?;
+            after = next_after;
+            for (skipped_before, row, set_home) in candidates {
+                scanned = scanned.saturating_add(skipped_before).saturating_add(1);
+                if scanned > MAX_SCAN {
+                    return Err(invalid(ValidationReason::BudgetExceeded));
+                }
+                let entry = match row.kind.as_str() {
+                    "set" => {
+                        let Some((home_space, set_owner)) = set_home else {
+                            return Err(invalid(ValidationReason::InvalidState));
+                        };
+                        let home_kind = match set_space_cache.get(&home_space) {
+                            Some(cached) => *cached,
+                            None => {
+                                let looked = budget
+                                    .run(
+                                        async {
+                                            match self.catalog_space(&current, &home_space).await {
+                                                Ok(info) => Ok(Some(info.space.kind)),
+                                                Err(error) if hidden(&error) => Ok(None),
+                                                Err(error) => Err(error),
+                                            }
+                                        },
+                                        CommitEffect::NotCommitted,
+                                    )
+                                    .await?;
+                                set_space_cache.insert(home_space, looked);
+                                looked
+                            }
+                        };
+                        let Some(kind) = home_kind else {
+                            continue;
+                        };
+                        if kind == SpaceKind::Personal
+                            && set_owner != current.auth().principal().as_str()
+                        {
+                            continue;
+                        }
+                        ContextEntry::Set(ContextSetId::parse(&row.entity)?)
+                    }
+                    "note" => {
+                        let note = NoteRef {
+                            space_id: SpaceId::parse(&row.space)?,
+                            note_id: NoteId::parse(&row.entity)?,
+                        };
+                        let visible = budget
+                            .run(
+                                async {
+                                    match self.catalog_note(&current, &note).await {
+                                        Ok(_) => Ok(true),
+                                        Err(error) if hidden(&error) => Ok(false),
+                                        Err(error) => Err(error),
+                                    }
+                                },
+                                CommitEffect::NotCommitted,
+                            )
+                            .await?;
+                        if !visible {
+                            continue;
+                        }
+                        ContextEntry::Note(note)
+                    }
+                    _ => return Err(invalid(ValidationReason::InvalidState)),
+                };
+                if items.len() == target {
+                    has_more = true;
+                    break;
+                }
+                let rank = row.rank;
+                items.push(ContextEntryInfo { entry, rank });
+                last_visible = Some(row);
+            }
+            if !has_more {
+                scanned = scanned.saturating_add(trailing_skipped);
+                if scanned > MAX_SCAN {
+                    return Err(invalid(ValidationReason::BudgetExceeded));
+                }
+            }
+            if has_more || batch_len < usize::try_from(fetch_limit).unwrap_or(usize::MAX) {
+                break;
+            }
+            batch_limit = batch_limit.saturating_mul(2).min(512);
+        }
+        let continuation = if has_more {
+            let last = last_visible.expect("positive page limit");
+            Some(
+                serde_json::to_string(&EntryCursor {
+                    version: 1,
+                    scope: digest,
+                    last,
+                })
+                .map_err(|_| invalid(ValidationReason::InvalidState))?,
+            )
+        } else {
+            None
+        };
+        Ok(ControlPage {
+            items,
+            continuation,
+        })
     }
 }
 

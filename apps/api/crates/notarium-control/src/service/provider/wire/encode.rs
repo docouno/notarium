@@ -65,7 +65,7 @@ pub(in crate::service::provider) fn completion_fingerprint(
         .iter()
         .flat_map(|message| message.parts.iter().map(|part| part.origin()))
         .collect();
-    fingerprint((
+    let input = (
         "completion-v1",
         &request.selection.provider,
         &request.selection.model,
@@ -78,7 +78,16 @@ pub(in crate::service::provider) fn completion_fingerprint(
         messages,
         tools,
         origins,
-    ))
+    );
+    if request.secondary_projects.is_empty() {
+        fingerprint(input)
+    } else {
+        fingerprint((
+            "completion-secondary-projects-v1",
+            input,
+            &request.secondary_projects,
+        ))
+    }
 }
 pub(in crate::service::provider) fn embedding_fingerprint(
     request: &EmbeddingRequest,
@@ -191,14 +200,41 @@ fn schema(
             }
         }
         ProviderToolSchema::Number => json!({"type":"number"}),
-        ProviderToolSchema::Integer => json!({"type":"integer"}),
+        ProviderToolSchema::Integer { minimum, maximum } => {
+            if let (Some(min), Some(max)) = (minimum, maximum)
+                && min > max
+            {
+                return Err(invalid());
+            }
+            let mut obj = serde_json::Map::new();
+            obj.insert("type".into(), json!("integer"));
+            if let Some(min) = minimum {
+                obj.insert("minimum".into(), json!(min));
+            }
+            if let Some(max) = maximum {
+                obj.insert("maximum".into(), json!(max));
+            }
+            Value::Object(obj)
+        }
         ProviderToolSchema::Boolean => json!({"type":"boolean"}),
+        ProviderToolSchema::ConstBool(expected) => json!({"type":"boolean", "const":expected}),
         ProviderToolSchema::Null => json!({"type":"null"}),
-        ProviderToolSchema::Array { items, maximum } => {
-            if *maximum > 4096 {
+        ProviderToolSchema::Array {
+            items,
+            minimum,
+            maximum,
+        } => {
+            if *maximum > 4096 || minimum.is_some_and(|min| min > *maximum) {
                 return Err(limited());
             }
-            json!({"type":"array", "items":schema(items, depth + 1, nodes, bytes)?, "maxItems":maximum})
+            let mut obj = serde_json::Map::new();
+            obj.insert("type".into(), json!("array"));
+            obj.insert("items".into(), schema(items, depth + 1, nodes, bytes)?);
+            if let Some(min) = minimum {
+                obj.insert("minItems".into(), json!(min));
+            }
+            obj.insert("maxItems".into(), json!(maximum));
+            Value::Object(obj)
         }
         ProviderToolSchema::Object {
             properties,
@@ -219,6 +255,22 @@ fn schema(
                 fields.insert(key.clone(), schema(value, depth + 1, nodes, bytes)?);
             }
             json!({"type":"object", "properties":fields, "required":required, "additionalProperties":false})
+        }
+        ProviderToolSchema::Map { values } => {
+            json!({"type":"object","additionalProperties":schema(values, depth + 1, nodes, bytes)?})
+        }
+        ProviderToolSchema::JsonValue => {
+            json!({"type":["string","number","boolean","null","array","object"]})
+        }
+        ProviderToolSchema::AnyOf(options) => {
+            if !(1..=8).contains(&options.len()) {
+                return Err(limited());
+            }
+            let options = options
+                .iter()
+                .map(|option| schema(option, depth + 1, nodes, bytes))
+                .collect::<Result<Vec<_>, _>>()?;
+            json!({"anyOf":options})
         }
     })
 }
@@ -361,8 +413,52 @@ fn history(request: &CompletionRequest, wire: ProviderWireKind) -> Result<Vec<Va
     }
     Ok(messages)
 }
-fn text_tokens(value: &str) -> u64 {
+pub(in crate::service::provider) fn text_tokens(value: &str) -> u64 {
     estimate_token_twelfths(value).div_ceil(12)
+}
+fn json_escaped_len(value: &str) -> usize {
+    value.chars().fold(0usize, |total, ch| {
+        total
+            + match ch {
+                '"' | '\\' | '\u{8}' | '\t' | '\n' | '\u{c}' | '\r' => 2,
+                '\0'..='\u{1f}' => 6,
+                ch => ch.len_utf8(),
+            }
+    })
+}
+pub(in crate::service::provider) fn estimate_completion_wire_bytes(
+    request: &CompletionRequest,
+) -> Result<usize, PortError> {
+    let mut total = 512usize;
+    for message in &request.messages {
+        total = total.saturating_add(96);
+        if let Some(id) = &message.result_for {
+            total = total.saturating_add(json_escaped_len(id.as_str()));
+        }
+        if let Some(instruction) = &message.instruction {
+            total = total.saturating_add(json_escaped_len(instruction.text()) + 2);
+        }
+        for part in &message.parts {
+            total = total.saturating_add(json_escaped_len(part.text()) + 2);
+        }
+        for call in &message.tool_calls {
+            let args = serde_json::to_string(&call.arguments).map_err(|_| invalid())?;
+            total = total
+                .saturating_add(128)
+                .saturating_add(json_escaped_len(call.id.as_str()))
+                .saturating_add(json_escaped_len(&call.name))
+                .saturating_add(json_escaped_len(&args));
+        }
+    }
+    if !request.tools.is_empty() {
+        let definitions = tools(&request.tools)?;
+        total = total.saturating_add(
+            serde_json::to_vec(&definitions)
+                .map_err(|_| invalid())?
+                .len(),
+        );
+    }
+    Ok(total)
 }
 pub(in crate::service::provider) fn estimate_completion_input_tokens(
     request: &CompletionRequest,

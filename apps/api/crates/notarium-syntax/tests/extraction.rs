@@ -64,6 +64,152 @@ fn explicit_ids_survive_invalid_edits_and_duplicate_ids_never_execute() {
     assert!(views(&example, true).blocks.is_empty());
 }
 #[test]
+fn view_patch_changes_only_the_named_block_in_nested_markdown() {
+    use notarium_core::{ports::ViewRef, value::YamlValue};
+    use notarium_syntax::frontmatter::FieldEdit;
+    use std::collections::BTreeMap;
+
+    let schema = BTreeMap::new();
+    let note = NoteId::from_bytes([9; 16]);
+    let key = ViewKey::from_bytes([7; 16]);
+    let other = ViewKey::from_bytes([8; 16]);
+    let suffix = format!(
+        "\r\nKeep this.\r\n\r\n\x60\x60\x60nota\r\nid: {other}\r\ntype: board\r\n\x60\x60\x60\r\n"
+    );
+    let carrier = format!(
+        "Intro.\r\n\r\n> \x60\x60\x60nota\r\n> id: {key}\r\n> type: table # retain\r\n> source: {{tags: [old]}}\r\n> \x60\x60\x60\r\n{suffix}"
+    );
+    let edits = nota::ViewBlockPatch {
+        source: vec![FieldEdit::Set {
+            key: "tags".into(),
+            value: YamlValue::Sequence(vec![YamlValue::String("new".into())]),
+        }],
+        options: vec![FieldEdit::Set {
+            key: "collapsed".into(),
+            value: YamlValue::Bool(true),
+        }],
+        ..Default::default()
+    };
+    let view = ViewRef {
+        note,
+        key: key.clone(),
+    };
+    let changed = patch::apply(
+        &carrier,
+        &nota::patch_view_block(&carrier, DocClass::UserDoc, &view, &edits, &schema).unwrap(),
+    )
+    .unwrap();
+    assert!(changed.starts_with("Intro.\r\n\r\n"));
+    assert!(changed.ends_with(&suffix));
+    assert!(changed.contains("> type: table # retain\r\n"));
+    let parsed = views(&changed, false);
+    let config = parsed.blocks[0].config.as_ref().unwrap();
+    let YamlValue::Mapping(fields) = config else {
+        panic!("expected view mapping")
+    };
+    assert_eq!(parsed.blocks[0].id.as_ref(), Some(&key));
+    assert_eq!(
+        fields["source"],
+        YamlValue::Mapping(
+            [(
+                "tags".into(),
+                YamlValue::Sequence(vec![YamlValue::String("new".into())])
+            )]
+            .into()
+        )
+    );
+    assert_eq!(
+        fields["options"],
+        YamlValue::Mapping([("collapsed".into(), YamlValue::Bool(true))].into())
+    );
+    let protected = nota::ViewBlockPatch {
+        common: vec![FieldEdit::Unset { key: "id".into() }],
+        ..Default::default()
+    };
+    assert!(
+        nota::patch_view_block(&changed, DocClass::UserDoc, &view, &protected, &schema).is_err()
+    );
+
+    // Block sub-mappings preserve comments and block style while nested filters
+    // and semantic view validation reject invalid specs before commit.
+    let block_carrier = format!(
+        "> ```nota\n> id: {key}\n> type: table\n> source:\n>   # keep source comment\n>   scope: folder\n>   folder: /docs # inline comment\n> options:\n>   # keep options comment\n>   collapsed: false\n> ```\n"
+    );
+    let nested_filter = YamlValue::Mapping(BTreeMap::from([(
+        "all".into(),
+        YamlValue::Sequence(vec![YamlValue::Mapping(BTreeMap::from([(
+            "eq".into(),
+            YamlValue::Mapping(BTreeMap::from([
+                ("key".into(), YamlValue::String("status".into())),
+                ("value".into(), YamlValue::String("open".into())),
+            ])),
+        )]))]),
+    )]));
+    let block_edits = nota::ViewBlockPatch {
+        source: vec![FieldEdit::Set {
+            key: "recursive".into(),
+            value: YamlValue::Bool(false),
+        }],
+        common: vec![FieldEdit::Set {
+            key: "filter".into(),
+            value: nested_filter.clone(),
+        }],
+        options: vec![FieldEdit::Set {
+            key: "collapsed".into(),
+            value: YamlValue::Bool(true),
+        }],
+    };
+    let patched = patch::apply(
+        &block_carrier,
+        &nota::patch_view_block(
+            &block_carrier,
+            DocClass::UserDoc,
+            &view,
+            &block_edits,
+            &schema,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(patched.contains("# keep source comment"), "{patched}");
+    assert!(patched.contains("# inline comment"), "{patched}");
+    assert!(patched.contains("# keep options comment"), "{patched}");
+    assert!(
+        patched.contains(">   folder: /docs # inline comment\n"),
+        "{patched}"
+    );
+    assert!(patched.contains(">   collapsed: true\n"), "{patched}");
+    let reparsed = views(&patched, false);
+    let YamlValue::Mapping(reparsed_fields) = reparsed.blocks[0].config.as_ref().unwrap() else {
+        panic!("expected mapping")
+    };
+    assert_eq!(reparsed_fields["filter"], nested_filter);
+
+    // Invalid board without `group_by` and unknown `source` keys are rejected pre-commit.
+    let invalid_board = nota::ViewBlockPatch {
+        common: vec![FieldEdit::Set {
+            key: "type".into(),
+            value: YamlValue::String("board".into()),
+        }],
+        ..Default::default()
+    };
+    assert!(
+        nota::patch_view_block(&patched, DocClass::UserDoc, &view, &invalid_board, &schema)
+            .is_err()
+    );
+    let invalid_source = nota::ViewBlockPatch {
+        source: vec![FieldEdit::Set {
+            key: "tag".into(),
+            value: YamlValue::String("typo".into()),
+        }],
+        ..Default::default()
+    };
+    assert!(
+        nota::patch_view_block(&patched, DocClass::UserDoc, &view, &invalid_source, &schema)
+            .is_err()
+    );
+}
+#[test]
 fn links_tags_and_headings_share_byte_offsets_but_never_parse_code_or_escapes() {
     let note = NoteId::from_bytes([2; 16]);
     let source = format!(
@@ -526,6 +672,7 @@ fn selected_chunks_reach_embedding_and_recall_with_original_provenance() {
                         kind: SpaceKind::Personal,
                     },
                     class,
+                    project: None,
                     ancestor_folders: vec![],
                     folder_write_locked: false,
                     ability_package: None,

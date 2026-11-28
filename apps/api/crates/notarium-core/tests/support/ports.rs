@@ -21,8 +21,14 @@ macro_rules! reject {
 }
 impl NoteReadPort for RejectingPorts {
     reject! {
+    fn resolve_folder_path(&self, ctx: SpaceContext, base: Option<FolderId>, path: String) -> PortFuture<'_, Option<FolderSnapshot>>;
+    fn list_child_folders(&self, ctx: SpaceContext, base: Option<FolderId>, after: Option<FolderId>, at_seq: Option<SpaceSeq>, limit: PageLimit) -> PortFuture<'_, ChildFolders>;
+    fn resolve_note_target(&self, ctx: SpaceContext, parent: Option<FolderId>, slug_title_or_id: String) -> PortFuture<'_, Option<NoteRef>>;
+    fn space_schema(&self, ctx: SpaceContext) -> PortFuture<'_, std::collections::BTreeMap<String, FieldSchema>>;
+    fn project_note_counts(&self, ctx: SpaceContext, project: FolderRef, causal: CausalBasis) -> PortFuture<'_, ProjectNoteCounts>;
     fn read_ability_resource(&self, ctx: SpaceContext, request: ReadAbilityResource) -> PortFuture<'_, notarium_core::classes::ClassifiedAbilityResource>;
     fn get_note(&self, ctx: SpaceContext, request: GetNote) -> PortFuture<'_, NoteSnapshot>;
+    fn get_note_metadata(&self, ctx: SpaceContext, request: GetNote) -> PortFuture<'_, NoteMetadataSnapshot>;
     fn list_notes(
             &self,
             ctx: SpaceContext,
@@ -42,6 +48,7 @@ impl NoteReadPort for RejectingPorts {
 }
 impl NoteWritePort for RejectingPorts {
     reject! {
+    fn ensure_folder_path(&self, ctx: SpaceContext, request: Mutation<EnsureFolderPath>) -> PortFuture<'_, EnsuredFolder>;
     fn create_note(
             &self,
             ctx: SpaceContext,
@@ -56,6 +63,11 @@ impl NoteWritePort for RejectingPorts {
             &self,
             ctx: SpaceContext,
             request: Mutation<DeleteNote>,
+        ) -> PortFuture<'_, Committed<NoteRevision>>;
+    fn trash_ability_package(
+            &self,
+            ctx: SpaceContext,
+            request: Mutation<TrashAbilityPackage>,
         ) -> PortFuture<'_, Committed<NoteRevision>>;
     fn mint_and_purge(
             &self,
@@ -96,7 +108,7 @@ impl NoteWritePort for RejectingPorts {
             &self,
             ctx: SpaceContext,
             request: Mutation<AppendMemory>,
-        ) -> PortFuture<'_, Committed<NoteRevision>>;
+        ) -> PortFuture<'_, Committed<MemoryAppendResult>>;
     fn link(&self, ctx: SpaceContext, request: Mutation<Link>) -> PortFuture<'_, Committed<Link>>;
     fn link_many(&self, ctx: SpaceContext, request: LinkBatch)
         -> PortFuture<'_, BatchResult<Link>>;
@@ -105,10 +117,10 @@ impl NoteWritePort for RejectingPorts {
             ctx: SpaceContext,
             request: Mutation<PublishAbilityPackage>,
         ) -> PortFuture<'_, Committed<AbilityPackageRevision>>;
-    fn rollback_agent_run(
+    fn rollback_agent_run_by_id(
             &self,
             ctx: SpaceContext,
-            request: Mutation<RollbackAgentRun>,
+            request: Mutation<AgentRunId>,
         ) -> PortFuture<'_, Committed<RollbackResult>>;
     fn accept_external_observation(
             &self,
@@ -120,6 +132,15 @@ impl NoteWritePort for RejectingPorts {
 impl ChatPort for RejectingPorts {
     reject! {
     fn read_chat(&self, ctx: SpaceContext, request: ChatRead) -> PortFuture<'_, ChatBranch>;
+    fn read_chat_compaction_prefix(&self, ctx: SpaceContext, request: ChatRead) -> PortFuture<'_, ChatCompactionPrefix>;
+    fn read_chat_context(&self, ctx: SpaceContext, request: ChatRead) -> PortFuture<'_, ChatBranch>;
+    fn read_chat_contents(&self, ctx: SpaceContext, request: ChatContentRead) -> PortFuture<'_, Vec<HydratedChatEntry>>;
+    fn read_chat_proposal(&self, ctx: SpaceContext, request: ChatProposalRead) -> PortFuture<'_, CanonicalChatProposal>;
+    fn list_pending_chat_inputs(&self, ctx: SpaceContext, thread: ChatThreadId) -> PortFuture<'_, Vec<QueuedChatInput>>;
+    fn dismiss_chat_input(&self, ctx: SpaceContext, request: DismissPending) -> PortFuture<'_, bool>;
+    fn claim_active_run(&self, ctx: SpaceContext, request: ClaimChatRun) -> PortFuture<'_, ClaimChatRunOutcome>;
+    fn finish_run_if_queue_empty(&self, ctx: SpaceContext, request: ChatRunRequest) -> PortFuture<'_, FinishChatRunOutcome>;
+    fn recover_active_run(&self, ctx: SpaceContext, request: ChatRunRequest) -> PortFuture<'_, FinishChatRunOutcome>;
     fn create_chat(
             &self,
             ctx: SpaceContext,
@@ -135,6 +156,8 @@ impl ChatPort for RejectingPorts {
             ctx: SpaceContext,
             request: Mutation<AppendChat>,
         ) -> PortFuture<'_, Committed<ChatEntry>>;
+    fn submit_user_chat_input(&self, ctx: SpaceContext, request: SubmitUserChatInput) -> PortFuture<'_, SubmitUserChatOutcome>;
+    fn lookup_user_chat_input(&self, ctx: SpaceContext, request: &SubmitUserChatInput) -> PortFuture<'_, Option<SubmitUserChatOutcome>>;
     fn queue_chat_input(
             &self,
             ctx: SpaceContext,
@@ -168,10 +191,22 @@ impl ViewGraphPort for RejectingPorts {
         }
 }
 impl SearchPort for RejectingPorts {
-    reject! {
-    fn search(&self, ctx: SpaceContext, request: SearchQuery) -> PortFuture<'_, SearchResult>;
-    fn recall(&self, ctx: SpaceContext, request: RecallQuery) -> PortFuture<'_, SearchResult>;
-        }
+    fn search_for<'a>(
+        &'a self,
+        _: SpaceContext,
+        _: SearchQuery,
+        _: Option<&'a dyn SearchRecipient>,
+    ) -> PortFuture<'a, SearchResult> {
+        Box::pin(async { Err(DomainError::ResourceNotFound.into()) })
+    }
+    fn recall_for<'a>(
+        &'a self,
+        _: SpaceContext,
+        _: RecallQuery,
+        _: Option<&'a dyn SearchRecipient>,
+    ) -> PortFuture<'a, SearchResult> {
+        Box::pin(async { Err(DomainError::ResourceNotFound.into()) })
+    }
 }
 impl ContentJobPort for RejectingPorts {
     reject! {
@@ -196,6 +231,22 @@ impl ContentJobPort for RejectingPorts {
 impl ControlPort for RejectingPorts {
     reject! {
     fn resolve_auth(&self, ctx: PreAuthContext) -> PortFuture<'_, EngineAuthContext>;
+    fn revalidate_auth(&self, ctx: AccountContext) -> PortFuture<'_, EngineAuthContext>;
+    fn revalidate_chat_viewer(
+        &self,
+        ctx: AccountContext,
+    ) -> PortFuture<'_, (EngineAuthContext, Option<std::time::Instant>)>;
+    fn fence_canonical_effect(
+        &self,
+        authority: EngineAuthContext,
+        ctx: SpaceContext,
+        effect: CanonicalEffect,
+    ) -> PortFuture<'_, SpaceContext>;
+    fn revalidate_proposal_human(
+        &self,
+        ctx: AccountContext,
+        access: ProposalHumanAccess,
+    ) -> PortFuture<'_, EngineAuthContext>;
     fn whoami(&self, ctx: AccountContext) -> PortFuture<'_, PrincipalInfo>;
     fn list_spaces(&self, ctx: AccountContext, page: ControlPageRequest) -> PortFuture<'_, ControlPage<AccessibleSpace>>;
     fn list_projects(&self, ctx: AccountContext, page: ControlPageRequest) -> PortFuture<'_, ControlPage<ProjectInfo>>;
@@ -226,10 +277,15 @@ impl ControlPort for RejectingPorts {
             request: AccountMutation<StartEpisode>,
         ) -> PortFuture<'_, ControlCommit<EpisodeStartResult>>;
     fn get_episode(&self, ctx: AccountContext, episode: EpisodeId) -> PortFuture<'_, AgentEpisode>;
+    fn named_episode_project_hint(
+            &self,
+            ctx: AccountContext,
+            name: String,
+        ) -> PortFuture<'_, NamedEpisodePreview>;
     fn update_episode(
             &self,
             ctx: AccountContext,
-            request: AccountMutation<EpisodeUpdate>,
+            request: AccountMutation<EpisodeMutation>,
         ) -> PortFuture<'_, ControlCommit<AgentEpisode>>;
     fn touch_episode(&self, ctx: AccountContext, episode: EpisodeId) -> PortFuture<'_, ()>;
     fn acknowledge_delta(
@@ -248,7 +304,7 @@ impl ControlPort for RejectingPorts {
             &self,
             ctx: AccountContext,
             request: AbilityQuery,
-        ) -> PortFuture<'_, ControlPage<AbilityDescriptor>>;
+        ) -> PortFuture<'_, ControlPage<AbilityInspection>>;
     fn resolve_ability(
             &self,
             ctx: AccountContext,
@@ -260,21 +316,31 @@ impl ControlPort for RejectingPorts {
             reference: AbilityRef,
             project: Option<FolderRef>,
         ) -> PortFuture<'_, AbilityDescriptor>;
+    fn inspect_ability(
+            &self,
+            ctx: AccountContext,
+            identity: AbilityIdentity,
+        ) -> PortFuture<'_, AbilityInspection>;
+    fn follow_ability(
+            &self,
+            ctx: AccountContext,
+            reference: AbilityRef,
+        ) -> PortFuture<'_, AbilityRef>;
     fn update_ability_binding(
             &self,
             ctx: AccountContext,
             request: AccountMutation<AbilityBindingUpdate>,
-        ) -> PortFuture<'_, ControlCommit<AbilityDescriptor>>;
+        ) -> PortFuture<'_, ControlCommit<AbilityBindingResult>>;
     fn set_ability_preference(
             &self,
             ctx: AccountContext,
-            request: AccountMutation<AbilityPreferenceUpdate>,
+            request: AccountMutation<AbilityPreferenceChange>,
         ) -> PortFuture<'_, ControlCommit<AbilityPreferenceUpdate>>;
     fn set_ability_trail(
             &self,
             ctx: AccountContext,
-            request: AccountMutation<AbilityTrailUpdate>,
-        ) -> PortFuture<'_, ControlCommit<AbilityTrailUpdate>>;
+            request: AccountMutation<AbilityTrailMutation>,
+        ) -> PortFuture<'_, ControlCommit<AbilityTrailResult>>;
     fn lookup_mcp_dedup(
             &self,
             ctx: AccountContext,
@@ -284,18 +350,23 @@ impl ControlPort for RejectingPorts {
             &self,
             ctx: AccountContext,
             record: McpDedupRecord,
-        ) -> PortFuture<'_, ()>;
-    fn resolve_memory_target(
-            &self,
-            ctx: AccountContext,
-            target: MemoryTarget,
-            category: String,
-        ) -> PortFuture<'_, ResolvedMemoryTarget>;
+        ) -> PortFuture<'_, McpDedupHit>;
+    fn inspect_memory_target(
+        &self,
+        ctx: AccountContext,
+        target: MemoryTarget,
+        category: String,
+    ) -> PortFuture<'_, MemoryTargetSnapshot>;
     fn create_schedule(
         &self,
         ctx: AccountContext,
         request: AccountMutation<CreateSchedule>,
     ) -> PortFuture<'_, ControlCommit<AgentSchedule>>;
+    fn schedule_ability_candidate(
+        &self,
+        ctx: AccountContext,
+        selection: ScheduleAbilitySelection,
+    ) -> PortFuture<'_, ScheduleAbilityCandidate>;
     fn get_schedule(
         &self,
         ctx: SpaceContext,
@@ -322,6 +393,12 @@ impl ControlPort for RejectingPorts {
         now: Timestamp,
         page: ControlPageRequest,
     ) -> PortFuture<'_, ControlPage<AgentSchedule>>;
+    fn list_expired_schedule_runs(
+        &self,
+        ctx: MaintenanceContext,
+        now: Timestamp,
+        page: ControlPageRequest,
+    ) -> PortFuture<'_, ControlPage<ScheduleRunReceipt>>;
     fn get_schedule_run(
         &self,
         ctx: ScheduleRunContext,
@@ -344,11 +421,23 @@ impl ControlPort for RejectingPorts {
         ctx: MaintenanceContext,
         result: ScheduleResult,
     ) -> PortFuture<'_, ScheduleRunReceipt>;
+    fn ensure_run_inactive(
+        &self,
+        ctx: AccountContext,
+        space: SpaceId,
+        run: AgentRunId,
+    ) -> PortFuture<'_, ()>;
     fn select_provider(
             &self,
             ctx: SpaceContext,
             request: SelectProvider,
         ) -> PortFuture<'_, ProviderSelection>;
+    fn list_provider_project_targets(
+            &self,
+            ctx: SpaceContext,
+            resource: ProviderResourceId,
+            page: ControlPageRequest,
+        ) -> PortFuture<'_, ControlPage<FolderRef>>;
     fn update_provider_preference(
             &self,
             ctx: AccountContext,
@@ -442,6 +531,12 @@ impl SessionRevocationPort for RejectingPorts {
             selectors: Vec<RevocationSelector>,
             cancellation: Cancellation,
         ) -> PortFuture<'_, Box<dyn RevocationLease>>;
+    fn register_canonical_effect(
+            &self,
+            ctx: MaintenanceContext,
+            selectors: Vec<RevocationSelector>,
+            cancellation: Cancellation,
+        ) -> PortFuture<'_, std::sync::Arc<dyn CanonicalEffectRegistration>>;
     fn fence_provider(
             &self,
             ctx: MaintenanceContext,
@@ -478,14 +573,6 @@ impl BoardMutationFactsProvider for RejectingPorts {
         _cutoff: Option<SpaceSeq>,
         _intent: MoveBoardCard,
     ) -> PortFuture<'a, BoardMoveFacts> {
-        Box::pin(async { Err(DomainError::ResourceNotFound.into()) })
-    }
-    fn evaluate_rollback<'a>(
-        &'a self,
-        _authority: &'a BoardPlannerAuthority,
-        _ctx: SpaceContext,
-        _request: RollbackBoardFactsRequest,
-    ) -> PortFuture<'a, RollbackBoardFacts> {
         Box::pin(async { Err(DomainError::ResourceNotFound.into()) })
     }
 }

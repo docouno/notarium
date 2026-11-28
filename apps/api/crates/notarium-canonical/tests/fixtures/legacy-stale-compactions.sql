@@ -8,7 +8,10 @@ INSERT INTO spaces SELECT id,substr(manifest_checksum,1,16),'fld_000000000000000
     FROM fresh CROSS JOIN schema_meta;
 INSERT INTO change_commands SELECT space_id,history_incarnation,'redact-ancestor',6,6,
     'redact_chat_entry',NULL,0 FROM spaces WHERE slug IN ('stale-alone','stale-shared');
-INSERT INTO chat_threads SELECT space_id,history_incarnation,'thr_00000000000000000000000000000001','personal',owner_id,NULL,
+INSERT INTO chat_threads(space_id,history_incarnation,thread_id,kind,owner_id,project_folder_id,
+    title,head_leaf_seq,head_rev_id,next_entry_seq,active_run_id,ext_space_tainted_mask,
+    created_seq,updated_seq,created_at_sec,created_at_nsec,updated_at_sec,updated_at_nsec)
+SELECT space_id,history_incarnation,'thr_00000000000000000000000000000001','personal',owner_id,NULL,
     'test',4,'rev_00000000000000000000000000000004',5,NULL,0,1,6,0,0,0,0 FROM spaces WHERE slug IN ('stale-alone','stale-shared');
 WITH entries(n,parent,kind,stale) AS (VALUES (1,NULL,'redacted',0),(2,1,'compaction',1),(3,1,'compaction',1),(4,NULL,'compaction',0))
 INSERT INTO chat_entries(space_id,thread_id,entry_seq,parent_seq,revision_id,kind,author_id,inline_text,payload_blake3,

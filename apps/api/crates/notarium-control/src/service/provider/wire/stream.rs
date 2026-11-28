@@ -26,6 +26,7 @@ pub(in crate::service::provider) struct CompletionDecoder {
     tools: BTreeMap<usize, Tool>,
     tool_bytes: usize,
     reason: Option<CompletionFinish>,
+    refused: bool,
     usage: Option<ProviderUsage>,
     done: bool,
     failed: bool,
@@ -54,6 +55,7 @@ impl CompletionDecoder {
             tools: BTreeMap::new(),
             tool_bytes: 0,
             reason: None,
+            refused: false,
             usage: None,
             done: false,
             failed: false,
@@ -223,6 +225,9 @@ impl CompletionDecoder {
             let has_post_finish_payload = delta
                 .get("content")
                 .is_some_and(|v| !v.is_null() && v.as_str() != Some(""))
+                || delta
+                    .get("refusal")
+                    .is_some_and(|v| !v.is_null() && v.as_str() != Some(""))
                 || delta.get("tool_calls").is_some_and(|v| !v.is_null());
             if self.reason.is_some()
                 && (has_post_finish_payload
@@ -238,6 +243,13 @@ impl CompletionDecoder {
             if let Some(content) = delta.get("content").filter(|v| !v.is_null()) {
                 let text = content.as_str().ok_or_else(protocol)?;
                 if !text.is_empty() {
+                    events.push(CompletionEvent::Text(text.into()));
+                }
+            }
+            if let Some(refusal) = delta.get("refusal").filter(|v| !v.is_null()) {
+                let text = refusal.as_str().ok_or_else(protocol)?;
+                if !text.is_empty() {
+                    self.refused = true;
                     events.push(CompletionEvent::Text(text.into()));
                 }
             }
@@ -387,38 +399,60 @@ impl CompletionDecoder {
         Ok(())
     }
     fn finish(&mut self, events: &mut Vec<CompletionEvent>) -> Result<(), PortError> {
-        let reason = self.reason.ok_or_else(protocol)?;
-        if reason == CompletionFinish::ToolCalls && self.tools.is_empty()
-            || !self.tools.is_empty()
-                && !matches!(
-                    reason,
-                    CompletionFinish::ToolCalls | CompletionFinish::Length
-                )
-        {
-            return Err(protocol());
+        let mut reason = self.reason.ok_or_else(protocol)?;
+        if self.refused {
+            reason = match reason {
+                CompletionFinish::Stop | CompletionFinish::ContentFilter => {
+                    CompletionFinish::ContentFilter
+                }
+                CompletionFinish::Length => CompletionFinish::Length,
+                CompletionFinish::ToolCalls => return Err(protocol()),
+            };
         }
-        let mut ids = BTreeSet::new();
-        for (expected, (&index, tool)) in self.tools.iter().enumerate() {
-            if index != expected || !name(&tool.name) || !self.allowed_tools.contains(&tool.name) {
-                return Err(protocol());
+        match reason {
+            CompletionFinish::ToolCalls => {
+                if self.tools.is_empty() {
+                    return Err(protocol());
+                }
+                let mut ids = BTreeSet::new();
+                for (expected, (&index, tool)) in self.tools.iter().enumerate() {
+                    if index != expected
+                        || !name(&tool.name)
+                        || !self.allowed_tools.contains(&tool.name)
+                    {
+                        return Err(protocol());
+                    }
+                    let id = ProviderToolCallId::new(tool.id.clone()).map_err(|_| protocol())?;
+                    if !ids.insert(id.clone()) {
+                        return Err(protocol());
+                    }
+                    let arguments: Value =
+                        serde_json::from_str(&tool.arguments).map_err(|_| protocol())?;
+                    json_bound(&arguments, 0, &mut 0, &mut 0).map_err(|_| protocol())?;
+                    let arguments = arguments
+                        .as_object()
+                        .ok_or_else(protocol)?
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect();
+                    events.push(CompletionEvent::ToolCall(ProviderToolCall {
+                        id,
+                        name: tool.name.clone(),
+                        arguments,
+                    }));
+                }
             }
-            let id = ProviderToolCallId::new(tool.id.clone()).map_err(|_| protocol())?;
-            if !ids.insert(id.clone()) {
-                return Err(protocol());
+            CompletionFinish::Stop => {
+                if !self.tools.is_empty() {
+                    return Err(protocol());
+                }
             }
-            let arguments: Value = serde_json::from_str(&tool.arguments).map_err(|_| protocol())?;
-            json_bound(&arguments, 0, &mut 0, &mut 0).map_err(|_| protocol())?;
-            let arguments = arguments
-                .as_object()
-                .ok_or_else(protocol)?
-                .iter()
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect();
-            events.push(CompletionEvent::ToolCall(ProviderToolCall {
-                id,
-                name: tool.name.clone(),
-                arguments,
-            }));
+            CompletionFinish::Length | CompletionFinish::ContentFilter => {
+                // Truncated or filtered completions may cut off mid-tool-call
+                // (including partial JSON arguments). Drop incomplete tool
+                // calls so emitted text and the interruption reason are preserved.
+                self.tools.clear();
+            }
         }
         events.push(CompletionEvent::Usage(self.usage()));
         events.push(CompletionEvent::Finished(reason));

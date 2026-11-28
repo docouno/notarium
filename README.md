@@ -10,8 +10,9 @@ structural projections. The engine ports support declarative Markdown views,
 board reads and knowledge graphs. Control services cover transport-independent
 authentication, Space access, OAuth issuance, OIDC identity, provider services,
 account context, schedule claims, content-free telemetry and backup snapshots.
-The hybrid search library provides search and recall. Transport-independent Yrs rooms support live Markdown editing. Agents and
-the product UI arrive in subsequent waves.
+The hybrid search library provides search and recall. Transport-independent Yrs rooms support live Markdown editing. The agent library shares one MCP tool registry across external clients,
+supervised chat runs and scheduled Keepers. The runnable API and greeting
+screen still serve development examples.
 
 ## Start developing
 
@@ -74,7 +75,8 @@ See [development commands and ownership](docs/development.md) for details.
 The implemented library boundaries are documented in [core contracts](docs/core-contracts.md),
 [document syntax](docs/syntax.md), [canonical storage](docs/storage.md) and
 [live collaboration](docs/collab.md).
-See [control storage](docs/control.md) for the control-plane primitives.
+See [control storage](docs/control.md) for the control-plane primitives and
+[MCP tools, chat runs and Keepers](docs/agents.md) for the agent services.
 See [hybrid search](docs/search.md) for search and recall, model setup, and the
 offline scale gate.
 The [projections guide](docs/projections.md) covers note views, graph queries

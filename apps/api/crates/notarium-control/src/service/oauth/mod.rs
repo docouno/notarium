@@ -63,7 +63,12 @@ impl OAuthService {
                 token_endpoint: config.token_endpoint,
                 registration_endpoint: config.registration_endpoint,
                 revocation_endpoint: config.revocation_endpoint,
-                scopes_supported: vec!["read".into(), "write".into(), "offline_access".into()],
+                scopes_supported: vec![
+                    "read".into(),
+                    "write".into(),
+                    "offline_access".into(),
+                    "mcp:ability-write".into(),
+                ],
                 code_challenge_methods_supported: vec!["S256".into()],
                 token_endpoint_auth_methods_supported: vec!["none".into()],
                 grant_types_supported: vec!["authorization_code".into(), "refresh_token".into()],

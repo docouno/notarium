@@ -38,8 +38,9 @@ async fn legacy_index_bootstrap_spills_with_a_bounded_sqlite_heap() {
     let path = root.join("canonical.sqlite");
     let db = rusqlite::Connection::open(&path).unwrap();
     db.execute_batch(SQLITE_BASELINE_DDL).unwrap();
-    db.execute_batch(include_str!(
-        "../../../tests/fixtures/schema-v6-remove-projection.sql"
+    db.execute_batch(concat!(
+        include_str!("../../../tests/fixtures/schema-v6-remove-projection.sql"),
+        include_str!("../../../tests/fixtures/schema-v8-remove-agents.sql")
     ))
     .unwrap();
     db.execute(

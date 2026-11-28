@@ -2,6 +2,7 @@ use super::{
     ControlService,
     authority::*,
     commands::{Command, SavedResult},
+    provisioning::save_space_receipt,
     spaces::{admission, expect_space, require_owner},
 };
 use crate::{
@@ -51,6 +52,7 @@ impl ControlService {
             return Err(access_denied());
         }
         ctx.auth().authorize_human_management()?;
+        require_unpinned_project(ctx.auth())?;
         let digest = ContentDigest::from_bytes(
             *blake3::hash(
                 &serde_json::to_vec(&(ctx.scope(), request.lifecycle))
@@ -108,10 +110,10 @@ impl ControlService {
             return Err(access_denied());
         }
         let mut tx = self.store.write(budget.clone()).await?;
-        let (revision,saved)=budget.run(async {
+        let (revision,saved,enqueued)=budget.run(async {
             let actor=user(tx.inner_mut(),ctx.auth().principal().as_str()).await?;
             self.live_human(tx.inner_mut(),ctx.auth(),&actor).await?;
-            if let Some(replay)=command.replay::<ResultOperation>(tx.inner_mut()).await? {return Ok(replay);}
+            if let Some((revision,saved))=command.replay::<ResultOperation>(tx.inner_mut()).await? {return Ok((revision,saved,Vec::new()));}
             let current=admission(tx.inner_mut(),&ctx.scope().space_id,true).await?;
             expect_space(&current,request.expected)?;
             require_owner(tx.inner_mut(),ctx.auth(),&ctx.scope().space_id).await?;
@@ -127,11 +129,12 @@ impl ControlService {
             let row=TargetRecord::from(ControlOperationsRow{operation_id:id.to_string(),command_key:id.to_string(),kind:"lifecycle".into(),target_space:ctx.scope().space_id.to_string(),state:"pending".into(),payload_hash:blake3::hash(payload.as_bytes()).as_bytes().to_vec(),payload,canonical_receipt:None,next_action:"revoke-then-canonical".into(),updated_at:now});
             row.validate()?;row.insert(tx.inner_mut()).await?;
             let revision=ControlRevision::new(revision as u64)?;
+            let enqueued = vec![event.clone()];
             let saved=SavedResult{value:ResultOperation{operation:id},events:vec![event]};
             command.save(tx.inner_mut(),revision,&saved,now).await?;
-            Ok((revision,saved))
+            Ok((revision,saved,enqueued))
         },CommitEffect::NotCommitted).await?;
-        self.commit_revocations(tx, &budget, &saved.events).await?;
+        self.commit_revocations(tx, &budget, &enqueued).await?;
         let current = self
             .finish_lifecycle(&budget, &saved.value.operation)
             .await?;
@@ -139,8 +142,10 @@ impl ControlService {
             revision,
             value: AccessibleSpace {
                 space: current.space,
+                slug: current.slug,
                 role: SpaceRole::Owner,
                 history: current.history,
+                last_seq: current.last_seq,
             },
         })
     }
@@ -171,15 +176,14 @@ impl ControlService {
             let pending:PendingLifecycle=serde_json::from_str(&row.payload).map_err(|_|invalid(ValidationReason::InvalidState))?;
             if pending.version!=1 || pending.scope.space_id.as_str()!=row.target_space || pending.lifecycle==SpaceLifecycle::Closing {return Err(invalid(ValidationReason::InvalidState));}
             if row.state=="committed" {
-                let (space,history,last_seq)=serde_json::from_str(row.canonical_receipt.as_deref().ok_or_else(||invalid(ValidationReason::InvalidState))?).map_err(|_|invalid(ValidationReason::InvalidState))?;
-                return Ok(CatalogSpace{space,history,last_seq});
+                return self.load_space_receipt(budget, id, &pending.scope.space_id, row.canonical_receipt.as_deref()).await;
             }
             self.flush_event(budget,&pending.event).await?;
             let identity=AccountCommandIdentity{owner:pending.owner.clone(),actor:pending.owner,key:pending.key,hash:pending.hash,expected:pending.expected};
             let result=budget.run(self.catalog.change_lifecycle(budget.context(id.clone()),identity,pending.scope.clone(),pending.lifecycle),CommitEffect::Unknown).await?;
             result.history.check(&pending.scope)?;
             if result.space.id!=pending.scope.space_id || result.space.lifecycle!=pending.lifecycle {return Err(invalid(ValidationReason::InvalidState));}
-            let receipt=serde_json::to_string(&(result.space.clone(),result.history.clone(),result.last_seq)).map_err(|_|invalid(ValidationReason::InvalidState))?;
+            let receipt=save_space_receipt(&result)?;
             let mut tx=self.store.write(budget.clone()).await?;
             budget.run(async {
                 let current=rows!(tx.inner_mut(),ControlOperationsRow,fetch_one,"SELECT * FROM control_operations WHERE operation_id=$1","SELECT * FROM v1_control.control_operations WHERE operation_id=$1 FOR UPDATE";id.as_str())?;
@@ -192,7 +196,7 @@ impl ControlService {
                 execute!(tx.inner_mut(),"UPDATE control_operations SET state='committed',canonical_receipt=$1,next_action='done',updated_at=$2 WHERE operation_id=$3","UPDATE v1_control.control_operations SET state='committed',canonical_receipt=$1,next_action='done',updated_at=$2 WHERE operation_id=$3";&receipt,self.clock.now_ms()?,id.as_str())?;
                 Ok(())
             },CommitEffect::Unknown).await?;
-            budget.run(tx.commit(),CommitEffect::Unknown).await?;
+            budget.commit_tx(tx).await?;
             Ok(result)
         }.await;
         work.map_err(|_: PortError| {

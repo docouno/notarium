@@ -1,6 +1,8 @@
 //! Atomic schedule claims and short-lived, independently revalidated run grants.
+mod approvals;
+mod calendar;
 mod mutations;
-mod queries;
+pub(crate) mod queries;
 mod runs;
 use super::{
     ControlService,
@@ -17,6 +19,10 @@ use crate::{
         target::*,
     },
 };
+use approvals::{ScheduleScope, package_ids, system_package_ids};
+use calendar::Calendar;
+pub use calendar::compute_next_slot;
+pub(crate) use calendar::validate_stored_calendar;
 use notarium_core::{
     DomainError,
     auth::*,
@@ -30,7 +36,6 @@ use notarium_core::{
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    str::FromStr,
     time::Duration,
 };
 
@@ -56,8 +61,9 @@ fn floor_ms(value: Timestamp) -> Result<i64, PortError> {
 use crate::store::values::schedule_timestamp as timestamp;
 fn validate(
     def: &ScheduleDefinition,
-    next_slot: Timestamp,
+    next_slot: Option<Timestamp>,
     ceiling: RunLimits,
+    allow_legacy_fold: bool,
 ) -> Result<(), PortError> {
     if def.title.is_empty()
         || def.title.len() > 512
@@ -76,24 +82,9 @@ fn validate(
     {
         return Err(invalid(ValidationReason::InvalidQuery));
     }
-    let cron =
-        cron::Schedule::from_str(&def.cron).map_err(|_| invalid(ValidationReason::InvalidQuery))?;
-    let zone = chrono_tz::Tz::from_str(&def.timezone)
-        .map_err(|_| invalid(ValidationReason::InvalidQuery))?;
-    let slot = ms(next_slot)?;
-    let date = chrono::DateTime::from_timestamp_millis(slot)
-        .ok_or_else(|| invalid(ValidationReason::InvalidTimestamp))?;
-    let zoned = date.with_timezone(&zone);
-    if slot % 1000 != 0 || !cron.includes(zoned) {
-        return Err(invalid(ValidationReason::InvalidTimestamp));
-    }
-    let mut previous = slot;
-    for following in cron.after(&zoned).take(2) {
-        let next_ms = following.timestamp_millis();
-        if next_ms.saturating_sub(previous) < 60_000 {
-            return Err(invalid(ValidationReason::InvalidQuery));
-        }
-        previous = next_ms;
+    let calendar = Calendar::parse(&def.cron, &def.timezone)?;
+    if let Some(slot) = next_slot {
+        calendar.validate_slot(ms(slot)?, allow_legacy_fold, true)?;
     }
     Ok(())
 }
@@ -121,6 +112,7 @@ fn schedule_info(row: &AgentSchedulesRow) -> Result<AgentSchedule, PortError> {
             approved_role: parse(&row.approved_role)?,
             limits: parse(&row.budgets)?,
         },
+        approved_skills: parse(&row.approved_skills)?,
         paused_reason: row
             .paused_reason
             .as_ref()
@@ -128,7 +120,7 @@ fn schedule_info(row: &AgentSchedulesRow) -> Result<AgentSchedule, PortError> {
             .transpose()?,
         revision: ControlRevision::new(row.revision as u64)?,
         config_revision: ControlRevision::new(row.config_revision as u64)?,
-        next_slot: timestamp(row.next_slot_utc_ms)?,
+        next_slot: row.next_slot_utc_ms.map(timestamp).transpose()?,
     })
 }
 fn receipt(row: &AgentScheduleRunsRow) -> Result<ScheduleRunReceipt, PortError> {
@@ -137,7 +129,12 @@ fn receipt(row: &AgentScheduleRunsRow) -> Result<ScheduleRunReceipt, PortError> 
         run: AgentRunId::parse(&row.run_id)?,
         lease: LeaseEpoch::new(row.lease_epoch as u64)?,
         slot: timestamp(row.slot_utc_ms)?,
-        reserved_next_slot: timestamp(row.reserved_next_slot)?,
+        reserved_next_slot: row.reserved_next_slot.map(timestamp).transpose()?,
+        keeper_log: row
+            .keeper_log_id
+            .as_deref()
+            .map(ChatThreadId::parse)
+            .transpose()?,
         claimed_revision: ControlRevision::new(row.claimed_schedule_revision as u64)?,
         status: match row.status.as_str() {
             "claimed" => ScheduleRunStatus::Claimed,
@@ -145,6 +142,48 @@ fn receipt(row: &AgentScheduleRunsRow) -> Result<ScheduleRunReceipt, PortError> 
             other => ScheduleRunStatus::Terminal(parse(&json(&other)?)?),
         },
     })
+}
+fn scoped_receipt(
+    row: &AgentScheduleRunsRow,
+    auth: &EngineAuthContext,
+    space: &SpaceId,
+) -> Result<ScheduleRunReceipt, PortError> {
+    let mut value = receipt(row)?;
+    if auth
+        .spaces()
+        .get(space)
+        .and_then(|grant| grant.project_root.as_ref())
+        .is_some_and(|project| row.keeper_project_folder_id.as_deref() != Some(project.as_str()))
+    {
+        value.keeper_log = None;
+    }
+    Ok(value)
+}
+
+fn schedule_log_id(
+    schedule: &ScheduleId,
+    owner: &str,
+    space: &SpaceId,
+    project: Option<&FolderId>,
+) -> ChatThreadId {
+    let mut hash = blake3::Hasher::new_derive_key("notarium-v1-keeper-log-scope");
+    hash.update(schedule.as_str().as_bytes());
+    hash.update(&[0]);
+    hash.update(owner.as_bytes());
+    hash.update(&[0]);
+    hash.update(space.as_str().as_bytes());
+    match project {
+        Some(folder) => {
+            hash.update(&[1]);
+            hash.update(folder.as_str().as_bytes());
+        }
+        None => {
+            hash.update(&[0]);
+        }
+    }
+    let mut identifier = [0; 16];
+    identifier.copy_from_slice(&hash.finalize().as_bytes()[..16]);
+    ChatThreadId::from_bytes(identifier)
 }
 async fn schedule(
     tx: &mut Transaction,
@@ -178,6 +217,14 @@ pub(super) struct PrecheckedKeeper {
     pub(super) space: SpaceId,
     pub(super) history: HistoryScope,
     pub(super) project: Option<FolderId>,
+    config_revision: i64,
+    budget: CallBudget,
+    descriptors: Vec<AbilityDescriptor>,
+}
+impl PrecheckedKeeper {
+    pub(super) fn approved(&self) -> impl Iterator<Item = &AbilityRef> {
+        self.descriptors.iter().map(|item| &item.reference)
+    }
 }
 impl ControlService {
     pub(super) async fn precheck_keeper_catalog(
@@ -186,37 +233,77 @@ impl ControlService {
         budget: &OperationBudget,
         request: &RequestId,
     ) -> Result<Option<PrecheckedKeeper>, PortError> {
-        if !matches!(
-            auth.credential(),
-            Some(AuthenticatedCredential::ScheduledRun { .. })
-        ) {
+        let Some(AuthenticatedCredential::ScheduledRun {
+            schedule,
+            run,
+            lease,
+        }) = auth.credential()
+        else {
             return Ok(None);
-        }
+        };
         if auth.spaces().len() != 1 {
             return Err(denied());
         }
         let (space, grant) = auth.spaces().iter().next().ok_or_else(denied)?;
-        let ctx = AccountContext::new(auth.clone(), budget.context(request.clone()));
-        let facts = budget
-            .run(self.catalog_space(&ctx, space), CommitEffect::NotCommitted)
-            .await?;
-        if let Some(folder_id) = &grant.project_root {
-            let folder = FolderRef {
-                space_id: space.clone(),
-                folder_id: folder_id.clone(),
-            };
-            budget
-                .run(
-                    self.catalog_project(&ctx, &folder),
-                    CommitEffect::NotCommitted,
-                )
-                .await?;
+        let expected_log = schedule_log_id(
+            schedule,
+            auth.principal().as_str(),
+            space,
+            grant.project_root.as_ref(),
+        );
+        if auth.keeper_log() != Some(&expected_log) {
+            return Err(denied());
         }
-        Ok(Some(PrecheckedKeeper {
-            space: space.clone(),
-            history: facts.history,
-            project: grant.project_root.clone(),
-        }))
+        let observed = self.observe_schedule(budget, schedule).await?;
+        let info = schedule_info(&observed)?;
+        let scope = ScheduleScope::from(&info.definition);
+        if scope.space != space
+            || scope.project.map(|p| &p.folder_id) != grant.project_root.as_ref()
+        {
+            return Err(denied());
+        }
+        budget
+            .run(
+                async {
+                    let row = read_rows!(&self.store.backend,AgentScheduleRunsRow,fetch_optional,
+                "SELECT * FROM agent_schedule_runs WHERE run_id=$1 AND schedule_id=$2",
+                "SELECT * FROM v1_control.agent_schedule_runs WHERE run_id=$1 AND schedule_id=$2";
+                run.as_str(),schedule.as_str())?
+                    .ok_or_else(denied)?;
+                    if row.config_revision != observed.config_revision
+                        || row.lease_epoch as u64 != lease.get()
+                        || row.keeper_log_id.as_deref() != Some(expected_log.as_str())
+                        || row.expires_at <= self.clock.now_ms()?
+                        || !matches!(row.status.as_str(), "claimed" | "running")
+                    {
+                        return Err(denied());
+                    }
+                    let skills: Vec<AbilityRef> = parse(&row.approved_skills)?;
+                    if skills != info.approved_skills {
+                        return Err(denied());
+                    }
+                    let ctx = AccountContext::new(auth.clone(), budget.context(request.clone()));
+                    let history = self.schedule_history(&ctx, scope).await?;
+                    let descriptors = self
+                        .probe_schedule_approval(
+                            &ctx,
+                            scope,
+                            &info.definition.approved_role,
+                            &skills,
+                        )
+                        .await?;
+                    Ok(Some(PrecheckedKeeper {
+                        space: space.clone(),
+                        history,
+                        project: grant.project_root.clone(),
+                        config_revision: observed.config_revision,
+                        budget: ctx.budget,
+                        descriptors,
+                    }))
+                },
+                CommitEffect::NotCommitted,
+            )
+            .await
     }
     async fn observe_schedule(
         &self,
@@ -266,6 +353,10 @@ impl ControlService {
         } else {
             SpaceRole::Editor
         };
+        let mut read_classes = DocClass::all();
+        if owner.personal_space_id.as_deref() != Some(space.as_str()) {
+            read_classes.remove(&DocClass::Profile);
+        }
         let auth = EngineAuthContext::for_human(
             VerifiedHuman::attest(
                 PrincipalId::parse(&owner.user_id)?,
@@ -274,7 +365,7 @@ impl ControlService {
                     space.clone(),
                     SpaceGrant {
                         role,
-                        read_classes: DocClass::all(),
+                        read_classes,
                         write_classes: BTreeSet::from([DocClass::AgentMemory]),
                         project_root: None,
                     },
@@ -282,7 +373,8 @@ impl ControlService {
                 false,
             )
             .with_credential(credential),
-        );
+        )
+        .mark_spaces_narrowed();
         Ok(Some((auth, admission)))
     }
     pub(super) async fn scheduled_context(
@@ -344,113 +436,43 @@ impl ControlService {
             return Err(denied());
         }
         let info = schedule_info(&current)?;
-        let project_folder = info
-            .definition
-            .project
-            .as_ref()
-            .map(|p| p.folder_id.clone());
-        let auth = source.for_keeper(
-            run.clone(),
-            space.clone(),
-            project_folder.clone(),
-            BTreeSet::from([info.definition.approved_role.id]),
-        )?;
+        let scope = ScheduleScope::from(&info.definition);
+        let project_folder = scope.project.map(|project| project.folder_id.clone());
+        let log = schedule_log_id(id, &current.owner_id, &space, project_folder.as_ref());
+        if running.keeper_log_id.as_deref() != Some(log.as_str())
+            || running.keeper_project_folder_id.as_deref()
+                != project_folder.as_ref().map(FolderId::as_str)
+        {
+            return Err(denied());
+        }
+        let skills: Vec<AbilityRef> = parse(&running.approved_skills)?;
+        if skills != info.approved_skills {
+            return Err(denied());
+        }
+        let auth = scope
+            .keeper(
+                &source,
+                run.clone(),
+                package_ids(&info.definition.approved_role, &skills),
+                system_package_ids(&info.definition.approved_role, &skills),
+            )?
+            .with_verified_keeper_log(log)?;
         let history: HistoryScope = parse(&running.history_scope)?;
         let prechecked = keeper.ok_or_else(denied)?;
-        if prechecked.space != space || prechecked.project != project_folder {
+        if prechecked.space != space
+            || prechecked.project != project_folder
+            || prechecked.config_revision != running.config_revision
+        {
             return Err(denied());
         }
         prechecked.history.check(&history)?;
-        Ok(auth)
-    }
-    async fn precheck_schedule_definition(
-        &self,
-        ctx: &AccountContext,
-        budget: &OperationBudget,
-        definition: &ScheduleDefinition,
-    ) -> Result<(AccountContext, AbilityDescriptor), PortError> {
-        let (rtx, auth) = self
-            .open_revalidated_read(budget, &ctx.budget.request, ctx.auth())
-            .await?;
-        budget.run(rtx.finish(), CommitEffect::NotCommitted).await?;
-        let grant = auth
-            .spaces()
-            .get(&definition.space)
-            .ok_or(DomainError::ResourceNotFound)?;
-        if grant.role == SpaceRole::Viewer
-            || !grant.write_classes.contains(&DocClass::AgentMemory)
-            || auth.taint().is_tainted()
-        {
-            return Err(access_denied());
-        }
-        let keeper = auth.for_keeper(
-            AgentRunId::from_bytes([0; 16]),
-            definition.space.clone(),
-            definition.project.as_ref().map(|p| p.folder_id.clone()),
-            BTreeSet::from([definition.approved_role.id.clone()]),
-        )?;
-        let limited = AccountContext::new(keeper, budget.context(ctx.budget.request.clone()));
-        budget
-            .run(
-                async {
-                    self.catalog_space(&limited, &definition.space).await?;
-                    if let Some(project) = &definition.project {
-                        self.catalog_project(&limited, project).await?;
-                    }
-                    let raw = match self
-                        .raw_ability(&limited, definition.approved_role.identity())
-                        .await
-                    {
-                        Ok(raw)
-                            if raw.reference == definition.approved_role
-                                && raw.kind == notarium_core::classes::AbilityKind::Role
-                                && raw.healthy =>
-                        {
-                            raw
-                        }
-                        Ok(_) => return Err(invalid(ValidationReason::InvalidState)),
-                        Err(error) if hidden(&error) => {
-                            return Err(invalid(ValidationReason::InvalidState));
-                        }
-                        Err(error) => return Err(error),
-                    };
-                    Ok((limited, raw))
-                },
-                CommitEffect::NotCommitted,
-            )
-            .await
-    }
-    async fn verify_schedule_definition_db(
-        &self,
-        tx: &mut Transaction,
-        ctx: &AccountContext,
-        definition: &ScheduleDefinition,
-        raw: AbilityDescriptor,
-    ) -> Result<(), PortError> {
-        let grant = ctx
-            .auth()
-            .spaces()
-            .get(&definition.space)
-            .ok_or(DomainError::ResourceNotFound)?;
-        if grant.role == SpaceRole::Viewer
-            || !grant.write_classes.contains(&DocClass::AgentMemory)
-            || ctx.auth().taint().is_tainted()
-        {
-            return Err(access_denied());
-        }
-        let keeper = ctx.auth().for_keeper(
-            AgentRunId::from_bytes([0; 16]),
-            definition.space.clone(),
-            definition.project.as_ref().map(|p| p.folder_id.clone()),
-            BTreeSet::from([definition.approved_role.id.clone()]),
-        )?;
-        let limited = AccountContext::new(keeper, ctx.budget.clone());
+        let ctx = AccountContext::new(auth.clone(), prechecked.budget.clone());
         if !self
-            .current_role_db_only(tx, &limited, raw, definition.project.as_ref())
+            .verify_schedule_approval_db(tx, &ctx, scope, &prechecked.descriptors)
             .await?
         {
-            return Err(invalid(ValidationReason::InvalidState));
+            return Err(denied());
         }
-        Ok(())
+        Ok(auth)
     }
 }

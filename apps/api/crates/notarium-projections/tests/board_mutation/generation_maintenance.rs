@@ -243,7 +243,6 @@ async fn sqlite_recovers_an_older_generation_and_keeps_held_files() {
 #[tokio::test]
 async fn postgres_recovers_only_after_the_old_worker_releases_its_admission() {
     let fixture = PgFixture::required();
-    let blobs = Scratch::new();
     let cache = Scratch::new();
     let other_cache = Scratch::new();
     let id = hex::encode(&random_bytes()[..6]);
@@ -252,9 +251,7 @@ async fn postgres_recovers_only_after_the_old_worker_releases_its_admission() {
     let config = CanonicalConfig {
         installation_id: InstallationId::from_bytes(random_bytes()),
         sql: SqlBackendConfig::postgres_default(fixture.canonical(), &canonical_schema),
-        blobs: BlobBackendConfig::Local {
-            data_root: blobs.root(),
-        },
+        blobs: fixture.s3_blobs(&canonical_schema).await,
         writer: WriterConfig::default(),
         snapshot_retention: Duration::from_secs(60),
         default_backup_budget: default_postgres_backup_budget(),
@@ -389,7 +386,6 @@ async fn postgres_recovers_only_after_the_old_worker_releases_its_admission() {
 #[tokio::test]
 async fn postgres_recovers_obsolete_format_and_resets_obsolete_candidate() {
     let fixture = PgFixture::required();
-    let blobs = Scratch::new();
     let cache = Scratch::new();
     let id = hex::encode(&random_bytes()[..6]);
     let canonical_schema = format!("test_pg_recovery_{id}");
@@ -397,9 +393,7 @@ async fn postgres_recovers_obsolete_format_and_resets_obsolete_candidate() {
     let config = CanonicalConfig {
         installation_id: InstallationId::from_bytes(random_bytes()),
         sql: SqlBackendConfig::postgres_default(fixture.canonical(), &canonical_schema),
-        blobs: BlobBackendConfig::Local {
-            data_root: blobs.root(),
-        },
+        blobs: fixture.s3_blobs(&canonical_schema).await,
         writer: WriterConfig::default(),
         snapshot_retention: Duration::from_secs(60),
         default_backup_budget: default_postgres_backup_budget(),

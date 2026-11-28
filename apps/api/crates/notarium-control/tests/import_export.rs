@@ -419,6 +419,7 @@ async fn verify(store: ControlStore, mut observer: Observer) {
         .await;
 
     let grant = TargetRecord::OauthGrants {
+        ability_write: 0,
         grant_id: OAuthGrantId::from_bytes([1; 16]).to_string(),
         user_id: PrincipalId::from_bytes([1; 16]).to_string(),
         client_id: "client".into(),

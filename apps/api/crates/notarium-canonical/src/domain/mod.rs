@@ -4,27 +4,30 @@ use notarium_core::{
     DomainError,
     classes::ClassifiedAbilityResource,
     error::{PortError, ValidationReason},
-    ids::{FolderId, NoteId},
+    ids::{AgentRunId, FolderId, NoteId, SpaceSeq},
     model::{FolderRef, NoteRef, SnapshotCut},
     ports::{
         AbilityPackageRevision, AcceptBatch, AppendMemory, BatchResult, BoardMoveResult,
-        BoardMutationFactsProvider, BoardPlannerAuthority, ChangeRead, ChangeReadResult, Committed,
-        CreateNote, DeleteDisposition, DeleteNote, EditNote, ExternalObservation,
-        ExternalObservationResult, GetNote, Link, LinkBatch, LiveCollabInterceptor, MintAndPurge,
+        BoardMutationFactsProvider, BoardPlannerAuthority, ChangeRead, ChangeReadResult,
+        ChildFolders, Committed, CreateNote, DeleteDisposition, DeleteNote, EditNote,
+        EnsureFolderPath, ExternalObservation, ExternalObservationResult, FolderSnapshot, GetNote,
+        Link, LinkBatch, LiveCollabInterceptor, MemoryAppendResult, MintAndPurge,
         MintAndPurgeResult, MoveBoardCard, MoveFolder, MoveNote, Mutation, NoteCard, NoteRevision,
-        NoteSnapshot, NoteWritePort, PortFuture, PublishAbilityPackage, ReadAbilityResource,
-        RenameFolder, RenameNote, RenameProject, RollbackAgentRun, RollbackResult, SpaceContext,
+        NoteSnapshot, NoteWritePort, PageLimit, PortFuture, PublishAbilityPackage,
+        ReadAbilityResource, RenameFolder, RenameNote, RenameProject, RollbackResult, SpaceContext,
+        TrashAbilityPackage,
     },
 };
 
-use crate::{
-    CanonicalStore, changes::ChangeCaller, codec::internal_not_committed, sql_exec::BackendConn,
-};
+use crate::{CanonicalStore, changes::ChangeCaller};
 
 pub mod board;
 pub(crate) mod change_visibility;
 pub mod common;
+pub(crate) mod folder_cover;
+mod folder_paths;
 pub mod folders;
+mod memory;
 pub mod notes;
 pub mod packages;
 pub mod purge;
@@ -36,6 +39,14 @@ pub use notes::RoomCommandSettlement;
 pub(crate) type BoardProviderBinding = (BoardPlannerAuthority, Arc<dyn BoardMutationFactsProvider>);
 
 impl NoteWritePort for CanonicalStore {
+    fn ensure_folder_path(
+        &self,
+        ctx: SpaceContext,
+        request: Mutation<EnsureFolderPath>,
+    ) -> PortFuture<'_, notarium_core::ports::EnsuredFolder> {
+        Box::pin(folder_paths::ensure(self, ctx, request))
+    }
+
     fn create_note(
         &self,
         ctx: SpaceContext,
@@ -68,6 +79,14 @@ impl NoteWritePort for CanonicalStore {
                 DeleteDisposition::Purge => purge::purge_note_impl(&store, ctx, request).await,
             }
         })
+    }
+
+    fn trash_ability_package(
+        &self,
+        ctx: SpaceContext,
+        request: Mutation<TrashAbilityPackage>,
+    ) -> PortFuture<'_, Committed<NoteRevision>> {
+        Box::pin(notes::trash_ability_package_impl(self, ctx, request))
     }
 
     fn mint_and_purge(
@@ -137,9 +156,9 @@ impl NoteWritePort for CanonicalStore {
         &self,
         ctx: SpaceContext,
         request: Mutation<AppendMemory>,
-    ) -> PortFuture<'_, Committed<NoteRevision>> {
+    ) -> PortFuture<'_, Committed<MemoryAppendResult>> {
         let store = self.clone();
-        Box::pin(async move { notes::append_memory_impl(&store, ctx, request).await })
+        Box::pin(async move { memory::append(&store, ctx, request).await })
     }
 
     fn link(&self, ctx: SpaceContext, request: Mutation<Link>) -> PortFuture<'_, Committed<Link>> {
@@ -165,13 +184,13 @@ impl NoteWritePort for CanonicalStore {
         Box::pin(async move { packages::publish_ability_package_impl(&store, ctx, request).await })
     }
 
-    fn rollback_agent_run(
+    fn rollback_agent_run_by_id(
         &self,
         ctx: SpaceContext,
-        request: Mutation<RollbackAgentRun>,
+        request: Mutation<AgentRunId>,
     ) -> PortFuture<'_, Committed<RollbackResult>> {
         let store = self.clone();
-        Box::pin(async move { rollback::rollback_agent_run_impl(&store, ctx, request).await })
+        Box::pin(async move { rollback::rollback_agent_run_by_id(&store, ctx, request).await })
     }
 
     fn accept_external_observation(
@@ -185,6 +204,51 @@ impl NoteWritePort for CanonicalStore {
 }
 
 impl CanonicalStore {
+    pub async fn resolve_folder_path(
+        &self,
+        ctx: SpaceContext,
+        base: Option<FolderId>,
+        path: String,
+    ) -> Result<Option<FolderSnapshot>, PortError> {
+        folder_paths::resolve(self, ctx, base, path).await
+    }
+
+    pub async fn list_child_folders(
+        &self,
+        ctx: SpaceContext,
+        base: Option<FolderId>,
+        after: Option<FolderId>,
+        at_seq: Option<SpaceSeq>,
+        limit: PageLimit,
+    ) -> Result<ChildFolders, PortError> {
+        folder_paths::list_children(self, ctx, base, after, at_seq, limit).await
+    }
+
+    pub async fn resolve_note_target(
+        &self,
+        ctx: SpaceContext,
+        parent: Option<FolderId>,
+        target: String,
+    ) -> Result<Option<NoteRef>, PortError> {
+        folder_paths::resolve_note(self, ctx, parent, target).await
+    }
+
+    pub async fn space_schema(
+        &self,
+        ctx: SpaceContext,
+    ) -> Result<std::collections::BTreeMap<String, notarium_core::query::FieldSchema>, PortError>
+    {
+        folder_paths::space_schema(self, ctx).await
+    }
+
+    pub async fn space_schema_snapshot(
+        &self,
+        ctx: SpaceContext,
+        revision: Option<notarium_core::ids::RevisionId>,
+    ) -> Result<notarium_core::ports::SpaceSchemaSnapshot, PortError> {
+        folder_paths::space_schema_snapshot(self, ctx, revision).await
+    }
+
     pub fn room_fences(&self) -> &Arc<RoomFenceTable> {
         &self.inner.room_fences
     }
@@ -273,6 +337,29 @@ impl CanonicalStore {
         result
     }
 
+    pub async fn get_note_metadata(
+        &self,
+        ctx: SpaceContext,
+        request: GetNote,
+    ) -> Result<notarium_core::ports::NoteMetadataSnapshot, PortError> {
+        let budget = ctx.budget.clone();
+        let deadline = common::CommandDeadline::start(&budget, "get_note_metadata");
+        if self.is_postgres() {
+            return Self::run_pg_read_request(
+                budget,
+                notes::get_note_metadata_impl(self, ctx, request, &deadline),
+            )
+            .await;
+        }
+        let result = deadline
+            .wait(&budget, || {
+                notes::get_note_metadata_impl(self, ctx, request, &deadline)
+            })
+            .await?;
+        deadline.remaining(&budget)?;
+        result
+    }
+
     pub async fn read_ability_resource(
         &self,
         ctx: SpaceContext,
@@ -300,7 +387,8 @@ impl CanonicalStore {
         ctx: SpaceContext,
         request: ChangeRead,
     ) -> Result<ChangeReadResult, PortError> {
-        self.read_changes(ctx, request).await
+        self.execute_change_read(ChangeCaller::Activity(&ctx), request)
+            .await
     }
 
     pub async fn is_live_visible(
@@ -365,38 +453,4 @@ impl CanonicalStore {
     ) -> Result<Committed<BoardMoveResult>, PortError> {
         Box::pin(board::move_board_card_impl(self, ctx, request)).await
     }
-}
-
-pub(crate) async fn lookup_thread_visibility_tx(
-    tx: &mut BackendConn<'_>,
-    space_id: &notarium_core::ids::SpaceId,
-    thread_id: &str,
-) -> Result<Option<(Option<FolderId>, bool)>, PortError> {
-    let row: Option<(Option<String>, i64)> = match tx {
-        BackendConn::Sqlite(conn) => sqlx::query_as(
-            "SELECT project_folder_id, ext_space_tainted_mask FROM chat_threads WHERE space_id = ? AND thread_id = ?",
-        )
-        .bind(space_id.as_str())
-        .bind(thread_id)
-        .fetch_optional(&mut **conn)
-        .await
-        .map_err(|err| internal_not_committed("sqlite_lookup_thread_taint", err.to_string()))?,
-        BackendConn::Postgres(conn) => sqlx::query_as(
-            "SELECT project_folder_id, ext_space_tainted_mask::BIGINT FROM chat_threads WHERE space_id = $1 AND thread_id = $2",
-        )
-        .bind(space_id.as_str())
-        .bind(thread_id)
-        .fetch_optional(&mut **conn)
-        .await
-        .map_err(|err| crate::runtime::pg_read_error("pg_lookup_thread_taint", err))?,
-    };
-    row.map(|(project, mask)| {
-        let project = project
-            .as_deref()
-            .map(FolderId::parse)
-            .transpose()
-            .map_err(|_| internal_not_committed("corrupt_thread_proj", "invalid FolderId"))?;
-        Ok((project, mask != 0))
-    })
-    .transpose()
 }

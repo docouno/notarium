@@ -195,6 +195,7 @@ async fn lifecycle(pg: bool) {
         .create_pat(
             bob_actor.clone(),
             CreatePat {
+                ability_write: false,
                 name: "read client".into(),
                 scope: BearerScope::Read,
                 selected_spaces: None,
@@ -859,6 +860,7 @@ async fn bounds(pg: bool) {
         .create_pat(
             current.clone(),
             CreatePat {
+                ability_write: true,
                 name: "empty selection".into(),
                 scope: BearerScope::Write,
                 selected_spaces: Some(vec![]),
@@ -873,6 +875,7 @@ async fn bounds(pg: bool) {
         .await
         .unwrap();
     assert!(auth.spaces().is_empty());
+    assert_eq!(auth.bearer_scope(), Some(BearerScope::Write));
     assert!(!auth.has_cap(Cap::AbilityWrite));
     fixture.clock.0.fetch_add(1000, Ordering::SeqCst);
     denied(
@@ -895,6 +898,7 @@ async fn bounds(pg: bool) {
         .await
         .unwrap();
     assert!(matches!(oauth.kind(), PrincipalKind::OAuth { .. }));
+    assert_eq!(oauth.bearer_scope(), Some(BearerScope::Read));
     assert!(!oauth.has_cap(Cap::AbilityWrite));
     assert!(
         oauth
@@ -1533,6 +1537,7 @@ async fn interactive_management_and_account_guards(pg: bool) {
             .create_pat(
                 ambient_ctx.clone(),
                 CreatePat {
+                    ability_write: false,
                     name: "Blocked".into(),
                     scope: BearerScope::Read,
                     selected_spaces: None,
@@ -1579,6 +1584,7 @@ async fn interactive_management_and_account_guards(pg: bool) {
     fixture.catalog.project_entries.lock().unwrap().insert(
         (project_ok.space_id.clone(), project_ok.folder_id.clone()),
         ProjectInfo {
+            project_slug: "project".into(),
             folder: project_ok.clone(),
             name: "Allowed project".into(),
         },
@@ -1609,13 +1615,17 @@ async fn interactive_management_and_account_guards(pg: bool) {
         .lock()
         .unwrap()
         .push(AbilityDescriptor {
+            attached_skills: vec![],
+            promoted_from: None,
+            requires_explicit_binding: false,
             reference: ability_ref.clone(),
             kind: AbilityKind::Role,
             name: "selected-guide".into(),
+            description: None,
             enabled: true,
             healthy: true,
             lifecycle: Lifecycle::Active,
-            entrypoint: ability_note.clone(),
+            entrypoint: Some(ability_note.clone()),
             auxiliary_files: vec![],
         });
     fixture.catalog.note_entries.lock().unwrap().insert(
@@ -1626,6 +1636,7 @@ async fn interactive_management_and_account_guards(pg: bool) {
             facts: ResourceFacts {
                 space: shared.space,
                 class: DocClass::Skill,
+                project: None,
                 ancestor_folders: vec![],
                 folder_write_locked: false,
                 ability_package: Some(ability_ref.id.clone()),
@@ -1682,7 +1693,7 @@ async fn interactive_management_and_account_guards(pg: bool) {
                     input: AbilityBindingUpdate {
                         ability: ability_ref,
                         enabled: true,
-                        expected: ControlRevision::ZERO,
+                        expected: AbilityOverlayGuard::Account(ControlRevision::ZERO),
                         projects: AbilityProjects::Selected(vec![project_ok]),
                     },
                 },
@@ -1776,4 +1787,118 @@ async fn sqlite_interactive_management_attestation_and_account_guards() {
 #[tokio::test]
 async fn postgres_interactive_management_attestation_and_account_guards() {
     interactive_management_and_account_guards(true).await;
+}
+
+#[tokio::test]
+async fn sqlite_replaying_membership_change_receipt_does_not_refence_active_work() {
+    let _serial = AUTH_TEST_LOCK.lock().await;
+    let mut fixture = Fixture::new(false, "replay_membership_no_refence").await;
+    let service = fixture.service(AuthenticationMode::Password).await.unwrap();
+    let bootstrap = service
+        .bootstrap(
+            empty(),
+            budget(),
+            BootstrapAccount {
+                username: "owner".into(),
+                email: None,
+                display_name: "Owner".into(),
+                password: Some(secret("owner password")),
+            },
+        )
+        .await
+        .unwrap();
+    let owner = bootstrap.account;
+    let session = bootstrap.session.unwrap();
+    let actor = account_context(&service, session.token.expose()).await;
+    let (second, revision) = second_account(&service, actor.clone(), &owner).await;
+    let shared = service
+        .create_space(
+            actor,
+            AccountMutation {
+                identity: command(&owner.id, &owner.id, 91, revision),
+                input: CreateSpace {
+                    id: SpaceId::from_bytes([91; 16]),
+                    kind: SpaceKind::Shared,
+                    name: "Shared".into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let actor = account_context(&service, session.token.expose()).await;
+    let scope = shared.value.history.clone();
+    let context = SpaceContext::new(actor.auth().clone(), scope.clone(), budget()).unwrap();
+    let added = service
+        .change_membership(
+            context.clone(),
+            MembershipChange {
+                command: CommandKey::from_bytes([92; 16]),
+                member: second.account.id.clone(),
+                role: Some(SpaceRole::Editor),
+                expected: ControlRevision::ZERO,
+            },
+        )
+        .await
+        .unwrap();
+    let demotion = MembershipChange {
+        command: CommandKey::from_bytes([93; 16]),
+        member: second.account.id.clone(),
+        role: Some(SpaceRole::Viewer),
+        expected: added.revision,
+    };
+    fixture.revoker.fail.store(true, Ordering::SeqCst);
+    unknown(
+        service
+            .change_membership(context.clone(), demotion.clone())
+            .await,
+    );
+    assert_eq!(
+        fixture
+            .observer
+            .count("SELECT count(*) FROM revocation_events WHERE delivered_at IS NULL")
+            .await,
+        1
+    );
+
+    // Register a new provider call authorized under the member's post-commit role.
+    let active_cancel = Cancellation::default();
+    let active_lease = fixture
+        .revoker
+        .register_provider(
+            MaintenanceContext {
+                authority: ServiceAuthority::admit(ServicePurpose::Revocation),
+                budget: budget(),
+            },
+            vec![RevocationSelector::Membership {
+                space: scope.space_id.clone(),
+                principal: second.account.id.clone(),
+            }],
+            active_cancel.clone(),
+        )
+        .await
+        .unwrap();
+
+    // Replaying the saved receipt must resume event delivery via `flush_event`
+    // without calling `fence_provider` (which would cancel the active call).
+    fixture.revoker.fail.store(false, Ordering::SeqCst);
+    let replayed = service
+        .change_membership(context, demotion)
+        .await
+        .expect("replaying saved membership change receipt must succeed");
+    assert_eq!(replayed.value.role, Some(SpaceRole::Viewer));
+    assert!(
+        !active_cancel.is_cancelled(),
+        "replaying a committed membership receipt must not re-fence newly authorized work"
+    );
+    assert_eq!(
+        fixture
+            .observer
+            .count("SELECT count(*) FROM revocation_events WHERE delivered_at IS NULL")
+            .await,
+        0
+    );
+
+    drop(active_lease);
+    drop(service);
+    fixture.close().await;
 }

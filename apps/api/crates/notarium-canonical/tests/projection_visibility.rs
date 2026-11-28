@@ -547,10 +547,10 @@ async fn postgres_next_epoch_requires_the_previous_runtime_to_drain() {
     let fixtures = StorageTestFixtures::load_required();
     let schema = fixtures.fresh_pg_schema();
     let installation = sample_installation_id(25);
-    let local_a = TempDataRoot::new("projection-owner-pg-a");
-    let local_b = TempDataRoot::new("projection-owner-pg-b");
-    let first_config = fixtures.pg_local_config(installation.clone(), &schema, local_a.data_root());
-    let second_config = fixtures.pg_local_config(installation, &schema, local_b.data_root());
+    let first_config = fixtures
+        .open_pg_s3_config(installation.clone(), &schema)
+        .await;
+    let second_config = fixtures.open_pg_s3_config(installation, &schema).await;
     let (first, first_runtime) = CanonicalRuntime::open(first_config).await.unwrap();
     let (second, second_runtime) = CanonicalRuntime::open(second_config).await.unwrap();
     let space = create_space(&first, 26).await;
@@ -713,6 +713,7 @@ async fn suspend_revokes_queued_writer_gate_and_re_admission_observes_post_write
                 },
                 preconditions: Preconditions::default(),
                 input: notarium_core::ports::CreateNote {
+                    folder_page: false,
                     note: note.clone(),
                     parent: None,
                     slug: "race-note".into(),
@@ -785,8 +786,9 @@ async fn suspend_revokes_queued_writer_gate_and_re_admission_observes_post_write
 async fn postgres_drain_blocks_concurrent_re_admission_and_single_conn_pool_never_deadlocks() {
     let fixtures = StorageTestFixtures::load_required();
     let schema = fixtures.fresh_pg_schema();
-    let dir = TempDataRoot::new("projection-pg-single-conn");
-    let mut config = fixtures.pg_local_config(sample_installation_id(32), &schema, dir.data_root());
+    let mut config = fixtures
+        .open_pg_s3_config(sample_installation_id(32), &schema)
+        .await;
     if let notarium_canonical::SqlBackendConfig::Postgres {
         ref mut pool_size, ..
     } = config.sql
@@ -891,6 +893,7 @@ async fn postgres_drain_blocks_concurrent_re_admission_and_single_conn_pool_neve
         },
         preconditions: Preconditions::default(),
         input: notarium_core::ports::CreateNote {
+            folder_page: false,
             note: note_a.clone(),
             parent: None,
             slug: "pool-one-a".into(),
@@ -953,6 +956,7 @@ async fn postgres_drain_blocks_concurrent_re_admission_and_single_conn_pool_neve
                 },
                 preconditions: Preconditions::default(),
                 input: notarium_core::ports::CreateNote {
+                    folder_page: false,
                     note: note_b,
                     parent: None,
                     slug: "pool-one-b".into(),
@@ -981,6 +985,7 @@ async fn postgres_drain_blocks_concurrent_re_admission_and_single_conn_pool_neve
                 },
                 preconditions: Preconditions::default(),
                 input: notarium_core::ports::CreateNote {
+                    folder_page: false,
                     note: note_c,
                     parent: None,
                     slug: "pool-one-c".into(),
@@ -1040,8 +1045,9 @@ async fn postgres_drain_blocks_concurrent_re_admission_and_single_conn_pool_neve
 async fn postgres_multi_space_pool_size_two_concurrent_purges_never_self_deadlock() {
     let fixtures = StorageTestFixtures::load_required();
     let schema = fixtures.fresh_pg_schema();
-    let dir = TempDataRoot::new("projection-pg-pool-two");
-    let mut config = fixtures.pg_local_config(sample_installation_id(38), &schema, dir.data_root());
+    let mut config = fixtures
+        .open_pg_s3_config(sample_installation_id(38), &schema)
+        .await;
     if let notarium_canonical::SqlBackendConfig::Postgres {
         ref mut pool_size, ..
     } = config.sql
@@ -1127,6 +1133,7 @@ async fn postgres_multi_space_pool_size_two_concurrent_purges_never_self_deadloc
                     },
                     preconditions: Preconditions::default(),
                     input: notarium_core::ports::CreateNote {
+                        folder_page: false,
                         note: note_a.clone(),
                         parent: None,
                         slug: format!("p2-a-{round}"),
@@ -1146,6 +1153,7 @@ async fn postgres_multi_space_pool_size_two_concurrent_purges_never_self_deadloc
                     },
                     preconditions: Preconditions::default(),
                     input: notarium_core::ports::CreateNote {
+                        folder_page: false,
                         note: note_b.clone(),
                         parent: None,
                         slug: format!("p2-b-{round}"),
@@ -1223,8 +1231,9 @@ async fn postgres_multi_space_pool_size_two_concurrent_purges_never_self_deadloc
 async fn postgres_pool_size_one_back_to_back_writes_racing_admit_never_abba_deadlock() {
     let fixtures = StorageTestFixtures::load_required();
     let schema = fixtures.fresh_pg_schema();
-    let dir = TempDataRoot::new("projection-pg-pool-one-abba");
-    let mut config = fixtures.pg_local_config(sample_installation_id(42), &schema, dir.data_root());
+    let mut config = fixtures
+        .open_pg_s3_config(sample_installation_id(42), &schema)
+        .await;
     if let notarium_canonical::SqlBackendConfig::Postgres {
         ref mut pool_size, ..
     } = config.sql
@@ -1295,8 +1304,9 @@ async fn postgres_pool_size_one_back_to_back_writes_racing_admit_never_abba_dead
 async fn postgres_multi_space_trickle_writes_never_starve_admit() {
     let fixtures = StorageTestFixtures::load_required();
     let schema = fixtures.fresh_pg_schema();
-    let dir = TempDataRoot::new("projection-pg-pool-three-trickle");
-    let mut config = fixtures.pg_local_config(sample_installation_id(60), &schema, dir.data_root());
+    let mut config = fixtures
+        .open_pg_s3_config(sample_installation_id(60), &schema)
+        .await;
     if let notarium_canonical::SqlBackendConfig::Postgres {
         ref mut pool_size, ..
     } = config.sql

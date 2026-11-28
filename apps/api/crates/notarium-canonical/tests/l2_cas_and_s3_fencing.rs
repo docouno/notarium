@@ -590,15 +590,12 @@ async fn l2_local_cas_sqlite_and_pg_parity_corruption_quarantine_and_symlinks() 
     assert!(!quarantined.exists());
     runtime.shutdown().await.unwrap();
 
-    // 2. PostgreSQL 16 + Local CAS parity
+    // 2. PostgreSQL 16 + S3 CAS parity
     let fixtures = StorageTestFixtures::load_required();
     let pg_schema = fixtures.fresh_pg_schema();
-    let pg_blob_root = TempDataRoot::new("l2-pg-local");
-    let pg_cfg = fixtures.pg_local_config(
-        sample_installation_id(12),
-        &pg_schema,
-        pg_blob_root.data_root(),
-    );
+    let pg_cfg = fixtures
+        .open_pg_s3_config(sample_installation_id(12), &pg_schema)
+        .await;
     let (pg_store, pg_rt) = CanonicalRuntime::open(pg_cfg).await.unwrap();
     run_cas_roundtrip_and_refcount_suite(&pg_store, 12).await;
     drop(pg_store);
@@ -1077,4 +1074,101 @@ async fn l2_s3_minio_ce_modes_negative_controls_and_fencing_races() {
         }
         fixtures.drop_pg_schema(&pg_schema).await;
     }
+}
+
+#[test]
+fn decode_zstd_verified_rejects_raw_size_over_64mib_before_decompression() {
+    use notarium_canonical::blobs::{MAX_BLOB_DECODE_BYTES, decode_zstd_verified};
+    // Pass garbage compressed bytes: the raw_size cap must trigger BEFORE Zstd header parsing.
+    let err = decode_zstd_verified(
+        b"not-valid-zstd-bytes",
+        None,
+        MAX_BLOB_DECODE_BYTES + 1,
+        notarium_core::ids::ContentDigest::from_bytes([0xAB; 32]),
+    )
+    .expect_err("oversized raw_size must be rejected before decompression");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("blob_decode_limit_exceeded") || matches!(err, PortError::Internal(_)),
+        "expected blob_decode_limit_exceeded before Zstd decode, got {msg}"
+    );
+    assert!(
+        !msg.contains("corrupt_blob_zstd"),
+        "must reject before calling Zstd decoder: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn prepare_blob_rejects_raw_size_over_64mib() {
+    use notarium_canonical::blobs::{BlobCodecTag, MAX_BLOB_DECODE_BYTES, PreparedBlobSource};
+
+    let oversized = vec![b'a'; MAX_BLOB_DECODE_BYTES as usize + 1];
+    for codec in [BlobCodecTag::LocalZstdV1, BlobCodecTag::S3ChunkedV1] {
+        assert_validation_err(
+            &PreparedBlobSource::prepare(&oversized, codec),
+            ValidationReason::InvalidRange,
+        );
+    }
+}
+
+#[tokio::test]
+async fn local_shutdown_does_not_deadlock_with_held_staged_blob_ticket() {
+    let temp = TempDataRoot::new("l2-shutdown-held-ticket");
+    let cfg = CanonicalConfig::local_default(sample_installation_id(0x93), temp.data_root());
+    let (store, runtime) = CanonicalRuntime::open(cfg).await.unwrap();
+    let scope = HistoryScope {
+        space_id: sample_space_id(0x93),
+        incarnation: sample_incarnation(0x93),
+    };
+    store
+        .create_space(CreateSpaceSpec {
+            space_id: scope.space_id.clone(),
+            incarnation: scope.incarnation,
+            root_folder_id: sample_folder_id(0x93),
+            slug: "shutdown-ticket".to_owned(),
+            kind: SpaceKind::Personal,
+            owner: sample_principal_id(0x93),
+            active_epoch: LeaseEpoch::new(1).unwrap(),
+            initial_last_seq: SpaceSeq::ZERO,
+            created_at: None,
+        })
+        .await
+        .unwrap();
+
+    let payload = b"held ticket payload that must not deadlock shutdown ".repeat(64);
+    let prepared = store.prepare_blob(&payload).unwrap();
+    let held_ticket = store
+        .stage_blob(&scope, LeaseEpoch::new(1).unwrap(), &prepared)
+        .await
+        .unwrap();
+
+    // Schedule unretained local CAS orphan cleanup for the exact digest pinned by
+    // `held_ticket` so the background cleanup task defers it into
+    // `deferred_local_orphan_cleanups`. A blocking final sweep during shutdown would
+    // deadlock forever waiting on `held_ticket`'s LocalSharedGuard.
+    store.schedule_unretained_local_files_cleanup_for_test(vec![(
+        scope.space_id.clone(),
+        prepared.digest(),
+    )]);
+
+    let mut deferred_observed = false;
+    for _ in 0..100 {
+        if store.deferred_local_orphan_count_for_test() > 0 {
+            deferred_observed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        deferred_observed,
+        "scheduled local orphan cleanup while held_ticket is alive must populate deferred_local_orphan_cleanups"
+    );
+
+    tokio::time::timeout(std::time::Duration::from_secs(3), runtime.shutdown())
+        .await
+        .expect(
+            "runtime.shutdown must not deadlock when deferred orphans are pinned by a live ticket",
+        )
+        .expect("clean shutdown");
+    drop(held_ticket);
 }

@@ -19,7 +19,9 @@ pub(super) fn page_bytes(
     let mut bytes = size_of::<ReadState>() + 4096;
     match query {
         RetainedQuery::Notes(query) => {
-            bytes += predicate_bytes(&query.filter.predicate) + sort_bytes(&query.sort);
+            bytes += predicate_bytes(&query.filter.predicate)
+                + sort_bytes(&query.sort)
+                + query.tag.as_ref().map_or(0, String::capacity);
         }
         RetainedQuery::View(query) => {
             bytes += predicate_bytes(&query.filter.predicate)

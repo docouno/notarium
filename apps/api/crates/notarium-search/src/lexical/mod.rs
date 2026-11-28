@@ -100,6 +100,13 @@ pub struct LexicalHit {
     pub score: f32,
 }
 
+/// Strict matches precede any weaker single-clause matches in the shared window.
+#[derive(Default)]
+pub(crate) struct RankedLexical {
+    pub hits: Vec<LexicalHit>,
+    pub strict_len: usize,
+}
+
 /// Receipt matches and the pinned segment used to score them.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct OverlayHits {
@@ -116,7 +123,7 @@ impl OverlayHits {
         candidate_limit: usize,
         floor: usize,
         browse: bool,
-    ) -> Vec<LexicalHit> {
+    ) -> RankedLexical {
         let note_order = |left: &LexicalHit, right: &LexicalHit| match (&left.key, &right.key) {
             (HitKey::Note(a), HitKey::Note(b)) => a.cmp(b),
             _ => Ordering::Equal,
@@ -136,7 +143,8 @@ impl OverlayHits {
             }
         }
         strict.truncate(candidate_limit);
-        let missing = floor.min(candidate_limit).saturating_sub(strict.len());
+        let strict_len = strict.len();
+        let missing = floor.min(candidate_limit).saturating_sub(strict_len);
         if missing != 0 {
             if !self.fallback.is_empty() {
                 fallback.extend_from_slice(&self.fallback);
@@ -144,7 +152,10 @@ impl OverlayHits {
             }
             strict.extend(fallback.into_iter().take(missing));
         }
-        strict
+        RankedLexical {
+            hits: strict,
+            strict_len,
+        }
     }
 }
 
@@ -423,10 +434,11 @@ impl LexicalIndex {
             text,
             filter,
             candidate_limit,
-            top_k,
+            top_k.min(MAX_FALLBACK_FLOOR),
             filtered,
             &OverlayHits::default(),
         )
+        .map(|ranked| ranked.hits)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -436,12 +448,12 @@ impl LexicalIndex {
         text: &str,
         filter: &LexicalFilter<'_>,
         candidate_limit: usize,
-        top_k: usize,
+        fallback_floor: usize,
         filtered: bool,
         overlay: &OverlayHits,
-    ) -> Result<Vec<LexicalHit>, LexicalError> {
+    ) -> Result<RankedLexical, LexicalError> {
         if candidate_limit == 0 || (filter.classes == 0 && !filter.include_chats) {
-            return Ok(Vec::new());
+            return Ok(RankedLexical::default());
         }
         let fields = if filter.include_chats {
             &self.fields.bodies[..]
@@ -478,7 +490,7 @@ impl LexicalIndex {
         };
         let decode = |(score, address)| decode_hit(searcher, address, score);
         let ranked = collect(false, candidate_limit)?;
-        let floor = top_k.min(candidate_limit).min(MAX_FALLBACK_FLOOR);
+        let floor = fallback_floor.min(candidate_limit);
         let missing = floor.saturating_sub(ranked.len() + overlay.strict.len());
         let fallback = if missing != 0 && query.can_fallback() {
             let seen: HashSet<_> = ranked.iter().map(|(_, address)| *address).collect();

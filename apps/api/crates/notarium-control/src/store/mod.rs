@@ -9,7 +9,7 @@ pub(crate) mod target;
 pub(crate) mod values;
 #[cfg(test)]
 mod writer_tests;
-use crate::error::{database, invalid, unavailable};
+use crate::error::{database, database_not_committed, invalid, unavailable};
 pub use export::TargetExport;
 pub use import::TargetImport;
 use notarium_core::{
@@ -423,14 +423,14 @@ impl ControlStore {
             .run(
                 async {
                     let mut inner = match &self.backend {
-                        Backend::Sqlite { read_pool, .. } => {
-                            Transaction::Sqlite(read_pool.begin().await.map_err(database)?)
-                        }
+                        Backend::Sqlite { read_pool, .. } => Transaction::Sqlite(
+                            read_pool.begin().await.map_err(database_not_committed)?,
+                        ),
                         Backend::Postgres { read_pool, .. } => Transaction::Postgres(
                             read_pool
                                 .begin_with("BEGIN TRANSACTION READ ONLY")
                                 .await
-                                .map_err(database)?,
+                                .map_err(database_not_committed)?,
                         ),
                     };
                     budget.configure(&mut inner).await?;
@@ -504,7 +504,11 @@ impl ControlStore {
                 };
                 let inner = match &store.backend {
                     Backend::Sqlite { pool, .. } => {
-                        match pool.begin_with("BEGIN IMMEDIATE").await.map_err(database) {
+                        match pool
+                            .begin_with("BEGIN IMMEDIATE")
+                            .await
+                            .map_err(database_not_committed)
+                        {
                             Ok(tx) => Transaction::Sqlite(tx),
                             Err(err) => {
                                 if let Some(fence) = file_fence {
@@ -515,12 +519,13 @@ impl ControlStore {
                         }
                     }
                     Backend::Postgres { pool, .. } => {
-                        Transaction::Postgres(pool.begin().await.map_err(database)?)
+                        Transaction::Postgres(pool.begin().await.map_err(database_not_committed)?)
                     }
                 };
                 let mut tx = WriteTransaction {
                     resources: Some(WriteResources {
                         revocation_fences: Vec::new(),
+                        schedule_pin: None,
                         inner,
                         _guard: guard,
                         _admission: admission,
@@ -533,7 +538,7 @@ impl ControlStore {
                         .bind(BACKUP_LOCK)
                         .execute(&mut **inner)
                         .await
-                        .map_err(database)?;
+                        .map_err(database_not_committed)?;
                 }
                 worker_budget.check(CommitEffect::NotCommitted)?;
                 Ok(tx)
@@ -563,13 +568,13 @@ impl ControlStore {
             )
             .fetch_optional(read_pool)
             .await
-            .map_err(database)?,
+            .map_err(database_not_committed)?,
             Backend::Postgres { read_pool, .. } => sqlx::query_scalar(
                 "SELECT installation_id FROM v1_control.v1_storage_epoch WHERE singleton=1 AND epoch_version=1 AND state='ready'",
             )
             .fetch_optional(read_pool)
             .await
-            .map_err(database)?,
+            .map_err(database_not_committed)?,
         };
         value
             .map(|value| InstallationId::parse(&value).map_err(Into::into))
@@ -613,7 +618,7 @@ where
     let envelope = encoded_size(&serde_json::json!({"table":table.name(),"row":null}))? - 4;
     let mut rows = Vec::new();
     let mut bytes = 0usize;
-    while let Some(row) = stream.try_next().await.map_err(database)? {
+    while let Some(row) = stream.try_next().await.map_err(database_not_committed)? {
         // Match TargetRecord's exact tagged envelope used by import admission.
         let size = encoded_size(&row)?.saturating_add(envelope);
         if size > EXPORT_PAGE_BYTES {
@@ -659,8 +664,8 @@ impl ReadTransaction {
         let ReadResources { inner, _admission } =
             self.resources.take().expect("live read transaction");
         let result = match inner {
-            Transaction::Sqlite(tx) => tx.rollback().await.map_err(database),
-            Transaction::Postgres(tx) => tx.rollback().await.map_err(database),
+            Transaction::Sqlite(tx) => tx.rollback().await.map_err(database_not_committed),
+            Transaction::Postgres(tx) => tx.rollback().await.map_err(database_not_committed),
         };
         drop(_admission);
         result
@@ -692,6 +697,7 @@ impl Drop for ReadTransaction {
 struct WriteResources {
     inner: Transaction,
     revocation_fences: Vec<Box<dyn notarium_core::ports::RevocationLease>>,
+    schedule_pin: Option<Box<dyn notarium_core::ports::ScheduleAbilityLease>>,
     _guard: OwnedRwLockReadGuard<()>,
     _admission: OwnedSemaphorePermit,
     file_fence: Option<fence::FileFence>,
@@ -701,13 +707,14 @@ impl WriteResources {
         let Self {
             inner,
             revocation_fences,
+            schedule_pin,
             _guard,
             _admission,
             file_fence,
         } = self;
         let result = match inner {
-            Transaction::Sqlite(tx) => tx.rollback().await.map_err(database),
-            Transaction::Postgres(tx) => tx.rollback().await.map_err(database),
+            Transaction::Sqlite(tx) => tx.rollback().await.map_err(database_not_committed),
+            Transaction::Postgres(tx) => tx.rollback().await.map_err(database_not_committed),
         };
         let fence_result = if let Some(fence) = file_fence {
             fence.release()
@@ -715,12 +722,22 @@ impl WriteResources {
             Ok(())
         };
         drop(revocation_fences);
+        if let Some(mut pin) = schedule_pin {
+            let _ = pin.close().await;
+        }
         drop(_guard);
         drop(_admission);
         result?;
         fence_result
     }
     async fn commit(self) -> Result<(), PortError> {
+        let fences = self.commit_keeping_fences().await?;
+        drop(fences);
+        Ok(())
+    }
+    async fn commit_keeping_fences(
+        self,
+    ) -> Result<Vec<Box<dyn notarium_core::ports::RevocationLease>>, PortError> {
         let checked = self
             .revocation_fences
             .iter()
@@ -732,6 +749,7 @@ impl WriteResources {
         let Self {
             inner,
             revocation_fences,
+            schedule_pin,
             _guard,
             _admission,
             file_fence,
@@ -745,17 +763,37 @@ impl WriteResources {
         } else {
             Ok(())
         };
-        drop(revocation_fences);
+        if let Some(mut pin) = schedule_pin {
+            let _ = pin.close().await;
+        }
         drop(_guard);
         drop(_admission);
-        result?;
-        fence_result
+        if let Err(error) = result {
+            drop(revocation_fences);
+            return Err(error);
+        }
+        // `tx.commit()` is already durable and `fence.release(self)` closed the
+        // file descriptor on return, releasing the OS lock; do not misreport
+        // `CommitEffect::NotCommitted` after a committed write.
+        let _ = fence_result;
+        Ok(revocation_fences)
     }
 }
 pub(crate) struct WriteTransaction {
     resources: Option<WriteResources>,
 }
 impl WriteTransaction {
+    /// The native writer owns this lease until commit or rollback ACK, even
+    /// when the operation abandons its wait for the native writer.
+    pub(crate) fn hold_schedule_pin(
+        &mut self,
+        pin: Box<dyn notarium_core::ports::ScheduleAbilityLease>,
+    ) {
+        self.resources
+            .as_mut()
+            .expect("live write transaction")
+            .schedule_pin = Some(pin);
+    }
     pub(crate) fn hold_revocation_fence(
         &mut self,
         fence: Box<dyn notarium_core::ports::RevocationLease>,
@@ -779,9 +817,18 @@ impl WriteTransaction {
             .await
             .map_err(|_| unavailable("control rollback worker", CommitEffect::Unknown))?
     }
-    pub(crate) async fn commit(mut self) -> Result<(), PortError> {
+    pub(crate) fn spawn_commit(mut self) -> tokio::task::JoinHandle<Result<(), PortError>> {
         let resources = self.resources.take().expect("live write transaction");
         tokio::spawn(resources.commit())
+    }
+    pub(crate) async fn commit_keeping_fences(
+        mut self,
+    ) -> Result<Vec<Box<dyn notarium_core::ports::RevocationLease>>, PortError> {
+        let resources = self.resources.take().expect("live write transaction");
+        resources.commit_keeping_fences().await
+    }
+    pub(crate) async fn commit(self) -> Result<(), PortError> {
+        self.spawn_commit()
             .await
             .map_err(|_| unavailable("control commit worker", CommitEffect::Unknown))?
     }

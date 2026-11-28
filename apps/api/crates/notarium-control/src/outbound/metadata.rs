@@ -1,5 +1,5 @@
 //! Bounded freshness for identity metadata; zero means fetch for each operation.
-use reqwest::header::{AGE, CACHE_CONTROL, HeaderMap};
+use http::header::{AGE, CACHE_CONTROL, HeaderMap};
 pub(crate) fn freshness_ms(headers: &HeaderMap, default_seconds: u64, maximum_seconds: u64) -> i64 {
     let mut seconds: Option<u64> = None;
     for header in headers.get_all(CACHE_CONTROL) {

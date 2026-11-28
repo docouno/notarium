@@ -1,4 +1,5 @@
 //! Reusable pre-send checks. These helpers never perform a provider request.
+pub(crate) const CALL_RUN_EPOCHS_SQLITE_SQL: &str = "SELECT policy_epochs FROM provider_call_log WHERE run_id=$1 AND (delivery_state<>'settled' OR outcome IS NULL OR outcome<>'not_sent') ORDER BY call_id LIMIT 65";
 use super::{
     ProviderService,
     accounting::BudgetLimit,
@@ -15,17 +16,141 @@ use crate::{
         target::*,
     },
 };
+use http::header::{HeaderMap, HeaderName, HeaderValue};
 use notarium_core::{
     DomainError,
-    auth::{AuthenticatedCredential, EngineAuthContext, PrincipalKind, Space},
-    classes::{ClassEgressFence, ProviderCurrentContent, ProviderMessage},
+    auth::{AuthenticatedCredential, EngineAuthContext, PrincipalKind, Space, SpaceGrant},
+    classes::{ClassEgressFence, DocClass, ProviderCurrentContent, ProviderMessage},
     error::{CommitEffect, PortError, ValidationReason},
     ids::*,
     model::FolderRef,
     ports::*,
 };
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+
+/// Prior disclosure observed by an `AgentRun` or `Keeper` across its recorded
+/// provider calls.
+pub(super) struct RunQuerySourceDisclosure {
+    pub classes: BTreeSet<DocClass>,
+    /// `None` when the run has no prior non-query disclosure rows (clean unlogged run).
+    /// `Some(Some(project))` when every prior non-query call was strictly confined to `project`.
+    /// `Some(None)` when any prior non-query call had Space-wide, multi-project,
+    /// legacy, unparseable, or overflow (>64 rows) disclosure.
+    pub confined_project: Option<Option<FolderRef>>,
+    /// When `true` (disclosure scan overflow >64 non-query calls or legacy/unparseable
+    /// `policy_epochs`), remote query embedding fails closed unconditionally independent
+    /// of caller-narrowed `grant.read_classes`.
+    pub fail_closed: bool,
+}
+
+impl RunQuerySourceDisclosure {
+    pub(super) fn allows_embedder(
+        &self,
+        allowed_classes: &BTreeSet<DocClass>,
+        embedder_project_only: Option<&FolderRef>,
+    ) -> bool {
+        if self.fail_closed {
+            return false;
+        }
+        if !self.classes.is_subset(allowed_classes) {
+            return false;
+        }
+        if let (Some(required_project), Some(confined)) =
+            (embedder_project_only, &self.confined_project)
+        {
+            return confined.as_ref() == Some(required_project);
+        }
+        true
+    }
+}
+
+/// Model-authored search queries may reflect any non-encrypted class and scope
+/// previously disclosed to the calling run across its recorded provider calls.
+/// Require the remote embedding provider to cover every such class and respect
+/// project confinement, failing closed unconditionally if any recorded call lacks
+/// disclosure data, fails parsing, or exceeds the bounded scan limit. A clean run
+/// with zero prior non-query provider calls has no recorded disclosure.
+pub(super) async fn required_query_source_disclosure(
+    tx: &mut Transaction,
+    auth: &EngineAuthContext,
+    _grant: &SpaceGrant,
+) -> Result<RunQuerySourceDisclosure, PortError> {
+    let run = match auth.kind() {
+        PrincipalKind::AgentRun(run) | PrincipalKind::Keeper(run) => run,
+        _ => {
+            return Ok(RunQuerySourceDisclosure {
+                classes: BTreeSet::new(),
+                confined_project: None,
+                fail_closed: false,
+            });
+        }
+    };
+    let fail_closed = || RunQuerySourceDisclosure {
+        classes: BTreeSet::new(),
+        confined_project: Some(None),
+        fail_closed: true,
+    };
+    let prior_calls = rows!(
+        tx,
+        (String,),
+        fetch_all,
+        CALL_RUN_EPOCHS_SQLITE_SQL,
+        "SELECT policy_epochs FROM v1_control.provider_call_log WHERE run_id=$1 AND (delivery_state<>'settled' OR outcome IS NULL OR outcome<>'not_sent') ORDER BY call_id LIMIT 65";
+        run.as_str()
+    )?;
+    if prior_calls.is_empty() {
+        return Ok(RunQuerySourceDisclosure {
+            classes: BTreeSet::new(),
+            confined_project: None,
+            fail_closed: false,
+        });
+    }
+    if prior_calls.len() > 64 {
+        return Ok(fail_closed());
+    }
+    let mut required = BTreeSet::new();
+    let mut confined_project: Option<Option<FolderRef>> = None;
+    for (raw_epochs,) in prior_calls {
+        let Some((classes, call_project_only)) = parse_logged_disclosure(&raw_epochs) else {
+            return Ok(fail_closed());
+        };
+        let classes: BTreeSet<DocClass> = classes
+            .into_iter()
+            .filter(|class| *class != DocClass::EncryptedNote)
+            .collect();
+        if classes.is_empty() {
+            // Query-only embedding calls record empty classes and disclose no
+            // new corpus scope to the model.
+            continue;
+        }
+        required.extend(classes);
+        confined_project = match (confined_project, call_project_only) {
+            (None, next) => Some(next),
+            (Some(Some(prev)), Some(next)) if prev == next => Some(Some(prev)),
+            _ => Some(None),
+        };
+    }
+    Ok(RunQuerySourceDisclosure {
+        classes: required,
+        confined_project,
+        fail_closed: false,
+    })
+}
+
+fn parse_logged_disclosure(raw: &str) -> Option<(BTreeSet<DocClass>, Option<FolderRef>)> {
+    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let array = value.as_array()?;
+    if array.first()?.as_u64()? != 2 {
+        return None;
+    }
+    let classes = serde_json::from_value(array.get(4)?.clone()).ok()?;
+    let project_only = match array.get(5) {
+        Some(value) => serde_json::from_value(value.clone()).ok()?,
+        // Entries missing the project-confinement field fail closed as unconfined.
+        None => None,
+    };
+    Some((classes, project_only))
+}
 
 pub(super) struct Snapshot {
     pub resource: ProviderResourcesRow,
@@ -40,6 +165,8 @@ pub(super) struct Validated {
     pub auth: EngineAuthContext,
     pub selectors: Vec<RevocationSelector>,
     pub spaces: Vec<SpaceId>,
+    pub disclosed_classes: BTreeSet<DocClass>,
+    pub disclosed_project_only: Option<FolderRef>,
     pub expires_at_ms: Option<i64>,
 }
 pub(super) struct DispatchAuthority<'a> {
@@ -47,6 +174,7 @@ pub(super) struct DispatchAuthority<'a> {
     pub ctx: &'a AccountContext,
     pub primary: Option<&'a CatalogSpace>,
     pub project: Option<&'a FolderRef>,
+    pub secondary_projects: &'a [FolderRef],
     pub parts: &'a [ProviderMessage],
     pub embedding_inputs: &'a [EmbeddingInput],
     pub selection: Option<&'a EmbeddingSelection>,
@@ -85,14 +213,20 @@ impl Snapshot {
         }
         Ok(budgets)
     }
-    pub fn epochs(&self) -> Result<String, PortError> {
+    pub fn epochs(
+        &self,
+        disclosed_classes: &BTreeSet<DocClass>,
+        disclosed_project_only: Option<&FolderRef>,
+    ) -> Result<String, PortError> {
         json(&(
-            1,
+            2_u8,
             self.resource.consent_epoch,
             self.resource.runtime_epoch,
             self.credential
                 .as_ref()
                 .map(|value| (&value.id, value.consent_epoch, value.runtime_epoch)),
+            disclosed_classes,
+            disclosed_project_only,
         ))
     }
 }
@@ -125,6 +259,7 @@ impl ProviderService {
             ctx,
             primary,
             project,
+            secondary_projects,
             parts,
             embedding_inputs,
             selection,
@@ -206,22 +341,42 @@ impl ProviderService {
         if let Some(primary) = primary {
             spaces.insert(primary.space.id.clone(), primary.space.clone());
         }
-        if current.len() > 4096 || parts.len() > 4096 {
+        if current.len() > MAX_PROVIDER_ORIGINS || parts.len() > MAX_PROVIDER_ORIGINS {
             return Err(invalid(ValidationReason::InvalidLimit));
         }
         let mut metadata = BTreeMap::new();
         for item in current {
+            if let ProviderCurrentContent::Ability {
+                reference,
+                provenance,
+                promoted_from,
+                ..
+            } = item
+            {
+                let identity = AbilityIdentity {
+                    id: reference.ability.clone(),
+                    placement: provenance.current.placement.clone(),
+                };
+                if !self
+                    .control
+                    .promotion_is_committed(tx, promoted_from.as_ref(), &identity)
+                    .await?
+                {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+            }
             let origin = json(&item.origin())?;
             if metadata.insert(origin, item).is_some() {
                 return Err(invalid(ValidationReason::SourceMismatch));
             }
-            if let Some(old) = spaces.insert(item.space().id.clone(), item.space().clone())
-                && old != *item.space()
+            if let Some(space) = item.space()
+                && let Some(old) = spaces.insert(space.id.clone(), space.clone())
+                && old != *space
             {
                 return Err(invalid(ValidationReason::SourceMismatch));
             }
         }
-        if spaces.len() > 64 {
+        if spaces.len() > MAX_PROVIDER_SOURCE_SPACES {
             return Err(invalid(ValidationReason::InvalidLimit));
         }
         if primary.is_none()
@@ -234,37 +389,106 @@ impl ProviderService {
         }
         if primary.is_none() {
             auth.authorize_human_management()?;
+            super::super::authority::require_unpinned_human(&auth)?;
             if auth.principal().as_str() != resource.owner_id {
-                return Err(DomainError::AccessDenied.into());
+                return Err(DomainError::ResourceNotFound.into());
             }
         }
-        let mut policies: BTreeMap<SpaceId, PolicyAdmission> = BTreeMap::new();
+        let mut secondary_projects_by_space: BTreeMap<&SpaceId, Vec<&FolderRef>> = BTreeMap::new();
+        for sec_project in secondary_projects {
+            if !spaces.contains_key(&sec_project.space_id)
+                || primary.is_some_and(|primary| primary.space.id == sec_project.space_id)
+            {
+                return Err(invalid(ValidationReason::SourceMismatch));
+            }
+            let entry = secondary_projects_by_space
+                .entry(&sec_project.space_id)
+                .or_default();
+            if !entry.contains(&sec_project) {
+                entry.push(sec_project);
+            }
+        }
+        let mut space_policies: BTreeMap<SpaceId, PolicyAdmission> = BTreeMap::new();
+        let mut secondary_project_policies: BTreeMap<(SpaceId, FolderId), PolicyAdmission> =
+            BTreeMap::new();
         let now = self.control.clock.now_ms()?;
         for space in spaces.values() {
-            policies.insert(
-                space.id.clone(),
-                selection::policy(
+            if primary.is_some_and(|p| p.space.id == space.id) {
+                space_policies.insert(
+                    space.id.clone(),
+                    selection::policy(
+                        tx,
+                        &auth,
+                        &resource,
+                        credential_epoch,
+                        space,
+                        project,
+                        now,
+                        true,
+                    )
+                    .await?,
+                );
+                continue;
+            }
+            let sec_projects = secondary_projects_by_space
+                .get(&space.id)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            match selection::policy(
+                tx,
+                &auth,
+                &resource,
+                credential_epoch,
+                space,
+                None,
+                now,
+                true,
+            )
+            .await
+            {
+                Ok(wide) => {
+                    space_policies.insert(space.id.clone(), wide);
+                }
+                Err(error)
+                    if !sec_projects.is_empty()
+                        && matches!(
+                            error,
+                            PortError::Domain(
+                                DomainError::ResourceNotFound
+                                    | DomainError::AccessDenied
+                                    | DomainError::Provider {
+                                        error: ProviderErrorCode::Unavailable
+                                    }
+                            )
+                        ) => {}
+                Err(error) => return Err(error),
+            }
+            for &sec_project in sec_projects {
+                let admitted = selection::policy(
                     tx,
                     &auth,
                     &resource,
                     credential_epoch,
                     space,
-                    project,
+                    Some(sec_project),
                     now,
                     true,
                 )
-                .await?,
-            );
+                .await?;
+                secondary_project_policies.insert(
+                    (sec_project.space_id.clone(), sec_project.folder_id.clone()),
+                    admitted,
+                );
+            }
         }
+        let mut cached_query_disclosure: Option<RunQuerySourceDisclosure> = None;
         for input in embedding_inputs {
             let EmbeddingInput::Query(query) = input else {
                 continue;
             };
-            if auth.taint().is_tainted() {
-                return Err(DomainError::CrossSpaceTainted.into());
-            }
             let primary = primary.ok_or_else(selection::unavailable)?;
-            let admitted = policies
+            auth.authorize_remote_embedding_query(&primary.space.id)?;
+            let admitted = space_policies
                 .get(&primary.space.id)
                 .ok_or_else(selection::unavailable)?;
             let grant = auth
@@ -278,42 +502,270 @@ impl ProviderService {
             {
                 return Err(DomainError::AccessDenied.into());
             }
+            let source_disclosure = match &cached_query_disclosure {
+                Some(cached) => cached,
+                None => {
+                    let loaded = required_query_source_disclosure(tx, &auth, grant).await?;
+                    cached_query_disclosure.insert(loaded)
+                }
+            };
             if !query.classes.iter().all(|class| {
                 admitted.policy.allowed_classes.contains(class)
                     && grant.read_classes.contains(class)
-            }) {
+            }) || !source_disclosure.allows_embedder(
+                &admitted.policy.allowed_classes,
+                admitted.project_only.as_ref(),
+            ) {
                 return Err(invalid(ValidationReason::ClassEgressForbidden));
             }
         }
-        let mut used = std::collections::BTreeSet::new();
+        let candidate_policies_for =
+            |source: &ProviderCurrentContent,
+             part_opt: Option<&ProviderMessage>|
+             -> Result<Vec<(&PolicyAdmission, Option<&FolderRef>)>, PortError> {
+                let space = source
+                    .space()
+                    .or_else(|| primary.map(|value| &value.space))
+                    .ok_or_else(selection::unavailable)?;
+                if primary.is_some_and(|p| p.space.id == space.id) {
+                    return Ok(vec![(
+                        space_policies
+                            .get(&space.id)
+                            .ok_or_else(selection::unavailable)?,
+                        project,
+                    )]);
+                }
+                let mut candidates = Vec::new();
+                if !matches!(
+                    source,
+                    ProviderCurrentContent::Space { .. }
+                        | ProviderCurrentContent::SpaceProjects { .. }
+                ) && let Some(sec_projects) = secondary_projects_by_space.get(&space.id)
+                {
+                    for &proj in sec_projects {
+                        if let Some(admitted) = secondary_project_policies
+                            .get(&(proj.space_id.clone(), proj.folder_id.clone()))
+                            && (admitted.project_only.is_none()
+                                || (source.in_project(proj)
+                                    && part_opt.is_none_or(|part| part.in_project(proj))))
+                        {
+                            candidates.push((admitted, Some(proj)));
+                        }
+                    }
+                }
+                if let Some(wide) = space_policies.get(&space.id) {
+                    candidates.push((wide, None));
+                }
+                if candidates.is_empty() {
+                    if secondary_projects_by_space.contains_key(&space.id) {
+                        return Err(DomainError::AccessDenied.into());
+                    }
+                    return Err(selection::unavailable());
+                }
+                Ok(candidates)
+            };
+        let mut used = BTreeSet::new();
+        let mut checked_dependencies = BTreeSet::new();
+        let mut dependencies = Vec::new();
         for part in parts {
             let origin = json(&part.origin())?;
             used.insert(origin.clone());
             let metadata = metadata
                 .get(&origin)
                 .ok_or_else(|| invalid(ValidationReason::SourceMismatch))?;
-            let admitted = policies
-                .get(&metadata.space().id)
-                .ok_or_else(selection::unavailable)?;
-            if admitted
-                .project_only
-                .as_ref()
-                .or(indexing_project)
-                .is_some_and(|project| !part.in_project(project) || !metadata.in_project(project))
-            {
-                return Err(DomainError::AccessDenied.into());
+            let candidates = candidate_policies_for(metadata, Some(part))?;
+            let mut last_error: Option<PortError> = None;
+            let mut admitted_ok = false;
+            for (admitted, matched_project) in candidates {
+                if admitted
+                    .project_only
+                    .as_ref()
+                    .or(indexing_project)
+                    .is_some_and(|project| {
+                        !part.in_project(project) || !metadata.in_project(project)
+                    })
+                {
+                    last_error = Some(DomainError::AccessDenied.into());
+                    continue;
+                }
+                if let ProviderCurrentContent::Ability {
+                    reference,
+                    provenance,
+                    requires_explicit_binding,
+                    ..
+                } = metadata
+                {
+                    let identity = AbilityIdentity {
+                        id: reference.ability.clone(),
+                        placement: provenance.current.placement.clone(),
+                    };
+                    let ability_project = match &identity.placement {
+                        AbilityPlacement::OwnedProject(folder) => Some(folder),
+                        AbilityPlacement::OwnedSpace(_) => admitted
+                            .project_only
+                            .as_ref()
+                            .or(indexing_project)
+                            .or(matched_project),
+                        AbilityPlacement::OwnedPersonal(_) | AbilityPlacement::System => {
+                            admitted.project_only.as_ref().or(matched_project)
+                        }
+                    };
+                    if !self
+                        .control
+                        .ability_admitted_for_provider(
+                            tx,
+                            &identity,
+                            ability_project,
+                            *requires_explicit_binding,
+                        )
+                        .await?
+                    {
+                        last_error = Some(DomainError::ResourceNotFound.into());
+                        continue;
+                    }
+                }
+                match ClassEgressFence::revalidate(part, &auth, &admitted.policy, metadata) {
+                    Ok(()) => {
+                        admitted_ok = true;
+                        break;
+                    }
+                    Err(err) => {
+                        last_error = Some(err.into());
+                    }
+                }
             }
-            ClassEgressFence::revalidate(part, &auth, &admitted.policy, metadata)?;
+            if !admitted_ok {
+                return Err(last_error.unwrap_or_else(selection::unavailable));
+            }
+            dependencies.push(*metadata);
+        }
+        while let Some(source) = dependencies.pop() {
+            if !checked_dependencies.insert(json(&source.origin())?) {
+                continue;
+            }
+            let Some(proof) = source.provenance() else {
+                continue;
+            };
+            for witnessed in &proof.projects {
+                if !secondary_projects.contains(witnessed) && Some(witnessed) != project {
+                    return Err(invalid(ValidationReason::SourceMismatch));
+                }
+            }
+            for origin in &proof.origins {
+                let key = json(origin)?;
+                let dependency = metadata
+                    .get(&key)
+                    .ok_or_else(|| invalid(ValidationReason::SourceMismatch))?;
+                let candidates = candidate_policies_for(dependency, None)?;
+                let mut last_error: Option<PortError> = None;
+                let mut admitted_ok = false;
+                for (admitted, matched_project) in candidates {
+                    if admitted
+                        .project_only
+                        .as_ref()
+                        .is_some_and(|project| !dependency.in_project(project))
+                    {
+                        last_error = Some(DomainError::AccessDenied.into());
+                        continue;
+                    }
+                    if let ProviderCurrentContent::Ability {
+                        reference,
+                        provenance,
+                        requires_explicit_binding,
+                        ..
+                    } = dependency
+                    {
+                        let identity = AbilityIdentity {
+                            id: reference.ability.clone(),
+                            placement: provenance.current.placement.clone(),
+                        };
+                        let ability_project = match &identity.placement {
+                            AbilityPlacement::OwnedProject(folder) => Some(folder),
+                            AbilityPlacement::OwnedSpace(_) => admitted
+                                .project_only
+                                .as_ref()
+                                .or(indexing_project)
+                                .or(matched_project),
+                            AbilityPlacement::OwnedPersonal(_) | AbilityPlacement::System => {
+                                admitted.project_only.as_ref().or(matched_project)
+                            }
+                        };
+                        if !self
+                            .control
+                            .ability_admitted_for_provider(
+                                tx,
+                                &identity,
+                                ability_project,
+                                *requires_explicit_binding,
+                            )
+                            .await?
+                        {
+                            last_error = Some(DomainError::ResourceNotFound.into());
+                            continue;
+                        }
+                    }
+                    match ClassEgressFence::revalidate_origin(&auth, &admitted.policy, dependency) {
+                        Ok(()) => {
+                            admitted_ok = true;
+                            break;
+                        }
+                        Err(err) => {
+                            last_error = Some(err.into());
+                        }
+                    }
+                }
+                if !admitted_ok {
+                    return Err(last_error.unwrap_or_else(selection::unavailable));
+                }
+                if used.insert(key) {
+                    dependencies.push(dependency);
+                }
+            }
         }
         if used.len() != metadata.len() {
             return Err(invalid(ValidationReason::SourceMismatch));
         }
-        let mut selectors = vec![
-            RevocationSelector::Principal(auth.principal().clone()),
-            RevocationSelector::Principal(PrincipalId::parse(&resource.owner_id)?),
-            RevocationSelector::Grant(auth.grant().clone()),
-            RevocationSelector::ProviderResource(ProviderResourceId::parse(&resource.id)?),
-        ];
+        // Query-only embeddings carry no instructions. The credential recheck above
+        // validates the approved packages under the primary Space's egress lease.
+        let query_only = !embedding_inputs.is_empty()
+            && embedding_inputs
+                .iter()
+                .all(|input| matches!(input, EmbeddingInput::Query(_)));
+        if let Some(keeper) = keeper.filter(|_| !query_only) {
+            for approved in keeper.approved() {
+                if !parts.iter().any(|part| {
+                    let Ok(key) = json(&part.origin()) else {
+                        return false;
+                    };
+                    match metadata.get(&key).copied() {
+                        Some(ProviderCurrentContent::Ability {
+                            reference,
+                            provenance,
+                            ..
+                        }) => {
+                            reference.ability == approved.id
+                                && reference.package_revision == approved.revision
+                                && provenance.current.placement == approved.placement
+                                && matches!(
+                                    reference.resource,
+                                    notarium_core::model::AbilityResourceName::Entrypoint
+                                )
+                        }
+                        Some(ProviderCurrentContent::SystemAbility {
+                            ability, revision, ..
+                        }) => {
+                            approved.placement == AbilityPlacement::System
+                                && ability == &approved.id
+                                && revision == &approved.revision
+                        }
+                        _ => false,
+                    }
+                }) {
+                    return Err(invalid(ValidationReason::SourceMismatch));
+                }
+            }
+        }
+        let mut selectors = auth.selectors_for_revocation(spaces.keys())?;
         if let Some(EmbeddingSelection::SearchDefault {
             project: selected_project,
         }) = selection
@@ -327,40 +779,51 @@ impl ProviderService {
             }) {
                 return Err(invalid(ValidationReason::NotReady));
             }
-            selectors.push(RevocationSelector::SearchEmbeddingDefault(space.id.clone()));
+            selectors.insert(RevocationSelector::SearchEmbeddingDefault(space.id.clone()));
         }
-        if let Some(credential) = &snapshot.credential {
-            selectors.push(RevocationSelector::Credential(CredentialId::parse(
-                &credential.id,
-            )?));
-        }
-        let expires_at_ms=match auth.credential().ok_or(DomainError::AuthenticationFailed)? {
-            AuthenticatedCredential::Session(id)=>{selectors.push(RevocationSelector::Session(id.clone()));Some(rows!(tx,(i64,),fetch_one,"SELECT expires_at FROM sessions WHERE session_id=$1","SELECT expires_at FROM v1_control.sessions WHERE session_id=$1";id.as_str())?.0)},
-            AuthenticatedCredential::Pat(id)=>rows!(tx,(Option<i64>,),fetch_one,"SELECT expires_at FROM pats WHERE token_id=$1","SELECT expires_at FROM v1_control.pats WHERE token_id=$1";id.as_str())?.0,
-            AuthenticatedCredential::OAuth{token,grant,family}=>{selectors.push(RevocationSelector::OAuthAccess(token.clone()));selectors.push(RevocationSelector::OAuthGrant(grant.clone()));if let Some(family)=family{selectors.push(RevocationSelector::OAuthFamily(family.clone()));}Some(rows!(tx,(i64,),fetch_one,"SELECT expires_at FROM oauth_access_tokens WHERE token_id=$1","SELECT expires_at FROM v1_control.oauth_access_tokens WHERE token_id=$1";token.as_str())?.0)},
-            AuthenticatedCredential::TrustedNone | AuthenticatedCredential::SearchIndexing { .. }=>None,
-            AuthenticatedCredential::ScheduledRun{schedule,run,..}=>{
-                selectors.push(RevocationSelector::Schedule(schedule.clone()));
-                selectors.push(RevocationSelector::ScheduledRun(run.clone()));
-                Some(rows!(tx,(i64,),fetch_one,"SELECT expires_at FROM agent_schedule_runs WHERE run_id=$1","SELECT expires_at FROM v1_control.agent_schedule_runs WHERE run_id=$1";run.as_str())?.0)
-            },
+        let revocation_scope = ProviderRevocationScope {
+            owner: PrincipalId::parse(&resource.owner_id)?,
+            credential: snapshot
+                .credential
+                .as_ref()
+                .map(|row| CredentialId::parse(&row.id))
+                .transpose()?,
         };
-        for space in spaces.keys() {
-            selectors.push(RevocationSelector::Space(space.clone()));
-            selectors.push(RevocationSelector::Membership {
-                space: space.clone(),
-                principal: auth.principal().clone(),
-            });
-        }
-        let expires_at_ms = policies
-            .values()
+        selectors.extend(revocation_scope.selectors(&ProviderResourceId::parse(&resource.id)?));
+        let expires_at_ms = crate::service::sessions::credential_expiry(
+            tx,
+            auth.credential().ok_or(DomainError::AuthenticationFailed)?,
+        )
+        .await?;
+        let all_policies = || {
+            space_policies
+                .values()
+                .chain(secondary_project_policies.values())
+        };
+        let (disclosed_classes, disclosed_project_only) = if query_only {
+            (BTreeSet::new(), None)
+        } else {
+            let classes: BTreeSet<DocClass> = all_policies()
+                .flat_map(|policy| policy.policy.allowed_classes.iter().copied())
+                .filter(|class| *class != DocClass::EncryptedNote)
+                .collect();
+            let mut projects = all_policies().map(|policy| policy.project_only.as_ref());
+            let project_only = match projects.next().flatten() {
+                Some(first) if projects.all(|next| next == Some(first)) => Some(first.clone()),
+                _ => None,
+            };
+            (classes, project_only)
+        };
+        let expires_at_ms = all_policies()
             .filter_map(|policy| policy.expires_at_ms)
             .chain(expires_at_ms)
             .min();
         Ok(Validated {
             auth,
-            selectors,
+            selectors: selectors.into_iter().collect(),
             spaces: spaces.into_keys().collect(),
+            disclosed_classes,
+            disclosed_project_only,
             expires_at_ms,
         })
     }
@@ -445,4 +908,22 @@ fn put_header(
     value.set_sensitive(true);
     headers.insert(name, value);
     Ok(())
+}
+
+#[cfg(test)]
+mod disclosure_tests {
+    use super::*;
+
+    #[test]
+    fn fail_closed_disclosure_never_admits_embedder_even_for_all_classes() {
+        let disclosure = RunQuerySourceDisclosure {
+            classes: BTreeSet::new(),
+            confined_project: Some(None),
+            fail_closed: true,
+        };
+        assert!(
+            !disclosure.allows_embedder(&DocClass::all(), None),
+            "overflow/unparseable disclosure must fail closed unconditionally"
+        );
+    }
 }

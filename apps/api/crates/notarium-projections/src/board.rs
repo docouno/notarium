@@ -17,14 +17,12 @@ use notarium_core::{
     model::Lifecycle,
     ports::{
         BoardGroupFieldKind, BoardMoveFacts, BoardMoveFactsSpec, BoardMutationFactsProvider,
-        BoardPlannerAuthority, BoardViewRollbackFacts, EvaluatedBoardGroup, EvaluatedBoardRow,
-        GroupKey, MoveBoardCard, PlannedNoteRestoration, PortFuture, RankExpectation,
-        RollbackBoardFacts, RollbackBoardFactsRequest, SemanticPlacement, SpaceContext, ViewRef,
+        BoardPlannerAuthority, EvaluatedBoardGroup, EvaluatedBoardRow, GroupKey, MoveBoardCard,
+        PortFuture, RankExpectation, SemanticPlacement, SpaceContext, ViewRef,
     },
     query::{FieldObservation, FieldSchema, FieldValue},
     value::YamlValue,
 };
-use notarium_syntax::extract::{ExtractedDocDelta, extract};
 
 use crate::{
     nota::{NotaDescriptor, ViewKind, compile_projected_views},
@@ -97,47 +95,9 @@ impl BoardMutationFactsProvider for ProjectionBoardPlanner {
                 [(&spec.view, spec.groups.as_slice())],
                 std::iter::once(&intent.note),
                 auth_folder.iter(),
-                std::iter::empty(),
                 &deadline,
             )?;
             Ok(BoardMoveFacts::attest(authority, spec))
-        })
-    }
-
-    fn evaluate_rollback<'a>(
-        &'a self,
-        authority: &'a BoardPlannerAuthority,
-        ctx: SpaceContext,
-        request: RollbackBoardFactsRequest,
-    ) -> PortFuture<'a, RollbackBoardFacts> {
-        Box::pin(async move {
-            let engine = self.engine()?;
-            let deadline = PlannerDeadline::start(&ctx);
-            let cut = BoardCut::load(
-                &engine,
-                &ctx,
-                request.cutoff,
-                request.views.iter(),
-                request.eligible_notes.iter().map(|note| &note.note),
-                &deadline,
-            )
-            .await?;
-            let (views, auth_folders) = evaluate_rollback(&cut, &ctx, &request, &deadline)?;
-            let _permit = cut.check_live(
-                &engine,
-                &ctx,
-                request.cutoff,
-                views
-                    .iter()
-                    .map(|(view, facts)| (view, facts.groups.as_slice())),
-                std::iter::empty(),
-                auth_folders.iter(),
-                request.eligible_notes.iter(),
-                &deadline,
-            )?;
-            Ok(RollbackBoardFacts::attest(
-                authority, cut.scope, cut.cutoff, views,
-            ))
         })
     }
 }
@@ -223,52 +183,6 @@ fn evaluate_move(
         },
         auth_folder,
     ))
-}
-
-fn evaluate_rollback(
-    cut: &BoardCut,
-    ctx: &SpaceContext,
-    request: &RollbackBoardFactsRequest,
-    deadline: &PlannerDeadline,
-) -> Result<
-    (
-        BTreeMap<ViewRef, BoardViewRollbackFacts>,
-        BTreeSet<FolderId>,
-    ),
-    PortError,
-> {
-    let mut views = BTreeMap::new();
-    let mut auth_folders = BTreeSet::new();
-    for view in &request.views {
-        deadline.check()?;
-        let plan = board_plan(cut, ctx, view)?;
-        if let Some(folder) =
-            view_authorization_folder(&plan.descriptor.source, plan.source_folder.as_ref())
-        {
-            auth_folders.insert(folder.clone());
-        }
-        let groups = plan.groups(cut, ctx, view, deadline)?;
-        let mut post_restore_membership = BTreeMap::new();
-        for restoration in &request.eligible_notes {
-            deadline.check()?;
-            let membership = restored_membership(cut, ctx, &plan, restoration)?;
-            post_restore_membership.insert(restoration.note.clone(), membership);
-        }
-        views.insert(
-            view.clone(),
-            BoardViewRollbackFacts {
-                view: view.clone(),
-                view_revision: plan.view_revision,
-                schema_revision: cut.schema_revision(),
-                descriptor_fingerprint: cut.schema_fingerprint(),
-                group_field: plan.group_field,
-                group_field_kind: plan.group_field_kind,
-                groups,
-                post_restore_membership,
-            },
-        );
-    }
-    Ok((views, auth_folders))
 }
 
 struct BoardPlan<'a> {
@@ -454,73 +368,6 @@ fn proposed_raw_fields(
         }
     }
     Ok(Some(raw))
-}
-
-fn restored_membership(
-    cut: &BoardCut,
-    ctx: &SpaceContext,
-    plan: &BoardPlan<'_>,
-    restoration: &PlannedNoteRestoration,
-) -> Result<Option<GroupKey>, PortError> {
-    if restoration.planned_lifecycle != Lifecycle::Active
-        || restoration.planned_class == DocClass::EncryptedNote
-        || !cut.ancestry(&restoration.planned_parent_folder)?.active
-    {
-        return Ok(None);
-    }
-    let current = cut
-        .notes
-        .get(&restoration.note)
-        .ok_or(DomainError::ResourceNotFound)?;
-    if current.revision != restoration.current_revision {
-        return Err(DomainError::validation(ValidationReason::CursorStale).into());
-    }
-    let inline_tags = if let Some(carrier) = restoration
-        .planned_carrier
-        .as_deref()
-        .filter(|_| !plan.descriptor.source.tags.is_empty())
-    {
-        match extract(
-            carrier,
-            restoration.planned_class,
-            &restoration.note,
-            "",
-            None,
-        )? {
-            ExtractedDocDelta::Plain(doc) => doc.tags.into_iter().map(|tag| tag.key).collect(),
-            ExtractedDocDelta::Encrypted(_) => Vec::new(),
-        }
-    } else {
-        Vec::new()
-    };
-    let raw: BTreeMap<_, _> = restoration
-        .planned_fields
-        .iter()
-        .filter_map(|(key, value)| value.as_ref().map(|value| (key.clone(), value.clone())))
-        .collect();
-    let raw = (!raw.is_empty() || restoration.planned_header_diagnostic.is_none()).then_some(&raw);
-    let tags = effective_tags(&inline_tags, raw).into_iter().collect();
-    let fields = evaluate_fields_with_schema(
-        raw,
-        restoration.planned_header_diagnostic.as_ref(),
-        Some(plan.fields),
-    );
-    let group = plan.group(
-        cut,
-        &restoration.planned_parent_folder,
-        restoration.planned_class,
-        &tags,
-        &fields,
-    )?;
-    if group.is_some() {
-        cut.authorize_placement(
-            ctx,
-            &restoration.planned_parent_folder,
-            restoration.planned_class,
-            restoration.planned_ability.clone(),
-        )?;
-    }
-    Ok(group)
 }
 
 fn semantic_placement(groups: &[EvaluatedBoardGroup], target: &NoteId) -> SemanticPlacement {

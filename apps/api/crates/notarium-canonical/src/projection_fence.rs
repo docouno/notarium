@@ -296,6 +296,7 @@ struct FolderNode {
     parent: Option<u32>,
     lifecycle: Lifecycle,
     write_locked: bool,
+    is_project: bool,
 }
 
 impl LiveState {
@@ -403,6 +404,7 @@ impl LiveState {
             parent: None,
             lifecycle: Lifecycle::Purged,
             write_locked: false,
+            is_project: false,
         });
         Ok(slot)
     }
@@ -418,6 +420,7 @@ impl LiveState {
             parent,
             lifecycle: row.lifecycle,
             write_locked: row.write_locked,
+            is_project: row.is_project,
         };
         self.enforce_limit()
     }
@@ -476,8 +479,14 @@ impl LiveState {
         }
     }
 
-    fn ancestry(&self, start: u32) -> Option<(Vec<FolderId>, bool, bool)> {
+    fn resource_facts(
+        &self,
+        start: u32,
+        class: DocClass,
+        ability: Option<&AbilityId>,
+    ) -> Option<(ResourceFacts, bool)> {
         let mut ancestors = Vec::new();
+        let mut project = None;
         let mut slot = start;
         let mut write_locked = false;
         let mut trashed = false;
@@ -487,11 +496,24 @@ impl LiveState {
             let node = self.folders.get(slot as usize)?;
             trashed |= node.lifecycle != Lifecycle::Active;
             write_locked |= node.write_locked;
+            if node.is_project && project.is_none() {
+                project = Some(node.id.clone());
+            }
             ancestors.push(node.id.clone());
             match node.parent {
                 Some(parent) => slot = parent,
                 None if node.id == self.record.root_folder_id => {
-                    return Some((ancestors, write_locked, trashed));
+                    return Some((
+                        ResourceFacts {
+                            space: self.record.space.clone(),
+                            class,
+                            project,
+                            ancestor_folders: ancestors,
+                            folder_write_locked: write_locked,
+                            ability_package: ability.cloned(),
+                        },
+                        trashed,
+                    ));
                 }
                 None => return None,
             }
@@ -1077,17 +1099,11 @@ impl LiveReadPermit {
         active_ancestors_only: bool,
     ) -> Option<ResourceFacts> {
         let slot = *state.folder_slots.get(folder)?;
-        let (ancestor_folders, folder_write_locked, trashed) = state.ancestry(slot)?;
+        let (facts, trashed) = state.resource_facts(slot, DocClass::UserDoc, None)?;
         if active_ancestors_only && trashed {
             return None;
         }
-        Some(ResourceFacts {
-            space: state.record.space.clone(),
-            class: DocClass::UserDoc,
-            ancestor_folders,
-            folder_write_locked,
-            ability_package: None,
-        })
+        Some(facts)
     }
 
     pub fn classify(
@@ -1104,7 +1120,7 @@ impl LiveReadPermit {
         let Some((parent, class, lifecycle, ability)) = state.note(note) else {
             return Ok(LiveNoteStatus::PurgedOrAbsent);
         };
-        let Some((ancestor_folders, folder_write_locked, trashed)) = state.ancestry(parent) else {
+        let Some((facts, trashed)) = state.resource_facts(parent, class, ability) else {
             return Ok(LiveNoteStatus::PurgedOrAbsent);
         };
         if active_ancestors_only && trashed {
@@ -1114,13 +1130,6 @@ impl LiveReadPermit {
             Lifecycle::Active
         } else {
             Lifecycle::Trashed
-        };
-        let facts = ResourceFacts {
-            space: state.record.space.clone(),
-            class,
-            ancestor_folders,
-            folder_write_locked,
-            ability_package: ability.cloned(),
         };
         if ctx.auth().can_view_resource(&facts).is_err() {
             return Ok(LiveNoteStatus::HiddenByAuth {
@@ -1150,10 +1159,6 @@ pub(crate) struct LiveWriteSet {
 }
 
 impl LiveWriteSet {
-    pub(crate) fn has_live_state(&self) -> bool {
-        self.guards.iter().any(|guard| guard.state().is_some())
-    }
-
     fn guard_refresh_changes(
         state: &LiveState,
         windows: &[VisibilityWindow],

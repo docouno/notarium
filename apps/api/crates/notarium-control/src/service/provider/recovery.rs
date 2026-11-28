@@ -69,55 +69,68 @@ impl ProviderService {
         for observed in candidates.rows {
             cursor.created = observed.created_at;
             cursor.id = observed.call_id.clone();
-            let id = RequestId::parse(&observed.call_id)?;
-            let mut tx = self.control.store.write(budget.clone()).await?;
-            let row = budget
-                .run(
-                    accounting::call(tx.inner_mut(), &id),
-                    CommitEffect::NotCommitted,
-                )
-                .await?;
-            if row.delivery_state == "settled" || row.created_at > cursor.before {
-                budget
-                    .run(tx.rollback(), CommitEffect::NotCommitted)
+            let step = async {
+                let id = RequestId::parse(&observed.call_id)?;
+                let mut tx = self.control.store.write(budget.clone()).await?;
+                let row = budget
+                    .run(
+                        accounting::call(tx.inner_mut(), &id),
+                        CommitEffect::NotCommitted,
+                    )
                     .await?;
-                continue;
+                if row.delivery_state == "settled" || row.created_at > cursor.before {
+                    budget
+                        .run(tx.rollback(), CommitEffect::NotCommitted)
+                        .await?;
+                    return Ok(false);
+                }
+                let fence = budget
+                    .run(
+                        self.control.revoker.fence_inactive_provider(
+                            MaintenanceContext {
+                                authority: ServiceAuthority::admit(ServicePurpose::Revocation),
+                                budget: budget.context(id.clone()),
+                            },
+                            id,
+                        ),
+                        CommitEffect::NotCommitted,
+                    )
+                    .await?;
+                let Some(fence) = fence else {
+                    budget
+                        .run(tx.rollback(), CommitEffect::NotCommitted)
+                        .await?;
+                    return Ok(false);
+                };
+                fence.check()?;
+                tx.hold_revocation_fence(fence);
+                budget
+                    .run(
+                        accounting::settle(
+                            tx.inner_mut(),
+                            row,
+                            ProviderUsage::Unknown,
+                            ProviderOutcome::Unknown,
+                            None,
+                            now,
+                        ),
+                        CommitEffect::NotCommitted,
+                    )
+                    .await?;
+                budget.commit_tx(tx).await?;
+                Ok(true)
             }
-            let fence = budget
-                .run(
-                    self.control.revoker.fence_inactive_provider(
-                        MaintenanceContext {
-                            authority: ServiceAuthority::admit(ServicePurpose::Revocation),
-                            budget: budget.context(id.clone()),
-                        },
-                        id,
-                    ),
-                    CommitEffect::NotCommitted,
-                )
-                .await?;
-            let Some(fence) = fence else {
-                budget
-                    .run(tx.rollback(), CommitEffect::NotCommitted)
-                    .await?;
-                continue;
-            };
-            fence.check()?;
-            tx.hold_revocation_fence(fence);
-            budget
-                .run(
-                    accounting::settle(
-                        tx.inner_mut(),
-                        row,
-                        ProviderUsage::Unknown,
-                        ProviderOutcome::Unknown,
-                        None,
-                        now,
-                    ),
-                    CommitEffect::NotCommitted,
-                )
-                .await?;
-            budget.run(tx.commit(), CommitEffect::Unknown).await?;
-            settled += 1;
+            .await
+            .map_err(|err| {
+                if settled > 0 {
+                    unknown_after_settlement(err)
+                } else {
+                    err
+                }
+            })?;
+            if step {
+                settled += 1;
+            }
         }
         let continuation = if candidates.has_more {
             Some(json(&cursor)?)
@@ -129,5 +142,34 @@ impl ProviderService {
             settled,
             continuation,
         })
+    }
+}
+
+fn unknown_after_settlement(error: PortError) -> PortError {
+    let make = || {
+        notarium_core::error::OperationalFailure::new(
+            ContentDigest::from_bytes(*blake3::hash(b"provider recovery partial").as_bytes()),
+            CommitEffect::Unknown,
+            notarium_core::error::RetryAdvice::Never,
+            false,
+        )
+        .expect("non-retryable failure")
+    };
+    match error {
+        PortError::Cancelled(f) if f.effect() == CommitEffect::Unknown => PortError::Cancelled(f),
+        PortError::DeadlineExceeded(f) if f.effect() == CommitEffect::Unknown => {
+            PortError::DeadlineExceeded(f)
+        }
+        PortError::Unavailable(f) if f.effect() == CommitEffect::Unknown => {
+            PortError::Unavailable(f)
+        }
+        PortError::Internal(f) if f.effect() == CommitEffect::Unknown => PortError::Internal(f),
+        PortError::Cancelled(_) => PortError::Cancelled(make()),
+        PortError::DeadlineExceeded(_) => PortError::DeadlineExceeded(make()),
+        PortError::Unavailable(_) => PortError::Unavailable(make()),
+        PortError::Internal(_) => PortError::Internal(make()),
+        PortError::Domain(_) => {
+            crate::error::unavailable("provider recovery partial", CommitEffect::Unknown)
+        }
     }
 }

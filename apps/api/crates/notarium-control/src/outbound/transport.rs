@@ -6,6 +6,13 @@ use crate::{
     error::{invalid, unavailable},
     store::lease::OperationBudget,
 };
+use bytes::Bytes;
+use http::{HeaderMap, HeaderValue, Method, Request, Uri, Version, header};
+use hyper::{
+    body::{Body, Frame, SizeHint},
+    client::conn::http1::{self, SendRequest},
+};
+use hyper_util::rt::TokioIo;
 use notarium_core::{
     DomainError,
     error::{
@@ -14,14 +21,24 @@ use notarium_core::{
     ids::{ContentDigest, ProviderResourceId},
     ports::{CallBudget, Cancellation},
 };
-use reqwest::{Client, Method, header::HeaderMap};
 use std::{
     collections::HashMap,
     future::Future,
+    io,
+    net::{IpAddr, SocketAddr},
+    pin::Pin,
     sync::{Arc, Mutex},
+    task::{Context, Poll},
     time::Duration,
 };
-use tokio::sync::{OnceCell, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    net::TcpStream,
+    sync::{OnceCell, OwnedSemaphorePermit, Semaphore, mpsc, oneshot},
+    time::Instant,
+};
+use tokio_rustls::{TlsConnector, client::TlsStream};
+use url::Host;
 
 pub const DEFAULT_MAX_ACTIVE_REQUESTS: usize = 64;
 const MAX_ACTIVE_REQUESTS_CAP: usize = 1024;
@@ -29,21 +46,17 @@ const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_CLIENTS: usize = 128;
+const MAX_IDLE_PER_SLOT: usize = 2;
 const CHUNK_BYTES: usize = 64 * 1024;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const IDLE_CHUNK_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn failed() -> PortError {
     unavailable("control outbound request", CommitEffect::Unknown)
 }
-fn send_failed(error: reqwest::Error) -> PortError {
-    // With proxies and request retries disabled, connector failure occurs before
-    // HTTP application bytes. Other failures may follow a partial or full POST.
-    let effect = if error.is_connect() {
-        CommitEffect::NotCommitted
-    } else {
-        CommitEffect::Unknown
-    };
-    unavailable("control outbound request", effect)
+fn connect_failed() -> PortError {
+    unavailable("control outbound request", CommitEffect::NotCommitted)
 }
 fn saturated() -> PortError {
     DomainError::RateLimited {
@@ -52,11 +65,11 @@ fn saturated() -> PortError {
     }
     .into()
 }
-fn cancelled() -> PortError {
+fn cancelled(effect: CommitEffect) -> PortError {
     PortError::Cancelled(
         OperationalFailure::new(
             ContentDigest::from_bytes(*blake3::hash(b"control outbound cancellation").as_bytes()),
-            CommitEffect::Unknown,
+            effect,
             RetryAdvice::Never,
             false,
         )
@@ -74,6 +87,65 @@ fn header_bytes(headers: &HeaderMap) -> Result<usize, PortError> {
         }
     }
     Ok(total)
+}
+
+fn transfer_encoding_ends_with_chunked(headers: &HeaderMap) -> bool {
+    let mut last_token: Option<String> = None;
+    for value in headers.get_all(header::TRANSFER_ENCODING) {
+        let Ok(text) = value.to_str() else {
+            return false;
+        };
+        for token in text.split(',') {
+            let token = token.trim();
+            if !token.is_empty() {
+                last_token = Some(token.to_ascii_lowercase());
+            }
+        }
+    }
+    last_token.as_deref() == Some("chunked")
+}
+
+fn response_allows_keep_alive<B>(response: &http::Response<B>) -> bool {
+    let status = response.status().as_u16();
+    if status == 101 || (100..200).contains(&status) {
+        return false;
+    }
+    let mut saw_close = false;
+    let mut saw_keep_alive = false;
+    for value in response.headers().get_all(header::CONNECTION) {
+        let Ok(text) = value.to_str() else {
+            return false;
+        };
+        for token in text.split(',') {
+            let token = token.trim();
+            if token.eq_ignore_ascii_case("close") {
+                saw_close = true;
+            } else if token.eq_ignore_ascii_case("keep-alive") {
+                saw_keep_alive = true;
+            }
+        }
+    }
+    if saw_close {
+        return false;
+    }
+    let version_allows = match response.version() {
+        Version::HTTP_11 => true,
+        Version::HTTP_10 => saw_keep_alive,
+        _ => false,
+    };
+    if !version_allows {
+        return false;
+    }
+    // RFC 9112 §6.3: close-delimited responses terminate the connection at EOF
+    // and must never be returned to the keep-alive pool. When Transfer-Encoding
+    // is present, it takes precedence over Content-Length.
+    if matches!(status, 204 | 304) {
+        return true;
+    }
+    if response.headers().contains_key(header::TRANSFER_ENCODING) {
+        return transfer_encoding_ends_with_chunked(response.headers());
+    }
+    response.headers().contains_key(header::CONTENT_LENGTH)
 }
 
 /// Deliberately not Debug: URLs, headers and bodies may contain confidential
@@ -139,16 +211,331 @@ impl OutboundRequest {
     }
 }
 
+struct UploadTracker {
+    body_done: bool,
+    wrote_bytes: bool,
+    flushed: bool,
+    uploaded: Option<oneshot::Sender<()>>,
+}
+
+struct TrackedRequestBody {
+    remaining: Bytes,
+    tracker: Arc<Mutex<Option<UploadTracker>>>,
+}
+impl Body for TrackedRequestBody {
+    type Data = Bytes;
+    type Error = io::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        if self.remaining.is_empty() {
+            if let Ok(mut guard) = self.tracker.lock()
+                && let Some(tracker) = guard.as_mut()
+            {
+                tracker.body_done = true;
+            }
+            return Poll::Ready(None);
+        }
+        let take = self.remaining.len().min(CHUNK_BYTES);
+        let chunk = self.remaining.split_to(take);
+        if self.remaining.is_empty()
+            && let Ok(mut guard) = self.tracker.lock()
+            && let Some(tracker) = guard.as_mut()
+        {
+            tracker.body_done = true;
+        }
+        Poll::Ready(Some(Ok(Frame::data(chunk))))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.remaining.is_empty()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::with_exact(self.remaining.len() as u64)
+    }
+}
+
+enum TransportStream {
+    Plain(TcpStream),
+    Tls(Box<TlsStream<TcpStream>>),
+}
+impl AsyncRead for TransportStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_read(cx, buf),
+            Self::Tls(stream) => Pin::new(&mut **stream).poll_read(cx, buf),
+        }
+    }
+}
+impl AsyncWrite for TransportStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_write(cx, buf),
+            Self::Tls(stream) => Pin::new(&mut **stream).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_write_vectored(cx, bufs),
+            Self::Tls(stream) => Pin::new(&mut **stream).poll_write_vectored(cx, bufs),
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        match self {
+            Self::Plain(stream) => stream.is_write_vectored(),
+            Self::Tls(stream) => stream.is_write_vectored(),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_flush(cx),
+            Self::Tls(stream) => Pin::new(&mut **stream).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_shutdown(cx),
+            Self::Tls(stream) => Pin::new(&mut **stream).poll_shutdown(cx),
+        }
+    }
+}
+
+struct TrackedIo<S> {
+    inner: S,
+    tracker: Arc<Mutex<Option<UploadTracker>>>,
+}
+impl<S> TrackedIo<S> {
+    fn new(inner: S, tracker: Arc<Mutex<Option<UploadTracker>>>) -> Self {
+        Self { inner, tracker }
+    }
+    fn note_wrote(&self, n: usize) {
+        if n > 0
+            && let Ok(mut guard) = self.tracker.lock()
+            && let Some(tracker) = guard.as_mut()
+        {
+            tracker.wrote_bytes = true;
+        }
+    }
+    fn note_flushed(&self) {
+        if let Ok(mut guard) = self.tracker.lock()
+            && let Some(tracker) = guard.as_mut()
+            && tracker.body_done
+            && tracker.wrote_bytes
+        {
+            tracker.flushed = true;
+            if let Some(tx) = tracker.uploaded.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+}
+impl<S: AsyncRead + Unpin> AsyncRead for TrackedIo<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+impl<S: AsyncWrite + Unpin> AsyncWrite for TrackedIo<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let poll = Pin::new(&mut self.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(n)) = poll {
+            self.note_wrote(n);
+        }
+        poll
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let poll = Pin::new(&mut self.inner).poll_write_vectored(cx, bufs);
+        if let Poll::Ready(Ok(n)) = poll {
+            self.note_wrote(n);
+        }
+        poll
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let poll = Pin::new(&mut self.inner).poll_flush(cx);
+        if matches!(poll, Poll::Ready(Ok(()))) {
+            self.note_flushed();
+        }
+        poll
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+struct PooledConn {
+    sender: SendRequest<TrackedRequestBody>,
+    tracker: Arc<Mutex<Option<UploadTracker>>>,
+    conn_cancel: Cancellation,
+    conn_done: Option<oneshot::Receiver<()>>,
+    last_used: Instant,
+}
+impl PooledConn {
+    fn finish_upload_wait(&self) {
+        if let Ok(mut guard) = self.tracker.lock()
+            && let Some(tracker) = guard.as_mut()
+        {
+            tracker.uploaded = None;
+        }
+    }
+    fn finish_tracker(&self) -> bool {
+        if let Ok(mut guard) = self.tracker.lock() {
+            guard.take().is_some_and(|tracker| tracker.flushed)
+        } else {
+            false
+        }
+    }
+    async fn close(mut self) {
+        let _ = self.finish_tracker();
+        self.conn_cancel.cancel();
+        if let Some(done) = self.conn_done.take() {
+            let _ = done.await;
+        }
+    }
+}
+impl Drop for PooledConn {
+    fn drop(&mut self) {
+        let _ = self.finish_tracker();
+        self.conn_cancel.cancel();
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct PoolKey {
     scope: OutboundScope,
     origin: String,
     policy_epoch: u64,
 }
+struct IdlePool {
+    conns: Vec<PooledConn>,
+    reaper_running: bool,
+}
 struct Slot {
     endpoint: CheckedEndpoint,
-    client: OnceCell<Client>,
+    tls: OnceCell<Option<Arc<rustls::ClientConfig>>>,
+    idle: Mutex<IdlePool>,
     cancelled: Cancellation,
+}
+impl Slot {
+    fn cancel(&self) {
+        self.cancelled.cancel();
+        if let Ok(mut idle) = self.idle.lock() {
+            idle.conns.clear();
+        }
+    }
+    fn pop_idle(&self) -> Option<PooledConn> {
+        let mut idle = self.idle.lock().ok()?;
+        while let Some(conn) = idle.conns.pop() {
+            if conn.last_used.elapsed() < POOL_IDLE_TIMEOUT && !conn.sender.is_closed() {
+                return Some(conn);
+            }
+        }
+        None
+    }
+    fn push_idle(self: &Arc<Self>, conn: PooledConn) -> Option<PooledConn> {
+        let spawn_reaper = {
+            let Ok(mut idle) = self.idle.lock() else {
+                return Some(conn);
+            };
+            if self.cancelled.is_cancelled() || conn.sender.is_closed() {
+                return Some(conn);
+            }
+            idle.conns
+                .retain(|c| c.last_used.elapsed() < POOL_IDLE_TIMEOUT && !c.sender.is_closed());
+            if idle.conns.len() < MAX_IDLE_PER_SLOT {
+                idle.conns.push(conn);
+                if !idle.reaper_running {
+                    idle.reaper_running = true;
+                    true
+                } else {
+                    false
+                }
+            } else {
+                return Some(conn);
+            }
+        };
+        if spawn_reaper {
+            let weak = Arc::downgrade(self);
+            let cancel = self.cancelled.clone();
+            tokio::spawn(async move {
+                loop {
+                    let next_deadline = {
+                        let Some(slot) = weak.upgrade() else {
+                            return;
+                        };
+                        let Ok(mut idle) = slot.idle.lock() else {
+                            return;
+                        };
+                        if slot.cancelled.is_cancelled() {
+                            idle.conns.clear();
+                            idle.reaper_running = false;
+                            return;
+                        }
+                        idle.conns.retain(|c| {
+                            c.last_used.elapsed() < POOL_IDLE_TIMEOUT && !c.sender.is_closed()
+                        });
+                        match idle.conns.iter().map(|c| c.last_used).min() {
+                            Some(oldest) => oldest + POOL_IDLE_TIMEOUT,
+                            None => {
+                                idle.reaper_running = false;
+                                return;
+                            }
+                        }
+                    };
+                    tokio::select! {
+                        biased;
+                        () = cancel.cancelled() => {
+                            if let Some(slot) = weak.upgrade()
+                                && let Ok(mut idle) = slot.idle.lock()
+                            {
+                                idle.conns.clear();
+                                idle.reaper_running = false;
+                            }
+                            return;
+                        }
+                        () = tokio::time::sleep_until(next_deadline) => {}
+                    }
+                }
+            });
+        }
+        None
+    }
 }
 struct Entry {
     slot: Arc<Slot>,
@@ -168,8 +555,11 @@ struct Shared {
     dns_admission: Arc<Semaphore>,
     dns_queue: Arc<Semaphore>,
     lookup: Option<Arc<dyn Lookup>>,
+    verifier: OnceCell<Arc<dyn rustls::client::danger::ServerCertVerifier>>,
     #[cfg(test)]
-    fixture: Option<(String, reqwest::Certificate)>,
+    connect_timeout: Duration,
+    #[cfg(test)]
+    fixture: Option<(String, Vec<u8>)>,
 }
 
 #[derive(Clone)]
@@ -222,10 +612,20 @@ impl OutboundTransport {
                 dns_admission: Arc::new(Semaphore::new(DEFAULT_DNS_PERMITS)),
                 dns_queue: Arc::new(Semaphore::new(DEFAULT_DNS_QUEUE)),
                 lookup,
+                verifier: OnceCell::new(),
+                #[cfg(test)]
+                connect_timeout: CONNECT_TIMEOUT,
                 #[cfg(test)]
                 fixture: None,
             }),
         }
+    }
+    #[cfg(test)]
+    fn with_connect_timeout(mut self, timeout: Duration) -> Self {
+        Arc::get_mut(&mut self.shared)
+            .expect("new transport")
+            .connect_timeout = timeout;
+        self
     }
     #[cfg(test)]
     pub(super) fn available_permits(&self) -> usize {
@@ -236,15 +636,11 @@ impl OutboundTransport {
         self.shared.max_active_requests
     }
     #[cfg(test)]
-    pub(super) fn fixture_https(
-        origin: String,
-        lookup: Arc<dyn Lookup>,
-        ca: reqwest::Certificate,
-    ) -> Self {
+    pub(super) fn fixture_https(origin: String, lookup: Arc<dyn Lookup>, ca_der: Vec<u8>) -> Self {
         let mut transport = Self::with_lookup(NetworkPolicy::default(), Some(lookup));
         Arc::get_mut(&mut transport.shared)
             .expect("new transport")
-            .fixture = Some((origin, ca));
+            .fixture = Some((origin, ca_der));
         transport
     }
     /// Operator policy changes cancel active calls and discard every old pool.
@@ -252,7 +648,7 @@ impl OutboundTransport {
         let mut state = self.shared.state.lock().map_err(|_| failed())?;
         let epoch = state.epoch.checked_add(1).ok_or_else(failed)?;
         for entry in state.clients.values() {
-            entry.slot.cancelled.cancel();
+            entry.slot.cancel();
         }
         state.clients.clear();
         state.policy = policy;
@@ -266,7 +662,7 @@ impl OutboundTransport {
         state.clients.retain(|key, entry| {
             if matches!(&key.scope, OutboundScope::Provider { resource: id, .. } if id == resource)
             {
-                entry.slot.cancelled.cancel();
+                entry.slot.cancel();
                 false
             } else {
                 true
@@ -314,7 +710,7 @@ impl OutboundTransport {
             state.clients.retain(|key, entry| {
                 if matches!(&key.scope, OutboundScope::Provider { resource: old_resource, runtime_epoch: old_epoch, credential_epoch: old_credential, .. }
                     if old_resource == resource && (old_epoch, old_credential) < (runtime_epoch, credential_epoch)) {
-                    entry.slot.cancelled.cancel(); false
+                    entry.slot.cancel(); false
                 } else { true }
             });
         }
@@ -337,11 +733,17 @@ impl OutboundTransport {
                 .min_by_key(|(_, entry)| entry.used)
                 .map(|(key, _)| key.clone())
                 .ok_or_else(saturated)?;
-            state.clients.remove(&oldest);
+            if let Some(evicted) = state.clients.remove(&oldest) {
+                evicted.slot.cancel();
+            }
         }
         let slot = Arc::new(Slot {
             endpoint: endpoint.clone(),
-            client: OnceCell::new(),
+            tls: OnceCell::new(),
+            idle: Mutex::new(IdlePool {
+                conns: Vec::new(),
+                reaper_running: false,
+            }),
             cancelled: Cancellation::default(),
         });
         state.clients.insert(
@@ -379,7 +781,6 @@ impl OutboundTransport {
         preflight: impl FnOnce() -> Result<(), PortError> + Send + 'static,
     ) -> Result<OutboundResponse, PortError> {
         call.remaining = call.remaining.min(request.validate()?);
-        let request_id = call.request.clone();
         let budget = OperationBudget::new(call);
         budget.check(CommitEffect::NotCommitted)?;
         let permit = self
@@ -392,6 +793,7 @@ impl OutboundTransport {
         let dropped = Cancellation::default();
         let guard = CancelOnDrop(dropped.clone());
         let (head_tx, head_rx) = oneshot::channel();
+        let (uploaded_tx, uploaded_rx) = oneshot::channel();
         let (chunks_tx, chunks_rx) = mpsc::channel(1);
         let (end_tx, end_rx) = oneshot::channel();
         let (closed_tx, closed_rx) = oneshot::channel();
@@ -401,57 +803,152 @@ impl OutboundTransport {
             dropped,
             _permit: permit,
         };
+        let shared = self.shared.clone();
         let lookup = self.shared.lookup.clone();
         let dns_admission = self.shared.dns_admission.clone();
         let dns_queue = self.shared.dns_queue.clone();
         #[cfg(test)]
+        let connect_timeout = self.shared.connect_timeout;
+        #[cfg(not(test))]
+        let connect_timeout = CONNECT_TIMEOUT;
+        #[cfg(test)]
         let fixture_ca = self.shared.fixture.as_ref().map(|(_, ca)| ca.clone());
         tokio::spawn(async move {
             let mut head_tx = Some(head_tx);
+            let mut uploaded_tx = Some(uploaded_tx);
+            let mut active_conn: Option<PooledConn> = None;
+            let mut keep_alive = false;
             let result = async {
-                // Certificate loading may touch the filesystem. The owner keeps
-                // its active slot through actual blocking construction even if
-                // the caller has already timed out or dropped the future.
-                let client = context
+                // Platform certificate verifier initialization may touch the
+                // OS trust store once per transport. Keep the active slot
+                // through blocking load even if the caller times out, while
+                // keeping a separate ClientConfig per Slot for TLS session isolation.
+                let tls_config = context
                     .slot
-                    .client
+                    .tls
                     .get_or_try_init(|| async {
-                        let endpoint = context.slot.endpoint.clone();
-                        tokio::task::spawn_blocking(move || {
-                            build_client(
-                                endpoint,
+                        if context.slot.endpoint.url().scheme() != "https" {
+                            return Ok::<Option<Arc<rustls::ClientConfig>>, PortError>(None);
+                        }
+                        let verifier = shared
+                            .verifier
+                            .get_or_try_init(|| async {
+                                tokio::task::spawn_blocking(move || {
+                                    load_cert_verifier(
+                                        #[cfg(test)]
+                                        fixture_ca,
+                                    )
+                                })
+                                .await
+                                .map_err(|_| connect_failed())?
+                            })
+                            .await?
+                            .clone();
+                        Ok(Some(build_tls_config(verifier)?))
+                    })
+                    .await?
+                    .clone();
+                context.check(CommitEffect::NotCommitted)?;
+                let mut pooled = context
+                    .run(
+                        async {
+                            while let Some(mut candidate) = context.slot.pop_idle() {
+                                if candidate.sender.ready().await.is_ok()
+                                    && !candidate.sender.is_closed()
+                                {
+                                    return Ok(Some(candidate));
+                                }
+                                candidate.close().await;
+                            }
+                            Ok(None)
+                        },
+                        CommitEffect::NotCommitted,
+                    )
+                    .await?;
+                if pooled.is_none() {
+                    let fresh = context
+                        .run(
+                            connect_fresh(
+                                endpoint.clone(),
+                                tls_config,
                                 lookup,
                                 dns_admission,
                                 dns_queue,
-                                #[cfg(test)]
-                                fixture_ca,
-                            )
-                        })
-                        .await
-                        .map_err(|_| failed())?
-                    })
+                                connect_timeout,
+                            ),
+                            CommitEffect::NotCommitted,
+                        )
+                        .await?;
+                    pooled = Some(fresh);
+                }
+                active_conn = pooled;
+                context.check(CommitEffect::NotCommitted)?;
+                preflight()?;
+                let conn = active_conn.as_mut().expect("acquired connection");
+                let body_bytes = Bytes::from(request.body);
+                let body_empty = body_bytes.is_empty();
+                let mut req_builder = Request::builder()
+                    .method(request.method.clone())
+                    .uri(origin_form_uri(&endpoint)?);
+                let req_headers = req_builder.headers_mut().ok_or_else(connect_failed)?;
+                req_headers.insert(header::HOST, host_header(&endpoint)?);
+                for (name, value) in &request.headers {
+                    req_headers.append(name.clone(), value.clone());
+                }
+                if request.method == Method::POST || !body_empty {
+                    req_headers.insert(
+                        header::CONTENT_LENGTH,
+                        HeaderValue::from_str(&body_bytes.len().to_string())
+                            .map_err(|_| connect_failed())?,
+                    );
+                }
+                {
+                    let mut guard = conn.tracker.lock().map_err(|_| connect_failed())?;
+                    *guard = Some(UploadTracker {
+                        body_done: body_empty,
+                        wrote_bytes: false,
+                        flushed: false,
+                        uploaded: uploaded_tx.take(),
+                    });
+                }
+                let tracked_body = TrackedRequestBody {
+                    remaining: body_bytes,
+                    tracker: conn.tracker.clone(),
+                };
+                let outgoing = req_builder
+                    .body(tracked_body)
+                    .map_err(|_| connect_failed())?;
+                let response = context
+                    .run(
+                        async {
+                            conn.sender
+                                .send_request(outgoing)
+                                .await
+                                .map_err(|_| failed())
+                        },
+                        CommitEffect::Unknown,
+                    )
                     .await?;
-                context.check()?;
-                let outgoing = client
-                    .request(request.method, endpoint.url().clone())
-                    .headers(request.headers)
-                    .body(request.body)
-                    .timeout(context.budget.context(request_id).remaining)
-                    .build()
-                    .map_err(|_| failed())?;
-                let mut response = context
-                    .run(async {
-                        preflight()?;
-                        client.execute(outgoing).await.map_err(send_failed)
-                    })
-                    .await?;
+                // If response headers arrived before the request body finished
+                // flushing, release wait_uploaded() immediately so the caller
+                // cannot deadlock against the bounded response chunk channel,
+                // while keeping `tracker.flushed` intact for socket teardown.
+                conn.finish_upload_wait();
+                keep_alive = response_allows_keep_alive(&response);
                 header_bytes(response.headers()).map_err(|_| failed())?;
-                if response
-                    .content_length()
-                    .is_some_and(|size| size > request.response_limit as u64)
+                if let Some(len) = response
+                    .headers()
+                    .get(header::CONTENT_LENGTH)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.trim().parse::<u64>().ok())
+                    && len > request.response_limit as u64
                 {
                     return Err(failed());
                 }
+                if response.body().size_hint().lower() > request.response_limit as u64 {
+                    return Err(failed());
+                }
+                let status = response.status().as_u16();
                 let mut headers = response.headers().clone();
                 for value in headers.values_mut() {
                     value.set_sensitive(true);
@@ -459,45 +956,80 @@ impl OutboundTransport {
                 head_tx
                     .take()
                     .expect("head once")
-                    .send(Ok((response.status().as_u16(), headers)))
-                    .map_err(|_| cancelled())?;
+                    .send(Ok((status, headers)))
+                    .map_err(|_| cancelled(CommitEffect::Unknown))?;
+                let mut resp_body = response.into_body();
                 let mut received = 0usize;
-                while let Some(chunk) = context
-                    .run(async {
-                        tokio::time::timeout(IDLE_CHUNK_TIMEOUT, response.chunk())
+                while let Some(frame) = context
+                    .run(
+                        async {
+                            tokio::time::timeout(
+                                IDLE_CHUNK_TIMEOUT,
+                                std::future::poll_fn(|cx| Pin::new(&mut resp_body).poll_frame(cx)),
+                            )
                             .await
                             .map_err(|_| failed())?
+                            .transpose()
                             .map_err(|_| failed())
-                    })
+                        },
+                        CommitEffect::Unknown,
+                    )
                     .await?
                 {
+                    let Ok(chunk) = frame.into_data() else {
+                        continue;
+                    };
+                    if chunk.is_empty() {
+                        continue;
+                    }
                     received = received.checked_add(chunk.len()).ok_or_else(failed)?;
                     if received > request.response_limit {
                         return Err(failed());
                     }
                     for part in chunk.chunks(CHUNK_BYTES) {
                         context
-                            .run(async {
-                                tokio::time::timeout(
-                                    IDLE_CHUNK_TIMEOUT,
-                                    chunks_tx.send(part.to_vec()),
-                                )
-                                .await
-                                .map_err(|_| failed())?
-                                .map_err(|_| cancelled())
-                            })
+                            .run(
+                                async {
+                                    tokio::time::timeout(
+                                        IDLE_CHUNK_TIMEOUT,
+                                        chunks_tx.send(part.to_vec()),
+                                    )
+                                    .await
+                                    .map_err(|_| failed())?
+                                    .map_err(|_| cancelled(CommitEffect::Unknown))
+                                },
+                                CommitEffect::Unknown,
+                            )
                             .await?;
                     }
                 }
                 Ok(())
             }
             .await;
+            drop(uploaded_tx);
+            if let Some(mut conn) = active_conn.take() {
+                let upload_flushed = conn.finish_tracker();
+                if result.is_ok()
+                    && upload_flushed
+                    && keep_alive
+                    && !context.slot.cancelled.is_cancelled()
+                    && !conn.sender.is_closed()
+                {
+                    conn.last_used = Instant::now();
+                    if let Some(rejected) = context.slot.push_idle(conn) {
+                        rejected.close().await;
+                    }
+                } else {
+                    conn.close().await;
+                }
+            }
             if let Some(head_tx) = head_tx {
                 let _ = head_tx.send(Err(result.as_ref().err().cloned().unwrap_or_else(failed)));
             }
             let _ = end_tx.send(result);
-            // Response, client lease and active admission are owned here. An
-            // unpolled consumer cannot keep a socket alive past the budget.
+            // Connection shutdown, pool return and active admission are owned
+            // here. An unpolled consumer cannot keep a socket alive past the
+            // budget, and `close()` does not return until aborted sockets drop.
             drop(context);
             let _ = closed_tx.send(());
         });
@@ -505,6 +1037,7 @@ impl OutboundTransport {
             status: 0,
             headers: HeaderMap::new(),
             head: Some(head_rx),
+            uploaded: UploadWait::Pending(uploaded_rx),
             budget,
             closed: closed_rx,
             chunks: chunks_rx,
@@ -515,40 +1048,168 @@ impl OutboundTransport {
     }
 }
 
-fn build_client(
+fn origin_form_uri(endpoint: &CheckedEndpoint) -> Result<Uri, PortError> {
+    let mut path_and_query = endpoint.url().path().to_owned();
+    if path_and_query.is_empty() {
+        path_and_query.push('/');
+    }
+    if let Some(query) = endpoint.url().query() {
+        path_and_query.push('?');
+        path_and_query.push_str(query);
+    }
+    path_and_query.parse().map_err(|_| connect_failed())
+}
+
+fn host_header(endpoint: &CheckedEndpoint) -> Result<HeaderValue, PortError> {
+    let host = endpoint.url().host_str().ok_or_else(connect_failed)?;
+    let value = match endpoint.url().port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_owned(),
+    };
+    HeaderValue::from_str(&value).map_err(|_| connect_failed())
+}
+
+fn load_cert_verifier(
+    #[cfg(test)] fixture_ca: Option<Vec<u8>>,
+) -> Result<Arc<dyn rustls::client::danger::ServerCertVerifier>, PortError> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    #[cfg(test)]
+    if let Some(der) = fixture_ca {
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(rustls::pki_types::CertificateDer::from(der))
+            .map_err(|_| connect_failed())?;
+        let verifier =
+            rustls::client::WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider)
+                .build()
+                .map_err(|_| connect_failed())?;
+        return Ok(verifier);
+    }
+    let verifier =
+        rustls_platform_verifier::Verifier::new(provider).map_err(|_| connect_failed())?;
+    Ok(Arc::new(verifier))
+}
+
+fn build_tls_config(
+    verifier: Arc<dyn rustls::client::danger::ServerCertVerifier>,
+) -> Result<Arc<rustls::ClientConfig>, PortError> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(|_| connect_failed())?
+    .dangerous()
+    .with_custom_certificate_verifier(verifier)
+    .with_no_client_auth();
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    config.key_log = Arc::new(rustls::NoKeyLog {});
+    Ok(Arc::new(config))
+}
+
+async fn connect_fresh(
     endpoint: CheckedEndpoint,
+    tls_config: Option<Arc<rustls::ClientConfig>>,
     lookup: Option<Arc<dyn Lookup>>,
     dns_admission: Arc<Semaphore>,
     dns_queue: Arc<Semaphore>,
-    #[cfg(test)] fixture_ca: Option<reqwest::Certificate>,
-) -> Result<Client, PortError> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let resolver = GuardedResolver::with_admission(
-        endpoint,
-        lookup.unwrap_or_else(GuardedResolver::default_lookup),
-        dns_admission,
-        dns_queue,
-    );
-    let builder = Client::builder()
-        .tls_backend_rustls()
-        .dns_resolver(Arc::new(resolver))
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .retry(reqwest::retry::never())
-        .referer(false)
-        .tls_sslkeylogfile(false)
-        .http1_only()
-        .http1_max_headers(100)
-        .connect_timeout(Duration::from_secs(5))
-        .pool_idle_timeout(Duration::from_secs(60))
-        .pool_max_idle_per_host(2);
-    #[cfg(test)]
-    let builder = match fixture_ca {
-        Some(ca) => builder.tls_certs_only([ca]),
-        None => builder,
-    };
-    builder.build().map_err(|_| failed())
+    connect_timeout: Duration,
+) -> Result<PooledConn, PortError> {
+    let port = endpoint
+        .url()
+        .port_or_known_default()
+        .ok_or_else(connect_failed)?;
+    let connect_deadline = Instant::now() + connect_timeout;
+    let stream = tokio::time::timeout_at(connect_deadline, async {
+        let addrs: Vec<SocketAddr> = match endpoint.url().host().ok_or_else(connect_failed)? {
+            Host::Ipv4(ip) => vec![SocketAddr::new(IpAddr::V4(ip), port)],
+            Host::Ipv6(ip) => vec![SocketAddr::new(IpAddr::V6(ip), port)],
+            Host::Domain(host) => {
+                let resolver = GuardedResolver::with_admission(
+                    endpoint.clone(),
+                    lookup.unwrap_or_else(GuardedResolver::default_lookup),
+                    dns_admission,
+                    dns_queue,
+                );
+                resolver
+                    .resolve_addrs(host)
+                    .await
+                    .map_err(|_| connect_failed())?
+                    .into_iter()
+                    .map(|addr| SocketAddr::new(addr.ip(), port))
+                    .collect()
+            }
+        };
+        let mut connected = None;
+        let total = addrs.len();
+        for (index, addr) in addrs.into_iter().enumerate() {
+            let remaining = connect_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let left = (total - index) as u32;
+            let per_addr = if left > 1 {
+                (remaining / left)
+                    .max(Duration::from_millis(250))
+                    .min(remaining)
+            } else {
+                remaining
+            };
+            if let Ok(Ok(tcp)) = tokio::time::timeout(per_addr, TcpStream::connect(addr)).await {
+                let _ = tcp.set_nodelay(true);
+                connected = Some(tcp);
+                break;
+            }
+        }
+        let tcp = connected.ok_or_else(connect_failed)?;
+        if let Some(tls_cfg) = tls_config {
+            let server_name = match endpoint.url().host().ok_or_else(connect_failed)? {
+                Host::Domain(host) => rustls::pki_types::ServerName::try_from(
+                    host.strip_suffix('.').unwrap_or(host).to_owned(),
+                )
+                .map_err(|_| connect_failed())?,
+                Host::Ipv4(ip) => rustls::pki_types::ServerName::IpAddress(ip.into()),
+                Host::Ipv6(ip) => rustls::pki_types::ServerName::IpAddress(ip.into()),
+            };
+            let tls = TlsConnector::from(tls_cfg)
+                .connect(server_name, tcp)
+                .await
+                .map_err(|_| connect_failed())?;
+            Ok::<TransportStream, PortError>(TransportStream::Tls(Box::new(tls)))
+        } else {
+            Ok(TransportStream::Plain(tcp))
+        }
+    })
+    .await
+    .map_err(|_| connect_failed())??;
+    let tracker = Arc::new(Mutex::new(None));
+    let tracked = TrackedIo::new(stream, tracker.clone());
+    let (sender, conn) = http1::Builder::new()
+        .max_headers(100)
+        .handshake(TokioIo::new(tracked))
+        .await
+        .map_err(|_| connect_failed())?;
+    let conn_cancel = Cancellation::default();
+    let (conn_done_tx, conn_done_rx) = oneshot::channel();
+    let driver_cancel = conn_cancel.clone();
+    tokio::spawn(async move {
+        tokio::select! {
+            biased;
+            () = driver_cancel.cancelled() => {}
+            _ = conn => {}
+        }
+        let _ = conn_done_tx.send(());
+    });
+    Ok(PooledConn {
+        sender,
+        tracker,
+        conn_cancel,
+        conn_done: Some(conn_done_rx),
+        last_used: Instant::now(),
+    })
 }
+
 struct CancelOnDrop(Cancellation);
 impl Drop for CancelOnDrop {
     fn drop(&mut self) {
@@ -562,40 +1223,46 @@ struct Worker {
     _permit: OwnedSemaphorePermit,
 }
 impl Worker {
-    fn check(&self) -> Result<(), PortError> {
-        self.budget.check(CommitEffect::Unknown)?;
+    fn check(&self, effect: CommitEffect) -> Result<(), PortError> {
+        self.budget.check(effect)?;
         if self.dropped.is_cancelled() || self.slot.cancelled.is_cancelled() {
-            return Err(cancelled());
+            return Err(cancelled(effect));
         }
         Ok(())
     }
     async fn run<T>(
         &self,
         operation: impl Future<Output = Result<T, PortError>>,
+        effect: CommitEffect,
     ) -> Result<T, PortError> {
-        self.check()?;
+        self.check(effect)?;
         let wait_for = self.budget.remaining_now();
         tokio::select! {
             biased;
             () = self.budget.cancellation().cancelled() => {
-                Err(self.budget.check(CommitEffect::Unknown).expect_err("budget cancelled"))
+                Err(self.budget.check(effect).expect_err("budget cancelled"))
             }
-            () = self.dropped.cancelled() => Err(cancelled()),
-            () = self.slot.cancelled.cancelled() => Err(cancelled()),
+            () = self.dropped.cancelled() => Err(cancelled(effect)),
+            () = self.slot.cancelled.cancelled() => Err(cancelled(effect)),
             () = tokio::time::sleep(wait_for) => {
                 while self.budget.remaining_now() > Duration::ZERO {
                     tokio::time::sleep(self.budget.remaining_now()).await;
                 }
-                Err(self.budget.check(CommitEffect::Unknown).expect_err("budget expired"))
+                Err(self.budget.check(effect).expect_err("budget expired"))
             }
             result = operation => {
                 // The driver's timer can finish between wakeups. Keep the
                 // current caller deadline/cancellation as the terminal cause.
-                self.check()?;
+                self.check(effect)?;
                 result
             },
         }
     }
+}
+
+enum UploadWait {
+    Pending(oneshot::Receiver<()>),
+    Done(bool),
 }
 
 /// A bounded stream whose producer owns cancellation, sockets and admission.
@@ -605,6 +1272,7 @@ pub struct OutboundResponse {
     status: u16,
     headers: HeaderMap,
     head: Option<oneshot::Receiver<Result<(u16, HeaderMap), PortError>>>,
+    uploaded: UploadWait,
     budget: OperationBudget,
     closed: oneshot::Receiver<()>,
     chunks: mpsc::Receiver<Vec<u8>>,
@@ -613,6 +1281,22 @@ pub struct OutboundResponse {
     _guard: CancelOnDrop,
 }
 impl OutboundResponse {
+    /// Wait until preflight, connection establishment, and request-body flush
+    /// to the underlying socket complete (`Ok(true)`), or the request fails
+    /// before upload finishes (`Ok(false)`).
+    pub(crate) async fn wait_uploaded(&mut self) -> Result<bool, PortError> {
+        match &mut self.uploaded {
+            UploadWait::Done(sent) => Ok(*sent),
+            UploadWait::Pending(uploaded) => {
+                let sent = self
+                    .budget
+                    .run(async { Ok(uploaded.await.is_ok()) }, CommitEffect::Unknown)
+                    .await?;
+                self.uploaded = UploadWait::Done(sent);
+                Ok(sent)
+            }
+        }
+    }
     pub(crate) async fn receive_head(&mut self) -> Result<(), PortError> {
         if let Some(head) = self.head.as_mut() {
             let (status, headers) = self
@@ -629,8 +1313,9 @@ impl OutboundResponse {
         Ok(())
     }
     /// Cancellation is a request; this acknowledgement proves the producer has
-    /// dropped its HTTP response and request future. Do not cancel this wait
-    /// while holding authority that must exclude in-flight application bytes.
+    /// dropped its HTTP response, request future, and aborted socket. Do not
+    /// cancel this wait while holding authority that must exclude in-flight
+    /// application bytes.
     pub(crate) async fn close(self) -> Result<(), PortError> {
         self._guard.0.cancel();
         self.closed.await.map_err(|_| failed())

@@ -74,6 +74,7 @@ struct Entry {
     branch_depth: i64,
     kind: String,
     author_id: String,
+    body_format: i32,
     inline_text: Option<String>,
     payload_blake3: Option<Vec<u8>>,
     checkpoint_stale: i64,
@@ -103,6 +104,7 @@ struct BatchEntry {
     branch_depth: i64,
     kind: String,
     author_id: String,
+    body_format: i32,
     inline_text: Option<String>,
     payload_blake3: Option<Vec<u8>>,
     checkpoint_stale: i64,
@@ -118,6 +120,7 @@ impl BatchEntry {
                 branch_depth: self.branch_depth,
                 kind: self.kind,
                 author_id: self.author_id,
+                body_format: self.body_format,
                 inline_text: self.inline_text,
                 payload_blake3: self.payload_blake3,
                 checkpoint_stale: self.checkpoint_stale,
@@ -769,8 +772,12 @@ impl CanonicalStore {
         deadline: &CommandDeadline,
         entry: &Entry,
     ) -> Result<Option<String>, PortError> {
+        let visible_text = |body| {
+            super::content::decode_turn(entry.body_format, &entry.kind, body)
+                .map(|turn| Some(turn.text))
+        };
         if let Some(text) = &entry.inline_text {
-            return Ok(Some(text.clone()));
+            return visible_text(text.clone());
         }
         let digest = ContentDigest::from_bytes(
             entry
@@ -787,9 +794,9 @@ impl CanonicalStore {
             .read_verified_blob_with_budget(scope, digest, Some(&budget))
             .await
         {
-            Ok(bytes) => Ok(Some(String::from_utf8(bytes).map_err(|_| {
+            Ok(bytes) => visible_text(String::from_utf8(bytes).map_err(|_| {
                 internal_not_committed("search_chat_payload", "payload is not UTF-8")
-            })?)),
+            })?),
             Err(PortError::Domain(DomainError::ResourceNotFound)) => Ok(None),
             Err(error) => Err(error),
         }
@@ -878,6 +885,7 @@ fn prefilter_chat_candidate(
     if auth
         .can_view_chat_thread(
             space,
+            thread,
             head.kind,
             &head.owner,
             head.project_folder.as_ref(),
@@ -931,7 +939,7 @@ async fn load_entries_batch_tx(
                 qb.push(
                     ") SELECT e.thread_id, e.entry_seq, e.parent_seq,
                              CAST(e.branch_depth AS BIGINT) AS branch_depth,
-                             e.kind, e.author_id, e.inline_text, e.payload_blake3,
+                             e.kind, e.author_id, e.body_format, e.inline_text, e.payload_blake3,
                              CAST(e.checkpoint_stale AS BIGINT) AS checkpoint_stale,
                              CAST(e.ext_space_tainted AS BIGINT) AS ext_space_tainted
                       FROM keys
@@ -957,7 +965,7 @@ async fn load_entries_batch_tx(
         BackendConn::Postgres(conn) => {
             const SQL: &str = "SELECT e.thread_id, e.entry_seq, e.parent_seq,
                         CAST(e.branch_depth AS BIGINT) AS branch_depth,
-                        e.kind, e.author_id, e.inline_text, e.payload_blake3,
+                        e.kind, e.author_id, e.body_format, e.inline_text, e.payload_blake3,
                         CAST(e.checkpoint_stale AS BIGINT) AS checkpoint_stale,
                         CAST(e.ext_space_tainted AS BIGINT) AS ext_space_tainted
                  FROM UNNEST($2::text[], $3::bigint[]) AS k(t, s)
@@ -1114,7 +1122,9 @@ async fn thread_has_redaction_or_compaction_after_tx(
 ) -> Result<bool, PortError> {
     const REDACTION_SQL: &str = "SELECT EXISTS (SELECT 1 FROM chat_entries
         WHERE space_id = $1 AND redacted_at_seq IS NOT NULL AND redacted_at_seq > $2 AND thread_id = $3)";
-    const COMPACTION_SQL: &str = "SELECT EXISTS (SELECT 1 FROM chat_entries
+    const COMPACTION_SQLITE_SQL: &str = "SELECT EXISTS (SELECT 1 FROM chat_entries
+        WHERE space_id = $1 AND thread_id = $2 AND kind = 'compaction' AND created_space_seq > $3 AND created_space_seq <= $4)";
+    const COMPACTION_PG_SQL: &str = "SELECT EXISTS (SELECT 1 FROM chat_entries
         WHERE space_id = $1 AND thread_id = $2 AND kind = 'compaction' AND created_space_seq > $3 AND created_space_seq <= $4)";
     let after_seq = after.get() as i64;
     let redacted: bool = match tx {
@@ -1139,7 +1149,7 @@ async fn thread_has_redaction_or_compaction_after_tx(
         return Ok(true);
     }
     match tx {
-        BackendConn::Sqlite(conn) => sqlx::query_scalar(COMPACTION_SQL)
+        BackendConn::Sqlite(conn) => sqlx::query_scalar(COMPACTION_SQLITE_SQL)
             .bind(space_id.as_str())
             .bind(thread.as_str())
             .bind(after_seq)
@@ -1149,7 +1159,7 @@ async fn thread_has_redaction_or_compaction_after_tx(
             .map_err(|err| {
                 internal_not_committed("sqlite_search_chat_delta_compact", err.to_string())
             }),
-        BackendConn::Postgres(conn) => sqlx::query_scalar(COMPACTION_SQL)
+        BackendConn::Postgres(conn) => sqlx::query_scalar(COMPACTION_PG_SQL)
             .bind(space_id.as_str())
             .bind(thread.as_str())
             .bind(after_seq)
@@ -1246,7 +1256,7 @@ async fn load_entry(
     seq: ThreadEntrySeq,
 ) -> Result<Option<Entry>, PortError> {
     const SQL: &str = "SELECT entry_seq, parent_seq, CAST(branch_depth AS BIGINT) AS branch_depth,
-        kind, author_id, inline_text, payload_blake3, CAST(checkpoint_stale AS BIGINT) AS checkpoint_stale,
+        kind, author_id, body_format, inline_text, payload_blake3, CAST(checkpoint_stale AS BIGINT) AS checkpoint_stale,
         CAST(ext_space_tainted AS BIGINT) AS ext_space_tainted FROM chat_entries
         WHERE space_id = $1 AND thread_id = $2 AND entry_seq = $3";
     match tx {
@@ -1283,7 +1293,7 @@ async fn load_entries_for_thread_batch_tx(
             for chunk in seqs.chunks(200) {
                 let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
                     "SELECT entry_seq, parent_seq, CAST(branch_depth AS BIGINT) AS branch_depth,
-                        kind, author_id, inline_text, payload_blake3,
+                        kind, author_id, body_format, inline_text, payload_blake3,
                         CAST(checkpoint_stale AS BIGINT) AS checkpoint_stale,
                         CAST(ext_space_tainted AS BIGINT) AS ext_space_tainted
                      FROM chat_entries WHERE space_id = ",
@@ -1314,7 +1324,7 @@ async fn load_entries_for_thread_batch_tx(
         BackendConn::Postgres(conn) => {
             const SQL: &str =
                 "SELECT entry_seq, parent_seq, CAST(branch_depth AS BIGINT) AS branch_depth,
-                kind, author_id, inline_text, payload_blake3,
+                kind, author_id, body_format, inline_text, payload_blake3,
                 CAST(checkpoint_stale AS BIGINT) AS checkpoint_stale,
                 CAST(ext_space_tainted AS BIGINT) AS ext_space_tainted
                 FROM chat_entries WHERE space_id = $1 AND thread_id = $2 AND entry_seq = ANY($3)";
@@ -1342,19 +1352,25 @@ async fn read_chain(
     stop_at: Option<ThreadEntrySeq>,
     limit: PageLimit,
 ) -> Result<Vec<Entry>, PortError> {
-    const SQL: &str = "WITH RECURSIVE chain(entry_seq, parent_seq, hops) AS (
-        SELECT entry_seq, parent_seq, 1 FROM chat_entries
+    const SQL: &str = "WITH RECURSIVE chain(
+        entry_seq, parent_seq, branch_depth, kind, author_id, body_format,
+        inline_text, payload_blake3, checkpoint_stale, ext_space_tainted, hops
+    ) AS (
+        SELECT entry_seq, parent_seq, CAST(branch_depth AS BIGINT), kind, author_id, body_format,
+               inline_text, payload_blake3, CAST(checkpoint_stale AS BIGINT), CAST(ext_space_tainted AS BIGINT), 1
+        FROM chat_entries
         WHERE space_id = $1 AND thread_id = $2 AND entry_seq = $3 AND entry_seq <> $5
         UNION ALL
-        SELECT p.entry_seq, p.parent_seq, c.hops + 1 FROM chain c
-        JOIN chat_entries p ON p.space_id = $1 AND p.thread_id = $2 AND p.entry_seq = c.parent_seq
-        WHERE c.hops < $4 AND p.entry_seq <> $5
-    ) SELECT e.entry_seq, e.parent_seq, CAST(e.branch_depth AS BIGINT) AS branch_depth,
-        e.kind, e.author_id, e.inline_text, e.payload_blake3,
-        CAST(e.checkpoint_stale AS BIGINT) AS checkpoint_stale,
-        CAST(e.ext_space_tainted AS BIGINT) AS ext_space_tainted
-        FROM chain c JOIN chat_entries e ON e.space_id = $1 AND e.thread_id = $2 AND e.entry_seq = c.entry_seq
-        ORDER BY c.hops";
+        SELECT p.entry_seq, p.parent_seq, CAST(p.branch_depth AS BIGINT), p.kind, p.author_id, p.body_format,
+               p.inline_text, p.payload_blake3, CAST(p.checkpoint_stale AS BIGINT), CAST(p.ext_space_tainted AS BIGINT), c.hops + 1
+        FROM chain c
+        CROSS JOIN chat_entries p
+        WHERE c.hops < $4
+          AND p.space_id = $1 AND p.thread_id = $2 AND p.entry_seq = c.parent_seq
+          AND p.entry_seq <> $5
+    ) SELECT entry_seq, parent_seq, branch_depth, kind, author_id, body_format,
+             inline_text, payload_blake3, checkpoint_stale, ext_space_tainted
+      FROM chain";
     let stop_seq = stop_at.map_or(-1_i64, |seq| seq.get() as i64);
     match tx {
         BackendConn::Sqlite(conn) => sqlx::query_as(SQL)

@@ -1,10 +1,46 @@
 use super::*;
 use crate::service::commands::{Command, SavedResult};
 use crate::store::statements::execute;
-use notarium_core::auth::{PrincipalKind, SpaceRole};
+use notarium_core::auth::SpaceRole;
 use std::collections::BTreeSet;
 
+const ABILITY_TRAIL_LOCK: i64 = 0x4e54_5452_4149_4c31;
+pub(crate) const ABILITY_TRAIL_BY_DEST_SQLITE_SQL: &str = "WITH RECURSIVE walk(pl, id, depth) AS (\
+    SELECT $1, $2, 0 \
+    UNION \
+    SELECT t.source_placement, t.ability_id, w.depth + 1 \
+    FROM walk w \
+    JOIN ability_placement_trail t INDEXED BY ability_trail_destination \
+      ON t.destination_placement = w.pl AND t.destination_id = w.id \
+    WHERE w.depth < 17\
+) SELECT COALESCE(MAX(depth), 0) FROM walk";
+pub(crate) const ABILITY_PREFS_MOVE_DELETE_SQLITE_SQL: &str = "DELETE FROM ability_preferences AS src WHERE src.placement=$1 AND src.ability_id=$2 AND EXISTS (SELECT 1 FROM ability_preferences AS dst WHERE dst.placement=$3 AND dst.owner_id=src.owner_id AND dst.ability_id=src.ability_id)";
+pub(crate) const ABILITY_PREFS_MOVE_UPDATE_SQLITE_SQL: &str =
+    "UPDATE ability_preferences SET placement=$1 WHERE placement=$2 AND ability_id=$3";
+
 impl ControlService {
+    async fn ensure_current_ability_mutation(
+        &self,
+        tx: &mut Transaction,
+        ctx: &AccountContext,
+        ability: &AbilityDescriptor,
+    ) -> Result<(), PortError> {
+        if self
+            .follow_ability_db(tx, ctx, ability.reference.clone())
+            .await?
+            != ability.reference
+            || !self
+                .promotion_is_committed(
+                    tx,
+                    ability.promoted_from.as_ref(),
+                    &ability.reference.identity(),
+                )
+                .await?
+        {
+            return Err(DomainError::ResourceNotFound.into());
+        }
+        Ok(())
+    }
     async fn lock_ability_spaces(
         &self,
         tx: &mut Transaction,
@@ -12,11 +48,18 @@ impl ControlService {
         owner: &UsersRow,
         references: &[&AbilityRef],
     ) -> Result<BTreeSet<SpaceId>, PortError> {
-        ctx.auth().authorize_ability_mutation()?;
-        if ctx.auth().kind() != &PrincipalKind::DirectHuman {
-            return Err(access_denied());
+        let auth = ctx.auth();
+        if auth.taint().is_tainted() {
+            return Err(DomainError::CrossSpaceTainted.into());
         }
-        self.live_human(tx, ctx.auth(), owner).await?;
+        let authority = self
+            .credential_authority(
+                tx,
+                owner,
+                auth.credential().cloned().ok_or_else(denied)?,
+                true,
+            )
+            .await?;
         let mut spaces = BTreeSet::new();
         for reference in references {
             let space = match &reference.placement {
@@ -32,6 +75,7 @@ impl ControlService {
                 }
                 _ => return Err(access_denied()),
             };
+            authority.authorize_ability_space(auth, &space)?;
             if ctx.auth().spaces().get(&space).is_none_or(|grant| grant.role == SpaceRole::Viewer || !grant.write_classes.contains(&DocClass::Skill) || grant.project_root.as_ref().is_some_and(|root| !matches!(&reference.placement, AbilityPlacement::OwnedProject(project) if &project.folder_id == root))) {
                 return Err(access_denied());
             }
@@ -56,74 +100,221 @@ impl ControlService {
         owner: &UsersRow,
         spaces: &BTreeSet<SpaceId>,
     ) -> Result<ControlRevision, PortError> {
+        self.bump_ability_state_at_least(tx, owner, spaces, owner.revision)
+            .await
+    }
+    async fn bump_ability_state_at_least(
+        &self,
+        tx: &mut Transaction,
+        owner: &UsersRow,
+        spaces: &BTreeSet<SpaceId>,
+        min_previous: i64,
+    ) -> Result<ControlRevision, PortError> {
         for space in spaces {
             let current = crate::service::spaces::admission(tx, space, false).await?;
             execute!(tx,"UPDATE space_admission SET revision=$1 WHERE space_id=$2","UPDATE v1_control.space_admission SET revision=$1 WHERE space_id=$2";next(current.revision)?,space.as_str())?;
         }
-        let revision = next(owner.revision)?;
+        let revision = next(owner.revision.max(min_previous))?;
         execute!(tx,"UPDATE users SET revision=$1,metadata_revision=$2 WHERE user_id=$3","UPDATE v1_control.users SET revision=$1,metadata_revision=$2 WHERE user_id=$3";revision,next(owner.metadata_revision)?,&owner.user_id)?;
         Ok(ControlRevision::new(revision as u64)?)
     }
+    async fn pin_authoring_target(
+        &self,
+        current: &AccountContext,
+        budget: &OperationBudget,
+        target: &AbilityDescriptor,
+    ) -> Result<Box<dyn ScheduleAbilityLease>, PortError> {
+        let entry = target
+            .entrypoint
+            .as_ref()
+            .ok_or(DomainError::AbilityWriteForbidden)?;
+        let scope = AccountContext::new(
+            current.auth().restrict_to_space(&entry.space_id)?,
+            budget.context(current.budget.request.clone()),
+        );
+        let mut pin = self
+            .catalog
+            .pin_schedule_abilities(scope, vec![target.reference.clone()])
+            .await?;
+        if pin.history().space_id != entry.space_id
+            || !matches!(pin.abilities(), [pinned] if pinned.reference == target.reference)
+        {
+            let _ = pin.close().await;
+            return Err(DomainError::ResourceNotFound.into());
+        }
+        Ok(pin)
+    }
+
     pub async fn update_ability_binding(
         &self,
         ctx: AccountContext,
         request: AccountMutation<AbilityBindingUpdate>,
-    ) -> Result<ControlCommit<AbilityDescriptor>, PortError> {
-        if matches!(&request.input.projects, AbilityProjects::Selected(values) if values.len() > 200)
-        {
+    ) -> Result<ControlCommit<AbilityBindingResult>, PortError> {
+        #[derive(Serialize)]
+        struct BindingHash<'a, E: Serialize> {
+            ability: &'a AbilityRef,
+            enabled: bool,
+            expected: E,
+            projects: &'a AbilityProjects,
+        }
+        let (authoring, expected, command) = match request.input.expected {
+            AbilityOverlayGuard::Account(rev) => (
+                false,
+                Some(rev),
+                Command::new(
+                    request.identity,
+                    "update-ability-binding",
+                    &BindingHash {
+                        ability: &request.input.ability,
+                        enabled: request.input.enabled,
+                        expected: rev,
+                        projects: &request.input.projects,
+                    },
+                )?,
+            ),
+            AbilityOverlayGuard::Authored(rev) => (
+                true,
+                rev,
+                Command::new(
+                    request.identity,
+                    "compare-authored-ability-binding",
+                    &BindingHash {
+                        ability: &request.input.ability,
+                        enabled: request.input.enabled,
+                        expected: rev,
+                        projects: &request.input.projects,
+                    },
+                )?,
+            ),
+        };
+        let (revision, reference, descriptor) = self
+            .write_ability_binding(
+                ctx,
+                command,
+                request.input.ability,
+                request.input.enabled,
+                expected,
+                request.input.projects,
+                authoring,
+            )
+            .await?;
+        Ok(ControlCommit {
+            revision,
+            value: AbilityBindingResult {
+                reference,
+                descriptor,
+            },
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn write_ability_binding(
+        &self,
+        ctx: AccountContext,
+        command: Command,
+        ability: AbilityRef,
+        enabled: bool,
+        expected: Option<ControlRevision>,
+        projects: AbilityProjects,
+        authoring: bool,
+    ) -> Result<(ControlRevision, AbilityRef, Option<AbilityDescriptor>), PortError> {
+        if matches!(&projects, AbilityProjects::Selected(values) if values.len() > 200) {
             return Err(invalid(ValidationReason::InvalidLimit));
         }
-        let command = Command::new(request.identity, "update-ability-binding", &request.input)?;
         command.require(ctx.auth().principal(), ctx.auth().principal())?;
         ctx.auth().authorize_ability_mutation()?;
-        if ctx.auth().kind() != &PrincipalKind::DirectHuman {
-            return Err(access_denied());
+        if ctx.auth().taint().is_tainted() {
+            return Err(DomainError::CrossSpaceTainted.into());
         }
         let budget = OperationBudget::new(ctx.budget.clone());
         let current = self.current_account(&ctx, &budget).await?;
-        let value = budget
-            .run(
-                self.raw_ability(&current, request.input.ability.identity()),
-                CommitEffect::NotCommitted,
-            )
-            .await?;
-        if value.reference != request.input.ability {
-            return Err(DomainError::ResourceNotFound.into());
-        }
-        if let AbilityProjects::Selected(projects) = &request.input.projects {
-            let mut seen = BTreeSet::new();
-            for project in projects {
-                if !seen.insert((project.space_id.clone(), project.folder_id.clone())) {
-                    return Err(invalid(ValidationReason::ScopeMismatch));
+        let prechecked: Result<
+            (AbilityDescriptor, Option<Box<dyn ScheduleAbilityLease>>),
+            PortError,
+        > = async {
+            let value = budget
+                .run(
+                    self.raw_ability(&current, ability.identity()),
+                    CommitEffect::NotCommitted,
+                )
+                .await?;
+            if value.reference != ability {
+                return Err(DomainError::ResourceNotFound.into());
+            }
+            if let AbilityProjects::Selected(projects) = &projects {
+                let mut seen = BTreeSet::new();
+                for project in projects {
+                    if !seen.insert((project.space_id.clone(), project.folder_id.clone())) {
+                        return Err(invalid(ValidationReason::ScopeMismatch));
+                    }
+                    budget
+                        .run(
+                            self.catalog_project(&current, project),
+                            CommitEffect::NotCommitted,
+                        )
+                        .await?;
                 }
-                budget
-                    .run(
-                        self.catalog_project(&current, project),
-                        CommitEffect::NotCommitted,
-                    )
-                    .await?;
             }
+            let pin = if value.entrypoint.is_some() {
+                Some(
+                    budget
+                        .run(
+                            self.pin_authoring_target(&current, &budget, &value),
+                            CommitEffect::NotCommitted,
+                        )
+                        .await?,
+                )
+            } else {
+                None
+            };
+            Ok((value, pin))
         }
-        let mut tx = self.store.write(budget.clone()).await?;
-        let (revision, value) = budget.run(async {
-            let owner = user(tx.inner_mut(), ctx.auth().principal().as_str()).await?;
-            let spaces = self.lock_ability_spaces(tx.inner_mut(), &ctx, &owner, &[&request.input.ability]).await?;
-            let key = placement(&request.input.ability.placement)?;
-            let project = match &request.input.ability.placement { AbilityPlacement::OwnedProject(project) => Some(project), _ => None };
-            if let Some((revision, _)) = command.replay::<AbilityRef>(tx.inner_mut()).await? {
-                return Ok((revision, self.overlay(tx.inner_mut(), &ctx, value, project).await?));
+        .await;
+        let (prechecked, mut pin) = match prechecked {
+            Ok((value, pin)) => (Ok(value), pin),
+            Err(error) => (Err(error), None),
+        };
+        let mut tx = match self.store.write(budget.clone()).await {
+            Ok(tx) => tx,
+            Err(error) => {
+                if let Some(mut lease) = pin.take() {
+                    let _ = lease.close().await;
+                }
+                return Err(error);
             }
-            expect_revision(&owner, command.identity.expected)?;
-            let old = rows!(tx.inner_mut(),AbilityAvailabilityRow,fetch_optional,"SELECT * FROM ability_availability WHERE placement=$1 AND ability_id=$2","SELECT * FROM v1_control.ability_availability WHERE placement=$1 AND ability_id=$2";&key,request.input.ability.id.as_str())?;
+        };
+        if let Some(pin) = pin {
+            tx.hold_schedule_pin(pin);
+        }
+        let (revision, reference, descriptor) = budget.run(async {
+            let owner = user(tx.inner_mut(), ctx.auth().principal().as_str()).await?;
+            let spaces = self.lock_ability_spaces(tx.inner_mut(), &ctx, &owner, &[&ability]).await?;
+            let key = placement(&ability.placement)?;
+            let project = match &ability.placement { AbilityPlacement::OwnedProject(project) => Some(project), _ => None };
+            if let Some((revision, saved)) = command.replay::<AbilityRef>(tx.inner_mut()).await? {
+                let descriptor = match (authoring, prechecked) {
+                    (false, Ok(descriptor)) => {
+                        Some(self.overlay(tx.inner_mut(), &ctx, descriptor, project).await?)
+                    }
+                    _ => None,
+                };
+                return Ok((revision, saved.value, descriptor));
+            }
+            let value = prechecked?;
+            self.ensure_current_ability_mutation(tx.inner_mut(), &ctx, &value).await?;
+            if !authoring { expect_revision(&owner, command.identity.expected)?; }
+            let old = rows!(tx.inner_mut(),AbilityAvailabilityRow,fetch_optional,"SELECT * FROM ability_availability WHERE placement=$1 AND ability_id=$2","SELECT * FROM v1_control.ability_availability WHERE placement=$1 AND ability_id=$2";&key,ability.id.as_str())?;
             let previous = old.as_ref().map_or(0, |row| row.revision);
-            if previous as u64 != request.input.expected.get() { return Err(DomainError::ControlRevisionConflict { current: ControlRevision::new(previous as u64)? }.into()); }
-            let mode = match &request.input.projects { AbilityProjects::All => "all-projects", AbilityProjects::Selected(_) => "selected-projects" };
-            let row = AbilityAvailabilityRow { placement: key.clone(), ability_id: request.input.ability.id.to_string(), mode: mode.into(), enabled: i64::from(request.input.enabled), revision: next(previous)? };
+            let current = ControlRevision::new(previous as u64)?;
+            let actual = (old.is_some() || !authoring).then_some(current);
+            if actual != expected { return Err(DomainError::ControlRevisionConflict { current }.into()); }
+            let mode = match &projects { AbilityProjects::All => "all-projects", AbilityProjects::Selected(_) => "selected-projects" };
+            let row = AbilityAvailabilityRow { placement: key.clone(), ability_id: ability.id.to_string(), mode: mode.into(), enabled: i64::from(enabled), revision: next(previous)? };
             TargetRecord::from(row.clone()).validate()?;
             execute!(tx.inner_mut(),"INSERT INTO ability_availability(placement,ability_id,mode,enabled,revision) VALUES($1,$2,$3,$4,$5) ON CONFLICT(placement,ability_id) DO UPDATE SET mode=excluded.mode,enabled=excluded.enabled,revision=excluded.revision",
                 "INSERT INTO v1_control.ability_availability(placement,ability_id,mode,enabled,revision) VALUES($1,$2,$3,$4,$5) ON CONFLICT(placement,ability_id) DO UPDATE SET mode=excluded.mode,enabled=excluded.enabled,revision=excluded.revision";&key,&row.ability_id,mode,row.enabled,row.revision)?;
             execute!(tx.inner_mut(),"DELETE FROM ability_project_bindings WHERE placement=$1 AND ability_id=$2","DELETE FROM v1_control.ability_project_bindings WHERE placement=$1 AND ability_id=$2";&key,&row.ability_id)?;
-            if let AbilityProjects::Selected(projects) = &request.input.projects {
+            if let AbilityProjects::Selected(projects) = &projects {
                 let mut seen = BTreeSet::new();
                 for project in projects {
                     if !spaces.contains(&project.space_id) || !seen.insert((project.space_id.clone(), project.folder_id.clone())) { return Err(invalid(ValidationReason::ScopeMismatch)); }
@@ -132,47 +323,245 @@ impl ControlService {
                 }
             }
             let revision = self.bump_ability_state(tx.inner_mut(), &owner, &spaces).await?;
-            command.save(tx.inner_mut(), revision, &SavedResult { value: request.input.ability.clone(), events: vec![] }, self.clock.now_ms()?).await?;
-            Ok((revision, self.overlay(tx.inner_mut(), &ctx, value, project).await?))
+            command.save(tx.inner_mut(), revision, &SavedResult { value: ability.clone(), events: vec![] }, self.clock.now_ms()?).await?;
+            let descriptor = if authoring {
+                None
+            } else {
+                Some(self.overlay(tx.inner_mut(), &ctx, value, project).await?)
+            };
+            Ok((revision, ability, descriptor))
         }, CommitEffect::NotCommitted).await?;
-        budget.run(tx.commit(), CommitEffect::Unknown).await?;
-        Ok(ControlCommit { revision, value })
+        budget.commit_tx(tx).await?;
+        Ok((revision, reference, descriptor))
     }
     pub async fn set_ability_preference(
         &self,
         ctx: AccountContext,
-        request: AccountMutation<AbilityPreferenceUpdate>,
+        request: AccountMutation<AbilityPreferenceChange>,
     ) -> Result<ControlCommit<AbilityPreferenceUpdate>, PortError> {
-        let command = Command::new(request.identity, "set-ability-preference", &request.input)?;
+        #[derive(Serialize)]
+        struct AuthoredPreferenceHash<'a> {
+            preference: &'a AbilityPreferenceUpdate,
+            expected: Option<ControlRevision>,
+        }
+        let command = match request.input.expected {
+            AbilityPreferenceGuard::Account => Command::new(
+                request.identity,
+                "set-ability-preference",
+                &request.input.preference,
+            )?,
+            AbilityPreferenceGuard::Authored(expected) => {
+                ctx.auth().authorize_ability_mutation()?;
+                Command::new(
+                    request.identity,
+                    "compare-authored-ability-preference",
+                    &AuthoredPreferenceHash {
+                        preference: &request.input.preference,
+                        expected,
+                    },
+                )?
+            }
+        };
+        self.write_ability_preference(
+            ctx,
+            command,
+            request.input.preference,
+            request.input.expected,
+        )
+        .await
+    }
+
+    async fn write_ability_preference(
+        &self,
+        ctx: AccountContext,
+        command: Command,
+        input: AbilityPreferenceUpdate,
+        precondition: AbilityPreferenceGuard,
+    ) -> Result<ControlCommit<AbilityPreferenceUpdate>, PortError> {
         command.require(ctx.auth().principal(), ctx.auth().principal())?;
-        ctx.auth().authorize_human_management()?;
+        if !(ctx.auth().human_management() || ctx.auth().has_cap(Cap::AbilityWrite)) {
+            return Err(DomainError::AbilityWriteForbidden.into());
+        }
+        if ctx.auth().taint().is_tainted() {
+            return Err(DomainError::CrossSpaceTainted.into());
+        }
+        if matches!(input.ability.placement, AbilityPlacement::System)
+            && (!ctx.auth().human_management()
+                || ctx.auth().is_space_narrowed()
+                || ctx
+                    .auth()
+                    .spaces()
+                    .values()
+                    .any(|grant| grant.project_root.is_some()))
+        {
+            return Err(DomainError::AbilityWriteForbidden.into());
+        }
         let budget = OperationBudget::new(ctx.budget.clone());
         let current = self.current_account(&ctx, &budget).await?;
-        let value = budget
-            .run(
-                self.raw_ability(&current, request.input.ability.identity()),
-                CommitEffect::NotCommitted,
-            )
-            .await?;
-        if value.reference != request.input.ability {
-            return Err(DomainError::ResourceNotFound.into());
+        let authoring = matches!(precondition, AbilityPreferenceGuard::Authored(_));
+        if authoring {
+            ctx.auth().authorize_ability_mutation()?;
         }
-        let mut tx = self.store.write(budget.clone()).await?;
+        let prechecked: Result<
+            (AbilityDescriptor, Option<Box<dyn ScheduleAbilityLease>>),
+            PortError,
+        > = async {
+            let value = budget
+                .run(
+                    self.raw_ability(&current, input.ability.identity()),
+                    CommitEffect::NotCommitted,
+                )
+                .await?;
+            if value.reference != input.ability {
+                return Err(DomainError::ResourceNotFound.into());
+            }
+            let pin = if value.entrypoint.is_some() {
+                Some(
+                    budget
+                        .run(
+                            self.pin_authoring_target(&current, &budget, &value),
+                            CommitEffect::NotCommitted,
+                        )
+                        .await?,
+                )
+            } else {
+                None
+            };
+            Ok((value, pin))
+        }
+        .await;
+        let (prechecked, mut pin) = match prechecked {
+            Ok((value, pin)) => (Ok(value), pin),
+            Err(error) => (Err(error), None),
+        };
+        let mut tx = match self.store.write(budget.clone()).await {
+            Ok(tx) => tx,
+            Err(error) => {
+                if let Some(mut lease) = pin.take() {
+                    let _ = lease.close().await;
+                }
+                return Err(error);
+            }
+        };
+        if let Some(pin) = pin {
+            tx.hold_schedule_pin(pin);
+        }
         let (revision, saved) = budget.run(async {
-            let auth = self.revalidate(tx.inner_mut(), ctx.auth()).await?;
-            auth.authorize_human_management()?;
+            let (owner, live_ctx) = if authoring {
+                let owner = user(tx.inner_mut(), ctx.auth().principal().as_str()).await?;
+                self.lock_ability_spaces(tx.inner_mut(), &ctx, &owner, &[&input.ability]).await?;
+                (owner, ctx.clone())
+            } else {
+                let auth = self.revalidate(tx.inner_mut(), ctx.auth()).await?;
+                if auth.taint().is_tainted() {
+                    return Err(DomainError::CrossSpaceTainted.into());
+                }
+                if !(auth.human_management() || auth.has_cap(Cap::AbilityWrite)) {
+                    return Err(DomainError::AbilityWriteForbidden.into());
+                }
+                let owner = user(tx.inner_mut(), auth.principal().as_str()).await?;
+                match &input.ability.placement {
+                    AbilityPlacement::System => {
+                        if !auth.human_management()
+                            || auth.is_space_narrowed()
+                            || auth
+                                .spaces()
+                                .values()
+                                .any(|grant| grant.project_root.is_some())
+                            || !auth
+                                .spaces()
+                                .values()
+                                .any(|grant| grant.read_classes.contains(&DocClass::Skill))
+                        {
+                            return Err(DomainError::AbilityWriteForbidden.into());
+                        }
+                    }
+                    AbilityPlacement::OwnedPersonal(id) if id != auth.principal() => {
+                        return Err(DomainError::ResourceNotFound.into());
+                    }
+                    AbilityPlacement::OwnedPersonal(_)
+                    | AbilityPlacement::OwnedSpace(_)
+                    | AbilityPlacement::OwnedProject(_) => {
+                        let space = match &input.ability.placement {
+                            AbilityPlacement::OwnedSpace(space) => space.clone(),
+                            AbilityPlacement::OwnedProject(project) => project.space_id.clone(),
+                            AbilityPlacement::OwnedPersonal(_) => SpaceId::parse(
+                                owner
+                                    .personal_space_id
+                                    .as_deref()
+                                    .ok_or(DomainError::ResourceNotFound)?,
+                            )?,
+                            AbilityPlacement::System => unreachable!(),
+                        };
+                        let grant = auth.spaces().get(&space).ok_or_else(|| {
+                            if auth.human_management() {
+                                DomainError::ResourceNotFound.into()
+                            } else {
+                                access_denied()
+                            }
+                        })?;
+                        if !grant.read_classes.contains(&DocClass::Skill)
+                            || grant.project_root.as_ref().is_some_and(|root| {
+                                !matches!(
+                                    &input.ability.placement,
+                                    AbilityPlacement::OwnedProject(folder)
+                                        if &folder.folder_id == root
+                                )
+                            })
+                        {
+                            return Err(if auth.human_management() {
+                                DomainError::ResourceNotFound.into()
+                            } else {
+                                access_denied()
+                            });
+                        }
+                        if !auth.human_management()
+                            && (grant.role == SpaceRole::Viewer
+                                || !grant.write_classes.contains(&DocClass::Skill))
+                        {
+                            return Err(access_denied());
+                        }
+                    }
+                }
+                (owner, AccountContext::new(auth, ctx.budget.clone()))
+            };
             if let Some(replay) = command.replay::<AbilityPreferenceUpdate>(tx.inner_mut()).await? { return Ok(replay); }
-            let owner = user(tx.inner_mut(), auth.principal().as_str()).await?;
-            expect_revision(&owner, command.identity.expected)?;
-            let key = placement(&request.input.ability.placement)?;
-            let revision = self.bump_ability_state(tx.inner_mut(), &owner, &BTreeSet::new()).await?;
+            let value = prechecked?;
+            if !authoring && !live_ctx.auth().human_management() {
+                let entry = value
+                    .entrypoint
+                    .as_ref()
+                    .ok_or(DomainError::AbilityWriteForbidden)?;
+                let grant = live_ctx
+                    .auth()
+                    .spaces()
+                    .get(&entry.space_id)
+                    .ok_or_else(access_denied)?;
+                if grant.role == SpaceRole::Viewer
+                    || !grant.write_classes.contains(&DocClass::Skill)
+                    || grant.project_root.as_ref().is_some_and(|root| !matches!(&input.ability.placement, AbilityPlacement::OwnedProject(folder) if &folder.folder_id == root))
+                {
+                    return Err(access_denied());
+                }
+            }
+            self.ensure_current_ability_mutation(tx.inner_mut(), &live_ctx, &value).await?;
+            let key = placement(&input.ability.placement)?;
+            let existing = ability_preference(tx.inner_mut(), live_ctx.auth().principal(), &key, &input.ability.id).await?;
+            if let AbilityPreferenceGuard::Authored(expected) = precondition {
+                let actual = existing.as_ref().map(|row| ControlRevision::new(row.revision as u64)).transpose()?;
+                if actual != expected { return Err(DomainError::ControlRevisionConflict { current: actual.unwrap_or(ControlRevision::ZERO) }.into()); }
+            } else {
+                expect_revision(&owner, command.identity.expected)?;
+            }
+            let min_previous = existing.as_ref().map_or(0, |row| row.revision);
+            let revision = self.bump_ability_state_at_least(tx.inner_mut(), &owner, &BTreeSet::new(), min_previous).await?;
             execute!(tx.inner_mut(),"INSERT INTO ability_preferences(owner_id,ability_id,placement,enabled,revision) VALUES($1,$2,$3,$4,$5) ON CONFLICT(owner_id,ability_id,placement) DO UPDATE SET enabled=excluded.enabled,revision=excluded.revision",
-                "INSERT INTO v1_control.ability_preferences(owner_id,ability_id,placement,enabled,revision) VALUES($1,$2,$3,$4,$5) ON CONFLICT(owner_id,ability_id,placement) DO UPDATE SET enabled=excluded.enabled,revision=excluded.revision";&owner.user_id,request.input.ability.id.as_str(),&key,i64::from(request.input.enabled),revision.get() as i64)?;
-            let saved = SavedResult { value: request.input.clone(), events: vec![] };
+                "INSERT INTO v1_control.ability_preferences(owner_id,ability_id,placement,enabled,revision) VALUES($1,$2,$3,$4,$5) ON CONFLICT(owner_id,ability_id,placement) DO UPDATE SET enabled=excluded.enabled,revision=excluded.revision";&owner.user_id,input.ability.id.as_str(),&key,i64::from(input.enabled),revision.get() as i64)?;
+            let saved = SavedResult { value: input, events: vec![] };
             command.save(tx.inner_mut(), revision, &saved, self.clock.now_ms()?).await?;
             Ok((revision, saved))
         }, CommitEffect::NotCommitted).await?;
-        budget.run(tx.commit(), CommitEffect::Unknown).await?;
+        budget.commit_tx(tx).await?;
         Ok(ControlCommit {
             revision,
             value: saved.value,
@@ -181,91 +570,451 @@ impl ControlService {
     pub async fn set_ability_trail(
         &self,
         ctx: AccountContext,
-        request: AccountMutation<AbilityTrailUpdate>,
-    ) -> Result<ControlCommit<AbilityTrailUpdate>, PortError> {
-        let command = Command::new(request.identity, "set-ability-trail", &request.input)?;
+        request: AccountMutation<AbilityTrailMutation>,
+    ) -> Result<ControlCommit<AbilityTrailResult>, PortError> {
+        match request.input {
+            AbilityTrailMutation::Set(input) => {
+                let command = Command::new(request.identity, "set-ability-trail", &input)?;
+                let result = self
+                    .write_ability_trail(ctx, command, input.clone(), false)
+                    .await?;
+                Ok(ControlCommit {
+                    revision: result.revision,
+                    value: AbilityTrailResult::Updated(Box::new(input)),
+                })
+            }
+            AbilityTrailMutation::AdoptPromotion(AdoptAbilityPromotion {
+                source,
+                destination,
+            }) => {
+                if !matches!(
+                    (&source.placement, &destination.placement),
+                    (AbilityPlacement::OwnedProject(project), AbilityPlacement::OwnedSpace(space))
+                        if &project.space_id == space
+                            && source.id == destination.id
+                            && source.revision != destination.revision
+                ) {
+                    return Err(invalid(ValidationReason::ScopeMismatch));
+                }
+                let input = AbilityTrailUpdate {
+                    source,
+                    expected_destination: None,
+                    destination: Some(destination),
+                };
+                let command =
+                    Command::new(request.identity, "adopt-authored-ability-promotion", &input)?;
+                let result = self.write_ability_trail(ctx, command, input, true).await?;
+                Ok(ControlCommit {
+                    revision: result.revision,
+                    value: AbilityTrailResult::Promoted(
+                        result
+                            .value
+                            .ok_or_else(|| invalid(ValidationReason::InvalidState))?,
+                    ),
+                })
+            }
+        }
+    }
+
+    async fn write_ability_trail(
+        &self,
+        ctx: AccountContext,
+        command: Command,
+        input: AbilityTrailUpdate,
+        promotion: bool,
+    ) -> Result<ControlCommit<Option<AbilityPromotionResult>>, PortError> {
         command.require(ctx.auth().principal(), ctx.auth().principal())?;
         ctx.auth().authorize_ability_mutation()?;
-        if ctx.auth().kind() != &PrincipalKind::DirectHuman {
-            return Err(access_denied());
+        if ctx.auth().taint().is_tainted() {
+            return Err(DomainError::CrossSpaceTainted.into());
         }
         let budget = OperationBudget::new(ctx.budget.clone());
-        let prechecked = if let Some(destination) = &request.input.destination {
+        type PrecheckedTrail = (
+            Option<(AbilityDescriptor, AbilityDescriptor)>,
+            Option<Box<dyn ScheduleAbilityLease>>,
+        );
+        let prechecked: Result<PrecheckedTrail, PortError> = if let Some(destination) =
+            &input.destination
+        {
             let current = self.current_account(&ctx, &budget).await?;
-            let source = budget
-                .run(
-                    self.raw_ability(&current, request.input.source.identity()),
-                    CommitEffect::NotCommitted,
-                )
-                .await?;
-            let target = budget
-                .run(
-                    self.raw_ability(&current, destination.identity()),
-                    CommitEffect::NotCommitted,
-                )
-                .await?;
-            let mut rtx = self.store.read(budget.clone()).await?;
-            let (_, visited) = budget
-                .run(
-                    self.follow_ability_chain_db(rtx.inner_mut(), &current, destination.clone()),
-                    CommitEffect::NotCommitted,
-                )
-                .await?;
-            budget
-                .run(rtx.rollback(), CommitEffect::NotCommitted)
-                .await?;
-            budget
-                .run(
-                    async {
-                        for item in &visited {
-                            self.ability_placement(&current, item).await?;
-                        }
-                        Ok::<_, PortError>(())
-                    },
-                    CommitEffect::NotCommitted,
-                )
-                .await?;
-            Some((source, target))
-        } else {
-            None
-        };
-        let mut tx = self.store.write(budget.clone()).await?;
-        let (revision, saved) = budget.run(async {
-            let owner = user(tx.inner_mut(), ctx.auth().principal().as_str()).await?;
-            let mut references = vec![&request.input.source];
-            if let Some(destination) = &request.input.destination { references.push(destination); }
-            let spaces = self.lock_ability_spaces(tx.inner_mut(), &ctx, &owner, &references).await?;
-            if let Some(replay) = command.replay::<AbilityTrailUpdate>(tx.inner_mut()).await? { return Ok(replay); }
-            expect_revision(&owner, command.identity.expected)?;
-            let key = placement(&request.input.source.placement)?;
-            let old = rows!(tx.inner_mut(),AbilityPlacementTrailRow,fetch_optional,"SELECT * FROM ability_placement_trail WHERE source_placement=$1 AND ability_id=$2","SELECT * FROM v1_control.ability_placement_trail WHERE source_placement=$1 AND ability_id=$2";&key,request.input.source.id.as_str())?;
-            let previous = old.map(|row| serde_json::from_str::<Trail>(&row.manifest_ref).map_err(|_| invalid(ValidationReason::InvalidState))).transpose()?;
-            if previous.as_ref().map(|trail| &trail.destination) != request.input.expected_destination.as_ref()
-                || previous.as_ref().is_some_and(|trail| trail.source != request.input.source) { return Err(invalid(ValidationReason::InvalidState)); }
-            if let Some(destination) = &request.input.destination {
-                let (source, target) = prechecked.ok_or_else(|| invalid(ValidationReason::InvalidState))?;
-                if source.reference != request.input.source || target.reference != *destination || source.kind != target.kind { return Err(DomainError::ResourceNotFound.into()); }
-                let final_ref = self.follow_ability_db(tx.inner_mut(), &ctx, destination.clone()).await?;
-                if final_ref.identity() == source.reference.identity() { return Err(invalid(ValidationReason::InvalidState)); }
-                let trail = Trail { source: source.reference, destination: destination.clone() };
-                let record = TargetRecord::from(AbilityPlacementTrailRow { source_placement: key.clone(), ability_id: request.input.source.id.to_string(), destination_placement: placement(&destination.placement)?, destination_id: destination.id.to_string(), manifest_ref: serde_json::to_string(&trail).map_err(|_| invalid(ValidationReason::InvalidState))?, created_at: self.clock.now_ms()? });
-                record.validate()?;
-                execute!(tx.inner_mut(),"DELETE FROM ability_placement_trail WHERE source_placement=$1 AND ability_id=$2","DELETE FROM v1_control.ability_placement_trail WHERE source_placement=$1 AND ability_id=$2";&key,request.input.source.id.as_str())?;
-                record.insert(tx.inner_mut()).await?;
-                // Validate the newly installed chain, including its first hop.
-                self.follow_ability_db(tx.inner_mut(), &ctx, request.input.source.clone()).await?;
-            } else {
-                execute!(tx.inner_mut(),"DELETE FROM ability_placement_trail WHERE source_placement=$1 AND ability_id=$2","DELETE FROM v1_control.ability_placement_trail WHERE source_placement=$1 AND ability_id=$2";&key,request.input.source.id.as_str())?;
+            async {
+                let mut rtx = self.store.read(budget.clone()).await?;
+                let chain = budget
+                    .run(
+                        self.follow_ability_chain_db(
+                            rtx.inner_mut(),
+                            &current,
+                            destination.clone(),
+                        ),
+                        CommitEffect::NotCommitted,
+                    )
+                    .await?;
+                budget
+                    .run(rtx.rollback(), CommitEffect::NotCommitted)
+                    .await?;
+                budget
+                    .run(
+                        async {
+                            let terminal_id = chain.terminal.identity();
+                            for item in &chain.visited {
+                                if item == &terminal_id {
+                                    self.ability_placement(&current, item).await?;
+                                } else {
+                                    self.ability_trail_hop_space_active(&current, item).await?;
+                                }
+                            }
+                            Ok::<_, PortError>(())
+                        },
+                        CommitEffect::NotCommitted,
+                    )
+                    .await?;
+                if chain.revision_mismatched {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+                if promotion && chain.terminal != *destination {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+                let target = budget
+                    .run(
+                        self.raw_ability(&current, chain.terminal.identity()),
+                        CommitEffect::NotCommitted,
+                    )
+                    .await?;
+                if promotion && target.reference != *destination {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+                let source = budget
+                    .run(
+                        async {
+                            let original = &input.source;
+                            match (&original.placement, &destination.placement) {
+                                (
+                                    AbilityPlacement::OwnedProject(project),
+                                    AbilityPlacement::OwnedSpace(space),
+                                ) if original.id == destination.id
+                                    && original.revision != destination.revision
+                                    && &project.space_id == space =>
+                                {
+                                    self.catalog_project(&current, project).await?;
+                                    // Publishing the new placement changed the live lookup key.
+                                    // The source revision is still immutable and readable there.
+                                    let lookup = AbilityRef {
+                                        id: original.id.clone(),
+                                        placement: destination.placement.clone(),
+                                        revision: original.revision.clone(),
+                                    };
+                                    let mut previous = self
+                                        .catalog
+                                        .ability(current.clone(), lookup.clone())
+                                        .await?;
+                                    if previous.reference != lookup {
+                                        return Err(DomainError::ResourceNotFound.into());
+                                    }
+                                    previous.reference = original.clone();
+                                    Ok(previous)
+                                }
+                                _ => self.raw_ability(&current, original.identity()).await,
+                            }
+                        },
+                        CommitEffect::NotCommitted,
+                    )
+                    .await?;
+                let promotion_pin = if target.promoted_from.as_ref() == Some(&source.reference) {
+                    let AbilityPlacement::OwnedSpace(space) = &target.reference.placement else {
+                        return Err(invalid(ValidationReason::InvalidState));
+                    };
+                    let scoped = AccountContext::new(
+                        current.auth().restrict_to_space(space)?,
+                        budget.context(ctx.budget.request.clone()),
+                    );
+                    let mut pin = budget
+                        .run(
+                            self.catalog
+                                .pin_schedule_abilities(scoped, vec![target.reference.clone()]),
+                            CommitEffect::NotCommitted,
+                        )
+                        .await?;
+                    if &pin.history().space_id != space
+                        || !matches!(pin.abilities(), [pinned]
+                            if pinned.reference == target.reference
+                                && pinned.promoted_from == target.promoted_from
+                                && pinned.healthy)
+                    {
+                        let _ = pin.close().await;
+                        return Err(DomainError::ResourceNotFound.into());
+                    }
+                    Some(pin)
+                } else {
+                    None
+                };
+                Ok((Some((source, target)), promotion_pin))
             }
+            .await
+        } else {
+            Ok((None, None))
+        };
+        let (prechecked, mut promotion_pin) = match prechecked {
+            Ok((pair, pin)) => (Ok(pair), pin),
+            Err(error) => (Err(error), None),
+        };
+        let has_promotion_pin = promotion_pin.is_some();
+        let mut tx = match self.store.write(budget.clone()).await {
+            Ok(tx) => tx,
+            Err(error) => {
+                if let Some(mut lease) = promotion_pin.take() {
+                    let _ = lease.close().await;
+                }
+                return Err(error);
+            }
+        };
+        if let Some(pin) = promotion_pin {
+            tx.hold_schedule_pin(pin);
+        }
+        let (revision, value) = budget.run(async {
+            if let Transaction::Postgres(inner) = tx.inner_mut() {
+                sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                    .bind(ABILITY_TRAIL_LOCK)
+                    .execute(&mut **inner)
+                    .await
+                    .map_err(crate::error::database_not_committed)?;
+            }
+            let owner = user(tx.inner_mut(), ctx.auth().principal().as_str()).await?;
+            let mut references = vec![&input.source];
+            if let Some(destination) = &input.destination { references.push(destination); }
+            if let Ok(Some((_, target))) = &prechecked { references.push(&target.reference); }
+            let spaces = self.lock_ability_spaces(tx.inner_mut(), &ctx, &owner, &references).await?;
+            if promotion {
+                if let Some((revision, saved)) = command.replay::<AbilityPromotionResult>(tx.inner_mut()).await? {
+                    return Ok((revision, Some(saved.value)));
+                }
+            } else {
+                if let Some((revision, _)) = command.replay::<AbilityTrailUpdate>(tx.inner_mut()).await? {
+                    return Ok((revision, None));
+                }
+                expect_revision(&owner, command.identity.expected)?;
+            }
+            let prechecked = prechecked?;
+            if promotion && !has_promotion_pin {
+                return Err(DomainError::ResourceNotFound.into());
+            }
+            let key = placement(&input.source.placement)?;
+            let old = rows!(tx.inner_mut(),AbilityPlacementTrailRow,fetch_optional,"SELECT * FROM ability_placement_trail WHERE source_placement=$1 AND ability_id=$2","SELECT * FROM v1_control.ability_placement_trail WHERE source_placement=$1 AND ability_id=$2";&key,input.source.id.as_str())?;
+            let previous = old.map(|row| serde_json::from_str::<Trail>(&row.manifest_ref).map_err(|_| invalid(ValidationReason::InvalidState))).transpose()?;
+            if previous.as_ref().map(|trail| &trail.destination) != input.expected_destination.as_ref()
+                || previous.as_ref().is_some_and(|trail| trail.source != input.source) { return Err(invalid(ValidationReason::InvalidState)); }
+            let value = if let Some(destination) = &input.destination {
+                let (source, target) = prechecked.as_ref().ok_or_else(|| invalid(ValidationReason::InvalidState))?;
+                let dest_chain = self.follow_ability_chain_db(tx.inner_mut(), &ctx, destination.clone()).await?;
+                if dest_chain.revision_mismatched {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+                let final_ref = dest_chain.terminal;
+                if source.reference != input.source
+                    || target.reference != final_ref
+                    || (promotion && final_ref != *destination)
+                    || source.kind != target.kind
+                {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+                if final_ref.identity() == source.reference.identity() { return Err(invalid(ValidationReason::InvalidState)); }
+                let outgoing_hops = dest_chain.visited.len().saturating_sub(1);
+                let incoming_hops = max_incoming_trail_depth_db(tx.inner_mut(), &key, input.source.id.as_str()).await?;
+                if incoming_hops.saturating_add(1).saturating_add(outgoing_hops) > 16 {
+                    return Err(invalid(ValidationReason::InvalidState));
+                }
+                let source_state = if promotion {
+                    Some(read_overlay_state(tx.inner_mut(), ctx.auth().principal(), &key, &source.reference.id).await?)
+                } else {
+                    None
+                };
+                let destination_key = placement(&destination.placement)?;
+                if !self.promotion_is_committed(tx.inner_mut(), target.promoted_from.as_ref(), &final_ref.identity()).await? {
+                    let Some(original) = &target.promoted_from else { return Err(invalid(ValidationReason::InvalidState)); };
+                    let AbilityPlacement::OwnedProject(project) = &original.placement else { return Err(invalid(ValidationReason::InvalidState)); };
+                    if original != &source.reference
+                        || destination.placement != AbilityPlacement::OwnedSpace(project.space_id.clone())
+                        || destination.id != original.id
+                    {
+                        return Err(DomainError::ResourceNotFound.into());
+                    }
+                    let _ = transfer_promotion_overlays(tx.inner_mut(), project, &key, &destination_key, &original.id).await?;
+                }
+                let trail = Trail { source: source.reference.clone(), destination: destination.clone() };
+                let record = TargetRecord::from(AbilityPlacementTrailRow { source_placement: key.clone(), ability_id: input.source.id.to_string(), destination_placement: placement(&destination.placement)?, destination_id: destination.id.to_string(), manifest_ref: serde_json::to_string(&trail).map_err(|_| invalid(ValidationReason::InvalidState))?, created_at: self.clock.now_ms()? });
+                record.validate()?;
+                execute!(tx.inner_mut(),"DELETE FROM ability_placement_trail WHERE source_placement=$1 AND ability_id=$2","DELETE FROM v1_control.ability_placement_trail WHERE source_placement=$1 AND ability_id=$2";&key,input.source.id.as_str())?;
+                record.insert(tx.inner_mut()).await?;
+                // Validate the newly installed chain, including its first hop and revision continuity.
+                let installed = self.follow_ability_chain_db(tx.inner_mut(), &ctx, input.source.clone()).await?;
+                if installed.revision_mismatched {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+                if let Some(source) = source_state {
+                    let destination = read_overlay_state(tx.inner_mut(), ctx.auth().principal(), &destination_key, &destination.id).await?;
+                    Some(AbilityPromotionResult { source, destination })
+                } else {
+                    None
+                }
+            } else {
+                execute!(tx.inner_mut(),"DELETE FROM ability_placement_trail WHERE source_placement=$1 AND ability_id=$2","DELETE FROM v1_control.ability_placement_trail WHERE source_placement=$1 AND ability_id=$2";&key,input.source.id.as_str())?;
+                None
+            };
             let revision = self.bump_ability_state(tx.inner_mut(), &owner, &spaces).await?;
-            let saved = SavedResult { value: request.input.clone(), events: vec![] };
-            command.save(tx.inner_mut(), revision, &saved, self.clock.now_ms()?).await?;
-            Ok((revision, saved))
+            let now = self.clock.now_ms()?;
+            if let Some(snapshot) = &value {
+                command.save(tx.inner_mut(), revision, &SavedResult { value: snapshot, events: vec![] }, now).await?;
+            } else {
+                command.save(tx.inner_mut(), revision, &SavedResult { value: input, events: vec![] }, now).await?;
+            }
+            Ok((revision, value))
         }, CommitEffect::NotCommitted).await?;
-        budget.run(tx.commit(), CommitEffect::Unknown).await?;
-        Ok(ControlCommit {
-            revision,
-            value: saved.value,
-        })
+        budget.commit_tx(tx).await?;
+        Ok(ControlCommit { revision, value })
     }
+}
+
+async fn max_incoming_trail_depth_db(
+    tx: &mut Transaction,
+    target_placement: &str,
+    target_id: &str,
+) -> Result<usize, PortError> {
+    let depth = rows!(
+        tx,
+        (i64,),
+        fetch_one,
+        ABILITY_TRAIL_BY_DEST_SQLITE_SQL,
+        "WITH RECURSIVE walk(pl, id, depth) AS (\
+             SELECT $1::text COLLATE \"C\", $2::text COLLATE \"C\", 0 \
+             UNION \
+             SELECT t.source_placement, t.ability_id, w.depth + 1 \
+             FROM walk w \
+             JOIN v1_control.ability_placement_trail t \
+               ON t.destination_placement = w.pl AND t.destination_id = w.id \
+             WHERE w.depth < 17\
+         ) SELECT COALESCE(MAX(depth), 0)::bigint FROM walk";
+        target_placement,
+        target_id
+    )?
+    .0;
+    Ok(usize::try_from(depth).unwrap_or(17))
+}
+
+async fn read_overlay_state(
+    tx: &mut Transaction,
+    owner: &PrincipalId,
+    key: &str,
+    ability: &AbilityId,
+) -> Result<AbilityOverlayState, PortError> {
+    let (binding, preference) = ability_control_state(tx, owner, key, ability).await?;
+    let mut state = overlay_state(binding.as_ref(), preference.as_ref())?;
+    let availability = match binding.as_ref().map(|row| row.mode.as_str()) {
+        None | Some("all-projects") => AbilityProjects::All,
+        Some("selected-projects") => {
+            let rows = rows!(
+                tx,
+                AbilityProjectBindingsRow,
+                fetch_all,
+                "SELECT * FROM ability_project_bindings WHERE placement=$1 AND ability_id=$2 ORDER BY target_space, project_id",
+                "SELECT * FROM v1_control.ability_project_bindings WHERE placement=$1 AND ability_id=$2 ORDER BY target_space, project_id";
+                key,
+                ability.as_str()
+            )?;
+            let mut projects = Vec::with_capacity(rows.len());
+            for row in rows {
+                projects.push(FolderRef {
+                    space_id: SpaceId::parse(&row.target_space)?,
+                    folder_id: FolderId::parse(&row.project_id)?,
+                });
+            }
+            AbilityProjects::Selected(projects)
+        }
+        Some(_) => return Err(invalid(ValidationReason::InvalidState)),
+    };
+    state.availability = Some(availability);
+    Ok(state)
+}
+
+/// Both placements share one exclusively locked Space. Preserve effective old
+/// project visibility and combine any existing destination restrictions.
+async fn transfer_promotion_overlays(
+    tx: &mut Transaction,
+    project: &FolderRef,
+    source: &str,
+    destination: &str,
+    ability: &AbilityId,
+) -> Result<AbilityProjects, PortError> {
+    let bindings = rows!(tx,AbilityAvailabilityRow,fetch_all,
+        "SELECT * FROM ability_availability WHERE ability_id=$1 AND placement IN ($2,$3)",
+        "SELECT * FROM v1_control.ability_availability WHERE ability_id=$1 AND placement IN ($2,$3)";
+        ability.as_str(),source,destination)?;
+    let enabled = i64::from(bindings.iter().all(|binding| binding.enabled == 1));
+    let revision = next(
+        bindings
+            .iter()
+            .map(|binding| binding.revision)
+            .max()
+            .unwrap_or(0),
+    )?;
+    let mut admits_project = true;
+    for binding in &bindings {
+        match binding.mode.as_str() {
+            "all-projects" => (),
+            "selected-projects" => {
+                admits_project &= rows!(tx,AbilityProjectBindingsRow,fetch_optional,
+                    "SELECT * FROM ability_project_bindings WHERE placement=$1 AND ability_id=$2 AND target_space=$3 AND project_id=$4",
+                    "SELECT * FROM v1_control.ability_project_bindings WHERE placement=$1 AND ability_id=$2 AND target_space=$3 AND project_id=$4";
+                    &binding.placement,ability.as_str(),project.space_id.as_str(),project.folder_id.as_str())?.is_some();
+            }
+            _ => return Err(invalid(ValidationReason::InvalidState)),
+        }
+    }
+    execute!(tx,
+        "INSERT INTO ability_availability(placement,ability_id,mode,enabled,revision) VALUES($1,$2,'selected-projects',$3,$4) ON CONFLICT(placement,ability_id) DO UPDATE SET mode=excluded.mode,enabled=excluded.enabled,revision=excluded.revision",
+        "INSERT INTO v1_control.ability_availability(placement,ability_id,mode,enabled,revision) VALUES($1,$2,'selected-projects',$3,$4) ON CONFLICT(placement,ability_id) DO UPDATE SET mode=excluded.mode,enabled=excluded.enabled,revision=excluded.revision";
+        destination,ability.as_str(),enabled,revision)?;
+    execute!(tx,
+        "DELETE FROM ability_project_bindings WHERE placement=$1 AND ability_id=$2",
+        "DELETE FROM v1_control.ability_project_bindings WHERE placement=$1 AND ability_id=$2";
+        destination,ability.as_str())?;
+    if admits_project {
+        let record = TargetRecord::from(AbilityProjectBindingsRow {
+            placement: destination.into(),
+            ability_id: ability.to_string(),
+            target_space: project.space_id.to_string(),
+            project_id: project.folder_id.to_string(),
+        });
+        record.validate()?;
+        record.insert(tx).await?;
+    }
+    execute!(tx,
+        "DELETE FROM ability_availability WHERE placement=$1 AND ability_id=$2",
+        "DELETE FROM v1_control.ability_availability WHERE placement=$1 AND ability_id=$2";
+        source,ability.as_str())?;
+
+    // Moving an existing preference never updates its owner FK. Taking locks on
+    // other owners here would invert the order used by preference writers.
+    let max_merged_rev = rows!(tx,(Option<i64>,),fetch_one,
+        "SELECT MAX(MAX(dst.revision,src.revision)) FROM ability_preferences AS dst JOIN ability_preferences AS src ON src.ability_id=dst.ability_id AND src.owner_id=dst.owner_id WHERE dst.placement=$1 AND src.placement=$2 AND dst.ability_id=$3",
+        "SELECT MAX(GREATEST(dst.revision,src.revision)) FROM v1_control.ability_preferences AS dst JOIN v1_control.ability_preferences AS src ON src.ability_id=dst.ability_id AND src.owner_id=dst.owner_id WHERE dst.placement=$1 AND src.placement=$2 AND dst.ability_id=$3";
+        destination,source,ability.as_str())?.0;
+    if let Some(max_rev) = max_merged_rev {
+        next(max_rev)?;
+        execute!(tx,
+            "UPDATE ability_preferences AS dst SET enabled=CASE WHEN dst.enabled=1 AND src.enabled=1 THEN 1 ELSE 0 END, revision=MAX(dst.revision,src.revision)+1 FROM ability_preferences AS src WHERE dst.placement=$1 AND src.placement=$2 AND dst.ability_id=$3 AND src.ability_id=dst.ability_id AND src.owner_id=dst.owner_id",
+            "UPDATE v1_control.ability_preferences AS dst SET enabled=CASE WHEN dst.enabled=1 AND src.enabled=1 THEN 1 ELSE 0 END, revision=GREATEST(dst.revision,src.revision)+1 FROM v1_control.ability_preferences AS src WHERE dst.placement=$1 AND src.placement=$2 AND dst.ability_id=$3 AND src.ability_id=dst.ability_id AND src.owner_id=dst.owner_id";
+            destination,source,ability.as_str())?;
+    }
+    execute!(tx,
+        ABILITY_PREFS_MOVE_DELETE_SQLITE_SQL,
+        "DELETE FROM v1_control.ability_preferences AS src WHERE src.placement=$1 AND src.ability_id=$2 AND EXISTS (SELECT 1 FROM v1_control.ability_preferences AS dst WHERE dst.placement=$3 AND dst.owner_id=src.owner_id AND dst.ability_id=src.ability_id)";
+        source,ability.as_str(),destination)?;
+    execute!(tx,
+        ABILITY_PREFS_MOVE_UPDATE_SQLITE_SQL,
+        "UPDATE v1_control.ability_preferences SET placement=$1 WHERE placement=$2 AND ability_id=$3";
+        destination,source,ability.as_str())?;
+    Ok(AbilityProjects::Selected(if admits_project {
+        vec![project.clone()]
+    } else {
+        Vec::new()
+    }))
 }
