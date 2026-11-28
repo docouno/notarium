@@ -657,9 +657,7 @@ async fn resolve_stripped_segments(
             live_path,
             saved_digest,
         } => {
-            if !live_path.is_empty() && corpus::strip_folder_prefix(raw_path, live_path).is_some() {
-                segment_count(live_path)
-            } else if let Some((count, expected)) = *saved_digest {
+            if let Some((count, expected)) = *saved_digest {
                 let segments: Vec<&str> =
                     raw_path.split('/').filter(|seg| !seg.is_empty()).collect();
                 let count_usize = usize::from(count);
@@ -671,6 +669,10 @@ async fn resolve_stripped_segments(
                 } else {
                     Ok(0)
                 }
+            } else if !live_path.is_empty()
+                && corpus::strip_folder_prefix(raw_path, live_path).is_some()
+            {
+                segment_count(live_path)
             } else if allow_trashed_root
                 && let Some(base_id) = base.as_ref()
                 && let Some(first_seg) = raw_path

@@ -577,6 +577,7 @@ impl ControlCatalogPort for CanonicalStore {
                         reference,
                         project: ancestry.project,
                         ancestors: ancestry.ancestors,
+                        write_locked: ancestry.write_locked,
                     })
                 })
             })

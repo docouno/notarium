@@ -394,8 +394,6 @@ async fn projects(call: &mut ToolCallContext<'_>) -> Result<Value, PortError> {
                         }
                         continue;
                     }
-                    let mut candidate_folders: Vec<FolderRef> = Vec::new();
-                    let project_scoped = project_root.is_some();
                     if let Some(folder_id) = project_root {
                         let folder = FolderRef {
                             space_id: space.space.id.clone(),
@@ -408,13 +406,43 @@ async fn projects(call: &mut ToolCallContext<'_>) -> Result<Value, PortError> {
                             .await
                         {
                             Ok(_) => {
-                                candidate_folders.push(folder);
+                                let source = CatalogDisclosure::Folder(folder.clone());
+                                if let Some((proof, taint)) = project_metadata(
+                                    call,
+                                    scope.clone(),
+                                    source,
+                                    Some(folder.clone()),
+                                    true,
+                                )
+                                .await?
+                                {
+                                    if let Some(taint) = taint {
+                                        pending_taints.push(taint);
+                                    }
+                                    total_consented = total_consented.saturating_add(1);
+                                    if total_consented > MAX_PROJECTS {
+                                        return Err(invalid(ValidationReason::BudgetExceeded));
+                                    }
+                                    let space_slug = required_text(&proof, "spaceSlug")?.to_owned();
+                                    let slug = required_text(&proof, "projectSlug")?.to_owned();
+                                    let name = required_text(&proof, "name")?.to_owned();
+                                    let handle = format!("{space_slug}/{slug}");
+                                    let item = json!({
+                                        "projectId": folder.folder_id,
+                                        "spaceId": folder.space_id,
+                                        "handle": handle,
+                                        "slug": slug,
+                                        "name": name,
+                                    });
+                                    items.push((handle, item));
+                                }
                             }
                             Err(error) if corpus::hidden(&error) => {}
                             Err(error) => return Err(error),
                         }
                     } else {
                         let mut next: Option<String> = None;
+                        let mut exhausted = false;
                         for _ in 0..=MAX_PROJECTS {
                             let page = call
                                 .registry
@@ -428,12 +456,41 @@ async fn projects(call: &mut ToolCallContext<'_>) -> Result<Value, PortError> {
                             if page.items.len() > usize::from(CONTROL_PAGE) {
                                 return Err(invalid(ValidationReason::InvalidState));
                             }
-                            total_consented = total_consented.saturating_add(page.items.len());
-                            if total_consented > MAX_PROJECTS {
-                                return Err(invalid(ValidationReason::BudgetExceeded));
+                            for folder in page.items {
+                                let source = CatalogDisclosure::Folder(folder.clone());
+                                let Some((proof, taint)) = project_metadata(
+                                    call,
+                                    scope.clone(),
+                                    source,
+                                    Some(folder.clone()),
+                                    true,
+                                )
+                                .await?
+                                else {
+                                    continue;
+                                };
+                                if let Some(taint) = taint {
+                                    pending_taints.push(taint);
+                                }
+                                total_consented = total_consented.saturating_add(1);
+                                if total_consented > MAX_PROJECTS {
+                                    return Err(invalid(ValidationReason::BudgetExceeded));
+                                }
+                                let space_slug = required_text(&proof, "spaceSlug")?.to_owned();
+                                let slug = required_text(&proof, "projectSlug")?.to_owned();
+                                let name = required_text(&proof, "name")?.to_owned();
+                                let handle = format!("{space_slug}/{slug}");
+                                let item = json!({
+                                    "projectId": folder.folder_id,
+                                    "spaceId": folder.space_id,
+                                    "handle": handle,
+                                    "slug": slug,
+                                    "name": name,
+                                });
+                                items.push((handle, item));
                             }
-                            candidate_folders.extend(page.items);
                             let Some(cursor) = page.continuation else {
+                                exhausted = true;
                                 break;
                             };
                             if next.as_ref() == Some(&cursor) {
@@ -441,41 +498,9 @@ async fn projects(call: &mut ToolCallContext<'_>) -> Result<Value, PortError> {
                             }
                             next = Some(cursor);
                         }
-                    }
-                    for folder in candidate_folders {
-                        let source = CatalogDisclosure::Folder(folder.clone());
-                        let Some((proof, taint)) = project_metadata(
-                            call,
-                            scope.clone(),
-                            source,
-                            Some(folder.clone()),
-                            true,
-                        )
-                        .await?
-                        else {
-                            continue;
-                        };
-                        if project_scoped {
-                            total_consented = total_consented.saturating_add(1);
-                            if total_consented > MAX_PROJECTS {
-                                return Err(invalid(ValidationReason::BudgetExceeded));
-                            }
+                        if !exhausted {
+                            return Err(invalid(ValidationReason::BudgetExceeded));
                         }
-                        if let Some(taint) = taint {
-                            pending_taints.push(taint);
-                        }
-                        let space_slug = required_text(&proof, "spaceSlug")?.to_owned();
-                        let slug = required_text(&proof, "projectSlug")?.to_owned();
-                        let name = required_text(&proof, "name")?.to_owned();
-                        let handle = format!("{space_slug}/{slug}");
-                        let item = json!({
-                            "projectId": folder.folder_id,
-                            "spaceId": folder.space_id,
-                            "handle": handle,
-                            "slug": slug,
-                            "name": name,
-                        });
-                        items.push((handle, item));
                     }
                 }
             }
@@ -563,7 +588,12 @@ async fn project_metadata(
     {
         Ok(proof) => proof,
         Err(error) if corpus::hidden(&error) => return Ok(None),
-        Err(error) => return Err(error),
+        Err(error) => {
+            if foreign_space {
+                call.commit_external_read();
+            }
+            return Err(error);
+        }
     };
     let preflight_auth = scope.auth().with_preflight_taint();
     let mut deferred_policy = None;

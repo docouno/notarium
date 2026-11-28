@@ -905,7 +905,7 @@ impl ControlService {
             token::digest(format!("notarium:logout-event:v1:{}", observed.session_id).as_bytes());
         let event = RequestId::from_bytes(event_digest[..16].try_into().expect("digest prefix"));
         let mut tx = self.store.write(budget.clone()).await?;
-        budget.run(async {
+        let enqueued = budget.run(async {
             let current_user=user(tx.inner_mut(),&observed.user_id).await?;
             let current=session(tx.inner_mut(),&observed.session_id).await?;
             check_digest(&current.token_hash,&digest)?;
@@ -914,14 +914,14 @@ impl ControlService {
                 live_session(&current,&current_user,now)?;
                 execute!(tx.inner_mut(),"UPDATE sessions SET revoked_at=$1 WHERE session_id=$2","UPDATE v1_control.sessions SET revoked_at=$1 WHERE session_id=$2";now,&current.session_id)?;
                 super::outbox::enqueue_at(tx.inner_mut(),event.clone(),RevocationSelector::Session(AuthSessionId::parse(&current.session_id)?),RevocationReason::Logout,current.auth_version,now).await?;
+                Ok(vec![event.clone()])
             } else {
                 // A revoked credential can resume only its own exact logout.
                 rows!(tx.inner_mut(),RevocationEventsRow,fetch_optional,"SELECT * FROM revocation_events WHERE event_id=$1","SELECT * FROM v1_control.revocation_events WHERE event_id=$1";event.as_str())?.ok_or_else(denied)?;
+                Ok(Vec::new())
             }
-            Ok(())
         },CommitEffect::NotCommitted).await?;
-        self.commit_revocations(tx, &budget, std::slice::from_ref(&event))
-            .await?;
+        self.commit_revocations(tx, &budget, &enqueued).await?;
         self.flush_event(&budget, &event).await
     }
 }

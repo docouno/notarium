@@ -1788,3 +1788,117 @@ async fn sqlite_interactive_management_attestation_and_account_guards() {
 async fn postgres_interactive_management_attestation_and_account_guards() {
     interactive_management_and_account_guards(true).await;
 }
+
+#[tokio::test]
+async fn sqlite_replaying_membership_change_receipt_does_not_refence_active_work() {
+    let _serial = AUTH_TEST_LOCK.lock().await;
+    let mut fixture = Fixture::new(false, "replay_membership_no_refence").await;
+    let service = fixture.service(AuthenticationMode::Password).await.unwrap();
+    let bootstrap = service
+        .bootstrap(
+            empty(),
+            budget(),
+            BootstrapAccount {
+                username: "owner".into(),
+                email: None,
+                display_name: "Owner".into(),
+                password: Some(secret("owner password")),
+            },
+        )
+        .await
+        .unwrap();
+    let owner = bootstrap.account;
+    let session = bootstrap.session.unwrap();
+    let actor = account_context(&service, session.token.expose()).await;
+    let (second, revision) = second_account(&service, actor.clone(), &owner).await;
+    let shared = service
+        .create_space(
+            actor,
+            AccountMutation {
+                identity: command(&owner.id, &owner.id, 91, revision),
+                input: CreateSpace {
+                    id: SpaceId::from_bytes([91; 16]),
+                    kind: SpaceKind::Shared,
+                    name: "Shared".into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let actor = account_context(&service, session.token.expose()).await;
+    let scope = shared.value.history.clone();
+    let context = SpaceContext::new(actor.auth().clone(), scope.clone(), budget()).unwrap();
+    let added = service
+        .change_membership(
+            context.clone(),
+            MembershipChange {
+                command: CommandKey::from_bytes([92; 16]),
+                member: second.account.id.clone(),
+                role: Some(SpaceRole::Editor),
+                expected: ControlRevision::ZERO,
+            },
+        )
+        .await
+        .unwrap();
+    let demotion = MembershipChange {
+        command: CommandKey::from_bytes([93; 16]),
+        member: second.account.id.clone(),
+        role: Some(SpaceRole::Viewer),
+        expected: added.revision,
+    };
+    fixture.revoker.fail.store(true, Ordering::SeqCst);
+    unknown(
+        service
+            .change_membership(context.clone(), demotion.clone())
+            .await,
+    );
+    assert_eq!(
+        fixture
+            .observer
+            .count("SELECT count(*) FROM revocation_events WHERE delivered_at IS NULL")
+            .await,
+        1
+    );
+
+    // Register a new provider call authorized under the member's post-commit role.
+    let active_cancel = Cancellation::default();
+    let active_lease = fixture
+        .revoker
+        .register_provider(
+            MaintenanceContext {
+                authority: ServiceAuthority::admit(ServicePurpose::Revocation),
+                budget: budget(),
+            },
+            vec![RevocationSelector::Membership {
+                space: scope.space_id.clone(),
+                principal: second.account.id.clone(),
+            }],
+            active_cancel.clone(),
+        )
+        .await
+        .unwrap();
+
+    // Replaying the saved receipt must resume event delivery via `flush_event`
+    // without calling `fence_provider` (which would cancel the active call).
+    fixture.revoker.fail.store(false, Ordering::SeqCst);
+    let replayed = service
+        .change_membership(context, demotion)
+        .await
+        .expect("replaying saved membership change receipt must succeed");
+    assert_eq!(replayed.value.role, Some(SpaceRole::Viewer));
+    assert!(
+        !active_cancel.is_cancelled(),
+        "replaying a committed membership receipt must not re-fence newly authorized work"
+    );
+    assert_eq!(
+        fixture
+            .observer
+            .count("SELECT count(*) FROM revocation_events WHERE delivered_at IS NULL")
+            .await,
+        0
+    );
+
+    drop(active_lease);
+    drop(service);
+    fixture.close().await;
+}

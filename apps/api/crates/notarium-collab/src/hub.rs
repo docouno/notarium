@@ -482,7 +482,11 @@ impl CollabHub {
         selector: &RevocationSelector,
         reason: RevocationReason,
     ) -> Result<(), PortError> {
-        self.revoke_inner(ctx, selector, reason, true, None).await
+        let deadline = Instant::now()
+            .checked_add(ctx.budget.remaining)
+            .ok_or_else(|| DomainError::validation(ValidationReason::InvalidRange))?;
+        self.revoke_inner(ctx, selector, reason, true, None, deadline)
+            .await
     }
 
     async fn revoke_inner(
@@ -492,6 +496,7 @@ impl CollabHub {
         reason: RevocationReason,
         evict_peers: bool,
         evicted_event: Option<&RequestId>,
+        deadline: Instant,
     ) -> Result<(), PortError> {
         ctx.authority.require(ServicePurpose::Revocation)?;
         let mut affected = if evict_peers {
@@ -513,9 +518,6 @@ impl CollabHub {
             (RevocationSelector::Space(space), RevocationReason::SpaceClosed) => Some(space),
             _ => None,
         };
-        let deadline = Instant::now()
-            .checked_add(ctx.budget.remaining)
-            .ok_or_else(|| DomainError::validation(ValidationReason::InvalidRange))?;
         if let Some(space) = close_space {
             // The registration fence already cancelled all eligible peers.
             // Wait for in-flight durable opens to reach their room actor before
@@ -2026,13 +2028,13 @@ struct CollabEventTracker {
     applied: HashSet<RequestId>,
     order: std::collections::VecDeque<RequestId>,
     peers_evicted: HashSet<RequestId>,
-    peers_evicted_order: std::collections::VecDeque<RequestId>,
     next_token: u64,
     in_flight: HashMap<RequestId, (u64, tokio::sync::watch::Receiver<bool>)>,
 }
 
 impl CollabEventTracker {
     fn mark_applied(&mut self, id: RequestId) {
+        self.peers_evicted.remove(&id);
         if self.applied.insert(id.clone()) {
             self.order.push_back(id);
             while self.order.len() > MAX_COLLAB_APPLIED_EVENTS {
@@ -2044,14 +2046,7 @@ impl CollabEventTracker {
     }
 
     fn mark_peers_evicted(&mut self, id: RequestId) {
-        if self.peers_evicted.insert(id.clone()) {
-            self.peers_evicted_order.push_back(id);
-            while self.peers_evicted_order.len() > MAX_COLLAB_APPLIED_EVENTS {
-                if let Some(oldest) = self.peers_evicted_order.pop_front() {
-                    self.peers_evicted.remove(&oldest);
-                }
-            }
-        }
+        self.peers_evicted.insert(id);
     }
 }
 
@@ -2209,6 +2204,7 @@ impl SessionRevocationPort for CollabRevocations {
                         reason,
                         !peers_already_evicted,
                         Some(&event_id),
+                        deadline,
                     )
                     .await?;
             } else if !peers_already_evicted {
@@ -2704,5 +2700,26 @@ mod tests {
 
         drop(hub);
         runtime.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn collab_event_tracker_preserves_unfinished_peers_evicted_until_applied() {
+        let mut tracker = CollabEventTracker::default();
+        let stuck = RequestId::from_bytes([0xCC; 16]);
+        tracker.mark_peers_evicted(stuck.clone());
+        for i in 0u32..(MAX_COLLAB_APPLIED_EVENTS as u32 + 64) {
+            let mut bytes = [0u8; 16];
+            bytes[..4].copy_from_slice(&i.to_be_bytes());
+            let other = RequestId::from_bytes(bytes);
+            tracker.mark_peers_evicted(other.clone());
+            tracker.mark_applied(other);
+        }
+        assert!(
+            tracker.peers_evicted.contains(&stuck),
+            "unfinished peers_evicted marker must not be evicted before room settlement finishes"
+        );
+        tracker.mark_applied(stuck.clone());
+        assert!(!tracker.peers_evicted.contains(&stuck));
+        assert!(tracker.applied.contains(&stuck));
     }
 }

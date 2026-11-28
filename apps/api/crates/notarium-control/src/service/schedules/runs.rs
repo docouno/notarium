@@ -518,7 +518,7 @@ impl ControlService {
         let budget = OperationBudget::new(ctx.budget);
         let observed = self.observe_schedule(&budget, &result.schedule).await?;
         let mut tx = self.store.write(budget.clone()).await?;
-        let (receipt,events)=budget.run(async {
+        let (receipt,events,enqueued)=budget.run(async {
             // Terminal audit is independent of the old credential's expiration
             // or deletion, but uses the same owner -> schedule -> run lock order.
             user(tx.inner_mut(),&observed.owner_id).await?;
@@ -529,15 +529,15 @@ impl ControlService {
             if !matches!(row.status.as_str(),"claimed"|"running") {
                 if row.status!=status {return Err(invalid(ValidationReason::InvalidState));}
                 let events=super::super::outbox::pending(tx.inner_mut(),RevocationSelector::ScheduledRun(result.run.clone())).await?;
-                return Ok((receipt(&row)?,events));
+                return Ok((receipt(&row)?,events,Vec::new()));
             }
             let now=self.clock.now_ms()?;
             execute!(tx.inner_mut(),"UPDATE agent_schedule_runs SET status=$1,finished_at=$2 WHERE run_id=$3","UPDATE v1_control.agent_schedule_runs SET status=$1,finished_at=$2 WHERE run_id=$3";&status,now,result.run.as_str())?;
             row.status=status;row.finished_at=Some(now);
             let event=super::super::outbox::enqueue(tx.inner_mut(),RevocationSelector::ScheduledRun(result.run.clone()),RevocationReason::Expired,row.lease_epoch,now).await?;
-            Ok((receipt(&row)?,vec![event]))
+            Ok((receipt(&row)?,vec![event.clone()],vec![event]))
         },CommitEffect::NotCommitted).await?;
-        self.commit_revocations(tx, &budget, &events).await?;
+        self.commit_revocations(tx, &budget, &enqueued).await?;
         for event in &events {
             self.flush_event(&budget, event).await?;
         }

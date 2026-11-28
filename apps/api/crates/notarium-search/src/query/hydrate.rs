@@ -270,10 +270,10 @@ impl SearchEngine {
             return Ok((Vec::new(), truncated));
         }
 
-        // Hydrate projected notes in bounded batches and immediately extract
-        // compact excerpts so full document bodies are dropped as soon as their
-        // chunks are verified instead of holding every candidate body in RAM.
-        const HYDRATE_BATCH: usize = 32;
+        // Hydrate projected notes one document at a time and immediately
+        // extract compact excerpts so at most one full document body is held
+        // in RAM at any point before its chunks are verified and budgeted.
+        const HYDRATE_BATCH: usize = 1;
         const MAX_HYDRATED_EXCERPT_BYTES: usize = 16 * 1024 * 1024;
         let mut hits = Vec::new();
         let mut relevance = ChunkRelevance::new(text);

@@ -590,40 +590,46 @@ async fn authorize_settled_unchanged_replay(
     scope: &HistoryScope,
     folder: &FolderRef,
 ) -> Result<(), PortError> {
-    if let Ok(live) = call
-        .registry
-        .catalog
-        .folder(call.account(), folder.clone())
-        .await
-    {
-        if live.reference != *folder
-            || live.space.id != scope.space_id
-            || live.lifecycle == notarium_core::model::Lifecycle::Purged
-        {
-            return Err(DomainError::ResourceNotFound.into());
-        }
-        fenced
-            .auth()
-            .can_view_folder(&live.space, &folder.folder_id, &live.ancestor_folders)?;
-        let facts = notarium_core::auth::ResourceFacts {
-            space: live.space,
-            class: DocClass::UserDoc,
-            project: None,
-            ancestor_folders: live.ancestor_folders,
-            folder_write_locked: live.write_locked,
-            ability_package: None,
-        };
-        fenced.auth().authorize_direct_write(&facts, &facts)?;
-        return Ok(());
-    }
-    let trashed_account = notarium_core::ports::AccountContext::new(
+    let lookup_account = notarium_core::ports::AccountContext::new(
         fenced.auth().with_preflight_taint(),
         call.budget(),
     );
+    match call
+        .registry
+        .catalog
+        .folder(lookup_account.clone(), folder.clone())
+        .await
+    {
+        Ok(live) => {
+            if live.reference != *folder
+                || live.space.id != scope.space_id
+                || live.lifecycle == notarium_core::model::Lifecycle::Purged
+            {
+                return Err(DomainError::ResourceNotFound.into());
+            }
+            fenced.auth().can_view_folder(
+                &live.space,
+                &folder.folder_id,
+                &live.ancestor_folders,
+            )?;
+            let facts = notarium_core::auth::ResourceFacts {
+                space: live.space,
+                class: DocClass::UserDoc,
+                project: None,
+                ancestor_folders: live.ancestor_folders,
+                folder_write_locked: live.write_locked,
+                ability_package: None,
+            };
+            fenced.auth().authorize_direct_write(&facts, &facts)?;
+            return Ok(());
+        }
+        Err(PortError::Domain(DomainError::ResourceNotFound)) => {}
+        Err(error) => return Err(error),
+    }
     let trashed = call
         .registry
         .catalog
-        .trashed_folder_ancestry(trashed_account, folder.clone())
+        .trashed_folder_ancestry(lookup_account, folder.clone())
         .await?;
     if trashed.reference != *folder {
         return Err(DomainError::ResourceNotFound.into());
@@ -642,7 +648,7 @@ async fn authorize_settled_unchanged_replay(
         class: DocClass::UserDoc,
         project: trashed.project,
         ancestor_folders: trashed.ancestors,
-        folder_write_locked: false,
+        folder_write_locked: trashed.write_locked,
         ability_package: None,
     };
     fenced.auth().authorize_direct_write(&facts, &facts)?;

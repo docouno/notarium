@@ -104,7 +104,7 @@ impl ControlService {
             if let Some(pin) = schedule_pin.take() {
                 tx.hold_schedule_pin(pin);
             }
-            let (revision, committed_value, events) = budget.run(async {
+            let (revision, committed_value, events, enqueued) = budget.run(async {
             let (owner,_) = self.scoped_manager(tx.inner_mut(),ctx.auth(),ctx.auth().principal()).await?;
             let auth = self.revalidate(tx.inner_mut(),ctx.auth()).await?;
             let current = AccountContext::new(auth,budget.context(ctx.budget.request.clone()));
@@ -225,7 +225,7 @@ impl ControlService {
                     }
                     _ => return Err(invalid(ValidationReason::InvalidState)),
                 };
-                return Ok((revision, replayed, saved.events));
+                return Ok((revision, replayed, saved.events, Vec::new()));
             }
             expect_revision(&owner,command.identity.expected)?;
             let now = self.clock.now_ms()?;
@@ -373,9 +373,10 @@ impl ControlService {
                 events: events.clone(),
             };
             command.save(tx.inner_mut(),revision,&saved,now).await?;
-            Ok((revision,committed_schedule,events))
+            let enqueued = events.clone();
+            Ok((revision,committed_schedule,events,enqueued))
         },CommitEffect::NotCommitted).await?;
-            self.commit_revocations(tx, &budget, &events).await?;
+            self.commit_revocations(tx, &budget, &enqueued).await?;
             for event in &events {
                 self.flush_event(&budget, event).await?;
             }

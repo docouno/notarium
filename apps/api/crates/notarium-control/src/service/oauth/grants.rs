@@ -63,10 +63,10 @@ impl OAuthService {
         command.require(ctx.auth().principal(), ctx.auth().principal())?;
         let budget = OperationBudget::new(ctx.budget.clone());
         let mut tx = self.control.store.write(budget.clone()).await?;
-        let (revision,saved)=budget.run(async {
+        let (revision,saved,enqueued)=budget.run(async {
             let (_,user)=self.control.manager(tx.inner_mut(),ctx.auth(),ctx.auth().principal()).await?;
             if ctx.auth().is_space_narrowed() {return Err(access_denied());}
-            if let Some(replay)=command.replay::<()>(tx.inner_mut()).await? {return Ok(replay);}
+            if let Some((revision,saved))=command.replay::<()>(tx.inner_mut()).await? {return Ok((revision,saved,Vec::new()));}
             expect_revision(&user,command.identity.expected)?;
             let grant = rows!(
                 tx.inner_mut(),
@@ -80,6 +80,7 @@ impl OAuthService {
             .ok_or(DomainError::ResourceNotFound)?;
             let selector=RevocationSelector::OAuthGrant(request.input);
             let mut events=outbox::pending(tx.inner_mut(),selector.clone()).await?;
+            let mut enqueued=Vec::new();
             let now=self.control.clock.now_ms()?;
             let revision=if grant.revoked_at.is_none() {
                 let grant_revision=next(grant.revision)?;
@@ -87,16 +88,18 @@ impl OAuthService {
                 execute!(tx.inner_mut(),"UPDATE oauth_refresh_families SET revoked_at=$1,reason_code='grant_revoked' WHERE grant_id=$2 AND revoked_at IS NULL","UPDATE v1_control.oauth_refresh_families SET revoked_at=$1,reason_code='grant_revoked' WHERE grant_id=$2 AND revoked_at IS NULL";now,&grant.grant_id)?;
                 let revision=next(user.revision)?;
                 execute!(tx.inner_mut(),"UPDATE users SET revision=$1 WHERE user_id=$2","UPDATE v1_control.users SET revision=$1 WHERE user_id=$2";revision,&user.user_id)?;
-                events.push(outbox::enqueue(tx.inner_mut(),selector,RevocationReason::CredentialRemoved,grant_revision,now).await?);
+                let event = outbox::enqueue(tx.inner_mut(),selector,RevocationReason::CredentialRemoved,grant_revision,now).await?;
+                enqueued.push(event.clone());
+                events.push(event);
                 revision
             } else {user.revision};
             let revision=ControlRevision::new(revision as u64)?;
             let saved=SavedResult {value:(),events};
             command.save(tx.inner_mut(),revision,&saved,now).await?;
-            Ok((revision,saved))
+            Ok((revision,saved,enqueued))
         },CommitEffect::NotCommitted).await?;
         self.control
-            .commit_revocations(tx, &budget, &saved.events)
+            .commit_revocations(tx, &budget, &enqueued)
             .await?;
         for event in saved.events {
             self.control.flush_event(&budget, &event).await?;

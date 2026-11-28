@@ -532,13 +532,13 @@ impl ControlService {
             return Err(invalid(ValidationReason::InvalidState));
         }
         let mut tx = self.store.write(budget.clone()).await?;
-        let (revision,saved)=budget.run(async {
+        let (revision,saved,enqueued)=budget.run(async {
             let accounts=rows!(tx.inner_mut(),UsersRow,fetch_all,
                 "SELECT * FROM users WHERE user_id IN ($1,$2) ORDER BY user_id",
                 "SELECT * FROM v1_control.users WHERE user_id IN ($1,$2) ORDER BY user_id FOR UPDATE";ctx.auth().principal().as_str(),request.member.as_str())?;
             let actor=accounts.iter().find(|user|user.user_id==ctx.auth().principal().as_str()).ok_or_else(denied)?;
             self.live_human(tx.inner_mut(),ctx.auth(),actor).await?;
-            if let Some(replay)=command.replay::<MembershipResult>(tx.inner_mut()).await? {return Ok(replay);}
+            if let Some((revision,saved))=command.replay::<MembershipResult>(tx.inner_mut()).await? {return Ok((revision,saved,Vec::new()));}
             let target=accounts.iter().find(|user|user.user_id==request.member.as_str()).ok_or(DomainError::ResourceNotFound)?;
             if request.role.is_some() && target.disabled_at.is_some() {return Err(access_denied());}
             let current=admission(tx.inner_mut(),space,true).await?;
@@ -566,11 +566,12 @@ impl ControlService {
             execute!(tx.inner_mut(),"UPDATE space_admission SET revision=$1,admission_epoch=$2 WHERE space_id=$3","UPDATE v1_control.space_admission SET revision=$1,admission_epoch=$2 WHERE space_id=$3";revision,epoch,space.as_str())?;
             let event=super::outbox::enqueue(tx.inner_mut(),RevocationSelector::Membership{space:space.clone(),principal:request.member.clone()},RevocationReason::PermissionChanged,epoch,now).await?;
             let revision=ControlRevision::new(revision as u64)?;
+            let enqueued = vec![event.clone()];
             let saved=SavedResult{value:MembershipResult{space:space.clone(),member:request.member,role:request.role},events:vec![event]};
             command.save(tx.inner_mut(),revision,&saved,now).await?;
-            Ok((revision,saved))
+            Ok((revision,saved,enqueued))
         },CommitEffect::NotCommitted).await?;
-        self.commit_revocations(tx, &budget, &saved.events).await?;
+        self.commit_revocations(tx, &budget, &enqueued).await?;
         for event in &saved.events {
             self.flush_event(&budget, event).await?;
         }

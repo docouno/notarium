@@ -363,6 +363,7 @@ impl StepStreamBuffer {
             if entry.kind == ChatEntryKind::Model
                 && entry.run.as_ref() == Some(&self.run)
                 && state.redacted_incomplete_step.is_some()
+                && step.is_none_or(|s| state.redacted_incomplete_step == Some(s))
             {
                 state.redacted_incomplete_step = None;
                 changed = true;

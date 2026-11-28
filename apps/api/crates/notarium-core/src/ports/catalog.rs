@@ -24,6 +24,7 @@ pub struct TrashedFolderAncestry {
     pub reference: FolderRef,
     pub project: Option<FolderId>,
     pub ancestors: Vec<FolderId>,
+    pub write_locked: bool,
 }
 
 #[derive(Clone, Debug)]

@@ -190,7 +190,7 @@ async fn project_placement(
             .space(call.budget(), project.scope.space_id.clone())
             .await?;
         project.scope.check(&space.history)?;
-        (space.space, trashed.ancestors, false, true)
+        (space.space, trashed.ancestors, trashed.write_locked, true)
     };
     if !is_trashed_replay {
         let live = call

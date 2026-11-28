@@ -283,10 +283,10 @@ impl ControlService {
         command.require(ctx.auth().principal(), &request.input.account)?;
         let budget = OperationBudget::new(ctx.budget.clone());
         let mut tx = self.store.write(budget.clone()).await?;
-        let (revision,saved)=budget.run(async {
+        let (revision,saved,enqueued)=budget.run(async {
             let (_,current)=self.manager(tx.inner_mut(),ctx.auth(),&request.input.account).await?;
             if ctx.auth().is_space_narrowed() {return Err(access_denied());}
-            if let Some(replay)=command.replay::<()>(tx.inner_mut()).await? {return Ok(replay);}
+            if let Some((revision,saved))=command.replay::<()>(tx.inner_mut()).await? {return Ok((revision,saved,Vec::new()));}
             expect_revision(&current,command.identity.expected)?;
             let pat = match pat(tx.inner_mut(), request.input.token.as_str()).await {
                 Ok(pat) => pat,
@@ -298,19 +298,22 @@ impl ControlService {
             if pat.user_id!=current.user_id {return Err(DomainError::ResourceNotFound.into());}
             let now=self.clock.now_ms()?;
             let mut events=super::outbox::pending(tx.inner_mut(),RevocationSelector::Grant(grant("pat",&pat.token_id))).await?;
+            let mut enqueued=Vec::new();
             let revision=if pat.revoked_at.is_none() {
                 execute!(tx.inner_mut(),"UPDATE pats SET revoked_at=$1 WHERE token_id=$2","UPDATE v1_control.pats SET revoked_at=$1 WHERE token_id=$2";now,&pat.token_id)?;
                 let revision=next(current.revision)?;
                 execute!(tx.inner_mut(),"UPDATE users SET revision=$1 WHERE user_id=$2","UPDATE v1_control.users SET revision=$1 WHERE user_id=$2";revision,&current.user_id)?;
-                events.push(super::outbox::enqueue(tx.inner_mut(),RevocationSelector::Grant(grant("pat",&pat.token_id)),RevocationReason::CredentialRemoved,revision,now).await?);
+                let event = super::outbox::enqueue(tx.inner_mut(),RevocationSelector::Grant(grant("pat",&pat.token_id)),RevocationReason::CredentialRemoved,revision,now).await?;
+                enqueued.push(event.clone());
+                events.push(event);
                 revision
             } else {current.revision};
             let revision=ControlRevision::new(revision as u64)?;
             let saved=SavedResult{value:(),events};
             command.save(tx.inner_mut(),revision,&saved,now).await?;
-            Ok((revision,saved))
+            Ok((revision,saved,enqueued))
         },CommitEffect::NotCommitted).await?;
-        self.commit_revocations(tx, &budget, &saved.events).await?;
+        self.commit_revocations(tx, &budget, &enqueued).await?;
         for event in &saved.events {
             self.flush_event(&budget, event).await?;
         }

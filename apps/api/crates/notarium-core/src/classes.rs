@@ -42,7 +42,7 @@ pub enum AbilityKind {
     Skill,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Eq, PartialEq)]
 struct DocumentFacts {
     recorded: ResourceFacts,
     current: Option<Box<(ResourceFacts, Lifecycle)>>,
@@ -621,6 +621,8 @@ impl ContentPart {
         if metadata.reference() != document.reference()
             || metadata.revision() != document.revision()
             || metadata.digest() != document.digest()
+            || metadata.facts != document.facts
+            || metadata.lifecycle != document.lifecycle
             || chunk.source != document.digest
             || chunk.spans.is_empty()
             || render_chunk(&document.content, &chunk.context, &chunk.spans)? != chunk.text
@@ -1810,4 +1812,100 @@ fn content_part_releases_full_document_arc_immediately() {
         "ContentPart must drop the full ClassifiedDocument Arc immediately after verification"
     );
     assert_eq!(part.provenance().reference(), &reference);
+}
+
+#[cfg(test)]
+#[test]
+fn content_part_from_chunk_shared_rejects_metadata_facts_or_lifecycle_mismatch() {
+    let space = Space {
+        id: SpaceId::from_bytes([1; 16]),
+        kind: SpaceKind::Personal,
+        lifecycle: crate::auth::SpaceLifecycle::Active,
+    };
+    let reference = NoteRef {
+        space_id: space.id.clone(),
+        note_id: crate::ids::NoteId::from_bytes([2; 16]),
+    };
+    let revision = RevisionId::from_bytes([3; 16]);
+    let digest = ContentDigest::from_bytes([7; 32]);
+    let recorded = ResourceFacts {
+        space: space.clone(),
+        class: DocClass::UserDoc,
+        project: None,
+        ancestor_folders: vec![FolderId::from_bytes([4; 16])],
+        folder_write_locked: false,
+        ability_package: None,
+    };
+    let doc = ClassifiedDocument::from_canonical(
+        reference.clone(),
+        revision.clone(),
+        recorded.clone(),
+        Lifecycle::Active,
+        "# Title\n".to_owned(),
+        digest,
+    )
+    .unwrap();
+    let chunk = ChunkDescriptor {
+        key: ContentDigest::from_bytes([5; 32]),
+        source: digest,
+        model: ModelProfileId::from_bytes([6; 16]),
+        tokens: 2,
+        context: Vec::new(),
+        spans: vec![ByteSpan::new(0, 7).unwrap()],
+        text: "# Title".to_owned(),
+    };
+
+    // Lifecycle mismatch must be rejected.
+    let trashed_meta = Arc::new(
+        ClassifiedDocument::from_canonical(
+            reference.clone(),
+            revision.clone(),
+            recorded.clone(),
+            Lifecycle::Trashed,
+            "# Title\n".to_owned(),
+            digest,
+        )
+        .unwrap()
+        .metadata(),
+    );
+    assert!(matches!(
+        ContentPart::from_chunk_shared(&doc, trashed_meta, chunk.clone()),
+        Err(DomainError::ValidationFailed { diagnostic })
+            if diagnostic.reason == ValidationReason::SourceMismatch
+    ));
+
+    // Recorded ResourceFacts mismatch must be rejected.
+    let mut locked_facts = recorded.clone();
+    locked_facts.folder_write_locked = true;
+    let locked_meta = Arc::new(
+        ClassifiedDocument::from_canonical(
+            reference.clone(),
+            revision.clone(),
+            locked_facts,
+            Lifecycle::Active,
+            "# Title\n".to_owned(),
+            digest,
+        )
+        .unwrap()
+        .metadata(),
+    );
+    assert!(matches!(
+        ContentPart::from_chunk_shared(&doc, locked_meta, chunk.clone()),
+        Err(DomainError::ValidationFailed { diagnostic })
+            if diagnostic.reason == ValidationReason::SourceMismatch
+    ));
+
+    // Bound current-placement mismatch must be rejected.
+    let mut moved_facts = recorded;
+    moved_facts.class = DocClass::Skill;
+    let mut bound_doc = doc.clone();
+    bound_doc
+        .bind_current(moved_facts, Lifecycle::Active)
+        .unwrap();
+    let unbound_meta = Arc::new(doc.metadata());
+    assert!(matches!(
+        ContentPart::from_chunk_shared(&bound_doc, unbound_meta, chunk),
+        Err(DomainError::ValidationFailed { diagnostic })
+            if diagnostic.reason == ValidationReason::SourceMismatch
+    ));
 }

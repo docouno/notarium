@@ -27,6 +27,7 @@ const BACKGROUND_REVOKE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Default)]
 struct DeliveryState {
+    pending_ack: HashSet<RequestId>,
     delivered: HashSet<RequestId>,
     order: VecDeque<RequestId>,
     next_token: u64,
@@ -34,9 +35,20 @@ struct DeliveryState {
 }
 
 impl DeliveryState {
+    fn is_delivered(&self, id: &RequestId) -> bool {
+        self.pending_ack.contains(id) || self.delivered.contains(id)
+    }
+
     fn record_delivered(&mut self, id: RequestId) {
+        if !self.delivered.contains(&id) {
+            self.pending_ack.insert(id);
+        }
+    }
+
+    fn mark_acked(&mut self, id: &RequestId) {
+        self.pending_ack.remove(id);
         if self.delivered.insert(id.clone()) {
-            self.order.push_back(id);
+            self.order.push_back(id.clone());
             while self.order.len() > MAX_TRACKED_DELIVERED_EVENTS {
                 if let Some(oldest) = self.order.pop_front() {
                     self.delivered.remove(&oldest);
@@ -133,15 +145,21 @@ impl RevocationDeliveryTracker {
         self.state
             .lock()
             .unwrap_or_else(|err| err.into_inner())
-            .delivered
-            .contains(id)
+            .is_delivered(id)
+    }
+
+    fn mark_acked(&self, id: &RequestId) {
+        self.state
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .mark_acked(id);
     }
 
     async fn begin_owned(self: &Arc<Self>, id: RequestId) -> Option<OwnedInFlightGuard> {
         loop {
             let mut waiter = {
                 let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
-                if state.delivered.contains(&id) {
+                if state.is_delivered(&id) {
                     return None;
                 }
                 if let Some((_, existing)) = state.in_flight.get(&id) {
@@ -168,7 +186,7 @@ impl RevocationDeliveryTracker {
         loop {
             let mut waiter = {
                 let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
-                if state.delivered.contains(id) {
+                if state.is_delivered(id) {
                     return DeliverySlot::AlreadyDelivered;
                 }
                 if let Some((_, existing)) = state.in_flight.get(id) {
@@ -264,16 +282,22 @@ pub(super) async fn enqueue_at(
 impl ControlService {
     /// SQL authority locks precede registry leases on both dispatch and mutation
     /// paths. Calls release their registration before starting settlement SQL.
+    /// Only revocation events newly enqueued by `tx` should be passed here;
+    /// replayed receipts and pre-existing pending events resume via
+    /// `flush_event` without re-fencing already-authorized work.
     pub(super) async fn commit_revocations(
         &self,
         mut tx: crate::store::WriteTransaction,
         budget: &OperationBudget,
         events: &[RequestId],
     ) -> Result<(), PortError> {
+        if events.is_empty() {
+            return budget.commit_tx(tx).await;
+        }
         const MAX_FENCE_SELECTORS: usize = 512;
         let mut unique = std::collections::BTreeSet::new();
         let mut to_revoke = Vec::new();
-        let mut already_delivered_ids = Vec::new();
+        let mut already_delivered = Vec::new();
         for id in events {
             let event = budget
                 .run(
@@ -296,7 +320,7 @@ impl ControlService {
                         .map_err(|_| invalid(ValidationReason::InvalidState))?;
                 let request = RequestId::parse(&event.event_id)?;
                 if self.revocation_tracker.is_delivered(&request) {
-                    already_delivered_ids.push(event.event_id);
+                    already_delivered.push((event.event_id, request));
                 } else {
                     unique.insert(envelope.selector.clone());
                     to_revoke.push((event.event_id, request, envelope.selector, reason));
@@ -335,7 +359,7 @@ impl ControlService {
             .unwrap_or_else(|| RequestId::from_bytes([0; 16]));
         let settle_handle = tokio::spawn(async move {
             let fences = tx.commit_keeping_fences().await?;
-            let mut delivered_ids = already_delivered_ids;
+            let mut delivered_ids = already_delivered;
             delivered_ids.reserve(to_revoke.len());
             let mut first_error: Option<PortError> = None;
             for (event_id, request, selector, reason) in to_revoke {
@@ -348,7 +372,7 @@ impl ControlService {
                             MaintenanceContext {
                                 authority: ServiceAuthority::admit(ServicePurpose::Revocation),
                                 budget: CallBudget {
-                                    request,
+                                    request: request.clone(),
                                     remaining: BACKGROUND_REVOKE_TIMEOUT,
                                     cancellation: Cancellation::default(),
                                 },
@@ -365,7 +389,7 @@ impl ControlService {
                 })
                 .await;
                 match step_result {
-                    Ok(Ok(true)) => delivered_ids.push(event_id),
+                    Ok(Ok(true)) => delivered_ids.push((event_id, request)),
                     Ok(Ok(false)) => {}
                     Ok(Err(error)) => {
                         if first_error.is_none() {
@@ -395,7 +419,7 @@ impl ControlService {
                     ack_budget
                         .run(
                             async {
-                                for event_id in &delivered_ids {
+                                for (event_id, _) in &delivered_ids {
                                     execute!(
                                         mark_tx.inner_mut(),
                                         "UPDATE revocation_events SET attempts=attempts+1, delivered_at=$1 WHERE event_id=$2 AND delivered_at IS NULL",
@@ -412,10 +436,11 @@ impl ControlService {
                     ack_budget.commit_tx(mark_tx).await
                 }
                 .await;
-                // If recording `delivered_at` fails transiently, `flush_event` /
-                // `drain_revocations` will retry idempotently while the tracker
-                // prevents duplicate delivery within this process.
-                let _ = mark_delivered;
+                if mark_delivered.is_ok() {
+                    for (_, request) in &delivered_ids {
+                        tracker.mark_acked(request);
+                    }
+                }
             }
             if let Some(error) = first_error {
                 return Err(error);
@@ -514,7 +539,7 @@ impl ControlService {
                     self.revoker.revoke(
                         MaintenanceContext {
                             authority: ServiceAuthority::admit(ServicePurpose::Revocation),
-                            budget: budget.context(request),
+                            budget: budget.context(request.clone()),
                         },
                         envelope.selector,
                         reason,
@@ -535,7 +560,9 @@ impl ControlService {
             budget.commit_tx(tx).await
         }
         .await
-        .map_err(|err| unknown_after_revocation(err, "control revocation mark delivered"))
+        .map_err(|err| unknown_after_revocation(err, "control revocation mark delivered"))?;
+        self.revocation_tracker.mark_acked(&request);
+        Ok(())
     }
 }
 
@@ -603,5 +630,40 @@ mod tests {
             assert!(r1.is_none());
             assert!(r2);
         }
+    }
+
+    #[tokio::test]
+    async fn delivery_tracker_keeps_unacked_events_immune_from_lru_eviction() {
+        let tracker = Arc::new(RevocationDeliveryTracker::default());
+        let unacked = RequestId::from_bytes([0xAA; 16]);
+        let mut guard = tracker
+            .begin_owned(unacked.clone())
+            .await
+            .expect("claim unacked");
+        guard.mark_delivered();
+        drop(guard);
+        assert!(tracker.is_delivered(&unacked));
+
+        // Deliver and durably ACK more than MAX_TRACKED_DELIVERED_EVENTS other events.
+        for i in 0u32..(MAX_TRACKED_DELIVERED_EVENTS as u32 + 64) {
+            let mut bytes = [0u8; 16];
+            bytes[..4].copy_from_slice(&i.to_be_bytes());
+            let other = RequestId::from_bytes(bytes);
+            let mut g = tracker.begin_owned(other.clone()).await.expect("claim");
+            g.mark_delivered();
+            drop(g);
+            tracker.mark_acked(&other);
+        }
+
+        // Un-ACKed delivered event must never be evicted before SQL ACK succeeds.
+        assert!(tracker.is_delivered(&unacked));
+        assert!(matches!(
+            tracker.begin(&unacked).await,
+            DeliverySlot::AlreadyDelivered
+        ));
+
+        // Once durably ACKed, it enters the bounded LRU normally.
+        tracker.mark_acked(&unacked);
+        assert!(tracker.is_delivered(&unacked));
     }
 }

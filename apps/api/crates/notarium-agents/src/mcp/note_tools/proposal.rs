@@ -1305,29 +1305,15 @@ pub(in crate::mcp) async fn apply_proposal(
             }
             if let Some(view_key) = edited_view {
                 let changed = notarium_syntax::patch::apply(original, &plan)?;
-                let changed_body = notarium_syntax::carrier::Carrier::scan(&changed)?.body;
-                let changed_md = notarium_syntax::markdown::analyze(&changed, changed_body)?;
-                let reparsed = notarium_syntax::nota::analyze(
+                super::edit::validate_confirmed_view_with_schema_journal(
+                    owner,
+                    &scope,
+                    "confirmed-edit-note-view-schema",
                     &changed,
-                    changed_body,
                     &route.note,
-                    &changed_md,
-                    false,
-                )?;
-                let block = reparsed
-                    .blocks
-                    .iter()
-                    .find(|block| block.id.as_ref() == Some(&view_key))
-                    .ok_or_else(|| invalid(ValidationReason::InvalidView))?;
-                if block.state != notarium_core::document::ViewState::Ready {
-                    return Err(invalid(ValidationReason::InvalidView));
-                }
-                let config = block
-                    .config
-                    .as_ref()
-                    .ok_or_else(|| invalid(ValidationReason::InvalidView))?;
-                let live_schema = owner.registry.engine.space_schema(scope.clone()).await?;
-                notarium_syntax::nota::spec::validate_view_config(config, &view_key, &live_schema)?;
+                    &view_key,
+                )
+                .await?;
             }
             let result = owner
                 .registry

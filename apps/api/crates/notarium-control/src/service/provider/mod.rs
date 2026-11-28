@@ -244,7 +244,7 @@ impl ProviderService {
         command.require(ctx.auth().principal(), ctx.auth().principal())?;
         let budget = OperationBudget::new(ctx.budget.clone());
         let mut tx = self.control.store.write(budget.clone()).await?;
-        let (revision, saved) = budget
+        let (revision, saved, enqueued) = budget
             .run(
                 async {
                     let (_, owner) = self
@@ -258,7 +258,7 @@ impl ProviderService {
                         .await?;
                     if let Some((revision, saved)) = command.replay::<T>(tx.inner_mut()).await? {
                         authorize_replay(tx.inner_mut(), &owner, &saved.value).await?;
-                        return Ok((revision, saved));
+                        return Ok((revision, saved, Vec::new()));
                     }
                     authorize_fresh(tx.inner_mut(), &owner).await?;
                     expect_revision(&owner, command.identity.expected)?;
@@ -280,15 +280,16 @@ impl ProviderService {
                         );
                     }
                     let revision = notarium_core::ids::ControlRevision::new(revision as u64)?;
+                    let enqueued = events.clone();
                     let saved = SavedResult { value, events };
                     command.save(tx.inner_mut(), revision, &saved, now).await?;
-                    Ok((revision, saved))
+                    Ok((revision, saved, enqueued))
                 },
                 CommitEffect::NotCommitted,
             )
             .await?;
         self.control
-            .commit_revocations(tx, &budget, &saved.events)
+            .commit_revocations(tx, &budget, &enqueued)
             .await?;
         for event in &saved.events {
             self.control.flush_event(&budget, event).await?;
@@ -322,7 +323,7 @@ impl ProviderService {
         command.require(ctx.auth().principal(), ctx.auth().principal())?;
         let budget = OperationBudget::new(ctx.budget.clone());
         let mut tx = self.control.store.write(budget.clone()).await?;
-        let (revision, saved) = budget.run(async {
+        let (revision, saved, enqueued) = budget.run(async {
             let scope = if scoped {
                 ManagerScope::TargetScoped
             } else {
@@ -333,7 +334,9 @@ impl ProviderService {
                 .manager_impl(tx.inner_mut(), ctx.auth(), ctx.auth().principal(), scope)
                 .await?;
             authorize(tx.inner_mut(), &owner).await?;
-            if let Some(replay) = command.replay::<T>(tx.inner_mut()).await? { return Ok(replay); }
+            if let Some((revision, saved)) = command.replay::<T>(tx.inner_mut()).await? {
+                return Ok((revision, saved, Vec::new()));
+            }
             expect_revision(&owner, command.identity.expected)?;
             let now = self.control.clock.now_ms()?;
             let (value, selectors) = apply(tx.inner_mut(), &owner, now).await?;
@@ -344,12 +347,13 @@ impl ProviderService {
                 events.push(super::outbox::enqueue(tx.inner_mut(), selector, RevocationReason::PermissionChanged, revision, now).await?);
             }
             let revision = notarium_core::ids::ControlRevision::new(revision as u64)?;
+            let enqueued = events.clone();
             let saved = SavedResult { value, events };
             command.save(tx.inner_mut(), revision, &saved, now).await?;
-            Ok((revision, saved))
+            Ok((revision, saved, enqueued))
         }, CommitEffect::NotCommitted).await?;
         self.control
-            .commit_revocations(tx, &budget, &saved.events)
+            .commit_revocations(tx, &budget, &enqueued)
             .await?;
         for event in &saved.events {
             self.control.flush_event(&budget, event).await?;

@@ -402,6 +402,58 @@ pub(super) async fn plan_view_edit_with_schema_journal(
     class: DocClass,
     route: &NoteRoute,
 ) -> Result<CarrierPatchPlan, PortError> {
+    with_journaled_view_schema(call, scope, journal_label, None, |fields| {
+        input.plan(original, class, route, fields)
+    })
+    .await
+}
+
+/// Revalidate a confirmed view edit against the live Space schema on initial
+/// confirmation and journal only the schema revision ID so idempotent retries
+/// survive subsequent schema drift or project trash.
+pub(super) async fn validate_confirmed_view_with_schema_journal(
+    call: &ToolCallContext<'_>,
+    scope: &SpaceContext,
+    journal_label: &str,
+    changed: &str,
+    note: &NoteId,
+    view_key: &ViewKey,
+) -> Result<(), PortError> {
+    let changed_body = Carrier::scan(changed)?.body;
+    let changed_md = markdown::analyze(changed, changed_body)?;
+    let reparsed = notarium_syntax::nota::analyze(changed, changed_body, note, &changed_md, false)?;
+    let block = reparsed
+        .blocks
+        .iter()
+        .find(|block| block.id.as_ref() == Some(view_key))
+        .ok_or_else(|| invalid(ValidationReason::InvalidView))?;
+    if block.state != notarium_core::document::ViewState::Ready {
+        return Err(invalid(ValidationReason::InvalidView));
+    }
+    let config = block
+        .config
+        .as_ref()
+        .ok_or_else(|| invalid(ValidationReason::InvalidView))?;
+    with_journaled_view_schema(
+        call,
+        scope,
+        journal_label,
+        Some("notarium.mcp.confirmed-edit-note.v1"),
+        |fields| {
+            notarium_syntax::nota::spec::validate_view_config(config, view_key, fields)?;
+            Ok(())
+        },
+    )
+    .await
+}
+
+async fn with_journaled_view_schema<T>(
+    call: &ToolCallContext<'_>,
+    scope: &SpaceContext,
+    journal_label: &str,
+    replay_operational_label: Option<&'static str>,
+    apply: impl Fn(&BTreeMap<String, FieldSchema>) -> Result<T, PortError>,
+) -> Result<T, PortError> {
     if let Some(saved) = call
         .lookup_journal_with_key::<JournaledViewSchema>(
             journal_label,
@@ -412,22 +464,30 @@ pub(super) async fn plan_view_edit_with_schema_journal(
     {
         let fields = match saved.revision {
             Some(rev) => {
-                call.registry
+                let loaded = call
+                    .registry
                     .engine
                     .space_schema_snapshot(scope.clone(), Some(rev))
-                    .await?
-                    .fields
+                    .await;
+                let snapshot = match (loaded, replay_operational_label) {
+                    (Ok(snapshot), _) => snapshot,
+                    (Err(error), Some(label)) => {
+                        return Err(super::batch_operational_error(label, error, true));
+                    }
+                    (Err(error), None) => return Err(error),
+                };
+                snapshot.fields
             }
             None => BTreeMap::new(),
         };
-        return input.plan(original, class, route, &fields);
+        return apply(&fields);
     }
     let snapshot = call
         .registry
         .engine
         .space_schema_snapshot(scope.clone(), None)
         .await?;
-    let plan = input.plan(original, class, route, &snapshot.fields)?;
+    let outcome = apply(&snapshot.fields)?;
     let recorded = call
         .record_journal_with_key(
             journal_label,
@@ -441,17 +501,25 @@ pub(super) async fn plan_view_edit_with_schema_journal(
     if recorded.revision != snapshot.revision {
         let fields = match recorded.revision {
             Some(rev) => {
-                call.registry
+                let loaded = call
+                    .registry
                     .engine
                     .space_schema_snapshot(scope.clone(), Some(rev))
-                    .await?
-                    .fields
+                    .await;
+                let snapshot = match (loaded, replay_operational_label) {
+                    (Ok(snapshot), _) => snapshot,
+                    (Err(error), Some(label)) => {
+                        return Err(super::batch_operational_error(label, error, true));
+                    }
+                    (Err(error), None) => return Err(error),
+                };
+                snapshot.fields
             }
             None => BTreeMap::new(),
         };
-        return input.plan(original, class, route, &fields);
+        return apply(&fields);
     }
-    Ok(plan)
+    Ok(outcome)
 }
 
 pub(super) async fn edit_note(

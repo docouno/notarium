@@ -110,10 +110,10 @@ impl ControlService {
             return Err(access_denied());
         }
         let mut tx = self.store.write(budget.clone()).await?;
-        let (revision,saved)=budget.run(async {
+        let (revision,saved,enqueued)=budget.run(async {
             let actor=user(tx.inner_mut(),ctx.auth().principal().as_str()).await?;
             self.live_human(tx.inner_mut(),ctx.auth(),&actor).await?;
-            if let Some(replay)=command.replay::<ResultOperation>(tx.inner_mut()).await? {return Ok(replay);}
+            if let Some((revision,saved))=command.replay::<ResultOperation>(tx.inner_mut()).await? {return Ok((revision,saved,Vec::new()));}
             let current=admission(tx.inner_mut(),&ctx.scope().space_id,true).await?;
             expect_space(&current,request.expected)?;
             require_owner(tx.inner_mut(),ctx.auth(),&ctx.scope().space_id).await?;
@@ -129,11 +129,12 @@ impl ControlService {
             let row=TargetRecord::from(ControlOperationsRow{operation_id:id.to_string(),command_key:id.to_string(),kind:"lifecycle".into(),target_space:ctx.scope().space_id.to_string(),state:"pending".into(),payload_hash:blake3::hash(payload.as_bytes()).as_bytes().to_vec(),payload,canonical_receipt:None,next_action:"revoke-then-canonical".into(),updated_at:now});
             row.validate()?;row.insert(tx.inner_mut()).await?;
             let revision=ControlRevision::new(revision as u64)?;
+            let enqueued = vec![event.clone()];
             let saved=SavedResult{value:ResultOperation{operation:id},events:vec![event]};
             command.save(tx.inner_mut(),revision,&saved,now).await?;
-            Ok((revision,saved))
+            Ok((revision,saved,enqueued))
         },CommitEffect::NotCommitted).await?;
-        self.commit_revocations(tx, &budget, &saved.events).await?;
+        self.commit_revocations(tx, &budget, &enqueued).await?;
         let current = self
             .finish_lifecycle(&budget, &saved.value.operation)
             .await?;
