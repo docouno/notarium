@@ -773,12 +773,13 @@ async fn pg_unknown_commit_barrier_waits_for_active_space_row_lock() {
         .await
         .unwrap();
 
-    // Hold an exclusive FOR UPDATE lock on the Space row (simulating an in-flight
-    // server-side COMMIT whose client connection was lost).
+    // Hold a FOR NO KEY UPDATE lock on the Space row (the exact lock mode acquired
+    // by canonical writers, simulating an in-flight server-side COMMIT whose client
+    // connection was lost).
     let mut raw = fixtures.open_raw_pg().await;
     let mut tx = raw.begin().await.unwrap();
     sqlx::query(sqlx::AssertSqlSafe(format!(
-        "SELECT 1 FROM \"{schema}\".spaces WHERE space_id = $1 FOR UPDATE"
+        "SELECT 1 FROM \"{schema}\".spaces WHERE space_id = $1 FOR NO KEY UPDATE"
     )))
     .bind(space_id.as_str())
     .fetch_one(&mut *tx)
@@ -791,7 +792,7 @@ async fn pg_unknown_commit_barrier_waits_for_active_space_row_lock() {
         tokio::time::timeout(Duration::from_millis(80), &mut barrier)
             .await
             .is_err(),
-        "unknown-commit barrier must wait while a Space FOR UPDATE transaction is active"
+        "unknown-commit barrier must wait while a Space FOR NO KEY UPDATE transaction is active"
     );
 
     tx.rollback().await.unwrap();
@@ -799,7 +800,43 @@ async fn pg_unknown_commit_barrier_waits_for_active_space_row_lock() {
         .await
         .expect("unknown-commit barrier must complete once the Space row lock releases");
 
+    // Starting runtime.shutdown() while a Space row lock is still held must NOT cancel
+    // or bypass the barrier prematurely before PG settles the ambiguous transaction.
+    let mut tx2 = raw.begin().await.unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SELECT 1 FROM \"{schema}\".spaces WHERE space_id = $1 FOR NO KEY UPDATE"
+    )))
+    .bind(space_id.as_str())
+    .fetch_one(&mut *tx2)
+    .await
+    .unwrap();
+    let store_for_barrier = store.clone();
+    let space_for_barrier = space_id.clone();
+    let mut barrier_during_shutdown = tokio::spawn(async move {
+        store_for_barrier
+            .await_pg_unknown_commit_barrier_for_test(std::slice::from_ref(&space_for_barrier))
+            .await;
+    });
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    let shutdown_task = tokio::spawn(async move { runtime.shutdown().await });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(120), &mut barrier_during_shutdown)
+            .await
+            .is_err(),
+        "runtime.shutdown() must not bypass an active PG unknown-commit barrier"
+    );
+
+    tx2.rollback().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), barrier_during_shutdown)
+        .await
+        .expect("barrier must finish once the Space lock releases")
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), shutdown_task)
+        .await
+        .expect("shutdown must finish cleanly after barrier releases")
+        .unwrap()
+        .unwrap();
+
     let _ = raw.close().await;
-    runtime.shutdown().await.unwrap();
     fixtures.drop_pg_schema(&schema).await;
 }

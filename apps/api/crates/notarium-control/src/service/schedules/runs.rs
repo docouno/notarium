@@ -152,6 +152,15 @@ impl ControlService {
                 if slot > locked_now {
                     return Err(invalid(ValidationReason::InvalidTimestamp));
                 }
+                let repaired_revision = row.next_slot_utc_ms != Some(slot)
+                    && row.revision as u64 == request.expected.get().saturating_add(1)
+                    && (row.config_revision as u64) <= request.expected.get()
+                    && !has_run_at_claimed_revision(
+                        tx.inner_mut(),
+                        &request.schedule,
+                        request.expected.get(),
+                    )
+                    .await?;
                 let previous = slot_receipt(tx.inner_mut(), &request.schedule, slot).await?;
                 if let Some(previous) = &previous {
                     if previous.claim_request_hash == fingerprint {
@@ -162,8 +171,9 @@ impl ControlService {
                     let expected = request.expected.get();
                     let current = row.revision as u64;
                     let repairing = row.next_slot_utc_ms == Some(slot) && current == expected;
-                    let repaired = row.next_slot_utc_ms != Some(slot) && current == expected.saturating_add(1);
-                    if previous.claimed_schedule_revision as u64 >= expected || !(repairing || repaired) {
+                    if previous.claimed_schedule_revision as u64 >= expected
+                        || !(repairing || repaired_revision)
+                    {
                         return Err(DomainError::IdempotencyKeyReused.into());
                     }
                 }
@@ -194,8 +204,7 @@ impl ControlService {
                 } else {
                     None
                 };
-                if row.next_slot_utc_ms != Some(slot)
-                    && info.revision.get().checked_sub(1) == Some(request.expected.get())
+                if repaired_revision
                     && let Some(outcome) = skipped
                 {
                     return Ok((outcome, Vec::new(), None));
@@ -399,6 +408,21 @@ pub(super) async fn slot_receipt(
         "SELECT * FROM agent_schedule_runs WHERE schedule_id=$1 AND slot_utc_ms=$2",
         "SELECT * FROM v1_control.agent_schedule_runs WHERE schedule_id=$1 AND slot_utc_ms=$2";
         schedule.as_str(),slot)
+}
+
+async fn has_run_at_claimed_revision(
+    tx: &mut Transaction,
+    schedule: &ScheduleId,
+    claimed_revision: u64,
+) -> Result<bool, PortError> {
+    let Ok(claimed) = i64::try_from(claimed_revision) else {
+        return Ok(false);
+    };
+    let found = rows!(tx,(i64,),fetch_optional,
+        "SELECT CAST(1 AS BIGINT) FROM agent_schedule_runs WHERE schedule_id=$1 AND claimed_schedule_revision=$2 LIMIT 1",
+        "SELECT CAST(1 AS BIGINT) FROM v1_control.agent_schedule_runs WHERE schedule_id=$1 AND claimed_schedule_revision=$2 LIMIT 1";
+        schedule.as_str(),claimed)?;
+    Ok(found.is_some())
 }
 
 async fn advance(

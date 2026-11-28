@@ -377,7 +377,8 @@ Owner management admission can target an archived Space without granting content
 read/write access. Revocation callbacks receive the durable event request ID for
 idempotent delivery; a committed mutation cannot return success before their ACK.
 
-Schedule claims carry the next slot computed by the scheduler. A committed claim
+Control computes the next schedule slot authoritatively from the schedule
+calendar and Control clock inside the claim transaction. A committed claim
 advances the slot or records calendar exhaustion atomically. Repeated claims
 return an inspection receipt. A fresh winning claim authorizes dispatch. Terminal run results are typed and do not
 carry a next slot. Only a new winning claim returns a non-deserializable

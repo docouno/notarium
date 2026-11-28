@@ -53,7 +53,7 @@ pub(super) fn identity(
     if ctx.auth().kind() != &PrincipalKind::DirectHuman {
         return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
     }
-    if request.body.len() > content::MAX_TURN_BYTES || request.body.contains('\0') {
+    if request.body.len() > ChatInputBody::MAX_ENTRY_BYTES || request.body.contains('\0') {
         return Err(DomainError::validation(ValidationReason::InvalidRange).into());
     }
     // The transaction chooses the route. Its observed run and physical upload

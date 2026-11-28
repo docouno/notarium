@@ -12,6 +12,7 @@ pub fn remove_later_features(version: u32, checksum: &str) -> &'static [&'static
         (8, "085e724d4cf969a85265d36b616fe04bc78a51c3beadf86dee7f1664bee2dcd7") => {
             &[WITHOUT_AGENTS]
         }
+        (9, "a906f0cf2dc6d4948cd01b180491c1cbe796160ef88e18a706a96e7f36c8fd84") => &[],
         _ => panic!("unsupported archival layout v{version} with checksum {checksum}"),
     }
 }

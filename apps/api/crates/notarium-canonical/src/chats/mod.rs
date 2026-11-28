@@ -4060,7 +4060,9 @@ async fn queue_chat_input_impl(
     if ctx.auth().kind() != &PrincipalKind::DirectHuman {
         return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
     }
-    if request.input.body.contains('\0') || request.input.body.len() > content::MAX_TURN_BYTES {
+    if request.input.body.contains('\0')
+        || request.input.body.len() > ChatInputBody::MAX_ENTRY_BYTES
+    {
         return Err(DomainError::validation(ValidationReason::InvalidRange).into());
     }
     if request.input.sender != *ctx.auth().principal() {
@@ -4830,6 +4832,11 @@ async fn consume_chat_input_impl(
                         internal_not_committed("corrupt_pending_digest", "digest != 32B")
                     })?;
                     let digest = ContentDigest::from_bytes(arr);
+                    let meta =
+                        crate::blobs::load_active_blob_meta_tx(tx, &scope.space_id, digest).await?;
+                    if meta.raw_size > ChatInputBody::MAX_ENTRY_BYTES as u64 {
+                        return Err(DomainError::validation(ValidationReason::InvalidRange).into());
+                    }
                     let entry_owner = format!("{}:{}", input.thread.as_str(), entry_seq.get());
                     bind_existing_active_blob_ref_tx(
                         tx,

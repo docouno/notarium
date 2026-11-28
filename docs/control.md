@@ -578,11 +578,14 @@ After reservation, the service rechecks current authority/configuration/consent,
 changes intent to sending and acquires its live registration in one SQL transaction.
 Canonical egress revalidates participating sources inside a short read-only
 repeatable-read snapshot bounded by the caller and SQLite WAL reader deadlines.
-On PostgreSQL the read-only snapshot connection returns immediately to the pool
-after verification (no `FOR SHARE` or advisory locks are held across Control
-transactions or upstream network I/O); on SQLite an in-memory disclosure pin
-guards local mutations until `mark_dispatched`, while `RevocationHub` cancels
-in-flight HTTP calls on concurrent revocation. Restore waits for outstanding
+On PostgreSQL the provider-egress snapshot connection returns immediately to the
+pool after verification (no `FOR SHARE` or advisory locks are held across
+Control transactions or upstream network I/O); on SQLite an in-memory disclosure
+pin guards local mutations until `mark_dispatched`, while `RevocationHub` cancels
+in-flight HTTP calls on concurrent revocation. Short schedule/ability approval
+pins hold a Space `FOR SHARE` lock on PostgreSQL (or the in-memory disclosure
+pin on SQLite) strictly across the Control database transaction and never across
+external network I/O. Restore waits for outstanding
 local disclosures before switching generations.
 The transport handle exists before awaiting response headers. Shutdown acknowledgement
 precedes release of canonical/registry leases and the independent five-second audit

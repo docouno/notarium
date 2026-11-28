@@ -757,10 +757,11 @@ impl ProviderService {
             check_query_taint,
         )?);
         progress.submitted = true;
-        // Keep the pinned canonical snapshot across DNS/TCP/TLS, preflight(),
-        // and request-body upload so concurrent purge/redaction cannot race
-        // before bytes hit the socket, then release cleanly before waiting on
-        // upstream TTFB so same-Space chat writes stay unblocked.
+        // Local SQLite keeps its in-memory Space disclosure pin across DNS/TCP/TLS,
+        // preflight(), and request-body upload before releasing in `mark_dispatched()`
+        // prior to upstream TTFB. Cloud PostgreSQL verifies sources atomically under a
+        // short read-only snapshot at `acquire_egress` and relies on `RevocationHub`
+        // cancellation during upload so network I/O never holds PG connections or locks.
         let response = progress.response.as_mut().expect("started transport");
         let uploaded = progress
             .leases

@@ -1584,19 +1584,13 @@ async fn run_sqlite_rollback_benchmark(
 
 async fn run_pg_rollback_benchmark(
     fixtures: &BenchFixtures,
-    work_root: &Path,
-    use_s3: bool,
     iterations: usize,
-    local_p95_limit_us: u32,
+    p95_limit_us: Option<u32>,
 ) -> RollbackProfileMetrics {
-    let tag = if use_s3 { "rbs3" } else { "rbloc" };
-    let live_schema = fixtures.fresh_pg_schema(tag);
-    let local_dir = work_root.join(format!("pg-{tag}-cas"));
-    let _ = fs::remove_dir_all(&local_dir);
-    fs::create_dir_all(&local_dir).unwrap();
+    let live_schema = fixtures.fresh_pg_schema("rbs3");
 
     let blobs_cfg = {
-        let bucket = fixtures.fresh_s3_bucket(tag);
+        let bucket = fixtures.fresh_s3_bucket("rbs3");
         let s3_cfg = fixtures.s3_config(bucket);
         admin_ensure_bucket(&s3_cfg, Some("Enabled"))
             .await
@@ -1614,21 +1608,15 @@ async fn run_pg_rollback_benchmark(
     };
 
     let (store, rt) = CanonicalRuntime::open(cfg).await.unwrap();
-    let backend = if use_s3 {
-        "postgres16_sync+s3_chunked_v1_uds"
-    } else {
-        "postgres16_sync+local_zstd_v1"
-    };
     let metrics = measure_fresh_rollbacks(
         &store,
-        backend,
+        "postgres16_sync+s3_chunked_v1_uds",
         iterations,
-        (!use_s3).then_some(local_p95_limit_us),
+        p95_limit_us,
     )
     .await;
     rt.shutdown().await.unwrap();
     fixtures.drop_pg_schema(&live_schema).await;
-    fs::remove_dir_all(local_dir).unwrap();
     metrics
 }
 
@@ -3087,25 +3075,7 @@ async fn d3(budgets: D3Budgets) {
         rb_sqlite.latency.max_us,
     );
     tokio::time::sleep(Duration::from_millis(3000)).await;
-    let rb_pg_local =
-        run_pg_rollback_benchmark(&fixtures, &work_root, false, rb_iters, budgets.postgres_us)
-            .await;
-    eprintln!(
-        "[D3]   -> PG16+Local   min={:.1} us, p50={:.1} us, p95={:.1} us, p99={:.1} us, max={:.1} us",
-        rb_pg_local.latency.min_us,
-        rb_pg_local.latency.p50_us,
-        rb_pg_local.latency.p95_us,
-        rb_pg_local.latency.p99_us,
-        rb_pg_local.latency.max_us,
-    );
-    let rb_pg_s3 = run_pg_rollback_benchmark(
-        &fixtures,
-        &work_root,
-        true,
-        rb_s3_iters,
-        budgets.postgres_us,
-    )
-    .await;
+    let rb_pg_s3 = run_pg_rollback_benchmark(&fixtures, rb_s3_iters, None).await;
     eprintln!(
         "[D3]   -> PG16+S3(UDS) min={:.1} us, p50={:.1} us, p95={:.1} us, p99={:.1} us, max={:.1} us",
         rb_pg_s3.latency.min_us,
@@ -3114,7 +3084,7 @@ async fn d3(budgets: D3Budgets) {
         rb_pg_s3.latency.p99_us,
         rb_pg_s3.latency.max_us,
     );
-    let rollback_profiles = vec![rb_sqlite, rb_pg_local, rb_pg_s3];
+    let rollback_profiles = vec![rb_sqlite, rb_pg_s3];
 
     // 2. Writer 50w/0r & 50w/200r
     tokio::time::sleep(Duration::from_millis(5500)).await;
@@ -3198,7 +3168,7 @@ async fn d3(budgets: D3Budgets) {
         chat_read_profiles.extend(
             run_chat_read_benchmarks_for_store(
                 &st,
-                "postgres16_sync+local_zstd_v1",
+                "postgres16_sync+s3_chunked_v1_uds",
                 chat_turns,
                 chat_reads,
                 Some((&fixtures, &pg_schema)),
@@ -3207,7 +3177,6 @@ async fn d3(budgets: D3Budgets) {
         );
         rt.shutdown().await.unwrap();
         fixtures.drop_pg_schema(&pg_schema).await;
-        let _ = fs::remove_dir_all(&chat_pg_dir);
     }
     for cp in &chat_read_profiles {
         eprintln!(
@@ -3260,11 +3229,11 @@ async fn d3(budgets: D3Budgets) {
         .await
         .unwrap();
         board_first_slot_profiles.push(
-            run_board_first_slot_benchmark(&st, "postgres16_sync+local_zstd_v1", board_moves).await,
+            run_board_first_slot_benchmark(&st, "postgres16_sync+s3_chunked_v1_uds", board_moves)
+                .await,
         );
         rt.shutdown().await.unwrap();
         fixtures.drop_pg_schema(&pg_schema).await;
-        let _ = fs::remove_dir_all(&b_dir);
     }
     for bp in &board_first_slot_profiles {
         if let Some(failure) = &bp.failure {
@@ -3331,7 +3300,7 @@ async fn d3(budgets: D3Budgets) {
         folder_move_profiles.push(
             run_folder_100k_move_benchmark(
                 &st,
-                "postgres16_sync+local_zstd_v1",
+                "postgres16_sync+s3_chunked_v1_uds",
                 desc_folders,
                 desc_notes,
                 folder_moves,
@@ -3340,7 +3309,6 @@ async fn d3(budgets: D3Budgets) {
         );
         rt.shutdown().await.unwrap();
         fixtures.drop_pg_schema(&pg_schema).await;
-        let _ = fs::remove_dir_all(&f_dir);
     }
     for fp in &folder_move_profiles {
         if let Some(failure) = &fp.failure {

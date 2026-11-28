@@ -42,7 +42,7 @@ use crate::{
         decode_msgpack_bounded, encode_msgpack, i64_to_space_seq, internal_not_committed,
         now_unix_ms, unavailable_retryable,
     },
-    config::{BlobBackendConfig, SqlBackendConfig},
+    config::SqlBackendConfig,
     domain::purge::has_incomplete_pending_purges_tx,
     runtime::{
         CanonicalInner, SqlDriverState, load_space_record_for_update_opt, require_command_end_tx,
@@ -225,10 +225,9 @@ fn resolve_spool_dir(inner: &CanonicalInner) -> Result<PathBuf, PortError> {
         return Ok(custom);
     }
 
-    let dir = match (&inner.config.sql, &inner.config.blobs) {
-        (SqlBackendConfig::Sqlite { data_root, .. }, _) => data_root.staging().join("backups"),
-        (_, BlobBackendConfig::Local { data_root }) => data_root.staging().join("backups"),
-        _ => std::env::temp_dir().join(format!(
+    let dir = match &inner.config.sql {
+        SqlBackendConfig::Sqlite { data_root, .. } => data_root.staging().join("backups"),
+        SqlBackendConfig::Postgres { .. } => std::env::temp_dir().join(format!(
             "notarium-backup-spool-{}",
             inner.config.installation_id.as_str()
         )),
@@ -2220,6 +2219,7 @@ fn historical_spool_shapes_match_their_published_manifests() {
         (6, V6_HASH),
         (7, V7_HASH),
         (8, V8_HASH),
+        (9, V9_HASH),
     ] {
         let digest = ContentDigest::from_bytes(hex::decode(hash).unwrap().try_into().unwrap());
         let tables = verified_spool_tables(version, digest).unwrap();

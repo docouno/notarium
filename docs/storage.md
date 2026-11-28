@@ -34,9 +34,10 @@ combinations such as PostgreSQL with local CAS or SQLite with S3):
   issuer. Local PostgreSQL fixtures connect through a Unix socket.
   When a PostgreSQL writer batch or guarded auxiliary commit returns an
   ambiguous outcome while revocation leases are held, the store closes the
-  ambiguous connection and waits for a short `FOR SHARE` barrier on the touched
-  `spaces` rows before releasing those revocation leases so concurrent
-  revocation cannot settle ahead of a late server-side commit.
+  ambiguous connection and waits (including across runtime shutdown drain) for a
+  short `FOR SHARE` barrier on the touched `spaces` rows before releasing those
+  revocation leases so concurrent revocation cannot settle ahead of a late
+  server-side commit.
 
 `CanonicalRuntime::open` acquires lifetime `DataRootOwnerLock` guards where
 local storage is used, verifies or bootstraps the schema transactionally and
@@ -176,11 +177,14 @@ The caller can replay a pending control operation after losing the canonical
 response. Reusing the key with a different payload is rejected. Rebinding a
 Space's history invalidates receipts issued for its earlier incarnation.
 
-Version 9 extends the linear schema sequence from version 8 with chat runtime
-columns and updated ability-package and lookup indexes. Startup selects the upgrade by version and exact
-manifest checksum. Schema version 9 allows multiple canonical packages to share
-a folded name. Control binding policy selects the visible package and serializes
-live authoring operations. Canonical package identity and version remain exact.
+Version 10 raises the inline chat payload check constraint on `chat_entries` and
+`chat_pending_inputs` to 32 KiB and retires any legacy `staged_chat` blob
+references left by predecessor schemas. Version 9 extends the linear schema
+sequence from version 8 with chat runtime columns and updated ability-package
+and lookup indexes. Startup selects the upgrade by version and exact manifest
+checksum. Schema version 9 allows multiple canonical packages to share a folded
+name. Control binding policy selects the visible package and serializes live
+authoring operations. Canonical package identity and version remain exact.
 
 The same upgrade stores the active chat run's writer generation, distinguishes
 human turns from derived turns after redaction, and records the source proof of

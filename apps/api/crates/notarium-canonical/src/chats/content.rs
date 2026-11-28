@@ -17,7 +17,7 @@ pub(crate) use checkpoint::ProofFoldCache;
 
 const MODEL_MARKER: &str = "\u{FDD0}notarium_model_turn_v1\n";
 const PROPOSAL_MARKER: &str = "\u{FDD0}notarium_proposed_diff_v1\n";
-pub(super) const MAX_TURN_BYTES: usize = AppendChat::MAX_STRUCTURED_BODY_BYTES;
+pub(super) const MAX_TURN_BYTES: usize = ChatInputBody::MAX_ENTRY_BYTES;
 const MAX_TURN_CALLS: usize = 64;
 
 pub(super) fn require_human_text(text: &str) -> Result<(), PortError> {
@@ -75,7 +75,6 @@ pub(super) fn prepare(input: &mut AppendChat) -> Result<BodyFormat, PortError> {
         reason.interruption().is_none()
             || input.kind != ChatEntryKind::Model
             || !input.tool_calls.is_empty()
-            || !matches!(&input.body, ChatInputBody::Text(_))
     }) {
         return Err(DomainError::validation(ValidationReason::InvalidState).into());
     }
@@ -95,6 +94,9 @@ pub(super) fn prepare(input: &mut AppendChat) -> Result<BodyFormat, PortError> {
             return Err(DomainError::validation(ValidationReason::InvalidState).into());
         }
         let ChatInputBody::Text(text) = &input.body;
+        if text.len() > MAX_TURN_BYTES {
+            return Err(DomainError::validation(ValidationReason::InvalidLimit).into());
+        }
         let encoded = serde_json::to_string(&ProposalTurn {
             text: text.clone(),
             envelope,
@@ -120,6 +122,9 @@ pub(super) fn prepare(input: &mut AppendChat) -> Result<BodyFormat, PortError> {
             })
         {
             return Err(DomainError::validation(ValidationReason::InvalidState).into());
+        }
+        if text.len() > MAX_TURN_BYTES {
+            return Err(DomainError::validation(ValidationReason::InvalidLimit).into());
         }
         let encoded = serde_json::to_string(&ModelTurn {
             text: text.clone(),
@@ -777,10 +782,7 @@ pub(super) async fn hydrate_payloads_bounded(
             {
                 let next_starts_non_tool_group =
                     matches!(row.kind.as_str(), "human" | "model" | "compaction");
-                if (has_valid_cut && next_starts_non_tool_group)
-                    || next_starts_non_tool_group
-                    || !in_model_group
-                {
+                if next_starts_non_tool_group || !in_model_group {
                     truncated_at = last_seq;
                     break;
                 }

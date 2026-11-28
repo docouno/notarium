@@ -229,13 +229,14 @@ impl CanonicalStore {
             })
         }));
         let barrier_entered = effect_entered.clone();
+        let commit_attempted = Arc::new(AtomicBool::new(false));
+        let barrier_commit_attempted = Arc::clone(&commit_attempted);
         let task = self.inner.backup_executor.spawn(async move {
             let _aux_permit = aux_permit;
             check()?;
             // The owner keeps the active lease past a canceled waiter and
             // while the connection acknowledges COMMIT or ROLLBACK.
             let barrier_space = space.clone();
-            let barrier_commit = Arc::clone(&commit);
             let operation_effect = active.clone();
             let result = store
                 .with_visibility_write_tx(
@@ -259,6 +260,7 @@ impl CanonicalStore {
                                     "caller left before commit",
                                 ));
                             }
+                            commit_attempted.store(true, Ordering::Release);
                             Ok(result)
                         })
                     },
@@ -267,7 +269,7 @@ impl CanonicalStore {
                 .await;
             if store.is_postgres()
                 && result.is_err()
-                && !barrier_commit.load(Ordering::Acquire)
+                && barrier_commit_attempted.load(Ordering::Acquire)
                 && barrier_entered
                     .as_ref()
                     .is_some_and(|flag| flag.load(Ordering::Acquire))

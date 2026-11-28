@@ -40,7 +40,11 @@ fn timed_cursor(
 ) -> Result<Option<TimedCursor>, PortError> {
     let cursor: Option<TimedCursor> = page.continuation().map(parse).transpose()?;
     if cursor.as_ref().is_some_and(|v| {
-        v.version != 1 || v.scope != scope || v.at > requested || v.at > control_now
+        v.version != 1
+            || v.scope != scope
+            || v.at > requested
+            || v.at > control_now
+            || v.slot > v.at
     }) {
         return Err(invalid(ValidationReason::CursorStale));
     }

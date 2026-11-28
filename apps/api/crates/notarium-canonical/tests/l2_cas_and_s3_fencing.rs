@@ -1099,6 +1099,19 @@ fn decode_zstd_verified_rejects_raw_size_over_64mib_before_decompression() {
 }
 
 #[tokio::test]
+async fn prepare_blob_rejects_raw_size_over_64mib() {
+    use notarium_canonical::blobs::{BlobCodecTag, MAX_BLOB_DECODE_BYTES, PreparedBlobSource};
+
+    let oversized = vec![b'a'; MAX_BLOB_DECODE_BYTES as usize + 1];
+    for codec in [BlobCodecTag::LocalZstdV1, BlobCodecTag::S3ChunkedV1] {
+        assert_validation_err(
+            &PreparedBlobSource::prepare(&oversized, codec),
+            ValidationReason::InvalidRange,
+        );
+    }
+}
+
+#[tokio::test]
 async fn local_shutdown_does_not_deadlock_with_held_staged_blob_ticket() {
     let temp = TempDataRoot::new("l2-shutdown-held-ticket");
     let cfg = CanonicalConfig::local_default(sample_installation_id(0x93), temp.data_root());
@@ -1122,22 +1135,40 @@ async fn local_shutdown_does_not_deadlock_with_held_staged_blob_ticket() {
         .await
         .unwrap();
 
-    let payload = b"held ticket payload that must not deadlock shutdown".repeat(64);
+    let payload = b"held ticket payload that must not deadlock shutdown ".repeat(64);
     let prepared = store.prepare_blob(&payload).unwrap();
     let held_ticket = store
         .stage_blob(&scope, LeaseEpoch::new(1).unwrap(), &prepared)
         .await
         .unwrap();
-    // Schedule an orphan cleanup for the same digest while `held_ticket` stays alive.
-    let second_ticket = store
-        .stage_blob(&scope, LeaseEpoch::new(1).unwrap(), &prepared)
-        .await
-        .unwrap();
-    drop(second_ticket);
+
+    // Schedule unretained local CAS orphan cleanup for the exact digest pinned by
+    // `held_ticket` so the background cleanup task defers it into
+    // `deferred_local_orphan_cleanups`. A blocking final sweep during shutdown would
+    // deadlock forever waiting on `held_ticket`'s LocalSharedGuard.
+    store.schedule_unretained_local_files_cleanup_for_test(vec![(
+        scope.space_id.clone(),
+        prepared.digest(),
+    )]);
+
+    let mut deferred_observed = false;
+    for _ in 0..100 {
+        if store.deferred_local_orphan_count_for_test() > 0 {
+            deferred_observed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        deferred_observed,
+        "scheduled local orphan cleanup while held_ticket is alive must populate deferred_local_orphan_cleanups"
+    );
 
     tokio::time::timeout(std::time::Duration::from_secs(3), runtime.shutdown())
         .await
-        .expect("runtime.shutdown must not deadlock when an external StagedBlobTicket is held")
+        .expect(
+            "runtime.shutdown must not deadlock when deferred orphans are pinned by a live ticket",
+        )
         .expect("clean shutdown");
     drop(held_ticket);
 }

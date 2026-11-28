@@ -97,15 +97,17 @@ pub async fn bootstrap_sqlite_schema(
             .execute(&mut *conn)
             .await
             .map_err(|err| internal_not_committed("sqlite_bootstrap_fk_off", err.to_string()))?;
-        sqlx::query("PRAGMA legacy_alter_table = ON")
-            .execute(&mut *conn)
-            .await
-            .map_err(|err| {
-                internal_not_committed("sqlite_bootstrap_legacy_alter_on", err.to_string())
-            })?;
     }
 
     let result = async {
+        if needs_fk_rebuild {
+            sqlx::query("PRAGMA legacy_alter_table = ON")
+                .execute(&mut *conn)
+                .await
+                .map_err(|err| {
+                    internal_not_committed("sqlite_bootstrap_legacy_alter_on", err.to_string())
+                })?;
+        }
         sqlx::query("BEGIN IMMEDIATE")
             .execute(&mut *conn)
             .await
@@ -134,12 +136,13 @@ pub async fn bootstrap_sqlite_schema(
 
         match outcome {
             Ok(witness) => {
-                sqlx::query("COMMIT")
-                    .execute(&mut *conn)
-                    .await
-                    .map_err(|err| {
-                        internal_not_committed("sqlite_bootstrap_commit", err.to_string())
-                    })?;
+                if let Err(err) = sqlx::query("COMMIT").execute(&mut *conn).await {
+                    let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                    return Err(internal_not_committed(
+                        "sqlite_bootstrap_commit",
+                        err.to_string(),
+                    ));
+                }
                 Ok(witness)
             }
             Err(err) => {
@@ -151,12 +154,19 @@ pub async fn bootstrap_sqlite_schema(
     .await;
 
     if needs_fk_rebuild {
-        let _ = sqlx::query("PRAGMA legacy_alter_table = OFF")
+        let legacy_restore = sqlx::query("PRAGMA legacy_alter_table = OFF")
             .execute(&mut *conn)
             .await;
-        let _ = sqlx::query("PRAGMA foreign_keys = ON")
+        let fk_restore = sqlx::query("PRAGMA foreign_keys = ON")
             .execute(&mut *conn)
             .await;
+        if result.is_ok() {
+            legacy_restore.map_err(|err| {
+                internal_not_committed("sqlite_bootstrap_legacy_alter_off", err.to_string())
+            })?;
+            fk_restore
+                .map_err(|err| internal_not_committed("sqlite_bootstrap_fk_on", err.to_string()))?;
+        }
     }
 
     result

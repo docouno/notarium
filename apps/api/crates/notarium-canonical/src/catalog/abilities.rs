@@ -583,6 +583,7 @@ pub(super) async fn pin_schedule(
             &ctx.budget,
             &[space.clone()].into(),
             &ctx.budget.cancellation,
+            super::egress::PgDisclosureMode::HoldForShare,
         )
         .await?;
     let snapshot_deadline = guard.snapshot_deadline();

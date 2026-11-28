@@ -839,12 +839,15 @@ impl CanonicalStore {
     }
 
     /// Waits on PostgreSQL until any in-flight transaction that locked the
-    /// touched `spaces` rows `FOR UPDATE` has either committed or aborted.
+    /// touched `spaces` rows `FOR NO KEY UPDATE` has either committed or aborted.
     ///
     /// Called only after an ambiguous `COMMIT` outcome while `RevocationLease`
     /// guards are still held, and strictly AFTER the ambiguous writer socket
     /// has been closed and returned to the pool so `pool_size = 1` cannot
-    /// deadlock.
+    /// deadlock. Never cancelled by `backup_shutdown`, because `drain_shutdown`
+    /// drains both the writer coordinator and auxiliary workers before closing
+    /// the PostgreSQL pool; releasing `RevocationLease` early would let a
+    /// concurrent revocation settle ahead of a late server-side `COMMIT`.
     pub(crate) async fn await_pg_unknown_commit_barrier(&self, spaces: &[SpaceId]) {
         let SqlDriverState::Postgres { pool, .. } = &self.inner.sql else {
             return;
@@ -855,16 +858,16 @@ impl CanonicalStore {
         let mut space_ids: Vec<&str> = spaces.iter().map(SpaceId::as_str).collect();
         space_ids.sort_unstable();
         space_ids.dedup();
-        let shutdown = self.inner.backup_shutdown.clone();
         let mut backoff = Duration::from_millis(25);
         let max_backoff = Duration::from_secs(1);
 
         loop {
-            if shutdown.is_cancelled() || self.inner.shutting_down.load(Ordering::Acquire) {
-                return;
-            }
             let attempt = async {
-                let mut pooled = pool.acquire().await.map_err(|_| ())?;
+                let mut pooled = match pool.acquire().await {
+                    Ok(conn) => conn,
+                    Err(sqlx::Error::PoolClosed) => return Ok::<bool, ()>(true),
+                    Err(_) => return Err(()),
+                };
                 let mut lease = PgTransactionLease::new(&mut pooled);
                 sqlx::raw_sql("BEGIN")
                     .execute(lease.conn())
@@ -882,22 +885,12 @@ impl CanonicalStore {
                     .await
                     .map_err(|_| ())?;
                 lease.complete();
-                Ok::<(), ()>(())
+                Ok::<bool, ()>(true)
             };
-            tokio::select! {
-                biased;
-                _ = shutdown.cancelled() => return,
-                res = attempt => {
-                    if res.is_ok() {
-                        return;
-                    }
-                }
+            if matches!(attempt.await, Ok(true)) {
+                return;
             }
-            tokio::select! {
-                biased;
-                _ = shutdown.cancelled() => return,
-                _ = tokio::time::sleep(backoff) => {}
-            }
+            tokio::time::sleep(backoff).await;
             backoff = (backoff * 2).min(max_backoff);
         }
     }

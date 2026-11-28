@@ -164,8 +164,11 @@ impl PreparedBlobSource {
     }
 
     pub fn prepare(raw: &[u8], codec: BlobCodecTag) -> Result<Self, PortError> {
-        let digest = ContentDigest::from_bytes(*blake3::hash(raw).as_bytes());
         let raw_size = raw.len() as u64;
+        if raw_size > MAX_BLOB_DECODE_BYTES {
+            return Err(DomainError::validation(ValidationReason::InvalidRange).into());
+        }
+        let digest = ContentDigest::from_bytes(*blake3::hash(raw).as_bytes());
 
         match codec {
             BlobCodecTag::LocalZstdV1 => {
@@ -717,6 +720,24 @@ impl crate::CanonicalStore {
             .await;
     }
 
+    #[cfg(feature = "test-support")]
+    pub fn schedule_unretained_local_files_cleanup_for_test(
+        &self,
+        to_cleanup: Vec<(SpaceId, ContentDigest)>,
+    ) {
+        self.schedule_unretained_local_files_cleanup(to_cleanup);
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn deferred_local_orphan_count_for_test(&self) -> usize {
+        self.inner
+            .deferred_local_orphan_cleanups
+            .lock()
+            .expect("deferred local orphan cleanups mutex")
+            .items
+            .len()
+    }
+
     pub(crate) async fn sweep_deferred_local_orphans_async(&self, wait_for_lock: bool) {
         let BlobBackendDriver::Local(local) = &self.inner.blobs else {
             return;
@@ -806,25 +827,8 @@ impl crate::CanonicalStore {
                                 }
                             }
                         }
-                        BackendConn::Postgres(conn) => {
-                            let rows: Vec<Vec<u8>> = sqlx::query_scalar(
-                                "SELECT content_blake3 FROM blob_catalog
-                                 WHERE space_id = $1
-                                   AND blob_state <> 'retired'
-                                   AND content_blake3 = ANY($2)",
-                            )
-                            .bind(space_chk.as_str())
-                            .bind(&raw_digests)
-                            .fetch_all(&mut **conn)
-                            .await
-                            .map_err(|err| {
-                                crate::runtime::pg_read_error("pg_batch_orphan_catalog", err)
-                            })?;
-                            for bytes in rows {
-                                if let Ok(arr) = <[u8; 32]>::try_from(bytes.as_slice()) {
-                                    present.insert(arr);
-                                }
-                            }
+                        BackendConn::Postgres(_) => {
+                            unreachable!("local orphan sweep requires LocalSqlite profile");
                         }
                     }
                     Ok(present)
@@ -3817,7 +3821,7 @@ async fn promote_s3_staging_to_active_tx(
     Ok(())
 }
 
-async fn load_active_blob_meta_tx(
+pub(crate) async fn load_active_blob_meta_tx(
     tx: &mut BackendConn<'_>,
     space_id: &SpaceId,
     digest: ContentDigest,

@@ -89,13 +89,23 @@ async fn rollback_pg_clean(conn: StorePgConnection) {
     }
 }
 
+pub(super) enum PgDisclosureMode {
+    /// Short read-only snapshot released before Control TXs or external LLM I/O.
+    ShortSnapshot,
+    /// Short `FOR SHARE` Space pin held only across a Control DB schedule/ability commit.
+    HoldForShare,
+}
+
 enum DisclosureConnection {
     Sqlite {
         snapshot: Option<sqlx::pool::PoolConnection<sqlx::Sqlite>>,
         wal_guard: Option<crate::wal::ReaderGateGuard>,
         _pin: crate::runtime::disclosure::DisclosurePin,
     },
-    Postgres(Option<StorePgConnection>),
+    Postgres {
+        conn: Option<StorePgConnection>,
+        hold_for_share: bool,
+    },
 }
 
 pub(crate) struct CanonicalDisclosureGuard {
@@ -118,7 +128,7 @@ impl Drop for CanonicalDisclosureGuard {
                 }
                 let _ = wal_guard.take();
             }
-            DisclosureConnection::Postgres(conn) => {
+            DisclosureConnection::Postgres { conn, .. } => {
                 if let Some(mut conn) = conn.take() {
                     conn.close_on_drop();
                 }
@@ -133,7 +143,7 @@ impl CanonicalDisclosureGuard {
             DisclosureConnection::Sqlite { snapshot, .. } => {
                 BackendConn::Sqlite(snapshot.as_mut().expect("open SQLite disclosure snapshot"))
             }
-            DisclosureConnection::Postgres(conn) => {
+            DisclosureConnection::Postgres { conn, .. } => {
                 BackendConn::Postgres(conn.as_mut().expect("open PostgreSQL disclosure snapshot"))
             }
         }
@@ -153,10 +163,14 @@ impl CanonicalDisclosureGuard {
                     guard.finish_cleanly();
                 }
             }
-            DisclosureConnection::Postgres(conn) => {
-                // Return the PostgreSQL connection to the pool immediately after snapshot
-                // verification; never hold a PG transaction across Control TXs or LLM I/O.
-                if let Some(conn) = conn.take() {
+            DisclosureConnection::Postgres {
+                conn,
+                hold_for_share,
+            } => {
+                // Provider egress returns the PostgreSQL connection to the pool immediately
+                // after snapshot verification so LLM I/O never holds PG transactions/locks.
+                // Short Control DB schedule pins retain FOR SHARE until `release_clean`.
+                if !*hold_for_share && let Some(conn) = conn.take() {
                     rollback_pg_clean(conn).await;
                 }
             }
@@ -177,7 +191,7 @@ impl CanonicalDisclosureGuard {
                     guard.finish_cleanly();
                 }
             }
-            DisclosureConnection::Postgres(conn) => {
+            DisclosureConnection::Postgres { conn, .. } => {
                 if let Some(conn) = conn.take() {
                     rollback_pg_clean(conn).await;
                 }
@@ -206,11 +220,12 @@ pub(super) fn cancelled() -> PortError {
 }
 
 impl CanonicalStore {
-    pub(crate) async fn pin_disclosure(
+    pub(super) async fn pin_disclosure(
         &self,
         budget: &CallBudget,
         spaces: &BTreeSet<SpaceId>,
         cancellation: &Cancellation,
+        pg_mode: PgDisclosureMode,
     ) -> Result<CanonicalDisclosureGuard, PortError> {
         self.ensure_open()?;
         let deadline = Instant::now()
@@ -229,7 +244,10 @@ impl CanonicalStore {
                         if let Some(wal) = self.inner.wal_coord.get() {
                             let (guard, read_deadline) =
                                 wal.acquire_reader_gate_slot(Some(budget)).await?;
-                            (Some(guard), deadline.min(read_deadline))
+                            let wal_cap = Instant::now()
+                                .checked_add(wal.read_deadline())
+                                .unwrap_or(read_deadline);
+                            (Some(guard), deadline.min(read_deadline).min(wal_cap))
                         } else {
                             (None, deadline)
                         };
@@ -256,28 +274,50 @@ impl CanonicalStore {
                         .acquire()
                         .await
                         .map_err(|e| pg_read_error("egress_acquire", e))?;
-                    // Short read-only repeatable-read snapshot (no FOR SHARE / advisory locks);
-                    // released back to the pool in `finish_snapshot` before Control TXs or LLM I/O.
                     let mut guarded = CloseOnAbort::new(conn);
-                    sqlx::raw_sql("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                    let hold_for_share = matches!(pg_mode, PgDisclosureMode::HoldForShare);
+                    let begin_sql = if hold_for_share {
+                        // READ COMMITTED lets `FOR SHARE` wait via EvalPlanQual across
+                        // concurrent `spaces.last_seq` updates without 40001 aborts; once
+                        // the Space lock is acquired, no writer for those Spaces can commit.
+                        "BEGIN"
+                    } else {
+                        "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"
+                    };
+                    sqlx::raw_sql(begin_sql)
                         .execute(&mut **guarded.as_mut())
                         .await
                         .map_err(|e| pg_read_error("egress_begin", e))?;
                     if !spaces.is_empty() {
                         let space_ids: Vec<&str> = spaces.iter().map(SpaceId::as_str).collect();
-                        let found: i64 = sqlx::query_scalar(
-                            "SELECT COUNT(*) FROM spaces WHERE space_id = ANY($1)",
-                        )
-                        .bind(&space_ids)
-                        .fetch_one(&mut **guarded.as_mut())
-                        .await
-                        .map_err(|e| pg_read_error("egress_check_spaces", e))?;
-                        if found as usize != space_ids.len() {
+                        let found: usize = if hold_for_share {
+                            let locked: Vec<String> = sqlx::query_scalar(
+                                "SELECT space_id FROM spaces WHERE space_id = ANY($1) ORDER BY space_id FOR SHARE",
+                            )
+                            .bind(&space_ids)
+                            .fetch_all(&mut **guarded.as_mut())
+                            .await
+                            .map_err(|e| pg_read_error("egress_lock_spaces", e))?;
+                            locked.len()
+                        } else {
+                            let count: i64 = sqlx::query_scalar(
+                                "SELECT COUNT(*) FROM spaces WHERE space_id = ANY($1)",
+                            )
+                            .bind(&space_ids)
+                            .fetch_one(&mut **guarded.as_mut())
+                            .await
+                            .map_err(|e| pg_read_error("egress_check_spaces", e))?;
+                            usize::try_from(count).unwrap_or(0)
+                        };
+                        if found != space_ids.len() {
                             return Err(DomainError::ResourceNotFound.into());
                         }
                     }
                     (
-                        DisclosureConnection::Postgres(Some(guarded.disarm())),
+                        DisclosureConnection::Postgres {
+                            conn: Some(guarded.disarm()),
+                            hold_for_share,
+                        },
                         deadline,
                     )
                 }
@@ -415,7 +455,12 @@ impl ProviderEgressCatalogPort for CanonicalStore {
             }
 
             let mut guard = self
-                .pin_disclosure(&ctx.budget, &spaces, &cancellation)
+                .pin_disclosure(
+                    &ctx.budget,
+                    &spaces,
+                    &cancellation,
+                    PgDisclosureMode::ShortSnapshot,
+                )
                 .await?;
             let deadline = guard.snapshot_deadline;
             let current = {

@@ -1268,3 +1268,184 @@ async fn canonical_open_rejects_hybrid_storage_profiles() {
         ValidationReason::InvalidState,
     );
 }
+
+#[tokio::test]
+async fn pg_v8_and_v9_512b_upgrade_lifts_inline_limit_and_retires_staged_chat() {
+    use sqlx::Connection;
+
+    let fixtures = StorageTestFixtures::load_required();
+    let v8_hash = "085e724d4cf969a85265d36b616fe04bc78a51c3beadf86dee7f1664bee2dcd7";
+    let v9_hash = "a906f0cf2dc6d4948cd01b180491c1cbe796160ef88e18a706a96e7f36c8fd84";
+
+    for (version, hash) in [(8i32, v8_hash), (9i32, v9_hash)] {
+        let schema = fixtures.fresh_pg_schema();
+        let install = sample_installation_id(80 + version as u8);
+        let mut raw = fixtures.open_raw_pg().await;
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "CREATE SCHEMA \"{schema}\"; SET search_path TO \"{schema}\""
+        )))
+        .execute(&mut raw)
+        .await
+        .unwrap();
+
+        let downgraded_ddl = include_str!("../src/schema/postgres_ddl.sql")
+            .replace("CONSTRAINT chat_entries_body_check CHECK", "CHECK")
+            .replace("CONSTRAINT chat_pending_inputs_body_check CHECK", "CHECK")
+            .replace("<= 32768", "<= 512");
+        sqlx::raw_sql(sqlx::AssertSqlSafe(downgraded_ddl))
+            .execute(&mut raw)
+            .await
+            .unwrap();
+        if version == 8 {
+            sqlx::raw_sql(include_str!("fixtures/schema-v8-remove-agents.sql"))
+                .execute(&mut raw)
+                .await
+                .unwrap();
+        }
+        sqlx::query("INSERT INTO schema_meta VALUES(1,$1,1,$2,'ready',$3,0,0,0,0)")
+            .bind(version)
+            .bind(install.as_str())
+            .bind(hex::decode(hash).unwrap())
+            .execute(&mut raw)
+            .await
+            .unwrap();
+        let space_id = sample_space_id(80 + version as u8);
+        let sid = space_id.as_str();
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO spaces VALUES('{sid}',decode('00000000000000000000000000000000','hex'),'root','home','home','personal','owner','active',1,10,'{{}}',0,0);
+             INSERT INTO chat_threads(
+                 space_id, history_incarnation, thread_id, kind, owner_id, project_folder_id,
+                 title, head_leaf_seq, head_rev_id, next_entry_seq, active_run_id,
+                 ext_space_tainted_mask, created_seq, updated_seq, created_at_sec,
+                 created_at_nsec, updated_at_sec, updated_at_nsec
+             ) VALUES ('{sid}',decode('00000000000000000000000000000000','hex'),'thread','personal','owner',NULL,'Chat',1,'r1',2,NULL,0,1,2,0,0,0,0);
+             INSERT INTO chat_entries(
+                 space_id, thread_id, entry_seq, parent_seq, revision_id, kind, author_id,
+                 inline_text, referenced_notes_json, ext_space_tainted, is_chain_node,
+                 branch_depth, created_space_seq, redacted_at_seq
+             ) VALUES ('{sid}','thread',1,NULL,'r1','human','owner','hello','[]',0,1,0,1,NULL);
+             INSERT INTO chat_entry_note_refs(
+                 space_id, thread_id, entry_seq, ref_ordinal, target_space_id,
+                 target_note_id, created_space_seq
+             ) VALUES ('{sid}','thread',1,0,'{sid}','note1',1);
+             INSERT INTO chat_pending_inputs(
+                 space_id, thread_id, input_id, ordinal, author_id, inline_text,
+                 queued_base_leaf_seq, in_flight_run_id, mentions_agent, status,
+                 enqueued_seq, ext_space_tainted
+             ) VALUES ('{sid}','thread','in1',1,'owner','pending',1,'run1',0,'pending',2,0);
+             INSERT INTO blob_catalog VALUES('{sid}',decode('0000000000000000000000000000000000000000000000000000000000000000','hex'),600,120,1,'pub_staged','open','active',1);
+             INSERT INTO blob_publications VALUES('{sid}','pub_staged',decode('0000000000000000000000000000000000000000000000000000000000000000','hex'),1,'s3_chunked_v1','active',1,1,600,120,1,1);
+             INSERT INTO blob_references VALUES('{sid}','staged_chat','lease1','r0','body',decode('0000000000000000000000000000000000000000000000000000000000000000','hex'),'pub_staged',1);"
+        )))
+        .execute(&mut raw)
+        .await
+        .unwrap();
+
+        // Pre-upgrade 513B insert must fail against the old anonymous <= 512 CHECK.
+        let body_513 = "a".repeat(513);
+        assert!(
+            sqlx::query(
+                "INSERT INTO chat_entries(
+                    space_id, thread_id, entry_seq, parent_seq, revision_id, kind, author_id,
+                    inline_text, referenced_notes_json, ext_space_tainted, is_chain_node,
+                    branch_depth, created_space_seq
+                 ) VALUES ($1,'thread',2,1,'r2','model','owner',$2,'[]',0,1,1,3)",
+            )
+            .bind(sid)
+            .bind(&body_513)
+            .execute(&mut raw)
+            .await
+            .is_err(),
+            "PG v{version} must reject 513B inline before upgrade"
+        );
+
+        notarium_canonical::schema::bootstrap_postgres_schema(&mut raw, &schema, &install)
+            .await
+            .expect("upgrade PG v8/v9 to v10");
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SET search_path TO \"{schema}\""
+        )))
+        .execute(&mut raw)
+        .await
+        .unwrap();
+
+        let body_32k = "b".repeat(32 * 1024);
+        let body_32k_plus_1 = "c".repeat(32 * 1024 + 1);
+        sqlx::query(
+            "INSERT INTO chat_entries(
+                space_id, thread_id, entry_seq, parent_seq, revision_id, kind, author_id,
+                inline_text, referenced_notes_json, ext_space_tainted, is_chain_node,
+                branch_depth, created_space_seq, human_origin, body_format
+             ) VALUES ($1,'thread',2,1,'r2','model','owner',$2,'[]',0,1,1,3,0,0)",
+        )
+        .bind(sid)
+        .bind(&body_32k)
+        .execute(&mut raw)
+        .await
+        .expect("upgraded PG chat_entries must accept 32 KiB inline");
+        assert!(
+            sqlx::query(
+                "INSERT INTO chat_entries(
+                    space_id, thread_id, entry_seq, parent_seq, revision_id, kind, author_id,
+                    inline_text, referenced_notes_json, ext_space_tainted, is_chain_node,
+                    branch_depth, created_space_seq, human_origin, body_format
+                 ) VALUES ($1,'thread',3,2,'r3','model','owner',$2,'[]',0,1,2,4,0,0)",
+            )
+            .bind(sid)
+            .bind(&body_32k_plus_1)
+            .execute(&mut raw)
+            .await
+            .is_err()
+        );
+        sqlx::query(
+            "INSERT INTO chat_pending_inputs(
+                space_id, thread_id, input_id, ordinal, author_id, inline_text,
+                queued_base_leaf_seq, in_flight_run_id, mentions_agent, status,
+                enqueued_seq, ext_space_tainted
+             ) VALUES ($1,'thread','in2',2,'owner',$2,2,'run1',0,'pending',4,0)",
+        )
+        .bind(sid)
+        .bind(&body_32k)
+        .execute(&mut raw)
+        .await
+        .expect("upgraded PG chat_pending_inputs must accept 32 KiB inline");
+        assert!(
+            sqlx::query(
+                "INSERT INTO chat_pending_inputs(
+                    space_id, thread_id, input_id, ordinal, author_id, inline_text,
+                    queued_base_leaf_seq, in_flight_run_id, mentions_agent, status,
+                    enqueued_seq, ext_space_tainted
+                 ) VALUES ($1,'thread','in3',3,'owner',$2,2,'run1',0,'pending',5,0)",
+            )
+            .bind(sid)
+            .bind(&body_32k_plus_1)
+            .execute(&mut raw)
+            .await
+            .is_err()
+        );
+
+        let remaining_staged: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM blob_references WHERE owner_kind='staged_chat'",
+        )
+        .fetch_one(&mut raw)
+        .await
+        .unwrap();
+        let catalog_refs: i64 =
+            sqlx::query_scalar("SELECT ref_count FROM blob_catalog WHERE space_id=$1")
+                .bind(sid)
+                .fetch_one(&mut raw)
+                .await
+                .unwrap();
+        let pending_rets: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM blob_retirements WHERE space_id=$1 AND reason='gc' AND status='pending'",
+        )
+        .bind(sid)
+        .fetch_one(&mut raw)
+        .await
+        .unwrap();
+        assert_eq!((remaining_staged, catalog_refs, pending_rets), (0, 0, 1));
+
+        let _ = raw.close().await;
+        fixtures.drop_pg_schema(&schema).await;
+    }
+}
