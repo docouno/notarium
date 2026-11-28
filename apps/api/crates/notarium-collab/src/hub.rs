@@ -241,6 +241,7 @@ impl CollabHub {
         Arc::new(CollabRevocations {
             hub: Arc::downgrade(&self.0),
             registry,
+            events: std::sync::Mutex::new(CollabEventTracker::default()),
         })
     }
 
@@ -1993,9 +1994,56 @@ pub(crate) fn unknown(error: &PortError) -> bool {
     }
 }
 
+const MAX_COLLAB_APPLIED_EVENTS: usize = 16_384;
+
+#[derive(Default)]
+struct CollabEventTracker {
+    applied: HashSet<RequestId>,
+    order: std::collections::VecDeque<RequestId>,
+    in_flight: HashMap<RequestId, Arc<tokio::sync::Notify>>,
+}
+
+impl CollabEventTracker {
+    fn mark_applied(&mut self, id: RequestId) {
+        if self.applied.insert(id.clone()) {
+            self.order.push_back(id);
+            while self.order.len() > MAX_COLLAB_APPLIED_EVENTS {
+                if let Some(oldest) = self.order.pop_front() {
+                    self.applied.remove(&oldest);
+                }
+            }
+        }
+    }
+}
+
+struct CollabEventGuard<'a> {
+    tracker: &'a std::sync::Mutex<CollabEventTracker>,
+    id: RequestId,
+    notify: Arc<tokio::sync::Notify>,
+    applied: bool,
+}
+
+impl Drop for CollabEventGuard<'_> {
+    fn drop(&mut self) {
+        let mut state = self.tracker.lock().unwrap_or_else(|err| err.into_inner());
+        if self.applied {
+            state.mark_applied(self.id.clone());
+        }
+        if state
+            .in_flight
+            .get(&self.id)
+            .is_some_and(|existing| Arc::ptr_eq(existing, &self.notify))
+        {
+            state.in_flight.remove(&self.id);
+        }
+        self.notify.notify_waiters();
+    }
+}
+
 struct CollabRevocations {
     hub: Weak<HubInner>,
     registry: Arc<dyn SessionRevocationPort>,
+    events: std::sync::Mutex<CollabEventTracker>,
 }
 
 impl SessionRevocationPort for CollabRevocations {
@@ -2042,12 +2090,62 @@ impl SessionRevocationPort for CollabRevocations {
         reason: RevocationReason,
     ) -> PortFuture<'_, ()> {
         Box::pin(async move {
+            let event_id = ctx.budget.request.clone();
+            let deadline = Instant::now()
+                .checked_add(ctx.budget.remaining)
+                .unwrap_or_else(|| Instant::now() + Duration::from_secs(365 * 24 * 3600));
+            let mut guard = loop {
+                if ctx.budget.cancellation.is_cancelled() {
+                    return Err(operation_error(
+                        b"collab_revocation_cancelled",
+                        CommitEffect::NotCommitted,
+                    ));
+                }
+                let waiter = {
+                    let mut state = self.events.lock().unwrap_or_else(|err| err.into_inner());
+                    if state.applied.contains(&event_id) {
+                        return Ok(());
+                    }
+                    if let Some(existing) = state.in_flight.get(&event_id) {
+                        Arc::clone(existing)
+                    } else {
+                        let notify = Arc::new(tokio::sync::Notify::new());
+                        state
+                            .in_flight
+                            .insert(event_id.clone(), Arc::clone(&notify));
+                        break CollabEventGuard {
+                            tracker: &self.events,
+                            id: event_id.clone(),
+                            notify,
+                            applied: false,
+                        };
+                    }
+                };
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(deadline_error(b"collab_revocation_wait"));
+                }
+                tokio::select! {
+                    biased;
+                    () = ctx.budget.cancellation.cancelled() => {
+                        return Err(operation_error(
+                            b"collab_revocation_cancelled",
+                            CommitEffect::NotCommitted,
+                        ));
+                    }
+                    () = tokio::time::sleep(remaining) => {
+                        return Err(deadline_error(b"collab_revocation_wait"));
+                    }
+                    () = waiter.notified() => {}
+                }
+            };
             self.registry
                 .revoke(ctx.clone(), selector.clone(), reason)
                 .await?;
             if let Some(hub) = self.hub.upgrade() {
                 CollabHub(hub).revoke(&ctx, &selector, reason).await?;
             }
+            guard.applied = true;
             Ok(())
         })
     }

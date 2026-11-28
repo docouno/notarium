@@ -232,7 +232,7 @@ impl<'a> Reader<'a> {
             registry,
             primary,
             selection,
-            deadline: Instant::now() + primary.budget.remaining,
+            deadline: super::deadline_from(primary.budget.remaining),
         })
     }
 

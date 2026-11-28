@@ -434,7 +434,7 @@ pub(super) async fn overrides_and_promotion(fixture: &RuntimeFixture) {
     )
     .await
     .unwrap();
-    call(
+    let disabled = call(
         fixture,
         &human,
         95,
@@ -445,7 +445,7 @@ pub(super) async fn overrides_and_promotion(fixture: &RuntimeFixture) {
     .unwrap();
     let promotion = json!({
         "ref":reference,
-        "versionToken":created.structured_content["versionToken"],
+        "versionToken":disabled.structured_content["versionToken"],
         "home":{"home":"space"},
         "instructions":"After promotion",
     });

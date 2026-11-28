@@ -298,12 +298,15 @@ fn reference_token(reference: &AbilityRef) -> Result<String, PortError> {
 struct Version {
     package: RevisionId,
     binding: ControlRevision,
+    #[serde(default)]
+    preference: Option<ControlRevision>,
 }
 impl Version {
     fn from_inspection(inspection: &AbilityInspection) -> Self {
         Self {
             package: inspection.descriptor.reference.revision.clone(),
             binding: inspection.binding_revision,
+            preference: inspection.overlays.preference_revision,
         }
     }
     fn decode(text: &str) -> Result<Self, PortError> {
@@ -1939,7 +1942,7 @@ async fn list(
             }
             Some(json!({"tool":"list_abilities","reason":"next_page","arguments":arguments}))
         }
-        None if items.is_empty() && filtered => {
+        None if items.is_empty() && filtered && args.cursor.is_none() => {
             Some(json!({"tool":"list_abilities","reason":"zero_results","arguments":{"view":view}}))
         }
         None => None,
@@ -2841,29 +2844,7 @@ async fn resolve_replayed_role_descriptor(
         .await
     {
         Ok(desc) => Ok(Some(desc)),
-        Err(PortError::Domain(DomainError::ResourceNotFound)) => {
-            match call
-                .registry
-                .control
-                .inspect_ability(call.account(), reference.identity())
-                .await
-            {
-                Ok(insp) if insp.descriptor.reference != *reference => {
-                    match call
-                        .registry
-                        .control
-                        .get_ability(call.account(), insp.descriptor.reference, project.cloned())
-                        .await
-                    {
-                        Ok(desc) => Ok(Some(desc)),
-                        Err(PortError::Domain(DomainError::ResourceNotFound)) => Ok(None),
-                        Err(error) => Err(error),
-                    }
-                }
-                Ok(_) | Err(PortError::Domain(DomainError::ResourceNotFound)) => Ok(None),
-                Err(error) => Err(error),
-            }
-        }
+        Err(PortError::Domain(DomainError::ResourceNotFound)) => Ok(None),
         Err(error) => Err(error),
     }
 }

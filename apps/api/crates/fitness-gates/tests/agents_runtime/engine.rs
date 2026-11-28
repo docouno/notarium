@@ -449,7 +449,7 @@ canonical_port!(NoteWritePort;
         &self,
         ctx: SpaceContext,
         request: Mutation<EnsureFolderPath>,
-    ) -> PortFuture<'_, FolderRef> {
+    ) -> PortFuture<'_, EnsuredFolder> {
         Box::pin(async move {
             if std::mem::take(&mut *self.1.fail_next_ensure_folder_path_not_committed.lock().unwrap()) {
                 return Err(PortError::DeadlineExceeded(

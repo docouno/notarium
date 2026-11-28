@@ -43,7 +43,7 @@ impl NoteWritePort for CanonicalStore {
         &self,
         ctx: SpaceContext,
         request: Mutation<EnsureFolderPath>,
-    ) -> PortFuture<'_, FolderRef> {
+    ) -> PortFuture<'_, notarium_core::ports::EnsuredFolder> {
         Box::pin(folder_paths::ensure(self, ctx, request))
     }
 

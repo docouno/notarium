@@ -772,16 +772,15 @@ pub(super) async fn hydrate_payloads_bounded(
     started: tokio::time::Instant,
     deadline: CommandDeadline,
     max_bytes: Option<usize>,
-) -> Result<(Vec<HydratedChatEntry>, Option<ThreadEntrySeq>), PortError> {
+) -> Result<(Vec<HydratedChatEntry>, Option<usize>), PortError> {
     let mut results = Vec::with_capacity(payloads.len().min(64));
     let mut memo = ProofFoldCache::new();
     let mut hydrated_bytes = 0usize;
-    let mut last_seq: Option<ThreadEntrySeq> = None;
     let mut prev_group_non_cp = false;
     let mut has_valid_cut = false;
     let mut in_model_group = false;
-    let mut truncated_at: Option<ThreadEntrySeq> = None;
-    for mut row in payloads {
+    let mut truncated_len: Option<usize> = None;
+    for (idx, mut row) in payloads.into_iter().enumerate() {
         if let Some(limit) = max_bytes
             && hydrated_bytes >= limit
             && results.len() >= 2
@@ -792,14 +791,13 @@ pub(super) async fn hydrate_payloads_bounded(
             let can_cut_here = (has_valid_cut && next_starts_non_tool_group)
                 || (hydrated_bytes >= hard_cap && (next_starts_non_tool_group || !in_model_group));
             if can_cut_here {
-                truncated_at = last_seq;
+                truncated_len = Some(idx);
                 break;
             }
         }
         let seq = row.seq()?;
         let kind_str = row.kind.clone();
         if row.kind == "redacted" {
-            last_seq = Some(seq);
             continue;
         }
         let reader = PageReader::Snapshots(store, budget, deadline);
@@ -829,7 +827,7 @@ pub(super) async fn hydrate_payloads_bounded(
                 let next_starts_non_tool_group =
                     matches!(row.kind.as_str(), "human" | "model" | "compaction");
                 if next_starts_non_tool_group || !in_model_group {
-                    truncated_at = last_seq;
+                    truncated_len = Some(idx);
                     break;
                 }
                 return Err(DomainError::validation(ValidationReason::BudgetExceeded).into());
@@ -849,7 +847,6 @@ pub(super) async fn hydrate_payloads_bounded(
             interruption,
             tool_calls,
         });
-        last_seq = Some(seq);
         match kind_str.as_str() {
             "human" => {
                 if prev_group_non_cp {
@@ -879,7 +876,7 @@ pub(super) async fn hydrate_payloads_bounded(
         }
     }
     deadline.remaining(budget)?;
-    Ok((results, truncated_at))
+    Ok((results, truncated_len))
 }
 
 /// Exact read for human approval. This method returns an attestation for the

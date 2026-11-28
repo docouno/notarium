@@ -3467,6 +3467,7 @@ fn apply_title_surgery_to_carrier(
     } else {
         markdown.headings.iter().find(|heading| heading.level == 1)
     };
+    let escaped_heading = escape_markdown_heading(new_title);
     if let Some(heading) = heading.filter(|heading| heading.title.trim() != new_title) {
         let start = heading.heading_span.start();
         let text = heading
@@ -3474,7 +3475,11 @@ fn apply_title_surgery_to_carrier(
             .slice(carrier)?
             .trim_end_matches(['\r', '\n']);
         let span = ByteSpan::new(start, start + text.len())?;
-        edits.push((CarrierEditOrigin::Body, span, format!("# {new_title}")));
+        edits.push((
+            CarrierEditOrigin::Body,
+            span,
+            format!("# {escaped_heading}"),
+        ));
     } else if title.is_none() && heading.is_none() {
         let at = body.start();
         let eol = hdr.carrier.eol;
@@ -3487,11 +3492,27 @@ fn apply_title_surgery_to_carrier(
         edits.push((
             CarrierEditOrigin::Body,
             ByteSpan::new(at, at)?,
-            format!("{padding}# {new_title}{eol}{after}"),
+            format!("{padding}# {escaped_heading}{eol}{after}"),
         ));
     }
     let plan = notarium_syntax::patch::plan(carrier, body, edits)?;
     notarium_syntax::patch::apply(carrier, &plan).map_err(PortError::from)
+}
+
+/// Escape inline Markdown syntax inside an ATX H1 heading so CommonMark /
+/// GFM parsing recovers the exact literal `title` string.
+fn escape_markdown_heading(title: &str) -> String {
+    let mut out = String::with_capacity(title.len());
+    for ch in title.chars() {
+        if matches!(
+            ch,
+            '\\' | '*' | '_' | '`' | '[' | ']' | '<' | '>' | '~' | '&' | '!' | '#'
+        ) {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -3508,6 +3529,23 @@ fn rename_synchronizes_only_the_heading_used_as_title() {
         assert_eq!(
             apply_title_surgery_to_carrier(&source, DocClass::UserDoc, "Updated").unwrap(),
             expected
+        );
+    }
+
+    for literal in [
+        "Phase *beta*",
+        "a_b_c",
+        "`code` & [link](url) <tag> ~~strike~~ !img #tail \\slash",
+    ] {
+        let updated =
+            apply_title_surgery_to_carrier("# Initial\n\nBody\n", DocClass::UserDoc, literal)
+                .unwrap();
+        let hdr = notarium_syntax::frontmatter::analyze(&updated, DocClass::UserDoc).unwrap();
+        let md = notarium_syntax::markdown::analyze(&updated, hdr.carrier.body).unwrap();
+        assert_eq!(
+            md.headings.first().map(|h| h.title.trim()),
+            Some(literal),
+            "escaped H1 must round-trip exact literal title: {updated}"
         );
     }
 }

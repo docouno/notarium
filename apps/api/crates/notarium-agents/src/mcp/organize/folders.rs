@@ -783,6 +783,61 @@ pub(super) async fn handle(
         }
         return Ok(result);
     }
+    let unchanged_settled = call
+        .lookup_journal::<bool>("folder-unchanged-settled")
+        .await?
+        .unwrap_or(false);
+    if unchanged_settled {
+        let snapshot = match snapshot_by_id(call, &scope, &folder).await {
+            Ok(current) => Some(current),
+            Err(error) if in_app && corpus::hidden(&error) => {
+                tracing::debug!(code = error.code(), "folder unchanged replay unavailable");
+                return Ok(json!({"outcome": "unchanged"}));
+            }
+            Err(PortError::Domain(DomainError::ResourceNotFound)) if !in_app => None,
+            Err(error) => return Err(error),
+        };
+        let mut result = json!({
+            "outcome": "unchanged",
+            "folderId": folder,
+            "versionToken": route.revision,
+        });
+        if let Some(current) = snapshot {
+            let fenced = call.corpus_writer(scope.clone()).await?;
+            call.registry
+                .catalog
+                .authorize_folder_subtree_write(fenced, folder.clone(), current.revision.clone())
+                .await?;
+            let stable_ancestors = if current.revision == route.revision {
+                ancestors_unchanged(call, &scope, &current, &route.ancestor_revisions).await?
+            } else {
+                false
+            };
+            if current.revision == route.revision && stable_ancestors {
+                let proof = corpus::folder_metadata(call, &scope, &current).await?;
+                result["path"] = proof["path"].clone();
+                if name == ToolName::RenameProject {
+                    let space = proof["spaceSlug"]
+                        .as_str()
+                        .ok_or_else(|| invalid(ValidationReason::InvalidState))?;
+                    let slug = proof["projectSlug"]
+                        .as_str()
+                        .ok_or_else(|| invalid(ValidationReason::InvalidState))?;
+                    result["handle"] = Value::String(format!("{space}/{slug}"));
+                    result["displayName"] = proof["name"].clone();
+                }
+            } else if in_app
+                && let Err(error) = corpus::folder_metadata(call, &scope, &current).await
+            {
+                if corpus::hidden(&error) {
+                    tracing::debug!(code = error.code(), "folder unchanged replay unavailable");
+                    return Ok(json!({"outcome": "unchanged"}));
+                }
+                return Err(error);
+            }
+        }
+        return Ok(result);
+    }
     let fenced = call.corpus_writer(scope.clone()).await?;
     call.registry
         .catalog
@@ -796,6 +851,8 @@ pub(super) async fn handle(
         }
         .into());
     }
+    call.journal("folder-unchanged-settled", || async { Ok(true) })
+        .await?;
     let stable_ancestors =
         ancestors_unchanged(call, &scope, &current, &route.ancestor_revisions).await?;
     let proof = corpus::folder_metadata(call, &scope, &current).await?;

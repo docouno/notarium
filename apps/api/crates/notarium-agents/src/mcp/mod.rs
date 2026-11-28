@@ -192,6 +192,32 @@ pub struct ToolRegistry {
     ability_cursors: ability_tools::AbilityCursors,
 }
 
+pub(super) fn deadline_from(remaining: Duration) -> Instant {
+    Instant::now()
+        .checked_add(remaining)
+        .unwrap_or_else(|| Instant::now() + Duration::from_secs(365 * 24 * 3600))
+}
+
+fn telemetry_pre_error(error: PortError) -> PortError {
+    let downgrade = |failure: OperationalFailure| {
+        let retry = failure.retry();
+        OperationalFailure::new(
+            failure.diagnostic_ref(),
+            CommitEffect::NotCommitted,
+            retry,
+            retry != RetryAdvice::Never,
+        )
+        .expect("not-committed failure is valid")
+    };
+    match error {
+        PortError::Cancelled(failure) => PortError::Cancelled(downgrade(failure)),
+        PortError::DeadlineExceeded(failure) => PortError::DeadlineExceeded(downgrade(failure)),
+        PortError::Unavailable(failure) => PortError::Unavailable(downgrade(failure)),
+        PortError::Internal(failure) => PortError::Internal(downgrade(failure)),
+        PortError::Domain(domain) => PortError::Domain(domain),
+    }
+}
+
 impl ToolRegistry {
     pub(crate) fn control(&self) -> &dyn ControlPort {
         self.control.as_ref()
@@ -370,14 +396,12 @@ impl ToolRegistry {
         };
         let tool =
             ToolName::parse(name).ok_or_else(|| pre(DomainError::ResourceNotFound.into()))?;
-        let deadline = Instant::now()
-            .checked_add(ctx.account.budget.remaining)
-            .unwrap_or_else(|| Instant::now() + Duration::from_secs(365 * 24 * 3600));
+        let deadline = deadline_from(ctx.account.budget.remaining);
         let auth = self
             .control
             .revalidate_auth(ctx.account.clone())
             .await
-            .map_err(pre)?;
+            .map_err(|err| pre(telemetry_pre_error(err)))?;
         check_target(&auth, &ctx.target).map_err(pre)?;
         if tool.ability_write()
             && matches!(
@@ -467,7 +491,7 @@ impl ToolRegistry {
                 },
             )
             .await
-            .map_err(pre)?;
+            .map_err(|err| pre(telemetry_pre_error(err)))?;
 
         #[inline(never)]
         fn box_tool<'a, T, Fut>(
@@ -712,7 +736,7 @@ impl<'a> ToolCallContext<'a> {
             request_key: derive_key("notarium.proposal.approval.v1", &[proposal.as_bytes()]),
             request_hash: proposal,
             call_id: new_request_id()?,
-            deadline: Instant::now() + budget.remaining,
+            deadline: deadline_from(budget.remaining),
             cancellation: budget.cancellation,
             provenance: std::sync::Mutex::new(ChatProvenance::default()),
             policies: corpus::CandidatePolicies::default(),

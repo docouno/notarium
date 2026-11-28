@@ -280,7 +280,7 @@ impl CanonicalStore {
                         // READ COMMITTED lets `FOR SHARE` wait via EvalPlanQual across
                         // concurrent `spaces.last_seq` updates without 40001 aborts; once
                         // the Space lock is acquired, no writer for those Spaces can commit.
-                        "BEGIN"
+                        "BEGIN ISOLATION LEVEL READ COMMITTED"
                     } else {
                         "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"
                     };
@@ -725,6 +725,10 @@ async fn snapshot(
             .current()
             .clone(),
             ProviderOrigin::Space { .. } => space_content(ctx.auth(), record)?.current().clone(),
+            ProviderOrigin::SpaceProjects { .. } => space_projects_content(tx, ctx.auth(), record)
+                .await?
+                .current()
+                .clone(),
             ProviderOrigin::SystemAbility { .. } => {
                 return Err(DomainError::ResourceNotFound.into());
             }
@@ -840,6 +844,14 @@ pub(super) async fn metadata(
                         space.scope.check(&scope)?;
                         space_content(ctx.auth(), &space)
                     }
+                    CatalogDisclosure::SpaceProjects(scope) => {
+                        if !ctx.auth().spaces().contains_key(&scope.space_id) {
+                            return Err(DomainError::ResourceNotFound.into());
+                        }
+                        let space = load_space_record(tx, &scope.space_id).await?;
+                        space.scope.check(&scope)?;
+                        space_projects_content(tx, ctx.auth(), &space).await
+                    }
                 }
             })
         })
@@ -943,6 +955,67 @@ fn space_content(
     let current = ProviderCurrentContent::Space {
         history: space.scope.clone(),
         digest: ContentDigest::from_bytes(*blake3::hash(text.as_bytes()).as_bytes()),
+        space: space.space.clone(),
+        root: space.root_folder_id.clone(),
+    };
+    Ok(CanonicalMetadataContent::from_canonical(current, text)?)
+}
+
+async fn space_projects_content(
+    tx: &mut BackendConn<'_>,
+    auth: &EngineAuthContext,
+    space: &SpaceRecord,
+) -> Result<CanonicalMetadataContent, PortError> {
+    auth.authorize_folder_read(&space.space, &space.root_folder_id, &[])?;
+    let rows: Vec<(String, String, String, Option<String>)> = match tx {
+        BackendConn::Sqlite(conn) => sqlx::query_as(
+            "SELECT folder_id, head_rev_id, display_name, project_slug
+             FROM folder_heads
+             WHERE space_id = ? AND lifecycle_state = 'active' AND is_project = 1
+             ORDER BY folder_id ASC",
+        )
+        .bind(space.space.id.as_str())
+        .fetch_all(&mut **conn)
+        .await
+        .map_err(|e| internal_not_committed("sqlite_space_projects_digest", e.to_string()))?,
+        BackendConn::Postgres(conn) => sqlx::query_as(
+            "SELECT folder_id, head_rev_id, display_name, project_slug
+             FROM folder_heads
+             WHERE space_id = $1 AND lifecycle_state = 'active' AND is_project = 1
+             ORDER BY folder_id COLLATE \"C\" ASC",
+        )
+        .bind(space.space.id.as_str())
+        .fetch_all(&mut **conn)
+        .await
+        .map_err(|e| pg_read_error("pg_space_projects_digest", e))?,
+    };
+    let text = serde_json::json!({
+        "id": space.space.id,
+        "slug": space.slug,
+        "kind": space.space.kind,
+        "activeProjectCount": rows.len(),
+    })
+    .to_string();
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"notarium.egress.space-projects.v1\0");
+    hasher.update(&(text.len() as u64).to_le_bytes());
+    hasher.update(text.as_bytes());
+    for (folder_id, head_rev_id, display_name, project_slug) in &rows {
+        let slug = project_slug.as_deref().unwrap_or("");
+        for field in [
+            folder_id.as_str(),
+            head_rev_id.as_str(),
+            display_name.as_str(),
+            slug,
+        ] {
+            hasher.update(&(field.len() as u64).to_le_bytes());
+            hasher.update(field.as_bytes());
+        }
+    }
+    let digest = ContentDigest::from_bytes(*hasher.finalize().as_bytes());
+    let current = ProviderCurrentContent::SpaceProjects {
+        history: space.scope.clone(),
+        digest,
         space: space.space.clone(),
         root: space.root_folder_id.clone(),
     };

@@ -158,7 +158,7 @@ CREATE TABLE provider_call_log (
     CHECK (coalesce(length(CAST(principal AS BLOB)),0) + coalesce(length(CAST(scope_id AS BLOB)),0) + coalesce(length(CAST(intent_key AS BLOB)),0) <= 2048),
     CHECK (coalesce(length(CAST(owner_id AS BLOB)),0) + 8 + coalesce(length(CAST(call_id AS BLOB)),0) <= 2048),
     CHECK (coalesce(length(CAST(delivery_state AS BLOB)),0) + 8 + coalesce(length(CAST(call_id AS BLOB)),0) <= 2048),
-    CHECK (coalesce(length(CAST(run_id AS BLOB)),0) + coalesce(length(CAST(call_id AS BLOB)),0) <= 2048)
+    CHECK (coalesce(length(CAST(run_id AS BLOB)),0) + coalesce(length(CAST(call_id AS BLOB)),0) <= 2088)
 ) STRICT;
 INSERT INTO provider_call_log(call_id,owner_id,principal,run_id,scope_id,intent_key,request_hash,resource_id,credential_id,policy_epochs,participating_spaces,model_id,reserved_tokens,bucket_keys,delivery_state,outcome,usage_source,input_tokens,output_tokens,diagnostic,dispatch_owner,created_at,settled_at)
 SELECT call_id,owner_id,principal,run_id,scope_id,intent_key,request_hash,resource_id,credential_id,policy_epochs,participating_spaces,model_id,reserved_tokens,bucket_keys,delivery_state,outcome,usage_source,input_tokens,output_tokens,diagnostic,dispatch_owner,created_at,settled_at FROM provider_call_log_v1;

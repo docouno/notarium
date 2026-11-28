@@ -370,7 +370,7 @@ async fn long_branch_compaction_prefix_stays_within_snapshot_budget(
     fixture
         .canonical
         .execute_diagnostic_write_sql_for_test(&format!(
-            "UPDATE chat_threads SET head_leaf_seq=25666 WHERE space_id='{}' AND thread_id='{}'",
+            "UPDATE chat_threads SET head_leaf_seq=25666, next_entry_seq=25667 WHERE space_id='{}' AND thread_id='{}'",
             scope.space_id.as_str(),
             thread.as_str(),
         ))
@@ -381,7 +381,7 @@ async fn long_branch_compaction_prefix_stays_within_snapshot_budget(
         .read_chat_compaction_prefix(
             personal.clone(),
             ChatRead {
-                thread,
+                thread: thread.clone(),
                 leaf: ThreadEntrySeq::new(25_666).unwrap(),
                 before: None,
                 max_entries: PageLimit::new(200).unwrap(),
@@ -404,6 +404,91 @@ async fn long_branch_compaction_prefix_stays_within_snapshot_budget(
     assert_eq!(
         after_sibling_page.branch.entries[199].seq,
         ThreadEntrySeq::new(599).unwrap()
+    );
+
+    // Byte-bounded hydration truncation must keep entries[0] (the compaction
+    // checkpoint whose seq 25,500 is greater than the truncated tail seqs 401..450).
+    // Stage one real 240 KiB CAS blob via `submit_user_chat_input` and point
+    // 50 tail entries (12 MiB > 9 MiB hydration cap) at it.
+    let SubmitUserChatOutcome::Appended(blob_entry) = fixture
+        .canonical
+        .submit_user_chat_input(
+            personal.clone(),
+            SubmitUserChatInput {
+                identity: CommandIdentity {
+                    scope: scope.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([0xC8; 16]),
+                    hash: ContentDigest::from_bytes([0xC8; 32]),
+                },
+                id: PendingInputId::from_bytes([0xC9; 16]),
+                thread: thread.clone(),
+                expected_leaf: ThreadEntrySeq::new(25_666).unwrap(),
+                body: "a".repeat(240 * 1024),
+                mentions_agent: false,
+            },
+        )
+        .await
+        .expect("staging 240 KiB chat blob entry must succeed")
+    else {
+        panic!("expected blob entry to append directly");
+    };
+    let blob_seq = blob_entry.value.seq;
+    let inflate_sql = format!(
+        "UPDATE chat_entries \
+         SET inline_text = NULL, \
+             payload_blake3 = ( \
+                 SELECT payload_blake3 FROM chat_entries \
+                 WHERE space_id = '{space}' AND thread_id = '{thread}' AND entry_seq = {blob_seq} \
+             ) \
+         WHERE space_id = '{space}' AND thread_id = '{thread}' AND entry_seq BETWEEN 401 AND 450",
+        space = scope.space_id.as_str(),
+        thread = thread.as_str(),
+        blob_seq = blob_seq.get(),
+    );
+    assert_eq!(
+        fixture
+            .canonical
+            .execute_diagnostic_write_sql_for_test(&inflate_sql)
+            .await
+            .unwrap(),
+        50
+    );
+    let truncated_prefix = fixture
+        .canonical
+        .read_chat_compaction_prefix(
+            personal.clone(),
+            ChatRead {
+                thread,
+                leaf: blob_seq,
+                before: None,
+                max_entries: PageLimit::new(200).unwrap(),
+            },
+        )
+        .await
+        .expect("byte-bounded prefix hydration must succeed with compaction checkpoint intact");
+    assert!(truncated_prefix.has_tail);
+    assert!(
+        truncated_prefix.branch.entries.len() < 200 && truncated_prefix.branch.entries.len() >= 3,
+        "expected byte-bounded truncation below 200 entries, got {}",
+        truncated_prefix.branch.entries.len()
+    );
+    assert_eq!(
+        truncated_prefix.branch.entries[0].seq,
+        ThreadEntrySeq::new(25_500).unwrap(),
+        "truncation must preserve entries[0] compaction checkpoint even when cp.seq > tail seq"
+    );
+    assert_eq!(
+        truncated_prefix.branch.entries[0].kind,
+        ChatEntryKind::Compaction
+    );
+    assert_eq!(
+        truncated_prefix.branch.entries[1].seq,
+        ThreadEntrySeq::new(401).unwrap()
+    );
+    assert_eq!(
+        truncated_prefix.contents.len(),
+        truncated_prefix.branch.entries.len()
     );
 }
 

@@ -92,18 +92,17 @@ impl OperationBudget {
             result = handle => result.map_err(|_| crate::error::unavailable("control commit worker", CommitEffect::Unknown))?,
         }
     }
-    pub async fn commit_tx_keeping_fences(
+    pub async fn await_spawned<T>(
         &self,
-        tx: WriteTransaction,
-    ) -> Result<Vec<Box<dyn notarium_core::ports::RevocationLease>>, PortError> {
-        self.check(CommitEffect::NotCommitted)?;
-        let handle = tx.spawn_commit_keeping_fences();
+        handle: tokio::task::JoinHandle<Result<T, PortError>>,
+        worker: &'static str,
+    ) -> Result<T, PortError> {
         let sleep_for = self.remaining_now();
         tokio::select! {
             biased;
             () = self.cancellation.cancelled() => Err(PortError::Cancelled(budget_failure(CommitEffect::Unknown))),
             () = tokio::time::sleep(sleep_for) => Err(PortError::DeadlineExceeded(budget_failure(CommitEffect::Unknown))),
-            result = handle => result.map_err(|_| crate::error::unavailable("control commit worker", CommitEffect::Unknown))?,
+            result = handle => result.map_err(|_| crate::error::unavailable(worker, CommitEffect::Unknown))?,
         }
     }
     pub async fn configure(&self, tx: &mut Transaction) -> Result<(), PortError> {

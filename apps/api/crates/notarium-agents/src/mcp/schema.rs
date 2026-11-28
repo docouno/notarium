@@ -184,7 +184,10 @@ impl ToolName {
                     opt("task", string(0, 4096)),
                     opt(
                         "session",
-                        object(vec![opt("id", Input::Episode), opt("name", string(1, 128))]),
+                        one_of(vec![
+                            object(vec![req("id", Input::Episode)]),
+                            object(vec![req("name", string(1, 128))]),
+                        ]),
                     ),
                     opt("continuation", cursor()),
                     opt("deliveryReceipt", cursor()),
@@ -375,6 +378,7 @@ enum Input {
     Object(Vec<Field>),
     Map(Box<Input>),
     AnyOf(Vec<Input>),
+    OneOf(Vec<Input>),
     YamlValue {
         max_depth: usize,
     },
@@ -452,6 +456,9 @@ impl Input {
                 object.len() <= 128 && object.values().all(|value| rule.matches(value))
             }),
             Self::AnyOf(choices) => choices.iter().any(|input| input.matches(value)),
+            Self::OneOf(choices) => {
+                choices.iter().filter(|input| input.matches(value)).count() == 1
+            }
             Self::YamlValue { max_depth } => valid_yaml_value(value, *max_depth),
         }
     }
@@ -513,13 +520,46 @@ impl Input {
                 .iter()
                 .find(|input| input.matches(value))
                 .is_some_and(|input| input.validate(value)),
+            Self::OneOf(choices) => {
+                let mut matched = choices.iter().filter(|input| input.matches(value));
+                let first = matched.next();
+                if matched.next().is_some() {
+                    return false;
+                }
+                first.is_some_and(|input| input.validate(value))
+            }
             Self::YamlValue { max_depth } => valid_yaml_value(value, *max_depth),
         }
     }
 
     fn json_schema(&self) -> Value {
         match self {
-            Self::Text { min, max, .. } => {
+            Self::Text {
+                min,
+                max,
+                max_bytes: Some(bytes),
+            } => {
+                let ascii_max = (*max).min(*bytes);
+                let two_byte_max = (*max).min(bytes / 2);
+                let bmp_max = (*max).min(bytes / 3);
+                let any_max = (*max).min(bytes / 4);
+                json!({
+                    "type": "string",
+                    "minLength": min,
+                    "maxLength": ascii_max,
+                    "anyOf": [
+                        {"maxLength": any_max},
+                        {"maxLength": bmp_max, "pattern": "^[\\u0000-\\ud7ff\\ue000-\\uffff]*$"},
+                        {"maxLength": two_byte_max, "pattern": "^[\\u0000-\\u07ff]*$"},
+                        {"maxLength": ascii_max, "pattern": "^[\\u0000-\\u007f]*$"}
+                    ]
+                })
+            }
+            Self::Text {
+                min,
+                max,
+                max_bytes: None,
+            } => {
                 json!({"type":"string","minLength":min,"maxLength":max})
             }
             Self::Episode => json!({
@@ -551,6 +591,9 @@ impl Input {
             }
             Self::AnyOf(choices) => {
                 json!({"anyOf":choices.iter().map(Self::json_schema).collect::<Vec<_>>()})
+            }
+            Self::OneOf(choices) => {
+                json!({"oneOf":choices.iter().map(Self::json_schema).collect::<Vec<_>>()})
             }
             Self::YamlValue { .. } => {
                 json!({"type":["string","number","boolean","null","array","object"]})
@@ -590,7 +633,7 @@ impl Input {
             Self::Map(rule) => ProviderToolSchema::Map {
                 values: Box::new(rule.provider_schema()),
             },
-            Self::AnyOf(choices) => {
+            Self::AnyOf(choices) | Self::OneOf(choices) => {
                 ProviderToolSchema::AnyOf(choices.iter().map(Self::provider_schema).collect())
             }
             Self::YamlValue { .. } => ProviderToolSchema::JsonValue,
@@ -620,6 +663,9 @@ fn map(rule: Input) -> Input {
 }
 fn any_of(choices: Vec<Input>) -> Input {
     Input::AnyOf(choices)
+}
+fn one_of(choices: Vec<Input>) -> Input {
+    Input::OneOf(choices)
 }
 fn array(item: Input, min: usize, max: usize) -> Input {
     Input::Array {
@@ -757,6 +803,44 @@ mod tests {
                 "ref":"abc", "fields":{"tag":["a", "b"], "owner":null},
                 "view":{"viewRef":"v_old","options":{"set":{"enabled":true}}}
             }))
+            .unwrap();
+
+        // start_session.session schema uses oneOf and rejects empty or dual-key locators.
+        let ss_schema = ToolName::StartSession.descriptor().input_schema;
+        assert!(ss_schema["properties"]["session"]["oneOf"].is_array());
+        assert!(
+            ToolName::StartSession
+                .validate(&mut json!({"session":{}}))
+                .is_err()
+        );
+        assert!(
+            ToolName::StartSession
+                .validate(&mut json!({"session":{"id":"ses_A0b1C2d3E4_-","name":"alpha"}}))
+                .is_err()
+        );
+        ToolName::StartSession
+            .validate(&mut json!({"session":{"id":"ses_A0b1C2d3E4_-"}}))
+            .unwrap();
+        ToolName::StartSession
+            .validate(&mut json!({"session":{"name":"alpha"}}))
+            .unwrap();
+
+        // search/recall byte_string enforces 4096 UTF-8 byte ceiling and publishes matching anyOf bounds.
+        let search_schema = ToolName::Search.descriptor().input_schema;
+        assert!(search_schema["properties"]["query"]["anyOf"].is_array());
+        let two_byte_over = "\u{044F}".repeat(2049);
+        assert!(
+            ToolName::Search
+                .validate(&mut json!({"query": two_byte_over}))
+                .is_err()
+        );
+        let two_byte_exact = "\u{044F}".repeat(2048);
+        ToolName::Search
+            .validate(&mut json!({"query": two_byte_exact}))
+            .unwrap();
+        let ascii_exact = "a".repeat(4096);
+        ToolName::Search
+            .validate(&mut json!({"query": ascii_exact}))
             .unwrap();
     }
 }

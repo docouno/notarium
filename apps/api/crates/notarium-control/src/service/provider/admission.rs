@@ -536,8 +536,11 @@ impl ProviderService {
                     )]);
                 }
                 let mut candidates = Vec::new();
-                if !matches!(source, ProviderCurrentContent::Space { .. })
-                    && let Some(sec_projects) = secondary_projects_by_space.get(&space.id)
+                if !matches!(
+                    source,
+                    ProviderCurrentContent::Space { .. }
+                        | ProviderCurrentContent::SpaceProjects { .. }
+                ) && let Some(sec_projects) = secondary_projects_by_space.get(&space.id)
                 {
                     for &proj in sec_projects {
                         if let Some(admitted) = secondary_project_policies

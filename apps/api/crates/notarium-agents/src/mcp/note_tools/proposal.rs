@@ -29,13 +29,19 @@ pub(in crate::mcp) type ConfirmedStep<'a> = dyn Fn(&HistoryScope, &'static str, 
     + Sync
     + 'a;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::mcp) struct UnifiedPreview {
+    pub diff: String,
+    pub truncated: bool,
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub(in crate::mcp) enum PreparedNoteAction {
     Create(create::proposal::ProposedCreates),
     Edit {
         route: NoteRoute,
-        input: EditInput,
+        plan: notarium_core::patch::CarrierPatchPlan,
     },
     Delete {
         route: NoteRoute,
@@ -160,8 +166,8 @@ pub(in crate::mcp) async fn describe_proposal(
 pub(in crate::mcp) async fn preview_proposal(
     viewer: &mut ToolCallContext<'_>,
     action: &PreparedNoteAction,
-) -> Result<Option<String>, PortError> {
-    let PreparedNoteAction::Edit { route, input } = action else {
+) -> Result<Option<UnifiedPreview>, PortError> {
+    let PreparedNoteAction::Edit { route, plan } = action else {
         return Ok(None);
     };
     let result = async {
@@ -179,14 +185,14 @@ pub(in crate::mcp) async fn preview_proposal(
         )
         .await?;
         let original = corpus::note_document(viewer, &scope, &before.document).await?;
-        let schema = if input.edits_view() {
-            viewer.registry.engine.space_schema(scope.clone()).await?
-        } else {
-            std::collections::BTreeMap::new()
-        };
-        let plan = input.plan(&original, before.document.class(), route, &schema)?;
-        let updated = notarium_syntax::patch::apply(&original, &plan)?;
-        Ok(unified_preview(&original, &updated))
+        if before.document.digest() != plan.base_content_hash {
+            return Err(DomainError::RevisionConflict {
+                current: before.document.revision().clone(),
+                lineage: None,
+            }
+            .into());
+        }
+        Ok(unified_preview_from_plan(&original, plan))
     }
     .await;
     match result {
@@ -195,150 +201,528 @@ pub(in crate::mcp) async fn preview_proposal(
     }
 }
 
-fn unified_preview(before: &str, after: &str) -> Option<String> {
-    const PREVIEW_CAP_BYTES: usize = 64 * 1024;
-    if before == after {
+fn floor_char_boundary(text: &str, mut index: usize) -> usize {
+    index = index.min(text.len());
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+fn ceil_char_boundary(text: &str, mut index: usize) -> usize {
+    index = index.min(text.len());
+    while index < text.len() && !text.is_char_boundary(index) {
+        index += 1;
+    }
+    index
+}
+
+fn count_lines(text: &str) -> usize {
+    if text.is_empty() {
+        0
+    } else {
+        text.split_inclusive('\n').count()
+    }
+}
+
+/// Render a multi-hunk unified diff directly from `ByteSpan` edits without
+/// cloning the full target document. Bounds unchanged context lines and huge
+/// single-line edits so changed bytes remain visible within the 32 KiB cap,
+/// and reports `truncated = true` whenever any byte or hunk is omitted.
+fn unified_preview_from_plan(
+    before: &str,
+    plan: &notarium_core::patch::CarrierPatchPlan,
+) -> Option<UnifiedPreview> {
+    const PREVIEW_CAP_BYTES: usize = super::super::proposals::MAX_DISPLAY_BYTES;
+    const CONTEXT_LINES: usize = 3;
+    const MAX_CONTEXT_LINE_BYTES: usize = 512;
+    const LARGE_REGION_THRESHOLD: usize = 8 * 1024;
+    const INLINE_WINDOW_BYTES: usize = 128;
+    const NO_NEWLINE_MARKER: &str = "\n\\ No newline at end of file\n";
+
+    let active_edits: Vec<(usize, usize, &str)> = plan
+        .edits
+        .iter()
+        .filter_map(|edit| {
+            let start = edit.bytes.0.start();
+            let end = edit.bytes.0.end();
+            let old_slice = before.get(start..end)?;
+            if old_slice == edit.replacement.as_str() {
+                None
+            } else {
+                Some((start, end, edit.replacement.as_str()))
+            }
+        })
+        .collect();
+    if active_edits.is_empty() {
         return None;
     }
-    let mut context_before: std::collections::VecDeque<&str> =
-        std::collections::VecDeque::with_capacity(3);
-    let mut first = 0usize;
-    let mut prefix_bytes = 0usize;
-    for (left, right) in before
-        .split_inclusive('\n')
-        .zip(after.split_inclusive('\n'))
-    {
-        if left != right {
-            break;
-        }
-        if context_before.len() == 3 {
-            context_before.pop_front();
-        }
-        context_before.push_back(left);
-        first += 1;
-        prefix_bytes += left.len();
+
+    let mut lines: Vec<(usize, usize)> = Vec::new();
+    let mut offset = 0usize;
+    for line in before.split_inclusive('\n') {
+        let end = offset + line.len();
+        lines.push((offset, end));
+        offset = end;
     }
-    let before_rem = &before[prefix_bytes..];
-    let after_rem = &after[prefix_bytes..];
-    let mut context_after_rev: std::collections::VecDeque<&str> =
-        std::collections::VecDeque::with_capacity(3);
-    let mut suffix = 0usize;
-    let mut suffix_bytes = 0usize;
-    for (left, right) in before_rem
-        .split_inclusive('\n')
-        .rev()
-        .zip(after_rem.split_inclusive('\n').rev())
-    {
-        if left != right {
-            break;
-        }
-        if context_after_rev.len() == 3 {
-            context_after_rev.pop_front();
-        }
-        context_after_rev.push_back(left);
-        suffix += 1;
-        suffix_bytes += left.len();
+    let total_lines = lines.len();
+
+    struct EditSpan {
+        start: usize,
+        end: usize,
+        replacement: usize,
+        first_line: usize,
+        last_line_excl: usize,
     }
-    let old_mid = &before_rem[..before_rem.len() - suffix_bytes];
-    let new_mid = &after_rem[..after_rem.len() - suffix_bytes];
-    let old_mid_lines = if old_mid.is_empty() {
-        0
-    } else {
-        old_mid.split_inclusive('\n').count()
-    };
-    let new_mid_lines = if new_mid.is_empty() {
-        0
-    } else {
-        new_mid.split_inclusive('\n').count()
-    };
-    let begin = first.saturating_sub(3);
-    let following = suffix.min(3);
-    let old_count = (first - begin) + old_mid_lines + following;
-    let new_count = (first - begin) + new_mid_lines + following;
-    let old_line = begin + usize::from(old_count > 0);
-    let new_line = begin + usize::from(new_count > 0);
-    let mut output = format!(
-        "--- current\n+++ proposed\n@@ -{old_line},{old_count} +{new_line},{new_count} @@\n"
-    );
-    let mut push_line = |marker: char, line: &str| -> bool {
-        if output.len() >= PREVIEW_CAP_BYTES {
-            return false;
-        }
-        output.push(marker);
-        let room = PREVIEW_CAP_BYTES.saturating_sub(output.len());
-        if line.len() <= room {
-            output.push_str(line);
-            if !line.ends_with('\n') && output.len() < PREVIEW_CAP_BYTES {
-                output.push_str("\n\\ No newline at end of file\n");
+
+    let mut mapped = Vec::with_capacity(active_edits.len());
+    for (idx, &(start, end, replacement)) in active_edits.iter().enumerate() {
+        let (first_line, last_line_excl) = if total_lines == 0 {
+            (0, 0)
+        } else if start == end {
+            if start == before.len() {
+                if before.ends_with('\n') {
+                    (total_lines, total_lines)
+                } else {
+                    (total_lines - 1, total_lines)
+                }
+            } else {
+                let line_idx = lines.partition_point(|&(_, line_end)| line_end <= start);
+                if start == lines[line_idx].0 && replacement.ends_with('\n') {
+                    (line_idx, line_idx)
+                } else {
+                    (line_idx, (line_idx + 1).min(total_lines))
+                }
             }
+        } else {
+            let first = lines.partition_point(|&(_, line_end)| line_end <= start);
+            let mut last_excl = lines.partition_point(|&(_, line_end)| line_end < end) + 1;
+            if last_excl < total_lines
+                && lines[last_excl - 1].1 == end
+                && before.as_bytes().get(end - 1) == Some(&b'\n')
+                && !replacement.ends_with('\n')
+            {
+                last_excl += 1;
+            }
+            (first.min(total_lines), last_excl.min(total_lines))
+        };
+        mapped.push(EditSpan {
+            start,
+            end,
+            replacement: idx,
+            first_line,
+            last_line_excl,
+        });
+    }
+
+    struct HunkGroup {
+        ctx_start: usize,
+        edit_start: usize,
+        edit_end: usize,
+        ctx_end: usize,
+        edits: Vec<usize>,
+    }
+
+    let mut hunks: Vec<HunkGroup> = Vec::new();
+    for (idx, edit) in mapped.iter().enumerate() {
+        let ctx_start = edit.first_line.saturating_sub(CONTEXT_LINES);
+        let ctx_end = (edit.last_line_excl + CONTEXT_LINES).min(total_lines);
+        if let Some(prev) = hunks.last_mut()
+            && ctx_start <= prev.ctx_end
+        {
+            prev.edit_end = prev.edit_end.max(edit.last_line_excl);
+            prev.ctx_end = prev.ctx_end.max(ctx_end);
+            prev.edits.push(idx);
+        } else {
+            hunks.push(HunkGroup {
+                ctx_start,
+                edit_start: edit.first_line,
+                edit_end: edit.last_line_excl,
+                ctx_end,
+                edits: vec![idx],
+            });
+        }
+    }
+
+    let mut output = String::from("--- current\n+++ proposed\n");
+    let mut truncated = false;
+    let mut line_delta: isize = 0;
+
+    let push_raw = |out: &mut String, piece: &str, truncated: &mut bool| -> bool {
+        if out.len().saturating_add(piece.len()) <= PREVIEW_CAP_BYTES {
+            out.push_str(piece);
             true
         } else {
-            let mut end = room;
-            while end > 0 && !line.is_char_boundary(end) {
-                end -= 1;
-            }
-            output.push_str(&line[..end]);
+            let room = PREVIEW_CAP_BYTES.saturating_sub(out.len());
+            let end = floor_char_boundary(piece, room);
+            out.push_str(&piece[..end]);
+            *truncated = true;
             false
         }
     };
-    let mut ok = true;
-    for line in &context_before {
-        if !push_line(' ', line) {
-            ok = false;
-            break;
+
+    let push_diff_line = |out: &mut String,
+                          marker: char,
+                          line: &str,
+                          cap: Option<usize>,
+                          truncated: &mut bool|
+     -> bool {
+        if out.len() >= PREVIEW_CAP_BYTES {
+            *truncated = true;
+            return false;
         }
-    }
-    if ok && !old_mid.is_empty() {
-        for line in old_mid.split_inclusive('\n') {
-            if !push_line('-', line) {
-                ok = false;
-                break;
+        let mut was_capped = false;
+        let display = if let Some(limit) = cap
+            && line.len() > limit
+        {
+            was_capped = true;
+            *truncated = true;
+            let trimmed = line.trim_end_matches('\n');
+            let end = floor_char_boundary(trimmed, limit.saturating_sub(4));
+            &trimmed[..end]
+        } else {
+            line
+        };
+        if out.len().saturating_add(1) > PREVIEW_CAP_BYTES {
+            *truncated = true;
+            return false;
+        }
+        out.push(marker);
+        if was_capped {
+            if !push_raw(out, display, truncated) {
+                return false;
+            }
+            return push_raw(out, "...\n", truncated);
+        }
+        if !push_raw(out, display, truncated) {
+            return false;
+        }
+        if !display.ends_with('\n') {
+            if out.len().saturating_add(NO_NEWLINE_MARKER.len()) <= PREVIEW_CAP_BYTES {
+                out.push_str(NO_NEWLINE_MARKER);
+            } else {
+                *truncated = true;
+                return false;
+            }
+        }
+        true
+    };
+
+    'hunks: for hunk in hunks {
+        let region_start = if hunk.edit_start < total_lines {
+            lines[hunk.edit_start].0
+        } else {
+            before.len()
+        };
+        let region_end = if hunk.edit_end == hunk.edit_start {
+            region_start
+        } else {
+            lines[hunk.edit_end - 1].1
+        };
+        let old_region = &before[region_start..region_end];
+        let old_region_lines = hunk.edit_end - hunk.edit_start;
+        let pre_count = hunk.edit_start - hunk.ctx_start;
+        let post_count = hunk.ctx_end - hunk.edit_end;
+
+        let estimated_new_bytes = {
+            let mut size = old_region.len();
+            for &edit_idx in &hunk.edits {
+                let edit = &mapped[edit_idx];
+                let repl = active_edits[edit.replacement].2;
+                size = size
+                    .saturating_sub(edit.end - edit.start)
+                    .saturating_add(repl.len());
+            }
+            size
+        };
+
+        if old_region.len() <= LARGE_REGION_THRESHOLD
+            && estimated_new_bytes <= LARGE_REGION_THRESHOLD
+        {
+            let mut new_region = String::with_capacity(estimated_new_bytes);
+            let mut cursor = region_start;
+            for &edit_idx in &hunk.edits {
+                let edit = &mapped[edit_idx];
+                let repl = active_edits[edit.replacement].2;
+                new_region.push_str(&before[cursor..edit.start]);
+                new_region.push_str(repl);
+                cursor = edit.end;
+            }
+            new_region.push_str(&before[cursor..region_end]);
+
+            let new_region_lines = count_lines(&new_region);
+            let old_count = pre_count + old_region_lines + post_count;
+            let new_count = pre_count + new_region_lines + post_count;
+            let old_line = hunk.ctx_start + usize::from(old_count > 0);
+            let new_base = (hunk.ctx_start as isize + line_delta).max(0) as usize;
+            let new_line = new_base + usize::from(new_count > 0);
+            line_delta += new_region_lines as isize - old_region_lines as isize;
+
+            let header = format!("@@ -{old_line},{old_count} +{new_line},{new_count} @@\n");
+            if !push_raw(&mut output, &header, &mut truncated) {
+                break 'hunks;
+            }
+            for &(ls, le) in &lines[hunk.ctx_start..hunk.edit_start] {
+                if !push_diff_line(
+                    &mut output,
+                    ' ',
+                    &before[ls..le],
+                    Some(MAX_CONTEXT_LINE_BYTES),
+                    &mut truncated,
+                ) {
+                    break 'hunks;
+                }
+            }
+            for line in old_region.split_inclusive('\n') {
+                if !push_diff_line(&mut output, '-', line, None, &mut truncated) {
+                    break 'hunks;
+                }
+            }
+            for line in new_region.split_inclusive('\n') {
+                if !push_diff_line(&mut output, '+', line, None, &mut truncated) {
+                    break 'hunks;
+                }
+            }
+            for &(ls, le) in &lines[hunk.edit_end..hunk.ctx_end] {
+                if !push_diff_line(
+                    &mut output,
+                    ' ',
+                    &before[ls..le],
+                    Some(MAX_CONTEXT_LINE_BYTES),
+                    &mut truncated,
+                ) {
+                    break 'hunks;
+                }
+            }
+        } else {
+            // Large edited region (for example, a long single line with a localized
+            // replacement): window directly around each edited ByteSpan without
+            // allocating a full copy of the untouched prefix/suffix.
+            truncated = true;
+            let mut new_newlines = 0usize;
+            let mut cursor = region_start;
+            let mut last_byte: Option<u8> = None;
+            let mut non_empty = false;
+            for &edit_idx in &hunk.edits {
+                let edit = &mapped[edit_idx];
+                let repl = active_edits[edit.replacement].2;
+                let unchanged = &before[cursor..edit.start];
+                if !unchanged.is_empty() {
+                    non_empty = true;
+                    last_byte = unchanged.as_bytes().last().copied();
+                    new_newlines += unchanged.bytes().filter(|&b| b == b'\n').count();
+                }
+                if !repl.is_empty() {
+                    non_empty = true;
+                    last_byte = repl.as_bytes().last().copied();
+                    new_newlines += repl.bytes().filter(|&b| b == b'\n').count();
+                }
+                cursor = edit.end;
+            }
+            let tail = &before[cursor..region_end];
+            if !tail.is_empty() {
+                non_empty = true;
+                last_byte = tail.as_bytes().last().copied();
+                new_newlines += tail.bytes().filter(|&b| b == b'\n').count();
+            }
+            let new_region_lines = if !non_empty {
+                0
+            } else if last_byte == Some(b'\n') {
+                new_newlines
+            } else {
+                new_newlines + 1
+            };
+
+            let old_count = pre_count + old_region_lines + post_count;
+            let new_count = pre_count + new_region_lines + post_count;
+            let old_line = hunk.ctx_start + usize::from(old_count > 0);
+            let new_base = (hunk.ctx_start as isize + line_delta).max(0) as usize;
+            let new_line = new_base + usize::from(new_count > 0);
+            line_delta += new_region_lines as isize - old_region_lines as isize;
+
+            let header = format!("@@ -{old_line},{old_count} +{new_line},{new_count} @@\n");
+            if !push_raw(&mut output, &header, &mut truncated) {
+                break 'hunks;
+            }
+            for &(ls, le) in &lines[hunk.ctx_start..hunk.edit_start] {
+                if !push_diff_line(
+                    &mut output,
+                    ' ',
+                    &before[ls..le],
+                    Some(MAX_CONTEXT_LINE_BYTES),
+                    &mut truncated,
+                ) {
+                    break 'hunks;
+                }
+            }
+            for &edit_idx in &hunk.edits {
+                let edit = &mapped[edit_idx];
+                let repl = active_edits[edit.replacement].2;
+                let win_start =
+                    ceil_char_boundary(before, edit.start.saturating_sub(INLINE_WINDOW_BYTES))
+                        .max(region_start);
+                let win_end = floor_char_boundary(
+                    before,
+                    edit.end.saturating_add(INLINE_WINDOW_BYTES).min(region_end),
+                );
+                let pre = &before[win_start..edit.start];
+                let old_mid = &before[edit.start..edit.end];
+                let post = &before[edit.end..win_end];
+                let pre_elided = win_start > region_start;
+                let post_elided = win_end < region_end;
+                let old_cap = floor_char_boundary(old_mid, 4096);
+                let new_cap = floor_char_boundary(repl, 4096);
+                let mut old_snippet = String::new();
+                if pre_elided {
+                    old_snippet.push_str("...");
+                }
+                old_snippet.push_str(pre);
+                old_snippet.push_str(&old_mid[..old_cap]);
+                if old_cap < old_mid.len() {
+                    old_snippet.push_str("...");
+                }
+                old_snippet.push_str(post);
+                if post_elided {
+                    old_snippet.push_str("...");
+                }
+                if !old_snippet.ends_with('\n') {
+                    old_snippet.push('\n');
+                }
+                for line in old_snippet.split_inclusive('\n') {
+                    if !push_diff_line(&mut output, '-', line, None, &mut truncated) {
+                        break 'hunks;
+                    }
+                }
+                let mut new_snippet = String::new();
+                if pre_elided {
+                    new_snippet.push_str("...");
+                }
+                new_snippet.push_str(pre);
+                new_snippet.push_str(&repl[..new_cap]);
+                if new_cap < repl.len() {
+                    new_snippet.push_str("...");
+                }
+                new_snippet.push_str(post);
+                if post_elided {
+                    new_snippet.push_str("...");
+                }
+                if !new_snippet.ends_with('\n') {
+                    new_snippet.push('\n');
+                }
+                for line in new_snippet.split_inclusive('\n') {
+                    if !push_diff_line(&mut output, '+', line, None, &mut truncated) {
+                        break 'hunks;
+                    }
+                }
+            }
+            for &(ls, le) in &lines[hunk.edit_end..hunk.ctx_end] {
+                if !push_diff_line(
+                    &mut output,
+                    ' ',
+                    &before[ls..le],
+                    Some(MAX_CONTEXT_LINE_BYTES),
+                    &mut truncated,
+                ) {
+                    break 'hunks;
+                }
             }
         }
     }
-    if ok && !new_mid.is_empty() {
-        for line in new_mid.split_inclusive('\n') {
-            if !push_line('+', line) {
-                ok = false;
-                break;
-            }
-        }
-    }
-    if ok {
-        for line in context_after_rev.iter().rev() {
-            if !push_line(' ', line) {
-                break;
-            }
-        }
-    }
-    Some(output)
+
+    debug_assert!(output.len() <= PREVIEW_CAP_BYTES);
+    Some(UnifiedPreview {
+        diff: output,
+        truncated,
+    })
 }
 
 #[cfg(test)]
 #[test]
 fn preview_keeps_changed_lines_and_final_newline_semantics() {
+    let plan_for = |before: &str, edits: Vec<(usize, usize, &str)>| {
+        let body = notarium_core::span::ByteSpan::new(0, before.len()).unwrap();
+        let ops = edits
+            .into_iter()
+            .map(|(s, e, r)| {
+                (
+                    notarium_core::patch::CarrierEditOrigin::Body,
+                    notarium_core::span::ByteSpan::new(s, e).unwrap(),
+                    r.to_owned(),
+                )
+            })
+            .collect();
+        notarium_syntax::patch::plan(before, body, ops).unwrap()
+    };
+
     let old = "Far away.\nFirst.\nSecond.\nThird.\nOld.";
-    let new = "Far away.\nFirst.\nSecond.\nThird.\nNew.\n";
-    assert_eq!(unified_preview(old, old), None);
+    assert_eq!(unified_preview_from_plan(old, &plan_for(old, vec![])), None);
+    let old_pos = old.find("Old.").unwrap();
+    let preview =
+        unified_preview_from_plan(old, &plan_for(old, vec![(old_pos, old.len(), "New.\n")]))
+            .unwrap();
+    assert!(!preview.truncated);
     assert_eq!(
-        unified_preview(old, new).unwrap(),
+        preview.diff,
         concat!(
             "--- current\n+++ proposed\n@@ -2,4 +2,4 @@\n",
             " First.\n Second.\n Third.\n-Old.\n\\ No newline at end of file\n+New.\n",
         )
     );
 
-    let prefix = "\n".repeat(100_000);
-    let large_old = format!("{prefix}old\n");
-    let large_new = format!("{prefix}new\n");
-    let diff = unified_preview(&large_old, &large_new).unwrap();
-    assert!(diff.contains("@@ -99998,4 +99998,4 @@\n"));
-    assert!(diff.contains("-old\n+new\n"));
+    // Separate huge unchanged preceding line must not crowd out `-OLD`/`+NEW`.
+    let huge_prefix_line = format!("{}\nOLD\n", "x".repeat(70_000));
+    let old_idx = huge_prefix_line.find("OLD").unwrap();
+    let preview_sep = unified_preview_from_plan(
+        &huge_prefix_line,
+        &plan_for(&huge_prefix_line, vec![(old_idx, old_idx + 3, "NEW")]),
+    )
+    .unwrap();
+    assert!(preview_sep.truncated);
+    assert!(preview_sep.diff.len() <= 32 * 1024);
+    assert!(preview_sep.diff.contains("-OLD\n+NEW\n"));
 
+    // Huge unchanged prefix on the SAME line must still expose OLD -> NEW directly.
+    let same_line = format!("{}OLD\n", "x".repeat(70_000));
+    let same_idx = same_line.find("OLD").unwrap();
+    let preview_same = unified_preview_from_plan(
+        &same_line,
+        &plan_for(&same_line, vec![(same_idx, same_idx + 3, "NEW")]),
+    )
+    .unwrap();
+    assert!(preview_same.truncated);
+    assert!(preview_same.diff.len() <= 32 * 1024);
+    assert!(preview_same.diff.contains("OLD"));
+    assert!(preview_same.diff.contains("NEW"));
+
+    // Multi-hunk distant edits stay compact with 2 separate hunks.
+    let prefix = "\n".repeat(100_000);
+    let large_old = format!("first\n{prefix}old\n");
+    let end_idx = large_old.len() - 4;
+    let multi = unified_preview_from_plan(
+        &large_old,
+        &plan_for(
+            &large_old,
+            vec![(0, 5, "FIRST"), (end_idx, end_idx + 3, "new")],
+        ),
+    )
+    .unwrap();
+    assert!(!multi.truncated);
+    assert!(multi.diff.contains("-first\n+FIRST\n"));
+    assert!(multi.diff.contains("-old\n+new\n"));
+    assert!(multi.diff.len() < 512);
+
+    // Exact 32 KiB cap even with missing trailing newline marker.
     let huge_before = "a".repeat(100_000);
-    let huge_after = "b".repeat(100_000);
-    let capped = unified_preview(&huge_before, &huge_after).unwrap();
-    assert!(capped.len() <= 64 * 1024 + 64);
+    let capped = unified_preview_from_plan(
+        &huge_before,
+        &plan_for(
+            &huge_before,
+            vec![(0, huge_before.len(), &"b".repeat(100_000))],
+        ),
+    )
+    .unwrap();
+    assert!(capped.truncated);
+    assert!(capped.diff.len() <= 32 * 1024);
 }
 
 pub(super) async fn authorize_folder(
@@ -557,7 +941,8 @@ impl Destination {
             .await
             .map_err(|error| {
                 super::batch_operational_error(CONFIRMED_DEST_LABEL, error, attempted_replayed)
-            })?;
+            })?
+            .folder;
         call.record_journal_with_key(
             "confirmed_destination",
             &identity.key,
@@ -723,8 +1108,8 @@ pub(in crate::mcp) async fn plan_proposal(
             } else {
                 std::collections::BTreeMap::new()
             };
-            input.plan(original, before.document.class(), &route, &schema)?;
-            PreparedNoteAction::Edit { route, input }
+            let plan = input.plan(original, before.document.class(), &route, &schema)?;
+            PreparedNoteAction::Edit { route, plan }
         }
         ToolName::DeleteNote => {
             let input: NoteInput = decode(arguments)?;
@@ -866,9 +1251,8 @@ pub(in crate::mcp) async fn apply_proposal(
 ) -> Result<Value, PortError> {
     match action {
         PreparedNoteAction::Create(creates) => create::proposal::apply(owner, creates, step).await,
-        PreparedNoteAction::Edit { route, input } => {
+        PreparedNoteAction::Edit { route, plan } => {
             let (scope, identity) = step(&route.scope, "edit_note", 0)?;
-            input.validate()?;
             let before = snapshot(
                 owner,
                 &scope,
@@ -880,26 +1264,14 @@ pub(in crate::mcp) async fn apply_proposal(
             if before.document.class() == DocClass::EncryptedNote {
                 return Err(DomainError::ResourceNotFound.into());
             }
-            let original = before.document.explicit_read(scope.auth())?;
-            let plan = if input.edits_view() {
-                super::edit::plan_view_edit_with_schema_journal(
-                    owner,
-                    &scope,
-                    "confirmed-edit-note-view-schema",
-                    &input,
-                    original,
-                    before.document.class(),
-                    &route,
-                )
-                .await?
-            } else {
-                input.plan(
-                    original,
-                    before.document.class(),
-                    &route,
-                    &std::collections::BTreeMap::new(),
-                )?
-            };
+            let _ = before.document.explicit_read(scope.auth())?;
+            if before.document.digest() != plan.base_content_hash {
+                return Err(DomainError::RevisionConflict {
+                    current: before.document.revision().clone(),
+                    lineage: None,
+                }
+                .into());
+            }
             let result = owner
                 .registry
                 .engine

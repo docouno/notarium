@@ -1076,6 +1076,11 @@ pub struct ChatBacklinkPage {
     /// A continuation refers only to a visible occurrence already returned.
     pub next: Option<ChatBacklinkCursor>,
 }
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EnsuredFolder {
+    pub folder: FolderRef,
+    pub created: bool,
+}
 #[derive(Clone, Debug)]
 pub struct SearchQuery {
     pub text: String,

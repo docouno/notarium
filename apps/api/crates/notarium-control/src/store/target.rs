@@ -954,7 +954,9 @@ target_tables! {
             validate_index(r.principal.len() + r.scope_id.len() + r.intent_key.len())?;
             validate_index(r.owner_id.len() + 8 + r.call_id.len())?;
             validate_index(r.delivery_state.len() + 8 + r.call_id.len())?;
-            validate_index(r.run_id.as_ref().map_or(0, String::len) + r.call_id.len())?;
+            if r.run_id.as_ref().map_or(0, String::len) + r.call_id.len() > 2088 {
+                return Err(invalid(ValidationReason::InvalidLimit));
+            }
         })
     },
     AbilityAvailability (AbilityAvailabilityRow, "ability_availability") {

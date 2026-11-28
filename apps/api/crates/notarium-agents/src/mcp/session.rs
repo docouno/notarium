@@ -240,15 +240,35 @@ async fn whoami(call: &mut ToolCallContext<'_>) -> Result<Value, PortError> {
                 card.slug
             } else {
                 let ctx = call.space(card.history)?;
-                let source = CatalogDisclosure::Space(ctx.scope().clone());
-                let Some((proof, taint)) = project_metadata(call, ctx, source, None, true).await?
+                let project_root = call
+                    .auth
+                    .spaces()
+                    .get(&space.id)
+                    .and_then(|grant| grant.project_root.clone());
+                let (source, project_arg) = match project_root.as_ref() {
+                    Some(folder_id) => {
+                        let folder = FolderRef {
+                            space_id: space.id.clone(),
+                            folder_id: folder_id.clone(),
+                        };
+                        (CatalogDisclosure::Folder(folder.clone()), Some(folder))
+                    }
+                    None => (CatalogDisclosure::Space(ctx.scope().clone()), None),
+                };
+                let Some((proof, taint)) =
+                    project_metadata(call, ctx, source, project_arg, true).await?
                 else {
                     continue;
                 };
                 if let Some(taint) = taint {
                     pending_taints.push(taint);
                 }
-                required_text(&proof, "slug")?.to_owned()
+                let slug_field = if project_root.is_some() {
+                    "spaceSlug"
+                } else {
+                    "slug"
+                };
+                required_text(&proof, slug_field)?.to_owned()
             };
             let space_kind = match space.kind {
                 SpaceKind::Personal => "personal",
@@ -319,35 +339,65 @@ async fn projects(call: &mut ToolCallContext<'_>) -> Result<Value, PortError> {
                 let mut total_consented = 0usize;
                 for space in spaces.values() {
                     let scope = call.space(space.history.clone())?;
-                    let space_wide = match call.provider_selection(&scope, None).await {
-                        Ok(Some(sel)) if sel.project_only.is_none() => {
-                            match project_metadata(
-                                call,
-                                scope.clone(),
-                                CatalogDisclosure::Space(space.history.clone()),
-                                None,
-                                true,
-                            )
-                            .await?
-                            {
-                                Some((_, taint)) => {
-                                    if let Some(taint) = taint {
-                                        pending_taints.push(taint);
+                    let project_root = call
+                        .auth
+                        .spaces()
+                        .get(&space.space.id)
+                        .and_then(|grant| grant.project_root.clone());
+                    let space_wide = if project_root.is_some() {
+                        false
+                    } else {
+                        match call.provider_selection(&scope, None).await {
+                            Ok(Some(sel)) if sel.project_only.is_none() => {
+                                match project_metadata(
+                                    call,
+                                    scope.clone(),
+                                    CatalogDisclosure::SpaceProjects(space.history.clone()),
+                                    None,
+                                    true,
+                                )
+                                .await?
+                                {
+                                    Some((_, taint)) => {
+                                        if let Some(taint) = taint {
+                                            pending_taints.push(taint);
+                                        }
+                                        true
                                     }
-                                    true
+                                    None => false,
                                 }
-                                None => false,
                             }
+                            Ok(_) => false,
+                            Err(PortError::Domain(DomainError::Provider {
+                                error: ProviderErrorCode::Unavailable,
+                            })) => false,
+                            Err(error) if corpus::hidden(&error) => false,
+                            Err(error) => return Err(error),
                         }
-                        Ok(_) => false,
-                        Err(PortError::Domain(DomainError::Provider {
-                            error: ProviderErrorCode::Unavailable,
-                        })) => false,
-                        Err(error) if corpus::hidden(&error) => false,
-                        Err(error) => return Err(error),
                     };
                     let mut candidate_folders: Vec<FolderRef> = Vec::new();
-                    if space_wide {
+                    if let Some(folder_id) = project_root {
+                        let folder = FolderRef {
+                            space_id: space.space.id.clone(),
+                            folder_id,
+                        };
+                        match call
+                            .registry
+                            .catalog
+                            .project(scope.with_preflight_taint(), folder.clone())
+                            .await
+                        {
+                            Ok(_) => {
+                                total_consented = total_consented.saturating_add(1);
+                                if total_consented > MAX_PROJECTS {
+                                    return Err(invalid(ValidationReason::BudgetExceeded));
+                                }
+                                candidate_folders.push(folder);
+                            }
+                            Err(error) if corpus::hidden(&error) => {}
+                            Err(error) => return Err(error),
+                        }
+                    } else if space_wide {
                         let mut next: Option<String> = None;
                         for _ in 0..=MAX_PROJECTS {
                             let page = call
@@ -498,7 +548,7 @@ async fn project_metadata(
         EgressTarget::InAppProvider {
             primary_project, ..
         } if auth.auth().pinned_write_space() == Some(&scope.scope().space_id) => {
-            primary_project.clone()
+            primary_project.clone().or(project)
         }
         _ => project,
     };

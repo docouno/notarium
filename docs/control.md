@@ -534,7 +534,8 @@ admission also checks `provider_call_log` (`policy_epochs` v2, indexed by
 and respects the project confinement previously disclosed to that run; missing,
 unparseable, legacy v1, or overflow (>64 rows) call-log entries fail closed.
 For a folder-scoped query with project consent, the canonical egress lease
-pins the requested folder's current membership in that project through dispatch.
+verifies the requested folder's current membership in that project (and pins
+it against local canonical mutations on SQLite until dispatch).
 An implicit call registers for changes to the Space's effective search recipient.
 If another project preference becomes eligible and the choice becomes
 ambiguous, Control cancels and drains the old implicit calls before the
@@ -755,8 +756,8 @@ Thus a later slot does not revoke an earlier active run. Configuration edits,
 pause/delete and terminal results use the durable SQL-to-registry revocation fence
 and wait for shutdown acknowledgement. Deletion retains audit rows and the ID.
 Current approved package revisions are checked on claims and credential
-revalidation. Provider dispatch also pins the exact role and skill content under
-its canonical disclosure lease.
+revalidation. Provider dispatch also verifies the exact role and skill content
+under its canonical egress lease.
 
 Terminal Succeeded/Failed/Unknown results require the exact run and lease. They
 record the outcome even after expiry or schedule deletion. Repeating the same

@@ -39,6 +39,7 @@ pub struct CatalogFolder {
 pub enum CatalogDisclosure {
     Folder(FolderRef),
     Space(HistoryScope),
+    SpaceProjects(HistoryScope),
 }
 
 #[derive(Clone, Debug)]

@@ -61,7 +61,7 @@ Keep every failed and incomplete attempt with its exit status.
 
 Every class checks receipts, rights, resulting state and zero errors. The
 ordinary command without a tier keeps the original <5 ms local rollback
-limits, the >2,000 mutations/s writer floor and the <1 ms chat and paired
+limit, the >2,000 mutations/s writer floor and the <1 ms chat and paired
 pause limits. The PostgreSQL/S3 Unix-socket profile reports its own latency.
 Record whether the rollback component and the full suite each passed.
 The writer report includes internal SQLite read timeouts and all returned

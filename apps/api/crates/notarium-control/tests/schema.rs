@@ -309,6 +309,71 @@ async fn both_dialects_have_the_same_schema_and_constraints() {
             .import_target_batch(maintenance(ServicePurpose::Restore), &[user(4, "Importer")])
             .await
             .unwrap();
+        // Legacy 0001 deleted schedule exports with non-empty title/init_prompt must be scrubbed on import.
+        let deleted_schedule_id = ScheduleId::from_bytes([0x44; 16]).to_string();
+        let approved_role = serde_json::to_string(&AbilityRef {
+            id: AbilityId::from_bytes([0x45; 16]),
+            placement: AbilityPlacement::System,
+            revision: RevisionId::from_bytes([0x46; 16]),
+        })
+        .unwrap();
+        let budgets = serde_json::to_string(&RunLimits::HARD_CEILING).unwrap();
+        let deleted_sched = TargetRecord::AgentSchedules {
+            schedule_id: deleted_schedule_id.clone(),
+            owner_id: PrincipalId::from_bytes([4; 16]).to_string(),
+            space_id: SpaceId::from_bytes([0x47; 16]).to_string(),
+            project_folder_id: None,
+            title: "Sensitive deleted title".into(),
+            init_prompt: "Sensitive deleted prompt".into(),
+            cron_expr: "0 0 9 * * *".into(),
+            timezone: "UTC".into(),
+            approved_role,
+            approved_skills: "[]".into(),
+            paused_reason: None,
+            write_class_mask: 1,
+            budgets,
+            misfire_policy: "coalesce_latest".into(),
+            next_slot_utc_ms: None,
+            deleted_at: Some(1_000),
+            config_revision: 1,
+            revision: 1,
+            created_at: 100,
+            updated_at: 1_000,
+        };
+        store
+            .import_target_batch(
+                maintenance(ServicePurpose::Restore),
+                std::slice::from_ref(&deleted_sched),
+            )
+            .await
+            .unwrap();
+    }
+    for (conn_name, (title, prompt)) in [
+        (
+            "sqlite",
+            sqlx::query_as::<_, (String, String)>(
+                "SELECT title, init_prompt FROM agent_schedules WHERE schedule_id=$1",
+            )
+            .bind(ScheduleId::from_bytes([0x44; 16]).to_string())
+            .fetch_one(&mut local)
+            .await
+            .unwrap(),
+        ),
+        (
+            "postgres",
+            sqlx::query_as::<_, (String, String)>(
+                "SELECT title, init_prompt FROM v1_control.agent_schedules WHERE schedule_id=$1",
+            )
+            .bind(ScheduleId::from_bytes([0x44; 16]).to_string())
+            .fetch_one(&mut cloud)
+            .await
+            .unwrap(),
+        ),
+    ] {
+        assert!(
+            title.is_empty() && prompt.is_empty(),
+            "{conn_name} import must scrub deleted schedule title/prompt, got ({title:?}, {prompt:?})"
+        );
     }
     sqlx::query("UPDATE v1_storage_epoch SET state='ready'")
         .execute(&mut local)
@@ -499,6 +564,20 @@ async fn upgrade_from_0001_to_0002_preserves_populated_rows_both_dialects() {
         .execute(&pool)
         .await
         .unwrap();
+        // A valid 0001 provider_call_log row with a 2020-byte call_id and 36-byte run_id
+        // has run_id + call_id = 2056 bytes (>2048); 0002 must preserve it on upgrade.
+        let legacy_call_id = "c".repeat(2020);
+        sqlx::query(
+            "INSERT INTO provider_call_log(call_id,owner_id,principal,run_id,scope_id,intent_key,request_hash,resource_id,credential_id,policy_epochs,participating_spaces,model_id,reserved_tokens,bucket_keys,delivery_state,outcome,usage_source,input_tokens,output_tokens,diagnostic,dispatch_owner,created_at,settled_at) \
+             VALUES($1,'u1',$2,$3,'sc','ik',$4,'res_legacy',NULL,'{}','[]',NULL,1,'[]','settled','completed','exact',1,1,NULL,NULL,100,200)",
+        )
+        .bind(&legacy_call_id)
+        .bind(&user_id)
+        .bind(&run_id)
+        .bind(hash32.as_slice())
+        .execute(&pool)
+        .await
+        .unwrap();
         pool.close().await;
     }
     let upgraded_sqlite = ControlStore::sqlite(&DataRoot::new(&root)).await.unwrap();
@@ -557,6 +636,14 @@ async fn upgrade_from_0001_to_0002_preserves_populated_rows_both_dialects() {
         .unwrap();
         assert_eq!(run_skills, "[]");
         assert!(keeper_log.is_none() && keeper_proj.is_none());
+        let preserved_call_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM provider_call_log WHERE run_id=$1 AND length(CAST(call_id AS BLOB))=2020",
+        )
+        .bind(&run_id)
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(preserved_call_rows, 1);
         // Verify schedule_due partial index and nullable terminal next_slot_utc_ms work after 0002.
         sqlx::query("UPDATE agent_schedules SET next_slot_utc_ms=NULL WHERE schedule_id=$1")
             .bind(&schedule_id)
@@ -668,6 +755,18 @@ async fn upgrade_from_0001_to_0002_preserves_populated_rows_both_dialects() {
         .execute(&mut *conn)
         .await
         .unwrap();
+        let legacy_call_id = "c".repeat(2020);
+        sqlx::query(
+            "INSERT INTO v1_control.provider_call_log(call_id,owner_id,principal,run_id,scope_id,intent_key,request_hash,resource_id,credential_id,policy_epochs,participating_spaces,model_id,reserved_tokens,bucket_keys,delivery_state,outcome,usage_source,input_tokens,output_tokens,diagnostic,dispatch_owner,created_at,settled_at) \
+             VALUES($1,'u1',$2,$3,'sc','ik',$4,'res_legacy',NULL,'{}','[]',NULL,1,'[]','settled','completed','exact',1,1,NULL,NULL,100,200)",
+        )
+        .bind(&legacy_call_id)
+        .bind(&user_id)
+        .bind(&run_id)
+        .bind(hash32.as_slice())
+        .execute(&mut *conn)
+        .await
+        .unwrap();
         drop(conn);
         pool.close().await;
     }
@@ -725,6 +824,14 @@ async fn upgrade_from_0001_to_0002_preserves_populated_rows_both_dialects() {
             .unwrap();
         assert_eq!(run_skills, "[]");
         assert!(keeper_log.is_none() && keeper_proj.is_none());
+        let preserved_call_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM v1_control.provider_call_log WHERE run_id=$1 AND octet_length(call_id)=2020",
+        )
+        .bind(&run_id)
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(preserved_call_rows, 1);
         let due_idx: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM pg_indexes WHERE schemaname='v1_control' AND tablename='agent_schedules' AND indexname='schedule_due'",
         )

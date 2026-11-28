@@ -619,19 +619,22 @@ impl ProviderRevocationScope {
 pub trait ProviderEgressLease: Send {
     /// Exactly one result per requested origin, in the original request order.
     fn current(&self) -> &[ProviderCurrentContent];
-    /// The canonical owner verifies this active project and pins its lifecycle
-    /// even when the call contains only trusted orchestration instructions.
+    /// The canonical owner verifies this active project under its egress
+    /// snapshot (and excludes local canonical mutations on SQLite until
+    /// `mark_dispatched()` / `close()`), even when the call contains only
+    /// trusted orchestration instructions.
     fn project(&self) -> Option<&FolderRef>;
     fn secondary_projects(&self) -> &[FolderRef];
-    /// The transport accepted the encoded request body. Release database read
-    /// locks/snapshots cleanly before waiting for upstream response headers;
-    /// keep revocation registration active until socket close.
+    /// The transport accepted the encoded request body. Release any retained
+    /// local SQLite disclosure pin cleanly before waiting for upstream response
+    /// headers; keep revocation registration active until socket close.
     fn mark_dispatched(&mut self) -> PortFuture<'_, ()>;
-    /// Cleanly release any remaining database snapshot/locks on teardown without
+    /// Cleanly release any retained local disclosure pin on teardown without
     /// marking the call dispatched (for example, on pre-send validation failure).
     fn close(&mut self) -> PortFuture<'_, ()>;
-    /// Scoped query folders verified inside this project. The lease pins their
-    /// active ancestry until dispatch finishes or is cancelled.
+    /// Scoped query folders verified inside this project under the canonical
+    /// egress snapshot (and pinned against local mutations on SQLite until
+    /// `mark_dispatched()` / `close()`).
     fn project_folders(&self) -> &BTreeSet<FolderId>;
     fn check(&self) -> DomainResult<()>;
 }

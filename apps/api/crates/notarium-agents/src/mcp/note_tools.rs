@@ -962,7 +962,6 @@ async fn ensure_destination(
                 )
                 .await?;
             let existed = precheck.existed();
-            let mut folder_created = !existed;
             let escalate_unknown = existed_replayed && !existed;
             let legacy_precheck = precheck.stored_stripped_segments().is_none();
             let stripped_segments = match precheck.stored_stripped_segments() {
@@ -1006,14 +1005,13 @@ async fn ensure_destination(
                         .await
                 }
             };
-            let folder = match run_ensure(path.clone()).await {
-                Ok(folder) => folder,
+            let ensured = match run_ensure(path.clone()).await {
+                Ok(ensured) => ensured,
                 Err(PortError::Domain(DomainError::IdempotencyKeyReused)) if legacy_precheck => {
                     // `IdempotencyKeyReused` proves `folder_key` already committed under some
                     // stripped path on attempt 1 before `DestinationPrecheck::WithStrip` existed.
                     // Because `folder_key` is already committed, probing other strip counts can
                     // only replay the exact committed hash and can never create new folders.
-                    folder_created = true;
                     let max_strip = segment_count(&raw_path)?;
                     let mut recovered = None;
                     for candidate_strip in 0..=max_strip {
@@ -1022,9 +1020,9 @@ async fn ensure_destination(
                         }
                         let candidate_path = strip_leading_segments(&raw_path, candidate_strip)?;
                         match run_ensure(candidate_path.clone()).await {
-                            Ok(folder) => {
+                            Ok(ensured) => {
                                 path = candidate_path;
-                                recovered = Some(folder);
+                                recovered = Some(ensured);
                                 break;
                             }
                             Err(PortError::Domain(DomainError::IdempotencyKeyReused)) => continue,
@@ -1039,6 +1037,8 @@ async fn ensure_destination(
                     return Err(batch_operational_error(ERR_LABEL, error, escalate_unknown));
                 }
             };
+            let folder_created = ensured.created;
+            let folder = ensured.folder;
             let has_path = !path.is_empty();
             let plan = JournaledDestination::Detailed {
                 folder,
@@ -1153,11 +1153,16 @@ pub(super) fn validated_title(value: &str) -> Result<String, PortError> {
 }
 
 fn generated_slug(title: &str, note: &NoteId) -> String {
+    const MAX_GENERATED_SLUG_BYTES: usize = 128;
     let mut output = String::new();
     let mut separator = false;
     for ch in notarium_syntax::unicode::lookup_key(title).chars() {
         if ch.is_alphanumeric() || ch == '_' {
-            if separator && !output.is_empty() {
+            let sep_len = usize::from(separator && !output.is_empty());
+            if output.len() + sep_len + ch.len_utf8() > MAX_GENERATED_SLUG_BYTES {
+                break;
+            }
+            if sep_len == 1 {
                 output.push('-');
             }
             output.push(ch);
@@ -1166,10 +1171,13 @@ fn generated_slug(title: &str, note: &NoteId) -> String {
             separator = true;
         }
     }
-    if notarium_syntax::unicode::validate_component(&output).is_err() {
+    let trimmed = output.trim_end_matches('-');
+    if trimmed.is_empty() || notarium_syntax::unicode::validate_component(trimmed).is_err() {
         note.as_str().to_owned()
-    } else {
+    } else if trimmed.len() == output.len() {
         output
+    } else {
+        trimmed.to_owned()
     }
 }
 

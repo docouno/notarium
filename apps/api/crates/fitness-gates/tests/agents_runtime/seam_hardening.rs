@@ -13781,7 +13781,8 @@ async fn authority_narrowing_chat_and_replay_seams(
             },
         )
         .await
-        .unwrap();
+        .unwrap()
+        .folder;
 
     // (1) admit_space_management + change_membership + provider management respect taint,
     //     space exclusions, read_classes narrowing, and project_root pins.
@@ -15380,7 +15381,8 @@ async fn authority_narrowing_chat_and_replay_seams(
             },
         )
         .await
-        .unwrap();
+        .unwrap()
+        .folder;
     let f_mov = fixture
         .canonical
         .ensure_folder_path(
@@ -15402,7 +15404,8 @@ async fn authority_narrowing_chat_and_replay_seams(
             },
         )
         .await
-        .unwrap();
+        .unwrap()
+        .folder;
     let f_dest = fixture
         .canonical
         .ensure_folder_path(
@@ -15424,7 +15427,8 @@ async fn authority_narrowing_chat_and_replay_seams(
             },
         )
         .await
-        .unwrap();
+        .unwrap()
+        .folder;
     let ren_key = [0xD2, 91, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
     let ren_args = json!({
         "project": sa_p1_handle,
@@ -15496,7 +15500,8 @@ async fn authority_narrowing_chat_and_replay_seams(
             },
         )
         .await
-        .unwrap();
+        .unwrap()
+        .folder;
     let p_slug = fixture
         .control
         .list_spaces(owner.clone(), ControlPageRequest::new(50, None).unwrap())
@@ -15616,7 +15621,8 @@ async fn authority_narrowing_chat_and_replay_seams(
             },
         )
         .await
-        .unwrap();
+        .unwrap()
+        .folder;
     let aux_entry_id = NoteId::from_bytes([0xD2, 95, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
     let aux_entry = fixture
         .canonical
@@ -15772,7 +15778,8 @@ async fn authority_narrowing_chat_and_replay_seams(
             },
         )
         .await
-        .unwrap();
+        .unwrap()
+        .folder;
     let shadow_entry_id = NoteId::from_bytes([0xD2, 98, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
     let shadow_entry = fixture
         .canonical
@@ -23061,7 +23068,8 @@ async fn folder_move_large_view_and_session_rotation_seams(
         .canonical
         .ensure_folder_path(s2_sc.clone(), ensure_mv_mut.clone())
         .await
-        .unwrap();
+        .unwrap()
+        .folder;
     let _child_b = fixture
         .canonical
         .ensure_folder_path(
@@ -23182,7 +23190,8 @@ async fn folder_move_large_view_and_session_rotation_seams(
         .canonical
         .ensure_folder_path(s2_sc.clone(), ensure_mv_mut)
         .await
-        .expect("ensure_folder_path replay must succeed after ensured folder moved out of base");
+        .expect("ensure_folder_path replay must succeed after ensured folder moved out of base")
+        .folder;
     assert_eq!(ensure_mv_replay, child_a);
 
     // (9) View edit_note with >64 KiB body succeeds without exceeding control.mcp_dedup
@@ -30879,11 +30888,11 @@ async fn run_mcp_chat_replay_and_isolation_seams(pg: bool) {
             owner.auth().spaces().clone(),
         )
         .unwrap();
-    let in_app_projects = local_provider
+    let in_app_projects_res = local_provider
         .registry
         .call_tool(
             McpInvocationContext {
-                account: AccountContext::new(in_app_agent_auth, budget()),
+                account: AccountContext::new(in_app_agent_auth.clone(), budget()),
                 target: EgressTarget::InAppProvider {
                     provider: local_provider.resource.id.clone(),
                     model: local_provider.model.clone(),
@@ -30897,8 +30906,8 @@ async fn run_mcp_chat_replay_and_isolation_seams(pg: bool) {
             json!({}),
         )
         .await
-        .expect("get_my_projects must succeed on 260 projects in one Space-wide consented Space")
-        .structured_content;
+        .expect("get_my_projects must succeed on 260 projects in one Space-wide consented Space");
+    let in_app_projects = in_app_projects_res.structured_content;
     assert!(
         in_app_projects["projects"]
             .as_array()
@@ -30907,6 +30916,417 @@ async fn run_mcp_chat_replay_and_isolation_seams(pg: bool) {
         in_app_projects["projects"]
             .as_array()
             .map_or(0, std::vec::Vec::len)
+    );
+    assert_eq!(
+        in_app_projects_res.provenance.origins.len(),
+        1,
+        "Space-wide get_my_projects must fold 260+ projects into 1 SpaceProjects origin"
+    );
+    assert!(
+        matches!(
+            in_app_projects_res.provenance.origins[0],
+            notarium_core::classes::ProviderOrigin::SpaceProjects { .. }
+        ),
+        "expected ProviderOrigin::SpaceProjects, got {:?}",
+        in_app_projects_res.provenance.origins[0]
+    );
+    // Active SpaceProjects origin passes acquire_egress before any project changes.
+    let mut active_lease = fixture
+        .canonical
+        .acquire_egress(
+            AccountContext::new(in_app_agent_auth.clone(), budget()),
+            ProviderEgressRequest {
+                origins: in_app_projects_res.provenance.origins.clone(),
+                primary: scope.clone(),
+                project: None,
+                secondary_projects: vec![],
+                project_folders: Default::default(),
+            },
+            notarium_core::ports::Cancellation::default(),
+        )
+        .await
+        .expect("fresh SpaceProjects origin must pass acquire_egress");
+    active_lease.close().await.unwrap();
+
+    // Renaming a disclosed project must immediately invalidate the SpaceProjects digest.
+    let mut proj0_fid = [0u8; 16];
+    proj0_fid[0] = 0xEA;
+    let proj0_id = FolderId::from_bytes(proj0_fid);
+    fixture
+        .canonical
+        .rename_project(
+            personal.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: scope.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([
+                        0xEB, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xEB; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: RenameProject {
+                    folder: proj0_id.clone(),
+                    name: "bulk-proj-000-renamed".into(),
+                    display_name: Some("Renamed Project 0".into()),
+                },
+            },
+        )
+        .await
+        .expect("rename_project must succeed");
+    let stale_egress = fixture
+        .canonical
+        .acquire_egress(
+            AccountContext::new(in_app_agent_auth, budget()),
+            ProviderEgressRequest {
+                origins: in_app_projects_res.provenance.origins.clone(),
+                primary: scope.clone(),
+                project: None,
+                secondary_projects: vec![],
+                project_folders: Default::default(),
+            },
+            notarium_core::ports::Cancellation::default(),
+        )
+        .await;
+    assert!(
+        matches!(
+            stale_egress,
+            Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
+                if diagnostic.reason == ValidationReason::SourceMismatch
+        ),
+        "stale SpaceProjects origin must fail closed after project rename, got {:?}",
+        stale_egress.err()
+    );
+
+    // 6. Project-scoped in-app run (`grant.project_root = Some(P)`) must still
+    //    see its own Space in `whoami` and its own project in `get_my_projects`.
+    let mut proj1_fid = [0u8; 16];
+    proj1_fid[0] = 0xEA;
+    proj1_fid[15] = 1;
+    let proj1_id = FolderId::from_bytes(proj1_fid);
+    let proj1_ref = FolderRef {
+        space_id: scope.space_id.clone(),
+        folder_id: proj1_id.clone(),
+    };
+    let mut scoped_grants = owner.auth().spaces().clone();
+    scoped_grants.get_mut(&scope.space_id).unwrap().project_root = Some(proj1_id.clone());
+    let scoped_agent_auth = owner
+        .auth()
+        .for_agent_run(
+            AgentRunId::from_bytes([0xEC; 16]),
+            scope.space_id.clone(),
+            ChatAudience::Personal,
+            scoped_grants,
+        )
+        .unwrap();
+    let scoped_whoami = local_provider
+        .registry
+        .call_tool(
+            McpInvocationContext {
+                account: AccountContext::new(scoped_agent_auth.clone(), budget()),
+                target: EgressTarget::InAppProvider {
+                    provider: local_provider.resource.id.clone(),
+                    model: local_provider.model.clone(),
+                    primary_project: Some(proj1_ref.clone()),
+                },
+                request_key: CommandKey::from_bytes([
+                    0xEC, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                ]),
+            },
+            "whoami",
+            json!({}),
+        )
+        .await
+        .expect("project-scoped whoami must succeed")
+        .structured_content;
+    assert!(
+        scoped_whoami["personalSpace"].is_null(),
+        "project-scoped whoami omits Space-wide personalSpace: {scoped_whoami}"
+    );
+    assert!(
+        scoped_whoami["spaces"]
+            .as_array()
+            .is_some_and(|arr| arr.iter().any(|s| s["spaceId"] == scope.space_id.as_str())),
+        "project-scoped whoami must include its own Space: {scoped_whoami}"
+    );
+    let scoped_projects = local_provider
+        .registry
+        .call_tool(
+            McpInvocationContext {
+                account: AccountContext::new(scoped_agent_auth, budget()),
+                target: EgressTarget::InAppProvider {
+                    provider: local_provider.resource.id.clone(),
+                    model: local_provider.model.clone(),
+                    primary_project: Some(proj1_ref.clone()),
+                },
+                request_key: CommandKey::from_bytes([
+                    0xEC, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                ]),
+            },
+            "get_my_projects",
+            json!({}),
+        )
+        .await
+        .expect("project-scoped get_my_projects must succeed")
+        .structured_content;
+    let scoped_proj_list = scoped_projects["projects"].as_array().unwrap();
+    assert_eq!(scoped_proj_list.len(), 1);
+    assert_eq!(scoped_proj_list[0]["projectId"], proj1_id.as_str());
+
+    // 7. `rename_folder(A, A)` unchanged replay succeeds after a later `rename_folder(A, B)`.
+    let p_slug = scoped_whoami["spaces"][0]["slug"].as_str().unwrap();
+    let proj1_handle = format!("{p_slug}/bulk-proj-001");
+    let _unchanged_dir = fixture
+        .canonical
+        .ensure_folder_path(
+            personal.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: scope.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([
+                        0xED, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xED; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: EnsureFolderPath {
+                    base: Some(proj1_id.clone()),
+                    path: "stable-a".into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let noop_key = [0xED, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    let noop_args = json!({
+        "project": proj1_handle,
+        "folder": "stable-a",
+        "name": "stable-a",
+    });
+    let noop_1 = call_mcp(
+        &fixture.registry,
+        &owner,
+        noop_key,
+        "rename_folder",
+        noop_args.clone(),
+    )
+    .await
+    .expect("first rename_folder(A, A) must succeed")
+    .structured_content;
+    assert_eq!(noop_1["outcome"], "unchanged");
+    let _renamed_b = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xED, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "rename_folder",
+        json!({
+            "project": proj1_handle,
+            "folder": "stable-a",
+            "name": "stable-b",
+        }),
+    )
+    .await
+    .expect("rename_folder(A, B) must succeed");
+    let noop_2 = call_mcp(
+        &fixture.registry,
+        &owner,
+        noop_key,
+        "rename_folder",
+        noop_args,
+    )
+    .await
+    .expect("replaying unchanged rename_folder(A, A) after rename to B must succeed")
+    .structured_content;
+    assert_eq!(noop_2["outcome"], "unchanged");
+    assert_eq!(noop_2["versionToken"], noop_1["versionToken"]);
+    assert!(
+        noop_2.get("path").is_none(),
+        "replayed unchanged rename_folder must not leak later path B: {noop_2}"
+    );
+
+    // 8. `create_note` bounds auto-generated slug from an 8192-char H1 to <=128 bytes.
+    let huge_h1 = format!("# {}\n\nBody text\n", "a".repeat(8192));
+    let long_title_created = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xED, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "create_note",
+        json!({
+            "project": proj1_handle,
+            "body": huge_h1,
+        }),
+    )
+    .await
+    .expect("create_note with 8192-char H1 must succeed with bounded auto-slug")
+    .structured_content;
+    let created_note_id = long_title_created["noteId"].as_str().unwrap();
+    let loaded_long = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xED, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "get_note",
+        json!({ "ref": created_note_id }),
+    )
+    .await
+    .expect("get_note on created long-H1 note must succeed")
+    .structured_content;
+    let created_path = loaded_long["path"].as_str().unwrap();
+    let created_basename = created_path.rsplit('/').next().unwrap();
+    assert!(
+        created_basename.len() <= 131,
+        "auto-generated filename must be <=128B + .md, got {} ({} bytes)",
+        created_basename,
+        created_basename.len()
+    );
+
+    // 9. `edit_ability` versionToken catches concurrent `enabled` toggle, and
+    //    `use_role` replay fails closed instead of falling back from v1 to v2.
+    let ab_created = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xEE, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "create_ability",
+        json!({
+            "kind": "role",
+            "name": "replay-pin-role",
+            "description": "v1 description",
+            "instructions": "v1 instructions",
+            "placement": {"home": "personal"},
+        }),
+    )
+    .await
+    .expect("create_ability must succeed")
+    .structured_content;
+    let ab_ref = ab_created["ref"].as_str().unwrap().to_owned();
+    let stale_ver = ab_created["versionToken"].as_str().unwrap().to_owned();
+    let ep_started = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xEE, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "start_session",
+        json!({"session": {"name": "role-replay-check"}}),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    let ep_id = ep_started["session"]["id"].as_str().unwrap().to_owned();
+    let use_role_key = [0xEE, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    let use_role_args = json!({"role": "replay-pin-role", "session": ep_id});
+    let activated_v1 = call_mcp(
+        &fixture.registry,
+        &owner,
+        use_role_key,
+        "use_role",
+        use_role_args.clone(),
+    )
+    .await
+    .expect("use_role v1 must succeed")
+    .structured_content;
+    assert_eq!(activated_v1["instructions"], "v1 instructions");
+
+    // Client B disables the ability; Client A retrying with stale_ver + enabled=true must conflict.
+    let disabled = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xEE, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "edit_ability",
+        json!({"ref": ab_ref, "versionToken": stale_ver, "enabled": false}),
+    )
+    .await
+    .expect("disable must succeed")
+    .structured_content;
+    let fresh_ver = disabled["versionToken"].as_str().unwrap().to_owned();
+    assert_ne!(fresh_ver, stale_ver);
+    let stale_toggle = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xEE, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "edit_ability",
+        json!({"ref": ab_ref, "versionToken": stale_ver, "enabled": true}),
+    )
+    .await;
+    assert!(
+        matches!(
+            stale_toggle,
+            Err(PortError::Domain(
+                DomainError::ControlRevisionConflict { .. }
+            ))
+        ),
+        "stale preference versionToken must fail with ControlRevisionConflict, got {:?}",
+        stale_toggle.err()
+    );
+    // Re-enable and edit instructions to v2, then replay use_role key -> must NOT return v2 instructions.
+    let _edited_v2 = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xEE, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "edit_ability",
+        json!({
+            "ref": ab_ref,
+            "versionToken": fresh_ver,
+            "enabled": true,
+            "instructions": "v2 instructions",
+        }),
+    )
+    .await
+    .expect("edit to v2 must succeed");
+    let replayed_v1 = call_mcp(
+        &fixture.registry,
+        &owner,
+        use_role_key,
+        "use_role",
+        use_role_args,
+    )
+    .await;
+    assert!(
+        matches!(
+            replayed_v1,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ),
+        "replaying use_role for superseded v1 must fail closed rather than substituting v2, got {:?}",
+        replayed_v1.map(|r| r.structured_content)
+    );
+
+    // 10. `list_abilities` empty final page with non-empty cursor must NOT emit `zero_results`.
+    let mut cursor_val: Option<String> = None;
+    let mut saw_cursor_empty = false;
+    for page_idx in 0u8..64 {
+        let mut args = json!({
+            "view": "runtime",
+            "q": "nonexistent-filter-for-cursor-check",
+            "limit": 1,
+        });
+        if let Some(c) = &cursor_val {
+            args["cursor"] = json!(c);
+        }
+        let page = call_mcp(
+            &fixture.registry,
+            &owner,
+            [0xEF, page_idx, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+            "list_abilities",
+            args,
+        )
+        .await
+        .unwrap()
+        .structured_content;
+        let next = page["nextCursor"].as_str().map(str::to_owned);
+        if next.is_none() {
+            if cursor_val.is_some() && page["items"].as_array().is_some_and(Vec::is_empty) {
+                saw_cursor_empty = true;
+                assert!(
+                    page["nextAction"].is_null(),
+                    "empty trailing cursor page must not suggest zero_results: {page}"
+                );
+            }
+            break;
+        }
+        cursor_val = next;
+    }
+    assert!(
+        saw_cursor_empty,
+        "test must actually exercise an empty trailing page reached via cursor"
     );
 
     fixture.close().await;

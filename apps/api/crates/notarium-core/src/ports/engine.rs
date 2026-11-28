@@ -93,7 +93,7 @@ pub trait NoteWritePort: Send + Sync {
         &self,
         ctx: SpaceContext,
         request: Mutation<EnsureFolderPath>,
-    ) -> PortFuture<'_, FolderRef>;
+    ) -> PortFuture<'_, EnsuredFolder>;
     fn create_note(
         &self,
         ctx: SpaceContext,
@@ -313,6 +313,10 @@ pub trait SearchRecipient: Send + Sync {
     /// Additional context tokens charged by recall for a delivered chunk.
     fn framing_tokens(&self, _note: &NoteId, _first_chunk: bool) -> u32 {
         0
+    }
+    /// Context tokens charged by recall for a title-only note with no chunks.
+    fn title_only_framing_tokens(&self, note: &NoteId) -> u32 {
+        self.framing_tokens(note, true)
     }
     /// Non-encrypted document classes the calling model may have observed when
     /// authoring this query. Remote query embedding must cover every class here.

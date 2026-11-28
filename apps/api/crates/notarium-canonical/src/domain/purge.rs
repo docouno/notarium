@@ -1964,7 +1964,7 @@ async fn execute_sql_erasure_for_old_note_tx(
             sqlx::query(
                 "UPDATE pending_purges
                  SET new_note_rev_id = NULL, sanitized_response_msgpack = ''::BYTEA
-                 WHERE space_id = $1 AND new_note_id IS NOT NULL AND new_note_id = $2",
+                 WHERE space_id = $1 AND new_note_id IS NOT NULL AND new_note_id COLLATE \"C\" = $2",
             )
             .bind(scope.space_id.as_str())
             .bind(old_id_str)
@@ -2140,7 +2140,7 @@ async fn load_pending_purge_for_idempotency(
                             "SELECT purge_id, command_hash, old_note_id, retirement_ids_json, sanitized_response_msgpack, canonical_seq
                              FROM pending_purges
                              WHERE space_id = ? AND history_incarnation = ? AND actor_id = ? AND idempotency_key = ?
-                               AND phase <> 'completed'
+                               AND phase IN ('sql_erased', 'cas_retired')
                              ORDER BY created_at_ms DESC
                              LIMIT 1",
                         )
@@ -2169,7 +2169,7 @@ async fn load_pending_purge_for_idempotency(
                             "SELECT purge_id, command_hash, old_note_id, retirement_ids_json, sanitized_response_msgpack, canonical_seq
                              FROM pending_purges
                              WHERE space_id = $1 AND history_incarnation = $2 AND actor_id = $3 AND idempotency_key = $4
-                               AND phase <> 'completed'
+                               AND phase IN ('sql_erased', 'cas_retired')
                              ORDER BY created_at_ms DESC
                              LIMIT 1",
                         )
@@ -2483,7 +2483,7 @@ async fn scrub_pending_purge_successor_receipts_tx(
         BackendConn::Postgres(conn) => {
             let rows = sqlx::query(
                 "SELECT history_incarnation, actor_id, idempotency_key
-                 FROM pending_purges WHERE space_id = $1 AND new_note_id IS NOT NULL AND new_note_id = $2",
+                 FROM pending_purges WHERE space_id = $1 AND new_note_id IS NOT NULL AND new_note_id COLLATE \"C\" = $2",
             )
             .bind(scope.space_id.as_str())
             .bind(purged_note.as_str())

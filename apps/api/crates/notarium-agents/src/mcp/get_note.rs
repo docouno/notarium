@@ -409,25 +409,49 @@ async fn graph(
     };
     ctx.scope().check(&graph.cut.scope)?;
     let mut admitted = BTreeSet::from([note.clone()]);
-    let incomplete = graph.cut.projected_seq < head.max(graph.cut.canonical_seq)
-        || (matches!(call.target, EgressTarget::ExternalMcp)
-            && (graph.truncated || graph.nodes.len() > MAX_LINK_NODES));
-    for node in graph.nodes.into_iter().take(MAX_LINK_NODES) {
+    let mut admitted_neighbors = 0usize;
+    let mut admitted_truncated = false;
+    let external = matches!(call.target, EgressTarget::ExternalMcp);
+    for node in graph.nodes {
         let (GraphNodeId::Note(id), Some(card)) = (node.id, node.card) else {
             continue;
         };
+        if id == *note {
+            continue;
+        }
         let proof = card.document.provenance();
         if proof.reference().note_id != id {
             return Err(invalid(ValidationReason::SourceMismatch));
         }
+        if admitted_neighbors >= MAX_LINK_NODES {
+            let extra_admitted = if external {
+                true
+            } else {
+                match corpus::admit_search_card(call, ctx, proof, &call.policies).await {
+                    Ok(()) => true,
+                    Err(error) if corpus::hidden(&error) => false,
+                    Err(error) => return Err(error),
+                }
+            };
+            if extra_admitted {
+                admitted_truncated = true;
+                break;
+            }
+            continue;
+        }
         match corpus::note_metadata(call, ctx, proof).await {
             Ok(()) => {
-                admitted.insert(id);
+                if admitted.insert(id) {
+                    admitted_neighbors += 1;
+                }
             }
             Err(error) if corpus::hidden(&error) => (),
             Err(error) => return Err(error),
         }
     }
+    let incomplete = graph.cut.projected_seq < head.max(graph.cut.canonical_seq)
+        || admitted_truncated
+        || (external && graph.truncated);
     let edges: Vec<_> = graph
         .edges
         .into_iter()

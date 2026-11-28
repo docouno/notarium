@@ -102,18 +102,18 @@ pub(super) async fn observe_project(
 ) -> Result<CreateProject, PortError> {
     let project = session::resolve_project_for_direct_write(call, handle).await?;
     let scope = session::space(call, &project.folder.space_id).await?;
-    let write_scope = scope.clone().restrict_to_project(&project.folder)?;
-    let project_path = folder_base(call, &write_scope, &project.folder.folder_id)
-        .await?
-        .path;
     Ok(CreateProject {
         reference: project.folder,
         scope: scope.scope().clone(),
-        project_path: Some(project_path),
+        project_path: None,
     })
 }
 
-async fn placement(call: &ToolCallContext<'_>, handle: &str) -> Result<CreatePlacement, PortError> {
+async fn placement(
+    call: &ToolCallContext<'_>,
+    handle: &str,
+    replay_error_label: &'static str,
+) -> Result<CreatePlacement, PortError> {
     let mut replayed = true;
     let project: CreateProject = call
         .journal("create_project", || async {
@@ -121,7 +121,9 @@ async fn placement(call: &ToolCallContext<'_>, handle: &str) -> Result<CreatePla
             observe_project(call, handle).await
         })
         .await?;
-    project_placement(call, project, replayed).await
+    project_placement(call, project, replayed)
+        .await
+        .map_err(|error| batch_operational_error(replay_error_label, error, replayed))
 }
 
 async fn project_placement(
@@ -751,7 +753,7 @@ pub(super) async fn create_one(
 ) -> Result<Value, PortError> {
     let input: CreateInput = decode(raw)?;
     let _ = validate_draft_syntax(&input.draft, input.folder_page)?;
-    let placement = placement(call, &input.project).await?;
+    let placement = placement(call, &input.project, "notarium.mcp.create-note.v1").await?;
     let prepared = PreparedDraft::new(call, &placement, input.draft, input.folder_page, 0, None)?;
     let carrier = prepare_carrier(
         call,
@@ -999,7 +1001,7 @@ pub(super) async fn create_many(
 ) -> Result<Value, PortError> {
     const LABEL: &str = "notarium.mcp.create-notes-batch.v1";
     let input: BatchInput = decode(raw)?;
-    let placement = placement(call, &input.project).await?;
+    let placement = placement(call, &input.project, LABEL).await?;
     let mut titles: BTreeMap<String, BTreeSet<NoteId>> = BTreeMap::new();
     let mut created = Vec::with_capacity(input.notes.len());
     let mut committed_any = placement.replayed;

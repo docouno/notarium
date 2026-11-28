@@ -341,6 +341,37 @@ async fn redaction_invalidates_all_retained_viewers_and_cached_checkpoints() {
     }
 }
 
+#[tokio::test]
+async fn redaction_mid_step_preserves_incomplete_step_in_catch_up() {
+    let buffer = Arc::new(stream());
+    let mut subscriber = buffer.subscribe(None);
+    let _ = checkpoint(&mut subscriber).await;
+
+    buffer.begin_step(0).unwrap();
+    buffer
+        .text_delta(0, "partial output before redaction")
+        .unwrap();
+    assert_eq!(encoded(&frame(&mut subscriber).await)["type"], "text_delta");
+
+    // Redaction drops the live stream before the Model entry ever commits.
+    let hold = buffer.pause_for_redaction();
+    drop(hold);
+    buffer.fail(RunFailure::Cancelled).unwrap();
+
+    let reset = checkpoint(&mut subscriber).await;
+    assert_eq!(
+        reset.incomplete_step,
+        Some(0),
+        "mid-step redaction must tell subscribers to discard step 0 transient deltas"
+    );
+    assert_eq!(
+        reset.terminal,
+        Some(RunTerminal::Failed {
+            code: RunFailure::Cancelled
+        })
+    );
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(32))]
 

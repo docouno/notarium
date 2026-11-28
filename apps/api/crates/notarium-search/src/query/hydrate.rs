@@ -51,19 +51,23 @@ impl NoteAdmission<'_> {
             HitKey::Note(note) => Some(note),
             HitKey::Chat { .. } => None,
         });
-        let admitted = self
+        let admitted: std::collections::HashSet<NoteId> = self
             .select(engine, notes, |note| *note, floor, true)
-            .await?;
+            .await?
+            .into_iter()
+            .cloned()
+            .collect();
         let filled = admitted.len() == floor;
         let mut pos = 0;
         let mut kept_strict = 0;
-        let checked = &self.checked;
         ranked.hits.retain(|hit| {
             pos += 1;
             let keep = if pos <= ranked.strict_len {
-                !matches!(&hit.key, HitKey::Note(note) if checked.get(note) == Some(&false))
+                // Keep all strict hits in place so rejected strict candidates
+                // never perturb strict RRF ranks when weak fallback runs.
+                true
             } else {
-                matches!(&hit.key, HitKey::Note(note) if checked.get(note) == Some(&true))
+                matches!(&hit.key, HitKey::Note(note) if admitted.contains(note))
             };
             if keep && pos <= ranked.strict_len {
                 kept_strict += 1;
@@ -196,7 +200,7 @@ impl SearchEngine {
             top_k,
             delivery,
         } = task;
-        let truncated = selected.len() > top_k;
+        let mut truncated = selected.len() > top_k;
         selected.truncate(top_k);
         let NoteAdmission {
             context,
@@ -266,81 +270,118 @@ impl SearchEngine {
             return Ok((Vec::new(), truncated));
         }
 
-        // Only read CAS carriers for projected notes; overlay rows already carry
-        // their authorized receipt-bound document and passed live visibility.
-        let mut projected_ids = Vec::new();
-        let mut projected_targets = Vec::new();
-        for (candidate, card) in &ordered {
-            if !overlay.contains_key(&candidate.note) {
-                projected_ids.push(candidate.note.clone());
-                projected_targets.push(SearchDocumentTarget {
-                    note_id: candidate.note.clone(),
-                    revision: card.document.provenance().revision().clone(),
-                    projected_at: Some(cut.projected_seq),
-                });
-            }
-        }
-        let mut docs: HashMap<NoteId, Arc<ClassifiedDocument>> = HashMap::new();
-        if !projected_targets.is_empty() {
-            ctx.budget = clock.remaining()?;
-            let documents = self
-                .services
-                .deps
-                .carriers
-                .read_authorized_documents_for_search(ctx, projected_targets)
-                .await?;
-            if documents.len() != projected_ids.len() {
-                return Err(internal("canonical_search_batch"));
-            }
-            for (note_id, document) in projected_ids.into_iter().zip(documents) {
-                if let Some(document) = document {
-                    docs.insert(note_id, document);
-                }
-            }
-        }
-        for (candidate, _) in &ordered {
-            if let Some(Some(row)) = overlay.get(&candidate.note) {
-                docs.insert(candidate.note.clone(), Arc::new(row.document.clone()));
-            }
-        }
-
+        // Hydrate projected notes in bounded batches and immediately extract
+        // compact excerpts so full document bodies are dropped as soon as their
+        // chunks are verified instead of holding every candidate body in RAM.
+        const HYDRATE_BATCH: usize = 32;
+        const MAX_HYDRATED_EXCERPT_BYTES: usize = 16 * 1024 * 1024;
         let mut hits = Vec::new();
         let mut relevance = ChunkRelevance::new(text);
-        for (candidate, card) in ordered {
-            clock.remaining()?;
-            let Some(document) = docs.remove(&candidate.note) else {
-                continue;
-            };
-            if document.reference().note_id != candidate.note
-                || document.reference().space_id != cut.scope.space_id
-                || document.revision() != card.document.provenance().revision()
-                || document.digest() != card.document.provenance().digest()
-            {
-                return Err(internal("canonical_search_identity"));
+        let mut hydrated_bytes = 0usize;
+        let mut ordered_iter = ordered.into_iter().peekable();
+        'batches: while ordered_iter.peek().is_some() {
+            let batch: Vec<_> = ordered_iter.by_ref().take(HYDRATE_BATCH).collect();
+            let mut projected_ids = Vec::new();
+            let mut projected_targets = Vec::new();
+            for (candidate, card) in &batch {
+                if !overlay.contains_key(&candidate.note) {
+                    projected_ids.push(candidate.note.clone());
+                    projected_targets.push(SearchDocumentTarget {
+                        note_id: candidate.note.clone(),
+                        revision: card.document.provenance().revision().clone(),
+                        projected_at: Some(cut.projected_seq),
+                    });
+                }
             }
-            let Ok(content) = ClassEgressFence::search(document.as_ref().clone(), &hydrate_auth)
-            else {
-                continue;
-            };
-            let descriptors = hit_chunks(&candidate, &content, tokenizer, &mut relevance, clock)?;
-            let maximum = if delivery.recall.is_some() {
-                usize::MAX
-            } else {
-                3
-            };
-            let chunks = descriptors
-                .into_iter()
-                .take(maximum)
-                .filter_map(|descriptor| {
-                    let part = ContentPart::from_chunk(document.clone(), descriptor).ok()?;
-                    ClassEgressFence::search_part(part, &hydrate_auth).ok()
-                })
-                .collect();
-            hits.push(SearchHit {
-                card,
-                score: candidate.score,
-                chunks,
-            });
+            let mut docs: HashMap<NoteId, Arc<ClassifiedDocument>> = HashMap::new();
+            if !projected_targets.is_empty() {
+                ctx.budget = clock.remaining()?;
+                let documents = self
+                    .services
+                    .deps
+                    .carriers
+                    .read_authorized_documents_for_search(ctx.clone(), projected_targets)
+                    .await?;
+                if documents.len() != projected_ids.len() {
+                    return Err(internal("canonical_search_batch"));
+                }
+                for (note_id, document) in projected_ids.into_iter().zip(documents) {
+                    if let Some(document) = document {
+                        docs.insert(note_id, document);
+                    }
+                }
+            }
+            for (candidate, _) in &batch {
+                if let Some(Some(row)) = overlay.get(&candidate.note) {
+                    docs.insert(candidate.note.clone(), Arc::new(row.document.clone()));
+                }
+            }
+            for (candidate, card) in batch {
+                clock.remaining()?;
+                let Some(document) = docs.remove(&candidate.note) else {
+                    continue;
+                };
+                if document.reference().note_id != candidate.note
+                    || document.reference().space_id != cut.scope.space_id
+                    || document.revision() != card.document.provenance().revision()
+                    || document.digest() != card.document.provenance().digest()
+                {
+                    return Err(internal("canonical_search_identity"));
+                }
+                let Ok(content) =
+                    ClassEgressFence::search(document.as_ref().clone(), &hydrate_auth)
+                else {
+                    continue;
+                };
+                let descriptors =
+                    hit_chunks(&candidate, &content, tokenizer, &mut relevance, clock)?;
+                let maximum = if delivery.recall.is_some() {
+                    usize::MAX
+                } else {
+                    3
+                };
+                let mut chunks = Vec::new();
+                let mut hit_bytes = card.title.len().saturating_add(card.path.len());
+                let mut budget_hit = false;
+                for descriptor in descriptors.into_iter().take(maximum) {
+                    let Some(part) = ContentPart::from_chunk(document.clone(), descriptor).ok()
+                    else {
+                        continue;
+                    };
+                    let Ok(search_part) = ClassEgressFence::search_part(part, &hydrate_auth) else {
+                        continue;
+                    };
+                    let next_bytes = hydrated_bytes
+                        .saturating_add(hit_bytes)
+                        .saturating_add(search_part.text().len());
+                    if next_bytes > MAX_HYDRATED_EXCERPT_BYTES
+                        && (!hits.is_empty() || !chunks.is_empty())
+                    {
+                        truncated = true;
+                        budget_hit = true;
+                        break;
+                    }
+                    hit_bytes = hit_bytes.saturating_add(search_part.text().len());
+                    chunks.push(search_part);
+                }
+                drop(content);
+                drop(document);
+                if hydrated_bytes.saturating_add(hit_bytes) > MAX_HYDRATED_EXCERPT_BYTES
+                    && !hits.is_empty()
+                {
+                    truncated = true;
+                    break 'batches;
+                }
+                hydrated_bytes = hydrated_bytes.saturating_add(hit_bytes);
+                hits.push(SearchHit {
+                    card,
+                    score: candidate.score,
+                    chunks,
+                });
+                if budget_hit {
+                    break 'batches;
+                }
+            }
         }
         Ok((hits, truncated))
     }
@@ -599,6 +640,11 @@ fn pack(
             recipient.framing_tokens(&hit.card.document.provenance().reference().note_id, first)
         })
     };
+    let title_only_framing = |hit: &SearchHit| {
+        recipient.map_or(0, |recipient| {
+            recipient.title_only_framing_tokens(&hit.card.document.provenance().reference().note_id)
+        })
+    };
     let mut truncated = false;
     for (((hit, mask), source), keep_title) in hits
         .iter()
@@ -607,7 +653,7 @@ fn pack(
         .zip(&mut keep_title_only)
     {
         if hit.chunks.is_empty() {
-            let frame = framing(hit, true);
+            let frame = title_only_framing(hit);
             if frame <= remaining {
                 remaining -= frame;
                 *keep_title = true;

@@ -48,7 +48,7 @@ impl NoteReadPort for RejectingPorts {
 }
 impl NoteWritePort for RejectingPorts {
     reject! {
-    fn ensure_folder_path(&self, ctx: SpaceContext, request: Mutation<EnsureFolderPath>) -> PortFuture<'_, FolderRef>;
+    fn ensure_folder_path(&self, ctx: SpaceContext, request: Mutation<EnsureFolderPath>) -> PortFuture<'_, EnsuredFolder>;
     fn create_note(
             &self,
             ctx: SpaceContext,

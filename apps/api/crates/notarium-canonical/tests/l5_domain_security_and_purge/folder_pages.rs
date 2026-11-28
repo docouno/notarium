@@ -21,12 +21,14 @@ pub(super) async fn check(
     let left = store
         .ensure_folder_path(ctx.clone(), path.clone())
         .await
-        .unwrap();
+        .unwrap()
+        .folder;
     assert_eq!(
         store
             .ensure_folder_path(ctx.clone(), path.clone())
             .await
-            .unwrap(),
+            .unwrap()
+            .folder,
         left
     );
     let wrong_retry = Mutation {
@@ -56,7 +58,8 @@ pub(super) async fn check(
             ),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .folder;
     let cover = |parent: FolderId, note: NoteId, slug: &str, folder_page| CreateNote {
         parent: Some(parent),
         note,
@@ -317,7 +320,8 @@ pub(super) async fn check(
             ),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .folder;
     let legacy_note = sample_note_id(238);
     let legacy_carrier = "# Legacy index\n\nOrdinary v1 body\n";
     let legacy_mutation = next_mutation(
@@ -524,7 +528,8 @@ pub(super) async fn check(
             ),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .folder;
     let active_epoch = store
         .read_space(&scope.space_id)
         .await

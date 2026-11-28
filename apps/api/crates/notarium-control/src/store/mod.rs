@@ -821,13 +821,11 @@ impl WriteTransaction {
         let resources = self.resources.take().expect("live write transaction");
         tokio::spawn(resources.commit())
     }
-    pub(crate) fn spawn_commit_keeping_fences(
+    pub(crate) async fn commit_keeping_fences(
         mut self,
-    ) -> tokio::task::JoinHandle<
-        Result<Vec<Box<dyn notarium_core::ports::RevocationLease>>, PortError>,
-    > {
+    ) -> Result<Vec<Box<dyn notarium_core::ports::RevocationLease>>, PortError> {
         let resources = self.resources.take().expect("live write transaction");
-        tokio::spawn(resources.commit_keeping_fences())
+        resources.commit_keeping_fences().await
     }
     pub(crate) async fn commit(self) -> Result<(), PortError> {
         self.spawn_commit()

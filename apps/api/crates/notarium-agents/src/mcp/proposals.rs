@@ -57,6 +57,8 @@ pub struct ProposedDiffPreview {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unified_preview: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub unified_preview_truncated: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub memory: Option<Value>,
 }
 
@@ -325,7 +327,8 @@ pub(super) async fn prepare(
     let payload = json!({
         "outcome": "approvalRequired", "proposalId": id,
         "summary": "Review the proposed change and explicitly approve it in the chat.",
-        "unifiedPreview": preview.as_deref().map(bounded_preview),
+        "unifiedPreview": preview.as_ref().map(|item| item.diff.as_str()),
+        "unifiedPreviewTruncated": preview.as_ref().map(|item| item.truncated),
     });
     Ok(Draft {
         id,
@@ -390,12 +393,16 @@ pub(super) async fn preview(
         tool: owner.tool.name().to_owned(),
         change: None,
         unified_preview: None,
+        unified_preview_truncated: None,
         memory: None,
     };
     match &envelope.action {
         ProposedAction::Notes(notes) => {
             preview.change = Some(note_tools::describe_proposal(&mut owner, notes).await?);
-            preview.unified_preview = note_tools::preview_proposal(&mut owner, notes).await?;
+            if let Some(rendered) = note_tools::preview_proposal(&mut owner, notes).await? {
+                preview.unified_preview = Some(rendered.diff);
+                preview.unified_preview_truncated = Some(rendered.truncated);
+            }
         }
         ProposedAction::Memory(plan) => {
             let current = registry
@@ -438,7 +445,7 @@ async fn resolve_for_human<'a>(
     ),
     PortError,
 > {
-    let deadline = tokio::time::Instant::now() + account.budget.remaining;
+    let deadline = super::deadline_from(account.budget.remaining);
     let budget = || CallBudget {
         remaining: deadline.saturating_duration_since(tokio::time::Instant::now()),
         ..account.budget.clone()
@@ -504,14 +511,6 @@ fn action_matches(action: &ProposedAction, tool: ToolName) -> bool {
                 | (MemoryTarget::Project { .. }, ToolName::RememberAboutProject)
         ),
     }
-}
-
-fn bounded_preview(value: &str) -> &str {
-    let mut end = value.len().min(MAX_DISPLAY_BYTES);
-    while !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    &value[..end]
 }
 
 fn step_identity(

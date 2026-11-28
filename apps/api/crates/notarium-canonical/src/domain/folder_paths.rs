@@ -620,7 +620,7 @@ pub(super) async fn ensure(
     store: &CanonicalStore,
     mut ctx: SpaceContext,
     request: Mutation<EnsureFolderPath>,
-) -> Result<FolderRef, PortError> {
+) -> Result<notarium_core::ports::EnsuredFolder, PortError> {
     super::common::validate_confirmable_mutation_identity(&ctx, &request.identity)?;
     require_empty_preconditions(&request.preconditions)?;
     let parts = components(&request.input.path)?;
@@ -671,13 +671,20 @@ pub(super) async fn ensure(
         .await?;
     if let Some(replay) = replay {
         ctx.budget.remaining = deadline.remaining(&budget)?;
-        return verify_ensured_folder(store, &ctx, replay.into_committed().value).await;
+        let folder = verify_ensured_folder(store, &ctx, replay.into_committed().value).await?;
+        return Ok(notarium_core::ports::EnsuredFolder {
+            folder,
+            created: true,
+        });
     }
     ctx.budget.remaining = deadline.remaining(&budget)?;
     if confirmed.is_none()
         && let Some(found) = authorize_existing_folder_ensure(store, &ctx, &base, &parts).await?
     {
-        return Ok(found);
+        return Ok(notarium_core::ports::EnsuredFolder {
+            folder: found,
+            created: false,
+        });
     }
     ctx.budget.remaining = deadline.remaining(&budget)?;
 
@@ -820,20 +827,30 @@ pub(super) async fn ensure(
     {
         Ok(result) => {
             let reference = result.into_committed().value;
-            if !executed.load(std::sync::atomic::Ordering::SeqCst) {
+            let folder = if !executed.load(std::sync::atomic::Ordering::SeqCst) {
                 ctx.budget.remaining = deadline.remaining(&budget)?;
-                return verify_ensured_folder(store, &ctx, reference).await;
-            }
-            Ok(reference)
+                verify_ensured_folder(store, &ctx, reference).await?
+            } else {
+                reference
+            };
+            Ok(notarium_core::ports::EnsuredFolder {
+                folder,
+                created: true,
+            })
         }
         Err(PortError::Domain(DomainError::PathConflict { .. })) => {
             ctx.budget.remaining = deadline.remaining(&budget)?;
-            if let Some(step) = confirmed {
-                return confirmed_existing(store, &ctx, step.as_ref(), &parts).await;
-            }
-            authorize_existing_folder_ensure(store, &ctx, &base, &parts)
-                .await?
-                .ok_or(DomainError::ResourceNotFound.into())
+            let folder = if let Some(step) = confirmed {
+                confirmed_existing(store, &ctx, step.as_ref(), &parts).await?
+            } else {
+                authorize_existing_folder_ensure(store, &ctx, &base, &parts)
+                    .await?
+                    .ok_or(DomainError::ResourceNotFound)?
+            };
+            Ok(notarium_core::ports::EnsuredFolder {
+                folder,
+                created: false,
+            })
         }
         Err(err) => Err(err),
     }

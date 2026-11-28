@@ -73,6 +73,10 @@ impl SearchRecipient for Recipient<'_, '_> {
         framing_tokens(note, first_chunk)
     }
 
+    fn title_only_framing_tokens(&self, note: &NoteId) -> u32 {
+        title_only_framing_tokens(note)
+    }
+
     fn query_source_classes(&self) -> Option<BTreeSet<DocClass>> {
         self.source_classes.clone()
     }
@@ -92,10 +96,15 @@ fn matches_target(
         && project.is_none_or(|project| card.in_project(project))
 }
 
+fn title_only_framing_tokens(note: &NoteId) -> u32 {
+    // The heading is "## <note>\n" with no chunk trailer when there are no chunks.
+    4 + note.as_str().len() as u32
+}
+
 fn framing_tokens(note: &NoteId, first_chunk: bool) -> u32 {
     // The heading is "## <note>\n" and each chunk ends with two newlines.
     let heading = if first_chunk {
-        4 + note.as_str().len() as u32
+        title_only_framing_tokens(note)
     } else {
         0
     };
@@ -152,7 +161,6 @@ pub(super) async fn retrieve(
     let targeted_project = resolved.targeted_project;
     let mut candidates = Vec::new();
     let mut candidate_bytes = 0usize;
-    let mut seen_doc_bytes: BTreeSet<usize> = BTreeSet::new();
     let mut truncated = false;
     let mut own_degradation = BTreeSet::new();
     let mut foreign_degradation = BTreeSet::new();
@@ -310,10 +318,10 @@ pub(super) async fn retrieve(
             let multi_target = targets.len() > 1;
             let result = if recall {
                 let (recall_budget, recall_max_per_source) = if multi_target {
-                    // Across multiple Spaces, avoid premature per-Space budget
-                    // pruning so global Pass-1/Pass-2 packing below sees every
-                    // candidate's eligible chunks.
-                    (131_072, None)
+                    // Across multiple Spaces, keep `max_per_source` active so
+                    // oversized chunks do not crowd out eligible chunks while
+                    // global Pass-1/Pass-2 packing enforces `budget` below.
+                    (131_072, max_per_source)
                 } else {
                     (budget, max_per_source)
                 };
@@ -352,7 +360,7 @@ pub(super) async fn retrieve(
                 }
             }
             const MAX_IN_APP_CANDIDATES: usize = 4096;
-            const MAX_IN_APP_CANDIDATE_BYTES: usize = 16 * 1024 * 1024;
+            const MAX_CANDIDATE_BYTES: usize = 16 * 1024 * 1024;
             for hit in result.hits {
                 let metadata = hit.card.document.provenance();
                 if metadata.reference().space_id != target.scope.space_id || !hit.score.is_finite()
@@ -362,34 +370,38 @@ pub(super) async fn retrieve(
                 if !matches_target(metadata, &classes, target.project.as_ref()) {
                     continue;
                 }
-                if !external {
-                    let doc_bytes: usize = hit
-                        .chunks
-                        .iter()
-                        .map(|chunk| {
-                            let doc = chunk.provenance();
-                            if seen_doc_bytes.insert(std::ptr::from_ref(doc) as usize) {
-                                doc.content_bytes()
-                            } else {
-                                0
-                            }
+                if recall {
+                    let note_id = &metadata.reference().note_id;
+                    let eligible = if hit.chunks.is_empty() {
+                        title_only_framing_tokens(note_id) <= budget
+                    } else {
+                        let first_charge = framing_tokens(note_id, true);
+                        hit.chunks.iter().any(|chunk| {
+                            let tokens = chunk.part().tokens();
+                            tokens <= source_budget && tokens.saturating_add(first_charge) <= budget
                         })
-                        .fold(0usize, usize::saturating_add);
-                    let hit_bytes = doc_bytes
-                        .saturating_add(hit.card.title.len())
-                        .saturating_add(hit.card.path.len())
-                        .saturating_add(
-                            hit.chunks
-                                .iter()
-                                .map(|chunk| chunk.text().len())
-                                .sum::<usize>(),
-                        );
-                    candidate_bytes = candidate_bytes.saturating_add(hit_bytes);
-                    if candidates.len() >= MAX_IN_APP_CANDIDATES
-                        || candidate_bytes > MAX_IN_APP_CANDIDATE_BYTES
-                    {
-                        return Err(invalid(ValidationReason::BudgetExceeded));
+                    };
+                    if !eligible {
+                        truncated = true;
+                        continue;
                     }
+                }
+                let hit_bytes = hit
+                    .card
+                    .title
+                    .len()
+                    .saturating_add(hit.card.path.len())
+                    .saturating_add(
+                        hit.chunks
+                            .iter()
+                            .map(|chunk| chunk.text().len())
+                            .sum::<usize>(),
+                    );
+                candidate_bytes = candidate_bytes.saturating_add(hit_bytes);
+                if (!external && candidates.len() >= MAX_IN_APP_CANDIDATES)
+                    || candidate_bytes > MAX_CANDIDATE_BYTES
+                {
+                    return Err(invalid(ValidationReason::BudgetExceeded));
                 }
                 candidates.push(Candidate { index, hit });
             }
@@ -433,9 +445,10 @@ pub(super) async fn retrieve(
                 if seen.contains(&key) {
                     continue;
                 }
+                let title_charge = title_only_framing_tokens(&reference.note_id);
                 let header_charge = framing_tokens(&reference.note_id, true);
                 if hit.chunks.is_empty() {
-                    if header_charge > remaining {
+                    if title_charge > remaining {
                         truncated = true;
                         continue;
                     }
@@ -469,7 +482,7 @@ pub(super) async fn retrieve(
                         }
                         Err(error) => return Err(error),
                     }
-                    remaining -= header_charge;
+                    remaining -= title_charge;
                     best.get_or_insert(hit.score);
                     seen.insert(key);
                     recalled.push(RecalledNote {

@@ -15,6 +15,171 @@ use notarium_core::{
     ports::*,
 };
 use serde::{Deserialize, Serialize};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+use tokio::sync::Notify;
+
+const MAX_TRACKED_DELIVERED_EVENTS: usize = 16_384;
+const BACKGROUND_REVOKE_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Default)]
+struct DeliveryState {
+    delivered: HashSet<RequestId>,
+    order: VecDeque<RequestId>,
+    in_flight: HashMap<RequestId, Arc<Notify>>,
+}
+
+impl DeliveryState {
+    fn record_delivered(&mut self, id: RequestId) {
+        if self.delivered.insert(id.clone()) {
+            self.order.push_back(id);
+            while self.order.len() > MAX_TRACKED_DELIVERED_EVENTS {
+                if let Some(oldest) = self.order.pop_front() {
+                    self.delivered.remove(&oldest);
+                }
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+pub(super) struct RevocationDeliveryTracker {
+    state: Mutex<DeliveryState>,
+}
+
+enum DeliverySlot<'a> {
+    AlreadyDelivered,
+    Claimed(InFlightGuard<'a>),
+}
+
+struct InFlightGuard<'a> {
+    tracker: &'a RevocationDeliveryTracker,
+    id: RequestId,
+    notify: Arc<Notify>,
+    delivered: bool,
+}
+
+impl InFlightGuard<'_> {
+    fn mark_delivered(mut self) {
+        self.delivered = true;
+    }
+}
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        let mut state = self
+            .tracker
+            .state
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        if self.delivered {
+            state.record_delivered(self.id.clone());
+        }
+        if state
+            .in_flight
+            .get(&self.id)
+            .is_some_and(|existing| Arc::ptr_eq(existing, &self.notify))
+        {
+            state.in_flight.remove(&self.id);
+        }
+        self.notify.notify_waiters();
+    }
+}
+
+struct OwnedInFlightGuard {
+    tracker: Arc<RevocationDeliveryTracker>,
+    id: RequestId,
+    notify: Arc<Notify>,
+    delivered: bool,
+}
+
+impl OwnedInFlightGuard {
+    fn mark_delivered(&mut self) {
+        self.delivered = true;
+    }
+}
+
+impl Drop for OwnedInFlightGuard {
+    fn drop(&mut self) {
+        let mut state = self
+            .tracker
+            .state
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        if self.delivered {
+            state.record_delivered(self.id.clone());
+        }
+        if state
+            .in_flight
+            .get(&self.id)
+            .is_some_and(|existing| Arc::ptr_eq(existing, &self.notify))
+        {
+            state.in_flight.remove(&self.id);
+        }
+        self.notify.notify_waiters();
+    }
+}
+
+impl RevocationDeliveryTracker {
+    fn is_delivered(&self, id: &RequestId) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .delivered
+            .contains(id)
+    }
+
+    async fn begin_owned(self: &Arc<Self>, id: RequestId) -> Option<OwnedInFlightGuard> {
+        loop {
+            let waiter = {
+                let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+                if state.delivered.contains(&id) {
+                    return None;
+                }
+                if let Some(existing) = state.in_flight.get(&id) {
+                    Arc::clone(existing)
+                } else {
+                    let notify = Arc::new(Notify::new());
+                    state.in_flight.insert(id.clone(), Arc::clone(&notify));
+                    return Some(OwnedInFlightGuard {
+                        tracker: Arc::clone(self),
+                        id,
+                        notify,
+                        delivered: false,
+                    });
+                }
+            };
+            waiter.notified().await;
+        }
+    }
+
+    async fn begin<'a>(&'a self, id: &RequestId) -> DeliverySlot<'a> {
+        loop {
+            let waiter = {
+                let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+                if state.delivered.contains(id) {
+                    return DeliverySlot::AlreadyDelivered;
+                }
+                if let Some(existing) = state.in_flight.get(id) {
+                    Arc::clone(existing)
+                } else {
+                    let notify = Arc::new(Notify::new());
+                    state.in_flight.insert(id.clone(), Arc::clone(&notify));
+                    return DeliverySlot::Claimed(InFlightGuard {
+                        tracker: self,
+                        id: id.clone(),
+                        notify,
+                        delivered: false,
+                    });
+                }
+            };
+            waiter.notified().await;
+        }
+    }
+}
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -97,6 +262,7 @@ impl ControlService {
         const MAX_FENCE_SELECTORS: usize = 512;
         let mut unique = std::collections::BTreeSet::new();
         let mut to_revoke = Vec::new();
+        let mut already_delivered_ids = Vec::new();
         for id in events {
             let event = budget
                 .run(
@@ -118,8 +284,12 @@ impl ControlService {
                     serde_json::from_value(serde_json::Value::String(event.reason))
                         .map_err(|_| invalid(ValidationReason::InvalidState))?;
                 let request = RequestId::parse(&event.event_id)?;
-                unique.insert(envelope.selector.clone());
-                to_revoke.push((event.event_id, request, envelope.selector, reason));
+                if self.revocation_tracker.is_delivered(&request) {
+                    already_delivered_ids.push(event.event_id);
+                } else {
+                    unique.insert(envelope.selector.clone());
+                    to_revoke.push((event.event_id, request, envelope.selector, reason));
+                }
             }
         }
         let selectors: Vec<_> = unique.into_iter().collect();
@@ -139,36 +309,52 @@ impl ControlService {
             fence.check()?;
             tx.hold_revocation_fence(fence);
         }
-        let fences = budget.commit_tx_keeping_fences(tx).await?;
-        // Deliver revocation signals to the authority BEFORE dropping the fences
-        // (and after SQL write locks are released), so pending entries are wiped
-        // and no post-commit registration can race ahead of this revocation event.
-        let mut delivered_ids = Vec::with_capacity(to_revoke.len());
-        let revoke_result: Result<(), PortError> = async {
-            for (event_id, request, selector, reason) in to_revoke {
-                budget
-                    .run(
-                        self.revoker.revoke(
+        budget.check(CommitEffect::NotCommitted)?;
+        // Run COMMIT -> revoke -> release fences inside one spawned task so
+        // caller cancellation after COMMIT starts cannot drop provider fences
+        // before every newly committed revocation event is delivered.
+        let revoker = Arc::clone(&self.revoker);
+        let tracker = Arc::clone(&self.revocation_tracker);
+        let settle_handle = tokio::spawn(async move {
+            let fences = tx.commit_keeping_fences().await?;
+            let mut delivered_ids = Vec::with_capacity(to_revoke.len());
+            let revoke_result: Result<(), PortError> = async {
+                for (event_id, request, selector, reason) in to_revoke {
+                    let Some(mut guard) = tracker.begin_owned(request.clone()).await else {
+                        delivered_ids.push(event_id);
+                        continue;
+                    };
+                    revoker
+                        .revoke(
                             MaintenanceContext {
                                 authority: ServiceAuthority::admit(ServicePurpose::Revocation),
-                                budget: budget.context(request),
+                                budget: CallBudget {
+                                    request,
+                                    remaining: BACKGROUND_REVOKE_TIMEOUT,
+                                    cancellation: Cancellation::default(),
+                                },
                             },
                             selector,
                             reason,
-                        ),
-                        CommitEffect::Unknown,
-                    )
-                    .await
-                    .map_err(|_| {
-                        unavailable("control revocation delivery", CommitEffect::Unknown)
-                    })?;
-                delivered_ids.push(event_id);
+                        )
+                        .await
+                        .map_err(|_| {
+                            unavailable("control revocation delivery", CommitEffect::Unknown)
+                        })?;
+                    guard.mark_delivered();
+                    delivered_ids.push(event_id);
+                }
+                Ok(())
             }
-            Ok(())
-        }
-        .await;
-        drop(fences);
-        revoke_result?;
+            .await;
+            drop(fences);
+            revoke_result?;
+            Ok::<Vec<String>, PortError>(delivered_ids)
+        });
+        let mut delivered_ids = budget
+            .await_spawned(settle_handle, "control commit revocation worker")
+            .await?;
+        delivered_ids.extend(already_delivered_ids);
         if !delivered_ids.is_empty() {
             let mark_delivered: Result<(), PortError> = async {
                 let mut mark_tx = self.store.write(budget.clone()).await?;
@@ -265,29 +451,38 @@ impl ControlService {
         let reason: RevocationReason =
             serde_json::from_value(serde_json::Value::String(event.reason))
                 .map_err(|_| invalid(ValidationReason::InvalidState))?;
-        let mut tx = self.store.write(budget.clone()).await?;
-        let changed=budget.run(async {execute!(tx.inner_mut(),
-            "UPDATE revocation_events SET attempts=attempts+1 WHERE event_id=$1 AND delivered_at IS NULL",
-            "UPDATE v1_control.revocation_events SET attempts=attempts+1 WHERE event_id=$1 AND delivered_at IS NULL"; &event.event_id)
-        },CommitEffect::NotCommitted).await?;
-        budget.commit_tx(tx).await?;
-        if changed == 0 {
-            return Ok(());
-        }
-        budget
+        let slot = budget
             .run(
-                self.revoker.revoke(
-                    MaintenanceContext {
-                        authority: ServiceAuthority::admit(ServicePurpose::Revocation),
-                        budget: budget.context(request),
-                    },
-                    envelope.selector,
-                    reason,
-                ),
-                CommitEffect::Unknown,
+                async { Ok(self.revocation_tracker.begin(&request).await) },
+                CommitEffect::NotCommitted,
             )
-            .await
-            .map_err(|_| unavailable("control revocation delivery", CommitEffect::Unknown))?;
+            .await?;
+        if let DeliverySlot::Claimed(guard) = slot {
+            let mut tx = self.store.write(budget.clone()).await?;
+            let changed=budget.run(async {execute!(tx.inner_mut(),
+                "UPDATE revocation_events SET attempts=attempts+1 WHERE event_id=$1 AND delivered_at IS NULL",
+                "UPDATE v1_control.revocation_events SET attempts=attempts+1 WHERE event_id=$1 AND delivered_at IS NULL"; &event.event_id)
+            },CommitEffect::NotCommitted).await?;
+            budget.commit_tx(tx).await?;
+            if changed == 0 {
+                return Ok(());
+            }
+            budget
+                .run(
+                    self.revoker.revoke(
+                        MaintenanceContext {
+                            authority: ServiceAuthority::admit(ServicePurpose::Revocation),
+                            budget: budget.context(request),
+                        },
+                        envelope.selector,
+                        reason,
+                    ),
+                    CommitEffect::Unknown,
+                )
+                .await
+                .map_err(|_| unavailable("control revocation delivery", CommitEffect::Unknown))?;
+            guard.mark_delivered();
+        }
         async {
             let mut tx = self.store.write(budget.clone()).await?;
             let now = self.clock.now_ms()?;

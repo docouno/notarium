@@ -660,7 +660,6 @@ fn assemble_group(
             let mut unpaired = Vec::new();
             for candidate in &group_entries[1..] {
                 if matches!(candidate.kind, ChatEntryKind::Redacted) {
-                    through = candidate.seq;
                     continue;
                 }
                 let ChatEntryKind::Tool { call_id } = &candidate.kind else {
@@ -1152,6 +1151,103 @@ mod tests {
             ranges,
             vec![0..1, 1..4, 4..5],
             "redacted tool sibling must stay inside the Model->Tool group so surviving tool pairs stay attached"
+        );
+
+        // A Model group followed only by a Redacted entry must not advance
+        // `through` onto the tombstone sequence (which Canonical strips during
+        // `verify_prefix`).
+        let space = notarium_core::auth::Space {
+            id: SpaceId::from_bytes([0x95; 16]),
+            kind: notarium_core::auth::SpaceKind::Personal,
+            lifecycle: notarium_core::auth::SpaceLifecycle::Active,
+        };
+        let scope = notarium_core::model::HistoryScope {
+            space_id: space.id.clone(),
+            incarnation: notarium_core::ids::HistoryIncarnation::from_bytes([0x96; 16]),
+        };
+        let mut grants = std::collections::BTreeMap::new();
+        grants.insert(
+            space.id.clone(),
+            notarium_core::auth::SpaceGrant {
+                role: notarium_core::auth::SpaceRole::Owner,
+                read_classes: DocClass::all(),
+                write_classes: DocClass::all(),
+                project_root: None,
+            },
+        );
+        let auth = notarium_core::auth::EngineAuthContext::for_human(
+            notarium_core::auth::VerifiedHuman::attest(
+                author.clone(),
+                notarium_core::ids::GrantId::from_bytes([0x97; 16]),
+                grants,
+                false,
+            ),
+        );
+        let ctx = SpaceContext::new(
+            auth,
+            scope,
+            notarium_core::ports::CallBudget {
+                request: notarium_core::ids::RequestId::from_bytes([0x98; 16]),
+                remaining: std::time::Duration::from_secs(5),
+                cancellation: Default::default(),
+            },
+        )
+        .unwrap();
+        let selection = ProviderSelection {
+            provider: ProviderResourceId::from_bytes([0x99; 16]),
+            model: ModelProfileId::from_bytes([0x9A; 16]),
+            completion: None,
+            revocation_scope: ProviderRevocationScope {
+                owner: author,
+                credential: None,
+            },
+            runtime_epochs: ProviderRuntimeEpochs {
+                resource: std::num::NonZeroU64::MIN,
+                credential: None,
+            },
+            policy: ProviderPolicy {
+                provider: ProviderResourceId::from_bytes([0x99; 16]),
+                audience: ProviderAudience::Personal { consented: true },
+                allowed_classes: [DocClass::UserDoc].into(),
+            },
+            project_only: None,
+            project: None,
+        };
+        let model_content = notarium_core::classes::CanonicalChatContent::from_canonical(
+            space,
+            thread,
+            ThreadEntrySeq::new(2).unwrap(),
+            false,
+            "assistant reply".to_owned(),
+            notarium_core::ids::ContentDigest::from_bytes([0x9B; 32]),
+            None,
+        );
+        let mut content = BTreeMap::new();
+        content.insert(
+            ThreadEntrySeq::new(2).unwrap(),
+            HydratedChatEntry {
+                seq: ThreadEntrySeq::new(2).unwrap(),
+                content: model_content,
+                interruption: None,
+                tool_calls: Vec::new(),
+            },
+        );
+        let mut output = Vec::new();
+        let mut groups = Vec::new();
+        assemble_group(
+            &ctx,
+            &entries[1..3],
+            &mut content,
+            &selection,
+            &mut output,
+            &mut groups,
+        )
+        .unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(
+            groups[0].through,
+            ThreadEntrySeq::new(2).unwrap(),
+            "Model->Redacted group must anchor `through` on the Model entry, not the Redacted tombstone"
         );
     }
 }

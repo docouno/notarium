@@ -360,6 +360,7 @@ async fn ability_folder(
             },
         )
         .await?
+        .folder
         .folder_id)
 }
 
@@ -381,6 +382,7 @@ fn post_commit_ability_error(label: &str, error: PortError) -> PortError {
 fn committed_response(
     reference: &AbilityRef,
     binding_revision: ControlRevision,
+    preference_revision: Option<ControlRevision>,
     name: &str,
     kind: AbilityKind,
     projects: &AbilityProjects,
@@ -391,6 +393,7 @@ fn committed_response(
     let version = Version {
         package: reference.revision.clone(),
         binding: binding_revision,
+        preference: preference_revision,
     };
     Ok(json!({
         "ref": reference_token(reference)?,
@@ -665,6 +668,7 @@ pub(super) async fn create(
     committed_response(
         &reference,
         ControlRevision::new(1)?,
+        None,
         &slug,
         kind,
         &plan.availability,
@@ -737,6 +741,12 @@ async fn edit_plan(call: &ToolCallContext<'_>, args: &EditArgs) -> Result<EditPl
         if supplied.binding != current.binding {
             return Err(DomainError::ControlRevisionConflict {
                 current: current.binding,
+            }
+            .into());
+        }
+        if supplied.preference != current.preference {
+            return Err(DomainError::ControlRevisionConflict {
+                current: current.preference.unwrap_or(ControlRevision::ZERO),
             }
             .into());
         }
@@ -924,12 +934,14 @@ fn is_partial_step_error(error: &PortError) -> bool {
 fn edit_result(
     reference: &AbilityRef,
     binding_revision: ControlRevision,
+    preference_revision: Option<ControlRevision>,
     steps: Vec<Value>,
     error: Option<&PortError>,
 ) -> Result<Value, PortError> {
     let version = Version {
         package: reference.revision.clone(),
         binding: binding_revision,
+        preference: preference_revision,
     };
     Ok(json!({
         "ref": reference_token(reference)?,
@@ -1339,12 +1351,19 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
                 },
             );
         }
-        let partial_binding_rev = promotion
+        let partial_overlays = promotion
             .as_ref()
-            .map_or(&plan.overlays, |settled| &settled.destination)
+            .map_or(&plan.overlays, |settled| &settled.destination);
+        let partial_binding_rev = partial_overlays
             .binding_revision
             .unwrap_or(ControlRevision::ZERO);
-        return edit_result(report_ref, partial_binding_rev, steps, Some(&error));
+        return edit_result(
+            report_ref,
+            partial_binding_rev,
+            partial_overlays.preference_revision,
+            steps,
+            Some(&error),
+        );
     }
     let mut applied_any = authored_changed || promotion.is_some();
     steps.push(change_step(
@@ -1428,7 +1447,13 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
                 }
                 steps.push(change_step("availability", "failed", Some(&error)));
                 steps.push(change_step("enabled", "skipped", None));
-                return edit_result(&reference, committed_binding_rev, steps, Some(&error));
+                return edit_result(
+                    &reference,
+                    committed_binding_rev,
+                    overlays.preference_revision,
+                    steps,
+                    Some(&error),
+                );
             }
         }
     } else {
@@ -1436,6 +1461,7 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
     }
 
     let mut committed_preference_enabled = overlays.preference_enabled;
+    let mut committed_preference_rev = overlays.preference_revision;
     let promotion_preference_conflict = promotion
         .as_ref()
         .filter(|settled| settled.source.preference_revision != plan.overlays.preference_revision)
@@ -1477,9 +1503,10 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
         }
         .await;
         match result {
-            Ok(_) => {
+            Ok(commit) => {
                 applied_any = true;
                 committed_preference_enabled = enabled;
+                committed_preference_rev = Some(commit.revision);
                 steps.push(change_step("enabled", "applied", None));
             }
             Err(error) => {
@@ -1491,7 +1518,13 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
                     ));
                 }
                 steps.push(change_step("enabled", "failed", Some(&error)));
-                return edit_result(&reference, committed_binding_rev, steps, Some(&error));
+                return edit_result(
+                    &reference,
+                    committed_binding_rev,
+                    committed_preference_rev,
+                    steps,
+                    Some(&error),
+                );
             }
         }
     } else {
@@ -1518,6 +1551,7 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
     let mut result = committed_response(
         &reference,
         committed_binding_rev,
+        committed_preference_rev,
         &slug,
         AbilityKind::from(plan.kind),
         &committed_availability,

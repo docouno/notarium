@@ -1042,6 +1042,7 @@ impl AgentRunSupervisor {
                 admission.clone(),
             ))
             .await?;
+        let auth = auth.intersect_current(account.auth())?;
         let mut ctx = SpaceContext::new(auth, request.scope.clone(), account.budget.clone())?;
         let leaf = self
             .thread_at(ctx.clone(), &request.thread, request.expected_leaf)

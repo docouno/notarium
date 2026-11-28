@@ -29,7 +29,7 @@ UPDATE v1_control.agent_schedules
     SET title = ''
     WHERE deleted_at IS NOT NULL AND title <> '';
 ALTER TABLE v1_control.provider_call_log
-    ADD CHECK (coalesce(octet_length(run_id),0) + coalesce(octet_length(call_id),0) <= 2048);
+    ADD CHECK (coalesce(octet_length(run_id),0) + coalesce(octet_length(call_id),0) <= 2088);
 ALTER TABLE v1_control.provider_attachments
     ADD CHECK (state <> 'approved' OR coalesce(octet_length(target_space),0) + coalesce(octet_length(id),0) <= 2048),
     ADD CHECK (state <> 'approved' OR target_kind <> 'project' OR coalesce(octet_length(target_space),0) + coalesce(octet_length(target_project),0) + coalesce(octet_length(id),0) <= 2048);

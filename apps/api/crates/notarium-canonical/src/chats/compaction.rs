@@ -986,7 +986,7 @@ pub(super) async fn hydrated_prefix(
         crate::domain::common::CommandDeadline::start(&ctx.budget, "hydrate_prompt_prefix");
     let started = tokio::time::Instant::now();
     let mut window = oldest_prefix(store, ctx.clone(), request).await?;
-    let (contents, truncated_at) = content::hydrate_payloads_bounded(
+    let (contents, truncated_len) = content::hydrate_payloads_bounded(
         store,
         ctx.auth(),
         &window.space,
@@ -998,8 +998,8 @@ pub(super) async fn hydrated_prefix(
         Some(COMPACTION_HYDRATION_BYTE_LIMIT),
     )
     .await?;
-    if let Some(last_seq) = truncated_at {
-        window.branch.entries.retain(|entry| entry.seq <= last_seq);
+    if let Some(kept_len) = truncated_len {
+        window.branch.entries.truncate(kept_len);
         window.has_tail = true;
     }
     Ok(notarium_core::ports::ChatCompactionPrefix {

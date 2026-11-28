@@ -150,6 +150,7 @@ struct State {
     end: u64,
     committed_leaf: ThreadEntrySeq,
     transient: Option<TransientStep>,
+    redacted_incomplete_step: Option<u32>,
     last_step: Option<u32>,
     terminal: Option<RunTerminal>,
     redaction_pending: usize,
@@ -167,7 +168,8 @@ impl State {
             incomplete_step: self
                 .transient
                 .filter(|transient| transient.start < self.end)
-                .map(|transient| transient.step),
+                .map(|transient| transient.step)
+                .or(self.redacted_incomplete_step),
             terminal: self.terminal,
         }
     }
@@ -177,6 +179,13 @@ impl State {
     }
 
     fn reset_visibility(&mut self) {
+        if let Some(step) = self
+            .transient
+            .filter(|transient| transient.start < self.end)
+            .map(|transient| transient.step)
+        {
+            self.redacted_incomplete_step = Some(step);
+        }
         self.frames.clear();
         self.retained = 0;
         self.transient = None;
@@ -258,6 +267,7 @@ impl StepStreamBuffer {
                 end: 0,
                 committed_leaf: initial_leaf,
                 transient: None,
+                redacted_incomplete_step: None,
                 last_step: None,
                 terminal: None,
                 redaction_pending: 0,
@@ -351,6 +361,9 @@ impl StepStreamBuffer {
         if state.visibility_floor != 0 {
             if entry.seq > state.committed_leaf {
                 state.committed_leaf = entry.seq;
+                if entry.kind == ChatEntryKind::Model && entry.run.as_ref() == Some(&self.run) {
+                    state.redacted_incomplete_step = None;
+                }
                 state.reset_visibility();
                 self.changed.send_replace(state.end);
             }
@@ -387,6 +400,9 @@ impl StepStreamBuffer {
         if state.visibility_floor != 0 {
             if entry.seq > state.committed_leaf {
                 state.committed_leaf = entry.seq;
+                if entry.kind == ChatEntryKind::Model && entry.run.as_ref() == Some(&self.run) {
+                    state.redacted_incomplete_step = None;
+                }
                 state.reset_visibility();
                 self.changed.send_replace(state.end);
             }
