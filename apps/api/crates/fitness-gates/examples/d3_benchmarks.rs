@@ -1277,7 +1277,7 @@ async fn seed_rollback_microfixture(store: &CanonicalStore) -> PreparedRollbackT
                 vec![(CarrierEditOrigin::Body, span, manual_b)],
             )
             .unwrap();
-            let man_ed = store
+            let _man_ed = store
                 .edit_note(
                     foreign_ctx.clone(),
                     next_mutation(

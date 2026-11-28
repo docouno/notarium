@@ -194,6 +194,10 @@ async fn rollback_room_plan_replans_on_concurrent_open_and_clean_close_both_back
         swap_open_rev: RevisionId,
         swap_raced: AtomicBool,
         always_race_target: NoteId,
+        busy_fence_target: NoteId,
+        held_busy_guard:
+            Mutex<Option<tokio::sync::OwnedMutexGuard<notarium_core::ports::RoomFenceState>>>,
+        busy_raced: AtomicBool,
         reserve_calls: AtomicUsize,
     }
 
@@ -212,6 +216,21 @@ async fn rollback_room_plan_replans_on_concurrent_open_and_clean_close_both_back
         ) -> PortFuture<'_, RollbackReservation> {
             Box::pin(async move {
                 self.reserve_calls.fetch_add(1, Ordering::SeqCst);
+                if note == self.busy_fence_target {
+                    if !self.busy_raced.swap(true, Ordering::SeqCst) {
+                        // Hold the room fence mutex across the writer TX while reporting
+                        // SkippedRoomActive (no durable collab_sessions row). A blocking
+                        // `.lock().await` inside the writer TX would deadlock until timeout;
+                        // a non-blocking `try_lock` must immediately return CursorStale and
+                        // reach this second reserve_rollback call to release the guard.
+                        let lock = self.fences.get_or_init(&self.scope, &note);
+                        let guard = lock.lock_owned().await;
+                        *self.held_busy_guard.lock().unwrap() = Some(guard);
+                        return Ok(RollbackReservation::SkippedRoomActive);
+                    }
+                    // Second attempt: release the held guard and reserve cleanly.
+                    let _ = self.held_busy_guard.lock().unwrap().take();
+                }
                 if note == self.swap_open_target && !self.swap_raced.swap(true, Ordering::SeqCst) {
                     // Close `swap_close_target` cleanly, then open `swap_open_target` BEFORE
                     // reserving it so both notes end up in `plan.skipped_room_active` despite
@@ -388,6 +407,7 @@ async fn rollback_room_plan_replans_on_concurrent_open_and_clean_close_both_back
         let note_d = sample_note_id(84);
         let note_e = sample_note_id(85);
         let note_f = sample_note_id(86);
+        let note_g = sample_note_id(87);
         let run3 = sample_run_id(83);
         let agent3 = agent_run_ctx(&ctx, run3.clone());
         let created_d = store
@@ -447,6 +467,27 @@ async fn rollback_room_plan_replans_on_concurrent_open_and_clean_close_both_back
             .await
             .unwrap();
 
+        let run5 = sample_run_id(85);
+        let agent5 = agent_run_ctx(&ctx, run5.clone());
+        store
+            .create_note(
+                agent5,
+                next_mutation(
+                    &scope,
+                    &owner,
+                    CreateNote {
+                        folder_page: false,
+                        note: note_g.clone(),
+                        parent: None,
+                        slug: "race-g".into(),
+                        class: DocClass::UserDoc,
+                        carrier: "# G\n".into(),
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+
         let rooms = Arc::new(RacingRoomInterceptor {
             store: store.clone(),
             scope: scope.clone(),
@@ -461,6 +502,9 @@ async fn rollback_room_plan_replans_on_concurrent_open_and_clean_close_both_back
             swap_open_rev: created_e.value.revision.clone(),
             swap_raced: AtomicBool::new(false),
             always_race_target: note_f.clone(),
+            busy_fence_target: note_g.clone(),
+            held_busy_guard: Mutex::new(None),
+            busy_raced: AtomicBool::new(false),
             reserve_calls: AtomicUsize::new(0),
         });
         store.register_collab_interceptor(rooms.clone()).unwrap();
@@ -555,8 +599,9 @@ async fn rollback_room_plan_replans_on_concurrent_open_and_clean_close_both_back
         assert_eq!(rb3.value.trashed[0].note, note_d);
 
         // Case 4: Exhausting all planner retries returns retryable Unavailable (never raw CursorStale).
+        let before_exhaust = rooms.reserve_calls.load(Ordering::SeqCst);
         let exhausted = store
-            .rollback_agent_run_by_id(ctx, next_mutation(&scope, &owner, run4))
+            .rollback_agent_run_by_id(ctx.clone(), next_mutation(&scope, &owner, run4))
             .await
             .unwrap_err();
         assert!(
@@ -568,6 +613,26 @@ async fn rollback_room_plan_replans_on_concurrent_open_and_clean_close_both_back
             ),
             "planner retry exhaustion must return retryable Unavailable, got: {exhausted:?}"
         );
+        assert_eq!(
+            rooms.reserve_calls.load(Ordering::SeqCst),
+            before_exhaust + 4,
+            "planner must exhaust all MAX_PLANNER_RETRIES attempts before returning Unavailable"
+        );
+
+        // Case 5: Held RoomFenceState mutex on a skipped note must NOT deadlock the writer TX;
+        // non-blocking try_lock must immediately replan (releasing the guard on attempt 2) and succeed.
+        let mut bounded = ctx;
+        bounded.budget.remaining = Duration::from_secs(3);
+        let rb5 = store
+            .rollback_agent_run_by_id(bounded, next_mutation(&scope, &owner, run5))
+            .await
+            .expect(
+                "held room fence guard must trigger non-blocking CursorStale replan, not deadlock",
+            );
+        assert!(rooms.busy_raced.load(Ordering::SeqCst));
+        assert!(rb5.value.skipped_room_active.is_empty());
+        assert_eq!(rb5.value.trashed.len(), 1);
+        assert_eq!(rb5.value.trashed[0].note, note_g);
 
         runtime.shutdown().await.unwrap();
         if postgres {

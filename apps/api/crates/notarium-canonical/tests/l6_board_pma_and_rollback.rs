@@ -2248,12 +2248,39 @@ async fn check_self_trashed_agent_memory_rollback_reopens_slot(
         .await
         .unwrap();
 
+    // Write-locking the origin project must reject rolling back the moved AgentMemory note
+    // before mutating state; unlocking lets rollback restore both parent and original slug.
+    let origin_project = match &target {
+        MemoryTarget::Project { folder } => folder.folder_id.clone(),
+        MemoryTarget::User { .. } => unreachable!(),
+    };
+    let moved_rb_cmd = next_mutation(scope, owner, moved_run);
+    store
+        .set_folder_write_lock(human.clone(), origin_project.clone(), true)
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .rollback_agent_run_by_id(human.clone(), moved_rb_cmd.clone())
+            .await,
+        Err(PortError::Domain(DomainError::SpaceReadOnly))
+    ));
+    store
+        .set_folder_write_lock(human.clone(), origin_project.clone(), false)
+        .await
+        .unwrap();
+
     let moved_rolled = store
-        .rollback_agent_run_by_id(human.clone(), next_mutation(scope, owner, moved_run))
+        .rollback_agent_run_by_id(human.clone(), moved_rb_cmd.clone())
         .await
         .unwrap();
     assert_eq!(moved_rolled.value.trashed.len(), 1);
     assert_eq!(moved_rolled.value.trashed[0].note, moved_note);
+    let moved_replayed = store
+        .rollback_agent_run_by_id(human.clone(), moved_rb_cmd)
+        .await
+        .expect("immediate replay of moved AgentMemory rollback must succeed");
+    assert_eq!(moved_replayed.receipt, moved_rolled.receipt);
 
     let reopened_moved = store
         .inspect_memory_target(
@@ -2281,6 +2308,34 @@ async fn check_self_trashed_agent_memory_rollback_reopens_slot(
         .await
         .expect("reopened moved AgentMemory slot must accept fresh append_memory");
     assert_eq!(recreated_moved.value.outcome, MemoryAppendOutcome::Created);
+    let recreated_meta = store
+        .get_note(
+            owner_ctx(scope, owner.clone()),
+            GetNote {
+                note: moved_note,
+                revision: None,
+                causal: CausalBasis::Exact(
+                    ReceiptSet::new([recreated_moved.receipt.clone()]).unwrap(),
+                ),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        recreated_meta.parent.as_ref(),
+        Some(&origin_project),
+        "reopened AgentMemory note must reside in its original project root"
+    );
+    assert!(
+        recreated_meta
+            .provenance
+            .as_ref()
+            .expect("provenance")
+            .path
+            .ends_with("/memory-architecture.md"),
+        "reopened AgentMemory note must keep its canonical category slug: {:?}",
+        recreated_meta.provenance
+    );
 }
 
 async fn check_zero_note_run_rollback_isolation(

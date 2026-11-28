@@ -183,6 +183,7 @@ struct RoomRollbackPlan {
     expected_heads: BTreeMap<NoteId, RevisionId>,
     reservations: BTreeMap<NoteId, ClosedRoomReservation>,
     skipped_room_active: BTreeSet<NoteId>,
+    has_interceptor: bool,
 }
 
 struct RoomPlanDiscovery {
@@ -401,6 +402,7 @@ async fn execute_room_planned_rollback(
             expected_heads: discovery.expected_heads,
             reservations,
             skipped_room_active,
+            has_interceptor: interceptor.is_some(),
         };
         let intent = build_unified_rollback_intent(
             ctx.scope().clone(),
@@ -740,13 +742,24 @@ async fn execute_unified_rollback_tx(
         }
         if let Some(plan) = &room_plan {
             if plan.skipped_room_active.contains(&nid) {
-                let still_active = collab_states
-                    .get(&nid)
-                    .is_some_and(|status| status.is_blocked())
-                    || room_fences
-                        .observed_active_lease(&scope_cl, &nid)
-                        .await
-                        .is_some();
+                let still_active = match collab_states.get(&nid).copied() {
+                    Some(DurableRoomStatus::Blocked) => true,
+                    Some(DurableRoomStatus::Fenced) if !plan.has_interceptor => true,
+                    Some(DurableRoomStatus::Fenced) => false,
+                    Some(DurableRoomStatus::Clean) | None => {
+                        match room_fences.is_room_active(&scope_cl, &nid).await {
+                            Ok(active) => active,
+                            Err(_) => {
+                                // Never block inside the writer transaction waiting on a room
+                                // fence lock (held by an earlier batch item or recovery task);
+                                // release the writer transaction and replan instead.
+                                return Err(
+                                    DomainError::validation(ValidationReason::CursorStale).into()
+                                );
+                            }
+                        }
+                    }
+                };
                 if !still_active {
                     return Err(DomainError::validation(ValidationReason::CursorStale).into());
                 }
@@ -920,7 +933,7 @@ async fn execute_unified_rollback_tx(
                     &item_ctx.space,
                     &auth,
                     metadata,
-                    false,
+                    true,
                 )
                 .await?;
             }
