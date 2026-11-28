@@ -64,10 +64,15 @@ These constructors are trusted in-process boundaries, not isolation from malicio
 Rust code that controls the canonical/admission owner. Adapters must recheck live
 visibility and revocation at use time.
 
-Provider dispatch uses `ProviderEgressCatalogPort` to pin current metadata for
-every origin and the selected active project. Its lease excludes changes to class,
-lifecycle, provenance and project ancestry until release, or cancels the call and
-waits for release. Chat origins include their canonical digest and optional project;
+Provider dispatch uses `ProviderEgressCatalogPort` to verify current metadata for
+every origin and the selected active project under a short read-only snapshot. On
+local SQLite, its in-memory disclosure pin excludes local canonical mutations to
+participating Spaces until `mark_dispatched` / release; on Cloud PostgreSQL, the
+read-only snapshot returns its connection immediately after verification so
+upstream network I/O never holds database locks or exhausts the pool, while
+Control authority, consent, membership, credential and run revocations cancel
+in-flight calls synchronously through `RevocationHub`. Chat origins include their
+canonical digest and optional project;
 current taint remains authoritative. Folder and Space metadata carry their
 own canonical revision or digest. A derived chat entry retains the transitive
 origins of each source used to produce it, including earlier tool results and

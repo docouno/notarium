@@ -2405,6 +2405,45 @@ async fn pinned_schedule_cursors_and_control_next_slot(pg: bool) {
     }
     assert_eq!(seen_expired.len(), claimed_runs.len());
 
+    // 4. Config edit after a claim must NEVER masquerade as a SkippedDuplicate repair:
+    //    claim(T1, rev=0) -> update_schedule(rev=1 -> rev=2) -> claim(T1, rev=1) must fail
+    //    with IdempotencyKeyReused instead of returning SkippedDuplicate.
+    let mut updated_def = created[0].definition.clone();
+    updated_def.title = "Pinned 1 renamed".into();
+    let updated = service
+        .update_schedule(
+            ctx.clone(),
+            AccountMutation {
+                identity: identity(&service, &ctx, 210).await,
+                input: UpdateSchedule {
+                    schedule: created[0].id.clone(),
+                    expected: ControlRevision::new(1).unwrap(),
+                    definition: updated_def,
+                    approved_skills: None,
+                    next_slot: Some(tick(t0 + 20 * 60_000)),
+                    paused: false,
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    assert_eq!(updated.revision, ControlRevision::new(2).unwrap());
+    assert!(matches!(
+        service
+            .claim_schedule(
+                scheduler(),
+                ClaimSchedule {
+                    schedule: created[0].id.clone(),
+                    slot: tick(t0),
+                    current_role: role.clone(),
+                    expected: ControlRevision::new(1).unwrap(),
+                },
+            )
+            .await,
+        Err(PortError::Domain(DomainError::IdempotencyKeyReused))
+    ));
+
     drop(service);
     fixture.close().await;
 }

@@ -1448,4 +1448,82 @@ async fn pg_v8_and_v9_512b_upgrade_lifts_inline_limit_and_retires_staged_chat() 
         let _ = raw.close().await;
         fixtures.drop_pg_schema(&schema).await;
     }
+
+    // PostgreSQL parity: reachable >64 MiB note_revision blob must fail closed and roll back
+    // v9->v10 cleanly; converting it to obsolete staged_chat retires it and allows upgrade.
+    let schema = fixtures.fresh_pg_schema();
+    let install = sample_installation_id(99);
+    let space_id = sample_space_id(99);
+    let sid = space_id.as_str();
+    let mut raw = fixtures.open_raw_pg().await;
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "CREATE SCHEMA \"{schema}\"; SET search_path TO \"{schema}\""
+    )))
+    .execute(&mut raw)
+    .await
+    .unwrap();
+    sqlx::raw_sql(include_str!("../src/schema/postgres_ddl.sql"))
+        .execute(&mut raw)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO schema_meta VALUES(1,9,1,$1,'ready',$2,0,0,0,0)")
+        .bind(install.as_str())
+        .bind(hex::decode(v9_hash).unwrap())
+        .execute(&mut raw)
+        .await
+        .unwrap();
+    let over_64m = notarium_canonical::blobs::MAX_BLOB_DECODE_BYTES as i64 + 1;
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "INSERT INTO spaces VALUES('{sid}',decode('00000000000000000000000000000000','hex'),'root','home','home','personal','owner','active',1,10,'{{}}',0,0);
+         INSERT INTO blob_catalog VALUES('{sid}',decode('0000000000000000000000000000000000000000000000000000000000000000','hex'),{over_64m},120,1,'pub_big','open','active',1);
+         INSERT INTO blob_publications VALUES('{sid}','pub_big',decode('0000000000000000000000000000000000000000000000000000000000000000','hex'),1,'s3_chunked_v1','active',1,1,{over_64m},120,1,1);
+         INSERT INTO blob_references VALUES('{sid}','note_revision','note1','r1','body',decode('0000000000000000000000000000000000000000000000000000000000000000','hex'),'pub_big',1);"
+    )))
+    .execute(&mut raw)
+    .await
+    .unwrap();
+    assert!(
+        notarium_canonical::schema::bootstrap_postgres_schema(&mut raw, &schema, &install)
+            .await
+            .is_err(),
+        "PG v10 upgrade must fail closed when a reachable blob exceeds 64 MiB"
+    );
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SET search_path TO \"{schema}\""
+    )))
+    .execute(&mut raw)
+    .await
+    .unwrap();
+    let ver_after_abort: i32 =
+        sqlx::query_scalar("SELECT schema_version FROM schema_meta WHERE singleton_id=1")
+            .fetch_one(&mut raw)
+            .await
+            .unwrap();
+    assert_eq!(ver_after_abort, 9);
+
+    sqlx::query("UPDATE blob_references SET owner_kind='staged_chat'")
+        .execute(&mut raw)
+        .await
+        .unwrap();
+    notarium_canonical::schema::bootstrap_postgres_schema(&mut raw, &schema, &install)
+        .await
+        .expect("PG staged_chat-only >64 MiB blob must retire before reachability check");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SET search_path TO \"{schema}\""
+    )))
+    .execute(&mut raw)
+    .await
+    .unwrap();
+    let ver_after_ok: i32 =
+        sqlx::query_scalar("SELECT schema_version FROM schema_meta WHERE singleton_id=1")
+            .fetch_one(&mut raw)
+            .await
+            .unwrap();
+    assert_eq!(
+        ver_after_ok,
+        notarium_canonical::CANONICAL_SCHEMA_VERSION as i32
+    );
+
+    let _ = raw.close().await;
+    fixtures.drop_pg_schema(&schema).await;
 }

@@ -54,7 +54,6 @@ Keep every failed and incomplete attempt with its exit status.
 | Profile | High | Medium |
 | --- | ---: | ---: |
 | SQLite rollback, local CAS, 1,000 fresh commands | p95 <4 ms | p95 <10 ms |
-| PostgreSQL rollback, local CAS, 1,000 fresh commands | p95 <5 ms | p95 <15 ms |
 | SQLite, 50 writers with zero or 200 readers | >2,000 confirmed mutations/s in each run | >1,600 confirmed mutations/s in each run |
 | Chat window, 10,000 reads of 50 turns per topology | p95 <0.5 ms | p95 <1 ms |
 | Confirmed paired backup pause on SQLite, 1 and 64 Spaces | p95 <1 ms | p95 <1 ms |

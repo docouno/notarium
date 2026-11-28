@@ -97,13 +97,18 @@ pub(super) fn prepare(input: &mut AppendChat) -> Result<BodyFormat, PortError> {
         if text.len() > MAX_TURN_BYTES {
             return Err(DomainError::validation(ValidationReason::InvalidLimit).into());
         }
-        let encoded = serde_json::to_string(&ProposalTurn {
+        let turn = ProposalTurn {
             text: text.clone(),
             envelope,
             effect_kind: Some(effect_kind),
-        })
-        .map_err(|error| internal_not_committed("encode_chat_proposal", error.to_string()))?;
-        return encode(input, PROPOSAL_MARKER, encoded, BodyFormat::Proposal);
+        };
+        return encode_bounded(
+            input,
+            PROPOSAL_MARKER,
+            &turn,
+            BodyFormat::Proposal,
+            "encode_chat_proposal",
+        );
     }
     if input.proposed_effect.is_some() {
         return Err(DomainError::validation(ValidationReason::InvalidState).into());
@@ -126,13 +131,18 @@ pub(super) fn prepare(input: &mut AppendChat) -> Result<BodyFormat, PortError> {
         if text.len() > MAX_TURN_BYTES {
             return Err(DomainError::validation(ValidationReason::InvalidLimit).into());
         }
-        let encoded = serde_json::to_string(&ModelTurn {
+        let turn = ModelTurn {
             text: text.clone(),
             interruption: input.interruption,
             tool_calls: std::mem::take(&mut input.tool_calls),
-        })
-        .map_err(|error| internal_not_committed("encode_chat_model_turn", error.to_string()))?;
-        return encode(input, MODEL_MARKER, encoded, BodyFormat::Model);
+        };
+        return encode_bounded(
+            input,
+            MODEL_MARKER,
+            &turn,
+            BodyFormat::Model,
+            "encode_chat_model_turn",
+        );
     }
     if text.contains('\0') {
         return Err(DomainError::validation(ValidationReason::InvalidState).into());
@@ -140,16 +150,52 @@ pub(super) fn prepare(input: &mut AppendChat) -> Result<BodyFormat, PortError> {
     Ok(BodyFormat::Plain)
 }
 
-fn encode(
+struct BoundedByteWriter {
+    buf: Vec<u8>,
+    limit: usize,
+    exceeded: bool,
+}
+
+impl std::io::Write for BoundedByteWriter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if self.buf.len().saturating_add(data.len()) > self.limit {
+            self.exceeded = true;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "structured chat turn exceeded byte limit",
+            ));
+        }
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn encode_bounded<T: Serialize>(
     input: &mut AppendChat,
     marker: &str,
-    json: String,
+    payload: &T,
     format: BodyFormat,
+    error_code: &'static str,
 ) -> Result<BodyFormat, PortError> {
-    if marker.len() + json.len() > MAX_TURN_BYTES {
-        return Err(DomainError::validation(ValidationReason::InvalidLimit).into());
+    let mut writer = BoundedByteWriter {
+        buf: Vec::with_capacity(marker.len().saturating_add(256).min(MAX_TURN_BYTES)),
+        limit: MAX_TURN_BYTES,
+        exceeded: false,
+    };
+    writer.buf.extend_from_slice(marker.as_bytes());
+    if let Err(error) = serde_json::to_writer(&mut writer, payload) {
+        if writer.exceeded {
+            return Err(DomainError::validation(ValidationReason::InvalidLimit).into());
+        }
+        return Err(internal_not_committed(error_code, error.to_string()));
     }
-    input.body = ChatInputBody::Text(format!("{marker}{json}"));
+    let body = String::from_utf8(writer.buf)
+        .map_err(|error| internal_not_committed(error_code, error.to_string()))?;
+    input.body = ChatInputBody::Text(body);
     Ok(format)
 }
 

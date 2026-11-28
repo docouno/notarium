@@ -207,7 +207,7 @@ async fn upgrade_owners_v5(conn: &mut crate::sql_exec::BackendConn<'_>) -> Resul
     Ok(())
 }
 
-const PG_UPGRADE_CHAT_INLINE_LIMIT_V9: &str = "DO $migration$
+const PG_UPGRADE_CHAT_INLINE_LIMIT_V10: &str = "DO $migration$
     DECLARE
         cname TEXT;
     BEGIN
@@ -408,13 +408,40 @@ async fn upgrade_chat_inline_limit_v10(
             }
         }
         BackendConn::Postgres(c) => {
-            sqlx::raw_sql(PG_UPGRADE_CHAT_INLINE_LIMIT_V9)
+            sqlx::raw_sql(PG_UPGRADE_CHAT_INLINE_LIMIT_V10)
                 .execute(&mut **c)
                 .await
                 .map_err(fail)?;
         }
     }
-    retire_legacy_staged_chat_refs(conn).await
+    retire_legacy_staged_chat_refs(conn).await?;
+
+    // Fail closed before stamping schema version 10 if any reachable blob exceeds
+    // the 64 MiB decode ceiling so operators can export or purge oversized carriers
+    // on the predecessor version instead of silently losing read access after upgrade.
+    let oversized_exists: Option<i64> = match conn {
+        BackendConn::Sqlite(c) => sqlx::query_scalar(
+            "SELECT 1 FROM blob_catalog WHERE ref_count > 0 AND raw_size > ? LIMIT 1",
+        )
+        .bind(crate::blobs::MAX_BLOB_DECODE_BYTES as i64)
+        .fetch_optional(&mut **c)
+        .await
+        .map_err(fail)?,
+        BackendConn::Postgres(c) => sqlx::query_scalar(
+            "SELECT 1::BIGINT FROM blob_catalog WHERE ref_count > 0 AND raw_size > $1 LIMIT 1",
+        )
+        .bind(crate::blobs::MAX_BLOB_DECODE_BYTES as i64)
+        .fetch_optional(&mut **c)
+        .await
+        .map_err(fail)?,
+    };
+    if oversized_exists.is_some() {
+        return Err(internal_not_committed(
+            "migration_v10_blob_exceeds_64mib",
+            "reachable blob exceeds 64 MiB decode cap; export or purge oversized carriers before upgrading",
+        ));
+    }
+    Ok(())
 }
 
 macro_rules! upgrade {
@@ -721,7 +748,7 @@ mod tests {
                 ("redacted".into(), None, 0, None),
             ]
         );
-        // Verify upgraded v9 table enforces the 32 KiB inline threshold (not the old 512B cap).
+        // Verify upgraded v10 table enforces the 32 KiB inline threshold (not the old 512B cap).
         let ten_kib = "x".repeat(10 * 1024);
         sqlx::query(
             "INSERT INTO chat_entries(
@@ -733,7 +760,7 @@ mod tests {
         .bind(&ten_kib)
         .execute(&mut db)
         .await
-        .expect("upgraded v9 chat_entries must accept 10 KiB inline body");
+        .expect("upgraded v10 chat_entries must accept 10 KiB inline body");
         let over_32k = "y".repeat(32 * 1024 + 1);
         assert!(
             sqlx::query(
@@ -747,7 +774,7 @@ mod tests {
             .execute(&mut db)
             .await
             .is_err(),
-            "upgraded v9 chat_entries must reject > 32 KiB inline body"
+            "upgraded v10 chat_entries must reject > 32 KiB inline body"
         );
     }
 
@@ -1283,5 +1310,77 @@ mod tests {
             .unwrap();
             assert_eq!((remaining_staged, catalog_refs, pending_rets), (0, 0, 1));
         }
+
+        // Reachable >64 MiB note_revision blob must fail-closed and roll back v9->v10 cleanly
+        // (preserving schema_version=9 and restoring SQLite pragmas), whereas an oversized blob
+        // referenced ONLY by obsolete staged_chat retires first and does not block upgrade.
+        let mut db = SqliteConnection::connect(":memory:").await.unwrap();
+        let installation = InstallationId::from_bytes([0x99; 16]);
+        let space_id = notarium_core::ids::SpaceId::from_bytes([0x99; 16]);
+        let sid = space_id.as_str();
+        sqlx::query("PRAGMA foreign_keys = ON")
+            .execute(&mut db)
+            .await
+            .unwrap();
+        for sql in split_sql_statements(SQLITE_BASELINE_DDL) {
+            sqlx::query(sqlx::AssertSqlSafe(sql))
+                .execute(&mut db)
+                .await
+                .unwrap();
+        }
+        sqlx::query("INSERT INTO schema_meta VALUES(1,9,1,$1,'ready',$2,0,0,0,0)")
+            .bind(installation.as_str())
+            .bind(hex::decode(V9_HASH).unwrap())
+            .execute(&mut db)
+            .await
+            .unwrap();
+        let over_64m = crate::blobs::MAX_BLOB_DECODE_BYTES as i64 + 1;
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO spaces VALUES('{sid}',zeroblob(16),'root','home','home','personal','owner','active',1,10,'{{}}',0,0);
+             INSERT INTO blob_catalog VALUES('{sid}',zeroblob(32),{over_64m},120,1,'pub_big','open','active',1);
+             INSERT INTO blob_publications VALUES('{sid}','pub_big',zeroblob(32),1,'local_zstd_v1','active',1,1,{over_64m},120,1,1);
+             INSERT INTO blob_references VALUES('{sid}','note_revision','note1','r1','body',zeroblob(32),'pub_big',1);"
+        )))
+        .execute(&mut db)
+        .await
+        .unwrap();
+        assert!(
+            bootstrap_sqlite_schema(&mut db, &installation)
+                .await
+                .is_err(),
+            "v10 upgrade must fail closed when a reachable blob exceeds 64 MiB"
+        );
+        let ver_after_abort: i64 =
+            sqlx::query_scalar("SELECT schema_version FROM schema_meta WHERE singleton_id=1")
+                .fetch_one(&mut db)
+                .await
+                .unwrap();
+        let fk_after_abort: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+            .fetch_one(&mut db)
+            .await
+            .unwrap();
+        let legacy_after_abort: i64 = sqlx::query_scalar("PRAGMA legacy_alter_table")
+            .fetch_one(&mut db)
+            .await
+            .unwrap();
+        assert_eq!(
+            (ver_after_abort, fk_after_abort, legacy_after_abort),
+            (9, 1, 0)
+        );
+
+        // Convert the oversized reference to obsolete staged_chat: v10 must retire it and succeed.
+        sqlx::query("UPDATE blob_references SET owner_kind='staged_chat'")
+            .execute(&mut db)
+            .await
+            .unwrap();
+        bootstrap_sqlite_schema(&mut db, &installation)
+            .await
+            .expect("staged_chat-only >64 MiB blob must retire before the reachability check");
+        let ver_after_ok: i64 =
+            sqlx::query_scalar("SELECT schema_version FROM schema_meta WHERE singleton_id=1")
+                .fetch_one(&mut db)
+                .await
+                .unwrap();
+        assert_eq!(ver_after_ok, i64::from(CANONICAL_SCHEMA_VERSION));
     }
 }

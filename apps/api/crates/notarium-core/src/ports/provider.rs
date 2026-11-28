@@ -608,11 +608,14 @@ impl ProviderRevocationScope {
     }
 }
 
-/// The canonical owner pins current metadata and excludes class, lifecycle and
-/// provenance changes until dispatch releases this lease. Mutations may cancel
-/// the supplied operation and wait for its lease to drop. The lease also holds
-/// current ability revisions in the primary Space stable, so a scheduled caller
-/// can revalidate its approved packages before sending a query. No body crosses this port.
+/// The canonical owner verifies current metadata (class, lifecycle, provenance,
+/// project ancestry and current ability revisions) atomically under a short
+/// read-only snapshot. On local SQLite, an in-memory Space disclosure pin
+/// excludes local canonical mutations until `mark_dispatched()` / `close()`.
+/// On Cloud PostgreSQL, the read-only snapshot returns to the pool immediately
+/// after verification so upstream network I/O never holds PG connections or row
+/// locks, while Control revocations cancel in-flight calls synchronously through
+/// `RevocationHub`. No body crosses this port.
 pub trait ProviderEgressLease: Send {
     /// Exactly one result per requested origin, in the original request order.
     fn current(&self) -> &[ProviderCurrentContent];
